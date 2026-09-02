@@ -36,7 +36,7 @@
 
 use crate::modules::auth::TenantId;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -45,12 +45,12 @@ use crate::utils::error::AppResult;
 
 use super::service::SlaService;
 
-/// Lower bound on the at-risk lead so sub-minute SLA windows still warn
-/// before they breach.
-const LEAD_FLOOR: Duration = Duration::minutes(5);
-/// Upper bound on the at-risk lead so a multi-week resolution target
-/// does not warn days in advance.
-const LEAD_CEIL: Duration = Duration::hours(24);
+// PMS-893: the at-risk lead and its clamps now live in `mokosh-types`, beside
+// `compute_sla_status`, because the badge the SPA renders and the alert this
+// worker sends must answer the same question the same way. They did not: the
+// badge warned under a flat two hours, which on a 30-day target is a day after
+// this worker has already alerted, and on a 1-hour target is the whole window.
+use mokosh_types::tickets::sla_at_risk_lead;
 
 /// One due field the worker evaluates, paired with the ledger `kind`
 /// strings and the event_type to dispatch.
@@ -159,7 +159,7 @@ impl SlaSweepWorker {
                 // point emitting the at-risk alert for the same field.
                 let (kind, event_type) = if now >= due {
                     (m.breached_kind, "sla.breached")
-                } else if now >= due - lead_for(t.created_at, due) {
+                } else if now >= due - sla_at_risk_lead(t.created_at, due) {
                     (m.at_risk_kind, "sla.at_risk")
                 } else {
                     continue;
@@ -229,19 +229,6 @@ impl SlaSweepWorker {
     }
 }
 
-/// Compute the at-risk lead for a ticket: 20% of the SLA window
-/// (`due - created_at`), clamped to `[LEAD_FLOOR, LEAD_CEIL]`. A
-/// non-positive window falls back to `LEAD_FLOOR`.
-fn lead_for(created_at: DateTime<Utc>, due: DateTime<Utc>) -> Duration {
-    let window = due - created_at;
-    if window <= Duration::zero() {
-        return LEAD_FLOOR;
-    }
-    // 20% via integer milliseconds to avoid float round-trips.
-    let lead = Duration::milliseconds(window.num_milliseconds() / 5);
-    lead.clamp(LEAD_FLOOR, LEAD_CEIL)
-}
-
 #[async_trait]
 impl Job for SlaSweepWorker {
     fn name(&self) -> &'static str {
@@ -271,6 +258,13 @@ struct TicketRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
+    // PMS-893: the clamps moved to `mokosh-types` with the arithmetic. These
+    // tests still assert them here, unchanged, which is what shows the move was
+    // a move and not a rewrite.
+    use mokosh_types::tickets::{
+        SLA_AT_RISK_LEAD_CEIL as LEAD_CEIL, SLA_AT_RISK_LEAD_FLOOR as LEAD_FLOOR,
+    };
 
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
         use chrono::TimeZone;
@@ -282,7 +276,7 @@ mod tests {
         // 10h window => 2h lead, inside [5m, 24h].
         let created = utc(2026, 6, 1, 0, 0);
         let due = created + Duration::hours(10);
-        assert_eq!(lead_for(created, due), Duration::hours(2));
+        assert_eq!(sla_at_risk_lead(created, due), Duration::hours(2));
     }
 
     #[test]
@@ -290,7 +284,7 @@ mod tests {
         // 10m window => 2m raw, clamped up to the 5m floor.
         let created = utc(2026, 6, 1, 0, 0);
         let due = created + Duration::minutes(10);
-        assert_eq!(lead_for(created, due), LEAD_FLOOR);
+        assert_eq!(sla_at_risk_lead(created, due), LEAD_FLOOR);
     }
 
     #[test]
@@ -298,13 +292,16 @@ mod tests {
         // 30d window => 6d raw, clamped down to the 24h ceiling.
         let created = utc(2026, 6, 1, 0, 0);
         let due = created + Duration::days(30);
-        assert_eq!(lead_for(created, due), LEAD_CEIL);
+        assert_eq!(sla_at_risk_lead(created, due), LEAD_CEIL);
     }
 
     #[test]
     fn lead_falls_back_to_floor_for_nonpositive_window() {
         let created = utc(2026, 6, 1, 0, 0);
-        assert_eq!(lead_for(created, created), LEAD_FLOOR);
-        assert_eq!(lead_for(created, created - Duration::hours(1)), LEAD_FLOOR);
+        assert_eq!(sla_at_risk_lead(created, created), LEAD_FLOOR);
+        assert_eq!(
+            sla_at_risk_lead(created, created - Duration::hours(1)),
+            LEAD_FLOOR
+        );
     }
 }

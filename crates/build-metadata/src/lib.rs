@@ -1,10 +1,10 @@
 //! Shared build-script helper for the Mokosh workspace.
 //!
-//! Both the workspace-root `build.rs` and `crates/google-oauth-flow/build.rs`
-//! used to carry a near-identical copy of this logic (PMS-198). They now call
-//! [`emit`] so the git hash / describe / build date capture lives in exactly
-//! one place. The only thing that differs between call sites is the relative
-//! path to the `.git` directory, passed as `git_dir`.
+//! The workspace-root `build.rs` and each member's build script used to carry
+//! a near-identical copy of this logic (PMS-198). They now call [`emit`] so the
+//! git hash / describe / build date capture lives in exactly one place. The
+//! only thing that differs between call sites is the relative path to the
+//! `.git` directory, passed as `git_dir`.
 //!
 //! Resolution order for each value:
 //!   1. Pre-set env var (`MOKOSH_GIT_HASH`, `MOKOSH_GIT_DESCRIBE`,

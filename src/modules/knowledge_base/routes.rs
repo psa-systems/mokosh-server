@@ -38,6 +38,14 @@ pub fn kb_routes(service: KbService) -> Router {
             "/kb/articles/{id}",
             get(get_article).put(update_article).delete(delete_article),
         )
+        // PMS-922: the author's in-progress text. Deliberately its own
+        // resource rather than a flag on the article PUT: `update_article`
+        // snapshots a version on every call, so autosaving through it would
+        // append a revision per interval and bury the real edits.
+        .route(
+            "/kb/articles/{id}/draft",
+            get(get_draft).put(save_draft).delete(delete_draft),
+        )
         .route("/kb/articles/{id}/versions", get(list_article_versions))
         // Restore a prior version as a new monotonic version (PMS-83).
         .route(
@@ -178,6 +186,52 @@ async fn update_article(
     Ok(Json(
         s.service.update_article(u.tenant(), id, u.id, &req).await?,
     ))
+}
+
+/// PMS-922: upsert the caller's draft.
+///
+/// `RequireManager` like the article PUT it is a draft of: a draft is
+/// in-progress editing, so whoever can save can draft, and nobody else can use
+/// it as a side door. `RequireKnowledgeBase` still gates the module.
+async fn save_draft(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    _m: RequireManager,
+    Path(id): Path<Uuid>,
+    Json(req): Json<SaveKbDraftRequest>,
+) -> AppResult<Json<KbDraftResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service.save_draft(u.tenant(), id, u.id, &req).await?,
+    ))
+}
+
+/// The caller's draft, or 404 when they have none.
+///
+/// 404 rather than 200-with-null so "no draft" is a status the client can
+/// branch on without inspecting a body, and so it reads the same as any other
+/// absent resource.
+async fn get_draft(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    _m: RequireManager,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<KbDraftResponse>> {
+    s.service
+        .get_draft(u.tenant(), id, u.id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| crate::utils::error::AppError::NotFound("Draft".to_string()))
+}
+
+async fn delete_draft(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    _m: RequireManager,
+    Path(id): Path<Uuid>,
+) -> AppResult<axum::http::StatusCode> {
+    s.service.delete_draft(u.tenant(), id, u.id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 async fn delete_article(

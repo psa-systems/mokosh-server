@@ -106,6 +106,7 @@ mod tests {
             support_phone: Some("+15555550100".into()),
             support_contact_name: Some("Alice".into()),
             portal_domain: Some("portal.acme.example".into()),
+            ..Default::default()
         }
     }
 

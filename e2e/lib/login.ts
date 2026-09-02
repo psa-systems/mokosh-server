@@ -433,7 +433,7 @@ export async function expectAnonymous(request: APIRequestContext): Promise<void>
 }
 
 // Browser-driven "logged out" proof: the SPA bounces back to /login when the
-// session is gone. Used by the auth-ui project so it never touches a request
+// session is gone. Used by the browser projects so it never touches a request
 // context (which would need its own bearer token). Logout redirects through
 // the bunyip hub's /logout (cross-origin POST + Set-Cookie + redirect to the
 // hub's /login), so the wait budget covers that round-trip. Match any

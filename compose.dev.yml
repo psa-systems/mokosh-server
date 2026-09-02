@@ -22,7 +22,7 @@
 #
 # This stack contains the Mokosh API server plus its secrets-management
 # infrastructure (Infisical + its Postgres + Valkey, behind the `infisical`
-# profile). The Mokosh client apps run separately (see ../mokosh-clients) and
+# profile). The Mokosh client apps run separately (see ../mokosh-apps) and
 # reach the API through Traefik at https://${USER}-mokosh-api.a8n.run.
 #
 # The Mokosh API server runs as the `server` service, reachable inside the
@@ -32,19 +32,20 @@
 # https://${USER}-mokosh-api.a8n.run to the container's $MOKOSH_PORT (see the
 # server's `labels` below).
 #
-# MOKOSH_HOST_BIND_IP is still discovered by `just dev` for the server's
-# BASE_URL. It is deliberately NOT used to publish any host port: postgres and
-# mailpit publish on loopback only (PMS-496), so host-side tooling (sqlx-cli,
-# the mail UI) reaches them via localhost while the LAN/internet cannot.
+# MOKOSH_HOST_BIND_IP is still discovered and written to .env by `just dev`, but
+# nothing in this file consumes it. It is deliberately NOT used to publish any
+# host port: postgres and mailpit publish on loopback only (PMS-496), so
+# host-side tooling (sqlx-cli, the mail UI) reaches them via localhost while the
+# LAN/internet cannot, and the server is reachable through Traefik alone.
 # Discover the host IP with:
 #   sys net | where name =~ 'eth0|br0' | get ip.0 | where protocol == 'ipv4'
 #
 # The Mokosh application database runs inside this stack as the
 # `postgres` service (separate from `infisical-postgres`, which is for
 # Infisical only). Server reaches it via in-network DNS at
-# `postgres:5432`. The container is also published to the host so
-# host-side tools (sqlx-cli via `just migrate-run`) can connect via
-# `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PG_HOST_PORT}` (default 5433 to
+# `postgres:5432`. The container is also published to the host on
+# loopback so host-side tools (sqlx-cli via `just migrate-run`) can
+# connect via `127.0.0.1:${MOKOSH_PG_HOST_PORT}` (default 5433 to
 # avoid clashing with any host-side postgres on 5432).
 #
 # This file contains no hardcoded values. Every environment variable is
@@ -175,8 +176,8 @@ services:
   # Mailpit captures every outgoing email locally. mokosh-server points
   # SMTP_HOST=mailpit in the dev env (see the server service below); the
   # web UI is at http://localhost:8025. State is intentionally
-  # ephemeral - no volume mount, restart clears the inbox. See
-  # docs/mokosh-smtp/01-dev-mailcatcher.md.
+  # ephemeral - no volume mount, restart clears the inbox. MP_DELIVER is
+  # false, so nothing leaves the box whatever SMTP_FROM says.
   mailpit:
     container_name: dev-mokosh-mailpit-${USER:?USER missing - run via just dev}
     image: axllent/mailpit:v1.27
@@ -206,7 +207,10 @@ services:
       HOST: 0.0.0.0
       PORT: ${MOKOSH_PORT:?MOKOSH_PORT missing - run `just dev` (which generates .env from .env.example)}
       ENVIRONMENT: development
-      BASE_URL: http://${MOKOSH_HOST_BIND_IP:-127.0.0.1}:${MOKOSH_PORT}
+      # The server's own public base URL. Traefik is the sole ingress and this
+      # service publishes no host port, so the only address that reaches it is
+      # the routed hostname below (same value as OIDC_AUDIENCE).
+      BASE_URL: https://${USER}-mokosh-api.a8n.run
 
       # Serialise rustc so the final mokosh_server lib compile does
       # not race a codegen unit against another peaking process on a
@@ -239,7 +243,7 @@ services:
       # alongside this one; messages land in http://localhost:8025.
       # Production deploys override these via secrets; setting
       # SMTP_HOST empty drops back to LogMailer (links go to docker
-      # logs). See docs/mokosh-smtp/03-config-and-bootstrap.md.
+      # logs). The .env.example block above these keys is the reference.
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
@@ -254,11 +258,15 @@ services:
       # `just dev` and the readiness probe reports "skipped" instead of
       # 503ing against an absent host (PMS-707). `just dev-infisical`
       # writes the service-DNS URL into .env under the MOKOSH_SERVER_
-      # name; the plain INFISICAL_BASE_URL in .env is the host-side
-      # localhost URL that `just infisical-bootstrap` consumes, so the
-      # two contexts need two names.
-      INFISICAL_BASE_URL: ${MOKOSH_SERVER_INFISICAL_BASE_URL:-}
+      # name; the plain INFISICAL_URL in .env is the host-side localhost
+      # URL that `just infisical-bootstrap` consumes, so the two contexts
+      # need two names.
+      INFISICAL_ADDRESS: ${MOKOSH_SERVER_INFISICAL_ADDRESS:-}
       INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-dev}
+      # PMS-967: `database` (the default) or `infisical`. The `:-` default
+      # reproduces the code's own fallback in SecretsConfig::from_env, so an
+      # unset variable behaves the same here as it does in production.
+      SECRET_BACKEND: ${SECRET_BACKEND:-database}
       INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
       INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:-}
@@ -275,22 +283,12 @@ services:
       OIDC_ISSUER: https://${USER}-bunyip-api.a8n.run
       OIDC_AUDIENCE: https://${USER}-mokosh-api.a8n.run
 
-      # Google OAuth login. Consumed by the google-oauth-flow workspace
-      # crate (Config::from_env()). The two secrets are required; the
-      # redirect URI defaults to the dev localhost callback.
-      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:?GOOGLE_OAUTH_CLIENT_ID missing - paste the dev OAuth client id into .env}
-      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:?GOOGLE_OAUTH_CLIENT_SECRET missing - paste the dev OAuth client secret into .env}
-      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-http://localhost:4301/api/v1/auth/google/callback}
-
-      # The exact origin the callback HTML postMessages tokens to.
-      # Must equal the browser-visible client origin byte-for-byte.
+      # Browser-visible origin of the client that talks to this API. Must
+      # equal it byte-for-byte: it is the CORS_ORIGIN default and the base
+      # for emailed reset/invite links. PMS-837 removed the Google OAuth
+      # client id/secret/redirect keys and the super-admin email allowlist
+      # along with the Google sign-in routes.
       CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:4301}
-
-      # Comma-separated, lowercased exact-email allowlist. A first-time
-      # Google sign-in whose email exactly matches an entry is
-      # auto-provisioned as role 'super_admin'; others are rejected.
-      # Existing users are never re-roled. Empty by default (fail-closed).
-      OAUTH_SUPER_ADMIN_EMAILS: ${OAUTH_SUPER_ADMIN_EMAILS:-}
 
       # First-run admin bootstrap (DEV ONLY). Ignored once any user exists.
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
@@ -304,6 +302,15 @@ services:
       # from your own `.env` and remove any Traefik / DNS wildcard that
       # pointed at `*.client.<apex>`. See
       # docs/dev-docs/portal-single-host-cutover.md.
+
+      # PMS-836: this map enumerates the container's environment, so a variable
+      # the code reads but that has no line here CANNOT be set from .env - the
+      # operator edits .env, sees no error, and the feature stays off. Every
+      # remaining variable the server process reads is therefore listed below,
+      # each defaulting to the fallback the code already applies when unset, so
+      # an untouched .env behaves exactly as before. scripts/check-env-example.nu
+      # fails `just check` if a new read is added without a line here.
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
 
       # PMS-729 / MAPPS-649: CORS allow-list, comma-separated. Empty
       # passes through as `[CLIENT_ORIGIN]` on the server side. Add the
@@ -321,6 +328,64 @@ services:
       TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
       TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
       TURNSTILE_TRIGGER_THRESHOLD: ${TURNSTILE_TRIGGER_THRESHOLD:-}
+
+      # MAPPS-425 / PMS-748 / MAPPS-429: the emailed-link and email-branding
+      # trio. SPA_BASE_URL falls back to CLIENT_ORIGIN, so it only needs setting
+      # on a stack where the SPA is not the login origin; PUBLIC_API_BASE_URL is
+      # what makes the tenant logo in a request-form email an absolute src, and
+      # unset means the mail carries no logo at all.
+      SPA_BASE_URL: ${SPA_BASE_URL:-}
+      ABUSE_CONTACT_EMAIL: ${ABUSE_CONTACT_EMAIL:-}
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
+
+      # PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
+      # Empty falls back to the built-in dev value, which only development /
+      # dev / test accept (resolve_secret, PMS-499).
+      BUNYIP_WEBHOOK_SECRET: ${BUNYIP_WEBHOOK_SECRET:-}
+
+      # PMS-587 / PMS-809: empty means "use the built-in default" for the
+      # trusted-proxy ranges, and "exempt nothing" for the outbound SSRF guard.
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
+      OUTBOUND_PRIVATE_ALLOWLIST: ${OUTBOUND_PRIVATE_ALLOWLIST:-}
+
+      # PMS-657 / BUNYIP-475 / PMS-658: login-location enrichment and the
+      # notify-and-approve gate. All three are off when empty.
+      IP2LOCATION_DB_PATH: ${IP2LOCATION_DB_PATH:-}
+      IP2PROXY_DB_PATH: ${IP2PROXY_DB_PATH:-}
+      LOGIN_APPROVAL_ENABLED: ${LOGIN_APPROVAL_ENABLED:-}
+
+      # PMS-904: self-hosted (default) or saas. Empty means unset, which the
+      # code resolves to self-hosted, so the dev stack sends every email.
+      MOKOSH_DEPLOYMENT_MODE: ${MOKOSH_DEPLOYMENT_MODE:-}
+
+      # Upload root, shared by ticket attachments and tenant logos (which live
+      # in a `tenant-logos/` subdirectory of it). Defaulted to the `attachments`
+      # named volume below rather than the code's CWD-relative `./attachments`,
+      # so an uploaded logo survives `just dev` rebuilding the image.
+      ATTACHMENT_DIR: ${ATTACHMENT_DIR:-/data/attachments}
+      ATTACHMENT_MAX_BYTES: ${ATTACHMENT_MAX_BYTES:-}
+      # PMS-923: KB article images. Default reproduces the code's own 5 MiB.
+      KB_ATTACHMENT_MAX_BYTES: ${KB_ATTACHMENT_MAX_BYTES:-}
+      TENANT_LOGO_MAX_BYTES: ${TENANT_LOGO_MAX_BYTES:-}
+
+      # RS verifier knobs beyond the issuer/audience pair above; empty keeps the
+      # built-in 600s JWKS cache and 30s clock leeway. OIDC_DEFAULT_TENANT_ID is
+      # the shared landing tenant bunyip users JIT into (PMS-239).
+      OIDC_JWKS_CACHE_TTL_SECS: ${OIDC_JWKS_CACHE_TTL_SECS:-}
+      OIDC_LEEWAY_SECONDS: ${OIDC_LEEWAY_SECONDS:-}
+      OIDC_DEFAULT_TENANT_ID: ${OIDC_DEFAULT_TENANT_ID:-}
+
+      # Stripe REST base, overridable so a test can point checkout at a stub;
+      # empty uses https://api.stripe.com.
+      STRIPE_API_BASE: ${STRIPE_API_BASE:-}
+      # PayPal REST base, same purpose (PMS-969); empty uses PayPal's own hosts.
+      PAYPAL_API_BASE: ${PAYPAL_API_BASE:-}
+
+      # PMS-710 demo-data gate, the template tenant its rows are copied from,
+      # and the upstream version probe. All three are off/default when empty.
+      MOKOSH_DEMO_SEED: ${MOKOSH_DEMO_SEED:-}
+      MOKOSH_SEED_TENANT_ID: ${MOKOSH_SEED_TENANT_ID:-}
+      MOKOSH_UPDATE_CHECK_URL: ${MOKOSH_UPDATE_CHECK_URL:-}
 
       RUST_LOG: ${RUST_LOG:-info,mokosh_server=debug}
     networks:
@@ -373,15 +438,22 @@ services:
       # Postgres-backed run stays in `just test-integration`).
       - ./tests:/app/tests
       - server-target:/app/target
+      # PMS-836: uploads (ticket attachments and tenant logos) land under
+      # ATTACHMENT_DIR. Without this they live in the container filesystem and
+      # a rebuild loses them, so a dev tenant's logo disappears on the next
+      # `just dev`. Mount point must match the ATTACHMENT_DIR default above.
+      - attachments:/data/attachments
     depends_on:
       postgres:
         condition: service_healthy
-      # NB: no dependency on infisical. The mokosh-server binary never
-      # reads Infisical at startup (only the one-shot mokosh-bootstrap
-      # CLI does), and Infisical is now opt-in behind the `infisical`
-      # compose profile. A hard depends_on a profiled-out service makes
-      # compose reject the whole project ("depends on undefined service
-      # infisical") for every `just dev` / `just down`.
+      # NB: no dependency on infisical. The mokosh-server binary reads
+      # INFISICAL_ADDRESS (the readiness probe in src/api/router.rs pings
+      # it, and reports "skipped" when the address is blank), but it does
+      # not require Infisical to be up to boot, and Infisical is opt-in
+      # behind the `infisical` compose profile. A hard depends_on a
+      # profiled-out service makes compose reject the whole project
+      # ("depends on undefined service infisical") for every
+      # `just dev` / `just down`.
       mailpit:
         # No healthcheck on mailpit; it accepts SMTP from cold start.
         # Wait for the container to be running, not healthy.
@@ -394,6 +466,8 @@ volumes:
     name: dev-mokosh-postgres-data-${USER:?USER missing - run via just dev}
   server-target:
     name: dev-mokosh-server-target-${USER:?USER missing - run via just dev}
+  attachments:
+    name: dev-mokosh-attachments-${USER:?USER missing - run via just dev}
 
 networks:
   private:

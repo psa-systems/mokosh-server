@@ -7,10 +7,128 @@ use axum::{
 };
 use std::sync::Arc;
 
-use super::oidc_rs::Verifier as BunyipVerifier;
-use super::service::{is_unresolved_placeholder_email, UNRESOLVED_EMAIL_DOMAIN};
+use super::oidc_rs::{Verifier as BunyipVerifier, VerifyError};
+use super::service::{is_unresolved_placeholder_email, BunyipPrincipal, UNRESOLVED_EMAIL_DOMAIN};
 use super::{AuthService, AuthState, CurrentUser, UserRole};
 use crate::utils::error::AppError;
+
+/// PMS-769: what happened to the `Authorization: Bearer` credential on this
+/// request. Recorded on the request extensions by [`auth_middleware`] (and by
+/// the portal middleware) so the extractors can render the RFC 6750
+/// `WWW-Authenticate` challenge that matches the actual failure instead of a
+/// single opaque 401.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BearerOutcome {
+    /// No `Authorization: Bearer` header was presented.
+    #[default]
+    Absent,
+    /// A bearer was presented and accepted by one of the auth paths.
+    Accepted,
+    /// A bearer was presented and rejected because it had expired.
+    Expired,
+    /// A bearer was presented and rejected for any other reason (bad
+    /// signature, wrong audience, unknown kid, unusable principal, ...).
+    Rejected,
+}
+
+impl BearerOutcome {
+    /// Classify a bunyip verification failure. Only `Expired` is singled out;
+    /// every other variant is an ordinary `invalid_token` rejection as far as
+    /// RFC 6750 section 3.1 is concerned.
+    fn from_verify_error(error: &VerifyError) -> Self {
+        match error {
+            VerifyError::Expired => Self::Expired,
+            _ => Self::Rejected,
+        }
+    }
+
+    /// The `WWW-Authenticate` value a 401 for this outcome must carry
+    /// (RFC 6750 section 3).
+    fn challenge(self) -> &'static str {
+        match self {
+            Self::Expired => {
+                r#"Bearer error="invalid_token", error_description="The access token expired""#
+            }
+            Self::Rejected => r#"Bearer error="invalid_token""#,
+            // No credential was presented (or one was accepted and the 401
+            // came from somewhere else): the bare challenge just names the
+            // scheme the resource server expects.
+            Self::Absent | Self::Accepted => "Bearer",
+        }
+    }
+}
+
+/// PMS-769: extractor rejection for the credential gates. Renders exactly the
+/// same `AppError` envelope as before and adds the RFC 6750 challenge when the
+/// 401 actually concerns a bearer credential. Kept out of
+/// `impl IntoResponse for AppError` on purpose: the webhook HMAC gates and the
+/// portal password checks also return `AppError::Unauthorized` and must stay
+/// challenge-free.
+#[derive(Debug)]
+pub struct AuthRejection {
+    error: AppError,
+    challenge: Option<&'static str>,
+}
+
+impl AuthRejection {
+    /// A 401 raised by a credential gate: carries the challenge for `outcome`.
+    pub(crate) fn challenged(error: AppError, outcome: BearerOutcome) -> Self {
+        Self {
+            error,
+            challenge: Some(outcome.challenge()),
+        }
+    }
+}
+
+impl From<AppError> for AuthRejection {
+    /// Errors an extractor raises *after* the credential resolved (403
+    /// Forbidden, the 404 module gate, the 500 wiring bug) never concern a
+    /// bearer, so they render unchanged with no challenge. This also carries
+    /// the `?` conversions inside the extractor bodies.
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            challenge: None,
+        }
+    }
+}
+
+impl From<AuthRejection> for AppError {
+    /// Reverse conversion so extractors whose own `Rejection` is
+    /// `AppError` can use `?` on a call that returns `AuthRejection`
+    /// (e.g. `RequireAuth::from_request_parts`). The RFC 6750
+    /// challenge is dropped, which is correct: an extractor whose
+    /// rejection is `AppError` never attaches a challenge anyway,
+    /// so the response shape is identical to the direct-`AppError`
+    /// path it was already using before the merge.
+    fn from(rejection: AuthRejection) -> Self {
+        rejection.error
+    }
+}
+
+impl axum::response::IntoResponse for AuthRejection {
+    fn into_response(self) -> Response {
+        let mut response = self.error.into_response();
+        if let Some(challenge) = self.challenge {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static(challenge),
+            );
+        }
+        response
+    }
+}
+
+/// Read the bearer outcome the middleware recorded. Defaults to `Absent`, so a
+/// route somehow mounted without the middleware still answers a bare `Bearer`
+/// challenge rather than claiming a credential was rejected.
+pub(crate) fn bearer_outcome(parts: &axum::http::request::Parts) -> BearerOutcome {
+    parts
+        .extensions
+        .get::<BearerOutcome>()
+        .copied()
+        .unwrap_or_default()
+}
 
 /// Extension to hold the current auth state
 #[derive(Clone)]
@@ -142,8 +260,13 @@ pub async fn auth_middleware(
     // 403 + copy instead of a generic 401 the AuthGuard reads as
     // "session expired" and loops on.
     let mut principal_rejection: Option<AppError> = None;
+    // PMS-769: which bearer outcome the extractors should challenge on.
+    let mut outcome = BearerOutcome::Absent;
     let auth_state = match bearer(&request) {
         Some(token) => {
+            // A credential was presented; assume it is rejected until a path
+            // accepts it (settled after both branches have run).
+            outcome = BearerOutcome::Rejected;
             // 1. Bunyip-as-OP Resource-Server path (new). Tokens minted by
             //    bunyip-api carry typ=at+jwt + iss=bunyip's OIDC_ISSUER.
             let from_bunyip = match auth_middleware.bunyip.as_ref() {
@@ -164,7 +287,25 @@ pub async fn auth_middleware(
                         }
                         state
                     }
-                    Err(_) => None,
+                    // PMS-769: this error used to be dropped on the floor, so
+                    // an expired token, a wrong-audience token, a forged
+                    // signature and a JWKS outage were indistinguishable in
+                    // the log (they all ended as a bare 401). Control flow is
+                    // unchanged - `None` still falls through to the legacy
+                    // branch below - but the cause is now recorded. A routine
+                    // expiry stays at `debug` so a junk-token spray cannot
+                    // flood the warn stream; everything else is `warn`,
+                    // because a misconfiguration or a JWKS outage must be
+                    // loud.
+                    Err(e) => {
+                        outcome = BearerOutcome::from_verify_error(&e);
+                        if outcome == BearerOutcome::Expired {
+                            tracing::debug!(error = %e, "bunyip bearer rejected");
+                        } else {
+                            tracing::warn!(error = %e, "bunyip bearer rejected");
+                        }
+                        None
+                    }
                 },
                 None => None,
             };
@@ -198,7 +339,9 @@ pub async fn auth_middleware(
                         mid_hint = claims.mid;
                         match auth_middleware
                             .auth_service
-                            .ensure_user_and_tenant_active(claims.tid, claims.sub, claims.iat)
+                            .ensure_user_and_tenant_active(
+                                claims.tid, claims.sub, claims.iat, claims.sid,
+                            )
                             .await
                         {
                             // PMS-681: ensure_user_and_tenant_active returns the
@@ -206,12 +349,20 @@ pub async fn auth_middleware(
                             Ok(user) => {
                                 AuthState::authenticated(user.to_current_user(), claims.tid)
                             }
+                            // PMS-769: the cause (deactivated user, suspended
+                            // tenant, post-password-change `iat`, MAPPS-531
+                            // signed-out session) is logged rather than
+                            // discarded, so a support report of "it just 401s"
+                            // has server-side evidence. `debug`, not `warn`:
+                            // every one of these is an expected revocation,
+                            // and the 401 itself is the loud part. The reason
+                            // is ALSO captured so the outer function can
+                            // return the AppError's own response (e.g. 403
+                            // "This organization is not active") instead of
+                            // dropping to a generic 401 the SPA reads as
+                            // "session expired" and loops on.
                             Err(e) => {
-                                // Capture the reason so the outer function can
-                                // return the AppError's own response (e.g. 403
-                                // "This organization is not active") instead of
-                                // dropping to a generic 401 the SPA reads as
-                                // "session expired" and loops on.
+                                tracing::debug!(error = %e, user = %claims.sub, "legacy bearer principal rejected");
                                 if principal_rejection.is_none() {
                                     principal_rejection = Some(e);
                                 }
@@ -219,7 +370,18 @@ pub async fn auth_middleware(
                             }
                         }
                     }
-                    _ => AuthState::default(),
+                    // A decoded token with the wrong `typ` (e.g. a refresh
+                    // token used as a Bearer).
+                    Ok(claims) => {
+                        tracing::debug!(typ = %claims.typ, "legacy bearer is not an access token");
+                        AuthState::default()
+                    }
+                    // Suppressed deliberately: `decode_token`'s error is
+                    // already logged with its cause by
+                    // `From<jsonwebtoken::errors::Error> for AppError`, and
+                    // every bunyip at+jwt reaching this fallback trips it, so
+                    // re-logging here would only double the line.
+                    Err(_) => AuthState::default(),
                 }
             }
         }
@@ -267,7 +429,11 @@ pub async fn auth_middleware(
         enrich_auth_state_with_identity(&auth_middleware.auth_service, auth_state, mid_hint).await;
 
     // Insert auth state into request extensions
+    if auth_state.is_authenticated {
+        outcome = BearerOutcome::Accepted;
+    }
     request.extensions_mut().insert(auth_state);
+    request.extensions_mut().insert(outcome);
 
     next.run(request).await
 }
@@ -286,11 +452,25 @@ fn bearer(req: &Request) -> Option<&str> {
 /// circuit BEFORE the generic 401 path, so the SPA sees 410 Gone
 /// (`ACCOUNT_DELETED`) and can render the terminal modal instead of
 /// falling into its 401-refresh-and-retry loop.
-fn user_or_auth_error(auth_state: &AuthState) -> Result<CurrentUser, AppError> {
+///
+/// PMS-769: when the request does end at a 401, `outcome` decides both the
+/// error code (`TOKEN_EXPIRED` for a presented-but-expired bearer, else
+/// `UNAUTHORIZED`) and the RFC 6750 challenge attached to the response.
+fn user_or_auth_error(
+    auth_state: &AuthState,
+    outcome: BearerOutcome,
+) -> Result<CurrentUser, AuthRejection> {
     if auth_state.deleted {
-        return Err(AppError::AccountDeleted);
+        // 410 Gone, and no challenge: the credential itself verified fine.
+        return Err(AppError::AccountDeleted.into());
     }
-    auth_state.user.clone().ok_or(AppError::Unauthorized)
+    match auth_state.user.clone() {
+        Some(user) => Ok(user),
+        None if outcome == BearerOutcome::Expired => {
+            Err(AuthRejection::challenged(AppError::TokenExpired, outcome))
+        }
+        None => Err(AuthRejection::challenged(AppError::Unauthorized, outcome)),
+    }
 }
 
 /// Extractor for requiring authentication
@@ -301,7 +481,7 @@ impl<S> axum::extract::FromRequestParts<S> for RequireAuth
 where
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -313,7 +493,10 @@ where
             .cloned()
             .unwrap_or_default();
 
-        Ok(RequireAuth(user_or_auth_error(&auth_state)?))
+        Ok(RequireAuth(user_or_auth_error(
+            &auth_state,
+            bearer_outcome(parts),
+        )?))
     }
 }
 
@@ -342,7 +525,7 @@ where
             .unwrap_or_default();
         // Reuse the RequireAuth gate: if the state isn't authenticated
         // (or is tombstoned), map to the same 401 / 410.
-        user_or_auth_error(&auth_state)?;
+        user_or_auth_error(&auth_state, bearer_outcome(parts))?;
         Ok(RequireAuthState(auth_state))
     }
 }
@@ -379,7 +562,7 @@ impl<S> axum::extract::FromRequestParts<S> for TenantScope
 where
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -391,7 +574,7 @@ where
             .cloned()
             .unwrap_or_default();
 
-        let user = user_or_auth_error(&auth_state)?;
+        let user = user_or_auth_error(&auth_state, bearer_outcome(parts))?;
         Ok(TenantScope {
             tenant_id: super::tenant::TenantScoped::tenant(&user),
             user,
@@ -413,7 +596,7 @@ where
     S: Send + Sync,
     R: RoleRequirement,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -425,12 +608,12 @@ where
             .cloned()
             .unwrap_or_default();
 
-        let user = user_or_auth_error(&auth_state)?;
+        let user = user_or_auth_error(&auth_state, bearer_outcome(parts))?;
         let user_role = user.role.as_str();
         if R::allowed_roles().contains(&user_role) {
             Ok(RequireRole(user, std::marker::PhantomData))
         } else {
-            Err(AppError::Forbidden("Insufficient permissions".to_string()))
+            Err(AppError::Forbidden("You do not have permission to do that".to_string()).into())
         }
     }
 }
@@ -455,7 +638,7 @@ impl<S> axum::extract::FromRequestParts<S> for RequireAdminUser
 where
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -511,6 +694,9 @@ pub type RequireFinance = RequireRole<FinanceRoles>;
 /// The blanket `FromRequestParts` below does the DB lookup.
 pub trait ModuleGate: Send + Sync + 'static {
     const NAME: &'static str;
+    /// Human noun for the 404 message. `NAME` is the `module_config` key
+    /// (`rmm_integration`), which must not reach a user (PMS-775).
+    const LABEL: &'static str;
 }
 
 /// Extractor that authenticates the caller AND verifies their tenant
@@ -527,7 +713,8 @@ pub trait ModuleGate: Send + Sync + 'static {
 /// `notifications`, and portal authentication keep working regardless
 /// of `module_config.is_enabled`. The gateable taxonomy is
 /// `billing`, `projects`, `calendar`, `contracts`, `assets`,
-/// `knowledge_base`, `rmm_integration`, `reports`, `time_tracking`.
+/// `knowledge_base`, `rmm_integration`, `reports`, `time_tracking`,
+/// `timesheets`.
 ///
 /// The extractor reads an `Arc<SettingsService>` from the request's
 /// extensions; `create_api_router` adds it via `.layer(Extension(...))`.
@@ -541,7 +728,7 @@ impl<G: ModuleGate, S> axum::extract::FromRequestParts<S> for RequireModuleEnabl
 where
     S: Send + Sync,
 {
-    type Rejection = AppError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
@@ -556,7 +743,7 @@ where
             .get::<AuthState>()
             .cloned()
             .unwrap_or_default();
-        let user = user_or_auth_error(&auth_state)?;
+        let user = user_or_auth_error(&auth_state, bearer_outcome(parts))?;
 
         // Read the SettingsService from request extensions. Wired in
         // via `.layer(Extension(settings_service))` on the API v1
@@ -577,7 +764,7 @@ where
             .is_module_enabled(super::tenant::TenantScoped::tenant(&user), G::NAME)
             .await?;
         if !enabled {
-            return Err(AppError::NotFound(format!("module {}", G::NAME)));
+            return Err(AppError::NotFound(format!("{} module", G::LABEL)).into());
         }
         Ok(Self {
             user,
@@ -590,24 +777,46 @@ where
 /// `ModuleGate` on it, and exposes a `RequireFoo` type alias for the
 /// extractor.
 macro_rules! gated_module {
-    ($struct_name:ident, $module_name:expr, $alias:ident) => {
+    ($struct_name:ident, $module_name:expr, $label:expr, $alias:ident) => {
         pub struct $struct_name;
         impl ModuleGate for $struct_name {
             const NAME: &'static str = $module_name;
+            const LABEL: &'static str = $label;
         }
         pub type $alias = RequireModuleEnabled<$struct_name>;
     };
 }
 
-gated_module!(BillingModule, "billing", RequireBilling);
-gated_module!(ProjectsModule, "projects", RequireProjects);
-gated_module!(CalendarModule, "calendar", RequireCalendar);
-gated_module!(ContractsModule, "contracts", RequireContracts);
-gated_module!(AssetsModule, "assets", RequireAssets);
-gated_module!(KnowledgeBaseModule, "knowledge_base", RequireKnowledgeBase);
-gated_module!(RmmModule, "rmm_integration", RequireRmm);
-gated_module!(ReportsModule, "reports", RequireReports);
-gated_module!(TimeTrackingModule, "time_tracking", RequireTimeTracking);
+gated_module!(BillingModule, "billing", "Billing", RequireBilling);
+gated_module!(ProjectsModule, "projects", "Projects", RequireProjects);
+gated_module!(CalendarModule, "calendar", "Calendar", RequireCalendar);
+gated_module!(ContractsModule, "contracts", "Contracts", RequireContracts);
+gated_module!(AssetsModule, "assets", "Assets", RequireAssets);
+gated_module!(
+    KnowledgeBaseModule,
+    "knowledge_base",
+    "Knowledge base",
+    RequireKnowledgeBase
+);
+gated_module!(RmmModule, "rmm_integration", "RMM integration", RequireRmm);
+gated_module!(ReportsModule, "reports", "Reports", RequireReports);
+gated_module!(
+    TimeTrackingModule,
+    "time_tracking",
+    "Time tracking",
+    RequireTimeTracking
+);
+// PMS-943: timesheets are separate from `time_tracking` on purpose. Logging
+// time is not the same feature as submitting a week of it for approval: a
+// one-person MSP still logs and still bills, it just has nobody to submit to.
+// The timesheet routes carry BOTH gates, so turning time tracking off still
+// takes the timesheets with it.
+gated_module!(
+    TimesheetsModule,
+    "timesheets",
+    "Timesheets",
+    RequireTimesheets
+);
 
 // ── Bunyip RS helper ─────────────────────────────────────────────────────────
 
@@ -656,49 +865,58 @@ async fn ensure_user_from_bunyip(
     // invite needs none of it: `place_bunyip_user` resolves them from local state
     // with `None` email/name, still running the PMS-698 principal gate and the
     // role reconcile. Skip the hop for that (overwhelmingly common) case.
+    //
+    // PMS-777: the decision below is made from local state, and that state is
+    // exactly what `place_bunyip_user` needs next. Carry it across instead of
+    // re-reading it (the skip path used to read `users` twice and
+    // `tenant_invitations` once, then throw all three results away).
     let (email, email_verified, given_name, family_name) =
-        if bunyip_userinfo_needed(auth_service, invitations, sub).await {
-            let info = verifier.userinfo(bearer).await;
-            // MAPPS-335: bind the userinfo response to the verified at+jwt by
-            // asserting `info.sub == claims.sub` before reading any other field.
-            // Without this guard a misbehaving / compromised /oauth2/userinfo
-            // response (load-balancing bug at the OP, attacker-influenced
-            // response, etc.) injects ANOTHER user's `email` / `email_verified` /
-            // `given_name` / `family_name` into the JIT row keyed on `claims.sub`.
-            // The at+jwt's signature is already validated; sub is the canonical
-            // join key. Drop the userinfo response (treat as unverified email + no
-            // name hints) on mismatch so we never JIT a wrong-identity row, but
-            // keep the request alive so a transient OP glitch does not 401 the
-            // user across the whole site.
-            let info = info.filter(|i| {
-                if i.sub == claims.sub {
-                    true
-                } else {
-                    tracing::warn!(
-                        claims_sub = %claims.sub,
-                        userinfo_sub = %i.sub,
-                        "userinfo sub does not match at+jwt sub; dropping userinfo claims"
-                    );
-                    false
-                }
-            });
-            let email = info.as_ref().and_then(|i| i.email.clone());
-            let email_verified = info
-                .as_ref()
-                .and_then(|i| i.email_verified)
-                .unwrap_or(false);
-            // BUNYIP-141: standard profile claims off the same userinfo round-trip.
-            // Bunyip emits them only when the at+jwt's scope set covers `profile`
-            // AND the bunyip-side column is non-NULL (BUNYIP-140); absent here
-            // means either "scope not requested" or "user has not filled it in",
-            // in both cases the JIT path falls back to `synthetic_name_from_email`.
-            let given_name = info.as_ref().and_then(|i| i.given_name.clone());
-            let family_name = info.as_ref().and_then(|i| i.family_name.clone());
-            (email, email_verified, given_name, family_name)
-        } else {
-            // Fast path: skip the network round-trip. `place_bunyip_user` resolves
-            // the existing, placed user entirely from local state.
-            (None, false, None, None)
+        match place_bunyip_user_from_local_state(auth_service, tenants, invitations, sub, claims)
+            .await
+        {
+            LocalPlacement::Placed(state) => return (*state, None),
+            LocalPlacement::UserinfoNeeded => {
+                let info = verifier.userinfo(bearer).await;
+                // MAPPS-335: bind the userinfo response to the verified at+jwt by
+                // asserting `info.sub == claims.sub` before reading any other field.
+                // Without this guard a misbehaving / compromised /oauth2/userinfo
+                // response (load-balancing bug at the OP, attacker-influenced
+                // response, etc.) injects ANOTHER user's `email` / `email_verified` /
+                // `given_name` / `family_name` into the JIT row keyed on `claims.sub`.
+                // The at+jwt's signature is already validated; sub is the canonical
+                // join key. Drop the userinfo response (treat as unverified email + no
+                // name hints) on mismatch so we never JIT a wrong-identity row, but
+                // keep the request alive so a transient OP glitch does not 401 the
+                // user across the whole site.
+                let info = info.filter(|i| {
+                    if i.sub == claims.sub {
+                        true
+                    } else {
+                        tracing::warn!(
+                            claims_sub = %claims.sub,
+                            userinfo_sub = %i.sub,
+                            "userinfo sub does not match at+jwt sub; dropping userinfo claims"
+                        );
+                        false
+                    }
+                });
+                let email = info.as_ref().and_then(|i| i.email.clone());
+                let email_verified = info
+                    .as_ref()
+                    .and_then(|i| i.email_verified)
+                    .unwrap_or(false);
+                // BUNYIP-141: standard profile claims off the same userinfo round-trip.
+                // Bunyip emits them only when the at+jwt's scope set covers `profile`
+                // AND the bunyip-side column is non-NULL (BUNYIP-140); absent here
+                // means either "scope not requested" or "user has not filled it in",
+                // in both cases the JIT path falls back to `synthetic_name_from_email`.
+                let given_name = info.as_ref().and_then(|i| i.given_name.clone());
+                let family_name = info.as_ref().and_then(|i| i.family_name.clone());
+                // Nothing is carried across on this branch: the userinfo
+                // response can change the placement answer, so the full path
+                // re-resolves from scratch exactly as it always did.
+                (email, email_verified, given_name, family_name)
+            }
         };
 
     place_bunyip_user_with_rejection(
@@ -715,54 +933,141 @@ async fn ensure_user_from_bunyip(
     .await
 }
 
+/// PMS-777: how far [`place_bunyip_user_from_local_state`] got.
+pub enum LocalPlacement {
+    /// Local state was enough: the caller is placed (or rejected by the
+    /// PMS-698 principal gate) with no `/oauth2/userinfo` hop. Boxed so the
+    /// `AuthState` (which carries a whole `CurrentUser`) does not set the size
+    /// of the empty `UserinfoNeeded` variant.
+    Placed(Box<Option<AuthState>>),
+    /// Local state was not enough - a first-sight user, a user stuck in the
+    /// legacy default tenant, a placeholder email, or a waiting invite - so the
+    /// caller must fetch `/oauth2/userinfo` and run the full path.
+    UserinfoNeeded,
+}
+
+/// PMS-777: the whole userinfo-free request path, in two statements.
+///
+/// `resolve_bunyip_caller` reads the caller's `users` row and the waiting-invite
+/// flag in one statement, and hands that row straight to `place_bunyip_caller`,
+/// which used to re-read both. The only other statement left is the PMS-698
+/// principal gate's tenant-status check, which is security-relevant and
+/// deliberately still runs on every request.
+///
+/// Public because it is the branch production takes for an already-provisioned
+/// caller, and the query-budget regression test
+/// (`tests/bunyip_query_budget.rs`) asserts its cost directly.
+pub async fn place_bunyip_user_from_local_state(
+    auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+    claims: &super::oidc_rs::AtClaims,
+) -> LocalPlacement {
+    let principal = match resolve_bunyip_caller(auth_service, invitations, sub).await {
+        UserinfoDecision::Needed => return LocalPlacement::UserinfoNeeded,
+        UserinfoDecision::Skip(principal) => *principal,
+    };
+    LocalPlacement::Placed(Box::new(
+        place_bunyip_caller(
+            auth_service,
+            tenants,
+            invitations,
+            sub,
+            // No userinfo, so no email / name hints: the placement, the
+            // placeholder repair and the name refresh all no-op, and the row
+            // comes from `principal`.
+            None,
+            false,
+            None,
+            None,
+            claims,
+            Some(principal),
+        )
+        .await
+        .0,
+    ))
+}
+
+/// PMS-777: what `resolve_bunyip_caller` decided, and the state it read to
+/// decide it. `Skip` carries the caller forward so `place_bunyip_caller` does
+/// not read the same rows again.
+enum UserinfoDecision {
+    Needed,
+    // Boxed: the principal carries a whole `User`, and `Needed` (the rarer but
+    // still routine variant) would otherwise pay for it on every request.
+    Skip(Box<BunyipPrincipal>),
+}
+
 /// Whether the Bunyip RS path must fetch `/oauth2/userinfo` for this request
 /// (PMS-713). userinfo is a per-request network hop to Bunyip; it is only needed
 /// to JIT-provision a first-sight user, back-fill a user stuck in the legacy
 /// default tenant, or match a pending invite - all of which key on the IdP
 /// email/name. An already-provisioned user placed in a real tenant with no
 /// pending invite needs none of it and is resolved from local state, so the hop
-/// is skipped for that (overwhelmingly common) case. Every check here is a local
-/// DB read - cheap next to the network round-trip it avoids.
+/// is skipped for that (overwhelmingly common) case. PMS-777: every check runs
+/// off one local `users` read - cheap next to the round-trip it avoids.
 pub async fn bunyip_userinfo_needed(
     auth_service: &Arc<AuthService>,
     invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
     sub: uuid::Uuid,
 ) -> bool {
-    // First sight: no local placement yet, so the user must be JIT-provisioned
-    // (needs email + name from userinfo).
-    let Some((tenant, role)) = auth_service.find_user_placement(sub).await.ok().flatten() else {
-        return true;
+    matches!(
+        resolve_bunyip_caller(auth_service, invitations, sub).await,
+        UserinfoDecision::Needed
+    )
+}
+
+/// The decision above, plus the state it was made from (PMS-777).
+///
+/// One statement, one pool checkout: [`AuthService::find_bunyip_principal`]
+/// reads the caller's `users` row and the "is an invite waiting" flag together.
+/// Everything after that is a pure function of that row, so a `Skip` hands the
+/// row straight to [`place_bunyip_caller`] rather than making it re-read.
+async fn resolve_bunyip_caller(
+    auth_service: &Arc<AuthService>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+) -> UserinfoDecision {
+    // First sight: no local row yet, so the user must be JIT-provisioned (needs
+    // email + name from userinfo). A read error reads the same way it did when
+    // this was `find_user_placement(..).ok().flatten()`: no placement, so the
+    // full path runs and re-reads.
+    let principal = match auth_service.find_bunyip_principal(sub).await {
+        Ok(Some(principal)) => principal,
+        Ok(None) => return UserinfoDecision::Needed,
+        Err(e) => {
+            tracing::warn!(error = %e, sub = %sub, "bunyip principal lookup failed");
+            return UserinfoDecision::Needed;
+        }
     };
+    let (tenant, role) = &principal.placement;
     // Stuck in the legacy default tenant: PMS-245 re-homes them to their own
     // personal tenant via the full placement path.
-    if is_stuck_in_default(Some(tenant), default_bunyip_tenant_id(), &role, false) {
-        return true;
+    if is_stuck_in_default(Some(*tenant), default_bunyip_tenant_id(), role, false) {
+        return UserinfoDecision::Needed;
     }
-    let Ok(user) = auth_service.get_user_by_id(tenant, sub).await else {
-        return false;
-    };
     // PMS-635: the row still carries the `{sub}@unresolved.invalid` JIT
     // placeholder, so it holds no usable address (every mokosh email to it
     // bounces) and no invite can ever match it. Only userinfo can tell us
     // whether bunyip has since verified the address, so keep fetching it until
     // the row is repaired. This costs the PMS-713 hop for as long as the user
     // stays unverified, which is a bounded, self-clearing state.
-    if is_unresolved_placeholder_email(&user.email) {
-        return true;
+    if is_unresolved_placeholder_email(&principal.user.email) {
+        return UserinfoDecision::Needed;
     }
     // A pending invite for the user's verified email re-homes them, so the full
     // path must run. Match on the user's LOCAL verified email (no userinfo): a
     // JIT row carries a verified email only when the IdP reported it verified,
     // which is exactly the condition the invite-consumption path already requires
     // (place_bunyip_user gates the invite match on `email_verified`).
-    if let Some(invs) = invitations {
-        if user.email_verified_at.is_some()
-            && matches!(invs.newest_pending_for(&user.email).await, Ok(Some(_)))
-        {
-            return true;
-        }
+    // `has_pending_invite` already encodes the `email_verified_at IS NOT NULL`
+    // half of that gate. The `invitations` check stays because a wiring without
+    // the service handles no invites at all, and must not start now.
+    if invitations.is_some() && principal.has_pending_invite {
+        return UserinfoDecision::Needed;
     }
-    false
+    UserinfoDecision::Skip(Box::new(principal))
 }
 
 /// PMS-249: the testable core of the bunyip login path. Given the verified
@@ -826,7 +1131,44 @@ pub async fn place_bunyip_user_with_rejection(
     family_name: Option<String>,
     claims: &super::oidc_rs::AtClaims,
 ) -> (Option<AuthState>, Option<AppError>) {
-    let placement = auth_service.find_user_placement(sub).await.ok().flatten();
+    place_bunyip_caller(
+        auth_service,
+        tenants,
+        invitations,
+        sub,
+        email,
+        email_verified,
+        given_name,
+        family_name,
+        claims,
+        None,
+    )
+    .await
+}
+
+/// [`place_bunyip_user`] with the PMS-777 fast path: `resolved` is the caller
+/// `resolve_bunyip_caller` already read this request. When it is `Some` and
+/// the user turns out to stay in the tenant they are already in, the placement
+/// and the user row are taken from it instead of being read again. `None`
+/// (every test call site, and the userinfo branch) resolves from the database
+/// exactly as before.
+#[allow(clippy::too_many_arguments)]
+async fn place_bunyip_caller(
+    auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+    email: Option<String>,
+    email_verified: bool,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    claims: &super::oidc_rs::AtClaims,
+    resolved: Option<BunyipPrincipal>,
+) -> (Option<AuthState>, Option<AppError>) {
+    let placement = match resolved.as_ref() {
+        Some(principal) => Some(principal.placement.clone()),
+        None => auth_service.find_user_placement(sub).await.ok().flatten(),
+    };
     let current = placement.as_ref().map(|(t, _)| *t);
 
     // An invite to address X is consumed only by a Bunyip user with verified X.
@@ -937,43 +1279,52 @@ pub async fn place_bunyip_user_with_rejection(
         .as_ref()
         .and_then(|i| UserRole::from_str(&i.role))
         .unwrap_or(UserRole::Admin);
-    let mut user = match auth_service.get_user_by_id(target, sub).await {
-        Ok(user) => user,
-        Err(_) => {
-            // Persist the IdP-supplied email on the JIT insert ONLY when the
-            // IdP reports it verified, matching the Google path.
-            // `upsert_user_from_oidc` (MAPPS-335) now binds
-            // `email_verified_at` to the actual `email_verified` flag, so
-            // an unverified address lands with NULL instead of NOW();
-            // writing the placeholder under `sub@unresolved.invalid` keeps
-            // the auto-link/capture path against the real owner closed.
-            let email_for_insert = match (email.clone(), email_verified) {
-                (Some(em), true) => em,
-                _ => format!("{sub}@{UNRESOLVED_EMAIL_DOMAIN}"),
-            };
-            // BUNYIP-141: hand the userinfo profile claims to the JIT path
-            // so a bunyip-provisioned user lands with their real name on
-            // first sight. Both are Option<String>; None falls back to
-            // `synthetic_name_from_email` inside the service.
-            match auth_service
-                .upsert_user_from_oidc(
-                    sub,
-                    target,
-                    &email_for_insert,
-                    initial_role,
-                    given_name.as_deref(),
-                    family_name.as_deref(),
-                    email_verified,
-                )
-                .await
-            {
-                Ok(u) => u,
-                Err(e) => {
-                    tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed");
-                    return (None, None);
+    // PMS-777: the pre-resolved row is only usable when the user did not move
+    // (no invite, no backfill); a re-home means the row must be re-read from
+    // the tenant it landed in.
+    let already_loaded = resolved
+        .map(|principal| principal.user)
+        .filter(|user| user.tenant_id == target);
+    let mut user = match already_loaded {
+        Some(user) => user,
+        None => match auth_service.get_user_by_id(target, sub).await {
+            Ok(user) => user,
+            Err(_) => {
+                // Persist the IdP-supplied email on the JIT insert ONLY when
+                // the IdP reports it verified.
+                // `upsert_user_from_oidc` (MAPPS-335) now binds
+                // `email_verified_at` to the actual `email_verified` flag, so
+                // an unverified address lands with NULL instead of NOW();
+                // writing the placeholder under `sub@unresolved.invalid` keeps
+                // the auto-link/capture path against the real owner closed.
+                let email_for_insert = match (email.clone(), email_verified) {
+                    (Some(em), true) => em,
+                    _ => format!("{sub}@{UNRESOLVED_EMAIL_DOMAIN}"),
+                };
+                // BUNYIP-141: hand the userinfo profile claims to the JIT path
+                // so a bunyip-provisioned user lands with their real name on
+                // first sight. Both are Option<String>; None falls back to
+                // `synthetic_name_from_email` inside the service.
+                match auth_service
+                    .upsert_user_from_oidc(
+                        sub,
+                        target,
+                        &email_for_insert,
+                        initial_role,
+                        given_name.as_deref(),
+                        family_name.as_deref(),
+                        email_verified,
+                    )
+                    .await
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed");
+                        return (None, None);
+                    }
                 }
             }
-        }
+        },
     };
 
     // PMS-635: heal a row still holding the `{sub}@unresolved.invalid`
@@ -1023,7 +1374,11 @@ pub async fn place_bunyip_user_with_rejection(
             .await
         {
             Ok(refreshed) => user = refreshed,
-            Err(e) => tracing::warn!(error = %e, sub = %sub, "profile name refresh failed"),
+            // PMS-787: best-effort cosmetic name sync. A failure leaves the
+            // request unaffected (the user keeps its stored name), and a real DB
+            // fault surfaces loudly on the login's own queries, so this is a
+            // debug diagnostic rather than a warn on every successful login.
+            Err(e) => tracing::debug!(error = %e, sub = %sub, "profile name refresh failed"),
         }
     }
 
@@ -1186,10 +1541,31 @@ fn is_stuck_in_default(
 mod tests {
     use super::{
         default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default,
-        user_or_auth_error, AuthState, CurrentUser, UserRole,
+        user_or_auth_error, AuthRejection, AuthState, BearerOutcome, CurrentUser, UserRole,
+        VerifyError,
     };
     use crate::utils::error::AppError;
+    use axum::response::IntoResponse;
     use uuid::Uuid;
+
+    /// Render a rejection and return `(status, WWW-Authenticate, error code)`.
+    async fn rendered(rejection: AuthRejection) -> (u16, Option<String>, String) {
+        let response = rejection.into_response();
+        let status = response.status().as_u16();
+        let challenge = response
+            .headers()
+            .get("www-authenticate")
+            .map(|v| v.to_str().expect("ascii challenge").to_string());
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let envelope: serde_json::Value = serde_json::from_slice(&body).expect("json envelope");
+        let code = envelope["error"]["code"]
+            .as_str()
+            .expect("error code")
+            .to_string();
+        (status, challenge, code)
+    }
 
     fn stub_user() -> CurrentUser {
         CurrentUser {
@@ -1216,10 +1592,22 @@ mod tests {
         // short-circuit to `AccountDeleted` (410 Gone) instead of falling
         // through to the generic `Unauthorized` (401). Pins the ordering the
         // SPA relies on to distinguish "account gone" from "session expired".
+        // PMS-769: still true for an EXPIRED bearer, which now has its own
+        // error - the 410 keeps precedence over both TokenExpired and
+        // Unauthorized, and carries no bearer challenge.
         let deleted = AuthState::deleted();
-        match user_or_auth_error(&deleted) {
-            Err(AppError::AccountDeleted) => {}
-            other => panic!("expected AccountDeleted, got {other:?}"),
+        for outcome in [
+            BearerOutcome::Absent,
+            BearerOutcome::Expired,
+            BearerOutcome::Rejected,
+        ] {
+            match user_or_auth_error(&deleted, outcome) {
+                Err(AuthRejection {
+                    error: AppError::AccountDeleted,
+                    challenge: None,
+                }) => {}
+                other => panic!("expected unchallenged AccountDeleted, got {other:?}"),
+            }
         }
     }
 
@@ -1228,8 +1616,11 @@ mod tests {
         // Default AuthState (no bearer, malformed token, verified-but-missing
         // sub) keeps the pre-348 behaviour: plain 401.
         let empty = AuthState::default();
-        match user_or_auth_error(&empty) {
-            Err(AppError::Unauthorized) => {}
+        match user_or_auth_error(&empty, BearerOutcome::Absent) {
+            Err(AuthRejection {
+                error: AppError::Unauthorized,
+                ..
+            }) => {}
             other => panic!("expected Unauthorized, got {other:?}"),
         }
     }
@@ -1240,8 +1631,138 @@ mod tests {
         // and no error path fires.
         let user = stub_user();
         let authed = AuthState::authenticated(user.clone(), Uuid::from_u128(2));
-        let got = user_or_auth_error(&authed).expect("authenticated");
+        let got = user_or_auth_error(&authed, BearerOutcome::Accepted).expect("authenticated");
         assert_eq!(got.id, user.id);
+    }
+
+    #[test]
+    fn only_expired_verification_maps_to_the_expired_outcome() {
+        // PMS-769: `VerifyError::Expired` is the one variant that earns
+        // `TOKEN_EXPIRED` + the `error_description` challenge; every other
+        // cause is a plain `invalid_token`.
+        assert_eq!(
+            BearerOutcome::from_verify_error(&VerifyError::Expired),
+            BearerOutcome::Expired
+        );
+        for error in [
+            VerifyError::Malformed("bad header".into()),
+            VerifyError::InvalidSignature,
+            VerifyError::UnknownKid,
+            VerifyError::InvalidIssuer,
+            VerifyError::InvalidAudience,
+            VerifyError::JwksFetch("boom".into()),
+            VerifyError::DiscoveryFetch("boom".into()),
+        ] {
+            assert_eq!(
+                BearerOutcome::from_verify_error(&error),
+                BearerOutcome::Rejected,
+                "unexpected outcome for {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_bearer_yields_token_expired_with_the_rfc6750_challenge() {
+        // PMS-769 incident case: the SPA presented a bunyip token 32 hours past
+        // `exp`. The response must name the cause instead of collapsing into
+        // the same 401 a credential-less request gets.
+        let rejection =
+            user_or_auth_error(&AuthState::default(), BearerOutcome::Expired).unwrap_err();
+        let (status, challenge, code) = rendered(rejection).await;
+        assert_eq!(status, 401);
+        assert_eq!(code, "TOKEN_EXPIRED");
+        assert_eq!(
+            challenge.as_deref(),
+            Some(r#"Bearer error="invalid_token", error_description="The access token expired""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_credential_yields_the_bare_bearer_challenge() {
+        // No `Authorization` header: RFC 6750 section 3 wants the bare scheme
+        // challenge, and no `error` parameter (nothing was rejected).
+        let rejection =
+            user_or_auth_error(&AuthState::default(), BearerOutcome::Absent).unwrap_err();
+        let (status, challenge, code) = rendered(rejection).await;
+        assert_eq!(status, 401);
+        assert_eq!(code, "UNAUTHORIZED");
+        assert_eq!(challenge.as_deref(), Some("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn rejected_bearer_yields_invalid_token_challenge() {
+        // A presented-but-invalid bearer (bad signature, wrong audience,
+        // unusable principal) is `invalid_token` without the expiry detail.
+        let rejection =
+            user_or_auth_error(&AuthState::default(), BearerOutcome::Rejected).unwrap_err();
+        let (status, challenge, code) = rendered(rejection).await;
+        assert_eq!(status, 401);
+        assert_eq!(code, "UNAUTHORIZED");
+        assert_eq!(
+            challenge.as_deref(),
+            Some(r#"Bearer error="invalid_token""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn require_auth_extractor_attaches_the_challenge_end_to_end() {
+        // The pieces above are wired through the real `RequireAuth` extractor
+        // and axum's response path, so the header survives `IntoResponse` and
+        // is not an artefact of the helper.
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        for (outcome, expected_challenge, expected_code) in [
+            (BearerOutcome::Absent, "Bearer", "UNAUTHORIZED"),
+            (
+                BearerOutcome::Rejected,
+                r#"Bearer error="invalid_token""#,
+                "UNAUTHORIZED",
+            ),
+            (
+                BearerOutcome::Expired,
+                r#"Bearer error="invalid_token", error_description="The access token expired""#,
+                "TOKEN_EXPIRED",
+            ),
+        ] {
+            let app = Router::new()
+                .route("/", get(|_: super::RequireAuth| async { "ok" }))
+                .layer(axum::middleware::from_fn(
+                    move |mut request: Request<Body>, next: axum::middleware::Next| async move {
+                        request.extensions_mut().insert(outcome);
+                        next.run(request).await
+                    },
+                ));
+            let response = app
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 401);
+            assert_eq!(
+                response.headers().get("www-authenticate").unwrap(),
+                expected_challenge
+            );
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(envelope["error"]["code"], expected_code);
+        }
+    }
+
+    #[tokio::test]
+    async fn post_authentication_errors_carry_no_challenge() {
+        // A 403 from the role gate, the module gate's 404 and the wiring-bug
+        // 500 all reach the client through `AuthRejection` too, but none of
+        // them concerns a bearer credential, so none gets a challenge.
+        for error in [
+            AppError::Forbidden("You do not have permission to do that".to_string()),
+            AppError::NotFound("module billing".to_string()),
+            AppError::Internal("SettingsService extension missing".to_string()),
+        ] {
+            let (_, challenge, _) = rendered(AuthRejection::from(error)).await;
+            assert_eq!(challenge, None);
+        }
     }
 
     #[test]

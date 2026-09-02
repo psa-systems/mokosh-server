@@ -12,6 +12,13 @@
 //!      tenant set it sees exactly that tenant's rows, and a write whose parent
 //!      lives in another tenant is rejected by WITH CHECK.
 //!
+//! PMS-874 adds the third: `quote_lines` was created by `092_quotes_entity.sql`
+//! in that same parent-FK shape, after `041` had hand-listed its five tables,
+//! and carried no policy at all until `128_rls_tenantless_child_tables.sql`. It
+//! is proven fail-closed here by the same three properties. The sweep that stops
+//! a fourth table slipping through lives in `rls_coverage.rs`; this file proves
+//! the policies actually behave, which schema introspection cannot.
+//!
 //! Like `rls_isolation.rs`, the policy assertions run under a dedicated
 //! unprivileged role because `#[sqlx::test]` connects as the superuser, which
 //! bypasses RLS unconditionally.
@@ -44,6 +51,55 @@ async fn seed_tenant_with_user(conn: &mut sqlx::PgConnection, name: &str) -> (Uu
     .expect("seed user");
 
     (tenant_id, user_id)
+}
+
+/// Create an unprivileged (`NOSUPERUSER NOBYPASSRLS`) role granted read/write on
+/// `tables`, and `SET ROLE` to it. Returns the generated role name for cleanup.
+///
+/// `#[sqlx::test]` connects as the superuser, which bypasses RLS unconditionally,
+/// so a policy assertion made without this switch proves nothing.
+async fn set_probe_role(conn: &mut sqlx::PgConnection, tables: &str) -> String {
+    let role = format!("mokosh_rls_probe_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("create app role");
+    sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("grant schema");
+    sqlx::query(&format!("GRANT SELECT, INSERT ON {tables} TO {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("grant tables");
+    sqlx::query(&format!("SET ROLE {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("set role");
+    role
+}
+
+/// Undo [`set_probe_role`]. A role cannot be dropped while it still holds
+/// privileges, so the grants come off first.
+async fn drop_probe_role(conn: &mut sqlx::PgConnection, role: &str, tables: &str) {
+    sqlx::query("RESET ROLE")
+        .execute(&mut *conn)
+        .await
+        .expect("reset role");
+    sqlx::query(&format!("REVOKE ALL ON {tables} FROM {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("revoke tables");
+    sqlx::query(&format!("REVOKE ALL ON SCHEMA public FROM {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("revoke schema");
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("drop role");
 }
 
 #[sqlx::test]
@@ -128,28 +184,8 @@ async fn child_table_parent_join_policy_is_fail_closed(pool: PgPool) {
     .expect("seed child version");
 
     // Unprivileged role to actually observe the policy.
-    let role = format!("mokosh_pms258_test_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!(
-        "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"
-    ))
-    .execute(&mut *conn)
-    .await
-    .expect("create app role");
-    sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO {role}"))
-        .execute(&mut *conn)
-        .await
-        .expect("grant schema");
-    sqlx::query(&format!(
-        "GRANT SELECT, INSERT ON kb_articles, kb_article_versions TO {role}"
-    ))
-    .execute(&mut *conn)
-    .await
-    .expect("grant tables");
-
-    sqlx::query(&format!("SET ROLE {role}"))
-        .execute(&mut *conn)
-        .await
-        .expect("set role");
+    let tables = "kb_articles, kb_article_versions";
+    let role = set_probe_role(&mut conn, tables).await;
 
     // 1) Fail-closed: no GUC => zero child rows visible.
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM kb_article_versions")
@@ -199,23 +235,101 @@ async fn child_table_parent_join_policy_is_fail_closed(pool: PgPool) {
         "expected an RLS WITH CHECK violation (42501), got: {err}"
     );
 
-    // Cleanup.
-    sqlx::query("RESET ROLE")
+    drop_probe_role(&mut conn, &role, tables).await;
+}
+
+/// PMS-874: `quote_lines` carries no `tenant_id` and, until migration `128`, no
+/// policy either, so its isolation was entirely the application's job. The
+/// service is correct today; this proves the database now refuses the same
+/// mistakes on its own.
+#[sqlx::test]
+async fn quote_lines_parent_join_policy_is_fail_closed(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire connection");
+
+    let (tenant_a, _user_a) = seed_tenant_with_user(&mut conn, "quote-tenant-a").await;
+    let (tenant_b, _user_b) = seed_tenant_with_user(&mut conn, "quote-tenant-b").await;
+
+    // A quote under tenant A (quotes.company_id is NOT NULL), with one line.
+    let company_a = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme A')")
+        .bind(company_a)
+        .bind(tenant_a)
         .execute(&mut *conn)
         .await
-        .expect("reset role");
-    sqlx::query(&format!(
-        "REVOKE ALL ON kb_articles, kb_article_versions FROM {role}"
-    ))
+        .expect("seed company");
+
+    let quote_a = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO quotes (id, tenant_id, company_id, title, status) \
+         VALUES ($1, $2, $3, 'Quote A', 'draft')",
+    )
+    .bind(quote_a)
+    .bind(tenant_a)
+    .bind(company_a)
     .execute(&mut *conn)
     .await
-    .expect("revoke tables");
-    sqlx::query(&format!("REVOKE ALL ON SCHEMA public FROM {role}"))
+    .expect("seed parent quote");
+
+    sqlx::query(
+        "INSERT INTO quote_lines (quote_id, line_type, description, quantity, unit_price, total) \
+         VALUES ($1, 'service', 'Line A', 1, 100.00, 100.00)",
+    )
+    .bind(quote_a)
+    .execute(&mut *conn)
+    .await
+    .expect("seed child line");
+
+    // The policy's EXISTS reads `quotes`, so the probe role needs both tables.
+    let tables = "quotes, quote_lines";
+    let role = set_probe_role(&mut conn, tables).await;
+
+    // 1) Fail-closed: no GUC => zero child rows visible.
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM quote_lines")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count with no GUC");
+    assert_eq!(count, 0, "no GUC must hide the quote line (fail-closed)");
+
+    // 2) With tenant A's GUC the line is visible (its parent quote is in A).
+    sqlx::query("SELECT set_config('app.current_tenant', $1, false)")
+        .bind(tenant_a.to_string())
         .execute(&mut *conn)
         .await
-        .expect("revoke schema");
-    sqlx::query(&format!("DROP ROLE {role}"))
+        .expect("set GUC to tenant A");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM quote_lines")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count under tenant A");
+    assert_eq!(count, 1, "tenant A's GUC must expose its quote line");
+
+    // 3) With tenant B's GUC the same line is hidden (parent not in B).
+    sqlx::query("SELECT set_config('app.current_tenant', $1, false)")
+        .bind(tenant_b.to_string())
         .execute(&mut *conn)
         .await
-        .expect("drop role");
+        .expect("set GUC to tenant B");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM quote_lines")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count under tenant B");
+    assert_eq!(count, 0, "tenant B must not see tenant A's quote line");
+
+    // 4) WITH CHECK: inserting a line onto tenant A's quote while the GUC names
+    //    tenant B is rejected. This is the shape the service's tenant-less
+    //    `DELETE ... WHERE id = $1 AND quote_id = $2` depended on getting right.
+    let err = sqlx::query(
+        "INSERT INTO quote_lines (quote_id, line_type, description, quantity, unit_price, total) \
+         VALUES ($1, 'service', 'Line B', 1, 50.00, 50.00)",
+    )
+    .bind(quote_a)
+    .execute(&mut *conn)
+    .await
+    .expect_err("a line written against another tenant's quote must be rejected");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("42501"),
+        "expected an RLS WITH CHECK violation (42501), got: {err}"
+    );
+
+    drop_probe_role(&mut conn, &role, tables).await;
 }

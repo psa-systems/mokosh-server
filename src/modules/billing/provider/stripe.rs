@@ -49,6 +49,39 @@ pub struct StripeProvider {
     http: reqwest::Client,
 }
 
+/// Shape of the decrypted `payment_gateway_configs.config_encrypted` blob for
+/// this provider. Both fields are write-only secrets: the tenant's restricted
+/// API key and the webhook signing secret. Never logged, never returned to a
+/// client (PMS-342).
+///
+/// It lives here rather than in `BillingService` because it is Stripe's shape
+/// and nobody else's: PayPal's credential is not a `secret_key` plus a
+/// `webhook_secret`, so a single service-level struct would have to become a
+/// union of every provider's fields (PMS-966).
+#[derive(serde::Deserialize)]
+struct StripeCredentials {
+    #[serde(default)]
+    secret_key: String,
+    #[serde(default)]
+    webhook_secret: String,
+}
+
+/// Build a provider from the decrypted config blob.
+///
+/// A blob that does not parse is a `Configuration` error and not a 500 with a
+/// serde message: the operator stored it, so the fix is theirs, and the error
+/// text must never carry the plaintext it failed to parse.
+pub fn from_config(plaintext: &str, http: reqwest::Client) -> AppResult<StripeProvider> {
+    let creds: StripeCredentials = serde_json::from_str(plaintext).map_err(|_| {
+        AppError::Configuration("stored Stripe config is not valid JSON".to_string())
+    })?;
+    Ok(StripeProvider::new(
+        creds.secret_key,
+        creds.webhook_secret,
+        http,
+    ))
+}
+
 impl StripeProvider {
     pub fn new(secret_key: String, webhook_secret: String, http: reqwest::Client) -> Self {
         Self {
@@ -70,7 +103,7 @@ impl PaymentProvider for StripeProvider {
         params: &CheckoutParams<'_>,
     ) -> AppResult<CheckoutSession> {
         let unit_amount = to_minor_units(params.amount).map_err(|_| {
-            AppError::BadRequest(format!("amount {} is out of range", params.amount))
+            AppError::BadRequest(format!("Amount {} is out of range", params.amount))
         })?;
         let currency = params.currency.to_ascii_lowercase();
         let tenant = params.tenant_id.to_string();
@@ -145,11 +178,16 @@ impl PaymentProvider for StripeProvider {
         })
     }
 
-    fn verify_and_parse_webhook(
+    async fn verify_and_parse_webhook(
         &self,
         raw_body: &[u8],
-        signature: &str,
+        headers: &axum::http::HeaderMap,
     ) -> AppResult<PaymentEvent> {
+        // Missing or non-ASCII header = 401 before the body is looked at.
+        let signature = headers
+            .get(SIGNATURE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .ok_or(AppError::Unauthorized)?;
         let now = chrono::Utc::now().timestamp();
         // DEV-514: the constant-time signature verifier lives in the shared
         // dunite-stripe-core crate (also consumed by a8n-tools and bunyip).
@@ -163,7 +201,19 @@ impl PaymentProvider for StripeProvider {
         .map_err(|_| AppError::Unauthorized)?;
         parse_stripe_event(raw_body)
     }
+
+    async fn capture(&self, order_id: &str) -> AppResult<()> {
+        // Checkout charges when the buyer completes, so there is never anything
+        // to capture. Reaching here means a `RequiresCapture` event was routed
+        // to the wrong provider.
+        Err(AppError::Configuration(format!(
+            "stripe has no capture step; order {order_id:?} was routed to the wrong provider"
+        )))
+    }
 }
+
+/// Stripe's signature header name.
+const SIGNATURE_HEADER: &str = "Stripe-Signature";
 
 /// Map a verified Stripe event body to a normalised [`PaymentEvent`].
 ///
@@ -176,7 +226,7 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
     // dunite-stripe-core crate; mokosh maps `data.object` to its own
     // PaymentEvent below.
     let event = parse_event_envelope(raw_body)
-        .map_err(|_| AppError::BadRequest("malformed Stripe event body".to_string()))?;
+        .map_err(|_| AppError::BadRequest("Malformed Stripe event body".to_string()))?;
     let kind = event.kind.clone();
     let object = &event.raw["data"]["object"];
 

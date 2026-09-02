@@ -89,7 +89,12 @@ pub fn validate_setting_value(
     }
 
     match (category, key) {
-        ("notifications", "channel_email_enabled")
+        // PMS-943: whether a break is a thing this employer tracks. Tenant-level
+        // and not per company, because the employee taking the break is the
+        // MSP's, and a client company has none of the MSP's staff. Default off,
+        // which is the absence of a row; PMS-950 reads it.
+        ("timesheets", "track_breaks")
+        | ("notifications", "channel_email_enabled")
         | ("notifications", "channel_in_app_enabled") => match value {
             Value::Bool(_) => Ok(()),
             _ => Err(bad("value", "expected a boolean")),
@@ -98,10 +103,15 @@ pub fn validate_setting_value(
             Some(s) if !s.is_empty() && s.len() <= 10 => Ok(()),
             _ => Err(bad("value", "expected a non-empty locale string (max 10)")),
         },
-        ("branding", "primary_color") | ("branding", "accent_color") => match value.as_str() {
-            Some(s) if is_hex_color(s) => Ok(()),
-            _ => Err(bad("value", "expected a hex color like #0066cc")),
-        },
+        // PMS-776: one shape table for both writers of a branding value.
+        // `PUT /api/v1/tenants/:id` merges the same keys into
+        // `tenants.branding`, so the two endpoints share
+        // `tenants::branding::validate_branding_value` rather than drifting.
+        // An unknown branding key is refused here too: the fall-through below
+        // exists for a category whose shapes are not settled, and this one's
+        // are, key by key.
+        ("branding", _) => crate::modules::tenants::branding::validate_branding_value(key, value)
+            .map_err(|message| bad("value", &message)),
         ("billing_prefs", "currency") => match value.as_str() {
             Some(s) if s.len() == 3 && s.chars().all(|c| c.is_ascii_uppercase()) => Ok(()),
             _ => Err(bad(
@@ -172,6 +182,60 @@ pub fn validate_setting_value(
     }
 }
 
-fn is_hex_color(s: &str) -> bool {
+/// The one hex-colour predicate in the tree (PMS-776). `pub(crate)` rather than
+/// duplicated in `tenants::branding`, which validates the same two keys on the
+/// other write path.
+pub(crate) fn is_hex_color(s: &str) -> bool {
     s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::tenants::branding::validate_branding_value;
+    use serde_json::json;
+
+    /// PMS-776: the settings endpoint and the tenants endpoint write the same
+    /// branding keys to different stores (PMS-703 F18). They must not disagree
+    /// about which values are legal, so this asserts one verdict per case
+    /// rather than two tables.
+    #[test]
+    fn the_two_branding_writers_agree_on_every_key() {
+        let cases = [
+            ("primary_color", json!("#0066cc")),
+            ("primary_color", json!("red")),
+            ("secondary_color", json!("#00AA55")),
+            ("accent_color", json!("#0066cc")),
+            ("support_email", json!("help@acme.example")),
+            ("support_email", json!("call us")),
+            ("support_phone", json!("555-0100")),
+            ("support_phone", json!("call the service desk")),
+            ("support_contact_name", json!("Dana")),
+            ("support_contact_name", json!("  ")),
+            ("logo_url", json!("/api/v1/public/tenants/x/logo")),
+            ("logo_url", json!("https://evil.example/logo.png")),
+            ("logo_mime", json!("image/png")),
+            ("logo_mime", json!("image/svg+xml")),
+            ("company_name", json!("Acme IT")),
+            ("website", json!("https://acme.example")),
+            ("website", json!("javascript:alert(1)")),
+            ("portal_domain", json!("portal.acme.example")),
+            ("supprt_email", json!("help@acme.example")),
+        ];
+        for (key, value) in cases {
+            assert_eq!(
+                validate_setting_value("branding", key, &value).is_ok(),
+                validate_branding_value(key, &value).is_ok(),
+                "the two writers disagree about branding.{key} = {value}"
+            );
+        }
+    }
+
+    /// The fall-through stays for a category whose shapes are not settled;
+    /// `branding` no longer reaches it.
+    #[test]
+    fn an_unknown_key_outside_branding_is_still_accepted_with_a_warning() {
+        assert!(validate_setting_value("experiments", "new_knob", &json!(1)).is_ok());
+        assert!(validate_setting_value("branding", "new_knob", &json!(1)).is_err());
+    }
 }

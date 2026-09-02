@@ -344,7 +344,8 @@ impl ContractsService {
         let rows = sqlx::query_as::<_, ContractItemRow>(
             r#"SELECT id, contract_id, name, description, item_type, quantity, unit_price,
                       total_price, billing_frequency, work_type_id, included_hours,
-                      overage_rate, rollover_enabled, max_rollover_hours, sort_order
+                      overage_rate, rollover_enabled, max_rollover_hours, sort_order,
+                      product_id, billing_rule, billed_at
                FROM contract_items WHERE tenant_id = $1 AND contract_id = $2
                ORDER BY sort_order
                LIMIT $3 OFFSET $4"#,
@@ -367,6 +368,12 @@ impl ContractsService {
         ctx: &AuditCtx,
     ) -> AppResult<ContractItemResponse> {
         let total = request.quantity * request.unit_price;
+        // PMS-956: omitted means "what this type has always done", so an
+        // existing client sees no change; stating it is how a product on a
+        // contract becomes a licence that bills every period.
+        let billing_rule = request
+            .billing_rule
+            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
         let id = Uuid::new_v4();
         // Mutation + audit row in one transaction. CREATE: old = None,
         // after captured by the new item id. PMS-117.
@@ -375,8 +382,9 @@ impl ContractsService {
             r#"INSERT INTO contract_items (id, tenant_id, contract_id, name, description, item_type,
                                             quantity, unit_price, total_price, billing_frequency, work_type_id,
                                             included_hours, overage_rate, rollover_enabled,
-                                            max_rollover_hours, sort_order)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)"#,
+                                            max_rollover_hours, sort_order, product_id,
+                                            billing_rule)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
         )
         .bind(id).bind(tenant_id).bind(contract_id)
         .bind(&request.name).bind(&request.description).bind(&request.item_type)
@@ -384,6 +392,8 @@ impl ContractsService {
         .bind(&request.billing_frequency).bind(request.work_type_id)
         .bind(request.included_hours).bind(request.overage_rate)
         .bind(request.rollover_enabled).bind(request.max_rollover_hours).bind(request.sort_order)
+        .bind(request.product_id)
+        .bind(billing_rule.as_str())
         .execute(&mut *tx).await?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -421,6 +431,9 @@ impl ContractsService {
             rollover_enabled: request.rollover_enabled,
             max_rollover_hours: request.max_rollover_hours,
             sort_order: request.sort_order,
+            product_id: request.product_id,
+            billing_rule,
+            billed_at: None,
         })
     }
 
@@ -433,6 +446,9 @@ impl ContractsService {
         ctx: &AuditCtx,
     ) -> AppResult<ContractItemResponse> {
         let total = request.quantity * request.unit_price;
+        let billing_rule = request
+            .billing_rule
+            .unwrap_or_else(|| BillingRule::derive(&request.item_type));
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -443,13 +459,16 @@ impl ContractsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
-        let contract_id: Option<Uuid> = sqlx::query_scalar(
+        // PMS-956: `billed_at` comes back from the UPDATE rather than being
+        // assumed. An edit to a `once` item that has already billed must not
+        // report it as unbilled, or the record would say it is still owed.
+        let updated: Option<(Uuid, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
             r#"UPDATE contract_items SET
                 name=$3, description=$4, item_type=$5, quantity=$6, unit_price=$7,
                 total_price=$8, billing_frequency=$9, work_type_id=$10, included_hours=$11,
                 overage_rate=$12, rollover_enabled=$13, max_rollover_hours=$14,
-                sort_order=$15, updated_at = NOW()
-               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id"#,
+                sort_order=$15, product_id=$16, billing_rule=$17, updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2 RETURNING contract_id, billed_at"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -466,10 +485,12 @@ impl ContractsService {
         .bind(request.rollover_enabled)
         .bind(request.max_rollover_hours)
         .bind(request.sort_order)
+        .bind(request.product_id)
+        .bind(billing_rule.as_str())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(cid) = contract_id else {
-            return Err(AppError::NotFound("ContractItem".to_string()));
+        let Some((cid, billed_at)) = updated else {
+            return Err(AppError::NotFound("Contract item".to_string()));
         };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -507,6 +528,9 @@ impl ContractsService {
             rollover_enabled: request.rollover_enabled,
             max_rollover_hours: request.max_rollover_hours,
             sort_order: request.sort_order,
+            product_id: request.product_id,
+            billing_rule,
+            billed_at,
         })
     }
 
@@ -534,7 +558,7 @@ impl ContractsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("ContractItem".to_string()));
+            return Err(AppError::NotFound("Contract item".to_string()));
         }
         audit_write(
             &mut *tx,
@@ -626,7 +650,7 @@ impl ContractsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("RateCard".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Rate card".to_string()))?;
         Ok(row.into())
     }
 
@@ -730,7 +754,7 @@ impl ContractsService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RateCard".to_string()));
+            return Err(AppError::NotFound("Rate card".to_string()));
         }
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM rate_cards t WHERE tenant_id = $1 AND id = $2",
@@ -784,7 +808,7 @@ impl ContractsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RateCard".to_string()));
+            return Err(AppError::NotFound("Rate card".to_string()));
         }
         audit_write(
             &mut *tx,
@@ -856,7 +880,7 @@ impl ContractsService {
         .fetch_one(&mut *tx)
         .await?;
         if !exists {
-            return Err(AppError::NotFound("RateCard".to_string()));
+            return Err(AppError::NotFound("Rate card".to_string()));
         }
 
         // Mutation + audit row in one transaction. PMS-117.
@@ -958,7 +982,7 @@ impl ContractsService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RateCardItem".to_string()));
+            return Err(AppError::NotFound("Rate card item".to_string()));
         }
         audit_write(
             &mut *tx,
@@ -1028,7 +1052,7 @@ impl ContractsService {
         .bind(contract_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("block_hours contract item".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Block hours contract item".to_string()))?;
 
         let included = item.included_hours.unwrap_or(Decimal::ZERO);
         let overage_rate = item.overage_rate.unwrap_or(Decimal::ZERO);
@@ -1114,6 +1138,66 @@ impl ContractsService {
         })
     }
 
+    /// PMS-951: give back hours a time entry had drawn.
+    ///
+    /// The counterpart to [`Self::consume_hours`], and the reason an edit to a
+    /// consumed entry can be correct. `applied` is the APPLIED hours the entry
+    /// recorded when it drew, never its duration: consuming ten against an
+    /// eight-hour allotment applies eight and leaves two as overage, and only
+    /// the applied part came out of the balance. Crediting the duration back
+    /// would hand the contract two hours it never gave.
+    ///
+    /// Because the caller says which balance row and how much, this is exact
+    /// and order-independent. Re-deriving the period here would credit the
+    /// wrong one for an entry whose date has since moved.
+    ///
+    /// `hours_used` and `hours_remaining` are two halves of one figure and are
+    /// moved together, so `used + remaining` stays `included` exactly as
+    /// `consume_hours` leaves it.
+    pub async fn release_hours(
+        &self,
+        tenant_id: TenantId,
+        balance_id: Uuid,
+        applied: Decimal,
+    ) -> AppResult<()> {
+        if applied <= Decimal::ZERO {
+            return Ok(());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<BalanceMutRow> = sqlx::query_as(
+            r#"SELECT id, hours_used, hours_remaining
+               FROM contract_hour_balances
+               WHERE tenant_id = $1 AND id = $2
+               FOR UPDATE"#,
+        )
+        .bind(tenant_id)
+        .bind(balance_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // A balance the contract took with it is not an error: the entry has
+        // nothing to give back to, which is the right answer.
+        let Some(row) = row else {
+            return Ok(());
+        };
+        // Never credit back more than was taken, whatever the caller says.
+        let used = row.hours_used.unwrap_or(Decimal::ZERO);
+        let give_back = applied.min(used);
+        sqlx::query(
+            r#"UPDATE contract_hour_balances
+               SET hours_used = $2,
+                   hours_remaining = $3,
+                   updated_at = NOW()
+               WHERE id = $1"#,
+        )
+        .bind(row.id)
+        .bind(used - give_back)
+        .bind(row.hours_remaining + give_back)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Roll the unused hours of the period ending `closing_period_end`
     /// into the next period's balance row, capped at the item's
     /// `max_rollover_hours`. No-op (returns `Decimal::ZERO`) when the
@@ -1148,7 +1232,7 @@ impl ContractsService {
         .bind(contract_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("block_hours contract item".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Block hours contract item".to_string()))?;
 
         if !item.rollover_enabled.unwrap_or(false) {
             tx.commit().await?;
@@ -1299,7 +1383,7 @@ impl ContractsService {
         .bind(work_type_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("RateCardItem".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Rate card item".to_string()))?;
 
         let rate = if emergency {
             row.emergency_rate.unwrap_or(row.hourly_rate)
@@ -1365,8 +1449,12 @@ impl ContractsService {
             // done and the loop terminates.
             loop {
                 let mut tx = self.db.migrator_pool().begin().await?;
+                // PMS-779: `to_jsonb(contracts)` rides along on the locked
+                // batch read, so the audit `before` snapshot costs no extra
+                // round trip and is taken from the same read as the update.
                 let due = sqlx::query_as::<_, DueContractRow>(
-                    r#"SELECT id, start_date, end_date, auto_renew, renewal_terms
+                    r#"SELECT id, start_date, end_date, auto_renew, renewal_terms,
+                              to_jsonb(contracts) AS before_snapshot
                        FROM contracts
                        WHERE tenant_id = $1 AND status = 'active'
                          AND end_date IS NOT NULL AND end_date < $2
@@ -1391,13 +1479,12 @@ impl ContractsService {
                         None => continue,
                     };
 
-                    let before: Option<serde_json::Value> =
-                        sqlx::query_scalar("SELECT to_jsonb(t) FROM contracts t WHERE id = $1")
-                            .bind(c.id)
-                            .fetch_optional(&mut *tx)
-                            .await?;
+                    let before = c.before_snapshot;
 
-                    if c.auto_renew.unwrap_or(false) {
+                    // `RETURNING to_jsonb(contracts)` yields the post-update
+                    // row, so the audit `after` snapshot rides on the write
+                    // instead of a follow-up read (PMS-779).
+                    let after: Option<serde_json::Value> = if c.auto_renew.unwrap_or(false) {
                         // Renewal length: explicit term_months override, else
                         // the span of the closing term in whole months (>= 1).
                         let term_months = c
@@ -1414,37 +1501,35 @@ impl ContractsService {
                             .and_then(|d| d.pred_opt())
                             .unwrap_or(new_start);
 
-                        sqlx::query(
+                        let after = sqlx::query_scalar(
                             r#"UPDATE contracts
                                SET status = 'renewed',
                                    start_date = $2,
                                    end_date = $3,
                                    updated_at = NOW()
-                               WHERE id = $1"#,
+                               WHERE id = $1
+                               RETURNING to_jsonb(contracts)"#,
                         )
                         .bind(c.id)
                         .bind(new_start)
                         .bind(new_end)
-                        .execute(&mut *tx)
+                        .fetch_optional(&mut *tx)
                         .await?;
                         renewed += 1;
+                        after
                     } else {
-                        sqlx::query(
+                        let after = sqlx::query_scalar(
                             r#"UPDATE contracts
                                SET status = 'expired', updated_at = NOW()
-                               WHERE id = $1"#,
+                               WHERE id = $1
+                               RETURNING to_jsonb(contracts)"#,
                         )
                         .bind(c.id)
-                        .execute(&mut *tx)
+                        .fetch_optional(&mut *tx)
                         .await?;
                         expired += 1;
-                    }
-
-                    let after: Option<serde_json::Value> =
-                        sqlx::query_scalar("SELECT to_jsonb(t) FROM contracts t WHERE id = $1")
-                            .bind(c.id)
-                            .fetch_optional(&mut *tx)
-                            .await?;
+                        after
+                    };
 
                     audit_write(
                         &mut *tx,
@@ -1482,7 +1567,8 @@ impl ContractsService {
         let rows = sqlx::query_as::<_, ContractItemRow>(
             r#"SELECT id, contract_id, name, description, item_type, quantity, unit_price,
                       total_price, billing_frequency, work_type_id, included_hours,
-                      overage_rate, rollover_enabled, max_rollover_hours, sort_order
+                      overage_rate, rollover_enabled, max_rollover_hours, sort_order,
+                      product_id, billing_rule, billed_at
                FROM contract_items
                WHERE tenant_id = $1 AND contract_id = $2
                  AND item_type IN ('recurring_service', 'retainer')
@@ -1566,6 +1652,9 @@ struct ContractItemRow {
     rollover_enabled: Option<bool>,
     max_rollover_hours: Option<Decimal>,
     sort_order: Option<i32>,
+    product_id: Option<Uuid>,
+    billing_rule: String,
+    billed_at: Option<chrono::DateTime<Utc>>,
 }
 
 impl From<ContractItemRow> for ContractItemResponse {
@@ -1586,6 +1675,11 @@ impl From<ContractItemRow> for ContractItemResponse {
             rollover_enabled: r.rollover_enabled.unwrap_or(false),
             max_rollover_hours: r.max_rollover_hours,
             sort_order: r.sort_order.unwrap_or(0),
+            product_id: r.product_id,
+            // An unrecognised value can only come from a row this build did
+            // not write. `Manual` is the reading that cannot bill somebody.
+            billing_rule: BillingRule::from_str(&r.billing_rule).unwrap_or(BillingRule::Manual),
+            billed_at: r.billed_at,
         }
     }
 }
@@ -1693,7 +1787,8 @@ struct RateTierRow {
     emergency_rate: Option<Decimal>,
 }
 
-/// Contract fields needed by the lifecycle sweep.
+/// Contract fields needed by the lifecycle sweep, including the pre-update
+/// whole-row snapshot the audit log records as `old_values` (PMS-779).
 #[derive(sqlx::FromRow)]
 struct DueContractRow {
     id: Uuid,
@@ -1701,4 +1796,5 @@ struct DueContractRow {
     end_date: Option<chrono::NaiveDate>,
     auto_renew: Option<bool>,
     renewal_terms: Option<serde_json::Value>,
+    before_snapshot: Option<serde_json::Value>,
 }

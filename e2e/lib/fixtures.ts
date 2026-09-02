@@ -5,7 +5,7 @@
 //
 // - `test` (default): every API call carries the bunyip-issued bearer
 //   token the setup project captured. Used by all PSA-API specs
-//   (tickets, contacts, tenants). The mokosh-clients SPA keeps its token
+//   (tickets, contacts, tenants). The mokosh-apps SPA keeps its token
 //   in WASM memory rather than cookies, so Playwright's `storageState`
 //   alone cannot authenticate the PSA context - the captured Bearer
 //   header is the only path.

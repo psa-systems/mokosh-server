@@ -45,6 +45,26 @@ mod decimal_opt {
     }
 }
 
+/// PMS-894: the tenant-wide project totals, so a client can render them
+/// without fetching every project.
+///
+/// The SPA's project list computed its Active / On hold / Completed cards and
+/// its budget sum from the rows it had fetched, which meant the cards reported
+/// one page. The counts alone are already answerable with
+/// `?status=X&per_page=1` and `meta.total`; the sum is not, and a sum is the
+/// one a page cannot approximate from a page.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectSummaryResponse {
+    /// Count per `projects.status`, one entry per status actually present.
+    /// Absent rather than zero for a status no project holds: the set of
+    /// statuses is the data's, not this endpoint's to assert.
+    pub counts_by_status: std::collections::BTreeMap<String, i64>,
+    /// Total of `budget_amount` across every project in the tenant, NULL
+    /// budgets excluded. Serialised as a string, like every other money field
+    /// on the wire, so no client parses it through a float.
+    pub total_budget: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectResponse {
     pub id: Uuid,
@@ -173,6 +193,12 @@ pub struct ProjectFilter {
     #[validate(length(max = 100))]
     pub status: Option<String>,
     pub project_manager_id: Option<Uuid>,
+    /// PMS-895: free-text search on the project name, ILIKE-matched, mirroring
+    /// `CompanyFilter::q` and `AssetFilter::q`. Without it the SPA's project
+    /// list cannot page server-side: its search box would filter whichever
+    /// page happened to be loaded and present that as the whole answer.
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

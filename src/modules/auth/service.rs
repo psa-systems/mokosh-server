@@ -29,13 +29,17 @@ use crate::modules::audit::{audit_auth_event, audit_write, AuditAction, AuditCtx
 use crate::modules::notifications::NotificationsService;
 #[cfg(feature = "server")]
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
+use crate::utils::deployment::DeploymentMode;
 #[cfg(feature = "server")]
-use crate::utils::email::{LogMailer, Mailer};
+use crate::utils::email::{salutation, LogMailer, Mailer};
 #[cfg(feature = "server")]
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::geoip::GeoIpService;
+use crate::utils::net::is_non_public_ip;
 use std::net::IpAddr;
 
+#[cfg(feature = "server")]
+use super::mfa_secret;
 #[cfg(feature = "server")]
 use super::models::*;
 
@@ -47,11 +51,6 @@ pub struct AuthService {
     jwt_secret: String,
     access_token_ttl: Duration,
     refresh_token_ttl: Duration,
-    /// Lowercased exact email addresses allowed to auto-provision a
-    /// super_admin account on first Google sign-in. Any other unrecognized
-    /// Google identity is rejected (fail-closed) rather than auto-created in
-    /// the default tenant. Existing users are never re-roled.
-    super_admin_emails: Vec<String>,
     /// Outbound transactional email. Defaults to `LogMailer` so unit
     /// constructions that do not need real SMTP keep working. Kept as
     /// a fallback for builds that do not wire a `NotificationsService`
@@ -77,6 +76,22 @@ pub struct AuthService {
     /// exactly as before (PMS-657 alert only). Wired via
     /// [`Self::with_login_approval`].
     login_approval_enabled: bool,
+    /// PMS-904: whether this deployment federates platform identity to Bunyip
+    /// SSO. In `saas` the mokosh-side password is not the credential anybody
+    /// signs in with, so the mail that exists only to service it is suppressed.
+    /// Defaults to self-hosted; wired via [`Self::with_deployment_mode`].
+    deployment_mode: DeploymentMode,
+    /// PMS-905: whether the bunyip Resource-Server verifier is mounted, i.e.
+    /// whether this instance has a working alternative to the local password.
+    /// Set from `bunyip_verifier.is_some()` in `create_api_router`; false in
+    /// fixtures. See [`Self::local_password_auth_disabled`].
+    sso_mounted: bool,
+    /// PMS-871: 32-byte AES-256-GCM key protecting `users.mfa_secret` at rest.
+    /// Sourced from `AppConfig::encryption_key` exactly as the payment-gateway
+    /// configs are; falls back to a zero key for the fixture constructors so
+    /// non-production callers stay compilable (the `BillingService` pattern).
+    /// Wired via [`Self::with_encryption_key`].
+    encryption_key: [u8; 32],
 }
 
 /// PMS-658: outcome of screening a login for suspicious signals. `country` and
@@ -92,11 +107,10 @@ struct LoginAssessment {
 #[cfg(feature = "server")]
 impl AuthService {
     /// Create a new auth service.
-    pub fn new(db: Database, jwt_secret: String, super_admin_emails: Vec<String>) -> Self {
+    pub fn new(db: Database, jwt_secret: String) -> Self {
         Self::with_mailer(
             db,
             jwt_secret,
-            super_admin_emails,
             Arc::new(LogMailer),
             "http://localhost:4301".to_string(),
         )
@@ -115,7 +129,6 @@ impl AuthService {
     pub fn with_mailer(
         db: Database,
         jwt_secret: String,
-        super_admin_emails: Vec<String>,
         mailer: Arc<dyn Mailer>,
         frontend_base_url: String,
     ) -> Self {
@@ -124,12 +137,14 @@ impl AuthService {
             jwt_secret,
             access_token_ttl: Duration::hours(1),
             refresh_token_ttl: Duration::days(7),
-            super_admin_emails,
             mailer,
             notifications: None,
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
             geoip: None,
             login_approval_enabled: false,
+            deployment_mode: DeploymentMode::SelfHosted,
+            sso_mounted: false,
+            encryption_key: [0u8; 32],
         }
     }
 
@@ -144,7 +159,6 @@ impl AuthService {
     pub fn with_dispatcher(
         db: Database,
         jwt_secret: String,
-        super_admin_emails: Vec<String>,
         mailer: Arc<dyn Mailer>,
         frontend_base_url: String,
         notifications: NotificationsService,
@@ -154,12 +168,14 @@ impl AuthService {
             jwt_secret,
             access_token_ttl: Duration::hours(1),
             refresh_token_ttl: Duration::days(7),
-            super_admin_emails,
             mailer,
             notifications: Some(notifications),
             frontend_base_url: frontend_base_url.trim_end_matches('/').to_string(),
             geoip: None,
             login_approval_enabled: false,
+            deployment_mode: DeploymentMode::SelfHosted,
+            sso_mounted: false,
+            encryption_key: [0u8; 32],
         }
     }
 
@@ -182,6 +198,83 @@ impl AuthService {
         self
     }
 
+    /// PMS-904: declare the deployment shape. Set from `MOKOSH_DEPLOYMENT_MODE`
+    /// at server startup (see `create_api_router`); test fixtures leave it at
+    /// the self-hosted default, which is today's behaviour unchanged.
+    #[must_use]
+    pub fn with_deployment_mode(mut self, mode: DeploymentMode) -> Self {
+        self.deployment_mode = mode;
+        self
+    }
+
+    /// PMS-905: declare whether the bunyip Resource-Server verifier is mounted.
+    /// Set from `bunyip_verifier.is_some()` at server startup; fixtures leave it
+    /// false, which is the "no alternative credential exists" posture.
+    #[must_use]
+    pub fn with_sso_mounted(mut self, mounted: bool) -> Self {
+        self.sso_mounted = mounted;
+        self
+    }
+
+    /// PMS-871: attach the `ENCRYPTION_KEY` that protects `users.mfa_secret`
+    /// at rest. Set once at server startup (see `create_api_router`), from the
+    /// same `AppConfig::encryption_key` the payment-gateway configs use.
+    #[must_use]
+    pub fn with_encryption_key(mut self, encryption_key: [u8; 32]) -> Self {
+        self.encryption_key = encryption_key;
+        self
+    }
+
+    /// PMS-905: whether the local password is a credential on this instance.
+    ///
+    /// Disabled only when BOTH conditions hold: this is a `saas` deployment,
+    /// AND the bunyip verifier is mounted so a working alternative demonstrably
+    /// exists. The conjunction is the whole design.
+    ///
+    /// Rejecting on the mode alone would mean a `saas` instance whose OIDC
+    /// configuration is missing or broken has no way in at all: SSO cannot
+    /// authenticate anyone (that is what broken means) and the local path has
+    /// been closed behind it. That is the PMS-289 shape - a misconfigured IdP
+    /// made fatal, which took staging and production down and needed PMS-292 to
+    /// restore service. Keeping the local path open in exactly that state is
+    /// the break-glass, and it is narrow: a bunyip-provisioned user has no
+    /// `password_hash` at all (`upsert_user_from_oidc` writes none) and is
+    /// already refused by the `ok_or(Unauthorized)` in `login`, so the only
+    /// accounts it admits are the bootstrap admin and pre-migration ones.
+    ///
+    /// `create_api_router` reports the misconfigured state at `error` on the
+    /// way past, so it is loud without being fatal.
+    fn local_password_auth_disabled(&self) -> bool {
+        self.deployment_mode.is_saas() && self.sso_mounted
+    }
+
+    /// PMS-904: whether account email for the local platform credential should
+    /// be sent at all.
+    ///
+    /// Defined as the negation of [`Self::local_password_auth_disabled`] rather
+    /// than as its own test of the mode, so the mail and the endpoints can
+    /// never disagree. The state that would otherwise fall between them is
+    /// `saas` with no verifier: mail keyed on the mode alone would suppress the
+    /// reset email there while login stayed open, leaving a break-glass path
+    /// nobody could recover a password for - the exact silent dead end PMS-905
+    /// exists to remove.
+    fn sends_local_account_email(&self) -> bool {
+        !self.local_password_auth_disabled()
+    }
+
+    /// The rejection every closed local-credential entry point returns.
+    ///
+    /// One message, so a customer who tries the password box, then "forgot
+    /// password", then their old reset link is told the same thing three times
+    /// instead of assembling three different guesses about what is wrong.
+    fn sso_only_rejection() -> AppError {
+        AppError::Forbidden(
+            "This deployment signs in with single sign-on. Use your organisation's \
+             sign-in page; a password set here would not sign you in."
+                .to_string(),
+        )
+    }
+
     /// PMS-657: on a genuine login, resolve the client IP to a country and, when
     /// it differs from the country recorded at the user's previous login (and
     /// the user has not opted out), email a "new sign-in" alert, then persist the
@@ -199,7 +292,7 @@ impl AuthService {
         // Private / loopback / link-local / unspecified addresses never map to a
         // public country and only show up behind a proxy or in dev; skip them so
         // they cannot spuriously "change country".
-        if Self::is_non_public_ip(&parsed) {
+        if is_non_public_ip(&parsed) {
             return;
         }
         let Some(country) = geoip.country_code(parsed) else {
@@ -221,7 +314,15 @@ impl AuthService {
             // Country changed: alert (unless opted out), then persist the new one.
             LoginLocationDecision::Alert => {
                 let previous = user.last_login_country.as_deref().unwrap_or("?");
-                if user.login_location_alerts {
+                // PMS-904: this alert is about a LOCAL password sign-in, which
+                // is the only path that reaches here - a Bunyip-issued token
+                // never runs `login`. In a SaaS deployment Bunyip owns sign-in
+                // and therefore owns telling the user about an unfamiliar one,
+                // so a mokosh alert is at best a duplicate and at worst points
+                // the user at a mokosh password that is not their credential.
+                // The country is still recorded below either way: it is the
+                // state this decision is made from next time, not a message.
+                if user.login_location_alerts && self.sends_local_account_email() {
                     // Send the alert on a detached task so a slow or failing SMTP
                     // round-trip never adds latency to (or fails) the login. The
                     // direct mailer is used rather than the notifications
@@ -307,7 +408,7 @@ impl AuthService {
     fn resolve_login_country(&self, ip: Option<&str>) -> Option<String> {
         let geoip = self.geoip.as_ref()?;
         let parsed = ip.and_then(|s| s.parse::<IpAddr>().ok())?;
-        if Self::is_non_public_ip(&parsed) {
+        if is_non_public_ip(&parsed) {
             return None;
         }
         geoip.country_code(parsed)
@@ -479,6 +580,22 @@ impl AuthService {
         .await?;
         tx.commit().await?;
 
+        // PMS-904: deliberately NOT gated on the deployment mode, unlike the
+        // password-reset, welcome and new-login-location mail.
+        //
+        // This is not a notification about an account, it is one half of a
+        // challenge-response. `login` returns `approval_required: true` with
+        // empty tokens and `verify_login_approval` demands the code that was
+        // emailed here, so suppressing the send in `saas` would strand the
+        // caller mid-login with nothing able to complete it - a lockout
+        // introduced by a mail-dispatch change, which is worse than the
+        // redundant email it would have saved.
+        //
+        // In practice the question rarely arises: the gate is opt-in via
+        // `LOGIN_APPROVAL_ENABLED` and only local password logins reach here,
+        // which a SaaS deployment does not use. Whether those endpoints should
+        // answer at all in `saas` is PMS-905, and that is the right place to
+        // remove this path rather than half-removing it here.
         let mailer = self.mailer.clone();
         let email = user.email.clone();
         let country = assessment.country.clone();
@@ -568,16 +685,6 @@ impl AuthService {
         }
     }
 
-    /// Post-code-review finding #10: agent side now delegates to the
-    /// shared `crate::utils::login_location::is_non_public_ip`. The
-    /// previous inherent method was byte-identical to the portal-side
-    /// copy AND missed the IPv4-mapped IPv6 case (finding #9). Keeping
-    /// the associated-function shape so every existing call site
-    /// (`Self::is_non_public_ip(...)`) compiles unchanged.
-    fn is_non_public_ip(ip: &IpAddr) -> bool {
-        crate::utils::login_location::is_non_public_ip(ip)
-    }
-
     /// Authenticate user with email and password
     #[tracing::instrument(skip_all)]
     pub async fn login(
@@ -639,6 +746,24 @@ impl AuthService {
             return Err(AppError::Forbidden("Account is not active".to_string()));
         }
 
+        // PMS-905: the local password is not a credential on this instance.
+        //
+        // Placed after the user lookup and the status check so the answer does
+        // not depend on whether the address exists, and before the password
+        // verify so no Argon2 work is spent on a credential that cannot be
+        // accepted. `warn`, not `info`: in a deployment that federates identity
+        // this is somebody presenting a password at a door that is supposed to
+        // be closed, which is worth seeing in the log even though the outcome
+        // is correct.
+        if self.local_password_auth_disabled() {
+            tracing::warn!(
+                user_id = %user.id,
+                deployment_mode = %self.deployment_mode,
+                "local password login refused: platform identity is federated to Bunyip SSO (PMS-905)",
+            );
+            return Err(Self::sso_only_rejection());
+        }
+
         // Reject sign-in when the owning tenant is suspended/cancelled, so a
         // tenant-level suspension takes effect immediately.
         self.ensure_tenant_active(user.tenant_id).await?;
@@ -689,8 +814,14 @@ impl AuthService {
             // across replicas (it lives in Postgres), and is budgeted
             // independently of the password-attempt bucket.
             let locked_until = self.mfa_locked_until(user.tenant_id, user.id).await?;
-            if locked_until.is_some_and(|until| until > Utc::now()) {
-                return Err(AppError::RateLimited);
+            if let Some(until) = locked_until.filter(|until| *until > Utc::now()) {
+                // PMS-773: the window's own remaining time is the wait the
+                // caller is owed, floored at 1 so a sub-second remainder is
+                // never reported as "retry immediately".
+                let retry_after = (until - Utc::now()).num_seconds().max(1) as u64;
+                return Err(AppError::RateLimited {
+                    retry_after_seconds: Some(retry_after),
+                });
             }
 
             if let Some(rc) = request.recovery_code.as_deref() {
@@ -729,11 +860,16 @@ impl AuthService {
                 // TOTP step, so the anti-replay watermark must not advance.
                 self.clear_mfa_lockout(user.tenant_id, user.id).await?;
             } else if let Some(code) = request.mfa_code.as_deref() {
-                let secret_b32 = user
+                let stored = user
                     .mfa_secret
                     .as_ref()
                     .ok_or_else(|| AppError::Internal("MFA enabled without secret".to_string()))?;
-                let secret = crate::utils::totp::base32_decode(secret_b32)
+                // PMS-871: the column is AES-256-GCM ciphertext, except on a
+                // row enrolled before that change. `open` classifies it; a
+                // legacy plaintext row is rewritten encrypted below, once the
+                // code it presented has actually verified.
+                let stored = mfa_secret::open(stored, &self.encryption_key)?;
+                let secret = crate::utils::totp::base32_decode(stored.secret_b32())
                     .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
                 // +-1 step (30s) tolerance handles modest clock skew. The
                 // verifier returns the matched step so we can enforce
@@ -756,6 +892,14 @@ impl AuthService {
                 if !accepted {
                     self.register_failed_mfa(user.tenant_id, user.id).await?;
                     return Err(AppError::Unauthorized);
+                }
+                // PMS-871: the code verified against a pre-encryption row, so
+                // rewrite it as ciphertext now. Gated on success so a guess
+                // cannot drive the write, and idempotent (the UPDATE matches
+                // the plaintext it read), so a concurrent re-enrolment wins.
+                if stored.needs_upgrade() {
+                    self.upgrade_legacy_mfa_secret(user.tenant_id, user.id, stored.secret_b32())
+                        .await?;
                 }
             } else {
                 return Ok(LoginResponse {
@@ -879,7 +1023,7 @@ impl AuthService {
 
     /// Reject access when the owning tenant is not active (suspended or
     /// cancelled). Threaded into every session-minting path (password login,
-    /// Google login, refresh) so a tenant suspension takes effect immediately
+    /// refresh) so a tenant suspension takes effect immediately
     /// instead of lingering until token expiry.
     /// MAPPS-337: cheap public guard the auth middleware can run after
     /// decoding a legacy HS256 access token. Loads the user, asserts
@@ -896,9 +1040,37 @@ impl AuthService {
         tenant_id: Uuid,
         user_id: Uuid,
         token_iat: i64,
+        session_id: Uuid,
     ) -> AppResult<User> {
         let user = self.get_user_by_id(tenant_id, user_id).await?;
         self.ensure_principal_usable(&user).await?;
+        // MAPPS-531: the session the token names must still exist.
+        //
+        // `logout` deletes the `user_sessions` row, which until now revoked
+        // only the REFRESH capability: nothing on the access path consulted
+        // that table, so a bearer minted just before sign-out kept
+        // authenticating every request for the rest of its hour. That is the
+        // residual half of the defect MAPPS-522 was filed to close, and it is
+        // the half that lets a signed-out bearer read tenant data.
+        //
+        // Keyed on `sid` rather than stamped on the user (the shape PMS-681
+        // used for password changes) because a stamp cannot distinguish
+        // sessions: signing out of one device would sign the user out of all
+        // of them. Refresh reuses the same `sid` rather than rotating it, so a
+        // long-lived session stays valid across refreshes.
+        //
+        // PMS-880 (audit F3) considered the cheaper alternative - stamp the user
+        // row on `logout_all` only, and leave single-session sign-out revoking
+        // just the refresh - and settled on this one instead: it is what makes
+        // BOTH sign-out paths immediate, and it costs one indexed primary-key
+        // read per authenticated legacy request. `logout_all` needs nothing of
+        // its own, because deleting every row for the user is the same check
+        // failing for every one of their tokens.
+        if !self.session_is_live(tenant_id, session_id).await? {
+            return Err(AppError::Forbidden(
+                "Session has been signed out".to_string(),
+            ));
+        }
         // PMS-681: reject an access token minted before the user's last password
         // change (reset or self-service), so a stolen token dies the moment the
         // password changes instead of living out its TTL. Read straight off the
@@ -969,6 +1141,29 @@ impl AuthService {
         Ok(())
     }
 
+    /// MAPPS-531: is the session behind an access token still live?
+    ///
+    /// `expires_at > NOW()` as well as existence, matching what
+    /// [`Self::get_session`] has always required of the refresh path. Session
+    /// lifetimes are 7 days (30 with "remember me") against a one-hour access
+    /// token, so this cannot expire a token early; it is the same row going
+    /// stale by the same clock.
+    ///
+    /// `user_sessions` is RLS-covered, so the read runs inside the tenant
+    /// transaction rather than on the bare pool, where it would fail closed to
+    /// "no session" and 403 every request.
+    pub async fn session_is_live(&self, tenant_id: Uuid, session_id: Uuid) -> AppResult<bool> {
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM user_sessions \
+             WHERE id = $1 AND tenant_id = $2 AND expires_at > NOW())",
+        )
+        .bind(session_id)
+        .bind(tenant_id)
+        .fetch_one(&mut *self.db.begin_with_tenant(tenant_id).await?)
+        .await?;
+        Ok(live)
+    }
+
     /// PMS-698: the shared "is this principal still usable" gate. Both auth
     /// paths run it - the legacy HS256 branch via
     /// [`Self::ensure_user_and_tenant_active`] and the bunyip RS branch via
@@ -1024,265 +1219,6 @@ impl AuthService {
         }
 
         Ok(())
-    }
-
-    /// Authenticate (or auto-provision) a user from a Google OAuth
-    /// userinfo response. The caller is responsible for verifying the
-    /// CSRF state and exchanging the authorization code via the
-    /// `google-oauth-flow` crate before calling this.
-    #[tracing::instrument(skip_all)]
-    pub async fn login_with_google(
-        &self,
-        google: google_oauth_flow::GoogleUserInfo,
-        ip_address: Option<String>,
-        user_agent: Option<String>,
-    ) -> AppResult<LoginResponse> {
-        // Reject if Google did not confirm the email is verified.
-        if google.email_verified != Some(true) {
-            return Err(AppError::Forbidden(
-                "Google did not report this email as verified".to_string(),
-            ));
-        }
-
-        // 1. Look up an existing identity by (provider, subject).
-        // SAFETY (PMS-258/PMS-285): this is a pre-auth, cross-tenant lookup - it
-        // runs before the user is placed in a tenant, so it cannot set
-        // `app.current_tenant`. user_oauth_identities now has FORCE RLS, so once
-        // the app connection moves to a NOBYPASSRLS role (PMS-285) this query and
-        // the last_used_at UPDATE below must run on the privileged (BYPASSRLS)
-        // pool. The tenant-scoped unique key keeps it to at most one row per
-        // tenant; a single human maps to one personal tenant, so it stays unique
-        // in practice.
-        let linked_user_id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT user_id FROM user_oauth_identities \
-             WHERE provider = 'google' AND subject = $1",
-        )
-        .bind(&google.sub)
-        .fetch_optional(self.db.migrator_pool())
-        .await?;
-
-        let user = if let Some(user_id) = linked_user_id {
-            sqlx::query(
-                "UPDATE user_oauth_identities SET last_used_at = NOW() \
-                 WHERE provider = 'google' AND subject = $1",
-            )
-            .bind(&google.sub)
-            .execute(self.db.migrator_pool())
-            .await?;
-            // Resolve the tenant from the linked row so the scoped
-            // get_user_by_id lookup has the boundary it needs. The
-            // OAuth callback path is the only place where we hold a
-            // user_id without already knowing the tenant.
-            // SAFETY (PMS-285): still pre-auth - this resolves which tenant the
-            // Google-linked user lives in before any session/GUC exists. Reads
-            // RLS-covered `users` by id on the migrator pool; the subsequent
-            // `get_user_by_id` re-reads under that tenant's GUC.
-            let tenant_id: Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
-                .bind(user_id)
-                .fetch_optional(self.db.migrator_pool())
-                .await?
-                .ok_or_else(|| AppError::NotFound("User".to_string()))?;
-            self.get_user_by_id(tenant_id, user_id).await?
-        } else {
-            // 2. No identity row yet - find or create the user by email.
-            // PMS-138: Google OAuth callback carries no SPA-provided
-            // tenant hint (the OAuth state cookie does not encode one),
-            // so the JIT-link lookup falls back to the default tenant.
-            // Multi-tenant Google login is a separate story; it would
-            // require baking tenant_id into the OAuth state at popup
-            // open time and verifying it in the callback.
-            let google_jit_tenant_id = Self::resolve_tenant_for_login(None);
-            match self
-                .find_user_by_email_for_tenant_optional(google_jit_tenant_id, &google.email)
-                .await?
-            {
-                Some(existing) => {
-                    // Only auto-link to an existing local account whose own
-                    // email is verified. Otherwise someone who registered a
-                    // password account under another person's email could
-                    // capture that person's Google sign-in.
-                    if existing.email_verified_at.is_none() {
-                        return Err(AppError::Forbidden(
-                            "An account with this email exists but is not verified. Sign in with your password first to link Google.".to_string(),
-                        ));
-                    }
-                    // Link new identity to existing user; do NOT change role.
-                    // Runs inside the existing user's tenant so the row carries
-                    // the tenant scope (PMS-258) and satisfies the WITH CHECK
-                    // policy even under a NOBYPASSRLS connection.
-                    let mut tx = self.db.begin_with_tenant(existing.tenant_id).await?;
-                    sqlx::query(
-                        "INSERT INTO user_oauth_identities \
-                         (user_id, tenant_id, provider, subject, email) \
-                         VALUES ($1, $2, 'google', $3, $4)",
-                    )
-                    .bind(existing.id)
-                    .bind(existing.tenant_id)
-                    .bind(&google.sub)
-                    .bind(&google.email)
-                    .execute(&mut *tx)
-                    .await?;
-                    tx.commit().await?;
-                    existing
-                }
-                None => self.provision_user_from_google(&google).await?,
-            }
-        };
-
-        // 3. Reject inactive users and suspended/cancelled tenants.
-        if user.status != UserStatus::Active {
-            return Err(AppError::Forbidden("Account is not active".to_string()));
-        }
-        self.ensure_tenant_active(user.tenant_id).await?;
-
-        // 3b. Enforce MFA exactly like the password `login()` path. A
-        // verified Google identity is NOT a substitute for the user's
-        // locally-enabled second factor; minting tokens here without it
-        // would silently bypass MFA for any account that links Google.
-        // The Google callback carries no MFA code, so signal
-        // `mfa_required` (with empty tokens) and let the SPA complete the
-        // second factor, mirroring `login()`'s no-code branch.
-        if user.mfa_enabled {
-            return Ok(LoginResponse {
-                access_token: String::new(),
-                refresh_token: String::new(),
-                expires_at: Utc::now(),
-                // Omit the user profile until the second factor is satisfied,
-                // mirroring the password `login()` mfa_required branch.
-                user: None,
-                mfa_required: true,
-                approval_required: false,
-                needs_selection: false,
-                needs_setup: false,
-                identity_token: None,
-                memberships: None,
-            });
-        }
-
-        // 4. Issue session + tokens identically to the password flow.
-        // PMS-657: keep the client IP + UA for the login-location check below,
-        // since create_session consumes the owned values.
-        let loc_ip = ip_address.clone();
-        let loc_ua = user_agent.clone();
-        let session_id = self
-            .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
-            .await?;
-        let (access_token, refresh_token, expires_at) =
-            self.generate_tokens(&user, session_id).await?;
-        self.update_last_login(user.tenant_id, user.id).await?;
-        self.check_login_location(&user, loc_ip.as_deref(), loc_ua.as_deref())
-            .await;
-
-        Ok(LoginResponse {
-            access_token,
-            refresh_token,
-            expires_at,
-            user: Some(user.to_current_user()),
-            mfa_required: false,
-            approval_required: false,
-            needs_selection: false,
-            needs_setup: false,
-            identity_token: None,
-            memberships: None,
-        })
-    }
-
-    /// Auto-provision a user from a verified Google identity. FAIL-CLOSED:
-    /// only exact emails in `self.super_admin_emails` may auto-provision.
-    /// Any other unrecognized Google identity is rejected - real users
-    /// must be invited rather than silently dropped into the default
-    /// tenant.
-    ///
-    /// MAPPS-518: the allowlisted Google identity now lands as a tenant
-    /// `admin`, not `super_admin`. The platform super-admin persona
-    /// lives in `platform_admins` and is bootstrapped via
-    /// `ADMIN_EMAIL` / `ADMIN_PASSWORD` (see `auth::bootstrap`); the
-    /// Google auto-provision flow can no longer mint platform-level
-    /// privilege. The environment variable name (`super_admin_emails`)
-    /// is unchanged for backwards-compat.
-    async fn provision_user_from_google(
-        &self,
-        google: &google_oauth_flow::GoogleUserInfo,
-    ) -> AppResult<User> {
-        if !is_allowlisted_email(&self.super_admin_emails, &google.email) {
-            return Err(AppError::Forbidden(
-                "No account is provisioned for this Google identity. Ask an administrator for an invite.".to_string(),
-            ));
-        }
-        let role = "admin";
-
-        let user_id = Uuid::new_v4();
-        // Bootstrap super-admins land in the default tenant seeded by
-        // migrations/002_seed_data.sql. Everyone else is invited into a
-        // specific tenant via the invite flow, not this path.
-        let tenant_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001")
-            .expect("default tenant UUID is valid");
-
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
-            r#"
-            INSERT INTO users (
-                id, tenant_id, email, password_hash, first_name, last_name,
-                role, status, email_verified_at
-            )
-            VALUES ($1, $2, $3, NULL, $4, $5, $6, 'active', NOW())
-            "#,
-        )
-        .bind(user_id)
-        .bind(tenant_id)
-        .bind(&google.email)
-        .bind(google.given_name.clone().unwrap_or_default())
-        .bind(google.family_name.clone().unwrap_or_default())
-        .bind(role)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO user_oauth_identities \
-             (user_id, tenant_id, provider, subject, email) \
-             VALUES ($1, $2, 'google', $3, $4)",
-        )
-        .bind(user_id)
-        .bind(tenant_id)
-        .bind(&google.sub)
-        .bind(&google.email)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-
-        self.get_user_by_id(tenant_id, user_id).await
-    }
-
-    /// Look up a user by `(tenant_id, email)`; returns `Ok(None)`
-    /// instead of `Err(Unauthorized)` when no row matches.
-    /// Tenant-bound sibling of `find_user_by_email_for_tenant` for
-    /// the Google JIT-link path. PMS-138.
-    async fn find_user_by_email_for_tenant_optional(
-        &self,
-        tenant_id: Uuid,
-        email: &str,
-    ) -> AppResult<Option<User>> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row = sqlx::query_as::<_, UserRow>(
-            r#"
-            SELECT id, tenant_id, email, password_hash, first_name, last_name,
-                   phone, mobile, title, avatar_url, timezone, locale,
-                   date_format_string, theme_base_mode, theme_accent_id, role,
-                   status, email_verified_at, last_login_at, last_login_country,
-                   login_location_alerts, mfa_enabled,
-                   mfa_secret, notification_preferences, settings,
-                   created_at, updated_at, profile_completed_at,
-                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id,
-                   (SELECT kind FROM tenants WHERE id = users.tenant_id) AS tenant_kind
-            FROM users
-            WHERE tenant_id = $1 AND email = $2
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(email)
-        .fetch_optional(&mut *tx)
-        .await?;
-        Ok(row.map(Into::into))
     }
 
     /// Refresh access token
@@ -1348,6 +1284,11 @@ impl AuthService {
     /// Logout all sessions for a user. PMS-260: scoped to the caller's tenant
     /// as well as the user so logout cannot span tenants when a `user_id`
     /// exists under more than one tenant.
+    ///
+    /// PMS-880: served by `POST /api/v1/auth/logout-all`. Deleting the rows
+    /// revokes the access tokens too, not only the refresh capability, because
+    /// [`Self::ensure_user_and_tenant_active`] fails every legacy request whose
+    /// `sid` no longer names a live row.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn logout_all(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
         // Tenant is in scope, so run under the GUC: RLS scopes the delete to the
@@ -1374,6 +1315,25 @@ impl AuthService {
         tenant_hint: Option<Uuid>,
         email: &str,
     ) -> AppResult<()> {
+        // PMS-905: refused BEFORE the user lookup, and the ordering is
+        // load-bearing.
+        //
+        // This endpoint answers the same way for a known and an unknown address
+        // on purpose, so it never reveals whether an account exists. Placing the
+        // refusal after the lookup would have handed a known address a 403 while
+        // an unknown one kept the silent `Ok(())` below - turning the fix into
+        // the account oracle the endpoint is written to avoid. The deployment
+        // mode is not a property of the address, so it is decided before any
+        // address is resolved and every caller gets one answer.
+        if self.local_password_auth_disabled() {
+            tracing::info!(
+                deployment_mode = %self.deployment_mode,
+                "password-reset refused: platform identity is federated to Bunyip SSO, so a \
+                 mokosh-side password is not a credential on this instance (PMS-905)",
+            );
+            return Err(Self::sso_only_rejection());
+        }
+
         // Find user - don't reveal if user exists
         let tenant_id = Self::resolve_tenant_for_login(tenant_hint);
         let user = match self.find_user_by_email_for_tenant(tenant_id, email).await {
@@ -1381,6 +1341,17 @@ impl AuthService {
             Err(_) => return Ok(()), // Silently succeed to not reveal user existence
         };
 
+        // PMS-904: in a SaaS deployment the platform credential lives in Bunyip,
+        // so a mokosh-side reset link would set a password nobody signs in with
+        // and read as though it had fixed the user's problem. Nothing below this
+        // point runs: the token is only ever delivered by the mail being
+        // suppressed, so minting one would leave a live credential-bearing row
+        // that no recipient can redeem and no code path can retire.
+        //
+        // Placed AFTER the user lookup so the early `Ok(())` for an unknown
+        // address still comes first, and returning the same `Ok(())` here keeps
+        // this endpoint's contract intact: it never reveals whether an address
+        // has an account, in either mode.
         // Generate a reset token bound to the user. The emailed token is
         // `{user_id}.{secret}`; only the secret is hashed and stored so
         // reset_password can scope its lookup to this user.
@@ -1500,6 +1471,23 @@ impl AuthService {
     }
 
     pub async fn reset_password(&self, request: &ResetPasswordRequest) -> AppResult<()> {
+        // PMS-905: refuse to redeem, ahead of every other check.
+        //
+        // No new token is minted in this state (PMS-904 stops that), but one
+        // issued before the deployment was switched over stays valid for its
+        // 24h - or 7 days for a welcome link - and redeeming it would set a
+        // password that signs nobody in. Answering 403 says so; succeeding
+        // would be the dead end this issue exists to remove, and the most
+        // convincing kind, because the customer would have just been told their
+        // password was changed.
+        if self.local_password_auth_disabled() {
+            tracing::info!(
+                deployment_mode = %self.deployment_mode,
+                "password-reset redemption refused: platform identity is federated to Bunyip SSO (PMS-905)",
+            );
+            return Err(Self::sso_only_rejection());
+        }
+
         if request.new_password != request.confirm_password {
             return Err(AppError::validation_field(
                 "confirm_password",
@@ -1574,6 +1562,13 @@ impl AuthService {
         // kept as belt-and-braces: post-135 the trigger no longer
         // touches password, but a future column addition to the
         // mirror should not silently escape this write. Cheap.
+        //
+        // PMS-681: stamp `password_changed_at` so the auth middleware rejects
+        // every access token issued before now. Since MAPPS-531 the session
+        // DELETE below independently kills them too (the access path checks
+        // the token's `sid`); the two cutoffs stay separate because one is
+        // keyed on the credential changing and the other on the session
+        // ending.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query("SELECT set_config('app.skip_users_identity_mirror', 'on', true)")
             .execute(&mut *tx)
@@ -1781,7 +1776,19 @@ impl AuthService {
         .await?;
         tx.commit().await?;
 
-        if request.send_welcome_email {
+        // PMS-904: `send_welcome_email` asks for a "set your password" link,
+        // and in a SaaS deployment there is no password to set: the user will
+        // sign in through Bunyip with an identity mokosh does not own. The
+        // account row above is still created, because that is what scopes the
+        // user to this tenant; only the mail about the local credential goes.
+        if request.send_welcome_email && !self.sends_local_account_email() {
+            tracing::info!(
+                user_id = %user_id,
+                deployment_mode = %self.deployment_mode,
+                "welcome email suppressed: the account was created, but its sign-in credential \
+                 lives in Bunyip SSO, so there is no password for this mail to set (PMS-904)",
+            );
+        } else if request.send_welcome_email {
             // Reuse the password_reset_tokens machinery so the recipient
             // can pick a password without going through "Forgot password"
             // first. 7-day window: long enough for admins who batch-create
@@ -1820,6 +1827,12 @@ impl AuthService {
                     let context = serde_json::json!({
                         "recipient_user_id": user_id.to_string(),
                         "recipient_email": request.email,
+                        // PMS-774: the template opens with `{{salutation}}`,
+                        // which reads correctly for a user created with no
+                        // names. `display_name` stays the bare name so a
+                        // customised tenant template that names it keeps
+                        // rendering rather than showing literal braces.
+                        "salutation": salutation(&display_name),
                         "display_name": display_name,
                         "setup_link": setup_link,
                     });
@@ -2019,6 +2032,35 @@ impl AuthService {
         self.get_user_by_id(tenant_id, user_id).await
     }
 
+    /// PMS-871: rewrite a pre-encryption `users.mfa_secret` as ciphertext.
+    ///
+    /// Called only after the presented code has verified against that very
+    /// plaintext, so a wrong guess never triggers a write. `AND mfa_secret =
+    /// $4` makes it idempotent and keeps it from clobbering a secret that a
+    /// concurrent re-enrolment staged between the read and this update: the
+    /// row is left alone rather than pinned back to a secret nobody holds.
+    async fn upgrade_legacy_mfa_secret(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        secret_b32: &str,
+    ) -> AppResult<()> {
+        let sealed = mfa_secret::seal(secret_b32, &self.encryption_key)?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE users SET mfa_secret = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3 AND mfa_secret = $4",
+        )
+        .bind(&sealed)
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(secret_b32)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Begin MFA enrollment. Generates a fresh TOTP secret, persists it
     /// on `users.mfa_secret`, and returns the base32 secret plus the
     /// `otpauth://` provisioning URI. `mfa_enabled` is NOT flipped here
@@ -2039,23 +2081,30 @@ impl AuthService {
 
         let secret = crate::utils::totp::generate_secret();
         let secret_b32 = crate::utils::totp::base32_encode(&secret);
+        // PMS-871: the column stores ciphertext. The base32 secret leaves this
+        // method only in the response the enrolling user's own authenticator
+        // needs; it is never at rest in the clear.
+        let stored = mfa_secret::seal(&secret_b32, &self.encryption_key)?;
 
-        // MAPPS-501 (MAPPS-496 stage 2c): identities is now the source
-        // of truth for mfa_secret; MAPPS-498 mirror back-propagates to
-        // every users.mfa_secret this identity backs.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            "UPDATE identities SET mfa_secret = $1, updated_at = NOW() \
-             WHERE lower(email) = lower($2)",
+            "UPDATE users SET mfa_secret = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
         )
-        .bind(&secret_b32)
-        .bind(&user.email)
+        .bind(&stored)
+        .bind(user_id)
+        .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
 
-        let label = format!("Mokosh:{}", user.email);
-        let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, "Mokosh");
+        // PMS-789: the issuer an authenticator app shows next to the code.
+        // The colon is the otpauth label separator, so one inside the operator's
+        // name would split the label in the wrong place once the app decodes
+        // the percent-encoding.
+        let app = crate::utils::app_name::app_name().replace(':', " ");
+        let label = format!("{app}:{}", user.email);
+        let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, &app);
 
         Ok(crate::modules::auth::models::MfaSetupResponse {
             secret: secret_b32,
@@ -2079,13 +2128,21 @@ impl AuthService {
         // PMS-4 AC6: `get_user_by_id` binds `AND tenant_id = $2`, so
         // any user_id from another tenant comes back as NotFound here.
         let user = self.get_user_by_id(tenant_id, user_id).await?;
-        let secret_b32 = user.mfa_secret.as_ref().ok_or_else(|| {
+        let stored = user.mfa_secret.as_ref().ok_or_else(|| {
             AppError::BadRequest("MFA enrollment has not been started".to_string())
         })?;
-        let secret = crate::utils::totp::base32_decode(secret_b32)
+        // PMS-871: normally ciphertext staged by `start_mfa_enrollment`. It can
+        // still be plaintext for an enrolment that was started before the
+        // upgrade and is being completed after it.
+        let stored = mfa_secret::open(stored, &self.encryption_key)?;
+        let secret = crate::utils::totp::base32_decode(stored.secret_b32())
             .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
         if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
             return Err(AppError::BadRequest("Invalid MFA code".to_string()));
+        }
+        if stored.needs_upgrade() {
+            self.upgrade_legacy_mfa_secret(tenant_id, user_id, stored.secret_b32())
+                .await?;
         }
 
         let recovery_codes = crate::utils::recovery::generate_set();
@@ -2322,6 +2379,73 @@ impl AuthService {
     /// $4+ = filters`; count has `$1 = tenant_id, $2+ = filters`.
     /// Same condition set, different placeholder offsets.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// PMS-921: the tenant's staff, as the minimum needed to name one.
+    ///
+    /// Separate from [`Self::list_users`] rather than a filtered call into it.
+    /// That method serves user management: it selects the whole `users` row,
+    /// including `password_hash`, MFA secret, login history and notification
+    /// preferences, and maps it through `UserResponse`. Reusing it for an
+    /// unprivileged caller would mean the projection is the only thing standing
+    /// between a Technician and a colleague's security posture, and a
+    /// projection is easy to widen by accident. This query selects three
+    /// columns, so there is nothing to leak.
+    ///
+    /// Active users only. The directory answers "who can I name", and a mention
+    /// is normally about current work; a mention of somebody who has left then
+    /// renders as the plain text it always was, which is a truthful signal
+    /// rather than a broken one.
+    pub async fn list_directory(
+        &self,
+        tenant_id: TenantId,
+        pagination: &crate::utils::pagination::PaginationParams,
+    ) -> AppResult<(Vec<mokosh_types::auth::DirectoryEntry>, u64)> {
+        let offset = pagination.offset() as i64;
+        let limit = pagination.limit() as i64;
+
+        // Ordered by name then id: name alone is not unique, and an unstable
+        // ORDER BY makes paging repeat and skip rows.
+        //
+        // `split_part(email, '@', 1)` is the handle. Doing it in SQL keeps the
+        // address itself from ever entering the response type, so there is no
+        // point in the call path where a full email is in hand and could be
+        // returned by mistake.
+        // One transaction for both queries, as `list_users` does: the RLS
+        // tenant GUC is set per transaction, so a second one would repeat the
+        // round trip for nothing.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
+            r#"
+            SELECT id,
+                   COALESCE(NULLIF(TRIM(first_name || ' ' || last_name), ''), email) AS name,
+                   LOWER(split_part(email, '@', 1)) AS handle
+            FROM users
+            WHERE tenant_id = $1 AND status = 'active'
+            ORDER BY name, id
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND status = 'active'",
+        )
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        Ok((
+            rows.into_iter()
+                .map(|(id, name, handle)| mokosh_types::auth::DirectoryEntry { id, name, handle })
+                .collect(),
+            total as u64,
+        ))
+    }
+
     pub async fn list_users(
         &self,
         tenant_id: Uuid,
@@ -2375,17 +2499,7 @@ impl AuthService {
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
 
-        let order_by = pagination.order_by(
-            "created_at",
-            &[
-                "email",
-                "first_name",
-                "last_name",
-                "role",
-                "status",
-                "created_at",
-            ],
-        );
+        let order_by = pagination.order_by("created_at", mokosh_types::sort::USERS)?;
 
         let data_query = format!(
             r#"
@@ -2473,6 +2587,74 @@ impl AuthService {
         .bind(user_id)
         .fetch_optional(self.db.migrator_pool())
         .await?)
+    }
+
+    /// PMS-777: everything the bunyip RS path needs to know about the caller,
+    /// in ONE statement on ONE pool checkout.
+    ///
+    /// The path used to read `users` twice (`find_user_placement` on the
+    /// migrator pool, then `get_user_by_id` inside a `begin_with_tenant`
+    /// transaction) and `tenant_invitations` once, and then threw the results
+    /// away and re-read them. This returns the same three facts together so the
+    /// caller resolves once and passes the result down.
+    ///
+    /// The invite answer is an EXISTS probe only, gated in SQL on the same
+    /// `email_verified_at IS NOT NULL` condition the Rust caller used: it says
+    /// *whether* a live invite is waiting, never which tenant sent it.
+    /// Consuming an invite still goes through
+    /// `InvitationsService::newest_pending_for`, which stays the only reader of
+    /// the invite payload.
+    ///
+    /// PMS-260: like [`Self::find_user_placement`], this is deliberately NOT
+    /// tenant-scoped, so it must NEVER be wired into a request handler; the
+    /// `routes_do_not_reach_global_login_helpers` regression test
+    /// (`tests/auth.rs`) pins that no `routes.rs` references it.
+    pub async fn find_bunyip_principal(&self, user_id: Uuid) -> AppResult<Option<BunyipPrincipal>> {
+        // SAFETY (PMS-285/PMS-260/PMS-777): both tables this reads are already
+        // read on the migrator (BYPASSRLS) pool on this exact path
+        // (`find_user_placement`, `newest_pending_for`), for the same reason:
+        // the caller is not yet placed in a tenant, so there is no
+        // `app.current_tenant` GUC to set and both tables are RLS-covered.
+        // Merging them crosses no pool boundary. `id = $1` is the JWT-verified
+        // `sub`, so the widened column list still exposes exactly one row - the
+        // caller's own.
+        // PMS-591: `deleted_at IS NULL` keeps a tombstoned account unresolvable,
+        // matching `find_user_placement`.
+        let row = sqlx::query_as::<_, BunyipPrincipalRow>(
+            r#"
+            SELECT u.id, u.tenant_id, u.email, u.password_hash, u.first_name, u.last_name,
+                   u.phone, u.mobile, u.title, u.avatar_url, u.timezone, u.locale,
+                   u.date_format_string, u.theme_base_mode, u.theme_accent_id, u.role,
+                   u.status, u.email_verified_at, u.last_login_at, u.last_login_country,
+                   u.login_location_alerts, u.mfa_enabled,
+                   u.mfa_secret, u.notification_preferences, u.settings,
+                   u.created_at, u.updated_at, u.password_changed_at, u.profile_completed_at,
+                   (SELECT own_company_id FROM tenants WHERE id = u.tenant_id) AS own_company_id,
+                   EXISTS (
+                       SELECT 1 FROM tenant_invitations i
+                       WHERE u.email_verified_at IS NOT NULL
+                         AND lower(i.email) = lower(btrim(u.email))
+                         AND i.status = 'pending'
+                         AND i.expires_at > NOW()
+                   ) AS has_pending_invite
+            FROM users u
+            WHERE u.id = $1 AND u.deleted_at IS NULL
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+
+        Ok(row.map(|row| {
+            // The raw `users.role` text, so the placement tuple is byte-for-byte
+            // what `find_user_placement` would have returned.
+            let placement = (row.user.tenant_id, row.user.role.clone());
+            BunyipPrincipal {
+                placement,
+                user: row.user.into(),
+                has_pending_invite: row.has_pending_invite,
+            }
+        }))
     }
 
     /// MAPPS-348: probe whether a user row exists in the tombstoned state.
@@ -3759,6 +3941,31 @@ impl AuthService {
     }
 }
 
+/// PMS-777: the caller of a bunyip-issued token, resolved in one statement by
+/// [`AuthService::find_bunyip_principal`].
+#[cfg(feature = "server")]
+pub struct BunyipPrincipal {
+    /// `(tenant_id, raw users.role)` - identical to what
+    /// [`AuthService::find_user_placement`] returns for the same `sub`.
+    pub placement: (Uuid, String),
+    /// The full local shadow row, as [`AuthService::get_user_by_id`] would
+    /// have loaded it.
+    pub user: User,
+    /// Whether a live (pending, unexpired) invite is waiting for the user's
+    /// verified local address. `false` when the address is unverified.
+    pub has_pending_invite: bool,
+}
+
+/// Wire shape behind [`AuthService::find_bunyip_principal`]: the `users` row
+/// plus the invite EXISTS flag selected alongside it.
+#[cfg(feature = "server")]
+#[derive(sqlx::FromRow)]
+struct BunyipPrincipalRow {
+    #[sqlx(flatten)]
+    user: UserRow,
+    has_pending_invite: bool,
+}
+
 // Database row types for sqlx
 #[cfg(feature = "server")]
 #[derive(sqlx::FromRow)]
@@ -4005,15 +4212,6 @@ fn recovery_code_hex_hash(code: &str) -> String {
     out
 }
 
-/// Case-insensitive exact-match against an email allowlist. Allowlist entries
-/// are expected already lowercased (config parsing lowercases them); the
-/// candidate is lowercased here for safety.
-#[cfg(feature = "server")]
-fn is_allowlisted_email(allowlist: &[String], email: &str) -> bool {
-    let email = email.to_ascii_lowercase();
-    allowlist.iter().any(|e| e == &email)
-}
-
 /// Domain of the JIT placeholder address (`{sub}@unresolved.invalid`) stored
 /// when bunyip has not yet verified the user's email. `.invalid` is reserved by
 /// RFC 2606 and never resolves, so mail addressed to it is guaranteed to bounce.
@@ -4108,6 +4306,85 @@ use crate::utils::login_location::{login_location_decision, LoginLocationDecisio
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    /// PMS-904: the predicate the three gated mail sites consult.
+    ///
+    /// Covered here rather than only through the two integration tests because
+    /// the third site, the new-login-location alert, cannot be reached in the
+    /// test suite at all: `check_login_location` returns immediately with no
+    /// IP2Location DB configured, and the harness configures none. Its gate is
+    /// this predicate, so this is the level at which it is testable.
+    /// PMS-904 / PMS-905: the predicate every gated site consults, over all
+    /// four configurations.
+    ///
+    /// A truth table rather than the two cases PMS-904 needed, because PMS-905
+    /// made the condition a conjunction and the interesting cell is the one
+    /// neither issue's happy path visits: `saas` with no verifier, where the
+    /// local path must stay open because it is the only one the instance has.
+    ///
+    /// Covered here rather than only through the integration suites because the
+    /// third gated mail site, the new-login-location alert, cannot be reached in
+    /// a test at all: `check_login_location` returns immediately with no
+    /// IP2Location DB and no harness configures one. This is the level at which
+    /// its gate is testable.
+    #[tokio::test]
+    async fn local_password_auth_closes_only_when_a_working_alternative_exists() {
+        // `connect_lazy` opens no socket and nothing here issues a query: what
+        // is under test is a pair of field reads, so a live database would be
+        // scaffolding around the thing being measured. It still needs a Tokio
+        // context to build the pool, hence `#[tokio::test]`.
+        let build = |mode, sso| {
+            let pool = sqlx::postgres::PgPool::connect_lazy("postgres://unused/unused")
+                .expect("a lazy pool needs no server");
+            AuthService::new(crate::db::Database::from_pool(pool), "test-secret".into())
+                .with_deployment_mode(mode)
+                .with_sso_mounted(sso)
+        };
+
+        for (mode, sso, closed, why) in [
+            (
+                DeploymentMode::SelfHosted,
+                false,
+                false,
+                "self-hosted owns its passwords",
+            ),
+            (
+                DeploymentMode::SelfHosted,
+                true,
+                false,
+                "a self-hosted operator may run SSO alongside local accounts and expect both",
+            ),
+            (
+                DeploymentMode::Saas,
+                false,
+                false,
+                "no verifier means SSO can authenticate nobody, so closing the local path \
+                 would leave no way in at all (PMS-289)",
+            ),
+            (
+                DeploymentMode::Saas,
+                true,
+                true,
+                "the credential lives in Bunyip and a working alternative is mounted",
+            ),
+        ] {
+            let service = build(mode, sso);
+            assert_eq!(
+                service.local_password_auth_disabled(),
+                closed,
+                "mode={mode} sso_mounted={sso}: {why}"
+            );
+            // The mail follows the endpoints by construction, never separately.
+            assert_eq!(
+                service.sends_local_account_email(),
+                !closed,
+                "mode={mode} sso_mounted={sso}: the mail and the endpoints must agree"
+            );
+        }
+
+        // The default, with nothing configured, is the fully open one.
+        assert!(build(DeploymentMode::default(), false).sends_local_account_email());
+    }
 
     #[test]
     fn parse_user_bound_token_splits_valid() {
@@ -4223,17 +4500,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn allowlist_matches_case_insensitively() {
-        let allow = vec!["admin@niceguyit.biz".to_string()];
-        assert!(is_allowlisted_email(&allow, "Admin@NiceGuyIT.biz"));
-        assert!(!is_allowlisted_email(&allow, "other@niceguyit.biz"));
-        assert!(
-            !is_allowlisted_email(&[], "admin@niceguyit.biz"),
-            "empty allowlist matches nothing"
-        );
-    }
-
     /// PMS-635: the predicate that decides whether a mirrored row still needs
     /// its address repaired. It must match the JIT placeholder (in any case)
     /// and nothing that could be a real, routable address.
@@ -4315,35 +4581,6 @@ mod tests {
         );
     }
 
-    // PMS-657: only genuinely public client IPs may drive a country-change
-    // alert; loopback / RFC1918 / link-local / unspecified must be ignored.
-    #[test]
-    fn non_public_ip_detection() {
-        let non_public = [
-            "127.0.0.1",
-            "10.1.2.3",
-            "192.168.1.1",
-            "172.16.0.1",
-            "169.254.10.10",
-            "0.0.0.0",
-            "::1",
-            "::",
-            "fd00::1",
-            "fe80::1",
-        ];
-        for ip in non_public {
-            assert!(
-                AuthService::is_non_public_ip(&ip.parse().unwrap()),
-                "{ip} should be treated as non-public"
-            );
-        }
-
-        let public = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"];
-        for ip in public {
-            assert!(
-                !AuthService::is_non_public_ip(&ip.parse().unwrap()),
-                "{ip} should be treated as public"
-            );
-        }
-    }
+    // PMS-657's non-public-IP coverage moved with the predicate itself in
+    // PMS-805: see `crate::utils::net::tests::non_public_ip_detection`.
 }

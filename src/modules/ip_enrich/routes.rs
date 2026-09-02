@@ -21,6 +21,12 @@ pub struct IpEnrichRouterState {
 }
 
 /// `GET /api/v1/ip-enrichment?ip=<addr>` (admin-gated).
+///
+/// PMS-840 parity record: no caller in `mokosh-apps/src/` (verified against
+/// `123442d` on 2026-08-22). The intended surface is the audit log's actor IP,
+/// which renders the address today (`pages/audit_log.rs`) but never asks for
+/// the enrichment. Wiring it is tracked in PMS-870; the route stays mounted
+/// because the consumer is identified and unbuilt, not redundant.
 pub fn ip_enrich_routes(service: Option<Arc<IpEnrichService>>) -> Router {
     Router::new()
         .route("/ip-enrichment", get(ip_enrichment))

@@ -10,17 +10,23 @@ Key consequence: the suite asserts against whatever the target environment is cu
 
 ## Architecture: the project model
 
-The suite shares ONE E2E account and ONE tenant, and login is rate-limited to **5 requests per minute per email** (`src/modules/auth/routes.rs`, the layered per-IP + per-email `LoginLimiter`). So the Playwright projects are serialised (`workers: 1`, `fullyParallel: false`) and logins are spent sparingly: the `setup` project logs in exactly once and every API spec reuses the captured credential.
+The suite shares ONE E2E account and ONE tenant, and login is rate-limited to **5 requests per minute per email** (`src/modules/auth/routes.rs`, the layered per-IP + per-email `AuthRateLimiter` from `src/modules/auth/rate_limit.rs`). So the Playwright projects are serialised (`workers: 1`, `fullyParallel: false`) and logins are spent sparingly: the `setup` project logs in exactly once and every API spec reuses the captured credential.
 
-| Project | Tests | Auth | Notes |
-| --- | --- | --- | --- |
-| `preflight` | `tests/preflight.setup.ts` | none | Aggregates EVERY missing required env var into one fail-loud error before anything runs (`lib/env.ts::preflightRequiredEnv`). A misconfigured CI names all gaps in one round trip instead of dying one var at a time. |
-| `setup` | `tests/global.setup.ts` | logs in ONCE | Drives the SPA login in a real browser (TOTP-aware), captures the bunyip-issued bearer to `.auth/token.txt`, the OP session cookies to `.auth/op-state.json`, and the cross-tenant canary id to `.auth/foreign-company.txt`. Depends on `preflight`. |
-| `auth-ui` | `tests/auth.spec.ts` | ANONYMOUS | Drives the SPA login form in a fresh browser and asserts on URL transitions (login leaves `/login`, logout returns to it). DOM-only, no API probe. Depends on `preflight`, NOT `setup` (its own login + logout must not invalidate the shared API token). Currently `test.fixme` (PMS-148). |
-| `form-ui` | `tests/form-validation.spec.ts` | ANONYMOUS | Browser-driven form-validation coverage (PMS-518 AC7): drives the SPA create forms and asserts every missing required field flags at once (per-field inline + banner) with no navigation. DOM-only (the FormGuard validation is client-side). Does its own `loginViaSpa`. Depends on `preflight`. Currently `test.fixme` (needs the FormGuard SPA deployed + PMS-148). |
-| `api` | `tests/{tickets,contacts,oidc,time-tracking,projects,billing,contracts,calendar,sla,assets,knowledge-base,notifications,settings,audit,reports,rmm,dispatch}.spec.ts` | request context | No browser. Bearer header for PSA-API specs, replayed OP cookies for `oidc.spec.ts`. Depends on `setup`. |
+This table is the single description of the project model; `e2e/README.md` points here rather than repeating it. It lists every project in `e2e/playwright.config.ts` and nothing else, so a config change has one document to update.
 
-When you add a spec file to the `api` project you MUST widen the `testMatch` regex in `playwright.config.ts`, or it silently never runs.
+| Project | Tests | Browser | Depends on | Auth | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `preflight` | `tests/preflight.setup.ts` | none | - | none | Aggregates EVERY missing required env var into one fail-loud error before anything else runs (`lib/env.ts::preflightRequiredEnv`). A misconfigured CI names all gaps in one round trip instead of dying one var at a time. |
+| `setup` | `tests/global.setup.ts` | Desktop Firefox | `preflight` | logs in ONCE | Drives the SPA login in a real browser (TOTP-aware), captures the bunyip-issued bearer to `.auth/token.txt`, the OP session cookies to `.auth/op-state.json`, and the cross-tenant canary id to `.auth/foreign-company.txt`. Firefox, not Chromium, on purpose: headless Chromium crashed intermittently post-login on the CI runner and made the token every `api` spec depends on flaky (DEV-396). Uses the SPA host. |
+| `chromium` | `tests/auth.spec.ts`, `tests/form-validation.spec.ts` | Desktop Chrome | `preflight` | ANONYMOUS | Browser-driven SPA coverage (PMS-423): auth/session URL transitions and form validation, asserted on the DOM, never through a request context. Depends on `preflight` and NOT on `setup`, because its own login/logout must not invalidate the shared API token. Launched with `--disable-dev-shm-usage` (PMS-592: the container's 64 MB `/dev/shm` crashes the WASM SPA tab). Both specs are `test.fixme` today. |
+| `firefox` | `tests/auth.spec.ts`, `tests/form-validation.spec.ts` | Desktop Firefox | `preflight` | ANONYMOUS | The same two specs against Firefox. |
+| `webkit` | `tests/auth.spec.ts`, `tests/form-validation.spec.ts` | Desktop Safari | `preflight` | ANONYMOUS | The same two specs against WebKit. |
+| `api` | `tests/{tickets,contacts,oidc,time-tracking,projects,billing,contracts,calendar,sla,assets,knowledge-base,notifications,settings,audit,reports,rmm,dispatch}.spec.ts` | none | `setup` | request context | No browser. Bearer header for the PSA-API specs, replayed OP cookies for `oidc.spec.ts`. Uses the API host, not the SPA host. Transitively depends on `preflight` through `setup`. |
+| `guard` | `tests/external-guard.spec.ts` | none | `preflight` | none | External-service exclusion canary (PMS-608). Tagged `@external`, so the production run's `--grep-invert @external` drops it there and keeps it on staging / PR / push. Reads only `E2E_ENVIRONMENT`, so it needs no account or tenant. |
+
+Three browser projects run the same two specs (`chromium`, `firefox`, `webkit`) because the SPA is a WASM app whose failures are engine-specific; the API surface needs no browser, so `api` runs once.
+
+When you add a spec file to the `api` project you MUST widen the `testMatch` regex in `playwright.config.ts`, or it silently never runs. The same applies to the browser projects' `(auth|form-validation)` regex.
 
 ## The two auth paths
 
@@ -31,9 +37,9 @@ mokosh's E2E auth is split because the PSA API and the bunyip OP are authenticat
 
 Why not just `POST /api/v1/auth/login` and skip the browser entirely? Three independent reasons (`tests/global.setup.ts`):
 
-- The OP (`crates/mokosh-auth-oidc/src/discovery.rs`) advertises only `authorization_code` + `refresh_token`. No `client_credentials`, no password grant, so a service-to-service token mint does not exist.
+- mokosh hosts no OP and no token endpoint (PMS-295 removed the OP subsystem it used to ship), so there is nothing in this repo to mint a token from. bunyip is the OP, and the suite holds no client credentials for a service-to-service grant against it.
 - Legacy `POST /api/v1/auth/login` works only against rows in mokosh's local `users` table; SPA accounts that signed up through the bunyip hub live elsewhere and 401 there.
-- The SPA keeps its bearer in WASM thread-local memory (`mokosh-clients/src/hooks/fetch.rs`), so `page.evaluate()` / `storageState` cannot read it.
+- The SPA keeps its bearer in WASM thread-local memory (`mokosh-apps/src/hooks/fetch.rs`), so `page.evaluate()` / `storageState` cannot read it.
 
 Intercepting the real SPA auth flow is the only path that reuses production auth without registering a new client or maintaining a parallel signup pipeline.
 
@@ -66,7 +72,7 @@ Set via `e2e/.env` locally (copy from `e2e/.env.example`) or Forgejo Actions sec
 | `E2E_OIDC_CLIENT_ID` | yes | Public PKCE client id for the OP token-flow spec. |
 | `E2E_OIDC_REDIRECT_URI` | yes | redirect_uri registered for that client. Must match EXACTLY or the OP returns `invalid_redirect_uri`. Only the `code` is captured; the URL is never loaded. |
 | `E2E_TOTP_SECRET` | yes | base32 TOTP secret for the account; the second factor is computed at runtime. |
-| `E2E_FOREIGN_COMPANY_ID` | no | A company id in ANOTHER tenant, to strengthen the cross-tenant leak canary. When unset, setup falls back to a random, well-formed UUID the E2E tenant cannot own (the canary still runs). |
+| `E2E_FOREIGN_COMPANY_ID` | no | A company id in ANOTHER tenant, to strengthen the cross-tenant leak canary. Genuinely optional: the canary in `tests/contacts.spec.ts` always runs and is never skipped. When unset, `global.setup.ts` substitutes a random, well-formed UUID, so the canary only proves a NON-EXISTENT company is unreadable; set it and the canary proves a real, foreign-owned company is unreadable, which is the leak worth catching. |
 
 In CI the three vars with a deployment equivalent use the deployment's own names (`MOKOSH_OIDC_CLIENT_ID` single shared; `MOKOSH_APPS_REDIRECT_URIS_STAGING`/`_PRODUCTION`; `OIDC_ISSUER_STAGING`/`_PRODUCTION`); test-only vars use `E2E_STAGING_*` / `E2E_PRODUCTION_*`. Automatic runs (push, PR) always resolve to staging; production is manual-dispatch only.
 
@@ -82,17 +88,21 @@ Done once by a human before the suite can pass (full detail in `e2e/README.md`):
 
 ## Running locally
 
+The suite standardises on **bun**, the same package manager and Playwright launcher `.forgejo/workflows/e2e.yml` uses. `e2e/` carries a `bun.lock` and no `package-lock.json`, so `npm ci` cannot install it.
+
 ```
 cp e2e/.env.example e2e/.env   # then fill in the secrets
 just test-e2e                  # from the repo root
 # or, from e2e/:
-npm ci
-npx playwright install --with-deps chromium
-npx playwright test
-npx playwright show-report     # after a run
+bun install --frozen-lockfile
+bun x playwright install chromium firefox webkit
+bun x playwright test
+bun x playwright show-report   # after a run
 ```
 
-Any `playwright test` flag passes through, e.g. `just test-e2e --headed`. Locally on a Debian/Ubuntu box `--with-deps` is fine; in CI it is not (see Troubleshooting).
+Install all three browsers, not just Chromium: `setup` runs on Firefox and there is a WebKit project, so a Chromium-only install fails the run before the first assertion.
+
+Any `playwright test` flag passes through, e.g. `just test-e2e --headed`. On a Debian/Ubuntu box you can add `--with-deps` to the browser install to pull the system libraries; in CI it is banned (see Troubleshooting).
 
 ## CI behaviour
 
@@ -116,7 +126,7 @@ Runnable specs assert now; quarantined specs are `test.fixme` with their blocker
 
 | Spec | Status | Blocker |
 | --- | --- | --- |
-| `tests/auth.spec.ts` (logout) | `test.fixme` | PMS-148: after the PMS-142 fix merged, post-merge CI exposed a separate failure where the auth-ui login deterministically stalls when run after `setup` finishes (submit click no-ops, URL stays on `/login`). Bunyip's BUNYIP-53 `/logout` fix IS deployed; this is a different problem. |
+| `tests/auth.spec.ts` (logout) | `test.fixme` | PMS-148: after the PMS-142 fix merged, post-merge CI exposed a separate failure where the browser-project login deterministically stalls when run after `setup` finishes (submit click no-ops, URL stays on `/login`). Bunyip's BUNYIP-53 `/logout` fix IS deployed; this is a different problem. |
 | `tests/oidc.spec.ts` (OP token flow) | `test.fixme` | PMS-435 / BUNYIP-146: the diagnostic run proved `bunyip_op_session` is captured, persisted on the right domain, and replayed, yet `/oauth2/authorize` still 302s to `/login` with no `state`. Root cause is bunyip's `COOKIE_DOMAIN` / `bunyip_op_session` scoping, not an e2e forwarding defect. Un-fixme when BUNYIP-146 ships. |
 | `tests/form-validation.spec.ts` (PMS-518 / AC7) | `test.fixme` | Needs BOTH: (1) the target's mokosh-apps SPA to include the PMS-518 `FormGuard` migration (merged to mokosh-apps `main` AND staging redeployed - on an older SPA the assertions fail), and (2) the browser-login path green (shares `loginViaSpa`, blocked by the PMS-148 stall). Un-fixme once both hold. |
 
@@ -148,14 +158,14 @@ Records without a run-suffixed name (time entries, tasks, contract items, paymen
 
 **`DELETE /api/v1/contacts/companies/{id}` returns 500 in teardown.** An unguarded FK violation (`23503`) surfaces as a generic 500 instead of 400 (PMS-170). Teardown is best-effort and swallows it, so it does not fail the run, but it leaves residue the 24h sweep cleans up later.
 
-**npm / Playwright on the OpenSUSE CI runner.** The image ships `nodejs24` only: the bare `node`/`npm`/`npx` are libalternatives wrappers that dispatch to an absent `*-default` target, and versioned `npm24`/`npx24` are not installed. Run JS package management through `corepack npm` / `corepack npx`, and node scripts through the concrete `node24` binary (PMS-429 / PMS-462). Do NOT use `playwright install --with-deps` in CI: `--with-deps` shells out to `apt-get`, which the OpenSUSE runner does not have; the image already carries the X/GTK/NSS libs Chromium needs.
+**Package manager and Playwright on the OpenSUSE CI runner.** The image ships `nodejs24` and `bun`: the bare `node`/`npm`/`npx` are libalternatives wrappers that dispatch to an absent `*-default` target, and versioned `npm24`/`npx24` are not installed. So the workflow installs with `bun install --frozen-lockfile`, invokes Playwright as `bun x playwright ...`, and runs the `.mjs` gate scripts through the concrete `node24` binary (PMS-429 / PMS-462). Do NOT use `playwright install --with-deps` in CI: `--with-deps` shells out to `apt-get`, which the OpenSUSE runner does not have; the image already carries the X/GTK/NSS libraries the browsers need.
 
 **`wait-for-deploy.mjs` finds no build-relevant commit.** The Forgejo `actions/checkout` has been observed to honour `fetch-depth: 0` inconsistently and to apply object filters that strip the trees `git log -- <path>` needs, so the build-SHA walk silently returns nothing. The script self-heals (unshallow, then `git fetch --refetch`); if all attempts fail it skips the gate with a loud warning rather than poll a SHA staging never serves. Keep `BUILD_TRIGGER_PATHS` in lock-step with `on.push.paths` in `build-oci-image.yml` or the gate polls for the wrong SHA.
 
 ## References
 
 - `e2e/README.md` - suite overview, full env table, one-time provisioning + rotation sources, test-data policy
-- `e2e/playwright.config.ts` - the project model (preflight / setup / auth-ui / api)
+- `e2e/playwright.config.ts` - the project model itself (`preflight`, `setup`, `chromium`, `firefox`, `webkit`, `api`, `guard`); described in [Architecture: the project model](#architecture-the-project-model) above
 - `e2e/tests/global.setup.ts` - login + token/cookie capture and the timeout diagnostic
 - `e2e/lib/{env,fixtures,auth-state,login,factories,api}.ts` - env loading, auth fixtures, captured-artifact readers, login helper, factories, route map
 - `e2e/scripts/{wait-for-deploy,health-check}.mjs` - the CI pre-flight gates

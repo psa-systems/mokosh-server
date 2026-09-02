@@ -275,6 +275,72 @@ async fn the_email_names_the_sender_the_client_and_how_to_get_help(pool: PgPool)
     );
 }
 
+/// MAPPS-429 / PMS-836: a mail client cannot resolve a relative `src`, so the
+/// tenant logo in a request-form email has to be absolute, built from
+/// `PUBLIC_API_BASE_URL`.
+///
+/// The harness sets that base to `http://api.localhost`, deliberately not the
+/// server's own origin, so a relative path or a path joined onto the wrong base
+/// cannot pass by coincidence. PMS-836 is why this is asserted end to end:
+/// `compose.dev.yml` enumerates the dev container's environment and had no
+/// `PUBLIC_API_BASE_URL` line, so on the dev stack the value never arrived, the
+/// block rendered empty, and nothing said so.
+#[sqlx::test]
+async fn the_emailed_logo_src_is_absolute(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let agent_token = common::login(&app, &email, &password).await;
+    let (form_id, _article_id) = seed_form_with_article(&app, &agent_token, &pool, admin_id).await;
+
+    // A one-pixel PNG, the same real bytes tests/tenants.rs uploads.
+    let png: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89,
+    ];
+    let part = reqwest::multipart::Part::bytes(png.to_vec())
+        .file_name("logo.png")
+        .mime_str("image/png")
+        .expect("mime");
+    let uploaded = app
+        .client
+        .put(app.url("/api/v1/tenants/current/logo"))
+        .bearer_auth(&agent_token)
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await
+        .expect("send logo upload");
+    assert_eq!(uploaded.status(), reqwest::StatusCode::OK);
+    let tenant: serde_json::Value = uploaded.json().await.expect("tenant JSON");
+    let logo_path = tenant["branding"]["logo_url"]
+        .as_str()
+        .expect("branding carries the logo path")
+        .to_string();
+
+    let _ = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+
+    // The logo is an `<img>`, so it lives in the HTML body (migration 103 put
+    // `{{logo_html}}` at the head of the request-link template); the plain-text
+    // body carries no image at all.
+    let body_html: String = sqlx::query_scalar(
+        "SELECT body_html FROM notifications WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("a request-link email was queued with an HTML body");
+
+    assert!(
+        body_html.contains(&format!("<img src=\"http://api.localhost{logo_path}\"")),
+        "the emailed logo must be absolute, from PUBLIC_API_BASE_URL; got body_html={body_html}"
+    );
+    assert!(
+        !body_html.contains(&format!("src=\"{logo_path}\"")),
+        "a relative src never renders in a mail client; got body_html={body_html}"
+    );
+}
+
 /// The form page is reached from an email by someone with no account here, so
 /// it carries its own attribution rather than relying on the message that
 /// linked to it still being open.
@@ -310,6 +376,34 @@ async fn the_public_form_names_the_msp(pool: PgPool) {
     assert!(
         form["contact_info"].is_null(),
         "this definition carries no contact details, and none must be invented"
+    );
+
+    // PMS-776: the other branch of the same field. A definition carrying its
+    // own contact used to be returned raw, so "the service desk on 555-0100"
+    // reached a client with nothing saying whose service desk it is.
+    let resp = app
+        .client
+        .patch(app.url(&format!("/api/v1/forms/{form_id}")))
+        .bearer_auth(&agent_token)
+        .json(&json!({ "contact_info": "the service desk on 555-0100" }))
+        .send()
+        .await
+        .expect("patch contact_info");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let (token, _link_id) = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+    let framed: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/public/request-forms/{token}")))
+        .send()
+        .await
+        .expect("send public get")
+        .json()
+        .await
+        .expect("public form JSON");
+    assert_eq!(
+        framed["contact_info"].as_str(),
+        Some(format!("{tenant_name} at the service desk on 555-0100").as_str()),
+        "both branches of this field name the organisation"
     );
 }
 
@@ -639,4 +733,69 @@ async fn an_expired_or_guessed_link_is_refused_identically(pool: PgPool) {
         .await
         .expect("send wrong secret");
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// PMS-773 AC1: the public request-form surface is the least tolerant of a
+/// bare refusal (an external client mid-form, with no account, several of whom
+/// can share one NAT address), so its 429 carries the wait the limiter already
+/// computed instead of logging it and dropping it. The quota check runs before
+/// the token is resolved, so a bogus token is enough to exhaust the bucket.
+#[sqlx::test]
+async fn the_public_form_429_carries_the_wait(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let token = format!("{}.{}", Uuid::new_v4(), "x".repeat(64));
+    let url = app.url(&format!("/api/v1/public/request-forms/{token}"));
+
+    // 30/min per IP: spend the bucket, then the next read is refused.
+    let mut refused_read = None;
+    for _ in 0..40 {
+        let resp = app
+            .client
+            .get(&url)
+            .send()
+            .await
+            .expect("send public form read");
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            refused_read = Some(resp);
+            break;
+        }
+    }
+    assert_rate_limited(refused_read.expect("40 reads must exhaust a 30/min bucket")).await;
+
+    // The submit handler shares the bucket, so it is refused the same way.
+    let refused_write = app
+        .client
+        .post(&url)
+        .json(&json!({ "payload": {} }))
+        .send()
+        .await
+        .expect("send public form submit");
+    assert_rate_limited(refused_write).await;
+}
+
+/// The 429 contract every rate-limited surface shares (PMS-773): the wait in
+/// the header and in the body, and never cached.
+async fn assert_rate_limited(resp: reqwest::Response) {
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("a 429 carries a Retry-After header");
+    assert!(retry_after >= 1, "the wait is at least one second");
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "a refusal must never be cached"
+    );
+    let body: serde_json::Value = resp.json().await.expect("429 body is JSON");
+    assert_eq!(body["error"], "rate_limited");
+    assert_eq!(
+        body["message"],
+        "Too many requests, please try again shortly"
+    );
+    assert_eq!(body["retry_after_seconds"], retry_after);
 }

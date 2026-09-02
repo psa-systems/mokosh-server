@@ -27,9 +27,9 @@ import { attachPageDiagnostics } from '../lib/page-diagnostics';
 // `attachPageDiagnostics` folds the URL trail + request list into any thrown
 // error - fj cannot download the Playwright trace artifact, so this is the only
 // way to see the failure mode in CI logs. `auth.spec.ts` is `test.fixme` (its
-// remaining red is the PMS-148 logout redirect), so this spec runs ALONE in the
-// `form-ui` project: two logins total (setup + form-ui), under the 5/min/email
-// cap.
+// remaining red is the PMS-148 logout redirect), so this is the only spec in
+// the browser projects that logs in: two logins total per browser (setup plus
+// this one), under the 5/min/email cap.
 // In-app sidebar/list navigation. Firefox paints the post-WASM-nav DOM more
 // slowly than Chromium/WebKit, so a bare `.click()` on its default action
 // timeout could miss the link before it rendered (PMS-543, run 2782:

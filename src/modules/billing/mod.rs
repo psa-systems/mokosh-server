@@ -26,17 +26,21 @@
 //! doc). Manual payments and refunds keep working through the existing
 //! `/payments` path unchanged.
 
+pub mod credential_move;
+pub mod documents;
+pub mod issuer;
 pub mod models;
-pub mod pdf;
 pub mod provider;
 pub mod routes;
 pub mod service;
-pub mod stripe_webhook;
+pub mod webhook;
 pub mod worker;
 
+pub use credential_move::{CredentialMoveOutcome, GatewayCredentialMover};
+pub use issuer::Issuer;
 pub use models::*;
 pub use provider::{CheckoutParams, CheckoutSession, PaymentEvent, PaymentProvider, RefundLine};
 pub use routes::billing_routes;
 pub use service::BillingService;
-pub use stripe_webhook::{stripe_webhook_handler, StripeWebhookState};
+pub use webhook::{provider_webhook_handler, ProviderWebhookState};
 pub use worker::RecurringInvoicingWorker;

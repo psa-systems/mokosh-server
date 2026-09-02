@@ -1,0 +1,51 @@
+# PMS-965: catch a migration version collision the moment the merge creates it.
+#
+# `scripts/check-migration-prefixes.nu` (PMS-198) already runs on every pull
+# request as part of check.yml, and it passed on both of the branches that put a
+# migration numbered 127 on main: each one held only its own 127, so neither had
+# a collision to find. The collision is created BY the merge, and DEV-612
+# deliberately removed `push: main` from check.yml because a post-merge run of a
+# COMPILING workflow gates nothing and costs 189s of runner time per merge.
+#
+# That reasoning does not carry over to this guard. It compiles nothing, it runs
+# in about a second, and its whole subject is the interaction between two
+# branches, which is precisely what no pull-request run can see. So it gets the
+# trigger check.yml gave up, and `scripts/check-single-build.nu` classifies this
+# workflow as "compiles nothing" and leaves it alone, the way it already does
+# for e2e.yml.
+#
+# This ALERTS rather than gates: by the time it runs, the merge has landed. The
+# zero-cost thing that actually gates is Forgejo branch protection's "require
+# the branch to be up to date before merging", which DEV-612 already names: it
+# forces the second branch to rebase onto the first, at which point the prefix
+# guard sees both files on the pull request where it can still be fixed. This
+# workflow is the backstop for when that setting is off.
+
+name: migration collision
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  prefixes:
+    name: migration version collision
+    # Base label: this job runs two Nushell scripts and compiles nothing, so it
+    # has no need of the dev image's `cc` / `gcc` / `ld` or OpenSSL headers
+    # (PMS-719).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Clone the repository
+        # fetch-depth: 0 so the immutability check can diff against origin/main.
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Migration prefixes are unique
+        run: nu scripts/check-migration-prefixes.nu
+
+      - name: No committed migration was modified
+        run: nu scripts/check-migration-immutability.nu

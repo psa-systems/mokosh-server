@@ -24,7 +24,7 @@ use crate::modules::auth::{
     auth_routes, bunyip_webhook::BunyipWebhookState, AuthMiddleware, AuthService,
 };
 use crate::modules::billing::{
-    billing_routes, stripe_webhook_handler, BillingService, StripeWebhookState,
+    billing_routes, provider_webhook_handler, BillingService, ProviderWebhookState,
 };
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
@@ -33,6 +33,9 @@ use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
 use crate::modules::forms::{forms_routes, public_form_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
+use crate::modules::knowledge_base::attachments::{
+    kb_attachment_routes, public_kb_attachment_routes, KbAttachmentConfig, KbAttachmentService,
+};
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
@@ -51,8 +54,8 @@ use crate::modules::teams::{me_teams_routes, teams_routes, TeamsService};
 use crate::modules::tenants::{public_tenant_routes, tenant_routes, TenantService};
 use crate::modules::ticket_templates::{ticket_template_routes, TicketTemplatesService};
 use crate::modules::tickets::{
-    agent_attachment_routes, contact_notes_routes, ticket_routes, AttachmentConfig,
-    AttachmentService, TicketService,
+    agent_attachment_routes, contact_notes_routes, public_ticket_attachment_routes, ticket_routes,
+    AttachmentConfig, AttachmentService, TicketService,
 };
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::modules::workflows::{workflow_routes, WorkflowsService};
@@ -67,22 +70,20 @@ use crate::version_check::version_check;
 pub fn create_api_router(
     db: Database,
     jwt_secret: String,
-    google_oauth: Arc<google_oauth_flow::Client>,
     client_origin: String,
     // MAPPS-425: base for emailed links to pages that exist only in the
     // mokosh-apps SPA. Distinct from `client_origin`, which is the apex on
     // every deployed environment because bunyip-web hosts login there.
     spa_base_url: String,
     cors_origins: Vec<String>,
-    super_admin_emails: Vec<String>,
-    cookie_secure: bool,
     bunyip_verifier: Option<crate::modules::auth::oidc_rs::Verifier>,
     // PMS-638: the live, swappable mailer handle. Upcast to `Arc<dyn Mailer>`
     // for the services below; the concrete handle is threaded into
     // `settings_routes` so the admin email-settings endpoint can hot-swap it.
     shared_mailer: Arc<crate::utils::email::SharedMailer>,
     // 32-byte AES-256-GCM key. Used for at-rest encryption of any
-    // per-tenant secret material (today: payment-gateway configs).
+    // per-tenant secret material (payment-gateway configs, and the legacy
+    // TOTP shared secret on `users.mfa_secret` since PMS-871).
     encryption_key: [u8; 32],
     // PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
     // Verified as `hex(hmac_sha256(body, secret))` against the
@@ -110,9 +111,36 @@ pub fn create_api_router(
     // `None` = uncapped (production today); `Some(N)` = 409 on further creates
     // once `SELECT COUNT(*) FROM tenants` reaches N.
     max_tenants: Option<usize>,
+    // PMS-904: self-hosted (mokosh owns platform identity) or saas (federated
+    // to Bunyip SSO), from MOKOSH_DEPLOYMENT_MODE in main.rs. Decides whether
+    // the mail that exists only to service a local password is sent at all.
+    deployment_mode: crate::utils::deployment::DeploymentMode,
+    // PMS-968: where tenant-supplied secrets live, chosen once at boot by
+    // `secrets::store_from_env`. Injected rather than built here so this
+    // function cannot pick a backend, and so a deployment on Infisical has
+    // every `BillingService` below on Infisical rather than whichever ones
+    // remembered to ask.
+    secrets: Arc<dyn crate::secrets::SecretStore>,
 ) -> Router {
     let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
+
+    // PMS-905: `bunyip_verifier` is moved into the auth middleware below, so
+    // capture the one fact the auth service needs from it first.
+    let sso_mounted = bunyip_verifier.is_some();
+    if deployment_mode.is_saas() && !sso_mounted {
+        // Loud, but not fatal. A `saas` deployment with no verifier can
+        // authenticate nobody through SSO, so the local password path is the
+        // only way in and stays open deliberately (see
+        // `AuthService::local_password_auth_disabled`). Making this a boot
+        // failure instead is precisely PMS-289, which took staging and
+        // production down and needed PMS-292 to restore service.
+        tracing::error!(
+            "MOKOSH_DEPLOYMENT_MODE=saas but no Bunyip RS verifier is mounted (OIDC_ISSUER / \
+             OIDC_AUDIENCE unset): local password login remains ENABLED because it is the only \
+             auth path this instance has. Configure the verifier, or set the mode to self-hosted.",
+        );
+    }
 
     // Create services. NotificationsService is constructed first so a
     // shared clone can be threaded into AuthService and TicketService,
@@ -125,19 +153,26 @@ pub fn create_api_router(
     let auth_service = AuthService::with_dispatcher(
         db.clone(),
         jwt_secret.clone(),
-        super_admin_emails,
         mailer.clone(),
         // MAPPS-425: stays on `client_origin` deliberately. This is the base
         // for `/reset-password/{token}`, and bunyip-web at the apex owns the
         // canonical reset page; mokosh-apps' route only redirects there. Same
-        // for the invitation link, the OAuth postMessage origin and the
-        // not-a-frontend fallback below. Only links to pages that exist ONLY
-        // in mokosh-apps take `spa_base_url`.
+        // for the invitation link and the not-a-frontend fallback below. Only
+        // links to pages that exist ONLY in mokosh-apps take `spa_base_url`.
         client_origin.clone(),
         notifications_service.clone(),
     )
-    .with_geoip(geoip.clone())
-    .with_login_approval(login_approval_enabled);
+    .with_geoip(geoip)
+    .with_login_approval(login_approval_enabled)
+    .with_deployment_mode(deployment_mode)
+    // PMS-905: local password auth closes only when a working alternative
+    // exists. `bunyip_verifier` is `Some` exactly when OIDC_ISSUER and
+    // OIDC_AUDIENCE are configured, so it is the signal for "SSO is set up
+    // here" rather than a guess from the mode alone.
+    .with_sso_mounted(sso_mounted)
+    // PMS-871: `users.mfa_secret` is AES-256-GCM at rest under the same key
+    // the payment-gateway configs use, so the auth service holds it too.
+    .with_encryption_key(encryption_key);
     #[cfg(feature = "multi-tenant")]
     // PMS-729 finalize: attach the dispatcher + SPA origin so a super-admin
     // creating a tenant produces an emailed setup link for the fresh admin
@@ -177,6 +212,7 @@ pub fn create_api_router(
         // MAPPS-425: the Pay Now link is `/portal/invoices/{id}`, a mokosh-apps
         // route, so it takes the SPA origin.
         spa_base_url.clone(),
+        secrets.clone(),
     );
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
@@ -292,7 +328,7 @@ pub fn create_api_router(
         // orchestrators to decide whether to restart the container.
         .route("/health", get(health_check))
         // Readiness probe (PMS-130): also pings the DB, and best-effort
-        // pings Infisical when `INFISICAL_BASE_URL` is set. Returns 503
+        // pings Infisical when `INFISICAL_ADDRESS` is set. Returns 503
         // with a JSON breakdown when a dependency is down so the
         // orchestrator drains traffic until the probe goes green.
         .route(
@@ -309,21 +345,12 @@ pub fn create_api_router(
         // latest published release and reports whether an upgrade is
         // available. Disabled (no outbound request) when the env var is unset.
         .route("/version/check", get(version_check))
-        // Auth routes
-        .nest(
-            "/auth",
-            auth_routes(
-                // MAPPS-493 (phase 4): share the AuthService Arc with
-                // tenant_routes so `/tenants/self-serve` can decode
-                // identity_tokens minted by /auth/login. AuthService
-                // derives Clone, so this is a cheap Arc bump.
-                auth_service.clone(),
-                google_oauth,
-                client_origin.clone(),
-                jwt_secret.clone(),
-                cookie_secure,
-            ),
-        )
+        // Auth routes. MAPPS-493 (phase 4): share the AuthService Arc with
+        // tenant_routes so `/tenants/self-serve` can decode identity_tokens
+        // minted by /auth/login. AuthService derives Clone, so this is a
+        // cheap Arc bump. PMS-837 removed the Google OAuth popup routes and
+        // their `google_oauth` / `cookie_secure` parameters.
+        .nest("/auth", auth_routes(auth_service.clone()))
         // MAPPS-513: platform super-admin routes. Distinct credential
         // store (`platform_admins`) and distinct JWT typ so the
         // super-admin persona is isolated from the tenant identity
@@ -457,6 +484,13 @@ pub fn create_api_router(
         .merge(assets_routes(assets_service, ticket_service.clone()))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
+        // PMS-923: images an article embeds. Upload / list / delete are
+        // manager-gated here; the READ is public (see the public tree below),
+        // because an `<img>` cannot carry an Authorization header.
+        .merge(kb_attachment_routes(KbAttachmentService::new(
+            db.clone(),
+            KbAttachmentConfig::from_env(),
+        )))
         // Org membership invitations (PMS-244): admin-only, tenant-scoped.
         .merge(invitations_routes(invitations_service))
         // Notifications: channels + templates + prefs + inbox + rules
@@ -651,15 +685,38 @@ pub fn create_api_router(
     // secret). The tenant id in the path selects which tenant's secret to verify
     // against; it is not itself a credential. Its own `BillingService` instance
     // (the router's `billing_service` is moved into `billing_routes`).
-    let stripe_webhook_state = Arc::new(StripeWebhookState {
-        billing: Arc::new(BillingService::with_encryption_key(
+    let stripe_webhook_state = Arc::new(ProviderWebhookState {
+        billing: Arc::new(BillingService::with_secrets(
             db.clone(),
             encryption_key,
+            secrets.clone(),
         )),
+        provider_id: "stripe",
     });
     let stripe_webhooks = Router::new()
-        .route("/webhooks/{tenant_id}", post(stripe_webhook_handler))
+        .route("/webhooks/{tenant_id}", post(provider_webhook_handler))
         .with_state(stripe_webhook_state)
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
+
+    // PMS-969: PayPal webhook receiver, same handler and same shape, nested
+    // under `/api/v1/paypal`. PayPal authenticates itself with five
+    // `PAYPAL-TRANSMISSION-*` headers that the provider checks back with
+    // PayPal rather than locally. Its prefix is in `RAW_BODY_PATHS` for the
+    // same reason Stripe's is: the verify call sends the body back to PayPal
+    // to compare, so a byte the sanitizer rewrote is a verification failure.
+    let paypal_webhook_state = Arc::new(ProviderWebhookState {
+        billing: Arc::new(BillingService::with_secrets(
+            db.clone(),
+            encryption_key,
+            secrets.clone(),
+        )),
+        provider_id: "paypal",
+    });
+    let paypal_webhooks = Router::new()
+        .route("/webhooks/{tenant_id}", post(provider_webhook_handler))
+        .with_state(paypal_webhook_state)
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));
@@ -681,6 +738,25 @@ pub fn create_api_router(
         // MAPPS-618 phase B: same shape for the Company-scoped
         // assets (logo / favicon / background).
         .merge(crate::modules::branding::routes::public_routes(db.clone()))
+        // PMS-923: an image embedded in a KB article. Unauthenticated by
+        // necessity, not by preference: the browser fetches it as `<img src>`,
+        // which carries no Authorization header, and the SPA holds a bearer
+        // rather than a cookie. The attachment's v4 UUID is the only
+        // credential, so anyone holding the URL can fetch the image even for an
+        // `internal` article. Same bargain as the logo above.
+        .merge(public_kb_attachment_routes(KbAttachmentService::new(
+            db.clone(),
+            KbAttachmentConfig::from_env(),
+        )))
+        // PMS-941: an image embedded in a ticket description or note, for the
+        // same reason as the KB image above and with one extra guard: this
+        // table also holds portal uploads and inbound-email attachments, so
+        // the read serves only rows the inline-image upload path flagged with
+        // `is_inline`. Anything else 404s here exactly as an unknown id does.
+        .merge(public_ticket_attachment_routes(AttachmentService::new(
+            db.clone(),
+            AttachmentConfig::from_env(),
+        )))
         .merge(public_form_routes(
             FormsService::with_request_links(
                 db.clone(),
@@ -722,9 +798,19 @@ pub fn create_api_router(
         .nest("/api/v1/contact", contact_api)
         .nest("/api/v1/bunyip", bunyip_webhooks)
         .nest("/api/v1/stripe", stripe_webhooks)
+        .nest("/api/v1/paypal", paypal_webhooks)
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))
+        // PMS-924: strip invisible characters from every JSON request body
+        // before any extractor deserializes it. Added first, so it is the
+        // INNERMOST of the outer layers: it runs after CORS has answered any
+        // preflight, and it sees the full `/api/v1/...` path (nesting strips the
+        // prefix only once routing starts), which is what lets it exempt the
+        // three signature-verified receivers by path. One layer rather than a
+        // `SanitizedJson<T>` extractor on 157 `Json<T>` handlers, so a route
+        // added later cannot forget to opt in.
+        .layer(middleware::from_fn(crate::utils::text::sanitize_json_body))
         // Apply global middleware
         .layer(TraceLayer::new_for_http())
         .layer(CompressionLayer::new())
@@ -757,6 +843,10 @@ async fn not_a_frontend(
         .strip_prefix("api.msp.")
         .map(|tld| format!("https://{tld}"))
         .unwrap_or(fallback_origin);
+    // PMS-789: read the cached name. This handler has no `State` and must
+    // render when the database is down, which is when it is most looked at.
+    // Escaped: `sanitize` bars control characters, not `<` or `&`.
+    let app = crate::utils::html::html_escape(&crate::utils::app_name::app_name());
     let body = format!(
         "<!doctype html>\n\
          <html lang=\"en\">\n\
@@ -768,7 +858,7 @@ async fn not_a_frontend(
          </head>\n\
          <body>\n\
          <h1>This is an API endpoint.</h1>\n\
-         <p>You're looking at the Mokosh backend API. There is no user interface here.</p>\n\
+         <p>You're looking at the {app} backend API. There is no user interface here.</p>\n\
          <p>Visit <a href=\"{hub_link}\">{hub_link}</a> to reach the application.</p>\n\
          </body>\n\
          </html>\n"
@@ -790,7 +880,7 @@ async fn health_check() -> &'static str {
 ///   distinguishes a process that booted from one that can actually
 ///   serve a request.
 /// - **Infisical** (best-effort): if the operator set
-///   `INFISICAL_BASE_URL` at process start, a 1-second HTTP probe
+///   `INFISICAL_ADDRESS` at process start, a 1-second HTTP probe
 ///   against `<base>/api/status`. Mokosh-server loads Infisical
 ///   secrets at boot only, so a transient Infisical outage does
 ///   not break in-flight requests; the probe still surfaces the
@@ -880,7 +970,7 @@ async fn bounded_db_ping(
 }
 
 /// Captured-at-boot Infisical probe state. The handler used to read
-/// `INFISICAL_BASE_URL` and build a fresh `reqwest::Client` on every
+/// `INFISICAL_ADDRESS` and build a fresh `reqwest::Client` on every
 /// request, which leaked file descriptors and re-resolved DNS under
 /// repeated orchestrator polling. Cache the parsed config + the HTTP
 /// client in a `OnceLock` so subsequent probes reuse the connection
@@ -894,7 +984,7 @@ struct InfisicalProbe {
     /// Sanitised display form of `<base>` (scheme + host[:port] only,
     /// no userinfo or query string) used inside error strings so the
     /// response body and access log do not echo credentials the
-    /// operator may have embedded in `INFISICAL_BASE_URL`.
+    /// operator may have embedded in `INFISICAL_ADDRESS`.
     display: String,
     client: reqwest::Client,
 }
@@ -903,11 +993,19 @@ static INFISICAL_PROBE: std::sync::OnceLock<Option<InfisicalProbe>> = std::sync:
 
 fn infisical_probe() -> Option<&'static InfisicalProbe> {
     INFISICAL_PROBE
-        .get_or_init(|| build_infisical_probe(std::env::var("INFISICAL_BASE_URL").ok()))
+        .get_or_init(|| {
+            // GOV-50: the Infisical instance URL is read from the canonical
+            // INFISICAL_ADDRESS only.
+            let raw = std::env::var("INFISICAL_ADDRESS")
+                .ok()
+                .filter(|v| !v.trim().is_empty());
+            build_infisical_probe(raw)
+        })
         .as_ref()
 }
 
-/// Build the probe from the raw `INFISICAL_BASE_URL` value. Split out of
+/// Build the probe from the resolved Infisical address (`INFISICAL_ADDRESS`).
+/// Split out of
 /// [`infisical_probe`] so the blank-is-unconfigured rule is unit testable
 /// without mutating the process-global env behind the `OnceLock`.
 ///
@@ -922,7 +1020,7 @@ fn build_infisical_probe(raw: Option<String>) -> Option<InfisicalProbe> {
     }
     let trimmed = base.trim_end_matches('/').to_string();
     // Best-effort credential scrub for error strings. If
-    // `INFISICAL_BASE_URL` does not parse as a URL, fall back
+    // `INFISICAL_ADDRESS` does not parse as a URL, fall back
     // to the literal trimmed string (no leak path exists for
     // a value that does not parse anyway, but stay defensive).
     let display = match url::Url::parse(&trimmed) {
@@ -947,7 +1045,7 @@ fn build_infisical_probe(raw: Option<String>) -> Option<InfisicalProbe> {
 }
 
 /// Probe Infisical's `/api/status` endpoint when the operator opted
-/// in via `INFISICAL_BASE_URL`. Returns:
+/// in via `INFISICAL_ADDRESS`. Returns:
 ///
 /// - `Ok(true)` - probe ran and got a 2xx response
 /// - `Ok(false)` - probe skipped (env var unset or blank)
@@ -1061,5 +1159,51 @@ mod tests {
             err.contains("http://127.0.0.1:1"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Drive the same `CompressionLayer::new()` the router applies globally and
+    /// report the `content-encoding` it negotiated for `accept_encoding`.
+    async fn negotiated_encoding(accept_encoding: &str) -> String {
+        use tower::ServiceExt;
+
+        // Well past the compression predicate's 32-byte floor, so the layer
+        // actually encodes instead of passing the body through.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async { "a body long enough to clear the compression size floor" }),
+            )
+            .layer(CompressionLayer::new());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header(header::ACCEPT_ENCODING, accept_encoding)
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .map(|v| v.to_str().expect("encoding is ascii").to_owned())
+            .unwrap_or_default()
+    }
+
+    /// PMS-780: `CompressionLayer::new()` only offers the algorithms whose
+    /// tower-http cargo features are compiled in, so dropping `compression-br`
+    /// from Cargo.toml would silently downgrade every brotli client to gzip
+    /// with no code change to review. This is the guard that fails instead.
+    #[tokio::test]
+    async fn brotli_is_negotiated_when_the_client_advertises_it() {
+        assert_eq!(negotiated_encoding("br,gzip").await, "br");
+    }
+
+    /// The gzip-only client keeps getting gzip: brotli is added, not swapped.
+    #[tokio::test]
+    async fn gzip_only_client_still_gets_gzip() {
+        assert_eq!(negotiated_encoding("gzip").await, "gzip");
     }
 }

@@ -1,6 +1,7 @@
 //! Time tracking module: time entries, timesheets, active timers,
-//! rounding rules, work types. Schema for all five lives in
-//! `001_initial_schema.sql`. Endpoints land incrementally across PMS-42.
+//! rounding rules, work types. Schema lives in
+//! `migrations/006_time_tracking.sql` (timesheets are aggregated from
+//! `time_entries`, not a table). Endpoints land incrementally across PMS-42.
 //!
 //! Shared module: the client (mokosh-apps) carries a byte-identical copy and
 //! compiles only the model types. Routes + service are gated behind the

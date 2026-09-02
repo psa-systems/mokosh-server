@@ -142,15 +142,30 @@ fn required_by_rule(
             field: target,
             when_field,
             equals,
-        } => {
-            target == &field.name
-                && object
-                    .get(when_field)
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.trim() == equals)
-                    .unwrap_or(false)
-        }
+        } => target == &field.name && condition_matches(object.get(when_field), equals),
+        // PMS-898: the read path is deliberately tolerant. A stored rule this
+        // build cannot name makes no field required here; it is not evidence
+        // that the submission is wrong, only that this binary is older than
+        // the rule. The write path refuses to create one in the first place,
+        // so reaching this arm means a definition written by a newer server.
+        FormRule::Unknown => false,
     })
+}
+
+/// Whether a condition value equals the rule's `equals` string.
+///
+/// `equals` is authored as text whatever the condition field's type, so the
+/// answer is compared by its JSON rendering: reading it with `as_str` alone
+/// made a `true` answer on a boolean field yield `None` and the rule never
+/// fire, while the SPA (which holds every answer as a string) did fire it.
+/// PMS-842.
+fn condition_matches(value: Option<&Value>, equals: &str) -> bool {
+    match value {
+        Some(Value::String(s)) => s.trim() == equals,
+        Some(Value::Bool(b)) => b.to_string() == equals,
+        Some(Value::Number(n)) => n.to_string() == equals,
+        _ => false,
+    }
 }
 
 /// Type and rule checks for a value already known to be present.
@@ -180,6 +195,15 @@ fn validate_value(
                 ));
             }
         }
+        // PMS-898: a stored field type this build cannot name. It cannot have
+        // been authored here (the write path refuses it, and `from_str` cannot
+        // produce it), so reaching this arm means a definition written by a
+        // newer server. Accept the answer as a string and let that server's own
+        // validation be the authority, rather than rejecting a submission on
+        // the strength of not recognising the question.
+        FieldType::Unknown => {
+            as_string(field, value)?;
+        }
         FieldType::Date => {
             let s = as_string(field, value)?;
             let Ok(parsed) = NaiveDate::parse_from_str(s, DATE_FORMAT) else {
@@ -204,17 +228,6 @@ fn validate_value(
                     "option",
                 ));
             }
-        }
-        FieldType::File => {
-            // The JSON payload carries a placeholder (typically a
-            // filename or a comma-separated list) so the submission
-            // remains valid; the actual bytes ride the follow-up
-            // per-note multipart upload the SPA fires with the
-            // returned ticket_id. `is_required` semantics live on
-            // the SPA side: an unchecked file input renders an empty
-            // string, which trips the required-if-empty rule the
-            // same way any other field does.
-            let _ = as_string(field, value)?;
         }
     }
     Ok(())
@@ -518,6 +531,55 @@ mod tests {
         )
         .expect_err("an optional field that IS answered must still be valid");
         assert_eq!(codes(&err), vec!["email"]);
+    }
+
+    /// PMS-842: the condition field can be a checkbox. `equals` is authored as
+    /// text whatever the type, so `"true"` must match a JSON `true`, which is
+    /// what the SPA already does and what the server used to miss.
+    #[test]
+    fn required_if_fires_on_a_boolean_condition_field() {
+        let fields = vec![
+            field("keep_mailbox", FieldType::Boolean, true),
+            field("forward_to", FieldType::Email, false),
+        ];
+        let rules = vec![FormRule::RequiredIf {
+            field: "forward_to".into(),
+            when_field: "keep_mailbox".into(),
+            equals: "true".into(),
+        }];
+
+        let err = validate_submission(
+            &fields,
+            &rules,
+            &serde_json::json!({"keep_mailbox": true}),
+            today(),
+        )
+        .expect_err("keeping the mailbox without an address");
+        assert_eq!(codes(&err), vec!["required"]);
+        assert_eq!(fields_of(&err), vec!["forward_to"]);
+
+        validate_submission(
+            &fields,
+            &rules,
+            &serde_json::json!({"keep_mailbox": false}),
+            today(),
+        )
+        .expect("no address needed when the mailbox is not kept");
+
+        // The `false` side of the same rule is symmetric.
+        let negated = vec![FormRule::RequiredIf {
+            field: "forward_to".into(),
+            when_field: "keep_mailbox".into(),
+            equals: "false".into(),
+        }];
+        let err = validate_submission(
+            &fields,
+            &negated,
+            &serde_json::json!({"keep_mailbox": false}),
+            today(),
+        )
+        .expect_err("the rule must fire on false too");
+        assert_eq!(fields_of(&err), vec!["forward_to"]);
     }
 
     #[test]

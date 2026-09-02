@@ -2,26 +2,26 @@
 
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::{header, header::SET_COOKIE, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Redirect, Response},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
 };
-use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    google_login, rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest,
-    CompleteOnboardingRequest, CreateApiKeyRequest, CreateApiKeyResponse, CreateUserRequest,
-    ForgotPasswordRequest, ListUsersFilter, LoginRequest, LoginResponse, MfaDisableRequest,
-    MfaEnableRequest, MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest,
-    RefreshTokenResponse, ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
+    rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest, CompleteOnboardingRequest,
+    CreateApiKeyRequest, CreateApiKeyResponse, CreateUserRequest, ForgotPasswordRequest,
+    ListUsersFilter, LoginRequest, MfaDisableRequest, MfaEnableRequest, MfaEnableResponse,
+    MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse, ResetPasswordRequest, SessionInfo,
+    UpdateUserRequest, UserResponse,
 };
 use crate::modules::auth::middleware::{RequireAuth, RequireAuthState, RequireManager};
-use crate::utils::error::{AppError, AppResult};
+use crate::modules::auth::TenantScoped;
+use crate::utils::error::{rate_limited_response, AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 use mokosh_types::auth::MembershipView;
 
@@ -29,16 +29,6 @@ use mokosh_types::auth::MembershipView;
 #[derive(Clone)]
 pub struct AuthRouterState {
     pub auth_service: Arc<AuthService>,
-    pub google_oauth: Arc<google_oauth_flow::Client>,
-    /// Origin where the SPA is served. Used as the `postMessage` target
-    /// origin in the popup-closing HTML.
-    pub client_origin: String,
-    /// JWT secret used to HMAC-sign the OAuth state cookie. Same key as
-    /// the access/refresh token signer.
-    pub jwt_secret: String,
-    /// Whether to set the `Secure` flag on the OAuth state cookie.
-    /// `false` over plain HTTP localhost in dev; `true` in prod.
-    pub cookie_secure: bool,
     /// Layered (per-IP + per-email) login rate limiter (PMS-4 AC2 / F2).
     /// Lives for the lifetime of the router so quota state survives
     /// across requests. The check happens inline at the top of the
@@ -51,28 +41,29 @@ pub struct AuthRouterState {
     /// Checked inline in the `forgot_password` handler for the same reason as
     /// login (the email lives in the request body).
     pub forgot_password_limiter: Arc<rate_limit::AuthRateLimiter>,
+    /// Failure-counted (per-IP + per-user-id) limiter for the password re-auth
+    /// on `/me/password` and `/me/mfa/disable` (PMS-881, audit F6). ONE
+    /// instance shared by both routes: they re-check the same credential, so
+    /// grinding it through one after exhausting the other must not hand the
+    /// attacker a fresh budget. Checked inline in each handler, before the
+    /// service call that compares the password.
+    pub reauth_limiter: Arc<rate_limit::ReauthRateLimiter>,
 }
 
 /// Create the auth router
-pub fn auth_routes(
-    auth_service: AuthService,
-    google_oauth: Arc<google_oauth_flow::Client>,
-    client_origin: String,
-    jwt_secret: String,
-    cookie_secure: bool,
-) -> Router {
+pub fn auth_routes(auth_service: AuthService) -> Router {
     let state = AuthRouterState {
         auth_service: Arc::new(auth_service),
-        google_oauth,
-        client_origin,
-        jwt_secret,
-        cookie_secure,
         // Login: 20/min per IP (NAT'd offices), 5/min per email (account cap).
         login_limiter: rate_limit::AuthRateLimiter::new(20, 5),
         // Forgot-password: rarer than login, so tighter. 10/min per IP,
         // 3/min per email - enough for a fumbling user, caps reset-email
         // bombing of a known address (PMS-680).
         forgot_password_limiter: rate_limit::AuthRateLimiter::new(10, 3),
+        // Re-auth: 10/min per IP, 5/min per user. Only FAILED re-auths are
+        // counted, and these are interactive settings screens, so a legitimate
+        // user mistyping their password twice never comes near it.
+        reauth_limiter: rate_limit::ReauthRateLimiter::new(10, 5),
     };
 
     Router::new()
@@ -90,6 +81,10 @@ pub fn auth_routes(
         // new tid + mid so subsequent requests scope to the picked tenant.
         .route("/switch-tenant/{tenant_id}", post(switch_tenant))
         .route("/logout", post(logout))
+        // PMS-880: sign out everywhere. Authenticated like the protected
+        // routes below (it needs the caller's identity), grouped here with its
+        // single-session sibling because the two are one feature.
+        .route("/logout-all", post(logout_all))
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))
         .route("/reset-password", post(reset_password))
@@ -102,9 +97,8 @@ pub fn auth_routes(
             "/set-password/context/{token}",
             axum::routing::get(set_password_context),
         )
-        // Google OAuth
-        .route("/google", get(google_authorize))
-        .route("/google/callback", get(google_callback))
+        // PMS-837: no `/google` mounts. The popup sign-in flow was retired as
+        // unconsumed; see the module doc in `mod.rs`.
         // Protected routes
         .route("/me", get(get_current_user))
         .route("/me", put(update_current_user))
@@ -125,34 +119,18 @@ pub fn auth_routes(
         .route("/me/api-keys", get(list_api_keys))
         .route("/me/api-keys", post(create_api_key))
         .route("/me/api-keys/{key_id}", delete(revoke_api_key))
+        // PMS-921: the staff directory. Any authenticated user of the tenant,
+        // unlike the user-management routes below. Placed apart from them on
+        // purpose: it is a different audience and a different projection, and
+        // grouping it with `/users` invites somebody to "tidy" it under the
+        // same guard.
+        .route("/directory", get(list_directory))
         // User management (admin only)
         .route("/users", get(list_users))
         .route("/users", post(create_user))
         .route("/users/{user_id}", get(get_user))
         .route("/users/{user_id}", put(update_user))
         .with_state(state)
-}
-
-/// Build the 429 response shared by the rate-limited auth endpoints (login and
-/// forgot-password): a `rate_limited` JSON body plus a `Retry-After` header and
-/// a `no-store` cache directive. `retry_after` is the limiter's suggested wait
-/// in seconds.
-fn rate_limited_response(retry_after: u64, message: &str) -> Response {
-    let mut resp = (
-        StatusCode::TOO_MANY_REQUESTS,
-        Json(serde_json::json!({
-            "error": "rate_limited",
-            "message": message,
-            "retry_after_seconds": retry_after,
-        })),
-    )
-        .into_response();
-    let h = resp.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
-        h.insert(header::RETRY_AFTER, v);
-    }
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
 }
 
 /// Login endpoint. Rate-limited per `(source IP, lowercased email)`
@@ -206,10 +184,25 @@ async fn login(
             .trim()
             .is_empty();
     let response = if has_tenant_hint {
-        state
+        match state
             .auth_service
             .login(&request, ip_address, user_agent)
-            .await?
+            .await
+        {
+            Ok(response) => response,
+            // PMS-773: the persistent second-factor lockout knows exactly when it
+            // lifts, so it answers with the same Retry-After contract as the
+            // limiter above instead of a bare 429.
+            Err(AppError::RateLimited {
+                retry_after_seconds: Some(retry_after),
+            }) => {
+                return Ok(rate_limited_response(
+                    retry_after,
+                    "Too many failed verification codes, please try again later",
+                ))
+            }
+            Err(other) => return Err(other),
+        }
     } else {
         state
             .auth_service
@@ -354,6 +347,72 @@ async fn logout(
         )
         .await;
         let _ = tx.commit().await;
+    }
+
+    Ok(())
+}
+
+/// Sign out everywhere (PMS-880). Deletes every `user_sessions` row for the
+/// caller, so the refresh capability of every device is gone AND, via the
+/// MAPPS-531 `sid` check in `ensure_user_and_tenant_active`, every access token
+/// they hold is refused on its next request. This is the compromise-recovery
+/// path: `logout` sheds one device, this sheds all of them.
+///
+/// The caller's own bearer dies with the rest, which is the point.
+async fn logout_all(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> AppResult<()> {
+    state
+        .auth_service
+        .logout_all(user.tenant_id, user.id)
+        .await?;
+
+    // Record it as a logout, exactly as the single-session path does (PMS-117 AC3).
+    let ua = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    // Out-of-band on its own tenant-scoped tx so the RLS GUC is set; a
+    // log-write failure must not fail the sign-out (the sessions are already
+    // gone, and refusing here would tell the caller the opposite). PMS-256.
+    // Suppressed, but not silently: the failure is logged with its cause, so a
+    // missing audit row is explainable rather than invisible.
+    let audited = async {
+        let mut tx = state
+            .auth_service
+            .db()
+            .begin_with_tenant(user.tenant_id)
+            .await?;
+        crate::modules::audit::audit_auth_event(
+            &mut *tx,
+            user.tenant_id,
+            Some(user.id),
+            crate::modules::audit::AuditAction::Logout,
+            // PMS-587: real client IP behind Traefik, not the proxy peer.
+            Some(
+                crate::utils::client_ip::extract_client_ip(
+                    addr.ip(),
+                    &headers,
+                    crate::utils::client_ip::trusted_proxies(),
+                )
+                .to_string(),
+            ),
+            ua,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok::<(), AppError>(())
+    }
+    .await;
+    if let Err(e) = audited {
+        tracing::warn!(
+            error = %e,
+            user = %user.id,
+            "sign-out everywhere succeeded but its audit row was not written"
+        );
     }
 
     Ok(())
@@ -519,18 +578,61 @@ async fn complete_onboarding(
     Ok(Json(updated.into()))
 }
 
-/// Change password endpoint
+/// Source IP for the re-auth buckets (PMS-881). The socket peer behind Traefik
+/// is the proxy on every request, so keying on it alone would make one global
+/// bucket in which any user's failures throttle everybody; `extract_client_ip`
+/// walks the forwarded chain and falls back to the peer for a direct client,
+/// which cannot spoof it (PMS-587).
+fn reauth_client_ip(addr: SocketAddr, headers: &HeaderMap) -> std::net::IpAddr {
+    crate::utils::client_ip::extract_client_ip(
+        addr.ip(),
+        headers,
+        crate::utils::client_ip::trusted_proxies(),
+    )
+}
+
+/// True when this error is `change_password`'s rejection of the submitted
+/// current password, rather than a mistyped new password or a failing
+/// database. Only a rejected re-auth spends rate-limit budget (PMS-881), so a
+/// user who fumbles the confirmation field is never throttled.
+fn is_wrong_current_password(err: &AppError) -> bool {
+    matches!(err, AppError::Validation { errors, .. }
+        if errors.iter().any(|e| e.field == "current_password"))
+}
+
+/// Change password endpoint. The current-password re-auth is rate limited per
+/// IP and per user (PMS-881, audit F6), sharing one budget with
+/// `disable_mfa`, so a stolen session cannot grind the password at full rate.
 async fn change_password(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ChangePasswordRequest>,
-) -> AppResult<()> {
+) -> Result<Response, AppError> {
     request.validate()?;
-    state
+
+    let ip = reauth_client_ip(addr, &headers);
+    if let Err(retry_after) = state.reauth_limiter.check(ip, user.id) {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many failed password attempts, please try again later",
+        ));
+    }
+
+    match state
         .auth_service
         .change_password(user.tenant_id, user.id, &request)
-        .await?;
-    Ok(())
+        .await
+    {
+        Ok(()) => Ok(StatusCode::OK.into_response()),
+        Err(err) => {
+            if is_wrong_current_password(&err) {
+                state.reauth_limiter.record_failure(ip, user.id);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Get user sessions
@@ -617,18 +719,41 @@ async fn enable_mfa(
 
 /// Disable MFA. Requires re-auth with the current password so a stolen
 /// session cannot weaken the account quietly. Zeroes the user's
-/// recovery-code set.
+/// recovery-code set. The re-auth is rate limited per IP and per user out of
+/// the same budget as `change_password` (PMS-881, audit F6): the two check the
+/// same credential, so failures on one count against the other.
 async fn disable_mfa(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<MfaDisableRequest>,
-) -> AppResult<()> {
+) -> Result<Response, AppError> {
     request.validate()?;
-    state
+
+    let ip = reauth_client_ip(addr, &headers);
+    if let Err(retry_after) = state.reauth_limiter.check(ip, user.id) {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many failed password attempts, please try again later",
+        ));
+    }
+
+    match state
         .auth_service
         .disable_mfa(user.tenant_id, user.id, &request.password)
-        .await?;
-    Ok(())
+        .await
+    {
+        Ok(()) => Ok(StatusCode::OK.into_response()),
+        Err(err) => {
+            // `disable_mfa` reports only the password check as `Unauthorized`;
+            // a missing user or a passwordless account is a different variant.
+            if matches!(err, AppError::Unauthorized) {
+                state.reauth_limiter.record_failure(ip, user.id);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// List the caller's personal API keys. Never includes secret material.
@@ -678,6 +803,36 @@ async fn revoke_api_key(
 }
 
 /// List users (admin / manager only). Supports paginated browsing
+/// PMS-921: the tenant's staff, as the minimum needed to name one.
+///
+/// `RequireAuth`, not `RequireManager`. MAPPS-578 renders `@handle` in Markdown
+/// as a resolved person, and it resolved against `GET /auth/users`, which is
+/// manager-gated, so a Technician saw every mention as plain text. A KB article
+/// is written for technicians and the mentions in it assign ownership, so the
+/// reader who most needs to know who is named was the one who could not see it.
+///
+/// Relaxing `/users` instead was the wrong shape: its `UserResponse` carries
+/// role, status, MFA state, login history and phone numbers, so it would have
+/// handed every technician a colleague's security posture to solve a name
+/// lookup. That gate stays exactly where it is.
+async fn list_directory(
+    State(state): State<AuthRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<mokosh_types::auth::DirectoryEntry>>> {
+    let (entries, total) = state
+        .auth_service
+        .list_directory(user.tenant(), &pagination)
+        .await?;
+
+    Ok(Json(PaginatedResponse::new(
+        entries,
+        pagination.page,
+        pagination.per_page(),
+        total,
+    )))
+}
+
 /// plus optional filters: `q` (substring across email + names),
 /// `role`, and `status`. Filter struct derives `Validate` (F9
 /// closeout for the auth module).
@@ -712,7 +867,9 @@ async fn create_user(
 ) -> AppResult<Json<UserResponse>> {
     // Check admin permission
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     // Role ceiling (PMS-503): a caller may only create a user whose role is at
@@ -743,7 +900,9 @@ async fn get_user(
     Path(user_id): Path<Uuid>,
 ) -> AppResult<Json<UserResponse>> {
     if !user.role.is_admin() && user.id != user_id {
-        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     let target_user = state
@@ -763,7 +922,9 @@ async fn update_user(
     Json(request): Json<UpdateUserRequest>,
 ) -> AppResult<Json<UserResponse>> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     // Role ceiling (PMS-503 / PMS-625): a caller may only assign a role at or
@@ -790,134 +951,45 @@ async fn update_user(
     Ok(Json(updated.into()))
 }
 
-// ---------------------------------------------------------------------------
-// Google OAuth handlers
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use axum::body::Body;
+    use sqlx::postgres::PgPool;
+    use tower::ServiceExt;
 
-#[derive(Debug, Deserialize)]
-struct GoogleCallbackQuery {
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
-    error_description: Option<String>,
-}
+    /// PMS-837: the Google OAuth popup surface was retired as unconsumed. This
+    /// is the mechanical guard: re-mounting either route turns these 404s into
+    /// 200/500 and fails here, so the surface cannot come back unnoticed.
+    ///
+    /// Routing a miss never touches the database, so the lazy pool is never
+    /// connected.
+    #[tokio::test]
+    async fn google_oauth_routes_stay_unmounted() {
+        let pool = PgPool::connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool builds without connecting");
+        let router = auth_routes(AuthService::new(
+            Database::from_pool(pool),
+            "test-secret".to_string(),
+        ));
 
-/// Step 1 of the OAuth flow: redirect the browser to Google's consent
-/// page. Sets a short-lived signed cookie carrying the CSRF state and
-/// PKCE verifier so the callback can verify them.
-async fn google_authorize(State(state): State<AuthRouterState>) -> Result<Response, AppError> {
-    let (url, auth_state) = state
-        .google_oauth
-        .build_authorize_url()
-        .map_err(|e| AppError::internal(format!("OAuth setup failed: {e}")))?;
-
-    let cookie = google_login::encode_state_cookie(
-        &auth_state,
-        state.jwt_secret.as_bytes(),
-        state.cookie_secure,
-    )
-    .map_err(|e| AppError::internal(format!("OAuth state cookie failed: {e}")))?;
-
-    let cookie_value = HeaderValue::from_str(&cookie)
-        .map_err(|e| AppError::internal(format!("invalid cookie header: {e}")))?;
-
-    let mut response = Redirect::to(url.as_str()).into_response();
-    response.headers_mut().append(SET_COOKIE, cookie_value);
-    Ok(response)
-}
-
-/// Step 2: Google redirects the browser back here with `?code&state`.
-/// Verify the state cookie, exchange the code for userinfo, find or
-/// auto-provision the user, then return an HTML page that posts the
-/// JWT response to `window.opener` and closes itself.
-async fn google_callback(
-    State(state): State<AuthRouterState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Query(query): Query<GoogleCallbackQuery>,
-) -> Response {
-    let outcome = run_google_callback(&state, &addr, &headers, &query).await;
-    let (payload, set_cookies): (serde_json::Value, Vec<String>) = match outcome {
-        Ok(login_response) => (
-            serde_json::json!({ "ok": true, "data": login_response }),
-            vec![google_login::clear_state_cookie()],
-        ),
-        Err(message) => (
-            serde_json::json!({ "ok": false, "error": message }),
-            vec![google_login::clear_state_cookie()],
-        ),
-    };
-
-    let mut response = google_login::callback_response(&payload, &state.client_origin);
-    for cookie in set_cookies {
-        if let Ok(v) = HeaderValue::from_str(&cookie) {
-            response.headers_mut().append(SET_COOKIE, v);
+        for uri in ["/google", "/google/callback"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must stay unmounted (PMS-837)"
+            );
         }
     }
-    response
-}
-
-/// Inner helper for `google_callback` that returns a flat `Result` so
-/// errors can be turned into the popup-closing HTML payload uniformly.
-async fn run_google_callback(
-    state: &AuthRouterState,
-    addr: &SocketAddr,
-    headers: &HeaderMap,
-    query: &GoogleCallbackQuery,
-) -> Result<LoginResponse, String> {
-    if let Some(err) = &query.error {
-        let detail = query
-            .error_description
-            .clone()
-            .unwrap_or_else(|| err.clone());
-        return Err(format!("Google rejected the sign-in: {detail}"));
-    }
-
-    let code = query
-        .code
-        .as_deref()
-        .ok_or_else(|| "missing `code` in callback".to_string())?;
-    let received_state = query
-        .state
-        .as_deref()
-        .ok_or_else(|| "missing `state` in callback".to_string())?;
-
-    let cookie_header = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| "missing state cookie".to_string())?;
-    let cookie_value = google_login::read_state_cookie(cookie_header)
-        .ok_or_else(|| "missing state cookie".to_string())?;
-    let auth_state = google_login::decode_state_cookie(&cookie_value, state.jwt_secret.as_bytes())
-        .map_err(|e| format!("invalid state cookie: {e}"))?;
-
-    if auth_state.csrf_token != received_state {
-        return Err("state mismatch (possible CSRF)".to_string());
-    }
-
-    let userinfo = state
-        .google_oauth
-        .exchange_code(code, &auth_state.pkce_verifier)
-        .await
-        .map_err(|e| format!("Google token exchange failed: {e}"))?;
-
-    // PMS-587: real client IP from the forwarded header behind Traefik.
-    let ip = Some(
-        crate::utils::client_ip::extract_client_ip(
-            addr.ip(),
-            headers,
-            crate::utils::client_ip::trusted_proxies(),
-        )
-        .to_string(),
-    );
-    let user_agent = headers
-        .get("User-Agent")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    state
-        .auth_service
-        .login_with_google(userinfo, ip, user_agent)
-        .await
-        .map_err(|e| e.to_string())
 }

@@ -9,6 +9,9 @@ mod models;
 mod routes;
 #[cfg(feature = "server")]
 mod service;
+// PMS-805: resolve a company website on demand (`GET /companies/website-probe`).
+#[cfg(feature = "server")]
+mod website_probe;
 
 #[cfg(feature = "server")]
 pub use industry_backfill::{normalize_company_industries, IndustryBackfillReport};
@@ -16,4 +19,14 @@ pub use models::*;
 #[cfg(feature = "server")]
 pub use routes::contact_routes;
 #[cfg(feature = "server")]
-pub use service::ContactService;
+// PMS-926: `COMPANY_BLOCKERS` is the single list the refusal message and the
+// deletion preview both read, and a test asserts a table cannot start blocking
+// a delete without appearing in it. That test lives in `tests/`, so the list
+// has to be reachable from outside the crate.
+pub use service::{
+    BlockingRecords, CompanyBlocker, CompanyDeletionPreview, ContactService, COMPANY_BLOCKERS,
+};
+#[cfg(feature = "server")]
+pub use website_probe::{
+    UnreachableReason, WebsiteProbe, WebsiteProbeLimiter, WebsiteProbeService, WwwChange,
+};

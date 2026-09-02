@@ -8,10 +8,186 @@ use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{generate_token, hash_password};
+use crate::utils::email::salutation;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
+
+/// PMS-920: the alternative every company-delete refusal ends with.
+///
+/// Phrased as the data change rather than as a UI gesture. The field has
+/// existed since migration 004 and `UpdateCompanyRequest` already accepts it,
+/// so this stays true regardless of whether a given client has caught up
+/// (MAPPS-575 is the SPA half).
+const ARCHIVE_INSTEAD: &str =
+    "archive it instead by setting its status to Inactive, which keeps its history \
+     and takes it out of your active lists";
+
+/// Turn a `23503` on the company DELETE into a refusal that says which records
+/// blocked it and what to do about them.
+///
+/// PMS-920: the previous message listed every table that could block and told
+/// the operator to "remove them first". For half of them that is advice they
+/// must not take: deleting invoices, payments, contracts or time entries to
+/// tidy a client list destroys the financial and billing record the deletion
+/// was refused to protect. Those two cases now read differently, and both name
+/// archiving, which is what the operator almost always actually wants.
+///
+/// Driven off the constraint name Postgres reports rather than a pre-flight
+/// count per table: it is the authority on which FK actually fired, it costs no
+/// extra queries, and a table added later cannot silently fall out of a
+/// hand-maintained list - it lands on the generic arm instead.
+/// One kind of record that stops a company being deleted.
+pub struct CompanyBlocker {
+    /// The foreign key Postgres names when it fires. Empty for `tickets`, which
+    /// has its own pre-flight guard and never reaches the 23503 arm.
+    pub constraint: &'static str,
+    /// The table to count, for the deletion preview (PMS-926).
+    pub table: &'static str,
+    /// What to call it in a message a person reads.
+    pub label: &'static str,
+    /// Whether these records exist to be KEPT. PMS-920: telling somebody to
+    /// delete their invoices to tidy a client list destroys exactly the record
+    /// the refusal is protecting, so retained blockers must never be phrased as
+    /// something to clear first.
+    pub retained: bool,
+}
+
+/// Every record that can stop a company delete.
+///
+/// PMS-926 lifted this out of `company_delete_blocked` so the refusal message
+/// and the deletion preview read the same table. Two lists that have to agree
+/// is how the CLIENT's hardcoded copy of these rules went stale within a week
+/// of PMS-919 changing them; a second copy on the server would go the same way.
+///
+/// Anything NOT here either unlinks on delete (`projects`, `appointments`,
+/// `active_timers`, `rmm_device_mappings`, `parent_company_id`, and `contacts`
+/// via PMS-812) or cascades (`sites`, `contact_companies`,
+/// `form_request_tokens`). See migration 113.
+pub const COMPANY_BLOCKERS: &[CompanyBlocker] = &[
+    CompanyBlocker {
+        constraint: "invoices_company_id_fkey",
+        table: "invoices",
+        label: "invoices",
+        retained: true,
+    },
+    CompanyBlocker {
+        constraint: "payments_company_id_fkey",
+        table: "payments",
+        label: "payments",
+        retained: true,
+    },
+    CompanyBlocker {
+        constraint: "contracts_company_id_fkey",
+        table: "contracts",
+        label: "contracts",
+        retained: true,
+    },
+    CompanyBlocker {
+        constraint: "time_entries_company_id_fkey",
+        table: "time_entries",
+        label: "time entries",
+        retained: true,
+    },
+    CompanyBlocker {
+        constraint: "mileage_entries_company_id_fkey",
+        table: "mileage_entries",
+        label: "mileage entries",
+        retained: true,
+    },
+    // `tickets` is guarded by an explicit pre-flight count in `delete_company`
+    // rather than by its FK, so it has no constraint name to match. It is a
+    // blocker all the same, and the preview has to say so.
+    CompanyBlocker {
+        constraint: "",
+        table: "tickets",
+        label: "tickets",
+        retained: false,
+    },
+    CompanyBlocker {
+        constraint: "assets_company_id_fkey",
+        table: "assets",
+        label: "assets",
+        retained: false,
+    },
+    CompanyBlocker {
+        constraint: "quotes_company_id_fkey",
+        table: "quotes",
+        label: "quotes",
+        retained: false,
+    },
+    CompanyBlocker {
+        constraint: "credential_vault_company_id_fkey",
+        table: "credential_vault",
+        label: "stored credentials",
+        retained: false,
+    },
+];
+
+/// PMS-926: what deleting this company would do, and what stops it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompanyDeletionPreview {
+    pub can_delete: bool,
+    /// The PMS-919 refusal that is about what the company IS rather than what
+    /// references it. Reported separately so a client can say so instead of
+    /// showing an empty blocker list beside a delete that still fails.
+    pub is_own_company: bool,
+    pub blocking: Vec<BlockingRecords>,
+    /// Detached rather than destroyed (migration 113, PMS-812).
+    pub unlinked: Vec<BlockingRecords>,
+    /// Destroyed along with the company.
+    pub removed: Vec<BlockingRecords>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BlockingRecords {
+    pub label: String,
+    pub count: i64,
+    /// Only meaningful in `blocking`: these records exist to be KEPT, so a
+    /// client must not phrase them as something to clear first.
+    pub retained: bool,
+}
+
+/// What a delete would unlink rather than destroy. Mirrors migration 113 plus
+/// PMS-812's `contacts` rule.
+const COMPANY_UNLINKED: &[(&str, &str)] = &[
+    ("contacts", "contacts"),
+    ("projects", "projects"),
+    ("appointments", "appointments"),
+];
+
+/// What a delete destroys outright.
+const COMPANY_REMOVED: &[(&str, &str)] = &[("sites", "sites")];
+
+fn company_delete_blocked(constraint: Option<&str>) -> AppError {
+    let named = constraint.and_then(|c| {
+        COMPANY_BLOCKERS
+            .iter()
+            // An empty constraint never matches a real one Postgres reports.
+            .find(|b| !b.constraint.is_empty() && b.constraint == c)
+            .map(|b| (b.label, b.retained))
+    });
+
+    let message = match named {
+        Some((label, true)) => format!(
+            "Cannot delete company: it has {label}, which are kept as a permanent \
+             financial and billing record and must not be removed to allow a \
+             deletion. You can {ARCHIVE_INSTEAD}"
+        ),
+        Some((label, false)) => format!(
+            "Cannot delete company: it has {label}. Remove or reassign them first, \
+             or {ARCHIVE_INSTEAD}"
+        ),
+        // An FK this function has not been taught about. Say so plainly rather
+        // than guessing which half it belongs to; the alternative still holds.
+        None => format!(
+            "Cannot delete company: other records still reference it. Remove or \
+             reassign whatever can be moved, or {ARCHIVE_INSTEAD}"
+        ),
+    };
+    AppError::BadRequest(message)
+}
 
 /// How long a portal setup link remains redeemable. Mirrors the
 /// password-reset redemption window (PMS-136).
@@ -258,9 +434,12 @@ impl ContactService {
                     WHEN u.id IS NULL THEN NULL
                     ELSE u.first_name || ' ' || u.last_name
                 END AS account_manager_name,
-                (SELECT COUNT(*) FROM contacts ct
-                    WHERE ct.tenant_id = c.tenant_id
-                      AND ct.company_id = c.id) AS contact_count,
+                -- PMS-806: count through the link table so a contact linked to
+                -- this company as a secondary shows up, and one holding several
+                -- links to it (impossible today, UNIQUE) is still counted once.
+                (SELECT COUNT(DISTINCT cc.contact_id) FROM contact_companies cc
+                    WHERE cc.tenant_id = c.tenant_id
+                      AND cc.company_id = c.id) AS contact_count,
                 (SELECT COUNT(*) FROM sites s
                     WHERE s.tenant_id = c.tenant_id
                       AND s.company_id = c.id) AS site_count,
@@ -375,7 +554,7 @@ impl ContactService {
 
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
-        let order_by = pagination.order_by("name", &["name", "created_at", "updated_at"]);
+        let order_by = pagination.order_by("name", mokosh_types::sort::COMPANIES)?;
 
         let query = format!(
             r#"
@@ -768,6 +947,127 @@ impl ContactService {
 
     /// Delete company
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// PMS-926: what deleting this company would do, without doing it.
+    ///
+    /// Exists because the CLIENT was keeping its own English copy of these
+    /// rules, and that copy went stale the moment PMS-919 changed which tables
+    /// block. Reporting the rules from the place that enforces them is the only
+    /// arrangement that cannot drift.
+    ///
+    /// Counts are read the way the delete reads them, in particular `tickets`
+    /// with no `closed_at` filter: `open_ticket_count` on the company response
+    /// counts only OPEN tickets, so a company with five closed tickets and none
+    /// open reports zero there and is still refused. A preview built on that
+    /// number would promise a delete that then fails.
+    pub async fn deletion_preview(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<CompanyDeletionPreview> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // 404 rather than an empty preview for a company that is not there, so
+        // this cannot be used to probe ids in another tenant.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM companies WHERE tenant_id = $1 AND id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound("Company".to_string()));
+        }
+
+        let is_own_company: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND own_company_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Every table name here is a compile-time constant from
+        // `COMPANY_BLOCKERS` and the two lists beside it, never anything a
+        // caller supplied, so the interpolation cannot carry input.
+        async fn count_in(
+            tx: &mut sqlx::PgConnection,
+            table: &str,
+            tenant_id: TenantId,
+            company_id: Uuid,
+        ) -> AppResult<i64> {
+            let sql =
+                format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1 AND company_id = $2");
+            Ok(sqlx::query_scalar(&sql)
+                .bind(tenant_id)
+                .bind(company_id)
+                .fetch_one(&mut *tx)
+                .await?)
+        }
+
+        let mut blocking = Vec::new();
+        for b in COMPANY_BLOCKERS {
+            let count = count_in(&mut tx, b.table, tenant_id, company_id).await?;
+            if count > 0 {
+                blocking.push(BlockingRecords {
+                    label: b.label.to_string(),
+                    count,
+                    retained: b.retained,
+                });
+            }
+        }
+
+        let mut unlinked = Vec::new();
+        for (table, label) in COMPANY_UNLINKED {
+            let count = count_in(&mut tx, table, tenant_id, company_id).await?;
+            if count > 0 {
+                unlinked.push(BlockingRecords {
+                    label: label.to_string(),
+                    count,
+                    retained: false,
+                });
+            }
+        }
+
+        let mut removed = Vec::new();
+        for (table, label) in COMPANY_REMOVED {
+            let count = count_in(&mut tx, table, tenant_id, company_id).await?;
+            if count > 0 {
+                removed.push(BlockingRecords {
+                    label: label.to_string(),
+                    count,
+                    retained: false,
+                });
+            }
+        }
+
+        // Sub-companies unlink rather than block (PMS-919 promotes them to top
+        // level), and they hang off `parent_company_id` rather than a
+        // `company_id`, so they need their own count.
+        let children: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM companies WHERE tenant_id = $1 AND parent_company_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if children > 0 {
+            unlinked.push(BlockingRecords {
+                label: "sub-companies".to_string(),
+                count: children,
+                retained: false,
+            });
+        }
+
+        Ok(CompanyDeletionPreview {
+            can_delete: blocking.is_empty() && !is_own_company,
+            is_own_company,
+            blocking,
+            unlinked,
+            removed,
+        })
+    }
+
     pub async fn delete_company(
         &self,
         tenant_id: TenantId,
@@ -780,6 +1080,33 @@ impl ContactService {
         // GUC is set for it too.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // PMS-919: the tenant's own company is refused here rather than by its
+        // foreign key, because the FK is the wrong messenger twice over. It is
+        // nullable, so it does not block on a fresh tenant at all: the delete
+        // would succeed, `own_company_id` would go NULL, and the failure would
+        // surface later as a NOT NULL violation on `time_entries` the next time
+        // someone logged overhead time (PMS-413 makes this the anchor for that,
+        // and MAPPS-243 sends it as the company). On a tenant that already has
+        // overhead time it blocks, but as a generic related-records error
+        // naming `time_entries`, which does not tell the operator that the real
+        // problem is the company's role. Checked first because it is a
+        // statement about what this company IS, not about what references it.
+        let is_own_company: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND own_company_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if is_own_company {
+            return Err(AppError::BadRequest(
+                "This is your organisation's own company record, which general and \
+                 overhead time is logged against; it cannot be deleted"
+                    .to_string(),
+            ));
+        }
+
         // Check for related records
         let ticket_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND company_id = $2",
@@ -790,9 +1117,13 @@ impl ContactService {
         .await?;
 
         if ticket_count > 0 {
-            return Err(AppError::BadRequest(
-                "Cannot delete company with existing tickets".to_string(),
-            ));
+            // PMS-920: tickets are removable, so "delete them first" is advice
+            // the operator can actually take, but it is rarely the one they
+            // want. Name the alternative alongside it.
+            return Err(AppError::BadRequest(format!(
+                "Cannot delete company: it has {ticket_count} ticket(s). Delete or \
+                 reassign them first, or {ARCHIVE_INSTEAD}"
+            )));
         }
 
         let before: Option<serde_json::Value> = sqlx::query_scalar(
@@ -803,26 +1134,77 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        // The explicit ticket guard above only covers one of the many tables
-        // that foreign-key `companies` (contracts, invoices, payments,
-        // projects, assets, time entries, appointments, sub-companies, ...).
-        // Those references are `ON DELETE RESTRICT`, so the DELETE raises
-        // Postgres `23503`; map it to a 400 instead of letting the generic
-        // `From<sqlx::Error>` turn it into a 500 (PMS-170, same shape as the
-        // PMS-149 ticket-delete fix).
+        // PMS-812: unlink this company's contacts, never delete them. Runs
+        // BEFORE the company DELETE so `recompute_contact_mirrors` - the single
+        // writer of `contacts.company_id` (PMS-806) - leaves no mirror pointing
+        // at the row that is about to go. The `ON DELETE SET NULL` action added
+        // in migration 110 is only the backstop for a direct SQL delete.
+        let unlinked: Vec<Uuid> = sqlx::query_scalar(
+            "DELETE FROM contact_companies WHERE tenant_id = $1 AND company_id = $2 \
+             RETURNING contact_id",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if !unlinked.is_empty() {
+            // Same promotion rule as `write_contact_companies`: a contact that
+            // just lost its primary gets its OLDEST remaining link, ordered by
+            // `(created_at, sort_order, id)` (PMS-815). `DISTINCT ON` picks one
+            // row per contact and the `NOT EXISTS` skips contacts that still
+            // have a primary, so the partial unique index cannot collide.
+            sqlx::query(
+                r#"
+                UPDATE contact_companies l
+                SET is_primary = TRUE, updated_at = NOW()
+                FROM (
+                    SELECT DISTINCT ON (contact_id) id, contact_id
+                    FROM contact_companies
+                    WHERE tenant_id = $1 AND contact_id = ANY($2)
+                    ORDER BY contact_id, created_at, sort_order, id
+                ) oldest
+                WHERE l.id = oldest.id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM contact_companies p
+                      WHERE p.contact_id = oldest.contact_id AND p.is_primary
+                  )
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(&unlinked)
+            .execute(&mut *tx)
+            .await?;
+
+            for contact_id in &unlinked {
+                self.recompute_contact_mirrors(&mut tx, tenant_id, *contact_id)
+                    .await?;
+            }
+        }
+
+        // The explicit ticket guard above only covers one of the tables that
+        // foreign-key `companies`. The rest still default to NO ACTION, so the
+        // DELETE raises Postgres `23503`; map it to a 400 instead of letting
+        // the generic `From<sqlx::Error>` turn it into a 500 (PMS-170, same
+        // shape as the PMS-149 ticket-delete fix).
+        //
+        // PMS-919 narrowed which tables can reach this. `projects`,
+        // `appointments`, `active_timers`, `rmm_device_mappings` and
+        // `parent_company_id` are nullable and now `ON DELETE SET NULL`
+        // (migration 113), so they unlink rather than block and must not be
+        // named. What is left is the `NOT NULL` group, where a company-less row
+        // is not a valid state, plus `credential_vault`, which is nullable but
+        // keeps blocking on purpose: nulling it would leave encrypted secrets
+        // owned by nothing and cascading would destroy them silently.
         if let Err(e) = sqlx::query("DELETE FROM companies WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(company_id)
             .execute(&mut *tx)
             .await
         {
-            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23503") {
-                return Err(AppError::BadRequest(
-                    "Cannot delete company with related records (contracts, invoices, \
-                     payments, projects, assets, time entries, appointments, or \
-                     sub-companies); remove them first"
-                        .to_string(),
-                ));
+            let db_err = e.as_database_error();
+            if db_err.and_then(|d| d.code()).as_deref() == Some("23503") {
+                return Err(company_delete_blocked(db_err.and_then(|d| d.constraint())));
             }
             return Err(e.into());
         }
@@ -1825,6 +2207,11 @@ impl ContactService {
         };
         let mut context = serde_json::json!({
             "recipient_email": email,
+            // PMS-774: `contacts.first_name` is NOT NULL but may hold an empty
+            // string, so the greeting word comes from `salutation` rather than
+            // from the name. `display_name` stays the bare name so a customised
+            // tenant template that names it keeps rendering.
+            "salutation": salutation(&contact.first_name),
             "display_name": contact.first_name,
             "password_setup_link": password_setup_link,
             // mokosh-contact-login prompt 011 (PMS-928): the grant
@@ -1914,6 +2301,304 @@ impl ContactService {
         ))
     }
 
+    // ------------------------------------------------------------------
+    // PMS-806: contact child collections (`contact_phones`,
+    // `contact_companies`) and the mirror columns derived from them.
+    // ------------------------------------------------------------------
+
+    /// Reject any `company_id` in a link list that does not belong to this
+    /// tenant. Runs BEFORE the write transaction opens, so a foreign id never
+    /// reaches an INSERT.
+    async fn validate_company_links(
+        &self,
+        tenant_id: TenantId,
+        links: &[ContactCompanyLinkInput],
+    ) -> AppResult<()> {
+        for link in links {
+            self.validate_fk(tenant_id, "companies", link.company_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Replace a contact's phone rows with `phones`, in list order.
+    ///
+    /// Phone entries carry no stable natural key, so the list is rewritten
+    /// wholesale and `contact_phones.id` is not stable across writes. The
+    /// partial unique index allows one primary row per contact; deleting the
+    /// old rows first is what keeps a primary swap from colliding with it.
+    async fn write_contact_phones(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        phones: &[ResolvedPhone],
+    ) -> AppResult<()> {
+        sqlx::query("DELETE FROM contact_phones WHERE tenant_id = $1 AND contact_id = $2")
+            .bind(tenant_id)
+            .bind(contact_id)
+            .execute(&mut *conn)
+            .await?;
+        for phone in phones {
+            sqlx::query(
+                r#"
+                INSERT INTO contact_phones
+                    (tenant_id, contact_id, phone_type, number, extension, is_primary, sort_order)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .bind(phone.phone_type.as_str())
+            .bind(&phone.number)
+            .bind(&phone.extension)
+            .bind(phone.is_primary)
+            .bind(phone.sort_order)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Replace a contact's company links with `links`.
+    ///
+    /// Unlike phones, a link HAS a natural key (`contact_id, company_id`), so
+    /// surviving links are upserted rather than recreated and keep their
+    /// `created_at`. That is what makes "promote the oldest remaining link"
+    /// meaningful after the primary link is removed.
+    ///
+    /// Which link ends up primary, in order:
+    ///
+    /// 1. the one the caller flagged (two flagged is a 422 at the request layer);
+    /// 2. else the OLDEST link that already existed and survives this write, so
+    ///    removing the primary promotes the oldest remaining link and an
+    ///    unflagged rewrite does not silently reshuffle the primary;
+    /// 3. else the first entry in the list, which is the create case (nothing
+    ///    pre-existed) and the "promote the first entry" rule.
+    ///
+    /// "Oldest" is `(created_at, sort_order)`, not `created_at` alone: NOW() is
+    /// the transaction timestamp, so every link written by one call shares one
+    /// `created_at` and only `sort_order` separates them (PMS-815). It is set
+    /// on INSERT and left alone on conflict, so a surviving link keeps its
+    /// original position.
+    async fn write_contact_companies(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        links: &[ResolvedLink],
+    ) -> AppResult<()> {
+        let existing_order: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT company_id FROM contact_companies \
+             WHERE tenant_id = $1 AND contact_id = $2 \
+             ORDER BY created_at, sort_order, id",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let keep: Vec<Uuid> = links.iter().map(|l| l.company_id).collect();
+        sqlx::query(
+            "DELETE FROM contact_companies \
+             WHERE tenant_id = $1 AND contact_id = $2 AND NOT (company_id = ANY($3))",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(&keep)
+        .execute(&mut *conn)
+        .await?;
+
+        // Every row lands non-primary first. The partial unique index permits
+        // one primary per contact, so promoting before demoting would collide;
+        // a single promotion at the end sidesteps the ordering entirely.
+        sqlx::query(
+            "UPDATE contact_companies SET is_primary = FALSE \
+             WHERE tenant_id = $1 AND contact_id = $2 AND is_primary",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .execute(&mut *conn)
+        .await?;
+
+        for (position, link) in links.iter().enumerate() {
+            sqlx::query(
+                r#"
+                INSERT INTO contact_companies
+                    (tenant_id, contact_id, company_id, title, is_primary, sort_order)
+                VALUES ($1, $2, $3, $4, FALSE, $5)
+                ON CONFLICT (contact_id, company_id) DO UPDATE
+                    SET title = EXCLUDED.title,
+                        updated_at = NOW()
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .bind(link.company_id)
+            .bind(&link.title)
+            .bind(position as i32)
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        let primary = links
+            .iter()
+            .find(|l| l.is_primary)
+            .map(|l| l.company_id)
+            .or_else(|| existing_order.iter().copied().find(|id| keep.contains(id)))
+            .or_else(|| links.first().map(|l| l.company_id));
+        if let Some(primary) = primary {
+            sqlx::query(
+                "UPDATE contact_companies SET is_primary = TRUE, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND contact_id = $2 AND company_id = $3",
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .bind(primary)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// THE one place that writes the derived `contacts` columns (PMS-806).
+    ///
+    /// `phone` / `mobile` / `fax` / `company_id` are maintained mirrors of the
+    /// child tables, kept so every pre-PMS-806 query, index, seed fixture,
+    /// portal lookup and the current SPA keep working unchanged. Every create
+    /// and update calls this inside its own transaction, right after writing
+    /// the child rows.
+    ///
+    /// `company_name` (the freeform label) is cleared whenever a primary link
+    /// exists: the two are mutually exclusive (PMS-402), and the read side
+    /// resolves `COALESCE(co.name, c.company_name)` anyway.
+    async fn recompute_contact_mirrors(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE contacts c SET
+                phone = (
+                    SELECT p.number FROM contact_phones p
+                    WHERE p.contact_id = c.id AND p.is_primary
+                    ORDER BY p.sort_order, p.created_at LIMIT 1
+                ),
+                mobile = (
+                    SELECT p.number FROM contact_phones p
+                    WHERE p.contact_id = c.id AND p.phone_type = 'mobile'
+                    ORDER BY p.sort_order, p.created_at LIMIT 1
+                ),
+                fax = (
+                    SELECT p.number FROM contact_phones p
+                    WHERE p.contact_id = c.id AND p.phone_type = 'fax'
+                    ORDER BY p.sort_order, p.created_at LIMIT 1
+                ),
+                company_id = (
+                    SELECT l.company_id FROM contact_companies l
+                    WHERE l.contact_id = c.id AND l.is_primary LIMIT 1
+                ),
+                company_name = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM contact_companies l
+                        WHERE l.contact_id = c.id AND l.is_primary
+                    ) THEN NULL
+                    ELSE c.company_name
+                END,
+                updated_at = NOW()
+            WHERE c.tenant_id = $1 AND c.id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Load `phones` and `companies` for a page of contacts with ONE query per
+    /// child table, then attach them. No per-row query: `list_contacts` and
+    /// `get_company_contacts` both hydrate a whole page this way.
+    async fn hydrate_contacts(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        rows: Vec<ContactRow>,
+    ) -> AppResult<Vec<Contact>> {
+        let mut contacts: Vec<Contact> = rows.into_iter().map(Into::into).collect();
+        if contacts.is_empty() {
+            return Ok(contacts);
+        }
+        let ids: Vec<Uuid> = contacts.iter().map(|c| c.id).collect();
+
+        let phone_rows = sqlx::query_as::<_, ContactPhoneRow>(
+            r#"
+            SELECT id, contact_id, phone_type, number, extension, is_primary, sort_order
+            FROM contact_phones
+            WHERE tenant_id = $1 AND contact_id = ANY($2)
+            ORDER BY contact_id, sort_order, created_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let link_rows = sqlx::query_as::<_, ContactCompanyLinkRow>(
+            r#"
+            SELECT l.contact_id, l.company_id, co.name AS company_name, l.title, l.is_primary
+            FROM contact_companies l
+            LEFT JOIN companies co ON co.id = l.company_id AND co.tenant_id = l.tenant_id
+            WHERE l.tenant_id = $1 AND l.contact_id = ANY($2)
+            ORDER BY l.contact_id, l.is_primary DESC, l.created_at, l.sort_order, l.id
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let mut phones_by_contact: std::collections::HashMap<Uuid, Vec<ContactPhone>> =
+            std::collections::HashMap::new();
+        for row in phone_rows {
+            phones_by_contact
+                .entry(row.contact_id)
+                .or_default()
+                .push(ContactPhone {
+                    id: row.id,
+                    // The column's CHECK constrains it to exactly the enum's
+                    // five values, so the fallback is unreachable; it matches
+                    // the `contact_type` / `status` handling above.
+                    phone_type: PhoneType::from_str(&row.phone_type).unwrap_or_default(),
+                    number: row.number,
+                    extension: row.extension,
+                    is_primary: row.is_primary,
+                    sort_order: row.sort_order,
+                });
+        }
+        let mut links_by_contact: std::collections::HashMap<Uuid, Vec<ContactCompanyLink>> =
+            std::collections::HashMap::new();
+        for row in link_rows {
+            links_by_contact
+                .entry(row.contact_id)
+                .or_default()
+                .push(ContactCompanyLink {
+                    company_id: row.company_id,
+                    company_name: row.company_name,
+                    title: row.title,
+                    is_primary: row.is_primary,
+                });
+        }
+
+        for contact in contacts.iter_mut() {
+            contact.phones = phones_by_contact.remove(&contact.id).unwrap_or_default();
+            contact.companies = links_by_contact.remove(&contact.id).unwrap_or_default();
+        }
+        Ok(contacts)
+    }
+
     /// Create a new contact
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_contact(
@@ -1927,12 +2612,45 @@ impl ContactService {
         if let Some(company_id) = request.company_id {
             self.get_company(tenant_id, company_id).await?;
         }
+        // PMS-806: every company named in the list is checked against this
+        // tenant before any row is written.
+        if let Some(links) = request.companies.as_deref() {
+            self.validate_company_links(tenant_id, links).await?;
+        }
+
+        // PMS-806: an explicit list is authoritative and the matching scalars
+        // in the same request are ignored; an absent list is materialized from
+        // those scalars, which is what keeps a pre-PMS-806 request creating
+        // exactly the same contact.
+        let phones = match request.phones.as_deref() {
+            Some(entries) => resolve_phone_list(entries)?,
+            None => phones_from_scalars(
+                request.phone.as_deref(),
+                request.mobile.as_deref(),
+                request.fax.as_deref(),
+            ),
+        };
+        let links = match request.companies.as_deref() {
+            Some(entries) => resolve_company_list(entries),
+            None => request
+                .company_id
+                .map(|company_id| ResolvedLink {
+                    company_id,
+                    title: request.title.clone(),
+                    is_primary: true,
+                })
+                .into_iter()
+                .collect(),
+        };
 
         // PMS-402: the stored freeform name is mutually exclusive with the FK.
         // When company_id is set, the CRM name is authoritative (resolved via
         // the read-side join), so persist NULL; otherwise store the freeform
-        // label. An empty freeform string normalizes to NULL.
-        let stored_company_name: Option<&str> = if request.company_id.is_some() {
+        // label. An empty freeform string normalizes to NULL. PMS-806: a
+        // non-empty `companies` list makes a CRM name authoritative the same
+        // way (the request layer already rejects both at once).
+        let stored_company_name: Option<&str> = if request.company_id.is_some() || !links.is_empty()
+        {
             None
         } else {
             request.company_name.as_deref().filter(|s| !s.is_empty())
@@ -2017,6 +2735,16 @@ impl ContactService {
         .execute(&mut *tx)
         .await?;
 
+        // PMS-806: the child collections are authoritative; the scalar columns
+        // written above are then recomputed from them in the same transaction,
+        // so the audit `after` snapshot below already shows the mirrors.
+        self.write_contact_phones(&mut tx, tenant_id, contact_id, &phones)
+            .await?;
+        self.write_contact_companies(&mut tx, tenant_id, contact_id, &links)
+            .await?;
+        self.recompute_contact_mirrors(&mut tx, tenant_id, contact_id)
+            .await?;
+
         // PMS-19 / PMS-136: flip the contact's `is_portal_user` flag so the
         // portal-login flow (PMS-26) treats it as a valid identity, and mint
         // a single-use setup token. We deliberately do NOT mint a
@@ -2092,7 +2820,10 @@ impl ContactService {
         .await?
         .ok_or_else(|| AppError::NotFound("Contact".to_string()))?;
 
-        Ok(row.into())
+        let mut contacts = self.hydrate_contacts(&mut tx, tenant_id, vec![row]).await?;
+        contacts
+            .pop()
+            .ok_or_else(|| AppError::NotFound("Contact".to_string()))
     }
 
     /// List contacts with filters
@@ -2133,8 +2864,19 @@ impl ContactService {
             count_idx += 1;
         }
         if filter.company_id.is_some() {
-            data_conds.push(format!("c.company_id = ${data_idx}"));
-            count_conds.push(format!("company_id = ${count_idx}"));
+            // PMS-806: match through ANY link, not just the primary one that
+            // `contacts.company_id` mirrors. `contacts` is aliased `c` in the
+            // data query and unaliased in the count query, hence the two forms.
+            data_conds.push(format!(
+                "EXISTS (SELECT 1 FROM contact_companies cc \
+                 WHERE cc.tenant_id = c.tenant_id AND cc.contact_id = c.id \
+                   AND cc.company_id = ${data_idx})"
+            ));
+            count_conds.push(format!(
+                "EXISTS (SELECT 1 FROM contact_companies cc \
+                 WHERE cc.tenant_id = contacts.tenant_id AND cc.contact_id = contacts.id \
+                   AND cc.company_id = ${count_idx})"
+            ));
             data_idx += 1;
             count_idx += 1;
         }
@@ -2151,10 +2893,7 @@ impl ContactService {
 
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
-        let order_by = pagination.order_by(
-            "last_name",
-            &["first_name", "last_name", "email", "created_at"],
-        );
+        let order_by = pagination.order_by("last_name", mokosh_types::sort::CONTACTS)?;
 
         let query = format!(
             r#"
@@ -2203,8 +2942,10 @@ impl ContactService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = query_builder.fetch_all(&mut *tx).await?;
         let total = count_builder.fetch_one(&mut *tx).await?;
+        // PMS-806: two more queries for the whole page, not one per row.
+        let contacts = self.hydrate_contacts(&mut tx, tenant_id, rows).await?;
 
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+        Ok((contacts, total as u64))
     }
 
     /// PMS-583: distinct non-empty values of a free-text contact field
@@ -2341,7 +3082,7 @@ impl ContactService {
         .bind(request.is_active)
         .fetch_optional(&mut *tx)
         .await?;
-        let row = row.ok_or_else(|| AppError::NotFound("CompanyIndustry".to_string()))?;
+        let row = row.ok_or_else(|| AppError::NotFound("Company industry".to_string()))?;
         tx.commit().await?;
         Ok(row.into())
     }
@@ -2356,7 +3097,7 @@ impl ContactService {
             .execute(&mut *tx)
             .await?;
         if res.rows_affected() == 0 {
-            return Err(AppError::NotFound("CompanyIndustry".to_string()));
+            return Err(AppError::NotFound("Company industry".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -2370,9 +3111,16 @@ impl ContactService {
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Contact>, u64)> {
+        // PMS-806: a contact belongs to this company through ANY of its links,
+        // not only the primary one that `contacts.company_id` mirrors. The
+        // EXISTS counts each contact once however many links it holds.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM contacts WHERE tenant_id = $1 AND company_id = $2",
+            "SELECT COUNT(*) FROM contacts c \
+             WHERE c.tenant_id = $1 AND EXISTS ( \
+                 SELECT 1 FROM contact_companies cc \
+                 WHERE cc.tenant_id = c.tenant_id AND cc.contact_id = c.id \
+                   AND cc.company_id = $2)",
         )
         .bind(tenant_id)
         .bind(company_id)
@@ -2390,7 +3138,11 @@ impl ContactService {
             FROM contacts c
             LEFT JOIN companies co
                 ON co.id = c.company_id AND co.tenant_id = c.tenant_id
-            WHERE c.tenant_id = $1 AND c.company_id = $2
+            WHERE c.tenant_id = $1 AND EXISTS (
+                SELECT 1 FROM contact_companies cc
+                WHERE cc.tenant_id = c.tenant_id AND cc.contact_id = c.id
+                  AND cc.company_id = $2
+            )
             ORDER BY c.contact_type, c.last_name
             LIMIT $3 OFFSET $4
             "#,
@@ -2401,8 +3153,10 @@ impl ContactService {
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
         .await?;
+        // PMS-806: batched hydration, one query per child table for the page.
+        let contacts = self.hydrate_contacts(&mut tx, tenant_id, rows).await?;
 
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+        Ok((contacts, total as u64))
     }
 
     /// Update contact
@@ -2414,7 +3168,7 @@ impl ContactService {
         request: &UpdateContactRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Contact> {
-        self.get_contact(tenant_id, contact_id).await?;
+        let existing = self.get_contact(tenant_id, contact_id).await?;
 
         // Mutation + audit row in one transaction: snapshot before and
         // after, write the audit entry on the same tx. PMS-117.
@@ -2431,6 +3185,11 @@ impl ContactService {
         // shape as the create-time validate_fk path above.
         self.validate_fk_opt(tenant_id, "companies", request.company_id)
             .await?;
+        // PMS-806: same check for every company named in the link list, before
+        // any row is written.
+        if let Some(links) = request.companies.as_deref() {
+            self.validate_company_links(tenant_id, links).await?;
+        }
 
         // Build the dynamic UPDATE the same way update_site does, so
         // every field in UpdateContactRequest round-trips instead of
@@ -2604,6 +3363,52 @@ impl ContactService {
         }
 
         q.execute(&mut *tx).await?;
+
+        // PMS-806: rewrite the child collections, then recompute the mirrors
+        // from them in this same transaction.
+        //
+        // An explicit list is authoritative. With no list, a request that
+        // touches any scalar phone field rebuilds the list from the resulting
+        // scalars, and a request that sets `company_id` makes that company the
+        // contact's only link: both preserve the pre-PMS-806 semantics the
+        // current SPA relies on. A request that touches neither leaves the
+        // child rows exactly as they are.
+        let phones = match request.phones.as_deref() {
+            Some(entries) => Some(resolve_phone_list(entries)?),
+            None if request.phone.is_some()
+                || request.mobile.is_some()
+                || request.fax.is_some() =>
+            {
+                Some(phones_from_scalars(
+                    request.phone.as_deref().or(existing.phone.as_deref()),
+                    request.mobile.as_deref().or(existing.mobile.as_deref()),
+                    request.fax.as_deref().or(existing.fax.as_deref()),
+                ))
+            }
+            None => None,
+        };
+        let links = match request.companies.as_deref() {
+            Some(entries) => Some(resolve_company_list(entries)),
+            None => request.company_id.map(|company_id| {
+                vec![ResolvedLink {
+                    company_id,
+                    title: request.title.clone().or_else(|| existing.title.clone()),
+                    is_primary: true,
+                }]
+            }),
+        };
+        if let Some(ref phones) = phones {
+            self.write_contact_phones(&mut tx, tenant_id, contact_id, phones)
+                .await?;
+        }
+        if let Some(ref links) = links {
+            self.write_contact_companies(&mut tx, tenant_id, contact_id, links)
+                .await?;
+        }
+        // Unconditional: the mirrors are derived state, so re-deriving them is
+        // idempotent when nothing changed and self-healing when it did.
+        self.recompute_contact_mirrors(&mut tx, tenant_id, contact_id)
+            .await?;
 
         // PMS-136: a false -> true transition mints a single-use setup token
         // and (after commit) emails the contact a `/portal/set-password` link.
@@ -3250,10 +4055,145 @@ impl From<ContactRow> for Contact {
             notes: row.notes,
             avatar_url: row.avatar_url,
             status: ContactStatus::from_str(&row.status).unwrap_or_default(),
+            // PMS-806: filled by `hydrate_contacts` in one batched query per
+            // child table; a bare row conversion leaves them empty.
+            phones: Vec::new(),
+            companies: Vec::new(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
     }
+}
+
+// ============================================================================
+// PMS-806: request -> child-row resolution
+// ============================================================================
+
+/// A phone entry resolved from a request, ready to write to `contact_phones`.
+struct ResolvedPhone {
+    phone_type: PhoneType,
+    number: String,
+    extension: Option<String>,
+    is_primary: bool,
+    sort_order: i32,
+}
+
+/// A company link resolved from a request, ready to write to
+/// `contact_companies`.
+struct ResolvedLink {
+    company_id: Uuid,
+    title: Option<String>,
+    is_primary: bool,
+}
+
+/// Resolve an explicit `phones` list. The array order IS the sort order. A list
+/// with no entry flagged primary promotes the first entry rather than erroring;
+/// two flagged entries were already rejected as a 422 at the request layer.
+///
+/// `number` is `Option<String>` because it carries the shared `de_phone_opt`
+/// normalization (a blank number deserializes to `None`); the request-layer
+/// `required` rule rejects `None`, and this is the fail-loud backstop for a
+/// caller that reaches the service without validating.
+fn resolve_phone_list(entries: &[ContactPhoneInput]) -> AppResult<Vec<ResolvedPhone>> {
+    let mut resolved = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let number = entry.number.clone().ok_or_else(|| {
+            AppError::validation_field(
+                format!("phones[{index}].number"),
+                "a phone number is required",
+            )
+        })?;
+        resolved.push(ResolvedPhone {
+            phone_type: entry.phone_type,
+            number,
+            extension: entry.extension.clone(),
+            is_primary: entry.is_primary,
+            sort_order: index as i32,
+        });
+    }
+    if !resolved.is_empty() && !resolved.iter().any(|p| p.is_primary) {
+        resolved[0].is_primary = true;
+    }
+    Ok(resolved)
+}
+
+/// Materialize the child rows implied by the legacy scalar fields, so a
+/// pre-PMS-806 request still ends up with a populated `contact_phones`.
+///
+/// Only the `phone` scalar becomes the primary entry. That is deliberate: if a
+/// contact carries a mobile but no `phone`, promoting the mobile would make the
+/// mirror rule write that number back into `contacts.phone`, changing what an
+/// unchanged request stores today. The migration backfill uses the same rule.
+fn phones_from_scalars(
+    phone: Option<&str>,
+    mobile: Option<&str>,
+    fax: Option<&str>,
+) -> Vec<ResolvedPhone> {
+    let mut resolved = Vec::new();
+    if let Some(number) = phone.filter(|s| !s.is_empty()) {
+        resolved.push(ResolvedPhone {
+            phone_type: PhoneType::Work,
+            number: number.to_string(),
+            extension: None,
+            is_primary: true,
+            sort_order: 0,
+        });
+    }
+    if let Some(number) = mobile.filter(|s| !s.is_empty()) {
+        resolved.push(ResolvedPhone {
+            phone_type: PhoneType::Mobile,
+            number: number.to_string(),
+            extension: None,
+            is_primary: false,
+            sort_order: 1,
+        });
+    }
+    if let Some(number) = fax.filter(|s| !s.is_empty()) {
+        resolved.push(ResolvedPhone {
+            phone_type: PhoneType::Fax,
+            number: number.to_string(),
+            extension: None,
+            is_primary: false,
+            sort_order: 2,
+        });
+    }
+    resolved
+}
+
+/// Resolve an explicit `companies` list, preserving the caller's flags as-is.
+/// Which link ends up primary when none is flagged is decided by
+/// [`ContactService::write_contact_companies`], because it depends on which
+/// links already existed. Duplicate ids and two primaries are 422s at the
+/// request layer.
+fn resolve_company_list(entries: &[ContactCompanyLinkInput]) -> Vec<ResolvedLink> {
+    entries
+        .iter()
+        .map(|e| ResolvedLink {
+            company_id: e.company_id,
+            title: e.title.clone(),
+            is_primary: e.is_primary,
+        })
+        .collect()
+}
+
+#[derive(sqlx::FromRow)]
+struct ContactPhoneRow {
+    id: Uuid,
+    contact_id: Uuid,
+    phone_type: String,
+    number: String,
+    extension: Option<String>,
+    is_primary: bool,
+    sort_order: i32,
+}
+
+#[derive(sqlx::FromRow)]
+struct ContactCompanyLinkRow {
+    contact_id: Uuid,
+    company_id: Uuid,
+    company_name: Option<String>,
+    title: Option<String>,
+    is_primary: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -3302,5 +4242,201 @@ impl From<SiteRow> for Site {
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use validator::Validate;
+
+    // These live in the server crate, not `mokosh-types`, because `cargo test
+    // --lib` (the pre-commit and check.yml gate) only builds the root package's
+    // lib target. The `mokosh-types` test target does not compile today, which
+    // is tracked separately; mirroring the PMS-806 rules here means they are
+    // actually enforced on every run.
+
+    fn contact_req(body: serde_json::Value) -> CreateContactRequest {
+        let mut full = serde_json::json!({ "first_name": "Ada", "last_name": "Lovelace" });
+        if let serde_json::Value::Object(extra) = body {
+            for (k, v) in extra {
+                full[k] = v;
+            }
+        }
+        serde_json::from_value(full).expect("contact request deserializes")
+    }
+
+    #[test]
+    fn phone_type_round_trips_through_serde_and_the_db_strings() {
+        for (variant, wire) in [
+            (PhoneType::Mobile, "mobile"),
+            (PhoneType::Work, "work"),
+            (PhoneType::Home, "home"),
+            (PhoneType::Fax, "fax"),
+            (PhoneType::Other, "other"),
+        ] {
+            let json = serde_json::to_string(&variant).expect("serializes");
+            assert_eq!(json, format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::from_str::<PhoneType>(&json).expect("deserializes"),
+                variant
+            );
+            // Same strings back the `contact_phones.phone_type` CHECK.
+            assert_eq!(variant.as_str(), wire);
+            assert_eq!(PhoneType::from_str(wire), Some(variant));
+        }
+        assert_eq!(PhoneType::from_str("pager"), None);
+        assert_eq!(PhoneType::default(), PhoneType::Other);
+    }
+
+    #[test]
+    fn phone_list_uses_array_order_and_promotes_the_first_entry() {
+        let req = contact_req(serde_json::json!({
+            "phones": [
+                { "phone_type": "work", "number": "+1 (415) 555-1234" },
+                { "phone_type": "mobile", "number": "+14155559999" },
+            ],
+        }));
+        assert!(req.validate().is_ok());
+        let resolved =
+            resolve_phone_list(req.phones.as_deref().expect("phones")).expect("resolves");
+        assert_eq!(resolved.len(), 2);
+        // de_phone_opt normalization reaches the child row, not just the scalar.
+        assert_eq!(resolved[0].number, "+14155551234");
+        assert!(resolved[0].is_primary, "first entry is promoted");
+        assert_eq!(resolved[0].sort_order, 0);
+        assert!(!resolved[1].is_primary);
+        assert_eq!(resolved[1].sort_order, 1);
+    }
+
+    #[test]
+    fn explicit_primary_phone_is_respected() {
+        let req = contact_req(serde_json::json!({
+            "phones": [
+                { "phone_type": "work", "number": "+14155551234" },
+                { "phone_type": "mobile", "number": "+14155559999", "is_primary": true },
+            ],
+        }));
+        let resolved =
+            resolve_phone_list(req.phones.as_deref().expect("phones")).expect("resolves");
+        assert!(!resolved[0].is_primary);
+        assert!(resolved[1].is_primary);
+    }
+
+    #[test]
+    fn two_primary_entries_are_rejected_before_the_service() {
+        let phones = contact_req(serde_json::json!({
+            "phones": [
+                { "phone_type": "work", "number": "+14155551234", "is_primary": true },
+                { "phone_type": "home", "number": "+14155555678", "is_primary": true },
+            ],
+        }));
+        assert!(phones.validate().is_err());
+
+        let companies = contact_req(serde_json::json!({
+            "companies": [
+                { "company_id": "11111111-1111-1111-1111-111111111111", "is_primary": true },
+                { "company_id": "22222222-2222-2222-2222-222222222222", "is_primary": true },
+            ],
+        }));
+        assert!(companies.validate().is_err());
+    }
+
+    #[test]
+    fn invalid_phone_entry_is_a_422_naming_the_entry() {
+        let req = contact_req(serde_json::json!({
+            "phones": [
+                { "phone_type": "work", "number": "+14155551234" },
+                { "phone_type": "home", "number": "not-a-phone" },
+            ],
+        }));
+        let err: AppError = req.validate().expect_err("invalid entry rejected").into();
+        assert_eq!(err.status_code(), 422);
+        let AppError::Validation { ref errors, .. } = err else {
+            panic!("expected a validation error, got {err:?}");
+        };
+        assert!(
+            errors.iter().any(|f| f.field == "phones[1].number"),
+            "the 422 must name the failing entry, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_phone_entry_with_no_number_fails_loud_in_the_service_too() {
+        // The request layer rejects this first; the service must not silently
+        // substitute an empty number if it is ever reached directly.
+        let entries: Vec<ContactPhoneInput> =
+            serde_json::from_value(serde_json::json!([{ "phone_type": "work", "number": null }]))
+                .expect("entries deserialize");
+        let err = resolve_phone_list(&entries)
+            .err()
+            .expect("a missing number is an error");
+        assert_eq!(err.status_code(), 422);
+    }
+
+    #[test]
+    fn companies_list_with_a_freeform_name_is_rejected() {
+        let req = contact_req(serde_json::json!({
+            "company_name": "Acme Plumbing",
+            "companies": [{ "company_id": "11111111-1111-1111-1111-111111111111" }],
+        }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_company_links_are_rejected_before_the_unique_constraint() {
+        let req = contact_req(serde_json::json!({
+            "companies": [
+                { "company_id": "11111111-1111-1111-1111-111111111111" },
+                { "company_id": "11111111-1111-1111-1111-111111111111" },
+            ],
+        }));
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn company_list_resolution_preserves_the_callers_flags() {
+        // Which link becomes primary when none is flagged depends on which
+        // links already exist, so `write_contact_companies` decides it; the
+        // resolver must not pre-empt that (integration coverage:
+        // `a_list_with_no_primary_promotes_the_first_entry` and
+        // `removing_links_repromotes_and_recomputes`).
+        let req = contact_req(serde_json::json!({
+            "companies": [
+                { "company_id": "11111111-1111-1111-1111-111111111111" },
+                { "company_id": "22222222-2222-2222-2222-222222222222", "is_primary": true },
+            ],
+        }));
+        let resolved = resolve_company_list(req.companies.as_deref().expect("companies"));
+        assert!(!resolved[0].is_primary);
+        assert!(resolved[1].is_primary);
+
+        let unflagged = contact_req(serde_json::json!({
+            "companies": [{ "company_id": "11111111-1111-1111-1111-111111111111" }],
+        }));
+        let resolved = resolve_company_list(unflagged.companies.as_deref().expect("companies"));
+        assert!(!resolved[0].is_primary);
+    }
+
+    #[test]
+    fn scalars_materialize_child_rows_without_changing_the_mirror() {
+        // Only `phone` is primary: promoting a lone mobile would make the
+        // mirror rule write it back into `contacts.phone`, which a pre-PMS-806
+        // request never did.
+        let resolved = phones_from_scalars(Some("+14155551234"), Some("+14155559999"), None);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].phone_type, PhoneType::Work);
+        assert!(resolved[0].is_primary);
+        assert_eq!(resolved[1].phone_type, PhoneType::Mobile);
+        assert!(!resolved[1].is_primary);
+
+        let mobile_only = phones_from_scalars(None, Some("+14155559999"), None);
+        assert_eq!(mobile_only.len(), 1);
+        assert!(
+            !mobile_only[0].is_primary,
+            "a mobile-only contact keeps contacts.phone NULL"
+        );
+
+        assert!(phones_from_scalars(None, None, None).is_empty());
     }
 }

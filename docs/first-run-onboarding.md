@@ -23,7 +23,8 @@ So a fresh instance with no SMTP configured still lets the platform admin sign i
 1. Spin up the instance (see `docs/quickstart.md` for the dev stack; production is the same server behind bunyip-as-OP with `OIDC_ISSUER` + `OIDC_AUDIENCE` set to bunyip).
 2. Sign in through the SPA with the bunyip account that holds the platform-admin role. You land as `super_admin` with no email configured and no verification step.
 3. Configure email as that admin: `PUT /api/v1/settings/email` (admin-only, `RequireAdmin`; PMS-638). The SMTP password is stored AES-256-GCM-encrypted and the live mailer is hot-swapped on write, so email starts working with no restart. Any field left unset falls back to the matching `SMTP_*` env var.
-4. From here, invite the rest of the team. Later users go through normal verification: an invite to address X is only consumed by a bunyip login with a verified X (`place_bunyip_user`'s invite gate, PMS-248). Turning email on does not change or downgrade the bootstrap admin.
+4. Name the deployment as that admin: `PUT /api/v1/settings/app-name` (admin-only, `RequireAdmin`; PMS-789), body `{"app_name": "PSA Systems"}`. This is the product name recipients see in outbound mail, in the authenticator app when they enrol in MFA, and on the API's own landing page. It is one value for the whole deployment, not per tenant, and it takes effect immediately with no restart. Leave it unset and everything reads `Mokosh`; send an empty string to clear it back to that. It is deliberately not an environment variable, so changing it never needs a redeploy.
+5. From here, invite the rest of the team. Later users go through normal verification: an invite to address X is only consumed by a bunyip login with a verified X (`place_bunyip_user`'s invite gate, PMS-248). Turning email on does not change or downgrade the bootstrap admin.
 
 ## Local development: the ADMIN_EMAIL / ADMIN_PASSWORD seed
 
@@ -37,7 +38,6 @@ This path is DEV ONLY (it is labelled as such in code and `.env.example`); it is
 
 - Invite consumption: a pending invite is honored only for a verified address (`place_bunyip_user`).
 - Email persistence: the real address is stored on the JIT insert only when verified; otherwise a `<sub>@unresolved.invalid` placeholder is used (MAPPS-335). The placeholder is repaired on the first request after bunyip reports the address verified (`repair_placeholder_email`, PMS-635): the JIT insert runs once, so until then the row kept an address in the reserved `.invalid` TLD that every outbound email bounced off, and the invite gate above could never open for it.
-- Google account-linking: linking Google to an existing unverified local account asks the user to sign in with a password first (`login_with_google`).
 
 There is no `RequireVerified` extractor and no `email_verified_at`-based 403 anywhere in the request path.
 

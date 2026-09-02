@@ -183,7 +183,7 @@ impl SlaService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("SlaPolicy".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("SLA policy".to_string()))?;
         Ok(row.into())
     }
 
@@ -219,7 +219,7 @@ impl SlaService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("SlaPolicy".to_string()));
+            return Err(AppError::NotFound("SLA policy".to_string()));
         }
         tx.commit().await?;
         Ok(SlaPolicyResponse {
@@ -241,7 +241,7 @@ impl SlaService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("SlaPolicy".to_string()));
+            return Err(AppError::NotFound("SLA policy".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -304,7 +304,7 @@ impl SlaService {
         .fetch_one(&mut *tx)
         .await?;
         if !exists {
-            return Err(AppError::NotFound("SlaPolicy".to_string()));
+            return Err(AppError::NotFound("SLA policy".to_string()));
         }
         let id: Uuid = sqlx::query_scalar(
             r#"INSERT INTO sla_targets
@@ -345,7 +345,7 @@ impl SlaService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("SlaTarget".to_string()));
+            return Err(AppError::NotFound("SLA target".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -469,7 +469,7 @@ impl SlaService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("BusinessHours".to_string()));
+            return Err(AppError::NotFound("Business hours".to_string()));
         }
         tx.commit().await?;
         Ok(BusinessHoursResponse {
@@ -491,7 +491,7 @@ impl SlaService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("BusinessHours".to_string()));
+            return Err(AppError::NotFound("Business hours".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -590,7 +590,7 @@ impl SlaService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("HolidayCalendar".to_string()));
+            return Err(AppError::NotFound("Holiday calendar".to_string()));
         }
         tx.commit().await?;
         Ok(HolidayCalendarResponse {
@@ -610,7 +610,7 @@ impl SlaService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("HolidayCalendar".to_string()));
+            return Err(AppError::NotFound("Holiday calendar".to_string()));
         }
         tx.commit().await?;
         Ok(())

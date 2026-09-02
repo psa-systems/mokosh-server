@@ -1,8 +1,9 @@
 // Shared API helpers: route constants, PKCE primitives, and OIDC discovery.
 //
-// The PSA JSON API lives under /api/v1; the OIDC/SSO surface is mounted at the
-// deployment root (/oauth2/*, /.well-known/openid-configuration) - see
-// crates/mokosh-auth-http/src/router.rs. The `api` Playwright project picks up
+// The PSA JSON API lives under /api/v1 on the mokosh host; the OIDC/SSO surface
+// (/oauth2/*, /.well-known/openid-configuration) belongs to bunyip and is
+// served at the root of a DIFFERENT host, `env.opBaseURL`. mokosh mounts no
+// /oauth2/* route (PMS-295). The `api` Playwright project picks up
 // a Bearer token from the setup project (see e2e/lib/auth-state.ts) and the
 // custom `test` fixture in e2e/lib/fixtures.ts attaches it as the
 // `Authorization` header on every request, so handlers see the same auth path

@@ -300,7 +300,7 @@ impl DashboardsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or(AppError::NotFound("ScheduledDashboard".into()))?;
+        .ok_or(AppError::NotFound("Scheduled dashboard".into()))?;
         Ok(row.into())
     }
 
@@ -337,7 +337,7 @@ impl DashboardsService {
         .rows_affected();
         tx.commit().await?;
         if rows == 0 {
-            return Err(AppError::NotFound("ScheduledDashboard".into()));
+            return Err(AppError::NotFound("Scheduled dashboard".into()));
         }
         self.schedule_get(tenant_id, id).await
     }
@@ -356,7 +356,7 @@ impl DashboardsService {
         .rows_affected();
         tx.commit().await?;
         if rows == 0 {
-            return Err(AppError::NotFound("ScheduledDashboard".into()));
+            return Err(AppError::NotFound("Scheduled dashboard".into()));
         }
         Ok(())
     }

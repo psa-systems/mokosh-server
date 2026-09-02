@@ -12,9 +12,10 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::logo::{logo_path, TenantLogoConfig, TenantLogoStore};
+use super::organization::organization_update;
 use super::{
-    CreateTenantRequest, TenantAdminInfo, TenantResponse, TenantService, TenantUsage,
-    UpdateTenantAdminRequest, UpdateTenantRequest,
+    CreateTenantRequest, OrganizationProfileRequest, TenantAdminInfo, TenantResponse,
+    TenantService, TenantUsage, UpdateTenantAdminRequest, UpdateTenantRequest,
 };
 use crate::modules::auth::{
     AuthService, CurrentUser, RequireAuth, RequireAuthState, TenantId, TenantScoped,
@@ -111,9 +112,13 @@ pub fn tenant_routes(
     settings_service: Arc<SettingsService>,
     auth_service: Arc<AuthService>,
 ) -> Router {
+    // PMS-957: the authenticated tree is where a logo is uploaded and removed,
+    // so it is the one that records what is stored.
+    let logos =
+        TenantLogoStore::new(TenantLogoConfig::from_env()).with_ledger(tenant_service.db.clone());
     let state = TenantRouterState {
         tenant_service: Arc::new(tenant_service),
-        logos: Arc::new(TenantLogoStore::new(TenantLogoConfig::from_env())),
+        logos: Arc::new(logos),
         settings_service,
         auth_service,
     };
@@ -149,6 +154,11 @@ pub fn tenant_routes(
         // the browser supply it was the defect.
         .route("/current", get(get_current_tenant))
         .route("/current", put(update_current_tenant))
+        // PMS-896: the organisation record, submitted whole. Separate from the
+        // PATCH above because this is the one surface that states which fields
+        // an account must supply; see `super::organization`. Read back off
+        // `GET /current`, which already returns the name and the branding.
+        .route("/current/organization", put(update_current_organization))
         // MAPPS-429: the organisation's logo. Written here, read from the
         // PUBLIC router below, because the two places it has to appear (a
         // client's browser on the request-form page, a client's mail client)
@@ -365,6 +375,8 @@ async fn get_tenant(
 pub fn public_tenant_routes(tenant_service: TenantService) -> Router {
     let state = PublicTenantState {
         tenant_service: Arc::new(tenant_service),
+        // No ledger: this router only READS a logo, and recording is a
+        // property of storing one.
         logos: Arc::new(TenantLogoStore::new(TenantLogoConfig::from_env())),
     };
     Router::new()
@@ -429,14 +441,16 @@ async fn upload_current_logo(
     mut multipart: Multipart,
 ) -> AppResult<Json<TenantResponse>> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
 
     let mut file: Option<(String, Vec<u8>)> = None;
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| AppError::BadRequest(format!("multipart parse: {e}")))?
+        .map_err(|e| AppError::BadRequest(format!("Multipart parse: {e}")))?
     {
         if field.name().unwrap_or_default() != "file" {
             continue;
@@ -448,12 +462,12 @@ async fn upload_current_logo(
         let bytes = field
             .bytes()
             .await
-            .map_err(|e| AppError::BadRequest(format!("multipart read: {e}")))?;
+            .map_err(|e| AppError::BadRequest(format!("Multipart read: {e}")))?;
         file = Some((mime, bytes.to_vec()));
         break;
     }
     let (mime, bytes) =
-        file.ok_or_else(|| AppError::BadRequest("missing 'file' part in multipart body".into()))?;
+        file.ok_or_else(|| AppError::BadRequest("Missing 'file' part in multipart body".into()))?;
 
     let tenant_id = user.tenant();
     let stored_mime = state.logos.store(tenant_id.get(), &mime, &bytes).await?;
@@ -495,7 +509,9 @@ async fn delete_current_logo(
     ctx: crate::modules::audit::AuditCtx,
 ) -> AppResult<Json<TenantResponse>> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
     let tenant_id = user.tenant();
     // PMS-758: explicit nulls, which is how a merged document clears a key.
@@ -548,12 +564,40 @@ async fn update_current_tenant(
     Json(request): Json<UpdateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
     }
     request.validate()?;
     let tenant = state
         .tenant_service
         .update_tenant(user.tenant(), &request, &ctx)
+        .await?;
+    Ok(Json(tenant.into()))
+}
+
+/// PMS-896: save the caller's organisation record.
+///
+/// Name, contact phone and contact email are required; the contact name and the
+/// website are optional and are cleared when the submission omits them. Same
+/// admin gate as the rename it performs: the organisation name, contact and
+/// website are what every client sees on the forms and email this tenant sends.
+/// A non-admin's onboarding does not reach here (MAPPS-524).
+async fn update_current_organization(
+    State(state): State<TenantRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<OrganizationProfileRequest>,
+) -> AppResult<Json<TenantResponse>> {
+    if !user.role.is_admin() {
+        return Err(AppError::Forbidden(
+            "You do not have permission to do that".to_string(),
+        ));
+    }
+    let update = organization_update(&request)?;
+    let tenant = state
+        .tenant_service
+        .update_tenant(user.tenant(), &update, &ctx)
         .await?;
     Ok(Json(tenant.into()))
 }

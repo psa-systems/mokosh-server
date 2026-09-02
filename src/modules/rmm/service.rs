@@ -14,6 +14,33 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+/// Parse and screen a stored `api_url` before the reachability probe connects
+/// to it (PMS-809). The error string is what the endpoint reports back, so a
+/// refused target reads as unreachable-with-a-reason rather than a bare false.
+async fn screened_target(api_url: &str, connection_id: Uuid) -> Result<url::Url, String> {
+    let target =
+        url::Url::parse(api_url).map_err(|e| format!("api_url is not a valid URL: {e}"))?;
+    match crate::utils::net::guard_outbound_url(
+        &crate::utils::net::SystemResolver,
+        &target,
+        None,
+        crate::utils::net::private_target_allowlist(),
+    )
+    .await
+    {
+        Ok(()) => Ok(target),
+        Err(e) => {
+            tracing::warn!(
+                %connection_id, blocked = %e,
+                "RMM connection test refused: api_url is not on the public internet",
+            );
+            Err(format!(
+                "api_url refused: {e}. Set OUTBOUND_PRIVATE_ALLOWLIST if this target is deliberately private."
+            ))
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RmmService {
     db: Database,
@@ -166,7 +193,7 @@ impl RmmService {
         .fetch_optional(&mut *tx)
         .await?;
         row.map(Into::into)
-            .ok_or_else(|| AppError::NotFound("RmmConnection".to_string()))
+            .ok_or_else(|| AppError::NotFound("RMM connection".to_string()))
     }
 
     /// `PUT /api/v1/rmm/connections/{id}`. Missing fields on the
@@ -214,7 +241,7 @@ impl RmmService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmConnection".to_string()));
+            return Err(AppError::NotFound("RMM connection".to_string()));
         }
         tx.commit().await?;
         self.get_connection(tenant_id, id).await
@@ -230,7 +257,7 @@ impl RmmService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmConnection".to_string()));
+            return Err(AppError::NotFound("RMM connection".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -251,19 +278,28 @@ impl RmmService {
         ).bind(tenant_id).bind(id).fetch_optional(&mut *read_tx).await?;
         drop(read_tx);
         let Some((url, key_enc)) = row else {
-            return Err(AppError::NotFound("RmmConnection".to_string()));
+            return Err(AppError::NotFound("RMM connection".to_string()));
         };
         let _api_key = crate::utils::crypto::decrypt(&key_enc, &self.encryption_key)?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            // A followed redirect would connect to an address the guard below
+            // never screened, so the hop is reported instead of taken.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| AppError::Internal(format!("http client: {e}")))?;
-        let result = client
-            .head(&url)
-            .send()
-            .await
-            .map(|r| r.status().as_u16())
-            .map_err(|e| e.to_string());
+        // PMS-809: `api_url` is tenant-editable, so this probe is screened
+        // exactly like the provider's requests. A refusal is `reachable: false`
+        // carrying the cause, never a silent success.
+        let result = match screened_target(&url, id).await {
+            Ok(target) => client
+                .head(target)
+                .send()
+                .await
+                .map(|r| r.status().as_u16())
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
         let summary = match result {
             Ok(status) => serde_json::json!({"reachable": true, "status": status}),
             Err(e) => serde_json::json!({"reachable": false, "error": e}),
@@ -406,7 +442,7 @@ impl RmmService {
         .fetch_optional(&mut *tx)
         .await?;
         row.map(Into::into)
-            .ok_or_else(|| AppError::NotFound("RmmDeviceMapping".to_string()))
+            .ok_or_else(|| AppError::NotFound("RMM device mapping".to_string()))
     }
 
     /// `PUT /api/v1/rmm/device-mappings/{id}`. Missing fields on the
@@ -439,7 +475,7 @@ impl RmmService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmDeviceMapping".to_string()));
+            return Err(AppError::NotFound("RMM device mapping".to_string()));
         }
         tx.commit().await?;
         self.get_device_mapping(tenant_id, id).await
@@ -455,7 +491,7 @@ impl RmmService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmDeviceMapping".to_string()));
+            return Err(AppError::NotFound("RMM device mapping".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -596,7 +632,7 @@ impl RmmService {
         .fetch_optional(&mut *tx)
         .await?;
         row.map(Into::into)
-            .ok_or_else(|| AppError::NotFound("RmmAlertRule".to_string()))
+            .ok_or_else(|| AppError::NotFound("RMM alert rule".to_string()))
     }
 
     /// `PUT /api/v1/rmm/alert-rules/{id}`. Missing fields on the request
@@ -635,7 +671,7 @@ impl RmmService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmAlertRule".to_string()));
+            return Err(AppError::NotFound("RMM alert rule".to_string()));
         }
         tx.commit().await?;
         self.get_alert_rule(tenant_id, id).await
@@ -651,7 +687,7 @@ impl RmmService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("RmmAlertRule".to_string()));
+            return Err(AppError::NotFound("RMM alert rule".to_string()));
         }
         tx.commit().await?;
         Ok(())

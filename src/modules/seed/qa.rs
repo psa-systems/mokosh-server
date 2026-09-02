@@ -59,8 +59,9 @@ use crate::modules::assets::{AssetsService, CreateAssetRequest, UpsertAssetTypeR
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::TenantId;
 use crate::modules::billing::{
-    BillingService, CreateInvoiceLineRequest, CreateInvoiceRequest, CreatePaymentRequest,
-    InvoiceLineType, PaymentMethod,
+    BillingService, CreateCreditNoteLineRequest, CreateCreditNoteRequest, CreateInvoiceLineRequest,
+    CreateInvoiceRequest, CreatePaymentRequest, InvoiceLineType, InvoiceStatus, PaymentMethod,
+    UpdateInvoiceRequest, UpsertProductRequest,
 };
 use crate::modules::calendar::{CalendarService, CreateAppointmentRequest};
 use crate::modules::contacts::{
@@ -101,8 +102,12 @@ pub struct QaReport {
     pub tasks: usize,
     pub time_entries: usize,
     pub contracts: usize,
+    pub products: usize,
     pub invoices: usize,
     pub payments: usize,
+    /// PMS-953: credited invoices, so the QA dataset carries the correction
+    /// path and not only the happy one.
+    pub credit_notes: usize,
     pub assets: usize,
     pub kb_articles: usize,
     pub sla_policies: usize,
@@ -120,8 +125,8 @@ impl fmt::Display for QaReport {
         write!(
             f,
             "companies={} contacts={} tickets={} projects={} phases={} tasks={} \
-             time_entries={} contracts={} invoices={} payments={} assets={} \
-             kb_articles={} sla_policies={} appointments={}",
+             time_entries={} contracts={} products={} invoices={} payments={} \
+             credit_notes={} assets={} kb_articles={} sla_policies={} appointments={}",
             self.companies,
             self.contacts,
             self.tickets,
@@ -130,8 +135,10 @@ impl fmt::Display for QaReport {
             self.tasks,
             self.time_entries,
             self.contracts,
+            self.products,
             self.invoices,
             self.payments,
+            self.credit_notes,
             self.assets,
             self.kb_articles,
             self.sla_policies,
@@ -372,6 +379,18 @@ impl QaSeeder {
             report.contracts += 1;
         }
 
+        // --- Product catalog (PMS-955), and the line that sells one ---
+        //
+        // Seeded before the invoices, because the invoice below references it.
+        // The line still states its own price: the catalog is where the price
+        // comes FROM, never where a written document reads it back.
+        let mut product_ids: Vec<Uuid> = Vec::new();
+        for spec in qa_product_specs() {
+            let product = self.billing.create_product(tenant, &spec, &ctx).await?;
+            product_ids.push(product.id);
+            report.products += 1;
+        }
+
         // --- Invoices with line items + payments ---
         for (inv_spec, pay_fraction) in qa_invoice_specs(&company_ids) {
             let total: Decimal = inv_spec
@@ -399,6 +418,46 @@ impl QaSeeder {
                 report.payments += 1;
             }
         }
+
+        // --- A sent invoice, partly credited (PMS-953) ---
+        //
+        // The two invoices above are drafts, and a credit note is only legal
+        // against a document the customer already holds, so this one is sent
+        // first. It exists so the QA dataset carries a corrected invoice and
+        // not only invoices that went out right the first time: a `void`
+        // status and a non-zero `amount_credited` are states no other seeded
+        // row reaches.
+        let credited_spec = qa_credited_invoice_spec(&company_ids, product_ids.first().copied());
+        let credited = self
+            .billing
+            .create_invoice(tenant, &credited_spec, &ctx)
+            .await?;
+        report.invoices += 1;
+        self.billing
+            .update_invoice(
+                tenant,
+                credited.id,
+                &UpdateInvoiceRequest {
+                    billing_contact_id: None,
+                    contract_id: None,
+                    invoice_date: None,
+                    due_date: None,
+                    payment_terms: None,
+                    payment_term_id: None,
+                    tax_amount: None,
+                    discount_amount: None,
+                    notes: None,
+                    po_number: None,
+                    lines: None,
+                    status: Some(InvoiceStatus::Sent),
+                },
+                &ctx,
+            )
+            .await?;
+        self.billing
+            .create_credit_note(tenant, &qa_credit_note_spec(credited.id), &ctx)
+            .await?;
+        report.credit_notes += 1;
 
         // --- Assets (one asset type + a handful spread across companies) ---
         let asset_type = self
@@ -627,6 +686,13 @@ async fn teardown(db: &Database, tid: Uuid) -> AppResult<QaReport> {
     report.payments = del!(&format!(
         "DELETE FROM payments WHERE tenant_id = $1 AND company_id IN ({qa_companies})"
     ));
+    // PMS-953: credit notes reference invoices, so they go before them. Their
+    // lines cascade on the note, but the note does not cascade on the invoice
+    // (the FK is a plain reference, so an invoice with a credit note cannot be
+    // deleted out from under it), which is why this is its own statement.
+    report.credit_notes = del!(&format!(
+        "DELETE FROM credit_notes WHERE tenant_id = $1 AND company_id IN ({qa_companies})"
+    ));
     del!(&format!(
         "DELETE FROM invoice_lines WHERE invoice_id IN \
          (SELECT id FROM invoices WHERE tenant_id = $1 AND company_id IN ({qa_companies}))"
@@ -634,6 +700,9 @@ async fn teardown(db: &Database, tid: Uuid) -> AppResult<QaReport> {
     report.invoices = del!(&format!(
         "DELETE FROM invoices WHERE tenant_id = $1 AND company_id IN ({qa_companies})"
     ));
+    // PMS-955: after the invoice lines that reference them, because the FK is a
+    // plain reference and refuses to drop a product a document still names.
+    report.products = del!("DELETE FROM products WHERE tenant_id = $1 AND name LIKE 'QA-%'");
     report.time_entries = del!(&format!(
         "DELETE FROM time_entries WHERE tenant_id = $1 AND company_id IN ({qa_companies})"
     ));
@@ -849,6 +918,10 @@ fn qa_contacts_for(company_id: Uuid, idx: usize) -> Vec<CreateContactRequest> {
                 tags: vec![QA_TAG.to_string()],
                 notes: None,
                 create_portal_access: false,
+                // PMS-806: the scalars above materialize the child rows, so the
+                // QA set exercises the compatibility path.
+                phones: None,
+                companies: None,
             }
         })
         .collect()
@@ -1021,7 +1094,10 @@ fn qa_time_entries(
                     None
                 },
                 task_id: None,
-                company_id: company_ids[i % company_ids.len()],
+                // PMS-942: the seed logs client work, so the kind is left to
+                // the service to derive from the company and the work item.
+                entry_kind: None,
+                company_id: Some(company_ids[i % company_ids.len()]),
                 notes: Some("QA seed time entry.".to_string()),
                 work_category: None,
                 is_billable: i % 3 != 0,
@@ -1087,6 +1163,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                 po_number: Some("QA-PO-1".to_string()),
                 lines: vec![
                     CreateInvoiceLineRequest {
+                        product_id: None,
                         line_type: InvoiceLineType::Service,
                         description: "QA-Managed services - June".to_string(),
                         quantity: Decimal::new(100, 2),
@@ -1096,6 +1173,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                         sort_order: 1,
                     },
                     CreateInvoiceLineRequest {
+                        product_id: None,
                         line_type: InvoiceLineType::TimeEntry,
                         description: "QA-Onsite support hours".to_string(),
                         quantity: Decimal::new(400, 2),
@@ -1124,6 +1202,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                 po_number: Some("QA-PO-2".to_string()),
                 lines: vec![
                     CreateInvoiceLineRequest {
+                        product_id: None,
                         line_type: InvoiceLineType::Product,
                         description: "QA-Firewall appliance".to_string(),
                         quantity: Decimal::new(200, 2),
@@ -1133,6 +1212,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                         sort_order: 1,
                     },
                     CreateInvoiceLineRequest {
+                        product_id: None,
                         line_type: InvoiceLineType::Service,
                         description: "QA-Installation".to_string(),
                         quantity: Decimal::new(100, 2),
@@ -1279,6 +1359,100 @@ fn qa_appointment_specs(
             }
         })
         .collect()
+}
+
+/// PMS-955: a small catalog, so the QA dataset has products that are rows
+/// rather than free text typed into a document.
+fn qa_product_specs() -> Vec<UpsertProductRequest> {
+    vec![
+        UpsertProductRequest {
+            sku: Some("QA-M365-BS".to_string()),
+            name: "QA-Microsoft 365 Business Standard".to_string(),
+            description: Some("Per user, per month.".to_string()),
+            unit_price: Decimal::new(2200, 2),
+            unit: "user".to_string(),
+            is_taxable: true,
+            is_active: true,
+        },
+        UpsertProductRequest {
+            sku: Some("QA-BKP-1TB".to_string()),
+            name: "QA-Managed backup, 1TB".to_string(),
+            description: Some("Per device, per month.".to_string()),
+            unit_price: Decimal::new(4500, 2),
+            unit: "month".to_string(),
+            is_taxable: true,
+            is_active: true,
+        },
+        UpsertProductRequest {
+            sku: Some("QA-SW-8P".to_string()),
+            name: "QA-8-port managed switch".to_string(),
+            description: Some(
+                "Retired: superseded. Kept to exercise the inactive path.".to_string(),
+            ),
+            unit_price: Decimal::new(24900, 2),
+            unit: "each".to_string(),
+            is_taxable: true,
+            is_active: false,
+        },
+    ]
+}
+
+/// PMS-953: one invoice that goes out, is sent, and is then partly credited.
+///
+/// Separate from `qa_invoice_specs` because those two stay drafts, and a credit
+/// note is only legal against a document the customer already holds.
+fn qa_credited_invoice_spec(
+    company_ids: &[Uuid],
+    product_id: Option<Uuid>,
+) -> CreateInvoiceRequest {
+    let company = company_ids.first().copied().unwrap_or_default();
+    CreateInvoiceRequest {
+        company_id: company,
+        billing_contact_id: None,
+        contract_id: None,
+        invoice_date: today() - Duration::days(30),
+        due_date: today(),
+        payment_terms: Some("net30".to_string()),
+        payment_term_id: None,
+        tax_amount: None,
+        discount_amount: None,
+        currency: Some("USD".to_string()),
+        notes: Some("QA seed invoice (sent, then partly credited).".to_string()),
+        po_number: Some("QA-PO-3".to_string()),
+        lines: vec![CreateInvoiceLineRequest {
+            // PMS-955: the one seeded line that names a catalog row, so the
+            // dataset carries a sold product and not only free-text lines.
+            product_id,
+            line_type: InvoiceLineType::Product,
+            description: "QA-Managed services - May".to_string(),
+            quantity: Decimal::ONE,
+            unit_price: Decimal::new(200000, 2),
+            ticket_id: None,
+            project_id: None,
+            sort_order: 1,
+        }],
+    }
+}
+
+/// The correcting document for the invoice above: a partial credit, so the QA
+/// dataset shows an invoice with a reduced balance rather than only the
+/// all-or-nothing `void` case.
+fn qa_credit_note_spec(invoice_id: Uuid) -> CreateCreditNoteRequest {
+    CreateCreditNoteRequest {
+        invoice_id,
+        issue_date: Some(today() - Duration::days(5)),
+        reason: "QA seed: billed for a site that had already been decommissioned".to_string(),
+        tax_amount: None,
+        currency: Some("USD".to_string()),
+        notes: Some("QA seed credit note.".to_string()),
+        lines: vec![CreateCreditNoteLineRequest {
+            line_type: InvoiceLineType::Adjustment,
+            description: "QA-Decommissioned site, May".to_string(),
+            quantity: Decimal::ONE,
+            unit_price: Decimal::new(50000, 2),
+            sort_order: 1,
+        }],
+    }
 }
 
 #[cfg(test)]

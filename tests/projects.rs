@@ -362,10 +362,14 @@ async fn create_accepts_status_dates_and_manager(pool: PgPool) {
     assert_eq!(fetched["actual_end_date"].as_str(), Some("2026-06-28"));
 }
 
-// AC5: a time entry linked to a task/project rolls into actual hours and
-// amount once approved (and not before).
+// AC5, as rewritten by PMS-944: a time entry linked to a task or project rolls
+// into actual hours and amount as soon as it is logged. It used to pin the
+// opposite ("and not before"), because PMS-144 made approval the gate on
+// everything. With approval confined to timesheets, a tenant with the flag off
+// never reaches 'approved', so the old rule would have shown every project on
+// such a tenant running at zero actuals for ever.
 #[sqlx::test]
-async fn approved_time_rolls_into_actuals(pool: PgPool) {
+async fn logged_time_rolls_into_actuals(pool: PgPool) {
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
     let app = common::boot(pool).await;
@@ -426,14 +430,17 @@ async fn approved_time_rolls_into_actuals(pool: PgPool) {
         entry.status()
     );
 
-    // Pending time must NOT count toward actuals yet.
+    // The hours count the moment they are logged. Nothing has been submitted
+    // and nobody has approved anything.
     let task_before = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
-    assert_eq!(
-        dec(&task_before["actual_hours"]),
-        0.0,
-        "pending (unapproved) time does not roll into actual hours"
+    assert!(
+        (dec(&task_before["actual_hours"]) - 2.0).abs() < 0.01,
+        "logged time rolls into actual hours with no approval step (got {})",
+        dec(&task_before["actual_hours"])
     );
 
+    // Approval still exists for the timesheet, and running it must leave the
+    // actuals exactly where they were: it is no longer what makes time count.
     // Submit the week first (PMS-183: entries start as draft and must be
     // submitted before a manager can approve them).
     let submit = post(
@@ -463,31 +470,32 @@ async fn approved_time_rolls_into_actuals(pool: PgPool) {
         approve.status()
     );
 
-    // Now the task and project reflect the approved 2h / $100.
+    // Same 2h / $100 as before the approval, on the task and on the project.
     let task_after = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
     assert!(
         (dec(&task_after["actual_hours"]) - 2.0).abs() < 0.01,
-        "approved time rolls into task actual_hours (expected 2.0, got {})",
+        "approving does not change task actual_hours (expected 2.0, got {})",
         dec(&task_after["actual_hours"])
     );
 
     let project_after = get_json(&app, &token, &format!("/api/v1/projects/{project_id}")).await;
     assert!(
         (dec(&project_after["actual_hours"]) - 2.0).abs() < 0.01,
-        "approved time rolls into project actual_hours"
+        "approving does not change project actual_hours"
     );
     assert!(
         (dec(&project_after["actual_amount"]) - 100.0).abs() < 0.01,
-        "approved billable time rolls into project actual_amount (expected 100.0, got {})",
+        "billable logged time rolls into project actual_amount (expected 100.0, got {})",
         dec(&project_after["actual_amount"])
     );
 }
 
-/// PMS-329: a task exposes `logged_hours` (every non-rejected entry) next to
-/// `actual_hours` (approved-only). Draft time shows in logged but not actual;
-/// approving makes both reflect it; rejecting drops it from both. The approval
-/// transitions are driven directly in SQL so the test pins the rollup SELECT,
-/// not the timesheet state machine.
+/// PMS-329, narrowed by PMS-944: a task exposes `logged_hours` next to
+/// `actual_hours`, and both now count every non-rejected entry. PMS-329 had
+/// `actual_hours` count approved time only, which is the rule PMS-944 removed;
+/// what is left of the distinction is that rejecting still drops an entry from
+/// both. The approval transitions are driven directly in SQL so the test pins
+/// the rollup SELECT, not the timesheet state machine.
 #[sqlx::test]
 async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
     let probe = pool.clone();
@@ -550,17 +558,18 @@ async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
         .unwrap()
         .to_string();
 
-    // Draft: logged counts it, actual does not.
+    // Draft: both count it. A tenant with timesheets off logs nothing else,
+    // so an actual_hours that waited for approval would never move at all.
     let t = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
     assert!(
         (dec(&t["logged_hours"]) - 2.0).abs() < 0.01,
         "draft time counts toward logged_hours (got {})",
         dec(&t["logged_hours"])
     );
-    assert_eq!(
-        dec(&t["actual_hours"]),
-        0.0,
-        "draft time does not count toward actual_hours"
+    assert!(
+        (dec(&t["actual_hours"]) - 2.0).abs() < 0.01,
+        "draft time counts toward actual_hours (got {})",
+        dec(&t["actual_hours"])
     );
 
     // The list read path carries logged_hours too.
@@ -575,7 +584,7 @@ async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
         "list_tasks exposes logged_hours"
     );
 
-    // Approve -> both reflect it.
+    // Approve -> nothing moves, because neither column was waiting on it.
     set_entry_approval(&probe, &entry_id, "approved").await;
     let t = get_json(&app, &token, &format!("/api/v1/tasks/{task_id}")).await;
     assert!(
@@ -584,7 +593,7 @@ async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
     );
     assert!(
         (dec(&t["actual_hours"]) - 2.0).abs() < 0.01,
-        "approved time rolls into actual_hours"
+        "approved time stays in actual_hours"
     );
 
     // Reject -> neither reflects it.
@@ -1578,4 +1587,168 @@ async fn project_oversized_budget_and_safe_company_id(pool: PgPool) {
         "create with a valid company_id must still 2xx after the injection attempt, got {}",
         after_injection.status()
     );
+}
+
+/// PMS-894: tenant-wide project totals in one request.
+///
+/// The SPA's project list computed its Active / On hold / Completed cards and
+/// its budget sum from the rows it had fetched, so past the server's default
+/// page every card reported one page rather than the tenant. The counts alone
+/// were already answerable with `?status=X&per_page=1` and `meta.total`; a sum
+/// is the one a page cannot approximate from a page, which is why this endpoint
+/// exists.
+#[sqlx::test]
+async fn project_summary_totals_the_tenant_not_a_page(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let summary = || {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/projects/summary");
+        let token = token.clone();
+        async move {
+            let resp = client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("get project summary");
+            assert!(resp.status().is_success(), "got {}", resp.status());
+            resp.json::<serde_json::Value>()
+                .await
+                .expect("summary JSON")
+        }
+    };
+
+    // An empty tenant sums to 0, not null: COALESCE, so a client renders "0"
+    // rather than deciding what a missing total means.
+    let empty = summary().await;
+    assert_eq!(empty["total_budget"].as_str(), Some("0"));
+    assert!(empty["counts_by_status"]
+        .as_object()
+        .expect("counts object")
+        .is_empty());
+
+    for (name, status, budget) in [
+        ("Network Upgrade", "active", Some("10000.50")),
+        ("Office Move", "active", Some("2500.25")),
+        ("Archive Cleanup", "completed", Some("100")),
+        // No budget at all, which is the case that makes SUM return NULL if
+        // nothing accounts for it.
+        ("Unbudgeted Discovery", "active", None),
+    ] {
+        let mut body = serde_json::json!({
+            "name": name,
+            "company_id": company,
+            "status": status,
+        });
+        if let Some(budget) = budget {
+            body["budget_amount"] = serde_json::json!(budget);
+        }
+        let resp = post(&app, &token, "/api/v1/projects", body).await;
+        assert!(
+            resp.status().is_success(),
+            "create {name}: {}",
+            resp.status()
+        );
+    }
+
+    let s = summary().await;
+
+    // Counts are per status, and a status nobody holds is absent rather than
+    // zero: the set of statuses belongs to the data.
+    assert_eq!(s["counts_by_status"]["active"].as_i64(), Some(3));
+    assert_eq!(s["counts_by_status"]["completed"].as_i64(), Some(1));
+    assert!(s["counts_by_status"].get("on_hold").is_none());
+
+    // The sum is exact and carries its cents. A project with no budget
+    // contributes nothing rather than making the whole sum NULL, which is what
+    // SUM does without the COALESCE and the NULL-skipping it relies on.
+    assert_eq!(
+        s["total_budget"].as_str(),
+        Some("12600.75"),
+        "10000.50 + 2500.25 + 100, with the unbudgeted project skipped"
+    );
+
+    // And it is a string on the wire, like every other money field, so no
+    // client parses a budget through a float.
+    assert!(
+        s["total_budget"].is_string(),
+        "money crosses the wire as a string"
+    );
+}
+
+/// PMS-895: `?q=` matches the project name, and the count agrees with the page.
+///
+/// The SPA's project list searched names in the browser. Paging it server-side
+/// (MAPPS-546) without this would have left the search box filtering whichever
+/// page happened to be loaded and presenting that as the whole answer - the
+/// failure mode that is worse than no filter, because the control appears to
+/// work.
+///
+/// The `meta.total` assertions are the point: this list builds its data and
+/// count WHERE clauses separately with their own placeholder numbering, and a
+/// filter added to one but not the other is a 500 or a lie, which is the bug
+/// class the comment above that code names.
+#[sqlx::test]
+async fn project_search_matches_names_and_counts(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    for name in ["Network Upgrade", "Network Audit", "Office Move"] {
+        let resp = post(
+            &app,
+            &token,
+            "/api/v1/projects",
+            serde_json::json!({ "name": name, "company_id": company, "status": "active" }),
+        )
+        .await;
+        assert!(resp.status().is_success(), "create {name}");
+    }
+
+    let search = |query: &str| {
+        let client = app.client.clone();
+        let url = app.url(&format!("/api/v1/projects?{query}"));
+        let token = token.clone();
+        async move {
+            let resp = client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("list projects");
+            assert!(resp.status().is_success(), "got {}", resp.status());
+            let v: serde_json::Value = resp.json().await.expect("projects JSON");
+            let names: Vec<String> = v["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .map(|p| p["name"].as_str().unwrap_or_default().to_string())
+                .collect();
+            (names, v["meta"]["total"].as_u64().unwrap_or_default())
+        }
+    };
+
+    let (mut names, total) = search("q=Network").await;
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Network Audit".to_string(), "Network Upgrade".to_string()]
+    );
+    assert_eq!(total, 2, "the count query must apply the same filter");
+
+    // Combined with another filter, so the placeholder numbering is exercised
+    // with two conditions rather than one.
+    let (names, total) = search("status=active&q=Office").await;
+    assert_eq!(names, vec!["Office Move".to_string()]);
+    assert_eq!(total, 1);
+
+    // And it excludes.
+    let (names, total) = search("q=nothing-matches-this").await;
+    assert!(names.is_empty());
+    assert_eq!(total, 0);
 }

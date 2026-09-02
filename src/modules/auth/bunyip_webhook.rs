@@ -93,11 +93,11 @@ pub async fn account_deleted(
     // 3. Only then parse the body. Order matters: an unauthenticated body must
     //    not reach the JSON parser at all.
     let payload: AccountDeletedPayload = serde_json::from_slice(&body)
-        .map_err(|_| AppError::BadRequest("malformed webhook body".to_string()))?;
+        .map_err(|_| AppError::BadRequest("Malformed webhook body".to_string()))?;
 
     if payload.event != EVENT_ACCOUNT_DELETED {
         return Err(AppError::BadRequest(format!(
-            "unsupported event {:?}",
+            "Unsupported event {:?}",
             payload.event
         )));
     }

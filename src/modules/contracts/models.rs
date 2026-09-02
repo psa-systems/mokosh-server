@@ -1,5 +1,11 @@
 //! Contracts DTOs.
 
+// `BillingRule` exposes `from_str(&str) -> Option<Self>` as a deliberate
+// infallible-style parser API, matching every other domain enum in this
+// codebase; it intentionally does not implement `std::str::FromStr` (which
+// requires a `Result`).
+#![allow(clippy::should_implement_trait)]
+
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -93,6 +99,7 @@ fn validate_contract_date_range(
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateContractRequest {
     pub contract_number: Option<String>,
+    #[validate(length(min = 1, max = 255))]
     pub name: Option<String>,
     #[validate(custom(function = crate::utils::validation::validate_contract_status))]
     pub status: Option<String>,
@@ -124,6 +131,20 @@ pub struct ContractItemResponse {
     pub rollover_enabled: bool,
     pub max_rollover_hours: Option<Decimal>,
     pub sort_order: i32,
+    /// PMS-955: the catalog product this item sells, when it names one. The
+    /// PRICE stays on the item: `unit_price` is what the contract agreed, and
+    /// the invoice line the recurring worker writes copies it from here, not
+    /// from the catalog, so editing the price list cannot re-price a signed
+    /// contract.
+    pub product_id: Option<Uuid>,
+    /// PMS-956: what the recurring generator does with this item. `item_type`
+    /// says what the item IS; this says whether it bills, and the two used to
+    /// be one field, which is how a `product` item came to bill never.
+    pub billing_rule: BillingRule,
+    /// PMS-956: when a `once` item was billed, and `None` until it is. This is
+    /// the per-item idempotency the period ledger cannot provide, since that is
+    /// keyed on the period rather than the item.
+    pub billed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -144,6 +165,73 @@ pub struct UpsertContractItemRequest {
     pub max_rollover_hours: Option<Decimal>,
     #[serde(default)]
     pub sort_order: i32,
+    /// PMS-955: optional link to the catalog. It does not fill in the price.
+    #[serde(default)]
+    pub product_id: Option<Uuid>,
+    /// PMS-956: omitted, it is derived from `item_type` by
+    /// [`BillingRule::derive`], which reproduces today's behaviour for the two
+    /// types that already bill. State it to say something else: a licence sold
+    /// on a contract is a `product` that should bill `every_period`.
+    #[serde(default)]
+    pub billing_rule: Option<BillingRule>,
+}
+
+/// PMS-956: what the recurring generator does with a contract item.
+///
+/// Three values, and none of them is a frequency. The period comes from the
+/// contract's `billing_cycle`; this says only whether an item takes part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingRule {
+    /// Billed on every one of the contract's periods. What `recurring_service`
+    /// and `retainer` have always done.
+    EveryPeriod,
+    /// Billed on the next period that runs, and never again. A setup fee.
+    Once,
+    /// The generator never touches it; invoice it by hand if at all. The
+    /// default, and the backfill target for every existing row that was not
+    /// already billing, so nothing starts charging a client retroactively.
+    #[default]
+    Manual,
+}
+
+impl BillingRule {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::EveryPeriod => "every_period",
+            Self::Once => "once",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "every_period" => Some(Self::EveryPeriod),
+            "once" => Some(Self::Once),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+
+    /// What an item bills when the caller does not say.
+    ///
+    /// One function rather than a rule spread across call sites, and it
+    /// reproduces today's behaviour exactly for the two types that already
+    /// bill, so an existing API client sees no change at all.
+    ///
+    /// `one_time` derives to `Once` because its name says so. `product` and
+    /// `block_hours` derive to `Manual`: a product on a contract may be a
+    /// monthly licence or a one-off box and the type cannot tell them apart,
+    /// so the operator says which. That is still a change worth having, because
+    /// `manual` is visible on the record and settable, where billing nothing
+    /// was neither.
+    pub fn derive(item_type: &str) -> Self {
+        match item_type {
+            "recurring_service" | "retainer" => Self::EveryPeriod,
+            "one_time" => Self::Once,
+            _ => Self::Manual,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -344,4 +432,55 @@ pub struct ConsumeOutcome {
     pub overage_amount: Decimal,
     /// The balance row id that was debited (current period).
     pub balance_id: Uuid,
+}
+
+#[cfg(test)]
+mod pms956_billing_rule_tests {
+    use super::*;
+
+    /// The compatibility rule, and the reason `derive` is one function rather
+    /// than a match repeated at each call site.
+    ///
+    /// The two types that bill today must keep billing identically, or this
+    /// change stops an MSP's recurring revenue the day it deploys. `one_time`
+    /// gets the meaning its name has always claimed. Everything else is
+    /// `Manual`, which bills nothing: a row written by a path that forgot must
+    /// not start charging a client, because a missing charge is recoverable
+    /// where a wrong one is a conversation.
+    #[test]
+    fn an_omitted_rule_reproduces_todays_behaviour() {
+        assert_eq!(
+            BillingRule::derive("recurring_service"),
+            BillingRule::EveryPeriod
+        );
+        assert_eq!(BillingRule::derive("retainer"), BillingRule::EveryPeriod);
+        assert_eq!(BillingRule::derive("one_time"), BillingRule::Once);
+        // Not billed by the generator before this change, and not after it.
+        assert_eq!(BillingRule::derive("product"), BillingRule::Manual);
+        assert_eq!(BillingRule::derive("block_hours"), BillingRule::Manual);
+        // A type this build does not know bills nothing rather than guessing.
+        assert_eq!(BillingRule::derive("something_new"), BillingRule::Manual);
+    }
+
+    /// The default is the safe one, in the enum as well as in the column, so a
+    /// value that arrives from neither the API nor the database still bills
+    /// nothing.
+    #[test]
+    fn the_default_bills_nothing() {
+        assert_eq!(BillingRule::default(), BillingRule::Manual);
+        assert_eq!(BillingRule::from_str("nonsense"), None);
+    }
+
+    /// The wire form round-trips, so a stored value and a request body mean the
+    /// same thing.
+    #[test]
+    fn every_value_round_trips_through_its_wire_form() {
+        for rule in [
+            BillingRule::EveryPeriod,
+            BillingRule::Once,
+            BillingRule::Manual,
+        ] {
+            assert_eq!(BillingRule::from_str(rule.as_str()), Some(rule));
+        }
+    }
 }

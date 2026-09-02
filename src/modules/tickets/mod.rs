@@ -14,7 +14,8 @@ mod service;
 
 #[cfg(feature = "server")]
 pub use attachments::{
-    agent_attachment_routes, AttachmentConfig, AttachmentResponse, AttachmentService,
+    agent_attachment_routes, inline_attachment_path, public_ticket_attachment_routes,
+    AttachmentConfig, AttachmentResponse, AttachmentService,
 };
 #[cfg(feature = "server")]
 pub use automation::AutomationEngine;

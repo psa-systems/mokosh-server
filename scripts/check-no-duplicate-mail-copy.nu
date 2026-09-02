@@ -12,7 +12,16 @@
 # Exit 0 when no seeded body copy appears under src/, 1 (listing the hits)
 # when it does.
 
+# PMS-789 rewrote the product name in both bodies to `{{app_name}}` (migration
+# 116), so the current copy is listed alongside the pre-789 wording. Dropping
+# the old lines would stop catching a reintroduction of the literal, which is
+# now doubly wrong: the name is operator-settable, so hardcoding it in Rust
+# contradicts the setting as well as the template.
 const PHRASES = [
+    "We received a request to reset your {{app_name}} password"
+    "An account has been created for you in {{app_name}}"
+    "Reset your {{app_name}} password"
+    "Welcome to {{app_name}}"
     "We received a request to reset your Mokosh password"
     "An account has been created for you in Mokosh"
     "Reset your Mokosh password"

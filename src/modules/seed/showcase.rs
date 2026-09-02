@@ -146,7 +146,7 @@ pub async fn confirm_showcase_tenant(db: &Database, tenant_id: Uuid) -> AppResul
         Some(s) => s,
         None => {
             return Err(AppError::BadRequest(format!(
-                "showcase seed refused: tenant {tenant_id} does not exist (fail closed, zero writes)."
+                "Showcase seed refused: tenant {tenant_id} does not exist (fail closed, zero writes)."
             )));
         }
     };
@@ -157,7 +157,7 @@ pub async fn confirm_showcase_tenant(db: &Database, tenant_id: Uuid) -> AppResul
         .unwrap_or("");
     if environment.eq_ignore_ascii_case("production") || environment.eq_ignore_ascii_case("prod") {
         return Err(AppError::Forbidden(format!(
-            "showcase seed refused: tenant {tenant_id} is marked environment=production. \
+            "Showcase seed refused: tenant {tenant_id} is marked environment=production. \
              The showcase seed must never run against production (fail closed, zero writes)."
         )));
     }
@@ -168,7 +168,7 @@ pub async fn confirm_showcase_tenant(db: &Database, tenant_id: Uuid) -> AppResul
         .unwrap_or(false);
     if !is_showcase {
         return Err(AppError::Forbidden(format!(
-            "showcase seed refused: tenant {tenant_id} is not marked as showcase \
+            "Showcase seed refused: tenant {tenant_id} is not marked as showcase \
              (settings->>'is_showcase' must be true). Refusing to write to a tenant whose \
              showcase status cannot be confirmed (fail closed, zero writes)."
         )));
@@ -356,7 +356,7 @@ impl ShowcaseSeeder {
         .await?;
         id.ok_or_else(|| {
             AppError::BadRequest(format!(
-                "showcase seed refused: tenant {tid} has no users to attribute records to. \
+                "Showcase seed refused: tenant {tid} has no users to attribute records to. \
                  Provision at least one user in the showcase tenant first."
             ))
         })
@@ -599,6 +599,10 @@ fn showcase_contact(company_id: Uuid, idx: usize) -> CreateContactRequest {
         tags: vec![SHOWCASE_TAG.to_string()],
         notes: None,
         create_portal_access: false,
+        // PMS-806: the scalars above materialize the child rows, so the
+        // showcase set exercises the compatibility path.
+        phones: None,
+        companies: None,
     }
 }
 
@@ -794,7 +798,10 @@ fn showcase_time_entries(
                 ticket_id: None,
                 project_id: project_ids.get(n % project_ids.len().max(1)).copied(),
                 task_id: None,
-                company_id: company_ids[n % company_ids.len()],
+                // PMS-942: the seed logs client work, so the kind is left to
+                // the service to derive from the company and the work item.
+                entry_kind: None,
+                company_id: Some(company_ids[n % company_ids.len()]),
                 notes: Some("Showcase seed: project work.".to_string()),
                 work_category: None,
                 is_billable: true,
@@ -814,7 +821,10 @@ fn showcase_time_entries(
                 ticket_id: None,
                 project_id: None,
                 task_id: None,
-                company_id: company_ids[n % company_ids.len()],
+                // PMS-942: the seed logs client work, so the kind is left to
+                // the service to derive from the company and the work item.
+                entry_kind: None,
+                company_id: Some(company_ids[n % company_ids.len()]),
                 notes: Some("Showcase seed: client support.".to_string()),
                 work_category: None,
                 is_billable: true,

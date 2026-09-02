@@ -8,6 +8,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
+use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
@@ -22,13 +23,13 @@ use super::{
     ContactFilter, ContactResponse, ContactService, CreateCompanyRequest, CreateContactRequest,
     CreateSiteRequest, GrantPortalAccessRequest, PortalGrantOutcome, PortalRoleSummary,
     SiteResponse, UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
-    UpsertCompanyIndustryRequest,
+    UpsertCompanyIndustryRequest, WebsiteProbeLimiter, WebsiteProbeService,
 };
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::modules::portal_roles::{
     CreatePortalRoleRequest, PortalRole, PortalRoleService, UpdatePortalRoleRequest,
 };
-use crate::utils::error::AppResult;
+use crate::utils::error::{rate_limited_response, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -40,6 +41,11 @@ pub struct ContactRouterState {
     /// handle to it. Shared with the top-level `/api/v1/portal-roles`
     /// mount (same underlying service, one pool).
     pub portal_role_service: Arc<PortalRoleService>,
+    /// PMS-805. `None` only when the probe's HTTP client could not be built,
+    /// which is logged at `error` here and surfaces as a 500 on the endpoint
+    /// rather than as a site that silently reports itself unreachable.
+    pub website_probe: Option<Arc<WebsiteProbeService>>,
+    pub website_probe_limiter: Arc<WebsiteProbeLimiter>,
 }
 
 /// Create the contact management router
@@ -54,18 +60,36 @@ pub fn contact_routes(
     contact_service: ContactService,
     portal_role_service: PortalRoleService,
 ) -> Router {
+    let website_probe = match WebsiteProbeService::live() {
+        Ok(service) => Some(service),
+        Err(e) => {
+            tracing::error!(error = %e, "website probe disabled: HTTP client could not be built");
+            None
+        }
+    };
     let state = ContactRouterState {
         contact_service: Arc::new(contact_service),
         portal_role_service: Arc::new(portal_role_service),
+        website_probe,
+        website_probe_limiter: WebsiteProbeLimiter::new(),
     };
 
     Router::new()
         // Companies
         .route("/companies", get(list_companies))
         .route("/companies", post(create_company))
+        // PMS-805: static segment, so it resolves ahead of the
+        // `{company_id}` routes below (same shape as
+        // `/contacts/field-values`).
+        .route("/companies/website-probe", get(probe_company_website))
         .route("/companies/{company_id}", get(get_company))
         .route("/companies/{company_id}", put(update_company))
         .route("/companies/{company_id}", delete(delete_company))
+        // PMS-926: what a delete would do, without doing it.
+        .route(
+            "/companies/{company_id}/deletion-preview",
+            get(company_deletion_preview),
+        )
         .route(
             "/companies/{company_id}/contacts",
             get(get_company_contacts),
@@ -239,6 +263,25 @@ async fn update_company(
     Ok(Json(company.into()))
 }
 
+/// PMS-926: what deleting this company would do, and what stops it.
+///
+/// `RequireAuth`, not the authority a delete needs: this is a read, and the
+/// counts it reports are already visible on the company page. Gating it harder
+/// than the page it serves would only mean the dialog cannot explain itself to
+/// somebody who can already see the numbers.
+async fn company_deletion_preview(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(company_id): Path<Uuid>,
+) -> AppResult<Json<crate::modules::contacts::CompanyDeletionPreview>> {
+    Ok(Json(
+        state
+            .contact_service
+            .deletion_preview(user.tenant(), company_id)
+            .await?,
+    ))
+}
+
 async fn delete_company(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
@@ -287,6 +330,45 @@ async fn get_company_sites(
         &pagination,
         total,
     )))
+}
+
+/// PMS-805: `GET /companies/website-probe?url=<value>`.
+#[derive(Debug, Deserialize)]
+pub struct WebsiteProbeQuery {
+    pub url: String,
+}
+
+/// Resolve a website and report what answered.
+///
+/// Reads and writes no tenant data; the tenant is used only as the rate-limit
+/// key. Both the reachable and the unreachable case are 200s, because
+/// determining that a site does not answer is a successful probe. Input that
+/// cannot be a website at all is a 400 instead, so the form can tell "you typed
+/// something that is not a URL" apart from "your site is down".
+async fn probe_company_website(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(query): Query<WebsiteProbeQuery>,
+) -> Result<Response, AppError> {
+    if let Err(retry_after) = state.website_probe_limiter.check(*user.tenant()) {
+        tracing::warn!(
+            tenant_id = %user.tenant(),
+            retry_after,
+            "website probe rate limited"
+        );
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many website probes, please try again shortly",
+        ));
+    }
+
+    let Some(service) = state.website_probe.as_ref() else {
+        return Err(AppError::Configuration(
+            "The website probe is unavailable.".to_string(),
+        ));
+    };
+
+    Ok(Json(service.probe_input(&query.url).await?).into_response())
 }
 
 // ============================================================================

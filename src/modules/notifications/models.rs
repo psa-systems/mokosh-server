@@ -121,9 +121,33 @@ pub struct UpsertNotificationRuleRequest {
 /// fire a rule's recipients for an event ad-hoc, e.g. from an admin
 /// "test rule" button. Schedulers and the rules engine eventually call
 /// `NotificationsService::dispatch` directly.
+///
+/// `POST /notifications/preview` (PMS-808) takes the same body: the
+/// preview answers "what would this dispatch say?", so asking for it
+/// with a different shape would only invite the two to drift.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct DispatchNotificationRequest {
     pub event_type: String,
     #[serde(default)]
     pub context: serde_json::Value,
+}
+
+/// One message `dispatch` would queue, as returned by
+/// `POST /notifications/preview` (PMS-808): one entry per (rule,
+/// channel) pair that would fire, in dispatch order.
+///
+/// `unresolved` names the `{{key}}` placeholders the context did not
+/// carry. Those stay literal in `subject` / `body_text` / `body_html`
+/// rather than being filled with a sample value, because they are the
+/// send-time values (a minted token and its link) that the preview
+/// deliberately does not create.
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationPreviewResponse {
+    pub rule_name: String,
+    pub channel: String,
+    pub recipients: Vec<String>,
+    pub subject: Option<String>,
+    pub body_text: String,
+    pub body_html: Option<String>,
+    pub unresolved: Vec<String>,
 }

@@ -9,9 +9,9 @@ gate (that is PMS-141).
 
 | Area | File | How |
 | --- | --- | --- |
-| Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form (TOTP-aware), opens the avatar menu, clicks Logout, asserts URL returns to the hub's `/login` (**quarantined - `test.fixme`**; PMS-148: after the PMS-142 v2 un-fixme merged, post-merge CI exposed a separate failure mode where the auth-ui project's login deterministically stalls when run after `setup` finishes - form submit click no-op's, URL stays on the hub `/login`. Bunyip's `/logout` fix from BUNYIP-53 IS deployed; this is a different problem) |
+| Auth login / session / logout | `tests/auth.spec.ts` | real browser drives the SPA login form (TOTP-aware), opens the avatar menu, clicks Logout, asserts URL returns to the hub's `/login` (**quarantined - `test.fixme`**; PMS-148: after the PMS-142 v2 un-fixme merged, post-merge CI exposed a separate failure mode where the browser projects' login deterministically stalls when run after `setup` finishes - form submit click no-op's, URL stays on the hub `/login`. Bunyip's `/logout` fix from BUNYIP-53 IS deployed; this is a different problem) |
 | OIDC token flow | `tests/oidc.spec.ts` | request context with replayed OP session cookies (from `e2e/.auth/op-state.json`, written by setup): `/oauth2/authorize` -> code -> `/oauth2/token` -> `/oauth2/userinfo` -> refresh (PKCE). Asserts the full OP contract; mokosh-server's RS path is exercised indirectly by every other api test (**quarantined - `test.fixme`**; PMS-435: the PMS-434 diagnostic run #2098 proved `bunyip_op_session` is captured, persisted on the right domain, and replayed by the fixture, yet `/oauth2/authorize` still 302s to `/login` with no `state`. Root cause is bunyip's COOKIE_DOMAIN / `bunyip_op_session` scoping (BUNYIP-146), not an e2e forwarding defect; un-fixme when BUNYIP-146 ships) |
-| Form validation (PMS-518 / AC7) | `tests/form-validation.spec.ts` | real browser drives the SPA create forms (new-ticket, new-contact): an empty submit must flag EVERY missing required field at once (per-field inline errors; company in the form-level banner) and not navigate, and correcting a field clears only its error. DOM-only, like `auth.spec.ts` (the FormGuard validation is client-side and never reaches an API). `form-ui` project (**quarantined - `test.fixme`**; un-fixme once the target's mokosh-apps SPA includes the PMS-518 `FormGuard` migration AND the browser-login path is green - it shares `loginViaSpa`, currently blocked by the PMS-148 stall) |
+| Form validation (PMS-518 / AC7) | `tests/form-validation.spec.ts` | real browser drives the SPA create forms (new-ticket, new-contact): an empty submit must flag EVERY missing required field at once (per-field inline errors; company in the form-level banner) and not navigate, and correcting a field clears only its error. DOM-only, like `auth.spec.ts` (the FormGuard validation is client-side and never reaches an API). Runs in the `chromium` / `firefox` / `webkit` projects (**quarantined - `test.fixme`**; un-fixme once the target's mokosh-apps SPA includes the PMS-518 `FormGuard` migration AND the browser-login path is green - it shares `loginViaSpa`, currently blocked by the PMS-148 stall) |
 | Tickets CRUD | `tests/tickets.spec.ts` | request context against `/api/v1/tickets` |
 | Contacts + tenants + cross-tenant canary | `tests/contacts.spec.ts` | request context, tenant-scoped smoke + leak check |
 | Time-tracking CRUD | `tests/time-tracking.spec.ts` | work types + time entries + rounding rules (PMS-155); enables the `time_tracking` module first |
@@ -33,8 +33,14 @@ gate (that is PMS-141).
 
 **Invoices.** Billing has no `DELETE /api/v1/invoices/{id}` route, so an invoice created by the suite would be permanent residue (the leak PMS-149/PMS-155 set out to avoid). The billing spec therefore smoke-reads the invoice list only; a follow-up should add a delete/void-and-purge route and the matching invoice lifecycle.
 
-**Harness shape.** Two independent auth paths because the mokosh-clients SPA
-keeps its bearer token in WASM memory (`mokosh-clients/src/hooks/fetch.rs`),
+**Project model.** The Playwright projects are defined in
+[`playwright.config.ts`](playwright.config.ts) and described one by one in
+[`docs/e2e.md`](../docs/e2e.md#architecture-the-project-model). That table is the
+only place the projects are enumerated in prose, so a config change has a single
+document to update; this README deliberately does not repeat it.
+
+**Harness shape.** Two independent auth paths because the mokosh-apps SPA
+keeps its bearer token in WASM memory (`mokosh-apps/src/hooks/fetch.rs`),
 which Playwright's `storageState` cannot replay; and direct
 `POST /api/v1/auth/login` does not work either (the OP advertises only
 `authorization_code` + `refresh_token`, and SPA-signed-up accounts do not
@@ -52,13 +58,16 @@ exist in mokosh's local `users` table):
   for PSA-API specs like `tickets`, `contacts`) and an `oidcTest`
   (replays the OP cookies via `storageState`, no bearer header, used by
   `tests/oidc.spec.ts`). Teardown reads `token.txt` only.
-- **`auth-ui` project** (`tests/auth.spec.ts`) drives the SPA login form in
-  a real browser and asserts on URL transitions (login leaves `/login`,
-  logout returns to it). DOM-only, no API probe - the SPA's in-memory token
-  cannot be exfiltrated for an external request context to use. Captures a
-  URL trail, a main-frame response log and a request log via
-  `lib/page-diagnostics.ts` and folds them into the thrown error on failure.
-  Currently `test.fixme` pending PMS-148 (see "What it covers" above).
+- **the browser projects** (`tests/auth.spec.ts` and
+  `tests/form-validation.spec.ts`, run once per engine) drive the SPA login
+  form in a real browser and assert on the DOM and on URL transitions (login
+  leaves `/login`, logout returns to it). DOM-only, no API probe - the SPA's
+  in-memory token cannot be exfiltrated for an external request context to
+  use. They depend on `preflight` and NOT on `setup`, so their own
+  login/logout never invalidates the shared API token. Both capture a URL
+  trail, a main-frame response log and a request log via
+  `lib/page-diagnostics.ts` and fold them into the thrown error on failure.
+  Both are currently `test.fixme` pending PMS-148 (see "What it covers" above).
 
 ## Diagnosing a failed browser login
 
@@ -108,16 +117,16 @@ is manual-dispatch only (see [CI](#ci)).
 
 | Var | Purpose |
 | --- | --- |
-| `E2E_BASE_URL` | **required** - SPA host the auth-ui project navigates to. No default; set per environment (staging `https://msp.a8n.systems`, prod `https://msp.psa.systems`) |
+| `E2E_BASE_URL` | **required** - SPA host the browser projects (`setup`, `chromium`, `firefox`, `webkit`) navigate to. No default; set per environment (staging `https://msp.a8n.systems`, prod `https://msp.psa.systems`) |
 | `E2E_API_BASE_URL` | *optional* - API host for `/api/v1`. Defaults to prepending `api.` to `E2E_BASE_URL` (e.g. `msp.a8n.systems` -> `api.msp.a8n.systems`). Set when the deployment uses a different naming scheme |
-| `E2E_OP_BASE_URL` | *optional* - OIDC OP host for `/oauth2/*` + `/.well-known/openid-configuration`. Defaults to `E2E_API_BASE_URL`. On bunyip-as-OP deploys the OP runs on the apex `api.<tld>`, NOT the mokosh API host, so set this explicitly (e.g. `https://api.a8n.systems`) |
+| `E2E_OP_BASE_URL` | *recommended* - OIDC OP host for `/oauth2/*` + `/.well-known/openid-configuration`. bunyip is the only OP and runs on the apex `api.<tld>`, NOT the mokosh API host, so set this explicitly (e.g. `https://api.a8n.systems`). It falls back to `E2E_API_BASE_URL`, which points at mokosh; mokosh serves no `/oauth2/*` (PMS-295), so the fallback only 404s |
 | `E2E_EMAIL` | dedicated E2E account login |
 | `E2E_PASSWORD` | E2E account password |
 | `E2E_TENANT_ID` | UUID of the dedicated E2E tenant |
 | `E2E_OIDC_CLIENT_ID` | public OIDC client id for the token-flow test |
 | `E2E_OIDC_REDIRECT_URI` | redirect_uri registered for that client (no default; must match exactly or the OP returns `invalid_redirect_uri`). Only the `code` is captured, the URL is never loaded |
 | `E2E_TOTP_SECRET` | base32 TOTP secret for the E2E account. Setup generates the second-factor code at runtime; same string you pasted into your authenticator when enrolling 2FA on the account |
-| `E2E_FOREIGN_COMPANY_ID` | *optional* - a company id in **another** tenant. The cross-tenant company canary always runs; setting this strengthens it (an existing, foreign-owned company must still 403/404). When unset, `global.setup.ts` falls back to a random, well-formed UUID the E2E tenant cannot own |
+| `E2E_FOREIGN_COMPANY_ID` | *optional*, and genuinely so - a company id in **another** tenant. The cross-tenant company canary always runs and is never skipped; setting this strengthens it (an existing, foreign-owned company must still 403/404). When unset, `global.setup.ts` falls back to a random, well-formed UUID the E2E tenant cannot own, so the canary then only proves a non-existent company is unreadable |
 
 ## One-time staging provisioning (manual)
 
@@ -276,15 +285,24 @@ from production runs.
 
 ## Run locally
 
+The suite uses **bun**, matching `.forgejo/workflows/e2e.yml`. This directory
+carries a `bun.lock` and no `package-lock.json`, so `npm ci` cannot install it.
+
 ```
 cp e2e/.env.example e2e/.env   # then fill in the secrets
 just test-e2e                  # from the repo root
 # or, from e2e/:
-npm ci
-npx playwright install --with-deps chromium
-npx playwright test
-npx playwright show-report     # after a run
+bun install --frozen-lockfile
+bun x playwright install chromium firefox webkit
+bun x playwright test
+bun x playwright show-report   # after a run
 ```
+
+Install all three browsers: `setup` runs on Firefox and there is a `webkit`
+project, so a Chromium-only install fails before the first assertion. On a
+Debian/Ubuntu box `--with-deps` can be added to pull the system libraries; in CI
+it is banned (the OpenSUSE runner has no `apt-get`, and the image already
+carries them).
 
 `just test-e2e --headed` (or any `playwright test` flag) passes through.
 
@@ -314,6 +332,8 @@ staging secret; a manual dispatch lets the operator pick. See the
 [One-time provisioning](#one-time-staging-provisioning-manual) step 5 for
 rotation sources.
 
-Each run installs Node + Chromium, runs the suite against the selected
-deployment, and uploads `playwright-report/` + `test-results/` as artifacts on
-failure.
+Each run installs dependencies with `bun install --frozen-lockfile` and the
+Chromium / Firefox / WebKit binaries with `bun x playwright install` (the runner
+image pre-bakes both bun and the browsers, so this is normally a no-op), runs the
+suite against the selected deployment, and uploads `playwright-report/` +
+`test-results/` as artifacts on failure.

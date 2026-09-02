@@ -184,7 +184,9 @@ impl ContactAuthService {
         // in the future = 429 with a retry hint.
         if let Some(until) = locked_until {
             if until > Utc::now() {
-                return Err(AppError::RateLimited);
+                return Err(AppError::RateLimited {
+                    retry_after_seconds: None,
+                });
             }
         }
 

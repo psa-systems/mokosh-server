@@ -17,6 +17,7 @@
 //! callers (quotes, billing, tickets, forms) are unconditional, and a
 //! single-tenant build still has an organisation with a name.
 
+use super::logo::{LOGO_BOX_HEIGHT, LOGO_BOX_WIDTH};
 use crate::db::Database;
 use crate::modules::auth::TenantId;
 use crate::utils::error::AppResult;
@@ -139,6 +140,23 @@ impl OrgIdentity {
         }
     }
 
+    /// PMS-776: the phrase with a per-message contact standing in for the
+    /// organisation's own channels, as the request-form page needs.
+    ///
+    /// The same two branches as [`OrgIdentity::contact_line`], which is the
+    /// point: the page used to return a form definition's own `contact_info`
+    /// raw, so "call the service desk on 555-0100" reached a client with
+    /// nothing saying whose service desk it is, while the fallback branch of
+    /// the same field always named someone. `{name} at {info}` matches the
+    /// email's override branch ("Contact {org} at {info}."), so one form with
+    /// its own contact and one without produce the same shape.
+    pub fn phrase_with(&self, override_info: Option<&str>) -> Option<String> {
+        match clean(override_info) {
+            Some(info) => Some(format!("{} at {}", self.name, info)),
+            None => self.phrase(),
+        }
+    }
+
     /// PMS-748: the "how do I ask about this?" line, which is never empty.
     ///
     /// The organisation's NAME is not optional: a client asked to hand over
@@ -179,13 +197,19 @@ impl OrgIdentity {
     /// that needs an absolute URL. It is deliberately NOT built from `BASE_URL`
     /// or `SPA_BASE_URL`: on every deployed environment those are the apex and
     /// the SPA, and the logo is served by the API on a third host.
+    ///
+    /// PMS-783: the `width` / `height` attributes carry the same box as the
+    /// CSS, from [`LOGO_BOX_WIDTH`] / [`LOGO_BOX_HEIGHT`]. Without them a
+    /// client cannot size the image before it arrives, so the message reflows,
+    /// and it cannot pick a smaller decode for an oversized source.
     pub fn logo_html(&self, public_api_base: Option<&str>) -> String {
         let (Some(base), Some(path)) = (clean(public_api_base), self.logo_path()) else {
             return String::new();
         };
         let src = format!("{}{}", base.trim_end_matches('/'), path);
         format!(
-            "<p><img src=\"{}\" alt=\"{}\" style=\"max-height:56px;max-width:220px\"></p>",
+            "<p><img src=\"{}\" alt=\"{}\" width=\"{LOGO_BOX_WIDTH}\" height=\"{LOGO_BOX_HEIGHT}\" \
+             style=\"max-height:{LOGO_BOX_HEIGHT}px;max-width:{LOGO_BOX_WIDTH}px\"></p>",
             html_escape(&src),
             html_escape(&self.name)
         )
@@ -289,6 +313,26 @@ mod tests {
     }
 
     #[test]
+    fn both_branches_of_the_form_pages_contact_line_name_the_organisation() {
+        let org = org(None, Some("555-0100"), None);
+        // A form definition carrying its own contact used to be returned raw.
+        assert_eq!(
+            org.phrase_with(Some(" call the service desk on 555-0199 ")),
+            Some("Contoso IT at call the service desk on 555-0199".to_string())
+        );
+        // No definition contact: the shared phrase, unchanged.
+        assert_eq!(org.phrase_with(None), org.phrase());
+        assert_eq!(org.phrase_with(Some("   ")), org.phrase());
+        // Both shapes open on a name, which is the finding.
+        for phrase in [org.phrase_with(Some("555-0199")), org.phrase_with(None)] {
+            assert!(
+                phrase.expect("a phrase").starts_with("Contoso IT"),
+                "a client is always told who is asking"
+            );
+        }
+    }
+
+    #[test]
     fn the_logo_block_needs_both_a_base_url_and_a_logo() {
         let mut id = org(None, None, None);
         assert_eq!(id.logo_html(Some("https://api.example")), "");
@@ -297,7 +341,34 @@ mod tests {
         assert_eq!(id.logo_html(Some("   ")), "");
         assert_eq!(
             id.logo_html(Some("https://api.example/")),
-            "<p><img src=\"https://api.example/api/v1/public/tenants/x/logo\" alt=\"Contoso IT\" style=\"max-height:56px;max-width:220px\"></p>"
+            "<p><img src=\"https://api.example/api/v1/public/tenants/x/logo\" alt=\"Contoso IT\" width=\"220\" height=\"56\" style=\"max-height:56px;max-width:220px\"></p>"
+        );
+    }
+
+    /// PMS-783 F10: a client that knows the box before the bytes arrive can
+    /// reserve the space and pick a smaller decode. The attributes and the CSS
+    /// must agree, so both come from the one pair of constants.
+    #[test]
+    fn the_logo_block_declares_its_intrinsic_box() {
+        let id = OrgIdentity {
+            name: "Contoso IT".to_string(),
+            logo_path: Some("/logo".to_string()),
+            ..Default::default()
+        };
+        let html = id.logo_html(Some("https://api.example"));
+        assert!(
+            html.contains(&format!("width=\"{LOGO_BOX_WIDTH}\"")),
+            "no intrinsic width: {html}"
+        );
+        assert!(
+            html.contains(&format!("height=\"{LOGO_BOX_HEIGHT}\"")),
+            "no intrinsic height: {html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "style=\"max-height:{LOGO_BOX_HEIGHT}px;max-width:{LOGO_BOX_WIDTH}px\""
+            )),
+            "the CSS box and the attributes must agree: {html}"
         );
     }
 

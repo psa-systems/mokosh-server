@@ -64,7 +64,7 @@ impl MileageTrackingService {
         }
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
-        let order_by = pagination.order_by("date", &["date", "distance_miles", "created_at"]);
+        let order_by = pagination.order_by("date", mokosh_types::sort::MILEAGE)?;
         let order_by = format!("me.{order_by}");
         let query = format!(
             r#"
@@ -147,10 +147,12 @@ impl MileageTrackingService {
         } else {
             None
         };
-        // Mileage has no timesheet-approval gate (unlike time entries, whose
-        // weekly approval flips them to ready_to_bill). A billable mileage
-        // entry is therefore ready to bill on creation; the invoice builder
-        // uses the same `ready_to_bill` predicate for both kinds.
+        // A billable mileage entry is ready to bill on creation; the invoice
+        // builder uses the same `ready_to_bill` predicate for both kinds. This
+        // used to be the exception, mileage having never had the PMS-144
+        // timesheet-approval gate that time entries did. PMS-944 removed that
+        // gate, so it is now simply the rule, shared with
+        // TimeTrackingService::resolve_billing_status.
         let billing_status = if request.is_billable {
             "ready_to_bill"
         } else {
@@ -240,7 +242,7 @@ impl MileageTrackingService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("MileageEntry".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Mileage entry".to_string()))?;
         Ok(row.into())
     }
 
@@ -310,7 +312,7 @@ impl MileageTrackingService {
         .await?
         .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("MileageEntry".to_string()));
+            return Err(AppError::NotFound("Mileage entry".to_string()));
         }
         tx.commit().await?;
         self.get_mileage_entry(tenant_id, id).await
@@ -326,7 +328,7 @@ impl MileageTrackingService {
             .await?
             .rows_affected();
         if affected == 0 {
-            return Err(AppError::NotFound("MileageEntry".to_string()));
+            return Err(AppError::NotFound("Mileage entry".to_string()));
         }
         tx.commit().await?;
         Ok(())

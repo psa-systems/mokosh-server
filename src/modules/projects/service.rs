@@ -27,6 +27,40 @@ impl ProjectsService {
     // ========================================================================
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// PMS-894: tenant-wide project totals in one round trip.
+    ///
+    /// Two aggregates over the same table, kept in one transaction so the
+    /// counts and the sum describe the same instant - a client rendering them
+    /// side by side should not be able to show a budget that includes a
+    /// project the counts do not.
+    pub async fn project_summary(&self, tenant_id: TenantId) -> AppResult<ProjectSummaryResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*) FROM projects WHERE tenant_id = $1 GROUP BY status",
+        )
+        .bind(tenant_id.get())
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // COALESCE so an empty tenant sums to 0 rather than NULL. `Decimal`
+        // all the way out: the column is numeric, and rounding it through an
+        // f64 on the way to a client is how a budget total ends in .9999999.
+        let total: rust_decimal::Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(budget_amount), 0) FROM projects WHERE tenant_id = $1",
+        )
+        .bind(tenant_id.get())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(ProjectSummaryResponse {
+            counts_by_status: rows.into_iter().collect(),
+            total_budget: total.to_string(),
+        })
+    }
+
     pub async fn list_projects(
         &self,
         tenant_id: TenantId,
@@ -60,12 +94,21 @@ impl ProjectsService {
         if filter.project_manager_id.is_some() {
             data_conds.push(format!("project_manager_id = ${data_idx}"));
             count_conds.push(format!("project_manager_id = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
+        }
+        // PMS-895: name search. Last, so the placeholder numbering above is
+        // untouched; the binds below go in this same order, which is the
+        // invariant this whole parallel-clause dance exists to hold.
+        if filter.q.is_some() {
+            data_conds.push(format!("name ILIKE ${data_idx}"));
+            count_conds.push(format!("name ILIKE ${count_idx}"));
         }
         let where_clause = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
         // Bare column only (order_by appends the direction); "created_at DESC"
         // produced "... DESC DESC" -> 500 (PMS-145).
-        let order_by = pagination.order_by("created_at", &["name", "start_date", "created_at"]);
+        let order_by = pagination.order_by("created_at", mokosh_types::sort::PROJECTS)?;
         let query = format!(
             r#"
             SELECT id, name, description, project_number, company_id,
@@ -75,13 +118,16 @@ impl ProjectsService {
                    contract_id,
                    project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
+                   -- PMS-944: see the note on the task query. Approval is no
+                   -- longer the gate on anything, so a project's actuals count
+                   -- every live entry rather than only countersigned ones.
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                              WHERE te.project_id = projects.id
-                               AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                               AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
                        AS actual_hours,
                    COALESCE((SELECT SUM(te.total_amount) FROM time_entries te
                              WHERE te.project_id = projects.id
-                               AND te.approval_status = 'approved'), 0) AS actual_amount,
+                               AND te.approval_status <> 'rejected'), 0) AS actual_amount,
                    billing_method, hourly_rate, is_billable, default_due_business_days,
                    created_at, updated_at
             FROM projects WHERE {where_clause}
@@ -105,6 +151,11 @@ impl ProjectsService {
         if let Some(v) = filter.project_manager_id {
             q = q.bind(v);
             cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.q {
+            let pattern = format!("%{v}%");
+            q = q.bind(pattern.clone());
+            cq = cq.bind(pattern);
         }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q.fetch_all(&mut *tx).await?;
@@ -193,13 +244,16 @@ impl ProjectsService {
                    contract_id,
                    project_type, project_type_id, status, project_manager_id, start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
+                   -- PMS-944: see the note on the task query. Approval is no
+                   -- longer the gate on anything, so a project's actuals count
+                   -- every live entry rather than only countersigned ones.
                    COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                              WHERE te.project_id = projects.id
-                               AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                               AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
                        AS actual_hours,
                    COALESCE((SELECT SUM(te.total_amount) FROM time_entries te
                              WHERE te.project_id = projects.id
-                               AND te.approval_status = 'approved'), 0) AS actual_amount,
+                               AND te.approval_status <> 'rejected'), 0) AS actual_amount,
                    billing_method, hourly_rate, is_billable, default_due_business_days,
                    created_at, updated_at
             FROM projects WHERE tenant_id = $1 AND id = $2
@@ -457,7 +511,7 @@ impl ProjectsService {
         .await?;
         tx.commit().await?;
         let Some(project_id) = project_id else {
-            return Err(AppError::NotFound("ProjectPhase".to_string()));
+            return Err(AppError::NotFound("Project phase".to_string()));
         };
         Ok(ProjectPhaseResponse {
             id,
@@ -481,7 +535,7 @@ impl ProjectsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("ProjectPhase".to_string()));
+            return Err(AppError::NotFound("Project phase".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -590,7 +644,7 @@ impl ProjectsService {
         .rows_affected();
         tx.commit().await?;
         if n == 0 {
-            return Err(AppError::NotFound("TaskStatus".to_string()));
+            return Err(AppError::NotFound("Task status".to_string()));
         }
         Ok(TaskStatusResponse {
             id,
@@ -611,7 +665,7 @@ impl ProjectsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TaskStatus".to_string()));
+            return Err(AppError::NotFound("Task status".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -738,7 +792,7 @@ impl ProjectsService {
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
-            return Err(AppError::NotFound("ProjectType".to_string()));
+            return Err(AppError::NotFound("Project type".to_string()));
         };
         tx.commit().await?;
         Ok(row.into())
@@ -757,7 +811,7 @@ impl ProjectsService {
         .fetch_optional(&mut *tx)
         .await?;
         match is_system {
-            None => return Err(AppError::NotFound("ProjectType".to_string())),
+            None => return Err(AppError::NotFound("Project type".to_string())),
             Some(true) => {
                 return Err(AppError::Conflict(
                     "Cannot delete a system project type".to_string(),
@@ -806,9 +860,15 @@ impl ProjectsService {
         let rows = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
                       priority, assigned_to_id, estimated_hours,
+                      -- PMS-944: actual hours are the hours worked. They used
+                      -- to count only `approved` time, which reads zero on a
+                      -- tenant with timesheets off, because nothing there ever
+                      -- reaches that state. `logged_hours` beside it always
+                      -- used this predicate; the two now agree, which is the
+                      -- point: approval is no longer a fact about the work.
                       COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                                 WHERE te.task_id = tasks.id
-                                  AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                                  AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
                           AS actual_hours,
                       COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                                 WHERE te.task_id = tasks.id
@@ -929,9 +989,15 @@ impl ProjectsService {
         let row = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
                       priority, assigned_to_id, estimated_hours,
+                      -- PMS-944: actual hours are the hours worked. They used
+                      -- to count only `approved` time, which reads zero on a
+                      -- tenant with timesheets off, because nothing there ever
+                      -- reaches that state. `logged_hours` beside it always
+                      -- used this predicate; the two now agree, which is the
+                      -- point: approval is no longer a fact about the work.
                       COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                                 WHERE te.task_id = tasks.id
-                                  AND te.approval_status = 'approved'), 0)::numeric / 60.0
+                                  AND te.approval_status <> 'rejected'), 0)::numeric / 60.0
                           AS actual_hours,
                       COALESCE((SELECT SUM(te.duration_minutes) FROM time_entries te
                                 WHERE te.task_id = tasks.id
