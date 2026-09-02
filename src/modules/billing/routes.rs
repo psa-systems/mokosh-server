@@ -50,6 +50,18 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}/pdf",
             axum::routing::get(get_invoice_pdf),
         )
+        // PMS-914: dual-plane "Pay Now" surface. The PMS-711 service
+        // method (`create_invoice_checkout_session`) has been in
+        // place since the Stripe adapter landed but the retired
+        // `/portal/*` tree was the only mount site; this restores
+        // the route on the dual-plane billing router. Contact plane
+        // gates on `invoices:pay` (Billing-Contact role by default);
+        // staff plane keeps the RequireBilling + RequireFinance
+        // inline check the sibling handlers use.
+        .route(
+            "/invoices/{invoice_id}/pay",
+            axum::routing::post(pay_invoice),
+        )
         .route("/payments", get(list_payments).post(create_payment))
         .route("/payments/{payment_id}", delete(delete_payment))
         .route(
@@ -473,4 +485,48 @@ async fn get_invoice_pdf(
         "invoice PDF download is not yet wired; see PMS-936 follow-up",
     )
         .into_response())
+}
+
+/// PMS-914 / PMS-711: mint a hosted checkout session for an invoice
+/// balance. Contact plane gates on `invoices:pay` plus a Company-scope
+/// check that 404s a foreign invoice (enumeration-resistant, matches
+/// the sibling `get_invoice` + `get_invoice_pdf` pattern); staff plane
+/// keeps the billing/finance inline gate. The 400s from the service
+/// (invoice in a non-payable status, zero balance, no active gateway)
+/// pass through unchanged.
+async fn pay_invoice(
+    State(state): State<BillingRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(invoice_id): Path<Uuid>,
+    Json(request): Json<PayInvoiceRequest>,
+) -> AppResult<Json<PayInvoiceResponse>> {
+    request.validate()?;
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::INVOICES_PAY, &db).await?;
+        }
+    }
+    if let CallerContext::Contact(session) = &caller {
+        let inv = state.service.get_invoice(tenant, invoice_id).await?;
+        if inv.company_id != session.company_id {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        }
+    }
+    let session = state
+        .service
+        .create_invoice_checkout_session(
+            tenant,
+            invoice_id,
+            &request.success_url,
+            &request.cancel_url,
+        )
+        .await?;
+    Ok(Json(PayInvoiceResponse {
+        checkout_url: session.url,
+    }))
 }
