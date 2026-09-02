@@ -17,14 +17,12 @@ use sqlx::PgPool;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-const ROOT: &str = "/tmp/mokosh-pms959-test";
-
 fn install_test_attachment_env() {
-    std::env::set_var("ATTACHMENT_DIR", ROOT);
+    common::storage_root();
 }
 
 fn document_path(id: &str) -> PathBuf {
-    PathBuf::from(ROOT)
+    common::storage_root()
         .join(common::DEFAULT_TENANT_ID.to_string())
         .join("documents")
         .join(id)

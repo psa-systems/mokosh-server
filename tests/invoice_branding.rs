@@ -13,12 +13,10 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-const ROOT: &str = "/tmp/mokosh-pms911-test";
-
 /// Set before `common::boot`: the logo store reads `ATTACHMENT_DIR` when it is
 /// constructed.
 fn install_test_attachment_env() {
-    std::env::set_var("ATTACHMENT_DIR", ROOT);
+    common::storage_root();
 }
 
 /// A one-pixel PNG.

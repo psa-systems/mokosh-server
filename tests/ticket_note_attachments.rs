@@ -13,20 +13,17 @@
 
 mod common;
 
-use std::path::PathBuf;
-
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Shared per-suite attachment dir + tight 1 KiB cap. Blob filenames
-/// are unique uuids so parallel tests do not collide.
-fn install_test_attachment_env() -> PathBuf {
-    let dir = PathBuf::from("/tmp/mokosh-pms483-test");
-    std::env::set_var("ATTACHMENT_DIR", &dir);
+/// A storage root private to this run, plus a tight 1 KiB cap. Blob filenames
+/// are unique uuids so the cases in this binary, which run concurrently, do not
+/// collide inside the shared root.
+fn install_test_attachment_env() {
+    common::storage_root();
     std::env::set_var("ATTACHMENT_MAX_BYTES", "1024");
-    dir
 }
 
 /// Insert a uniquely-named company on the default tenant. The shared
