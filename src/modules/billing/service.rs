@@ -2880,14 +2880,16 @@ impl BillingService {
 
         tx.commit().await?;
 
-        // PMS-711: on the first send transition, email the billing contact a
-        // "Pay Now" link. Best-effort and post-commit: a mail failure must not
-        // undo the status change. No-op unless this instance carries a mailer
-        // (agent-facing only), the invoice actually just moved to `sent`, and
-        // the tenant has an active payment gateway.
+        // PMS-711, PMS-991: on the first send transition, email the billing
+        // contact the invoice, with the stored document attached and a pay
+        // link when a gateway is connected. Best-effort and post-commit: a
+        // mail failure must not undo the status change. No-op unless this
+        // instance carries a mailer (agent-facing only) and the invoice
+        // actually just moved to `sent`; every other reason for sending
+        // nothing is logged inside.
         let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
         if just_sent {
-            self.notify_invoice_pay_now(tenant_id, invoice_id).await;
+            self.notify_invoice_sent(tenant_id, invoice_id).await;
         }
 
         self.get_invoice(tenant_id, invoice_id).await
@@ -2989,49 +2991,76 @@ impl BillingService {
         Ok(crate::modules::billing::issuer::resolve(&name, &branding))
     }
 
-    /// PMS-711: best-effort outbound invoice "Pay Now" email. Short-circuits
-    /// when this service instance has no mailer/origin, when the tenant has no
-    /// active gateway (a Pay Now button would be dead), or when the invoice has
-    /// no billing contact with an email. Every failure is logged, never
-    /// propagated: the caller has already committed the send.
-    async fn notify_invoice_pay_now(&self, tenant_id: TenantId, invoice_id: Uuid) {
-        let (Some(mailer), Some(origin)) = (self.mailer.as_ref(), self.portal_origin.as_ref())
-        else {
+    /// PMS-991: email the invoice to its billing contact, once, on the send.
+    ///
+    /// Post-commit and best-effort: the status change has already landed and
+    /// a mail failure must not undo it (PMS-711). Before PMS-991 this whole
+    /// message was gated on a connected payment gateway, so a fresh install
+    /// with none sent nothing on Send and nothing said so; the standup that
+    /// filed PMS-991 saw exactly that. The invoice is the message and the pay
+    /// link is an extra: the mail goes whenever there is a billing contact
+    /// with an address, carries the document stored at send (PMS-959), and
+    /// adds the portal link only when a gateway is connected and the portal
+    /// origin is known. Every reason for sending nothing is logged at `warn`
+    /// with the invoice id, because the caller has no other way to learn it.
+    async fn notify_invoice_sent(&self, tenant_id: TenantId, invoice_id: Uuid) {
+        let Some(mailer) = self.mailer.as_ref() else {
+            tracing::warn!(
+                target: "mokosh_server.billing",
+                %invoice_id,
+                "invoice sent, no email: this service has no mailer",
+            );
             return;
         };
-        // Only offer online payment when a gateway is actually connected.
-        match self.has_active_gateway(tenant_id).await {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(e) => {
-                tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: gateway check failed");
-                return;
-            }
-        }
         let invoice = match self.get_invoice(tenant_id, invoice_id).await {
             Ok(inv) => inv,
             Err(e) => {
-                tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: invoice reload failed");
+                tracing::warn!(target: "mokosh_server.billing", %invoice_id, error = %e, "invoice email: invoice reload failed");
                 return;
             }
         };
         let Some(contact_id) = invoice.billing_contact_id else {
+            tracing::warn!(
+                target: "mokosh_server.billing",
+                %invoice_id,
+                "invoice sent, no email: the invoice has no billing contact",
+            );
             return;
         };
         let email = match self.billing_contact_email(tenant_id, contact_id).await {
             Ok(Some((Some(email), _))) => email,
-            Ok(_) => return, // no contact, or contact has no email on file
+            Ok(_) => {
+                tracing::warn!(
+                    target: "mokosh_server.billing",
+                    %invoice_id,
+                    %contact_id,
+                    "invoice sent, no email: the billing contact has no email address",
+                );
+                return;
+            }
             Err(e) => {
-                tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: contact lookup failed");
+                tracing::warn!(target: "mokosh_server.billing", %invoice_id, error = %e, "invoice email: contact lookup failed");
                 return;
             }
         };
-        let base = origin.trim_end_matches('/');
-        let link = format!("{base}/portal/invoices/{invoice_id}");
+        // The pay link is offered only when something can take the payment.
+        let portal_link = match (
+            self.portal_origin.as_ref(),
+            self.has_active_gateway(tenant_id).await,
+        ) {
+            (Some(origin), Ok(true)) => Some(format!(
+                "{}/portal/invoices/{invoice_id}",
+                origin.trim_end_matches('/')
+            )),
+            (_, Err(e)) => {
+                tracing::warn!(target: "mokosh_server.billing", %invoice_id, error = %e, "invoice email: gateway check failed, sending without a pay link");
+                None
+            }
+            _ => None,
+        };
         let currency = invoice.currency.as_deref().unwrap_or("USD");
         let amount_due = format!("{} {}", invoice.balance_due, currency);
         let due_date = invoice.due_date.to_string();
-
         // PMS-761: an email asking someone to pay has to say who is asking.
         // Skipped rather than sent anonymously if the identity cannot be read:
         // the invoice is already visible in the portal, and an unattributed
@@ -3040,8 +3069,8 @@ impl BillingService {
             Ok(org) => org,
             Err(e) => {
                 tracing::warn!(
-                    target: "mokosh_server.billing", error = %e,
-                    "pay-now email: organisation identity unreadable, not sending",
+                    target: "mokosh_server.billing", %invoice_id, error = %e,
+                    "invoice email: organisation identity unreadable, not sending",
                 );
                 return;
             }
@@ -3051,21 +3080,29 @@ impl BillingService {
             org_name: org.name(),
             contact_line: &contact_line,
         };
-
+        // The document as issued (PMS-959), stored in the transaction that
+        // just committed. Absent only for an invoice sent before PMS-959 or a
+        // storage failure, and the mail still goes without it.
+        let pdf =
+            crate::modules::billing::documents::read_issued(tenant_id.get(), invoice_id).await;
+        if pdf.is_none() {
+            tracing::warn!(target: "mokosh_server.billing", %invoice_id, "invoice email: no stored document to attach");
+        }
         if let Err(e) = mailer
-            .send_invoice_pay_now(
+            .send_invoice_sent(
                 &email,
                 from,
-                crate::utils::email::InvoicePayNow {
+                crate::utils::email::InvoiceSent {
                     invoice_number: &invoice.invoice_number,
                     amount_due: &amount_due,
                     due_date: &due_date,
-                    portal_link: &link,
+                    portal_link: portal_link.as_deref(),
+                    pdf: pdf.as_deref(),
                 },
             )
             .await
         {
-            tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: send failed");
+            tracing::warn!(target: "mokosh_server.billing", %invoice_id, error = %e, "invoice email: send failed");
         }
     }
 
