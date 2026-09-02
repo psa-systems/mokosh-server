@@ -1628,6 +1628,25 @@ impl BillingService {
         request: &UpsertPaymentGatewayConfigRequest,
         ctx: &AuditCtx,
     ) -> AppResult<PaymentGatewayConfigResponse> {
+        // PMS-966: refuse to ACTIVATE a provider this build cannot serve.
+        //
+        // The column's CHECK and `GatewayProvider` both accept `paypal` and
+        // `authorize_net`, so this call used to store an active config that
+        // every resolution path then skipped: no checkout, no Pay Now button,
+        // and nothing anywhere saying why. Answering here is the only point
+        // where the operator is present to be told.
+        //
+        // Activation only, not storage. Saving credentials ahead of support
+        // costs nothing and is refused by no rule; switching on something that
+        // will never mint a checkout session is the part that lies.
+        if request.is_active && !provider::is_supported(request.provider.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "Payment provider '{}' cannot be activated: it is not implemented. Supported: {}",
+                request.provider.as_str(),
+                provider::SUPPORTED.join(", ")
+            )));
+        }
+
         // Encrypt only when the caller supplied a new config; `None` means
         // "keep the existing secret" (write-only update semantics, PMS-342).
         let encrypted = match request.config.as_ref() {
