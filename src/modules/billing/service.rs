@@ -1642,7 +1642,11 @@ impl BillingService {
                 provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
                 is_active: r.is_active,
                 is_test_mode: r.is_test_mode,
-                configured: !r.config_encrypted.is_empty(),
+                // PMS-968: NULL means the credential is in the secret store,
+                // so the row is configured. Non-NULL and non-empty is the
+                // pre-move state and equally configured. Only an empty string
+                // would not be, and nothing writes one.
+                configured: r.config_encrypted.as_ref().is_none_or(|c| !c.is_empty()),
             })
             .collect();
 
@@ -1853,15 +1857,50 @@ impl BillingService {
     // PMS-711: Stripe "Pay Now" - checkout sessions + webhook reconciliation.
     // ========================================================================
 
-    /// Decrypt a stored `payment_gateway_configs.config_encrypted` blob and
-    /// build the provider it names. The plaintext never leaves this function
-    /// as data returned to a client (PMS-342).
-    fn build_provider(
+    /// Recover a gateway's credential, from wherever this row keeps it.
+    ///
+    /// PMS-968: a non-NULL `config_encrypted` is the pre-move state and is
+    /// decrypted here; NULL means the credential is in the secret store, at the
+    /// address the row's own `(tenant_id, provider)` gives. Both states are
+    /// live at once on a deployment the mover has not finished, which is the
+    /// point of keeping them distinguishable.
+    ///
+    /// A NULL column with nothing in the store is a hard error and never a
+    /// missing-gateway `None`. The row asserts a credential exists; if it does
+    /// not, something moved half-way, and answering "not configured" would turn
+    /// that into a payment integration that silently switched itself off.
+    async fn gateway_plaintext(
         &self,
+        tenant_id: Uuid,
         provider_id: &str,
-        config_encrypted: &str,
+        config_encrypted: Option<String>,
+    ) -> AppResult<String> {
+        match config_encrypted {
+            Some(ciphertext) => crate::utils::crypto::decrypt(&ciphertext, &self.encryption_key),
+            None => {
+                let key = crate::secrets::SecretKey::payment_gateway(tenant_id, provider_id);
+                self.secrets.get(&key).await?.ok_or_else(|| {
+                    AppError::Configuration(format!(
+                        "gateway {provider_id:?} says its credential is in the secret store, but the store has none"
+                    ))
+                })
+            }
+        }
+    }
+
+    /// Build the provider a resolved row names.
+    ///
+    /// The plaintext never leaves this function as data returned to a client
+    /// (PMS-342).
+    async fn build_provider(
+        &self,
+        tenant_id: Uuid,
+        provider_id: &str,
+        config_encrypted: Option<String>,
     ) -> AppResult<Box<dyn PaymentProvider>> {
-        let plaintext = crate::utils::crypto::decrypt(config_encrypted, &self.encryption_key)?;
+        let plaintext = self
+            .gateway_plaintext(tenant_id, provider_id, config_encrypted)
+            .await?;
         provider::build(provider_id, &plaintext, self.http.clone())
     }
 
@@ -1878,8 +1917,10 @@ impl BillingService {
     /// from, so it is refused. It is unreachable today, because `SUPPORTED`
     /// holds one entry; PMS-969 is what makes it reachable, and enforcing one
     /// active gateway per tenant at write time belongs with that change.
-    fn select_serveable(rows: Vec<(String, String)>) -> AppResult<Option<(String, String)>> {
-        let mut serveable: Vec<(String, String)> = rows
+    fn select_serveable(
+        rows: Vec<(String, Option<String>)>,
+    ) -> AppResult<Option<(String, Option<String>)>> {
+        let mut serveable: Vec<(String, Option<String>)> = rows
             .into_iter()
             .filter(|(id, _)| provider::is_supported(id))
             .collect();
@@ -1907,7 +1948,7 @@ impl BillingService {
         tenant_id: TenantId,
     ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let rows: Vec<(String, String)> = sqlx::query_as(
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT provider, config_encrypted FROM payment_gateway_configs \
              WHERE tenant_id = $1 AND is_active = TRUE",
         )
@@ -1915,7 +1956,7 @@ impl BillingService {
         .fetch_all(&mut *tx)
         .await?;
         match Self::select_serveable(rows)? {
-            Some((id, enc)) => Ok(Some(self.build_provider(&id, &enc)?)),
+            Some((id, enc)) => Ok(Some(self.build_provider(tenant_id.into(), &id, enc).await?)),
             None => Ok(None),
         }
     }
@@ -1955,7 +1996,7 @@ impl BillingService {
         &self,
         tenant_id: Uuid,
     ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT provider, config_encrypted FROM payment_gateway_configs \
              WHERE tenant_id = $1 AND is_active = TRUE",
         )
@@ -1963,7 +2004,7 @@ impl BillingService {
         .fetch_all(self.db.migrator_pool())
         .await?;
         match Self::select_serveable(rows)? {
-            Some((id, enc)) => Ok(Some(self.build_provider(&id, &enc)?)),
+            Some((id, enc)) => Ok(Some(self.build_provider(tenant_id.into(), &id, enc).await?)),
             None => Ok(None),
         }
     }
@@ -4303,7 +4344,7 @@ struct PaymentGatewayRow {
     provider: String,
     is_active: bool,
     is_test_mode: bool,
-    config_encrypted: String,
+    config_encrypted: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -4841,8 +4882,11 @@ impl From<ProductRow> for ProductResponse {
 mod gateway_resolution {
     use super::*;
 
-    fn row(provider: &str) -> (String, String) {
-        (provider.to_string(), format!("ciphertext-for-{provider}"))
+    fn row(provider: &str) -> (String, Option<String>) {
+        (
+            provider.to_string(),
+            Some(format!("ciphertext-for-{provider}")),
+        )
     }
 
     /// The property that makes PMS-966 a refactor rather than a change: a
@@ -4880,7 +4924,8 @@ mod gateway_resolution {
         // Constructed from `SUPPORTED` rather than from two hard-coded names,
         // so this keeps testing the ambiguity once a second provider lands
         // instead of quietly becoming unreachable.
-        let mut rows: Vec<(String, String)> = provider::SUPPORTED.iter().map(|p| row(p)).collect();
+        let mut rows: Vec<(String, Option<String>)> =
+            provider::SUPPORTED.iter().map(|p| row(p)).collect();
         if rows.len() < 2 {
             rows.push(row(provider::SUPPORTED[0]));
         }
