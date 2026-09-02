@@ -104,6 +104,57 @@ jobs:
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
 
+      - name: Start MinIO for the S3 storage suite
+        # PMS-958. `tests/s3_storage.rs` round-trips the S3 backend against a
+        # real object store and skips (loudly) when S3_ENDPOINT is unset, so
+        # this step is what makes it run here. A `services:` entry cannot do
+        # it: the MinIO image carries no command, `server /data` has to be
+        # passed, and Forgejo (like GitHub) service containers have no
+        # `command` key and `--entrypoint` takes a binary without arguments.
+        # So the pinned release binary runs in the job, verified against the
+        # checksum MinIO publishes beside it. Bump both lines together.
+        #
+        # Only this suite sets STORAGE_BACKEND=s3, in its own process; the
+        # variables below are read by nothing else, so every other suite
+        # keeps exercising the local backend.
+        env:
+          MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+          MINIO_SHA256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" != "x86_64" ]; then
+            echo "::error::MinIO pin is for linux-amd64; runner is $(uname -m)"
+            exit 1
+          fi
+          curl --fail --location --silent --show-error \
+            --output /tmp/minio \
+            "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_RELEASE}"
+          echo "${MINIO_SHA256}  /tmp/minio" | sha256sum --check --strict
+          chmod +x /tmp/minio
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER=mokosh MINIO_ROOT_PASSWORD=mokosh-ci-password \
+            nohup /tmp/minio server /tmp/minio-data --address 127.0.0.1:9000 \
+            > /tmp/minio.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl --silent --fail http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --silent --fail http://127.0.0.1:9000/minio/health/live > /dev/null || {
+            echo "::error::MinIO did not become healthy; log follows"
+            cat /tmp/minio.log
+            exit 1
+          }
+          {
+            echo "S3_ENDPOINT=http://127.0.0.1:9000"
+            echo "S3_BUCKET=mokosh-ci"
+            echo "S3_REGION=us-east-1"
+            echo "S3_PATH_STYLE=true"
+            echo "S3_ACCESS_KEY_ID=mokosh"
+            echo "S3_SECRET_ACCESS_KEY=mokosh-ci-password"
+          } >> "$GITHUB_ENV"
+
       - name: Integration tests
         # cargo test --tests runs every integration suite (all `tests/*.rs`
         # binaries) plus the lib unit tests, so new suites are picked up
