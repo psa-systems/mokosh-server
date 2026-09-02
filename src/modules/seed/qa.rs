@@ -450,6 +450,8 @@ impl QaSeeder {
                     po_number: None,
                     lines: None,
                     status: Some(InvoiceStatus::Sent),
+                    // PMS-992: seeded data is issued, not emailed.
+                    skip_email: true,
                 },
                 &ctx,
             )

@@ -559,7 +559,7 @@ impl BillingService {
                    payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
-                   created_at, updated_at
+                   created_at, updated_at, emailed_at, emailed_to
             FROM invoices
             WHERE {data_where}
             ORDER BY {order_by}
@@ -2762,13 +2762,29 @@ impl BillingService {
             (_, given) => given,
         };
 
+        let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
+        // PMS-992: the recipient is resolved BEFORE the transition, and a send
+        // with nobody to email is refused rather than recorded. `sent` used to
+        // mean "the operator pressed Send"; it now means the invoice was
+        // emailed to the address recorded on it, or was marked sent without
+        // emailing on purpose (`skip_email`), which is a hand-delivered invoice
+        // and says so.
+        let recipient = if just_sent && !request.skip_email {
+            let contact = request.billing_contact_id.or(current.billing_contact_id);
+            match Self::resolve_invoice_recipient(&mut tx, tenant_id, current.company_id, contact)
+                .await?
+            {
+                Ok(recipient) => Some(recipient),
+                Err(reason) => return Err(AppError::Conflict(reason)),
+            }
+        } else {
+            None
+        };
         // PMS-911: the MSP's identity as it stands right now, frozen onto the
         // invoice on the transition that freezes the invoice. In this
-        // transaction and not in the `just_sent` hook below it, because that
-        // hook is post-commit and best-effort: an invoice must never freeze
-        // carrying no identity.
-        let issuer_snapshot = if matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none()
-        {
+        // transaction, because a post-commit step is best-effort and an
+        // invoice must never freeze carrying no identity.
+        let issuer_snapshot = if just_sent {
             Some(Self::freeze_issuer(&mut tx, tenant_id).await?)
         } else {
             None
@@ -2856,6 +2872,30 @@ impl BillingService {
                 &bytes,
             )
             .await?;
+            // PMS-992: the email goes inside this transaction, so a send the
+            // mailer refuses rolls the transition back and the invoice stays
+            // a draft rather than a `sent` nobody received. The relay's
+            // acceptance is what "sent" means from here; delivery beyond it is
+            // the relay's.
+            if let Some((_, address)) = &recipient {
+                self.email_invoice(tenant_id, &document, address, &bytes)
+                    .await?;
+                sqlx::query(
+                    "UPDATE invoices SET emailed_at = NOW(), emailed_to = $3 \
+                     WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(invoice_id)
+                .bind(address)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                tracing::info!(
+                    target: "mokosh_server.billing",
+                    %invoice_id,
+                    "invoice marked sent without emailing (skip_email)",
+                );
+            }
         }
 
         // Audit row in the same transaction. PMS-117.
@@ -2880,19 +2920,65 @@ impl BillingService {
 
         tx.commit().await?;
 
-        // PMS-711, PMS-991: on the first send transition, email the billing
-        // contact the invoice, with the stored document attached and a pay
-        // link when a gateway is connected. Best-effort and post-commit: a
-        // mail failure must not undo the status change. No-op unless this
-        // instance carries a mailer (agent-facing only) and the invoice
-        // actually just moved to `sent`; every other reason for sending
-        // nothing is logged inside.
-        let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
-        if just_sent {
-            self.notify_invoice_sent(tenant_id, invoice_id).await;
-        }
-
         self.get_invoice(tenant_id, invoice_id).await
+    }
+
+    /// PMS-992: who an invoice goes to, or why it cannot go.
+    ///
+    /// The invoice's own billing contact when it names one, else the
+    /// company's default billing contact; either must carry an email address.
+    /// No guessing beyond that: PMS-993 settles the recipient as a contact
+    /// holding the billing role and rejects picking "some contact", so this
+    /// guard does not pick one either. `Err` is the sentence the operator
+    /// sees, naming the company and what is missing, because "no recipient"
+    /// is a state of the company rather than of the request.
+    async fn resolve_invoice_recipient(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        invoice_contact: Option<Uuid>,
+    ) -> AppResult<Result<(Uuid, String), String>> {
+        let company: Option<(String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT name, default_billing_contact_id FROM companies \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((company_name, company_contact)) = company else {
+            return Ok(Err(
+                "The invoice's company no longer exists, so it has no recipient.".to_string(),
+            ));
+        };
+        let Some(contact_id) = invoice_contact.or(company_contact) else {
+            return Ok(Err(format!(
+                "{company_name} has no billing contact, so this invoice cannot be sent. \
+                 Set a billing contact on the invoice or on the company, or mark the invoice \
+                 sent without emailing."
+            )));
+        };
+        let contact: Option<(Option<String>, String, String)> = sqlx::query_as(
+            "SELECT email, first_name, last_name FROM contacts WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match contact {
+            Some((Some(email), _, _)) if !email.trim().is_empty() => {
+                Ok(Ok((contact_id, email.trim().to_string())))
+            }
+            Some((_, first, last)) => Ok(Err(format!(
+                "{company_name}'s billing contact {first} {last} has no email address, so this \
+                 invoice cannot be sent. Add an address to the contact, choose another billing \
+                 contact, or mark the invoice sent without emailing."
+            ))),
+            None => Ok(Err(format!(
+                "{company_name}'s billing contact no longer exists, so this invoice cannot be \
+                 sent. Set a billing contact on the invoice or on the company."
+            ))),
+        }
     }
 
     /// PMS-911: read the tenant's live branding and freeze it.
@@ -2991,57 +3077,28 @@ impl BillingService {
         Ok(crate::modules::billing::issuer::resolve(&name, &branding))
     }
 
-    /// PMS-991: email the invoice to its billing contact, once, on the send.
+    /// PMS-991, reshaped by PMS-992: email the invoice to the resolved
+    /// recipient, inside the send transaction.
     ///
-    /// Post-commit and best-effort: the status change has already landed and
-    /// a mail failure must not undo it (PMS-711). Before PMS-991 this whole
-    /// message was gated on a connected payment gateway, so a fresh install
-    /// with none sent nothing on Send and nothing said so; the standup that
-    /// filed PMS-991 saw exactly that. The invoice is the message and the pay
-    /// link is an extra: the mail goes whenever there is a billing contact
-    /// with an address, carries the document stored at send (PMS-959), and
-    /// adds the portal link only when a gateway is connected and the portal
-    /// origin is known. Every reason for sending nothing is logged at `warn`
-    /// with the invoice id, because the caller has no other way to learn it.
-    async fn notify_invoice_sent(&self, tenant_id: TenantId, invoice_id: Uuid) {
+    /// The invoice is the message and the pay link is an extra: the mail
+    /// carries the document just rendered and adds the portal link only when
+    /// a gateway is connected and the portal origin is known. A failure is an
+    /// error the caller propagates, which rolls the transition back: an
+    /// invoice the relay refused stays a draft rather than becoming a `sent`
+    /// nobody received. A service with no mailer cannot send an invoice at
+    /// all and says so, rather than marking it sent.
+    async fn email_invoice(
+        &self,
+        tenant_id: TenantId,
+        invoice: &InvoiceResponse,
+        to: &str,
+        pdf: &[u8],
+    ) -> AppResult<()> {
         let Some(mailer) = self.mailer.as_ref() else {
-            tracing::warn!(
-                target: "mokosh_server.billing",
-                %invoice_id,
-                "invoice sent, no email: this service has no mailer",
-            );
-            return;
-        };
-        let invoice = match self.get_invoice(tenant_id, invoice_id).await {
-            Ok(inv) => inv,
-            Err(e) => {
-                tracing::warn!(target: "mokosh_server.billing", %invoice_id, error = %e, "invoice email: invoice reload failed");
-                return;
-            }
-        };
-        let Some(contact_id) = invoice.billing_contact_id else {
-            tracing::warn!(
-                target: "mokosh_server.billing",
-                %invoice_id,
-                "invoice sent, no email: the invoice has no billing contact",
-            );
-            return;
-        };
-        let email = match self.billing_contact_email(tenant_id, contact_id).await {
-            Ok(Some((Some(email), _))) => email,
-            Ok(_) => {
-                tracing::warn!(
-                    target: "mokosh_server.billing",
-                    %invoice_id,
-                    %contact_id,
-                    "invoice sent, no email: the billing contact has no email address",
-                );
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(target: "mokosh_server.billing", %invoice_id, error = %e, "invoice email: contact lookup failed");
-                return;
-            }
+            return Err(AppError::external_service(
+                "mail",
+                "this service cannot send email, so the invoice cannot be sent; mark it sent without emailing if it was delivered another way",
+            ));
         };
         // The pay link is offered only when something can take the payment.
         let portal_link = match (
@@ -3049,11 +3106,12 @@ impl BillingService {
             self.has_active_gateway(tenant_id).await,
         ) {
             (Some(origin), Ok(true)) => Some(format!(
-                "{}/portal/invoices/{invoice_id}",
-                origin.trim_end_matches('/')
+                "{}/portal/invoices/{}",
+                origin.trim_end_matches('/'),
+                invoice.id
             )),
             (_, Err(e)) => {
-                tracing::warn!(target: "mokosh_server.billing", %invoice_id, error = %e, "invoice email: gateway check failed, sending without a pay link");
+                tracing::warn!(target: "mokosh_server.billing", invoice_id = %invoice.id, error = %e, "invoice email: gateway check failed, sending without a pay link");
                 None
             }
             _ => None,
@@ -3062,48 +3120,39 @@ impl BillingService {
         let amount_due = format!("{} {}", invoice.balance_due, currency);
         let due_date = invoice.due_date.to_string();
         // PMS-761: an email asking someone to pay has to say who is asking.
-        // Skipped rather than sent anonymously if the identity cannot be read:
-        // the invoice is already visible in the portal, and an unattributed
-        // payment request is the shape of invoice fraud.
-        let org = match crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await {
-            Ok(org) => org,
-            Err(e) => {
-                tracing::warn!(
-                    target: "mokosh_server.billing", %invoice_id, error = %e,
-                    "invoice email: organisation identity unreadable, not sending",
-                );
-                return;
-            }
-        };
+        let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id)
+            .await
+            .map_err(|e| {
+                AppError::external_service(
+                    "mail",
+                    format!("the organisation's identity could not be read, so the invoice was not sent: {e}"),
+                )
+            })?;
         let contact_line = org.contact_line("Questions about this invoice?", None);
         let from = crate::utils::email::SenderIdentity {
             org_name: org.name(),
             contact_line: &contact_line,
         };
-        // The document as issued (PMS-959), stored in the transaction that
-        // just committed. Absent only for an invoice sent before PMS-959 or a
-        // storage failure, and the mail still goes without it.
-        let pdf =
-            crate::modules::billing::documents::read_issued(tenant_id.get(), invoice_id).await;
-        if pdf.is_none() {
-            tracing::warn!(target: "mokosh_server.billing", %invoice_id, "invoice email: no stored document to attach");
-        }
-        if let Err(e) = mailer
+        mailer
             .send_invoice_sent(
-                &email,
+                to,
                 from,
                 crate::utils::email::InvoiceSent {
                     invoice_number: &invoice.invoice_number,
                     amount_due: &amount_due,
                     due_date: &due_date,
                     portal_link: portal_link.as_deref(),
-                    pdf: pdf.as_deref(),
+                    pdf: Some(pdf),
                 },
             )
             .await
-        {
-            tracing::warn!(target: "mokosh_server.billing", %invoice_id, error = %e, "invoice email: send failed");
-        }
+            .map_err(|e| {
+                tracing::warn!(target: "mokosh_server.billing", invoice_id = %invoice.id, error = %e, "invoice email: send refused, the invoice stays a draft");
+                AppError::external_service(
+                    "mail",
+                    format!("Could not email the invoice to {to}: {e}. The invoice has not been sent."),
+                )
+            })
     }
 
     /// PMS-36: read a single invoice with `lines` populated. 404 when
@@ -3144,7 +3193,7 @@ impl BillingService {
                    payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
-                   created_at, updated_at
+                   created_at, updated_at, emailed_at, emailed_to
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -4629,6 +4678,8 @@ struct InvoiceRow {
     po_number: Option<String>,
     sent_at: Option<chrono::DateTime<Utc>>,
     paid_at: Option<chrono::DateTime<Utc>>,
+    emailed_at: Option<chrono::DateTime<Utc>>,
+    emailed_to: Option<String>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -4661,6 +4712,8 @@ impl From<InvoiceRow> for InvoiceResponse {
             po_number: r.po_number,
             sent_at: r.sent_at,
             paid_at: r.paid_at,
+            emailed_at: r.emailed_at,
+            emailed_to: r.emailed_to,
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,

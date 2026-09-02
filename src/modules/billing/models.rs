@@ -163,6 +163,12 @@ pub struct InvoiceResponse {
     pub notes: Option<String>,
     pub po_number: Option<String>,
     pub sent_at: Option<DateTime<Utc>>,
+    /// PMS-992: who the invoice was emailed to on the send, and when. `None`
+    /// on a draft, and on an invoice marked sent without emailing
+    /// (`skip_email`), so the record says what happened rather than implying
+    /// a delivery.
+    pub emailed_at: Option<DateTime<Utc>>,
+    pub emailed_to: Option<String>,
     pub paid_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -298,6 +304,13 @@ pub struct UpdateInvoiceRequest {
     pub lines: Option<Vec<CreateInvoiceLineRequest>>,
     /// Transition status. Same set as the schema CHECK constraint.
     pub status: Option<InvoiceStatus>,
+    /// PMS-992: mark the invoice sent WITHOUT emailing it, for one delivered
+    /// by hand (printed, or attached to a message the operator writes). Off,
+    /// a transition to `sent` requires a resolvable recipient and an accepted
+    /// send, and is refused otherwise; on, the invoice freezes and records
+    /// nobody as emailed. Only meaningful alongside `status: sent`.
+    #[serde(default)]
+    pub skip_email: bool,
 }
 
 // ============================================================================
