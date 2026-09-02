@@ -4,7 +4,7 @@
 //! provider nothing can serve is now refused at the moment an operator switches
 //! it on, where before the config stored happily and every resolution path then
 //! skipped it in silence. The second is that removing the `provider = 'stripe'`
-//! literal changed nothing for a tenant who already has rows: a stored `paypal`
+//! literal changed nothing for a tenant who already has rows: a stored `authorize_net`
 //! row was invisible behind the literal, and it has to stay invisible without
 //! it, including on the pre-auth webhook path where the wrong answer is a
 //! payment that never reconciles.
@@ -44,7 +44,7 @@ fn sign(secret: &str, body: &[u8], t: i64) -> String {
 /// Insert a gateway row directly, bypassing the API's activation guard.
 ///
 /// Deliberately not through `PUT /payment-gateways`: the point of the
-/// `paypal` cases below is a row that predates the guard, which is the only
+/// `authorize_net` cases below is a row that predates the guard, which is the only
 /// way one can exist, so seeding through the guarded route would test nothing.
 async fn seed_gateway(pool: &PgPool, provider: &str, is_active: bool) {
     let plaintext = serde_json::json!({
@@ -95,7 +95,7 @@ async fn activating_a_provider_nothing_can_serve_is_refused(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    let resp = put_gateway(&app, &token, "paypal", true).await;
+    let resp = put_gateway(&app, &token, "authorize_net", true).await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::BAD_REQUEST,
@@ -126,7 +126,7 @@ async fn storing_an_inactive_config_for_an_unserveable_provider_is_allowed(pool:
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    let resp = put_gateway(&app, &token, "paypal", false).await;
+    let resp = put_gateway(&app, &token, "authorize_net", false).await;
     assert!(
         resp.status().is_success(),
         "an inactive config is not a claim that it works, got {}",
@@ -151,14 +151,14 @@ async fn activating_stripe_still_works(pool: PgPool) {
 
 /// The refactor's central claim, on the path where being wrong costs money.
 ///
-/// A tenant carrying an active `paypal` row from before the guard, alongside
+/// A tenant carrying an active `authorize_net` row from before the guard, alongside
 /// their real Stripe config, must have their Stripe webhook verify exactly as
 /// it did when the SQL literal picked the row. If resolution returned the
-/// paypal row instead, the signature would fail against the wrong secret and
+/// authorize_net row instead, the signature would fail against the wrong secret and
 /// the payment would never reconcile.
 #[sqlx::test]
 async fn a_legacy_unserveable_row_does_not_shadow_the_stripe_one(pool: PgPool) {
-    seed_gateway(&pool, "paypal", true).await;
+    seed_gateway(&pool, "authorize_net", true).await;
     seed_gateway(&pool, "stripe", true).await;
     let app = common::boot_rls(pool.clone()).await;
 
@@ -199,7 +199,7 @@ async fn a_legacy_unserveable_row_does_not_shadow_the_stripe_one(pool: PgPool) {
 /// unauthenticated caller the tenant exists and is misconfigured.
 #[sqlx::test]
 async fn a_tenant_with_only_an_unserveable_gateway_answers_like_an_unconfigured_one(pool: PgPool) {
-    seed_gateway(&pool, "paypal", true).await;
+    seed_gateway(&pool, "authorize_net", true).await;
     let app = common::boot_rls(pool.clone()).await;
 
     let body = serde_json::json!({"id": "evt_x", "type": "checkout.session.expired"}).to_string();
