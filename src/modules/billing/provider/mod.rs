@@ -7,6 +7,15 @@
 //! ([`stripe::StripeProvider`]); adding PayPal is a new `impl PaymentProvider`,
 //! not a change to `BillingService`.
 //!
+//! PMS-966: that last sentence used to be an intention rather than a fact. The
+//! trait existed and was never dispatched through - `BillingService` held a
+//! `StripeProvider` concretely and all three credential lookups carried
+//! `provider = 'stripe'` as a SQL literal, while `GatewayProvider` already
+//! accepted `paypal` and `authorize_net`, so a tenant could store an active
+//! config for a provider nothing could serve and get silence for it. [`build`]
+//! is now the one place a stored discriminator becomes a provider, and
+//! [`is_supported`] is the one place that answers whether it can.
+//!
 //! Credentials are per-tenant and write-only (PMS-342): the tenant's provider
 //! secret lives encrypted in `payment_gateway_configs.config_encrypted` and is
 //! decrypted strictly server-side to build a provider instance. It is never
@@ -17,10 +26,50 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 
 pub mod stripe;
 pub use stripe::StripeProvider;
+
+/// Every provider discriminator this build can actually serve.
+///
+/// `GatewayProvider` is the wider set: it knows `authorize_net` and `paypal`
+/// too, and the `payment_gateway_configs.provider` CHECK constraint accepts all
+/// three, because the column predates any implementation. This is the narrower,
+/// honest list, and it is what the config write path validates against so a
+/// tenant cannot activate a gateway that will never mint a checkout session.
+pub const SUPPORTED: &[&str] = &["stripe"];
+
+/// Whether [`build`] can produce a provider for this discriminator.
+pub fn is_supported(provider: &str) -> bool {
+    SUPPORTED.contains(&provider)
+}
+
+/// Turn a stored `(provider, decrypted config)` pair into a provider.
+///
+/// The ONE place a discriminator becomes an implementation. Every caller that
+/// used to name `StripeProvider` goes through here instead, which is what makes
+/// a second provider a new arm rather than a change to `BillingService`.
+///
+/// Parsing the credential blob belongs to the provider module, not here: each
+/// provider's config is its own shape, so the alternative is one struct that is
+/// the union of every provider's fields with everything optional.
+pub fn build(
+    provider: &str,
+    plaintext: &str,
+    http: reqwest::Client,
+) -> AppResult<Box<dyn PaymentProvider>> {
+    match provider {
+        "stripe" => Ok(Box::new(stripe::from_config(plaintext, http)?)),
+        // Unreachable for a config written after PMS-966, which refuses to
+        // activate an unsupported provider. Reachable for a row stored before
+        // it, so it is a stated error rather than a panic or a silent skip.
+        other => Err(AppError::Configuration(format!(
+            "payment provider {other:?} is configured but not implemented; supported: {}",
+            SUPPORTED.join(", ")
+        ))),
+    }
+}
 
 /// Inputs for a hosted checkout session covering one invoice's balance.
 pub struct CheckoutParams<'a> {
@@ -108,4 +157,67 @@ pub trait PaymentProvider: Send + Sync {
     /// signature; the raw body must not be trusted before verification passes.
     fn verify_and_parse_webhook(&self, raw_body: &[u8], signature: &str)
         -> AppResult<PaymentEvent>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The claim `build` exists to make: one arm per servable provider, and a
+    /// stated refusal for everything else.
+    #[test]
+    fn only_a_supported_provider_builds() {
+        let http = reqwest::Client::new();
+        let config = r#"{"secret_key":"sk_test","webhook_secret":"whsec_test"}"#;
+
+        assert!(build("stripe", config, http.clone()).is_ok());
+
+        for unsupported in ["paypal", "authorize_net", "", "STRIPE"] {
+            // `Box<dyn PaymentProvider>` is not `Debug`, so this matches rather
+            // than calling `expect_err`.
+            match build(unsupported, config, http.clone()) {
+                Err(AppError::Configuration(message)) => {
+                    assert!(
+                        message.contains("not implemented"),
+                        "{unsupported:?} refused for the wrong reason: {message}"
+                    );
+                }
+                Err(other) => panic!("{unsupported:?} should be a Configuration error: {other:?}"),
+                Ok(_) => panic!("{unsupported:?} must not build"),
+            }
+        }
+    }
+
+    /// `SUPPORTED` and `build` are two statements of the same fact, and a
+    /// provider added to one and not the other is the bug this catches:
+    /// `is_supported` gates activation, `build` runs at payment time, so a
+    /// disagreement means a gateway that switches on and then cannot charge.
+    #[test]
+    fn the_supported_list_and_the_build_arms_agree() {
+        let http = reqwest::Client::new();
+        // Deliberately not a real credential blob: every supported provider
+        // must at least reach its own parser rather than fall to the catch-all.
+        for id in SUPPORTED {
+            assert!(is_supported(id), "{id} is listed but not supported");
+            let err = build(id, "{}", http.clone());
+            let reached_the_arm = match err {
+                Ok(_) => true,
+                Err(AppError::Configuration(ref m)) => !m.contains("not implemented"),
+                Err(_) => true,
+            };
+            assert!(reached_the_arm, "{id} is listed but has no arm in build");
+        }
+        assert!(!is_supported("paypal"), "paypal has no implementation yet");
+    }
+
+    /// The discriminator is the stored column value, so it must match what a
+    /// built provider reports about itself. A mismatch would resolve one
+    /// tenant's row into a provider that signs with another scheme.
+    #[test]
+    fn a_built_provider_reports_the_id_it_was_asked_for() {
+        let http = reqwest::Client::new();
+        let config = r#"{"secret_key":"sk_test","webhook_secret":"whsec_test"}"#;
+        let p = build("stripe", config, http).expect("stripe builds");
+        assert_eq!(p.id(), "stripe");
+    }
 }

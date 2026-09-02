@@ -16,19 +16,7 @@ use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
-use super::provider::{CheckoutParams, CheckoutSession, PaymentProvider, StripeProvider};
-
-/// Shape of the decrypted `payment_gateway_configs.config_encrypted` blob for
-/// the Stripe provider (PMS-711). Both fields are write-only secrets: the
-/// tenant's restricted API key and the webhook signing secret. Never logged,
-/// never returned to a client.
-#[derive(serde::Deserialize)]
-struct StripeCredentials {
-    #[serde(default)]
-    secret_key: String,
-    #[serde(default)]
-    webhook_secret: String,
-}
+use super::provider::{self, CheckoutParams, CheckoutSession, PaymentProvider};
 
 /// Billing operations: invoices, payments, gateway configs, tax rates.
 #[derive(Clone)]
@@ -1640,6 +1628,25 @@ impl BillingService {
         request: &UpsertPaymentGatewayConfigRequest,
         ctx: &AuditCtx,
     ) -> AppResult<PaymentGatewayConfigResponse> {
+        // PMS-966: refuse to ACTIVATE a provider this build cannot serve.
+        //
+        // The column's CHECK and `GatewayProvider` both accept `paypal` and
+        // `authorize_net`, so this call used to store an active config that
+        // every resolution path then skipped: no checkout, no Pay Now button,
+        // and nothing anywhere saying why. Answering here is the only point
+        // where the operator is present to be told.
+        //
+        // Activation only, not storage. Saving credentials ahead of support
+        // costs nothing and is refused by no rule; switching on something that
+        // will never mint a checkout session is the part that lies.
+        if request.is_active && !provider::is_supported(request.provider.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "Payment provider '{}' cannot be activated: it is not implemented. Supported: {}",
+                request.provider.as_str(),
+                provider::SUPPORTED.join(", ")
+            )));
+        }
+
         // Encrypt only when the caller supplied a new config; `None` means
         // "keep the existing secret" (write-only update semantics, PMS-342).
         let encrypted = match request.config.as_ref() {
@@ -1811,51 +1818,91 @@ impl BillingService {
     // PMS-711: Stripe "Pay Now" - checkout sessions + webhook reconciliation.
     // ========================================================================
 
-    /// Decrypt the stored `payment_gateway_configs.config_encrypted` blob into
-    /// the Stripe credential pair. The plaintext never leaves this function's
-    /// callers as data returned to a client (PMS-342).
-    fn decrypt_stripe_config(&self, config_encrypted: &str) -> AppResult<StripeCredentials> {
+    /// Decrypt a stored `payment_gateway_configs.config_encrypted` blob and
+    /// build the provider it names. The plaintext never leaves this function
+    /// as data returned to a client (PMS-342).
+    fn build_provider(
+        &self,
+        provider_id: &str,
+        config_encrypted: &str,
+    ) -> AppResult<Box<dyn PaymentProvider>> {
         let plaintext = crate::utils::crypto::decrypt(config_encrypted, &self.encryption_key)?;
-        serde_json::from_str::<StripeCredentials>(&plaintext).map_err(|_| {
-            AppError::Configuration("stored Stripe config is not valid JSON".to_string())
-        })
+        provider::build(provider_id, &plaintext, self.http.clone())
     }
 
-    /// Load the tenant's ACTIVE Stripe credentials over the tenant-scoped
-    /// serving connection. Used by the authenticated checkout path, where the
-    /// caller's tenant is already established, so the read runs through
+    /// Pick the one active gateway this build can serve out of a tenant's rows.
+    ///
+    /// `payment_gateway_configs` is `UNIQUE (tenant_id, provider)`, not unique
+    /// on the tenant, and `is_active` has no partial index behind it, so a
+    /// tenant may legitimately hold an active row per provider. Filtering to
+    /// the supported set is what makes today's behaviour identical to the
+    /// `provider = 'stripe'` literal this replaced: a stored `paypal` row was
+    /// invisible then and is skipped now.
+    ///
+    /// Two supported actives is a real ambiguity rather than a row to pick
+    /// from, so it is refused. It is unreachable today, because `SUPPORTED`
+    /// holds one entry; PMS-969 is what makes it reachable, and enforcing one
+    /// active gateway per tenant at write time belongs with that change.
+    fn select_serveable(rows: Vec<(String, String)>) -> AppResult<Option<(String, String)>> {
+        let mut serveable: Vec<(String, String)> = rows
+            .into_iter()
+            .filter(|(id, _)| provider::is_supported(id))
+            .collect();
+        match serveable.len() {
+            0 => Ok(None),
+            1 => Ok(Some(serveable.remove(0))),
+            _ => {
+                serveable.sort_by(|a, b| a.0.cmp(&b.0));
+                let names: Vec<&str> = serveable.iter().map(|(id, _)| id.as_str()).collect();
+                Err(AppError::Configuration(format!(
+                    "tenant has {} active payment gateways ({}); exactly one may be active",
+                    names.len(),
+                    names.join(", ")
+                )))
+            }
+        }
+    }
+
+    /// Load the tenant's ACTIVE payment provider over the tenant-scoped serving
+    /// connection. Used by the authenticated checkout path, where the caller's
+    /// tenant is already established, so the read runs through
     /// `begin_with_tenant` like every other serving read.
-    async fn active_stripe_credentials(
+    async fn active_provider(
         &self,
         tenant_id: TenantId,
-    ) -> AppResult<Option<StripeCredentials>> {
+    ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT config_encrypted FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND provider = 'stripe' AND is_active = TRUE",
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT provider, config_encrypted FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND is_active = TRUE",
         )
         .bind(tenant_id)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        match row {
-            Some(enc) => Ok(Some(self.decrypt_stripe_config(&enc)?)),
+        match Self::select_serveable(rows)? {
+            Some((id, enc)) => Ok(Some(self.build_provider(&id, &enc)?)),
             None => Ok(None),
         }
     }
 
-    /// Whether the tenant has an active Stripe gateway. Cheap existence check
-    /// used to decide whether the outbound invoice email carries a Pay Now
-    /// button (PMS-711).
+    /// Whether the tenant has an active gateway this build can serve. Cheap
+    /// existence check used to decide whether the outbound invoice email
+    /// carries a Pay Now button (PMS-711).
+    ///
+    /// "Can serve" and not merely "is configured": a Pay Now button on an
+    /// unserveable gateway is a link to a 400, sent to the customer being asked
+    /// to pay. It reads the same set `active_provider` resolves from, so the
+    /// button and the checkout it leads to cannot disagree.
     pub async fn has_active_gateway(&self, tenant_id: TenantId) -> AppResult<bool> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let found: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND provider = 'stripe' AND is_active = TRUE",
+        let providers: Vec<String> = sqlx::query_scalar(
+            "SELECT provider FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND is_active = TRUE",
         )
         .bind(tenant_id)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(found.is_some())
+        Ok(providers.iter().any(|id| provider::is_supported(id)))
     }
 
     /// Build a Stripe provider scoped to the tenant's ACTIVE gateway for the
@@ -1869,28 +1916,21 @@ impl BillingService {
     /// single credential lookup runs on the BYPASSRLS `migrator_pool`, keyed by
     /// the `tenant_id` from the webhook URL path. `payment_gateway_configs` is
     /// RLS-covered and would fail closed on the unprivileged app pool here.
-    pub async fn stripe_provider_for_webhook(
+    pub async fn provider_for_webhook(
         &self,
         tenant_id: Uuid,
-    ) -> AppResult<Option<StripeProvider>> {
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT config_encrypted FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND provider = 'stripe' AND is_active = TRUE",
+    ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT provider, config_encrypted FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND is_active = TRUE",
         )
         .bind(tenant_id)
-        .fetch_optional(self.db.migrator_pool())
+        .fetch_all(self.db.migrator_pool())
         .await?;
-        let Some(enc) = row else {
-            return Ok(None);
-        };
-        let creds = self.decrypt_stripe_config(&enc)?;
-        // The webhook path needs only the signing secret; the API key is unused
-        // for verify/parse but carried for symmetry.
-        Ok(Some(StripeProvider::new(
-            creds.secret_key,
-            creds.webhook_secret,
-            self.http.clone(),
-        )))
+        match Self::select_serveable(rows)? {
+            Some((id, enc)) => Ok(Some(self.build_provider(&id, &enc)?)),
+            None => Ok(None),
+        }
     }
 
     /// PMS-711: create a hosted checkout session for an invoice's outstanding
@@ -1921,7 +1961,7 @@ impl BillingService {
                 "Invoice has no outstanding balance to pay".to_string(),
             ));
         }
-        let Some(creds) = self.active_stripe_credentials(tenant_id).await? else {
+        let Some(provider) = self.active_provider(tenant_id).await? else {
             return Err(AppError::BadRequest(
                 "No active payment provider is configured for this account".to_string(),
             ));
@@ -1937,8 +1977,6 @@ impl BillingService {
             None => None,
         };
 
-        let provider =
-            StripeProvider::new(creds.secret_key, creds.webhook_secret, self.http.clone());
         let currency = invoice.currency.as_deref().unwrap_or("USD");
         let params = CheckoutParams {
             tenant_id: tenant_id.get(),
@@ -4760,6 +4798,66 @@ impl From<ProductRow> for ProductResponse {
             is_active: r.is_active,
             created_at: r.created_at,
             updated_at: r.updated_at,
+        }
+    }
+}
+
+#[cfg(test)]
+mod gateway_resolution {
+    use super::*;
+
+    fn row(provider: &str) -> (String, String) {
+        (provider.to_string(), format!("ciphertext-for-{provider}"))
+    }
+
+    /// The property that makes PMS-966 a refactor rather than a change: a
+    /// tenant with a stored `paypal` row was invisible behind the old
+    /// `provider = 'stripe'` literal, and must stay invisible now that the
+    /// literal is gone.
+    #[test]
+    fn an_unserveable_row_is_skipped_exactly_as_the_literal_skipped_it() {
+        let picked = BillingService::select_serveable(vec![row("paypal"), row("stripe")])
+            .expect("one serveable row resolves");
+        assert_eq!(picked.map(|(id, _)| id), Some("stripe".to_string()));
+
+        let none = BillingService::select_serveable(vec![row("paypal"), row("authorize_net")])
+            .expect("no serveable row is not an error");
+        assert!(
+            none.is_none(),
+            "a tenant with only unserveable gateways resolves to None, not an error"
+        );
+    }
+
+    /// No active rows at all is the ordinary unconfigured tenant.
+    #[test]
+    fn no_rows_resolves_to_none() {
+        let none = BillingService::select_serveable(Vec::new()).expect("no rows is fine");
+        assert!(none.is_none());
+    }
+
+    /// Two serveable gateways is a question the database cannot answer, so it
+    /// is refused rather than resolved. `UNIQUE (tenant_id, provider)` permits
+    /// one active row per provider, so this becomes reachable the moment a
+    /// second provider is implemented (PMS-969); picking one would route a
+    /// customer's payment at whichever row the planner happened to return.
+    #[test]
+    fn two_serveable_gateways_is_refused_and_not_picked_between() {
+        // Constructed from `SUPPORTED` rather than from two hard-coded names,
+        // so this keeps testing the ambiguity once a second provider lands
+        // instead of quietly becoming unreachable.
+        let mut rows: Vec<(String, String)> = provider::SUPPORTED.iter().map(|p| row(p)).collect();
+        if rows.len() < 2 {
+            rows.push(row(provider::SUPPORTED[0]));
+        }
+        match BillingService::select_serveable(rows) {
+            Err(AppError::Configuration(message)) => {
+                assert!(
+                    message.contains("exactly one may be active"),
+                    "refused for the wrong reason: {message}"
+                );
+            }
+            Err(other) => panic!("expected a Configuration error, got {other:?}"),
+            Ok(_) => panic!("two serveable gateways must not resolve to one"),
         }
     }
 }

@@ -28,7 +28,7 @@ use axum::{
 };
 use uuid::Uuid;
 
-use super::provider::{PaymentEvent, PaymentProvider};
+use super::provider::PaymentEvent;
 use super::BillingService;
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
@@ -62,7 +62,7 @@ pub async fn stripe_webhook_handler(
     //    not confirm whether the tenant otherwise exists.
     let provider = state
         .billing
-        .stripe_provider_for_webhook(tenant_id)
+        .provider_for_webhook(tenant_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
 
