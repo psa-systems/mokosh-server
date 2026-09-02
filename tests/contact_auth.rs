@@ -463,3 +463,137 @@ async fn contact_portal_host_returns_hint_for_known_and_404s_for_unknown(pool: P
         "prompt 004: unknown slug on /portal/{{slug}}/host must 404"
     );
 }
+
+// ============================================================================
+// MAPPS-647 / PMS-917 AC4: negative tests against every contact-plane auth
+// path so a contact with `portal_password_hash IS NULL` cannot mint a session
+// on any surface. The password-login NULL-hash branch, the DTO empty-password
+// refusal, `refresh` without a prior session, and `reset-password` returning
+// no session tokens were all unpinned before this closeout. Magic-link redeem
+// is already covered by `tests/contact_magic_link_login.rs:913`.
+// ============================================================================
+
+/// PMS-917 AC4: a contact whose `portal_password_hash IS NULL` is refused
+/// with the same 401 shape as a wrong-password login. Pins the
+/// `ok_or(Unauthorized)` branch in `contact_portal::service::login`.
+#[sqlx::test]
+async fn contact_login_with_no_credential_returns_401(pool: PgPool) {
+    let (_contact_id, slug, _token) =
+        seed_portal_contact(&pool, "no-cred@mcl.example").await;
+    // Deliberately skip set-password so `portal_password_hash` stays NULL.
+    let app = common::boot(pool.clone()).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login"))
+        .json(&serde_json::json!({
+            "slug": slug,
+            "email": "no-cred@mcl.example",
+            "password": "anything-nonempty",
+        }))
+        .send()
+        .await
+        .expect("no-cred login");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "PMS-917: NULL portal_password_hash must 401, indistinguishable from wrong-password"
+    );
+}
+
+/// PMS-917 AC4: an empty submitted password is refused by DTO validation
+/// before it reaches the hash-compare, so the "empty submitted password"
+/// branch cannot slip through even if a future service-layer refactor
+/// weakens the NULL-hash guard.
+#[sqlx::test]
+async fn contact_login_with_empty_password_returns_400(pool: PgPool) {
+    let (_contact_id, slug, _token) =
+        seed_portal_contact(&pool, "empty-pw@mcl.example").await;
+    let app = common::boot(pool.clone()).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login"))
+        .json(&serde_json::json!({
+            "slug": slug,
+            "email": "empty-pw@mcl.example",
+            "password": "",
+        }))
+        .send()
+        .await
+        .expect("empty-password login");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "PMS-917: DTO validator must refuse an empty password with 400"
+    );
+}
+
+/// PMS-917 AC4: `refresh` cannot originate a session for a no-credential
+/// contact. A forged/unknown refresh token 401s without touching the
+/// contact row, so a NULL-hash contact has no way to obtain access tokens
+/// through this path either.
+#[sqlx::test]
+async fn contact_refresh_with_bogus_token_returns_401(pool: PgPool) {
+    let (_contact_id, _slug, _token) =
+        seed_portal_contact(&pool, "refresh-nocred@mcl.example").await;
+    let app = common::boot(pool.clone()).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/auth/refresh"))
+        .json(&serde_json::json!({
+            "refresh_token": "not-a-real-token",
+        }))
+        .send()
+        .await
+        .expect("bogus refresh");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "PMS-917: refresh must 401 on an unknown token; no session may be minted"
+    );
+    let cookie_header = resp.headers().get("set-cookie");
+    assert!(
+        cookie_header.is_none(),
+        "PMS-917: refresh 401 must not Set-Cookie a contact session, got {cookie_header:?}"
+    );
+}
+
+/// PMS-917 AC4: `reset-password` writes `portal_password_hash` and returns
+/// 204 without any session material. Even though it now legitimately gives
+/// a no-credential contact a credential, it does so WITHOUT minting a
+/// session; the SPA then has to drive `POST /contact/auth/login` with the
+/// freshly-set password. Pins that contract.
+#[sqlx::test]
+async fn contact_reset_password_returns_no_session(pool: PgPool) {
+    let (_contact_id, _slug, token) =
+        seed_portal_contact(&pool, "reset-nosession@mcl.example").await;
+    let app = common::boot(pool.clone()).await;
+
+    // The `portal_setup_tokens` table backs both setup + reset; the
+    // seed's token can drive reset_password directly (they share
+    // `setup_password` under the hood, see service.rs:531).
+    let strong = "Kq7$mZ2n#PxR9wLf";
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/auth/reset-password"))
+        .json(&serde_json::json!({ "token": token, "password": strong }))
+        .send()
+        .await
+        .expect("reset-password");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "PMS-917: reset-password must 204 with no body"
+    );
+    assert!(
+        resp.headers().get("set-cookie").is_none(),
+        "PMS-917: reset-password must not Set-Cookie a contact session"
+    );
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.trim().is_empty(),
+        "PMS-917: reset-password must return an empty body (no tokens), got {body:?}"
+    );
+}
