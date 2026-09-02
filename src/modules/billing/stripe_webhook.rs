@@ -33,9 +33,6 @@ use super::BillingService;
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
 
-/// Stripe's signature header name.
-const SIGNATURE_HEADER: &str = "Stripe-Signature";
-
 /// State for the Stripe webhook receiver. Holds the `BillingService` (which
 /// owns the DB handle, encryption key, and HTTP client) so the handler can load
 /// the tenant's signing secret and reconcile payments in one place.
@@ -51,13 +48,7 @@ pub async fn stripe_webhook_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<impl IntoResponse> {
-    // 1. Signature header. Missing / non-ASCII = 401 (do not parse the body).
-    let signature = headers
-        .get(SIGNATURE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AppError::Unauthorized)?;
-
-    // 2. Select the tenant's active Stripe provider (decrypts its signing
+    // 1. Select the tenant's active Stripe provider (decrypts its signing
     //    secret). No active gateway = 401: nothing to verify against, and we do
     //    not confirm whether the tenant otherwise exists.
     let provider = state
@@ -66,11 +57,12 @@ pub async fn stripe_webhook_handler(
         .await?
         .ok_or(AppError::Unauthorized)?;
 
-    // 3. Verify over the RAW bytes, then parse. `verify_and_parse_webhook`
-    //    returns Unauthorized on a bad signature before it touches the JSON.
-    let event = provider.verify_and_parse_webhook(&body, signature)?;
+    // 2. Verify over the RAW bytes, then parse. The provider picks its own
+    //    headers out of the map and returns Unauthorized on a missing or bad
+    //    signature before it touches the JSON.
+    let event = provider.verify_and_parse_webhook(&body, &headers).await?;
 
-    // 4. Dispatch. SAFETY (PMS-285 / PMS-711): the path `tenant_id` is trusted
+    // 3. Dispatch. SAFETY (PMS-285 / PMS-711): the path `tenant_id` is trusted
     //    only now - the signature verified against THIS tenant's secret, so the
     //    caller has proven possession of that tenant's Stripe credential.
     //    `from_trusted` bridges it to the tenant-scoped service calls, which set
@@ -113,6 +105,13 @@ pub async fn stripe_webhook_handler(
                 .billing
                 .record_gateway_refunds(scoped, &provider_reference, &currency, &refunds, &raw)
                 .await?;
+        }
+        PaymentEvent::RequiresCapture { order_id } => {
+            // The buyer approved; charge them. The provider's completed-capture
+            // event follows and records the payment, so nothing is written
+            // here, and a capture that fails is a 500 so the provider retries
+            // the approval delivery.
+            provider.capture(&order_id).await?;
         }
         PaymentEvent::Ignored { kind } => {
             tracing::debug!(

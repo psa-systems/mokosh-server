@@ -178,11 +178,16 @@ impl PaymentProvider for StripeProvider {
         })
     }
 
-    fn verify_and_parse_webhook(
+    async fn verify_and_parse_webhook(
         &self,
         raw_body: &[u8],
-        signature: &str,
+        headers: &axum::http::HeaderMap,
     ) -> AppResult<PaymentEvent> {
+        // Missing or non-ASCII header = 401 before the body is looked at.
+        let signature = headers
+            .get(SIGNATURE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .ok_or(AppError::Unauthorized)?;
         let now = chrono::Utc::now().timestamp();
         // DEV-514: the constant-time signature verifier lives in the shared
         // dunite-stripe-core crate (also consumed by a8n-tools and bunyip).
@@ -196,7 +201,19 @@ impl PaymentProvider for StripeProvider {
         .map_err(|_| AppError::Unauthorized)?;
         parse_stripe_event(raw_body)
     }
+
+    async fn capture(&self, order_id: &str) -> AppResult<()> {
+        // Checkout charges when the buyer completes, so there is never anything
+        // to capture. Reaching here means a `RequiresCapture` event was routed
+        // to the wrong provider.
+        Err(AppError::Configuration(format!(
+            "stripe has no capture step; order {order_id:?} was routed to the wrong provider"
+        )))
+    }
 }
+
+/// Stripe's signature header name.
+const SIGNATURE_HEADER: &str = "Stripe-Signature";
 
 /// Map a verified Stripe event body to a normalised [`PaymentEvent`].
 ///
