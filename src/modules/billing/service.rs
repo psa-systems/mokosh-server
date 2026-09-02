@@ -1851,6 +1851,20 @@ impl BillingService {
             .execute(&mut *tx)
             .await?;
 
+        // PMS-968: the credential goes with the row. Deleting the row and
+        // leaving the secret would keep a disconnected tenant's live API key in
+        // the store indefinitely, and a later reconnect would silently inherit
+        // it. This runs after the DELETE, matching `SecretStore::delete` being
+        // best-effort: the row is the thing that points at the secret, so a
+        // secret with no row is orphaned rather than dangerous, whereas a row
+        // whose secret is already gone cannot serve a payment.
+        self.secrets
+            .delete(&crate::secrets::SecretKey::payment_gateway(
+                tenant_id.get(),
+                provider.as_str(),
+            ))
+            .await?;
+
         if let Some((id, before)) = row {
             audit_write(
                 &mut *tx,
