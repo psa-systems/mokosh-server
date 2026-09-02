@@ -296,32 +296,21 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
 
-      # Portal host-to-tenant resolution suffix. Required for the client
-      # portal to work: every deploy hosts a client's portal at
-      # `{tenant.slug}<suffix>`, and the server resolves the tenant from
-      # the Host header on every portal request. The SPA has no on-page
-      # slug input; a customer visits their subdomain and lands on their
-      # tenant's portal.
-      #
-      # Recommended dev value: `.client.localhost`. Browsers resolve any
-      # `*.localhost` host to 127.0.0.1 with no /etc/hosts entry, so
-      # `http://acme.client.localhost:4301/portal/login` reaches
-      # mokosh-server directly (Traefik on staging listens on
-      # `${USER}-mokosh-api.a8n.run` and does not participate in the
-      # `.localhost` shape).
-      #
-      # Empty leaves the portal effectively disabled - a customer visit
-      # to the subdomain still 200s (routes through the SPA) but every
-      # portal API call 404s because no tenant is resolved.
-      PORTAL_HOST_SUFFIX: ${PORTAL_HOST_SUFFIX:-}
+      # MAPPS-649: the per-MSP `PORTAL_HOST_SUFFIX` env retired with the
+      # collapse onto a single portal subdomain. The portal now lives at
+      # one host (typically `portal.<apex>`) and the visitor addresses
+      # their Company from the URL path (`/portal/{portal_id}/*`). If
+      # you are upgrading an older deploy, drop `PORTAL_HOST_SUFFIX`
+      # from your own `.env` and remove any Traefik / DNS wildcard that
+      # pointed at `*.client.<apex>`. See
+      # docs/dev-docs/portal-single-host-cutover.md.
 
-      # PMS-729: CORS allow-list, comma-separated. Empty passes through as
-      # `[CLIENT_ORIGIN]` on the server side (the pre-729 dev default). Set
-      # in .env to `http://localhost:4301,http://*.client.localhost:4301`
-      # when exercising the portal host-derived path in a real browser -
-      # the scheme-locked wildcard lets any `{slug}.client.localhost:4301`
-      # tab POST credentialed calls to the dev server. See
-      # `.env.example` for the exact value and `src/api/cors_origin.rs`
+      # PMS-729 / MAPPS-649: CORS allow-list, comma-separated. Empty
+      # passes through as `[CLIENT_ORIGIN]` on the server side. Add the
+      # portal origin here when the SPA is served on a separate portal
+      # host in dev (e.g. `http://portal.localhost:4301`) so a browser
+      # tab on that origin can POST credentialed calls. See
+      # `.env.example` for a full example and `src/api/cors_origin.rs`
       # for the predicate.
       CORS_ORIGIN: ${CORS_ORIGIN:-}
 

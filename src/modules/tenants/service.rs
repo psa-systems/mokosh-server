@@ -63,37 +63,6 @@ const MAX_TENANT_NAME_LEN: usize = 255;
 ///
 /// The possessive is always `'s`, including after a trailing s ("Chris's
 /// workspace"), which is the common style and avoids branching on spelling.
-/// MAPPS-554: extract an explicit non-default port out of a base-URL
-/// string. Returns `Some(port)` only when the URL has an explicit
-/// `host:port` (colon-and-digits between the host and the next path
-/// slash) AND the port is non-standard for the scheme (80 for http,
-/// 443 for https). `None` for a bare `https://example.com` or a
-/// malformed input. Used to carry the dev port from
-/// `frontend_base_url` over onto the tenant-subdomain URL when the
-/// portal_host_suffix itself lacks a port (dev
-/// `PORTAL_HOST_SUFFIX=.client.localhost`).
-///
-/// Intentionally string-based to avoid taking a `url` crate dep just
-/// for this one call site.
-fn extract_explicit_port(base_url: &str) -> Option<u16> {
-    let (scheme, rest) = base_url.split_once("://")?;
-    let host_and_port = rest.split('/').next()?;
-    let (_host, port_str) = host_and_port.rsplit_once(':')?;
-    // A `:` inside an IPv6 literal wrapped in brackets would trip this,
-    // but the config values we see here are always hostname-based.
-    let port = port_str.parse::<u16>().ok()?;
-    let default_port = match scheme.to_ascii_lowercase().as_str() {
-        "http" => 80,
-        "https" => 443,
-        _ => return None,
-    };
-    if port == default_port {
-        None
-    } else {
-        Some(port)
-    }
-}
-
 fn personal_tenant_name(given_name: Option<&str>, email: Option<&str>) -> String {
     let from_given = given_name
         .map(str::trim)
@@ -134,13 +103,6 @@ pub struct TenantService {
     // production wire path opts in via `with_dispatcher`.
     notifications: Option<NotificationsService>,
     frontend_base_url: Option<String>,
-    /// Trailing portal host suffix (`.client.a8n.systems` in prod,
-    /// `.client.localhost:PORT` in dev). Threaded through so the
-    /// admin welcome email can compute + stamp the tenant's own
-    /// client-portal URL into the render context (templates
-    /// reference it as `{{client_portal_url}}` when they want to
-    /// tell the admin where to send their clients).
-    portal_host_suffix: Option<String>,
     /// MAPPS-457: instance-wide hard ceiling on total tenants. `None`
     /// leaves creation uncapped (production default). `Some(N)` makes
     /// [`create_tenant`] probe `SELECT COUNT(*) FROM tenants` before
@@ -157,7 +119,6 @@ impl TenantService {
             db,
             notifications: None,
             frontend_base_url: None,
-            portal_host_suffix: None,
             max_tenants: None,
         }
     }
@@ -177,17 +138,6 @@ impl TenantService {
     ) -> Self {
         self.notifications = Some(notifications);
         self.frontend_base_url = Some(frontend_base_url.trim_end_matches('/').to_string());
-        self
-    }
-
-    /// Attach the portal host suffix so the admin welcome context
-    /// carries a `client_portal_url` the template can reference.
-    /// Empty string / unset -> no URL in the context (matches the
-    /// legacy-deploy case).
-    #[must_use]
-    pub fn with_portal_host_suffix(mut self, suffix: impl Into<String>) -> Self {
-        let s = suffix.into().trim().to_ascii_lowercase();
-        self.portal_host_suffix = if s.is_empty() { None } else { Some(s) };
         self
     }
 
@@ -697,11 +647,18 @@ impl TenantService {
             );
             return;
         };
-        let Some(portal_suffix) = self.portal_host_suffix.as_deref() else {
+        // MAPPS-649: the portal now lives at a single host (typically
+        // `portal.<apex>`) rather than per-MSP subdomains, so the
+        // welcome URL is `{frontend_base_url}/portal/set-password?token={token}`
+        // - the SPA at that origin serves the `/portal/*` route tree.
+        // `with_dispatcher` sets `frontend_base_url`; without it we
+        // have no origin to build a link against and log-and-return
+        // the same way the pre-MAPPS-649 code did for a missing suffix.
+        let Some(portal_base) = self.frontend_base_url.as_deref() else {
             tracing::warn!(
                 tenant_id = %tenant_id,
                 contact_id = %contact_id,
-                "MAPPS-554: no portal host suffix configured; cannot build portal setup URL",
+                "MAPPS-649: no frontend base URL configured; cannot build portal setup URL",
             );
             return;
         };
@@ -770,35 +727,19 @@ impl TenantService {
             return;
         }
 
-        // Build the tenant subdomain portal URL.
-        //
-        // MAPPS-554 fix (2026-08-24 operator report): the naive
-        // `<scheme>://<slug><suffix>` shape lost the dev port. Dev
-        // `PORTAL_HOST_SUFFIX=.client.localhost` on the server plus a
-        // frontend served at `http://localhost:4301` = the emailed link
-        // resolved to `http://<slug>.client.localhost/portal/set-password?token=...`
-        // (port 80), which nothing serves, so the customer saw "This
-        // link is expired or invalid" the first time they clicked it.
-        // Carry the port over from `frontend_base_url` when the URL
-        // has an explicit non-default port so the emitted link stays
-        // reachable in dev. Prod URLs (`https://msp.<apex>` on 443,
-        // no port in the base URL) are unaffected.
-        let slug = slugify(tenant_slug);
-        let scheme = if portal_suffix.contains("localhost") {
-            "http"
-        } else {
-            "https"
-        };
-        let port = self
-            .frontend_base_url
-            .as_deref()
-            .and_then(extract_explicit_port);
-        let portal_origin = match port {
-            Some(p) => format!("{scheme}://{slug}{portal_suffix}:{p}"),
-            None => format!("{scheme}://{slug}{portal_suffix}"),
-        };
-        let setup_link = format!("{portal_origin}/portal/set-password?token={token}");
-        let client_portal_url = portal_origin;
+        // MAPPS-649: build against the single portal-serving origin
+        // (typically `https://portal.<apex>`, dev `http://localhost:4301`).
+        // Retires the pre-649 per-tenant `<slug><suffix>` shape (see
+        // git log for MAPPS-554's port-in-dev workaround, no longer
+        // needed since the origin now carries its port verbatim).
+        // `tenant_slug` is unused in the URL now; the visitor enters
+        // their Company ID at step 1 or lands directly on
+        // `/portal/set-password?token=...` when following the emailed
+        // link. Kept as a parameter for the audit-log context below.
+        let _ = tenant_slug;
+        let portal_base = portal_base.trim_end_matches('/');
+        let setup_link = format!("{portal_base}/portal/set-password?token={token}");
+        let client_portal_url = portal_base.to_string();
 
         let display_name = match (admin_first_name.trim(), admin_last_name.trim()) {
             ("", "") => String::new(),
