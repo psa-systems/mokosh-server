@@ -29,6 +29,18 @@
 //! [`LocalStore::path_for`] is where every layout decision lives, and the test
 //! below pins each of them, so a future change is a deliberate edit to a stated
 //! expectation rather than an accident that orphans a customer's attachments.
+//!
+//! PMS-958 found the seam documented and not built: `dyn ObjectStore` appeared
+//! nowhere, six structs held a `LocalStore` by name and four free functions
+//! constructed one inline, so "selected by configuration" had nowhere to plug
+//! in. Every caller now holds an `Arc<dyn ObjectStore>` from [`shared`], which
+//! is built once per process from `STORAGE_BACKEND` and touched first by `main`
+//! so a misconfigured backend ends startup rather than the first upload. A
+//! process-wide handle rather than a constructor argument, because the store
+//! is constructed at thirteen sites across the router, the tenants routes,
+//! billing and the seeders, and because an object-store client owns a
+//! connection pool that is only useful if it is shared; `utils::net` and
+//! `utils::client_ip` hold their env-derived configuration the same way.
 
 mod ledger;
 
@@ -36,6 +48,7 @@ pub use ledger::{FileLedger, FileRecord};
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use tokio::io::AsyncRead;
@@ -255,7 +268,7 @@ pub type ObjectReader = Pin<Box<dyn AsyncRead + Send>>;
 /// let one reach outside its tenant, because there is no method that takes a
 /// path.
 #[async_trait]
-pub trait ObjectStore: Send + Sync {
+pub trait ObjectStore: Send + Sync + std::fmt::Debug {
     async fn put(&self, key: &ObjectKey, bytes: &[u8]) -> AppResult<()>;
     /// The whole object. For a logo or a KB image, which are already read whole
     /// and are capped in the megabytes.
@@ -284,6 +297,14 @@ pub trait ObjectStore: Send + Sync {
     /// has just established is there and a silent success would mark the
     /// object migrated when nothing moved.
     async fn rename(&self, from: &ObjectKey, to: &ObjectKey) -> AppResult<()>;
+    /// Where the object is, in this backend's own words: an absolute path on
+    /// the local one, a bucket URL on an object store.
+    ///
+    /// Descriptive only. It exists because `ticket_attachments.storage_path`
+    /// is `NOT NULL` and every row holds one, and for a log line. It is a
+    /// `String` rather than a path so that no caller can hand it back as an
+    /// address: the only way to reach an object is still an [`ObjectKey`].
+    fn location(&self, key: &ObjectKey) -> AppResult<String>;
 }
 
 /// Where the local backend keeps things.
@@ -485,6 +506,55 @@ impl ObjectStore for LocalStore {
             .await
             .map_err(|e| AppError::Internal(format!("could not move object: {e}")))
     }
+
+    fn location(&self, key: &ObjectKey) -> AppResult<String> {
+        // Byte-identical to what `AttachmentService` wrote into
+        // `storage_path` before PMS-958, because every existing row holds
+        // that shape and a reader that comes back for the column should find
+        // one value, not two.
+        Ok(self.path_for(key)?.to_string_lossy().into_owned())
+    }
+}
+
+/// Build the backend this deployment is configured for.
+///
+/// The ONE place configuration becomes an [`ObjectStore`], so no construction
+/// site can pick a backend of its own. Fallible, so that [`init_from_env`] can
+/// end startup on a bad configuration; the local backend cannot fail to build,
+/// but the S3 one (PMS-958) can.
+pub fn store_from_env() -> AppResult<Arc<dyn ObjectStore>> {
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::from_env());
+    Ok(store)
+}
+
+static SHARED: OnceLock<Arc<dyn ObjectStore>> = OnceLock::new();
+
+/// Build the process-wide store from the environment, once, and fail loudly.
+///
+/// `main` calls this before it builds anything that stores bytes, which is
+/// what makes a misconfigured backend a boot failure rather than a 500 on the
+/// first upload. A second call after the first succeeded returns the store
+/// already built and reads no configuration.
+pub fn init_from_env() -> AppResult<Arc<dyn ObjectStore>> {
+    if let Some(store) = SHARED.get() {
+        return Ok(store.clone());
+    }
+    let store = store_from_env()?;
+    Ok(SHARED.get_or_init(|| store).clone())
+}
+
+/// The store every feature uses.
+///
+/// Built from the environment on first use when nothing called
+/// [`init_from_env`], which is the test and CLI path; a configuration that
+/// cannot build is a panic there, because there is no request to answer with a
+/// 500 and no startup to end.
+pub fn shared() -> Arc<dyn ObjectStore> {
+    SHARED
+        .get_or_init(|| {
+            store_from_env().unwrap_or_else(|e| panic!("storage backend configuration: {e}"))
+        })
+        .clone()
 }
 
 #[cfg(test)]
