@@ -334,6 +334,16 @@ services:
       # PMS-923: KB article images. Default reproduces the code's own 5 MiB.
       KB_ATTACHMENT_MAX_BYTES: ${KB_ATTACHMENT_MAX_BYTES:-}
       TENANT_LOGO_MAX_BYTES: ${TENANT_LOGO_MAX_BYTES:-}
+      # PMS-958: storage backend. Empty resolves to local, so the dev stack
+      # keeps writing to the `attachments` volume unless an operator opts in
+      # to the `s3` profile's MinIO (`just dev-s3`) and sets these.
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_PATH_STYLE: ${S3_PATH_STYLE:-}
 
       # RS verifier knobs beyond the issuer/audience pair above; empty keeps the
       # built-in 600s JWKS cache and 30s clock leeway. OIDC_DEFAULT_TENANT_ID is

@@ -517,14 +517,64 @@ impl ObjectStore for LocalStore {
     }
 }
 
+/// Which implementation a deployment runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageBackend {
+    /// The filesystem under `ATTACHMENT_DIR`. The default, and the only one
+    /// self-hosting needs.
+    Local,
+    /// An S3-compatible object store, configured by the `S3_*` variables
+    /// (PMS-958).
+    S3,
+}
+
+impl StorageBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StorageBackend::Local => "local",
+            StorageBackend::S3 => "s3",
+        }
+    }
+
+    /// The ONE reader of `STORAGE_BACKEND`, the way [`StorageConfig::from_env`]
+    /// is the only reader of `ATTACHMENT_DIR`.
+    pub fn from_env() -> AppResult<Self> {
+        Self::parse(&std::env::var("STORAGE_BACKEND").unwrap_or_default())
+    }
+
+    /// An unset or blank value is `Local`, because a forwarded-but-unset
+    /// variable arrives as `""` (PMS-836) and the default has to be the one
+    /// that needs no other service: no integration is a hard requirement. An
+    /// unrecognised value is a hard error rather than a fall back to local,
+    /// the same rule `SECRET_BACKEND` follows: an operator who wrote
+    /// `STORAGE_BACKEND=s3 ` with a typo asked for S3, and quietly writing
+    /// their uploads to a container filesystem instead is the silent degrade
+    /// this crate refuses everywhere else.
+    pub fn parse(raw: &str) -> AppResult<Self> {
+        match raw.trim() {
+            "" | "local" => Ok(StorageBackend::Local),
+            "s3" => Ok(StorageBackend::S3),
+            other => Err(AppError::Configuration(format!(
+                "STORAGE_BACKEND {other:?} is not a known backend; expected 'local' or 's3'"
+            ))),
+        }
+    }
+}
+
 /// Build the backend this deployment is configured for.
 ///
-/// The ONE place configuration becomes an [`ObjectStore`], so no construction
-/// site can pick a backend of its own. Fallible, so that [`init_from_env`] can
-/// end startup on a bad configuration; the local backend cannot fail to build,
-/// but the S3 one (PMS-958) can.
+/// The ONE place a [`StorageBackend`] becomes an [`ObjectStore`], so no
+/// construction site can pick a backend of its own. Fallible, so that
+/// [`init_from_env`] can end startup on a bad configuration: the local backend
+/// cannot fail to build, but the S3 one refuses a half-configured deployment
+/// here rather than on the first upload.
 pub fn store_from_env() -> AppResult<Arc<dyn ObjectStore>> {
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::from_env());
+    let backend = StorageBackend::from_env()?;
+    let store: Arc<dyn ObjectStore> = match backend {
+        StorageBackend::Local => Arc::new(LocalStore::from_env()),
+        StorageBackend::S3 => Arc::new(s3::S3Store::from_env()?),
+    };
+    tracing::info!(backend = backend.as_str(), "storage backend selected");
     Ok(store)
 }
 
@@ -926,5 +976,34 @@ mod tests {
             "an absolute default writes where nothing prepared a directory"
         );
         assert_eq!(DEFAULT_ROOT, "./attachments");
+    }
+
+    /// The selection rule, without touching process env. Blank is local
+    /// because a forwarded-but-unset variable arrives as `""`; a typo is an
+    /// error because the operator asked for something and did not get it.
+    #[test]
+    fn blank_is_local_and_a_typo_is_an_error() {
+        assert_eq!(StorageBackend::parse("").unwrap(), StorageBackend::Local);
+        assert_eq!(StorageBackend::parse("  ").unwrap(), StorageBackend::Local);
+        assert_eq!(
+            StorageBackend::parse("local").unwrap(),
+            StorageBackend::Local
+        );
+        assert_eq!(StorageBackend::parse(" s3 ").unwrap(), StorageBackend::S3);
+        for typo in ["S3", "minio", "filesystem", "s3,local"] {
+            assert!(
+                StorageBackend::parse(typo).is_err(),
+                "{typo:?} must not fall back to local"
+            );
+        }
+    }
+
+    /// `STORAGE_BACKEND` has exactly one reader, like `ATTACHMENT_DIR`: a
+    /// second is how two parts of one process come to disagree about where
+    /// bytes are.
+    #[test]
+    fn there_is_one_reader_of_the_backend_variable() {
+        const SRC: &str = include_str!("mod.rs");
+        assert_eq!(SRC.matches("var(\"STORAGE_BACKEND\")").count(), 1);
     }
 }
