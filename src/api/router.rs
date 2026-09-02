@@ -22,7 +22,7 @@ use crate::modules::auth::{
     auth_routes, bunyip_webhook::BunyipWebhookState, AuthMiddleware, AuthService,
 };
 use crate::modules::billing::{
-    billing_routes, stripe_webhook_handler, BillingService, StripeWebhookState,
+    billing_routes, provider_webhook_handler, BillingService, ProviderWebhookState,
 };
 use crate::modules::calendar::{calendar_routes, dispatch_routes, CalendarService};
 use crate::modules::contacts::{contact_routes, ContactService};
@@ -614,16 +614,38 @@ pub fn create_api_router(
     // secret). The tenant id in the path selects which tenant's secret to verify
     // against; it is not itself a credential. Its own `BillingService` instance
     // (the router's `billing_service` is moved into `billing_routes`).
-    let stripe_webhook_state = Arc::new(StripeWebhookState {
+    let stripe_webhook_state = Arc::new(ProviderWebhookState {
         billing: Arc::new(BillingService::with_secrets(
             db.clone(),
             encryption_key,
             secrets.clone(),
         )),
+        provider_id: "stripe",
     });
     let stripe_webhooks = Router::new()
-        .route("/webhooks/{tenant_id}", post(stripe_webhook_handler))
+        .route("/webhooks/{tenant_id}", post(provider_webhook_handler))
         .with_state(stripe_webhook_state)
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
+
+    // PMS-969: PayPal webhook receiver, same handler and same shape, nested
+    // under `/api/v1/paypal`. PayPal authenticates itself with five
+    // `PAYPAL-TRANSMISSION-*` headers that the provider checks back with
+    // PayPal rather than locally. Its prefix is in `RAW_BODY_PATHS` for the
+    // same reason Stripe's is: the verify call sends the body back to PayPal
+    // to compare, so a byte the sanitizer rewrote is a verification failure.
+    let paypal_webhook_state = Arc::new(ProviderWebhookState {
+        billing: Arc::new(BillingService::with_secrets(
+            db.clone(),
+            encryption_key,
+            secrets.clone(),
+        )),
+        provider_id: "paypal",
+    });
+    let paypal_webhooks = Router::new()
+        .route("/webhooks/{tenant_id}", post(provider_webhook_handler))
+        .with_state(paypal_webhook_state)
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));
@@ -680,6 +702,7 @@ pub fn create_api_router(
         .nest("/api/v1/portal", portal_api)
         .nest("/api/v1/bunyip", bunyip_webhooks)
         .nest("/api/v1/stripe", stripe_webhooks)
+        .nest("/api/v1/paypal", paypal_webhooks)
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))

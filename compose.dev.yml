@@ -345,6 +345,8 @@ services:
       # Stripe REST base, overridable so a test can point checkout at a stub;
       # empty uses https://api.stripe.com.
       STRIPE_API_BASE: ${STRIPE_API_BASE:-}
+      # PayPal REST base, same purpose (PMS-969); empty uses PayPal's own hosts.
+      PAYPAL_API_BASE: ${PAYPAL_API_BASE:-}
 
       # PMS-710 demo-data gate, the template tenant its rows are copied from,
       # and the upstream version probe. All three are off/default when empty.

@@ -688,7 +688,7 @@ mod tests {
 
     /// PMS-769: the RFC 6750 challenge is attached by the auth extractors'
     /// `AuthRejection`, never by `AppError` itself. The webhook HMAC gates
-    /// (`bunyip_webhook.rs`, `stripe_webhook.rs`) and the portal password
+    /// (`bunyip_webhook.rs`, `billing/webhook.rs`) and the portal password
     /// checks (`portal/service.rs`) return `AppError::Unauthorized` straight
     /// out of an `AppResult` handler, so this is the exact response they
     /// render: a plain `UNAUTHORIZED` envelope with no `WWW-Authenticate`.

@@ -22,13 +22,16 @@
 //! returned to a client and never logged.
 
 use async_trait::async_trait;
+use axum::http::HeaderMap;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::utils::error::{AppError, AppResult};
 
+pub mod paypal;
 pub mod stripe;
+pub use paypal::PaypalProvider;
 pub use stripe::StripeProvider;
 
 /// Every provider discriminator this build can actually serve.
@@ -38,7 +41,7 @@ pub use stripe::StripeProvider;
 /// three, because the column predates any implementation. This is the narrower,
 /// honest list, and it is what the config write path validates against so a
 /// tenant cannot activate a gateway that will never mint a checkout session.
-pub const SUPPORTED: &[&str] = &["stripe"];
+pub const SUPPORTED: &[&str] = &["stripe", "paypal"];
 
 /// Whether [`build`] can produce a provider for this discriminator.
 pub fn is_supported(provider: &str) -> bool {
@@ -61,6 +64,7 @@ pub fn build(
 ) -> AppResult<Box<dyn PaymentProvider>> {
     match provider {
         "stripe" => Ok(Box::new(stripe::from_config(plaintext, http)?)),
+        "paypal" => Ok(Box::new(paypal::from_config(plaintext, http)?)),
         // Unreachable for a config written after PMS-966, which refuses to
         // activate an unsupported provider. Reachable for a row stored before
         // it, so it is a stated error rather than a panic or a silent skip.
@@ -132,6 +136,14 @@ pub enum PaymentEvent {
         refunds: Vec<RefundLine>,
         raw: Value,
     },
+    /// The buyer approved a checkout and the provider is waiting for the
+    /// merchant to charge them (PMS-969). Stripe never emits this: Checkout
+    /// charges when the buyer completes. A PayPal Order with `intent=CAPTURE`
+    /// is only approved at that point, and the money moves when the merchant
+    /// calls capture, so the receiver answers this by calling
+    /// [`PaymentProvider::capture`] and lets the resulting completed-capture
+    /// event record the payment through the normal path.
+    RequiresCapture { order_id: String },
     /// A recognised event we deliberately do not act on (abandoned checkout,
     /// failed payment intent, an unrelated session on the tenant's account,
     /// ...). Carried rather than error'd so the handler returns 200 and the
@@ -152,11 +164,26 @@ pub trait PaymentProvider: Send + Sync {
         params: &CheckoutParams<'_>,
     ) -> AppResult<CheckoutSession>;
 
-    /// Verify the webhook signature over the raw request bytes, then parse the
-    /// body into a normalised event. Returns `Unauthorized` on a bad or missing
-    /// signature; the raw body must not be trusted before verification passes.
-    fn verify_and_parse_webhook(&self, raw_body: &[u8], signature: &str)
-        -> AppResult<PaymentEvent>;
+    /// Verify the inbound webhook, then parse the body into a normalised event.
+    /// Returns `Unauthorized` on a bad or missing signature; the raw body must
+    /// not be trusted before verification passes.
+    ///
+    /// Takes the whole header map and is async (PMS-969). The first version
+    /// took one `signature: &str` and was sync, which was Stripe's shape and
+    /// nobody else's: PayPal signs across five headers and its supported
+    /// verification is a call to PayPal, so the provider picks its own headers
+    /// out and may do I/O to check them.
+    async fn verify_and_parse_webhook(
+        &self,
+        raw_body: &[u8],
+        headers: &HeaderMap,
+    ) -> AppResult<PaymentEvent>;
+
+    /// Charge an approved checkout (PMS-969). Only meaningful for a provider
+    /// that emits [`PaymentEvent::RequiresCapture`]; a provider that charges
+    /// on completion returns an error, because being asked means the receiver
+    /// has confused which provider it is talking to.
+    async fn capture(&self, order_id: &str) -> AppResult<()>;
 }
 
 #[cfg(test)]
@@ -171,8 +198,9 @@ mod tests {
         let config = r#"{"secret_key":"sk_test","webhook_secret":"whsec_test"}"#;
 
         assert!(build("stripe", config, http.clone()).is_ok());
+        assert!(build("paypal", config, http.clone()).is_ok());
 
-        for unsupported in ["paypal", "authorize_net", "", "STRIPE"] {
+        for unsupported in ["authorize_net", "", "STRIPE", "PayPal"] {
             // `Box<dyn PaymentProvider>` is not `Debug`, so this matches rather
             // than calling `expect_err`.
             match build(unsupported, config, http.clone()) {
@@ -207,7 +235,10 @@ mod tests {
             };
             assert!(reached_the_arm, "{id} is listed but has no arm in build");
         }
-        assert!(!is_supported("paypal"), "paypal has no implementation yet");
+        assert!(
+            !is_supported("authorize_net"),
+            "authorize_net has no implementation"
+        );
     }
 
     /// The discriminator is the stored column value, so it must match what a

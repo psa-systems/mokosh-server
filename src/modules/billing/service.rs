@@ -1734,6 +1734,40 @@ impl BillingService {
             AuditAction::Create
         };
 
+        // PMS-969: one active gateway per tenant, enforced here rather than
+        // resolved later. `payment_gateway_configs` is UNIQUE on (tenant,
+        // provider) and not on the tenant, so nothing in the schema stops two
+        // rows being active at once, and `select_serveable` refuses a tenant
+        // in that state outright rather than guessing which one a customer's
+        // money should go to. PMS-966 deferred this to the change that makes
+        // two serveable actives possible, which is the second provider.
+        //
+        // Activating this provider deactivates the others in the same
+        // transaction; deactivating it touches nothing else. The rows that
+        // flip are logged by provider, not audited row-by-row: the audit entry
+        // below is for the row the caller named, and a per-sibling entry is a
+        // follow-up if it turns out to be wanted.
+        if request.is_active {
+            let flipped: Vec<String> = sqlx::query_scalar(
+                "UPDATE payment_gateway_configs \
+                 SET is_active = FALSE, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND provider <> $2 AND is_active = TRUE \
+                 RETURNING provider",
+            )
+            .bind(tenant_id)
+            .bind(request.provider.as_str())
+            .fetch_all(&mut *tx)
+            .await?;
+            if !flipped.is_empty() {
+                tracing::info!(
+                    target: "mokosh_server.billing",
+                    activated = request.provider.as_str(),
+                    deactivated = ?flipped,
+                    "one active payment gateway per tenant: siblings deactivated"
+                );
+            }
+        }
+
         // A brand-new gateway must carry a config: there is no existing secret
         // to preserve.
         let id: Uuid = if stored_in_secret_store {
@@ -4919,16 +4953,18 @@ mod gateway_resolution {
     }
 
     /// The property that makes PMS-966 a refactor rather than a change: a
-    /// tenant with a stored `paypal` row was invisible behind the old
+    /// tenant with a stored `authorize_net` row was invisible behind the old
     /// `provider = 'stripe'` literal, and must stay invisible now that the
-    /// literal is gone.
+    /// literal is gone. (PMS-966 used `paypal` as the example; PMS-969 made
+    /// that one serveable, so the example moved to the provider that still is
+    /// not.)
     #[test]
     fn an_unserveable_row_is_skipped_exactly_as_the_literal_skipped_it() {
-        let picked = BillingService::select_serveable(vec![row("paypal"), row("stripe")])
+        let picked = BillingService::select_serveable(vec![row("authorize_net"), row("stripe")])
             .expect("one serveable row resolves");
         assert_eq!(picked.map(|(id, _)| id), Some("stripe".to_string()));
 
-        let none = BillingService::select_serveable(vec![row("paypal"), row("authorize_net")])
+        let none = BillingService::select_serveable(vec![row("authorize_net")])
             .expect("no serveable row is not an error");
         assert!(
             none.is_none(),
