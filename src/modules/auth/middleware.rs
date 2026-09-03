@@ -1217,26 +1217,52 @@ async fn place_bunyip_caller(
     //
     // Remove this block on merge back to main - the production model
     // is "invitations, not silent JIT" (MAPPS-458 / PMS-728 slice 2).
-    let (placement, sub) = match (placement, email.as_deref(), email_verified) {
-        (Some(p), _, _) => (Some(p), sub),
-        (None, Some(em), true) => match auth_service.find_user_placement_by_email(em).await {
-            Ok(Some((users_id, tenant, role))) => {
-                tracing::warn!(
-                    bunyip_sub = %sub,
-                    users_id = %users_id,
-                    email = %em,
-                    tenant_id = %tenant,
-                    "TEMPORARY MAPPS-458 bypass: bunyip sub has no local placement, but a users row exists under this email; accepting and rebinding sub to that users row's id for this request"
-                );
-                (Some((tenant, role)), users_id)
+    let (placement, sub) = match (placement, email.as_deref()) {
+        (Some(p), _) => (Some(p), sub),
+        // TEMPORARY: `email_verified` is deliberately NOT required here,
+        // because some bunyip configs on staging emit the claim as `false`
+        // (or omit it entirely) even for real user rows. Production
+        // MAPPS-458 is untouched; this fallback lives only on this branch.
+        (None, Some(em)) => {
+            tracing::warn!(
+                bunyip_sub = %sub,
+                email = %em,
+                email_verified = email_verified,
+                "TEMPORARY MAPPS-458 bypass: placement lookup by sub returned None; attempting by-email lookup"
+            );
+            match auth_service.find_user_placement_by_email(em).await {
+                Ok(Some((users_id, tenant, role))) => {
+                    tracing::warn!(
+                        bunyip_sub = %sub,
+                        users_id = %users_id,
+                        email = %em,
+                        tenant_id = %tenant,
+                        role = %role,
+                        "TEMPORARY MAPPS-458 bypass: matched users row by email; rebinding sub to that row's id and accepting"
+                    );
+                    (Some((tenant, role)), users_id)
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        bunyip_sub = %sub,
+                        email = %em,
+                        "TEMPORARY MAPPS-458 bypass: by-email lookup found no matching users row; will fall through to MAPPS-458"
+                    );
+                    (None, sub)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, sub = %sub, "find_user_placement_by_email failed; falling through to MAPPS-458");
+                    (None, sub)
+                }
             }
-            Ok(None) => (None, sub),
-            Err(e) => {
-                tracing::warn!(error = %e, sub = %sub, "find_user_placement_by_email failed; falling through to MAPPS-458");
-                (None, sub)
-            }
-        },
-        _ => (None, sub),
+        }
+        (None, None) => {
+            tracing::warn!(
+                bunyip_sub = %sub,
+                "TEMPORARY MAPPS-458 bypass: no email in the JWT, cannot attempt by-email lookup"
+            );
+            (None, sub)
+        }
     };
     let current = placement.as_ref().map(|(t, _)| *t);
 
