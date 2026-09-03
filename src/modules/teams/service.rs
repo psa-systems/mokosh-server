@@ -397,19 +397,21 @@ impl TeamsService {
         team_id: Uuid,
     ) -> AppResult<Vec<TeamMemberWithUser>> {
         // Ensure the team exists in this tenant before returning members;
-        // otherwise a caller could probe team_id -> member_count.
+        // otherwise a caller could probe team_id -> member_count. PMS-692:
+        // this ran on `self.db.pool()` before, which fails closed under RLS
+        // (NOBYPASSRLS app pool, no GUC set) and turned every read into
+        // NotFound; the precheck runs inside the tenant-scoped tx below now.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let team_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM teams WHERE tenant_id = $1 AND id = $2)",
         )
         .bind(*tenant_id)
         .bind(team_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if !team_exists {
             return Err(AppError::NotFound("Team".to_string()));
         }
-
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<TeamMemberJoinRow> = sqlx::query_as(
             r#"
             SELECT tm.user_id, u.email, u.first_name, u.last_name, u.avatar_url,
@@ -477,18 +479,20 @@ impl TeamsService {
             .await?;
 
         // Team-in-tenant check surfaces a nicer 404 than the FK violation.
+        // PMS-692: precheck runs inside the tenant-scoped tx below so the
+        // NOBYPASSRLS app pool does not fail it closed to always-NotFound.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let team_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM teams WHERE tenant_id = $1 AND id = $2)",
         )
         .bind(*tenant_id)
         .bind(team_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if !team_exists {
             return Err(AppError::NotFound("Team".to_string()));
         }
 
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let insert = sqlx::query(
             r#"
             INSERT INTO team_members (tenant_id, team_id, user_id, role, joined_at)
@@ -600,6 +604,10 @@ impl TeamsService {
         .await?;
         tx.commit().await?;
 
+        // PMS-692: read-back opens its own tenant-scoped tx so the
+        // NOBYPASSRLS app pool does not fail-close this SELECT to zero
+        // rows against the row we just committed.
+        let mut read_tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: TeamMemberRow = sqlx::query_as(
             "SELECT tenant_id, team_id, user_id, role, joined_at \
              FROM team_members WHERE tenant_id = $1 AND team_id = $2 AND user_id = $3",
@@ -607,8 +615,9 @@ impl TeamsService {
         .bind(*tenant_id)
         .bind(team_id)
         .bind(user_id)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *read_tx)
         .await?;
+        drop(read_tx);
         Ok(row.into())
     }
 

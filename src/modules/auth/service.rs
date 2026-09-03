@@ -1200,12 +1200,17 @@ impl AuthService {
         // never locked out. `suspended` OR an expired entitlement
         // rejects with the same "not active" copy so the endpoint does
         // not distinguish billing vs. operator lifecycle to a caller.
-        // The row lives on `tenant_membership_entitlements`
-        // (migration 125), RLS-exempt like `tenants`.
+        // `tenant_membership_entitlements` (migration 154) is intentionally
+        // RLS-exempt: see the migration header for the "pre-auth / cross-
+        // tenant entitlement lookup path" reason, and 038's ENABLE-RLS loop
+        // runs at migration time only, so nothing enables RLS on 154's
+        // table after the fact.
         let entitlement: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
             "SELECT status, expires_at FROM tenant_membership_entitlements WHERE tenant_id = $1",
         )
         .bind(tenant_id)
+        // SAFETY (PMS-285 / PMS-692): RLS-exempt table, see the note
+        // right above; NOBYPASSRLS app pool without a GUC is fine here.
         .fetch_optional(self.db.pool())
         .await?;
         if let Some((entitlement_status, expires_at)) = entitlement {

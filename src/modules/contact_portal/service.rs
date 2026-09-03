@@ -1261,6 +1261,9 @@ impl ContactAuthService {
     /// sessions on the next fetch. Mirrors MAPPS-557 on the retired
     /// portal plane.
     pub async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
+        // SAFETY (PMS-285 / PMS-692): `tenants` is the RLS-exempt isolation
+        // root (migration 038: `table_name != 'tenants'`), so this single-
+        // row status read is safe on the NOBYPASSRLS app pool with no GUC.
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
             .bind(tenant_id)
             .fetch_optional(self.db.pool())

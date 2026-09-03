@@ -1529,6 +1529,10 @@ impl ContactService {
         // Refuse to grant on an own_company contact. Those rows are
         // internal bookkeeping (see `TenantService::ensure_own_company`)
         // and are never a real customer.
+        // SAFETY (PMS-285 / PMS-692): `tenants` is the RLS-exempt isolation
+        // root (migration 038 excludes `table_name != 'tenants'` from the
+        // fail-closed policy), so this single-row read is safe on the
+        // NOBYPASSRLS app pool with no `app.current_tenant` GUC.
         let own_company_id: Option<Uuid> =
             sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
                 .bind(*tenant_id)
