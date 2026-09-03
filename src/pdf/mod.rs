@@ -10,12 +10,13 @@
 //! ## What it is not
 //!
 //! Not a layout engine. A [`Document`] is a title and a list of sections, each
-//! either labelled fields or a table, which is the shape every report in this
+//! labelled fields, plain lines, a table, or (PMS-1004) the two shapes an
+//! invoice wanted that a report did not: headed line blocks side by side and a
+//! totals block at the right margin. That is the shape every report in this
 //! codebase already has (the CSV writers emit exactly that: a header block,
-//! then one or more grouped tables). Anything needing real flow - wrapped
-//! paragraphs, columns, images - is a bigger decision than the report export
-//! needs and would be better made against the invoice work that actually wants
-//! it.
+//! then one or more grouped tables) plus what a commercial document adds to it.
+//! Anything needing real flow - wrapped paragraphs, nested blocks - is a bigger
+//! decision than either needs and would be made against the work that wants it.
 //!
 //! ## Why `printpdf` and a base-14 font
 //!
@@ -77,9 +78,24 @@ const AVERAGE_CHAR_EM: f32 = 0.52;
 /// Left column width for a labelled field, in millimetres.
 const LABEL_WIDTH_MM: f32 = 62.0;
 
+/// Width of a totals block, measured in from the right margin (PMS-1004).
+/// Room for "Balance due" and a seven-figure amount with its currency code.
+const TOTALS_WIDTH_MM: f32 = 80.0;
+
+/// Space between side-by-side column blocks (PMS-1004).
+const COLUMN_GUTTER_MM: f32 = 8.0;
+
+/// Inset of a cell's text from its column edge.
+const CELL_PAD_MM: f32 = 2.0;
+
 /// Narrowest a table column is allowed to get, so a column of long values
 /// cannot squeeze its neighbours to nothing.
 const MIN_COLUMN_MM: f32 = 16.0;
+
+/// A column whose widest cell fits in this keeps its width when the table
+/// overflows (PMS-1004): dates, quantities and amounts are never cut to make
+/// room for a description.
+const NARROW_COLUMN_MM: f32 = 34.0;
 
 /// What a section holds.
 pub enum Body {
@@ -89,10 +105,31 @@ pub enum Body {
     /// is billed to (PMS-911). Not `Fields`, because an address has no labels.
     Lines(Vec<String>),
     /// A grid. The header row repeats when the table crosses a page.
+    /// `align` has one entry per column; a missing entry is `Left`.
     Table {
         headers: Vec<String>,
         rows: Vec<Vec<String>>,
+        align: Vec<Align>,
     },
+    /// PMS-1004: several headed line blocks side by side, sharing the content
+    /// width equally. An invoice's From and Bill to belong beside each other,
+    /// not one under the other: stacked, the two blocks push the items table
+    /// down the page for no reason a reader can see.
+    Columns(Vec<(String, Vec<String>)>),
+    /// PMS-1004: label / value pairs set against the RIGHT margin, values
+    /// flush right, with a rule above the last pair. Where an invoice puts
+    /// its totals, so the balance due sits under the amount column that
+    /// produced it.
+    Totals(Vec<(String, String)>),
+}
+
+/// How a table column sets its cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Align {
+    #[default]
+    Left,
+    /// For a column of numbers, so the units line up under each other.
+    Right,
 }
 
 /// One block of a document, optionally under a heading.
@@ -163,15 +200,53 @@ impl Document {
         self
     }
 
+    /// A table with every column set left.
     pub fn table(
-        mut self,
+        self,
         heading: impl Into<String>,
         headers: Vec<String>,
         rows: Vec<Vec<String>>,
     ) -> Self {
+        self.table_aligned(heading, headers, rows, Vec::new())
+    }
+
+    /// PMS-1004: a table that says how each column is set. `align` is
+    /// positional and may be shorter than `headers`; the rest are `Left`.
+    pub fn table_aligned(
+        mut self,
+        heading: impl Into<String>,
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+        align: Vec<Align>,
+    ) -> Self {
         self.sections.push(Section {
             heading: Some(heading.into()),
-            body: Body::Table { headers, rows },
+            body: Body::Table {
+                headers,
+                rows,
+                align,
+            },
+        });
+        self
+    }
+
+    /// PMS-1004: headed line blocks side by side. Each block carries its own
+    /// heading, so the section itself has none.
+    pub fn columns(mut self, blocks: Vec<(String, Vec<String>)>) -> Self {
+        self.sections.push(Section {
+            heading: None,
+            body: Body::Columns(blocks),
+        });
+        self
+    }
+
+    /// PMS-1004: a totals block at the right margin. No heading: the block
+    /// closes the table above it, and "Totals" over a column of totals says
+    /// nothing the reader did not know.
+    pub fn totals(mut self, pairs: Vec<(String, String)>) -> Self {
+        self.sections.push(Section {
+            heading: None,
+            body: Body::Totals(pairs),
         });
         self
     }
@@ -228,23 +303,28 @@ pub fn render(document: &Document) -> AppResult<Vec<u8>> {
     let title_top = layout.y_mm;
     layout.line(&document.title, BuiltinFont::HelveticaBold, TITLE_PT);
     if let Some(subtitle) = &document.subtitle {
-        layout.line(subtitle, BuiltinFont::Helvetica, BODY_PT);
+        layout.line(subtitle, BuiltinFont::Helvetica, HEADING_PT);
     }
     // Whichever of the two blocks is taller decides where the body starts.
     layout.y_mm = layout.y_mm.min(title_top - logo_height);
     layout.gap(4.0);
 
     for section in &document.sections {
+        layout.gap(4.0);
         if let Some(heading) = &section.heading {
-            layout.gap(3.0);
             layout.keep_together(heading_height() + row_height(BODY_PT) * 2.0);
-            layout.line(heading, BuiltinFont::HelveticaBold, HEADING_PT);
-            layout.rule();
+            layout.heading(heading);
         }
         match &section.body {
             Body::Fields(pairs) => layout.fields(pairs),
             Body::Lines(lines) => layout.text_block(lines),
-            Body::Table { headers, rows } => layout.table(headers, rows),
+            Body::Table {
+                headers,
+                rows,
+                align,
+            } => layout.table(headers, rows, align),
+            Body::Columns(blocks) => layout.columns(blocks),
+            Body::Totals(pairs) => layout.totals(pairs),
         }
     }
 
@@ -370,9 +450,19 @@ fn row_height(size_pt: f32) -> f32 {
     size_pt * MM_PER_PT * 1.45
 }
 
+/// A heading with its rule: the text, then what [`Layout::rule`] advances.
 fn heading_height() -> f32 {
-    row_height(HEADING_PT) + 2.0
+    row_height(HEADING_PT) + RULE_ABOVE_MM + RULE_BELOW_MM
 }
+
+/// Where a rule sits relative to the text either side of it (PMS-1004). The
+/// text cursor is a BASELINE, so the rule needs only descender clearance
+/// above it and a full ascent plus breathing room below, where the next
+/// baseline lands. Before this the rule was set a full row below the
+/// heading and the next baseline a hair below the rule, so every heading
+/// floated above its rule and every body sat on it.
+const RULE_ABOVE_MM: f32 = 2.0;
+const RULE_BELOW_MM: f32 = 4.5;
 
 /// A pen walking down a page, spilling onto the next when it runs out.
 struct Layout {
@@ -454,10 +544,27 @@ impl Layout {
         self.advance(row_height(size_pt));
     }
 
+    /// A section heading with its rule beneath.
+    fn heading(&mut self, text: &str) {
+        self.text_at(MARGIN_MM, text, BuiltinFont::HelveticaBold, HEADING_PT);
+        self.rule();
+    }
+
     /// A hairline the width of the content area, used under a heading and under
     /// a table's header row.
     fn rule(&mut self) {
-        self.advance(1.5);
+        self.rule_between(MARGIN_MM, PAGE_WIDTH_MM - MARGIN_MM);
+    }
+
+    /// A hairline from `x0` to `x1`, spaced for text above and below it.
+    fn rule_between(&mut self, x0: f32, x1: f32) {
+        self.advance(RULE_ABOVE_MM);
+        self.hairline(x0, x1);
+        self.advance(RULE_BELOW_MM);
+    }
+
+    /// The line itself at the current cursor, with no spacing of its own.
+    fn hairline(&mut self, x0: f32, x1: f32) {
         let y = Mm(self.y_mm).into();
         self.ops.extend([
             Op::SetOutlineThickness { pt: Pt(0.4) },
@@ -474,14 +581,14 @@ impl Layout {
                     points: vec![
                         LinePoint {
                             p: Point {
-                                x: Mm(MARGIN_MM).into(),
+                                x: Mm(x0).into(),
                                 y,
                             },
                             bezier: false,
                         },
                         LinePoint {
                             p: Point {
-                                x: Mm(PAGE_WIDTH_MM - MARGIN_MM).into(),
+                                x: Mm(x1).into(),
                                 y,
                             },
                             bezier: false,
@@ -491,7 +598,67 @@ impl Layout {
                 },
             },
         ]);
-        self.advance(2.5);
+    }
+
+    /// PMS-1004: headed line blocks side by side.
+    ///
+    /// Kept together as one unit: an address block is a handful of lines, and
+    /// a From on one page with its Bill to overleaf is not side by side.
+    fn columns(&mut self, blocks: &[(String, Vec<String>)]) {
+        if blocks.is_empty() {
+            return;
+        }
+        let count = blocks.len() as f32;
+        let width = (self.content_width() - COLUMN_GUTTER_MM * (count - 1.0)) / count;
+        let tallest = blocks.iter().map(|(_, l)| l.len()).max().unwrap_or(0);
+        let needed = heading_height() + row_height(BODY_PT) * tallest as f32;
+        self.keep_together(needed);
+        let top = self.y_mm;
+        let mut lowest = top;
+        for (i, (heading, lines)) in blocks.iter().enumerate() {
+            let x = MARGIN_MM + i as f32 * (width + COLUMN_GUTTER_MM);
+            self.y_mm = top;
+            self.text_at(
+                x,
+                &truncate_to(heading, width),
+                BuiltinFont::HelveticaBold,
+                HEADING_PT,
+            );
+            self.rule_between(x, x + width);
+            for line in lines {
+                self.text_at(
+                    x,
+                    &truncate_to(line, width),
+                    BuiltinFont::Helvetica,
+                    BODY_PT,
+                );
+                self.y_mm -= row_height(BODY_PT);
+            }
+            lowest = lowest.min(self.y_mm);
+        }
+        self.y_mm = lowest;
+    }
+
+    /// PMS-1004: a totals block against the right margin.
+    fn totals(&mut self, pairs: &[(String, String)]) {
+        let x0 = PAGE_WIDTH_MM - MARGIN_MM - TOTALS_WIDTH_MM;
+        let right = PAGE_WIDTH_MM - MARGIN_MM;
+        self.keep_together(row_height(BODY_PT) * (pairs.len() as f32 + 1.0) + RULE_BELOW_MM);
+        for (i, (label, value)) in pairs.iter().enumerate() {
+            if i + 1 == pairs.len() && pairs.len() > 1 {
+                // The rule that says "this one is the answer".
+                self.rule_between(x0, right);
+            }
+            self.text_at(x0, label, BuiltinFont::Helvetica, BODY_PT);
+            let value = truncate_to(value, TOTALS_WIDTH_MM - LABEL_WIDTH_MM / 2.0);
+            self.text_at(
+                right_aligned_x(right, &value),
+                &value,
+                BuiltinFont::HelveticaBold,
+                BODY_PT,
+            );
+            self.advance(row_height(BODY_PT));
+        }
     }
 
     fn fields(&mut self, pairs: &[(String, String)]) {
@@ -517,36 +684,46 @@ impl Layout {
         }
     }
 
-    fn table(&mut self, headers: &[String], rows: &[Vec<String>]) {
+    fn table(&mut self, headers: &[String], rows: &[Vec<String>], align: &[Align]) {
         if headers.is_empty() {
             return;
         }
         let widths = column_widths(headers, rows, self.content_width());
-        self.header_row(headers, &widths);
+        self.header_row(headers, &widths, align);
         for row in rows {
             // A row that would land in the bottom margin starts the next page,
             // and the header comes with it: a table whose columns are unlabelled
             // from page two is not a table any more.
             if self.y_mm - row_height(BODY_PT) < MARGIN_MM {
                 self.page_break();
-                self.header_row(headers, &widths);
+                self.header_row(headers, &widths, align);
             }
-            self.cells(row, &widths, BuiltinFont::Helvetica);
+            self.cells(row, &widths, align, BuiltinFont::Helvetica);
             self.advance(row_height(BODY_PT));
         }
+        // PMS-1004: a closing rule, so the table has a bottom as well as a
+        // top and what follows it (a totals block, the next section) reads as
+        // separate from the last row.
+        self.advance(RULE_ABOVE_MM - row_height(BODY_PT) * 0.4);
+        self.hairline(MARGIN_MM, PAGE_WIDTH_MM - MARGIN_MM);
+        self.advance(RULE_BELOW_MM);
     }
 
-    fn header_row(&mut self, headers: &[String], widths: &[f32]) {
-        self.cells(headers, widths, BuiltinFont::HelveticaBold);
-        self.advance(row_height(BODY_PT));
+    fn header_row(&mut self, headers: &[String], widths: &[f32], align: &[Align]) {
+        self.cells(headers, widths, align, BuiltinFont::HelveticaBold);
         self.rule();
     }
 
-    fn cells(&mut self, cells: &[String], widths: &[f32], font: BuiltinFont) {
+    fn cells(&mut self, cells: &[String], widths: &[f32], align: &[Align], font: BuiltinFont) {
         let mut x = MARGIN_MM;
         for (i, width) in widths.iter().enumerate() {
             if let Some(cell) = cells.get(i) {
-                self.text_at(x, &truncate_to(cell, *width), font, BODY_PT);
+                let text = truncate_to(cell, *width);
+                let at = match align.get(i).copied().unwrap_or_default() {
+                    Align::Left => x,
+                    Align::Right => right_aligned_x(x + width - CELL_PAD_MM, &text),
+                };
+                self.text_at(at, &text, font, BODY_PT);
             }
             x += width;
         }
@@ -569,6 +746,17 @@ fn text_width_mm(chars: usize) -> f32 {
     chars as f32 * AVERAGE_CHAR_EM * BODY_PT * MM_PER_PT
 }
 
+/// Where text has to START so that it ENDS at `right_mm` (PMS-1004).
+///
+/// Estimated from [`AVERAGE_CHAR_EM`] like every other width here, which is
+/// set above Helvetica's true average, so the estimate errs towards ending
+/// short of the edge rather than past it. Digits are 0.556 em in Helvetica,
+/// close enough to the 0.52 that a column of amounts lines up to within a
+/// character.
+fn right_aligned_x(right_mm: f32, text: &str) -> f32 {
+    (right_mm - text_width_mm(text.chars().count())).max(MARGIN_MM)
+}
+
 /// Share the content width between columns in proportion to what they hold.
 ///
 /// A column is never narrower than [`MIN_COLUMN_MM`], so one long free-text
@@ -589,8 +777,35 @@ fn column_widths(headers: &[String], rows: &[Vec<String>], available: f32) -> Ve
     if total <= available {
         return wanted;
     }
-    // Scale down, then lift anything under the floor and take the difference
-    // back off the columns that can afford it.
+    // PMS-1004: a narrow column keeps its width and only the wide ones give
+    // way. Scaling every column by the same factor let one long description
+    // squeeze "150.00 USD" down to "150.0..." on an invoice, which is the one
+    // cell a customer reads. A column is narrow when everything in it fits
+    // in NARROW_COLUMN_MM; the rest share what is left, in proportion.
+    let narrow = |w: &f32| *w <= NARROW_COLUMN_MM;
+    let fixed: f32 = wanted
+        .iter()
+        .filter(|w| narrow(w))
+        .map(|w| w.max(MIN_COLUMN_MM))
+        .sum();
+    let flexible: f32 = wanted.iter().filter(|w| !narrow(w)).sum();
+    let flexible_count = wanted.iter().filter(|w| !narrow(w)).count() as f32;
+    let room = available - fixed;
+    if flexible_count > 0.0 && room >= MIN_COLUMN_MM * flexible_count {
+        return wanted
+            .iter()
+            .map(|w| {
+                if narrow(w) {
+                    w.max(MIN_COLUMN_MM)
+                } else {
+                    (w * room / flexible).max(MIN_COLUMN_MM)
+                }
+            })
+            .collect();
+    }
+    // Every column is wide, or the narrow ones alone overflow the page: scale
+    // down, then lift anything under the floor and take the difference back
+    // off the columns that can afford it.
     let scale = available / total;
     let mut widths: Vec<f32> = wanted
         .iter()
@@ -612,7 +827,7 @@ fn column_widths(headers: &[String], rows: &[Vec<String>], available: f32) -> Ve
 /// Cut a cell to what its column can show, with an ellipsis so a reader can
 /// see that something was cut.
 fn truncate_to(text: &str, width_mm: f32) -> String {
-    let usable = (width_mm - 2.0).max(0.0);
+    let usable = (width_mm - CELL_PAD_MM).max(0.0);
     let fits = (usable / (AVERAGE_CHAR_EM * BODY_PT * MM_PER_PT)).floor() as usize;
     let len = text.chars().count();
     if len <= fits {
@@ -834,6 +1049,110 @@ mod tests {
         assert!(
             widths.iter().sum::<f32>() <= available + 0.01,
             "the row is wider than the page: {widths:?}"
+        );
+    }
+
+    /// PMS-1004: the invoice shapes. Side-by-side blocks, a right-aligned
+    /// amount column and a totals block all render, on one page, and two
+    /// renders still agree: none of it may introduce randomness, because
+    /// PMS-911's byte-identical rule rests on `rendering_is_deterministic`.
+    #[test]
+    fn the_invoice_shapes_render_on_one_page_and_deterministically() {
+        let doc = Document::new("Invoice")
+            .subtitle("INV-000001")
+            .columns(vec![
+                (
+                    "From".to_string(),
+                    vec!["Acme IT".to_string(), "12 Example St".to_string()],
+                ),
+                (
+                    "Bill to".to_string(),
+                    vec![
+                        "NiceGuy IT".to_string(),
+                        "1 Customer Way".to_string(),
+                        "Attn: Bill Payer".to_string(),
+                    ],
+                ),
+            ])
+            .table_aligned(
+                "Items",
+                vec!["Description".into(), "Qty".into(), "Amount".into()],
+                vec![vec![
+                    "2026-08-27 Remote support: T000042 Printer offline".into(),
+                    "2".into(),
+                    "300.00 USD".into(),
+                ]],
+                vec![Align::Left, Align::Right, Align::Right],
+            )
+            .totals(vec![
+                ("Subtotal".into(), "300.00 USD".into()),
+                ("Tax".into(), "0.00 USD".into()),
+                ("Balance due".into(), "300.00 USD".into()),
+            ]);
+        let first = render(&doc).expect("render");
+        let second = render(&doc).expect("render");
+        assert!(first.starts_with(b"%PDF-"));
+        assert_eq!(first, second, "the new shapes are deterministic");
+        assert_eq!(page_count(&first), 1);
+        assert!(
+            first.len() > render(&Document::new("Invoice")).expect("render").len(),
+            "and they drew something"
+        );
+    }
+
+    /// Right-aligned text ends where it was told to, within the width
+    /// estimate, and never runs off the left margin.
+    #[test]
+    fn right_aligned_text_ends_at_the_edge_it_was_given() {
+        let right = 120.0;
+        let text = "300.00 USD";
+        let x = right_aligned_x(right, text);
+        assert!(x < right);
+        assert!(
+            (x + text_width_mm(text.chars().count()) - right).abs() < 0.01,
+            "start plus width is the edge: {x}"
+        );
+        assert_eq!(
+            right_aligned_x(20.0, &"9".repeat(500)),
+            MARGIN_MM,
+            "an impossible fit is pinned to the margin rather than off the page"
+        );
+    }
+
+    /// PMS-1004: the money columns of an invoice keep their width; only the
+    /// description gives way. Before this every column scaled by the same
+    /// factor and "150.00 USD" came out as "150.0...".
+    #[test]
+    fn a_long_description_does_not_cut_the_amount_beside_it() {
+        let headers = vec![
+            "Description".to_string(),
+            "Qty".to_string(),
+            "Unit price".to_string(),
+            "Amount".to_string(),
+        ];
+        let rows = vec![vec![
+            "2026-08-24 Remote support: T000042 Printer offline - Rebooted the print spooler"
+                .to_string(),
+            "2".to_string(),
+            "150.00 USD".to_string(),
+            "1300.00 USD".to_string(),
+        ]];
+        let available = PAGE_WIDTH_MM - 2.0 * MARGIN_MM;
+        let widths = column_widths(&headers, &rows, available);
+        for (i, cell) in rows[0].iter().enumerate().skip(1) {
+            assert_eq!(
+                truncate_to(cell, widths[i]),
+                *cell,
+                "column {i} was cut: {widths:?}"
+            );
+        }
+        assert!(
+            widths.iter().sum::<f32>() <= available + 0.01,
+            "the row is wider than the page: {widths:?}"
+        );
+        assert!(
+            widths[0] > widths[3],
+            "the description still gets the most room: {widths:?}"
         );
     }
 

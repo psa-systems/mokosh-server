@@ -781,22 +781,30 @@ impl BillingService {
         //    serialises against a concurrent generate.
         let entries: Vec<TimeEntryBillingRow> = sqlx::query_as(
             r#"
-            SELECT id, duration_minutes, hourly_rate, total_amount, ticket_id
-            FROM time_entries
-            WHERE tenant_id = $1
-              AND company_id = $2
+            SELECT te.id, te.duration_minutes, te.hourly_rate, te.total_amount,
+                   te.ticket_id, te.date, te.notes,
+                   -- PMS-1004: what the line says. The work type is NOT NULL
+                   -- on the entry, so the join cannot drop a row; the ticket
+                   -- is optional and its two columns are NULL without one.
+                   wt.name AS work_type_name,
+                   t.ticket_number, t.title AS ticket_title
+            FROM time_entries te
+            JOIN work_types wt ON wt.id = te.work_type_id
+            LEFT JOIN tickets t ON t.id = te.ticket_id
+            WHERE te.tenant_id = $1
+              AND te.company_id = $2
               -- PMS-942: employee time never reaches a client invoice, and it
               -- is excluded by what it IS rather than by which company id the
               -- caller happened to pass. The tenant's own internal company
               -- (PMS-413) is a real `companies` row, so before this its
               -- overhead time was invoiceable by naming it.
-              AND entry_kind = 'client'
-              AND is_billable = TRUE
-              AND invoice_id IS NULL
-              AND billing_status = 'ready_to_bill'
-              AND ($3::uuid[] IS NULL OR id = ANY($3))
-            ORDER BY date, created_at
-            FOR UPDATE
+              AND te.entry_kind = 'client'
+              AND te.is_billable = TRUE
+              AND te.invoice_id IS NULL
+              AND te.billing_status = 'ready_to_bill'
+              AND ($3::uuid[] IS NULL OR te.id = ANY($3))
+            ORDER BY te.date, te.created_at
+            FOR UPDATE OF te
             "#,
         )
         .bind(tenant_id)
@@ -861,7 +869,21 @@ impl BillingService {
             let unit_price = entry.hourly_rate.unwrap_or(Decimal::ZERO);
             let total = entry.total_amount.unwrap_or(quantity * unit_price);
             subtotal += total;
-            let description = format!("Time entry {}", entry.id);
+            // PMS-1004: the line describes the work, not the row.
+            let ticket =
+                entry
+                    .ticket_number
+                    .as_deref()
+                    .map(|number| super::descriptions::TicketRef {
+                        number,
+                        title: entry.ticket_title.as_deref().unwrap_or(""),
+                    });
+            let description = super::descriptions::time_entry_line(
+                entry.date,
+                &entry.work_type_name,
+                ticket,
+                entry.notes.as_deref(),
+            );
             lines.push((
                 entry.id,
                 description,
@@ -2859,9 +2881,16 @@ impl BillingService {
         // changing.
         if let Some(issuer) = &issuer_snapshot {
             let document = Self::load_invoice(&mut tx, tenant_id, invoice_id).await?;
+            let bill_to = Self::bill_to_in_tx(
+                &mut tx,
+                tenant_id,
+                document.company_id,
+                document.billing_contact_id,
+            )
+            .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant_id.get(), issuer).await;
             let bytes = crate::pdf::render(&crate::modules::billing::documents::invoice(
-                &document, issuer, logo,
+                &document, issuer, &bill_to, logo,
             ))?;
             crate::modules::billing::documents::store_issued(
                 &mut tx,
@@ -3048,6 +3077,113 @@ impl BillingService {
         let branding: mokosh_types::tenants::TenantBranding =
             serde_json::from_value(branding).unwrap_or_default();
         Ok(crate::modules::billing::issuer::resolve(&name, &branding))
+    }
+
+    /// PMS-1004: who a document is addressed to, resolved beside the issuer.
+    ///
+    /// The company's billing address when any of its billing columns is set,
+    /// its postal address otherwise, and the named contact's name and email
+    /// when the document names one. A company that cannot be read resolves to
+    /// "Customer" rather than failing the render, the way `company_name`
+    /// already degrades to `None`.
+    pub async fn bill_to(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Option<Uuid>,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::bill_to_in_tx(&mut tx, tenant_id, company_id, contact_id).await
+    }
+
+    /// The same read, in a transaction the caller owns, for the documents
+    /// rendered inside their issuing transaction (PMS-959).
+    async fn bill_to_in_tx(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Option<Uuid>,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        use crate::modules::billing::documents::{postal_lines, BillTo};
+        let company: Option<CompanyAddressRow> = sqlx::query_as(
+            r#"
+            SELECT name,
+                   address_line1, address_line2, city, state, postal_code, country,
+                   billing_address_line1, billing_address_line2, billing_city,
+                   billing_state, billing_postal_code, billing_country
+            FROM companies
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(company) = company else {
+            return Ok(BillTo {
+                name: "Customer".to_string(),
+                ..Default::default()
+            });
+        };
+        let has_billing_address = [
+            &company.billing_address_line1,
+            &company.billing_address_line2,
+            &company.billing_city,
+            &company.billing_state,
+            &company.billing_postal_code,
+            &company.billing_country,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|v| !v.trim().is_empty());
+        let address_lines = if has_billing_address {
+            postal_lines(
+                company.billing_address_line1.as_deref(),
+                company.billing_address_line2.as_deref(),
+                company.billing_city.as_deref(),
+                company.billing_state.as_deref(),
+                company.billing_postal_code.as_deref(),
+                company.billing_country.as_deref(),
+            )
+        } else {
+            postal_lines(
+                company.address_line1.as_deref(),
+                company.address_line2.as_deref(),
+                company.city.as_deref(),
+                company.state.as_deref(),
+                company.postal_code.as_deref(),
+                company.country.as_deref(),
+            )
+        };
+        let contact: Option<(String, String, Option<String>)> = match contact_id {
+            Some(id) => {
+                sqlx::query_as(
+                    "SELECT first_name, last_name, email FROM contacts WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?
+            }
+            None => None,
+        };
+        let (contact_name, contact_email) = match contact {
+            Some((first, last, email)) => (
+                Some(
+                    format!("{} {}", first.trim(), last.trim())
+                        .trim()
+                        .to_string(),
+                ),
+                email,
+            ),
+            None => (None, None),
+        };
+        Ok(BillTo {
+            name: company.name,
+            address_lines,
+            contact_name,
+            contact_email,
+        })
     }
 
     /// PMS-911: the tenant's identity as it stands now, for a document that is
@@ -3603,9 +3739,10 @@ impl BillingService {
         // snapshot.
         let note = Self::load_credit_note(&mut tx, tenant_id, credit_note_id).await?;
         let issuer = Self::tenant_issuer_in_tx(&mut tx, tenant_id).await?;
+        let credit_to = Self::bill_to_in_tx(&mut tx, tenant_id, note.company_id, None).await?;
         let logo = crate::modules::billing::issuer::live_logo_bytes(tenant_id.get(), &issuer).await;
         let bytes = crate::pdf::render(&crate::modules::billing::documents::credit_note(
-            &note, &issuer, logo,
+            &note, &issuer, &credit_to, logo,
         ))?;
         crate::modules::billing::documents::store_issued(
             &mut tx,
@@ -4542,6 +4679,30 @@ struct TimeEntryBillingRow {
     hourly_rate: Option<Decimal>,
     total_amount: Option<Decimal>,
     ticket_id: Option<Uuid>,
+    /// PMS-1004: what the generated line says.
+    date: chrono::NaiveDate,
+    notes: Option<String>,
+    work_type_name: String,
+    ticket_number: Option<String>,
+    ticket_title: Option<String>,
+}
+
+/// PMS-1004: the columns a document's "Bill to" is composed from.
+#[derive(sqlx::FromRow)]
+struct CompanyAddressRow {
+    name: String,
+    address_line1: Option<String>,
+    address_line2: Option<String>,
+    city: Option<String>,
+    state: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
+    billing_address_line1: Option<String>,
+    billing_address_line2: Option<String>,
+    billing_city: Option<String>,
+    billing_state: Option<String>,
+    billing_postal_code: Option<String>,
+    billing_country: Option<String>,
 }
 
 /// PMS-315: mileage entry projection for the invoice builder.
