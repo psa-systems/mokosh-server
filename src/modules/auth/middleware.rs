@@ -1169,7 +1169,8 @@ async fn place_bunyip_caller(
         Some(principal) => Some(principal.placement.clone()),
         None => auth_service.find_user_placement(sub).await.ok().flatten(),
     };
-    let current = placement.as_ref().map(|(t, _)| *t);
+    // `current` is recomputed below after the TEMPORARY MAPPS-458
+    // email-fallback may have widened `placement`; do not shadow here.
 
     // An invite to address X is consumed only by a Bunyip user with verified X.
     let invite = match (invitations, email.as_deref()) {
@@ -1196,6 +1197,49 @@ async fn place_bunyip_caller(
     // pre-existing invitation - matches the `bootstrap_admin_*`
     // regression pins in `tests/bunyip_login.rs`.
     let is_platform_admin = claims.bunyip_role.as_deref() == Some("admin");
+
+    // TEMPORARY (mokosh-contact-login staging bypass): the c-01 dev DB
+    // has drifted from bunyip's `sub` for every tenant admin (a bunyip
+    // instance reset without a mokosh-side rekey), so
+    // `find_user_placement(sub)` returns None even for accounts that
+    // have valid `users` rows under their email. Every non-platform-
+    // admin user 401s at MAPPS-458 as a result.
+    //
+    // Before rejecting, try to resolve placement by verified email. If
+    // a users row exists there, accept the request and REBIND `sub` to
+    // that row's id so the downstream `get_user_by_id(target, sub)`
+    // (line ~1290), `rehome_user_between_tenants`, and every other
+    // helper that keys on `sub` address the real mokosh users row.
+    // `users.id` is not rewritten - the 55 FKs to `users(id)` are not
+    // ON UPDATE CASCADE and rewriting the id would leave every one of
+    // them dangling. The row's id stays what it is; we just stop using
+    // the mismatched bunyip sub for this request.
+    //
+    // Remove this block on merge back to main - the production model
+    // is "invitations, not silent JIT" (MAPPS-458 / PMS-728 slice 2).
+    let (placement, sub) = match (placement, email.as_deref(), email_verified) {
+        (Some(p), _, _) => (Some(p), sub),
+        (None, Some(em), true) => match auth_service.find_user_placement_by_email(em).await {
+            Ok(Some((users_id, tenant, role))) => {
+                tracing::warn!(
+                    bunyip_sub = %sub,
+                    users_id = %users_id,
+                    email = %em,
+                    tenant_id = %tenant,
+                    "TEMPORARY MAPPS-458 bypass: bunyip sub has no local placement, but a users row exists under this email; accepting and rebinding sub to that users row's id for this request"
+                );
+                (Some((tenant, role)), users_id)
+            }
+            Ok(None) => (None, sub),
+            Err(e) => {
+                tracing::warn!(error = %e, sub = %sub, "find_user_placement_by_email failed; falling through to MAPPS-458");
+                (None, sub)
+            }
+        },
+        _ => (None, sub),
+    };
+    let current = placement.as_ref().map(|(t, _)| *t);
+
     if placement.is_none() && invite.is_none() && !is_platform_admin {
         tracing::info!(
             sub = %sub,

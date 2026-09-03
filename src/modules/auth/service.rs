@@ -2594,6 +2594,41 @@ impl AuthService {
         .await?)
     }
 
+    /// TEMPORARY (mokosh-contact-login staging): resolve a placement by
+    /// verified email instead of by bunyip sub. Used by the middleware's
+    /// MAPPS-458 pre-check when the sub lookup returned None. Returns
+    /// `(users.id, tenant_id, role)` for the oldest active users row
+    /// carrying a case-insensitive match on `email`; None when no row
+    /// matches. Case-insensitive by-email because bunyip normalises to
+    /// lowercase and mokosh's `email` column preserves the operator's
+    /// original casing.
+    ///
+    /// Cross-tenant read on the migrator pool for the same reason as
+    /// [`Self::find_user_placement`]: this runs pre-session on the
+    /// bunyip placement path where there is no `app.current_tenant`
+    /// GUC to set. `DISTINCT ON (lower(email)) ... ORDER BY created_at
+    /// ASC` keeps the answer stable when the same email is on file in
+    /// two tenants (it picks the older placement, matching the
+    /// invitations resolver's tie-break).
+    ///
+    /// SAFETY (PMS-285): identical to `find_user_placement` above; same
+    /// path, same pool, same tenant scope.
+    pub async fn find_user_placement_by_email(
+        &self,
+        email: &str,
+    ) -> AppResult<Option<(Uuid, Uuid, String)>> {
+        Ok(sqlx::query_as::<_, (Uuid, Uuid, String)>(
+            "SELECT DISTINCT ON (lower(email)) id, tenant_id, role \
+             FROM users \
+             WHERE lower(email) = lower($1) \
+               AND deleted_at IS NULL \
+             ORDER BY lower(email), created_at ASC",
+        )
+        .bind(email)
+        .fetch_optional(self.db.migrator_pool())
+        .await?)
+    }
+
     /// PMS-777: everything the bunyip RS path needs to know about the caller,
     /// in ONE statement on ONE pool checkout.
     ///
