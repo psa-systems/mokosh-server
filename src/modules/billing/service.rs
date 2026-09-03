@@ -488,6 +488,13 @@ impl BillingService {
                 "(invoice_number ILIKE ${count_idx} OR po_number ILIKE ${count_idx})"
             ));
         }
+        if filter.exclude_draft {
+            // MAPPS-670 (mokosh-invoices P1e): no placeholder; the value
+            // is a fixed string set by the route only when the caller is
+            // a Contact.
+            data_conds.push("status <> 'draft'".to_string());
+            count_conds.push("status <> 'draft'".to_string());
+        }
 
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");

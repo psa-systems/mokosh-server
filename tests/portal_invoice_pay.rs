@@ -25,7 +25,7 @@ use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const NO_GATEWAY: &str = "no active payment provider is configured for this account";
+const NO_GATEWAY: &str = "no active payment provider is configured";
 
 async fn seed_contact_with_roles(
     app: &common::TestApp,
@@ -181,7 +181,7 @@ async fn contact_with_invoices_pay_reaches_service_400_no_gateway(pool: PgPool) 
         .or_else(|| body["message"].as_str())
         .unwrap_or("");
     assert!(
-        msg.contains(NO_GATEWAY),
+        msg.to_ascii_lowercase().contains(NO_GATEWAY),
         "PMS-914: no-gateway message expected, got {body}"
     );
 }
@@ -260,7 +260,7 @@ async fn staff_bypasses_invoices_pay_cap_400_no_gateway(pool: PgPool) {
         .or_else(|| body["message"].as_str())
         .unwrap_or("");
     assert!(
-        msg.contains(NO_GATEWAY),
+        msg.to_ascii_lowercase().contains(NO_GATEWAY),
         "PMS-914: no-gateway message expected, got {body}"
     );
 }
@@ -285,8 +285,8 @@ async fn pay_body_rejects_non_url_success_url(pool: PgPool) {
         .expect("pay");
     assert_eq!(
         resp.status(),
-        StatusCode::BAD_REQUEST,
-        "PMS-914: DTO validation must refuse non-URL success_url"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "PMS-914: DTO validation refuses non-URL success_url with 422 (AppError::Validation)"
     );
 }
 

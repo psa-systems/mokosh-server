@@ -177,6 +177,15 @@ pub struct InvoiceFilter {
     pub contract_id: Option<Uuid>,
     #[validate(length(max = 200))]
     pub q: Option<String>,
+    /// MAPPS-670 (mokosh-invoices P1e): server-side scope flag flipped
+    /// on by the route when the caller is a Contact. The client cannot
+    /// set it; `serde(skip_deserializing)` blocks a request-side
+    /// override. Draft invoices are internal artefacts the MSP is
+    /// still composing, so the portal must never see one - filtering
+    /// server-side keeps the count meta accurate (a client-side skip
+    /// would leave `total` inflated and pagination misleading).
+    #[serde(skip_deserializing, default)]
+    pub exclude_draft: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]

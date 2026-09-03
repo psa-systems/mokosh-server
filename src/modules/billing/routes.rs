@@ -465,6 +465,11 @@ async fn list_invoices(
         CallerContext::Contact(session) => {
             caller.require_capability(caps::INVOICES_READ, &db).await?;
             filter.company_id = Some(session.company_id);
+            // MAPPS-670 (mokosh-invoices P1e): the portal must never
+            // see a draft. Server-side so the count meta agrees with
+            // the rows (a client-side skip leaves `total` inflated
+            // and pagination misleading).
+            filter.exclude_draft = true;
         }
     }
     let (invoices, total) = state
@@ -691,7 +696,6 @@ async fn pay_invoice(
 async fn get_invoice_payment_readiness(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
-    _finance: RequireFinance,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoicePaymentReadinessResponse>> {

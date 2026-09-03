@@ -295,6 +295,78 @@ async fn readiness_cross_company_404(pool: PgPool) {
     );
 }
 
+/// MAPPS-670 (mokosh-invoices P1e): the portal must never see a draft
+/// invoice, and the exclusion runs server-side so the paginated `total`
+/// agrees with the returned rows.
+#[sqlx::test]
+async fn list_invoices_contact_plane_hides_drafts(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "list-hides-draft", &["Billing Contact"]).await;
+    let sent_id = seed_sent_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+    let _draft_id = seed_draft_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    let rows = body["data"].as_array().expect("data array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "MAPPS-670: contact list must contain only the sent invoice, got {body}"
+    );
+    assert_eq!(
+        rows[0]["id"].as_str(),
+        Some(sent_id.to_string().as_str()),
+        "MAPPS-670: the surviving row is the sent invoice"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r["status"].as_str() != Some("draft")),
+        "MAPPS-670: no draft may leak into the contact list"
+    );
+    assert_eq!(
+        body["meta"]["total"].as_u64(),
+        Some(1),
+        "MAPPS-670: `total` must count only the visible rows, not the hidden drafts"
+    );
+}
+
+/// MAPPS-670: `exclude_draft` is not a client-tunable filter. A contact
+/// posting `?exclude_draft=false` in the query string must NOT re-expose
+/// drafts (the field is `serde(skip_deserializing)` and the route sets
+/// it unconditionally for the contact plane).
+#[sqlx::test]
+async fn list_invoices_contact_plane_ignores_client_exclude_draft_override(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "list-no-override", &["Billing Contact"]).await;
+    let _sent = seed_sent_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+    let _draft = seed_draft_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/invoices?exclude_draft=false"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    let rows = body["data"].as_array().expect("data array");
+    assert!(
+        rows.iter()
+            .all(|r| r["status"].as_str() != Some("draft")),
+        "MAPPS-670: exclude_draft override in the URL must NOT re-expose drafts to a contact"
+    );
+}
+
 #[sqlx::test]
 async fn readiness_no_invoices_read_cap_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
