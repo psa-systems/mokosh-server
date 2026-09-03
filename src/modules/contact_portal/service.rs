@@ -362,8 +362,25 @@ impl ContactAuthService {
     /// - expired / malformed / unknown -> `AppError::BadRequest`
     #[tracing::instrument(skip_all)]
     pub async fn setup_password(&self, token: &str, new_password: &str) -> AppResult<()> {
-        let (contact_id, secret) = parse_contact_bound_token(token)
-            .ok_or_else(|| AppError::BadRequest("Invalid or expired setup token".to_string()))?;
+        // Diagnostic-only: log which of the four failure modes fired
+        // (parse, no-candidates, no-hash-match, expired), so a "link
+        // says expired" bug report tells us which branch it hit
+        // without waiting on a DB shell. The response copy stays the
+        // enum-resistant "Invalid or expired setup token" for all
+        // rejections (nothing new leaks to the caller).
+        let token_len = token.len();
+        let (contact_id, secret) = match parse_contact_bound_token(token) {
+            Some(pair) => pair,
+            None => {
+                tracing::warn!(
+                    token_len = token_len,
+                    "setup_password rejected: token did not parse as `{{uuid}}.{{secret}}`"
+                );
+                return Err(AppError::BadRequest(
+                    "Invalid or expired setup token".to_string(),
+                ));
+            }
+        };
 
         let candidates =
             sqlx::query_as::<_, (Uuid, Uuid, String, Option<DateTime<Utc>>, DateTime<Utc>)>(
@@ -377,14 +394,27 @@ impl ContactAuthService {
             .bind(contact_id)
             .fetch_all(self.db.migrator_pool())
             .await?;
+        let candidate_count = candidates.len();
 
         let mut matched: Option<(Uuid, Uuid)> = None;
         for (token_id, tenant_id, token_hash, used_at, expires_at) in &candidates {
             if verify_password(secret, token_hash)? {
                 if used_at.is_some() {
+                    tracing::warn!(
+                        contact_id = %contact_id,
+                        token_id = %token_id,
+                        "setup_password rejected: token hash matched but row is already used"
+                    );
                     return Err(AppError::Gone("Setup token already used".to_string()));
                 }
                 if *expires_at <= Utc::now() {
+                    tracing::warn!(
+                        contact_id = %contact_id,
+                        token_id = %token_id,
+                        expires_at = %expires_at,
+                        now = %Utc::now(),
+                        "setup_password rejected: token hash matched but row is past expiry"
+                    );
                     return Err(AppError::BadRequest(
                         "Invalid or expired setup token".to_string(),
                     ));
@@ -394,6 +424,11 @@ impl ContactAuthService {
             }
         }
         let Some((token_id, tenant_id)) = matched else {
+            tracing::warn!(
+                contact_id = %contact_id,
+                candidate_count = candidate_count,
+                "setup_password rejected: no portal_setup_tokens row's hash verified against the presented secret"
+            );
             return Err(AppError::BadRequest(
                 "Invalid or expired setup token".to_string(),
             ));
