@@ -1266,13 +1266,30 @@ async fn place_bunyip_caller(
     };
     let current = placement.as_ref().map(|(t, _)| *t);
 
+    // TEMPORARY (mokosh-contact-login staging): the production MAPPS-458
+    // reject is disabled on this branch. The by-email fallback above
+    // handles the "existing tenant admin whose bunyip sub drifted"
+    // case; brand-new bunyip identities that match neither a users row
+    // nor a pending invitation fall through to the JIT personal-tenant
+    // path below, restoring the pre-PMS-728-slice-2 behaviour where a
+    // bunyip identity provisions its own tenant on first sight. This
+    // fits the "every bunyip user is a platform admin of their own
+    // instance" model this staging branch is validating.
+    //
+    // On merge back to main, restore the MAPPS-458 reject verbatim:
+    //
+    //     if placement.is_none() && invite.is_none() && !is_platform_admin {
+    //         tracing::info!(sub = %sub, email = email.as_deref().unwrap_or("<absent>"),
+    //             "bunyip-authenticated identity has no local placement and no pending invitation; rejecting per MAPPS-458");
+    //         return (None, None);
+    //     }
     if placement.is_none() && invite.is_none() && !is_platform_admin {
-        tracing::info!(
+        tracing::warn!(
             sub = %sub,
             email = email.as_deref().unwrap_or("<absent>"),
-            "bunyip-authenticated identity has no local placement and no pending invitation; rejecting per MAPPS-458"
+            "TEMPORARY MAPPS-458 bypass: no placement, no invite, not platform admin - falling through to JIT personal-tenant provisioning"
         );
-        return (None, None);
+        // Deliberately NO `return` here on this branch.
     }
 
     // PMS-245: a non-admin user still parked in the shared default tenant (dumped
