@@ -2459,7 +2459,7 @@ impl TicketService {
         .await?;
         tx.commit().await?;
         row.map(TicketNote::from)
-            .ok_or(AppError::NotFound("TicketNote".to_string()))
+            .ok_or(AppError::NotFound("Ticket note".to_string()))
     }
 
     /// Portal contact reopens one of their own company's tickets. Only

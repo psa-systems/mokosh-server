@@ -16,10 +16,10 @@ Before merging the MAPPS-649 PR:
 
 2. **Retire the `PORTAL_HOST_SUFFIX` env** on every deploy.
    - mokosh-server: remove the `PORTAL_HOST_SUFFIX=...` line from your `.env`. The field is gone from the code and cargo will not warn, but it is confusing to leave stale env values around.
-   - mokosh-clients OCI image: remove `MOKOSH_PORTAL_HOST_SUFFIX` from the container env; set `MOKOSH_PORTAL_HOST` to the bare host (e.g. `portal.psa.systems`). The entrypoint emits `window.__MOKOSH_CONFIG__.portal_host` from that value.
+   - mokosh-apps OCI image: remove `MOKOSH_PORTAL_HOST_SUFFIX` from the container env; set `MOKOSH_PORTAL_HOST` to the bare host (e.g. `portal.psa.systems`). The entrypoint emits `window.__MOKOSH_CONFIG__.portal_host` from that value.
 
 3. **Update Traefik / DNS**.
-   - Add a route for `portal.<apex>` -> mokosh-clients (same container that already serves `msp.<apex>`; the SPA distinguishes staff vs portal routes by URL prefix).
+   - Add a route for `portal.<apex>` -> mokosh-apps (same container that already serves `msp.<apex>`; the SPA distinguishes staff vs portal routes by URL prefix).
    - Remove the `*.client.<apex>` route and its wildcard TLS certificate. Nothing routes there after the PR merges.
    - Remove the wildcard DNS record (`*.client.<apex>`).
 
@@ -27,7 +27,7 @@ Before merging the MAPPS-649 PR:
 
 At merge time (this is the hard cut):
 
-5. Merge the PR. Deploy mokosh-server + mokosh-clients simultaneously.
+5. Merge the PR. Deploy mokosh-server + mokosh-apps simultaneously.
 6. Verify `curl -I https://portal.<apex>/portal/login` returns 200. Verify `curl -I https://someslug.client.<apex>/portal/login` returns NXDOMAIN or a Traefik 404 (whichever your DNS/proxy setup produces).
 7. Watch mokosh-server logs for `MAPPS-649: no frontend base URL configured; cannot build portal setup URL`. That warning fires only if `TenantService::with_dispatcher` was not called with a `client_origin` (which points at the SPA host). It should not appear.
 

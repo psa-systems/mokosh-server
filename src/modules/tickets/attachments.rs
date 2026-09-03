@@ -44,7 +44,6 @@
 //! holding a UUID. Inline uploads are image-only (`utils::inline_image`, which
 //! refuses SVG) and capped far lower.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -65,7 +64,7 @@ use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
 // mokosh-contact-login: the /portal/* customer-portal surface retired on this
 // branch, so `crate::modules::portal::*` is gone with it. Portal-plane
 // attachment uploads are folded into the contact plane in a later prompt.
-use crate::storage::{FileLedger, FileRecord, LocalStore, ObjectKey, ObjectStore};
+use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectStore};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::inline_image::check_inline_image_mime;
 
@@ -188,7 +187,7 @@ pub struct AttachmentService {
     db: Database,
     config: AttachmentConfig,
     /// PMS-910: where the bytes go. This module no longer knows.
-    pub(crate) store: LocalStore,
+    pub(crate) store: Arc<dyn ObjectStore>,
     /// PMS-957: one row per stored file, so the tenant rollup is a fact.
     ledger: FileLedger,
 }
@@ -199,17 +198,19 @@ impl AttachmentService {
             ledger: FileLedger::new(db.clone()),
             db,
             config,
-            store: LocalStore::from_env(),
+            store: crate::storage::shared(),
         }
     }
 
     /// PMS-910: the layout lives in `crate::storage` now. This still resolves a
-    /// path because `ticket_attachments.storage_path` is `NOT NULL` and every
-    /// existing row holds one; the value it produces is byte-identical to what
-    /// this method built before.
-    fn storage_path_for(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<PathBuf> {
+    /// location because `ticket_attachments.storage_path` is `NOT NULL` and
+    /// every existing row holds one; on the local backend the value is
+    /// byte-identical to what this method built before, and on any other it
+    /// is whatever that backend calls the object. Nothing reads the column
+    /// back, which is why it is a `String` from `location` and not a path.
+    fn storage_path_for(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<String> {
         self.store
-            .path_for(&ObjectKey::ticket_attachment(tenant_id, attachment_id))
+            .location(&ObjectKey::ticket_attachment(tenant_id, attachment_id))
     }
 
     /// Verify the note belongs to the ticket and the ticket belongs to
@@ -431,10 +432,7 @@ impl AttachmentService {
         let id = Uuid::new_v4();
         let key = ObjectKey::ticket_attachment(tenant_id, id);
         self.store.put(&key, &bytes).await?;
-        let storage_path = self
-            .storage_path_for(tenant_id, id)?
-            .to_string_lossy()
-            .to_string();
+        let storage_path = self.storage_path_for(tenant_id, id)?;
 
         let safe_name = sanitize_filename(&file_name);
         let safe_mime = sanitize_mime_type(&mime_type);
@@ -832,7 +830,7 @@ async fn download_agent(
     if row.ticket_id != ticket_id || row.note_id != Some(note_id) {
         return Err(AppError::NotFound("attachment not on this note".into()));
     }
-    attachment_response(&s.service.store, row, &headers).await
+    attachment_response(s.service.store.as_ref(), row, &headers).await
 }
 
 async fn delete_agent(
@@ -861,7 +859,7 @@ async fn get_public_inline_attachment(
     headers: HeaderMap,
 ) -> AppResult<Response> {
     let row = s.service.read_public_inline(attachment_id).await?;
-    inline_image_response(&s.service.store, row, &headers).await
+    inline_image_response(s.service.store.as_ref(), row, &headers).await
 }
 
 /// Strong validator for an immutable blob: the uuid that addresses it plus the
@@ -896,7 +894,7 @@ fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
 /// the row rather than from a buffer. A conditional request that already has
 /// the bytes gets a 304 without the file ever being opened.
 async fn attachment_response(
-    store: &LocalStore,
+    store: &dyn ObjectStore,
     row: AttachmentRow,
     headers: &HeaderMap,
 ) -> AppResult<Response> {
@@ -955,7 +953,7 @@ async fn attachment_response(
 /// to something scriptable - the upload allowlist and this header are two
 /// halves of one guarantee.
 async fn inline_image_response(
-    store: &LocalStore,
+    store: &dyn ObjectStore,
     row: AttachmentRow,
     headers: &HeaderMap,
 ) -> AppResult<Response> {

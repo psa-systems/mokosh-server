@@ -1521,7 +1521,7 @@ impl ContactService {
         // being linked to a real Company first.
         let Some(company_id) = contact.company_id else {
             return Err(AppError::BadRequest(
-                "contact has no company_id; link the contact to a Company before granting portal access"
+                "This contact has no company_id. Link the contact to a Company before granting portal access."
                     .to_string(),
             ));
         };
@@ -1537,7 +1537,7 @@ impl ContactService {
                 .flatten();
         if own_company_id == Some(company_id) {
             return Err(AppError::BadRequest(
-                "cannot grant portal access to a contact on the tenant's own_company".to_string(),
+                "Portal access cannot be granted to a contact on the tenant's own_company.".to_string(),
             ));
         }
 

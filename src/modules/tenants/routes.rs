@@ -66,7 +66,7 @@ impl TenantOrPlatformCaller {
         match self {
             TenantOrPlatformCaller::Platform => Ok(()),
             TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id => Ok(()),
-            _ => Err(AppError::Forbidden("Access denied".to_string())),
+            _ => Err(AppError::Forbidden("You do not have permission to perform this action.".to_string())),
         }
     }
 
@@ -78,7 +78,7 @@ impl TenantOrPlatformCaller {
             TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id && u.role.is_admin() => {
                 Ok(())
             }
-            _ => Err(AppError::Forbidden("Access denied".to_string())),
+            _ => Err(AppError::Forbidden("You do not have permission to perform this action.".to_string())),
         }
     }
 }

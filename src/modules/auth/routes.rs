@@ -507,7 +507,7 @@ async fn get_current_user(
 /// MAPPS-491 (MAPPS-474 phase 2): every active membership the caller
 /// holds. Populated by the middleware, so this is a projection over
 /// `AuthState.memberships`; no query runs in the handler. Client's
-/// `use_memberships_loader` (mokosh-clients/src/hooks/auth.rs:299)
+/// `use_memberships_loader` (mokosh-apps/src/hooks/auth.rs:299)
 /// calls this endpoint on login and on switcher open.
 async fn list_my_memberships(
     RequireAuthState(state): RequireAuthState,

@@ -1004,7 +1004,7 @@ impl KbService {
         .bind(company_id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("KbArticle".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("KB article".to_string()))?;
         Ok(row.into())
     }
 

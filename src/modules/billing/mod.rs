@@ -27,6 +27,7 @@
 //! `/payments` path unchanged.
 
 pub mod credential_move;
+pub mod descriptions;
 pub mod documents;
 pub mod issuer;
 pub mod models;

@@ -44,7 +44,9 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::scheduler::Job;
-use crate::storage::{LocalStore, ObjectKey, ObjectStore};
+use std::sync::Arc;
+
+use crate::storage::{ObjectKey, ObjectStore};
 use crate::utils::error::AppResult;
 
 /// What one tick did, for the log line and for tests.
@@ -68,14 +70,14 @@ impl MoveOutcome {
 #[derive(Clone)]
 pub struct KbAttachmentMover {
     db: Database,
-    store: LocalStore,
+    store: Arc<dyn ObjectStore>,
 }
 
 impl KbAttachmentMover {
     pub fn new(db: Database) -> Self {
         Self {
             db,
-            store: LocalStore::from_env(),
+            store: crate::storage::shared(),
         }
     }
 

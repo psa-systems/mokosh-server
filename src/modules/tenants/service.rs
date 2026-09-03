@@ -2007,8 +2007,8 @@ impl TenantService {
         // Payment terms (PMS-333)
         sqlx::query(
             r#"
-            INSERT INTO payment_terms (tenant_id, name, is_default, is_active, sort_order)
-            SELECT $1, name, is_default, is_active, sort_order
+            INSERT INTO payment_terms (tenant_id, name, is_default, is_active, sort_order, net_days)
+            SELECT $1, name, is_default, is_active, sort_order, net_days
             FROM payment_terms WHERE tenant_id = $2
             "#,
         )

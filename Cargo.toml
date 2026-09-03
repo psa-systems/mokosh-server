@@ -124,7 +124,9 @@ async-trait = { workspace = true }
 secrecy = { workspace = true }
 
 # HTTP client (for integrations)
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# `stream` so the S3 backend (PMS-958) can hand a GET body to the
+# attachment download as a reader rather than buffering it (PMS-783 F6).
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 urlencoding = "2"
 
 # Encryption + HMAC (RMM alert ingest signs bodies with HMAC-SHA256;
@@ -243,7 +245,7 @@ opt-level = 0
 # whole IR + DWARF in RAM at once. Dropping to `debug = 0` and
 # splitting into more codegen units keeps rustc peak RSS well under
 # the OOM ceiling; the client-side `[profile.wasm-dev]` uses the same
-# posture (see mokosh-clients Cargo.toml). Debuggers still work on
+# posture (see mokosh-apps Cargo.toml). Debuggers still work on
 # release builds; dev is for iteration speed, not stepping through.
 debug = 0
 codegen-units = 256

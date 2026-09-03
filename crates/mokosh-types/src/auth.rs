@@ -161,7 +161,7 @@ impl std::error::Error for AuthRequired {}
 /// Returned by `GET /api/v1/auth/memberships` and populated on `AuthState`
 /// so extractors can inspect the caller's full membership set without a
 /// second round-trip. Client redefines the same shape locally in
-/// `mokosh-clients/src/hooks/auth.rs` until phase 3 consolidates.
+/// `mokosh-apps/src/hooks/auth.rs` until phase 3 consolidates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MembershipView {
     pub tenant_id: Uuid,

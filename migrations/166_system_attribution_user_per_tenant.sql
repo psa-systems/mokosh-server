@@ -12,7 +12,7 @@
 --   ORDER BY created_at LIMIT 1
 --
 -- Post-MAPPS-554 the tenant provisioning path stopped inserting any users
--- row (mokosh-clients now live entirely on the contacts plane), so fresh
+-- row (mokosh-apps now live entirely on the contacts plane), so fresh
 -- tenants had zero admin/manager users. Portal ticket creation therefore
 -- 500'd with CONFIGURATION_ERROR ("tenant has no admin/manager user to
 -- attribute it to"), blocking the one write path a client should have.
