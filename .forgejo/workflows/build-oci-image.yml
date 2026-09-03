@@ -7,7 +7,7 @@ name: Build OCI container
 on:
   push:
     branches:
-      - "main"
+      #- "main"
       # Allow-listed feature branches publish their own branch tag and never
       # :latest, so staging can run a branch (PMS-733). Keep this list in sync
       # with BRANCH_ALLOW_LIST in oci-build/get-tags.nu; scripts/check-oci-publish-tags.nu
