@@ -4425,7 +4425,7 @@ impl BillingService {
         if let Err(sqlx::Error::Database(e)) = &deleted {
             if e.code().as_deref() == Some("23503") {
                 return Err(AppError::Conflict(
-                    "This product is on an invoice or a contract and cannot be deleted.                      Retire it instead by marking it inactive."
+                    "This product is on an invoice or a contract and cannot be deleted. Retire it instead by marking it inactive."
                         .to_string(),
                 ));
             }
