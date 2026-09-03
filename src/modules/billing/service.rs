@@ -781,22 +781,30 @@ impl BillingService {
         //    serialises against a concurrent generate.
         let entries: Vec<TimeEntryBillingRow> = sqlx::query_as(
             r#"
-            SELECT id, duration_minutes, hourly_rate, total_amount, ticket_id
-            FROM time_entries
-            WHERE tenant_id = $1
-              AND company_id = $2
+            SELECT te.id, te.duration_minutes, te.hourly_rate, te.total_amount,
+                   te.ticket_id, te.date, te.notes,
+                   -- PMS-1004: what the line says. The work type is NOT NULL
+                   -- on the entry, so the join cannot drop a row; the ticket
+                   -- is optional and its two columns are NULL without one.
+                   wt.name AS work_type_name,
+                   t.ticket_number, t.title AS ticket_title
+            FROM time_entries te
+            JOIN work_types wt ON wt.id = te.work_type_id
+            LEFT JOIN tickets t ON t.id = te.ticket_id
+            WHERE te.tenant_id = $1
+              AND te.company_id = $2
               -- PMS-942: employee time never reaches a client invoice, and it
               -- is excluded by what it IS rather than by which company id the
               -- caller happened to pass. The tenant's own internal company
               -- (PMS-413) is a real `companies` row, so before this its
               -- overhead time was invoiceable by naming it.
-              AND entry_kind = 'client'
-              AND is_billable = TRUE
-              AND invoice_id IS NULL
-              AND billing_status = 'ready_to_bill'
-              AND ($3::uuid[] IS NULL OR id = ANY($3))
-            ORDER BY date, created_at
-            FOR UPDATE
+              AND te.entry_kind = 'client'
+              AND te.is_billable = TRUE
+              AND te.invoice_id IS NULL
+              AND te.billing_status = 'ready_to_bill'
+              AND ($3::uuid[] IS NULL OR te.id = ANY($3))
+            ORDER BY te.date, te.created_at
+            FOR UPDATE OF te
             "#,
         )
         .bind(tenant_id)
@@ -861,7 +869,21 @@ impl BillingService {
             let unit_price = entry.hourly_rate.unwrap_or(Decimal::ZERO);
             let total = entry.total_amount.unwrap_or(quantity * unit_price);
             subtotal += total;
-            let description = format!("Time entry {}", entry.id);
+            // PMS-1004: the line describes the work, not the row.
+            let ticket =
+                entry
+                    .ticket_number
+                    .as_deref()
+                    .map(|number| super::descriptions::TicketRef {
+                        number,
+                        title: entry.ticket_title.as_deref().unwrap_or(""),
+                    });
+            let description = super::descriptions::time_entry_line(
+                entry.date,
+                &entry.work_type_name,
+                ticket,
+                entry.notes.as_deref(),
+            );
             lines.push((
                 entry.id,
                 description,
@@ -4542,6 +4564,12 @@ struct TimeEntryBillingRow {
     hourly_rate: Option<Decimal>,
     total_amount: Option<Decimal>,
     ticket_id: Option<Uuid>,
+    /// PMS-1004: what the generated line says.
+    date: chrono::NaiveDate,
+    notes: Option<String>,
+    work_type_name: String,
+    ticket_number: Option<String>,
+    ticket_title: Option<String>,
 }
 
 /// PMS-315: mileage entry projection for the invoice builder.
