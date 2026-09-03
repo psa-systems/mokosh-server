@@ -2,9 +2,23 @@
 
 Professional Services Automation (PSA) platform for MSPs. REST API server built on Axum + SQLx + PostgreSQL. Secrets are sourced from a self-hosted Infisical instance.
 
+<!--
+BUNYIP-587 records the shared Bunyip-to-Mokosh walkthrough GIF. When it lands,
+commit a copy at docs/assets/mokosh-walkthrough.gif (a cross-repo relative path
+to the Bunyip copy does not render on the mirrors, and hot-linking the raw asset
+URL is fragile) and replace this comment with:
+![Mokosh walkthrough](docs/assets/mokosh-walkthrough.gif)
+-->
+
+## Try it
+
+Live staging: **<https://msp.a8n.systems>**. Sign in through the platform and click through the product; the walkthrough starts in Bunyip and moves into Mokosh.
+
+> Staging shows features **in development**, not a polished demo. State is **wiped on every deploy** - accounts and data are throwaway. Do not reuse a real password.
+
 ## Architecture
 
-- **HTTP**: Axum 0.8 (Tokio runtime) with Tower middleware (CORS, tracing, gzip, request limits, request-id).
+- **HTTP**: Axum 0.8 (Tokio runtime) with Tower middleware (CORS, tracing, brotli/gzip compression, request limits, request-id).
 - **Database**: PostgreSQL 18 via SQLx (compile-time-checked migrations).
 - **Secrets**: Infisical (Universal Auth machine identity) reached over HTTP.
 - **Email**: Lettre (SMTP).
@@ -20,81 +34,148 @@ Modules under `src/modules/` cover the typical PSA surface area: `tickets`, `con
 | `mokosh-server` | Long-running HTTP API (Axum). |
 | `mokosh-bootstrap` | One-shot CLI that performs first-run setup of a fresh Infisical instance and writes the resulting Universal Auth credentials into `.env`. |
 
+### Operator subcommands
+
+`mokosh-server` inspects `argv` before binding a port (PMS-494, `src/cli.rs`): when the first token is one of these it runs the task and exits instead of serving.
+
+| Subcommand | Purpose |
+| --- | --- |
+| `bootstrap-infisical` | First-run setup of a fresh Infisical instance. Driven by `just infisical-bootstrap`; see "Infisical bootstrap" below. |
+| `qa-seed` | Load the QA walkthrough dataset (PMS-331) into the tenant named by `--tenant <uuid>` or `MOKOSH_QA_TENANT_ID`. |
+| `qa-teardown` | Remove that dataset from the same tenant. |
+| `showcase-seed` | Create the richer showcase demo dataset (PMS-620) in the tenant named by `--tenant <uuid>` or `MOKOSH_SHOWCASE_TENANT_ID`. |
+| `showcase-refresh` | Tear the showcase dataset down and re-seed it in one step. |
+| `showcase-teardown` | Remove the showcase dataset. |
+
+Both seeds are fail-closed and write nothing unless the target tenant is explicitly marked: `settings.is_qa` for `qa-*`, `settings.is_showcase` for `showcase-*`. That is what keeps them off a production tenant. Each needs a privileged `DATABASE_URL`.
+
+`mokosh-bootstrap` dispatches its own overlapping set (`bootstrap-infisical`, `qa-seed`, `qa-teardown`, plus `normalize-company-industries`, PMS-602); it has no `showcase-*` subcommands. Run `mokosh-bootstrap` with no arguments for its help text.
+
 ## Prerequisites
 
 - Rust toolchain (matches `rust-toolchain.toml` if present, otherwise stable).
 - Docker + Docker Compose v2.
 - [`just`](https://github.com/casey/just) for the task runner.
 - [Nushell `0.112.2`](https://www.nushell.sh/) (used by several `just` recipes).
-- (No host-side PostgreSQL needed - the dev compose stack now bundles a `postgres` service for the app DB, published to the host on `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PG_HOST_PORT:-5433}` for `sqlx-cli`.)
+- The shared Traefik ingress network `network-traefik-public` must already exist; `compose.dev.yml` attaches to it as an external network and `just dev` fails if it is absent.
+- (No host-side PostgreSQL needed - the dev compose stack bundles a `postgres` service for the app DB, published on `127.0.0.1:${MOKOSH_PG_HOST_PORT:-5433}` for `sqlx-cli`.)
 
 ## Quick start
 
-The dev stack lives in `compose.dev.yml` and is driven entirely through `just`. The first run generates `.env` (gitignored) from the committed `.env.example`, minting fresh random values for every self-owned secret, and discovers the host's private LAN IP automatically.
+The dev stack lives in `compose.dev.yml` and is driven entirely through `just`. The first run generates `.env` (gitignored) from the committed `.env.example`, minting fresh random values for every self-owned secret.
 
 ```nu
-# 1. Bring up the dev stack (mokosh-server + Infisical + Postgres + Valkey).
-#    The recipe discovers the host bind IP from `sys net | where name =~ 'eth0|br0'`
-#    and publishes mokosh-server on `${MOKOSH_HOST_BIND_IP}:${MOKOSH_PORT}`.
+# 1. Bring up the dev stack: mokosh-server + Postgres + mailpit.
 just dev
 
-# 2. In a second terminal, bootstrap Infisical (one-time, after the
-#    container is healthy). See "Infisical bootstrap" below for the
-#    .env.infisical contents this needs.
+# 2. Stop it when you are done, from a second terminal or after Ctrl-C
+#    (volumes are preserved).
+just down
+```
+
+That is the whole loop. The API is reached through the shared Traefik, which terminates TLS and routes **`https://<your-username>-mokosh-api.a8n.run`** to the `server` container's `MOKOSH_PORT` (`8080`). The `server` service publishes no host port at all: Traefik is its sole ingress, so there is no `http://<ip>:8080` to curl. Mailpit's web UI is at `http://localhost:8025`.
+
+Infisical is opt-in and not part of `just dev`. Start it, then run the one-time bootstrap:
+
+```nu
+# 3. (Optional) Start Infisical + its Postgres sidecar (compose profile: infisical).
+just dev-infisical
+
+# 4. In a second terminal, bootstrap Infisical once it is healthy. See
+#    "Infisical bootstrap" below for the .env.infisical contents this needs.
 just infisical-bootstrap
 
-# 3. Re-run `just dev` so the server picks up the new INFISICAL_* values.
-just dev-down
+# 5. Restart the stack so the server picks up the new INFISICAL_* values.
+just down
 just dev
 ```
 
-The API is then reachable at `http://<MOKOSH_HOST_BIND_IP>:<MOKOSH_PORT>` (defaults to the host's br0/eth0 IP on port `4301`). The Infisical admin UI is reachable at `http://localhost:28002`.
+The Infisical admin UI is at `http://localhost:28002`.
 
-### Why a private LAN bind, not 127.0.0.1?
+### Why Traefik ingress, and why loopback for the rest?
 
-The dev host is a VPS on the public internet. Binding to `127.0.0.1` would hide the port from the internet but also prevent other Docker containers on the host from reaching it. Binding to a private LAN interface (br0/eth0, e.g. `172.16.x.x`) keeps the port off the public internet and still allows sibling containers to connect.
+The dev host is a VPS on the public internet, and several developers share it. The `server` is reached only through the shared Traefik, which gives each developer their own `*.a8n.run` hostname with a real Let's Encrypt certificate instead of a port on a shared IP. Everything else that needs a host port (`postgres` for `sqlx-cli`, `mailpit` for the mail UI, `infisical` for its admin UI) publishes on `127.0.0.1` only, so it is reachable from the host's own tooling and from nowhere else (PMS-496). Sibling containers do not need a host port either: they reach each service by its compose DNS name on the `dev-mokosh-private-${USER}` network.
 
 ## Configuration
 
 | Variable | Where set | Purpose |
 | --- | --- | --- |
-| `COMPOSE_FILE` | `.env` | Pins `docker compose` to `compose.dev.yml`. |
 | `DATABASE_URL` | `.env` | Host-side connection string against the bundled `postgres` service (used by `sqlx migrate`, `cargo run` on the host). |
-| `MOKOSH_PG_DB`, `MOKOSH_PG_USER`, `MOKOSH_PG_PASSWORD` | `.env` | App-database credentials. Dev defaults only. |
-| `MOKOSH_PG_HOST_PORT` | `.env` | Host-published port for the `postgres` service. Default `5433`. |
-| `MOKOSH_PORT` | `.env` | TCP port for the API server (container and host bind). |
-| `MOKOSH_HOST_BIND_IP` | written to `.env` by `just dev` | Host interface IP that the container's port is published on. Falls back to `127.0.0.1` when unset. |
-| `JWT_SECRET`, `ENCRYPTION_KEY` | `.env` | API server secrets. Dev defaults only; rotate for any non-local environment. |
+| `MOKOSH_PG_DB`, `MOKOSH_PG_USER`, `MOKOSH_PG_PASSWORD` | `.env` | App-database credentials. The password is generated per clone on first `.env` creation. |
+| `MOKOSH_PG_HOST_PORT` | `.env` | Loopback port the `postgres` service is published on. Default `5433`. |
+| `MOKOSH_PORT` | `.env` | Port the API server listens on inside its container, and the port Traefik forwards to. Default `8080`. |
+| `MOKOSH_HOST_BIND_IP`, `USER` | written to `.env` by `just dev` | The host's private LAN IP and your username. `USER` names the per-developer containers, volumes, networks and the `${USER}-mokosh-api.a8n.run` route. Nothing publishes a port on `MOKOSH_HOST_BIND_IP`. |
+| `MOKOSH_SERVER_INFISICAL_ADDRESS` | written to `.env` by `just dev-infisical` | In-network Infisical URL handed to the server as `INFISICAL_ADDRESS`. Empty on a plain `just dev`, which makes the readiness probe report Infisical as `skipped`. |
+| `JWT_SECRET`, `ENCRYPTION_KEY` | `.env` | API server secrets, generated per clone on first `.env` creation; provision them explicitly for any non-local environment. |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | `.env` | Optional first-run admin bootstrap. Dev only; see "First-run admin bootstrap" below. |
+| `INFISICAL_URL` | `.env` | Host-side URL of the dev Infisical instance, read by the bootstrap CLI when `just infisical-bootstrap` runs it on the host. Default `http://localhost:28002`. Not the same key as `MOKOSH_SERVER_INFISICAL_ADDRESS` above, which is the in-network URL the server container gets. |
 | `INFISICAL_*` | `.env` | Infisical server config (bootstrap inputs) and Universal Auth client credentials (filled by `mokosh-bootstrap`). |
+| `ATTACHMENT_DIR` | `.env` | Upload root for ticket attachments and tenant logos. The dev stack points it at `/data/attachments` on the `dev-mokosh-attachments-${USER}` volume so an upload survives a rebuild; deployed environments want an absolute path on a mounted volume. |
 | `RUST_LOG` | `.env` | Tracing subscriber filter. |
 
 `compose.dev.yml` references every value via `${VAR}` substitution and contains no hardcoded secrets. Required vars use `${VAR:?...}` so compose fails loudly with a helpful message when a value is missing.
 
 ## Recipes
 
+Every recipe `just --list` prints is listed here; run `just --list` for the grouped view straight from the `justfile`.
+
 ```nu
-just                       # list all recipes
-just dev [args]            # bring up the dev stack (passes args to `docker compose up`, e.g. --detach)
-just dev-down              # stop the dev stack (volumes preserved)
-just dev-clean             # stop and remove volumes; remove .env (preserves .env.infisical)
-just infisical-bootstrap   # one-time: drives Infisical first-run setup and rewrites .env
-just check                 # cargo check + clippy + fmt --check
-just check-clippy
-just check-compile
-just check-fmt
-just fmt
-just test
-just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
-just install-hooks         # install git pre-commit hook -> runs `just pre-commit`
-just pre-commit            # fast, DB-free checks (mirrors CI check.yml)
-just build                 # cargo build --release --bins
-just check-docker          # build the OCI image's builder stage only (validation)
-just build-docker          # build the production OCI image (oci-build/Dockerfile)
-just migrate-run           # apply pending migrations against $DATABASE_URL
-just migrate-create <name> # create a new migration file
-just create-release <bump> # bump version (major|minor|hotfix), push release branch, print PR link
+# General
+just                        # the `default` recipe: list every recipe
+just install-hooks          # install the git pre-commit hook (once per fresh clone) -> runs `just pre-commit`
+just pre-commit             # check.yml's cargo checks (fmt/clippy/compile/unit/doc) in the dev `server` container
+
+# Dev stack
+just dev [args]             # start the Traefik-routed dev stack (args go to `docker compose up`, e.g. --build --detach)
+just dev-infisical [args]   # start Infisical and its Postgres sidecar (compose profile: infisical)
+just down                   # stop the dev stack (volumes preserved)
+just dev-clean              # stop the stack, remove this repo's volumes and target/, delete .env (keeps .env.infisical)
+just dev-clean-all          # everything dev-clean does, plus remove this repo's images and prune its buildx cache
+just infisical-bootstrap    # one-time: drive Infisical first-run setup and fill INFISICAL_* in .env
+
+# Checks
+just check                  # umbrella: every check.yml step except its cargo test steps (see below)
+just check-compile          # cargo check --all-targets
+just check-clippy           # cargo clippy --all-targets -- -D warnings (same as check.yml)
+just check-fmt              # cargo fmt --all --check
+just check-docker           # build the OCI image's builder stage only (validation; NOT in `just check`)
+just check-migrations       # fail if two migrations share a numeric prefix (PMS-198)
+just check-migration-immutability # fail if a migration already on main is modified or deleted (DEV-395)
+just check-pool-safety      # fail if a serving `.pool()` call lacks its `// SAFETY (PMS-285` note (PMS-692)
+just check-mail-copy        # fail if a `Mailer` helper duplicates a seeded template's copy (PMS-700)
+just check-rate-limit-helper # fail if a 429 response is built outside the shared builder (PMS-773)
+just check-runner-labels    # fail if a CI job requests the wrong runner label (PMS-719)
+just check-oci-cache        # fail if the OCI build leaves the type=gha runner cache (PMS-720)
+just check-oci-publish-tags # fail if the publish tags drift from oci-build/get-tags.nu (PMS-733)
+just check-workspace-deps   # fail if [workspace.dependencies] and its members disagree (PMS-785)
+just check-unused-deps      # cargo-machete: fail on a dependency with no call site (PMS-780)
+just check-env-example      # fail if a var the code reads is missing from .env.example or compose.dev.yml (PMS-836)
+just check-doc-recipes      # fail if README.md or docs/quickstart.md names a recipe the justfile lacks (PMS-843)
+just check-config-doc-paths # fail if a docs/ path in .env.example, compose.dev.yml or the justfile is missing (PMS-855)
+just check-doc-links        # fail if a relative Markdown link does not resolve to an existing path (PMS-850)
+
+# Format, test, build
+just fmt                    # cargo fmt --all
+just test                   # cargo test
+just test-integration       # Postgres-backed tests/*.rs suite in the dev `server` container (mirrors CI integration.yml)
+just verify-demo            # the demo-critical subset of the integration suite (seed_demo + data_transfer)
+just test-e2e [args]        # Playwright E2E suite against staging or $E2E_BASE_URL (args go to `playwright test`)
+just build                  # cargo build --release --bins
+just build-docker           # build the production OCI image (oci-build/Dockerfile)
+
+# Database
+just migrate-run            # apply pending migrations against $DATABASE_URL
+just migrate-create <name>  # create a new migration file
+
+# Release
+just create-release <bump>  # bump version (major|minor|hotfix), push release branch, print PR link
 ```
+
+`just check` plus `just pre-commit` together cover every step of
+`.forgejo/workflows/check.yml`; neither covers it alone.
+[`docs/dev-docs/local-vs-ci-checks.md`](docs/dev-docs/local-vs-ci-checks.md)
+maps the workflow onto the recipes step by step and states why `check-docker`,
+`test-integration`, `verify-demo` and `test-e2e` stay outside the umbrella.
 
 ## First-run admin bootstrap
 
@@ -107,7 +188,7 @@ The generated `.env` ships `ADMIN_EMAIL` / `ADMIN_PASSWORD` empty (they are blan
 ```nu
 # Set in .env (gitignored), then restart the stack.
 "ADMIN_EMAIL=you@example.com\nADMIN_PASSWORD=at-least-12-characters\n" | save --append .env
-just dev-down
+just down
 just dev
 ```
 
@@ -115,7 +196,7 @@ DEV ONLY. Production deployments should provision the first admin through a real
 
 ## Infisical bootstrap
 
-The first-run setup is driven by `mokosh-bootstrap` (invoked via `just infisical-bootstrap`). The recipe loads `.env.infisical` (gitignored) before invoking the binary, so the admin password never lands in shell history.
+Infisical runs behind the `infisical` compose profile, so start it with `just dev-infisical` first. The first-run setup is then driven by `mokosh-bootstrap` (invoked via `just infisical-bootstrap`). The recipe loads `.env.infisical` (gitignored) before invoking the binary, so the admin password never lands in shell history.
 
 ```nu
 # Create the gitignored credentials file.
@@ -135,7 +216,7 @@ open .env | lines | where ($it | str starts-with 'INFISICAL_')
 After bootstrap, restart the stack so the API server picks up the new credentials:
 
 ```nu
-just dev-down
+just down
 just dev
 ```
 
@@ -177,7 +258,8 @@ src/
 migrations/      SQLx migrations (embedded at compile time).
 oci-build/       Production OCI image (multi-stage Alpine).
 Dockerfile       Dev OCI image (debug build, source-mounted).
-compose.dev.yml  Dev stack: mokosh-server + Infisical + Postgres + Valkey.
+compose.dev.yml  Dev stack: mokosh-server + Postgres + mailpit, routed by the shared Traefik
+                 (Infisical + its Postgres + Valkey sit behind the `infisical` profile).
 .env.example     Committed template; `just dev` generates `.env` from it with fresh per-clone secrets.
 justfile         Task runner.
 .forgejo/        CI workflows (Forgejo).
@@ -191,3 +273,7 @@ justfile         Task runner.
 ## License
 
 Proprietary. See `Cargo.toml`.
+
+## Development happens on Forgejo
+
+The development home for this repository is <https://dev.a8n.run/psa-systems/mokosh-server>. The [GitHub](https://github.com/psa-systems/mokosh-server) and [Codeberg](https://codeberg.org/psa-systems/mokosh-server) copies are read-only mirrors that exist for visibility only: issues and pull requests are disabled there, and no community support runs on the mirrors. File issues and open pull requests on Forgejo.

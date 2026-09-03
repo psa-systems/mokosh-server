@@ -70,6 +70,12 @@ jobs:
     # compiles, but base carries none of that toolchain.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
 
+    # Backstop, not a target (PMS-829): 42 green runs over the same window took
+    # 1.2-4.2 minutes, median 2.0. The bound is generous against that because
+    # what it catches is a browser or a staging request that never returns, not
+    # a slow suite; Playwright's own per-test timeouts handle the slow case.
+    timeout-minutes: 20
+
     defaults:
       run:
         working-directory: e2e

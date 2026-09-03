@@ -22,6 +22,7 @@ use super::service::FormsService;
 use crate::modules::auth::TenantId;
 use crate::modules::tenants::OrgIdentity;
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
+use crate::utils::email::salutation;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::html::{html_escape, urlencoded};
 
@@ -79,8 +80,7 @@ impl FormsService {
         let definition = self.get(tenant_id, req.form_definition_id).await?;
         if !definition.is_active {
             return Err(AppError::Conflict(
-                "This form has been retired and cannot be sent to a client. An active form"
-                    .to_string(),
+                "This form has been retired and cannot be sent to a client.".to_string(),
             ));
         }
 
@@ -132,7 +132,9 @@ impl FormsService {
             .unwrap_or_else(|| tenant_name.clone());
 
         // Resolve the addressee. An explicit contact supplies the address and
-        // the greeting; otherwise the caller must give an email outright.
+        // the name; otherwise the caller must give an email outright. PMS-774:
+        // an unknown or blank name stays blank here, and `salutation` decides
+        // how the message opens.
         let (contact_id, recipient_email, display_name) = match req.contact_id {
             Some(contact_id) => {
                 let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
@@ -149,17 +151,13 @@ impl FormsService {
                         "That contact has no email address; supply recipient_email".to_string(),
                     )
                 })?;
-                (
-                    Some(contact_id),
-                    email,
-                    first_name.unwrap_or_else(|| "Hello".to_string()),
-                )
+                (Some(contact_id), email, first_name.unwrap_or_default())
             }
             None => {
                 let email = req.recipient_email.clone().ok_or_else(|| {
                     AppError::BadRequest("Supply either contact_id or recipient_email".to_string())
                 })?;
-                (None, email, "Hello".to_string())
+                (None, email, String::new())
             }
         };
 
@@ -244,6 +242,11 @@ impl FormsService {
             abuse_notice(self.abuse_contact_email.as_deref(), form_name);
         let context = json!({
             "recipient_email": recipient_email,
+            // PMS-774: the greeting word comes from the template via
+            // `salutation`; `display_name` stays the bare name so a tenant
+            // still holding a customised template that names it keeps
+            // rendering rather than showing literal braces.
+            "salutation": salutation(display_name),
             "display_name": display_name,
             "form_name": form_name,
             // MAPPS-425: the seeded subject asks for this; without it the
@@ -362,7 +365,11 @@ impl FormsService {
         // MAPPS-429: the form's own contact wins; the organisation's is the
         // fallback, so an MSP sets a service-desk number once instead of on
         // every definition.
-        let contact_info = definition.contact_info.clone().or_else(|| org.phrase());
+        //
+        // PMS-776: framed either way. The form-supplied branch used to be
+        // returned raw, so only one of the two branches of this one field told
+        // the client who was asking.
+        let contact_info = org.phrase_with(definition.contact_info.as_deref());
         Ok(PublicFormResponse {
             name: definition.name,
             description: definition.description,
@@ -407,8 +414,7 @@ impl FormsService {
         let definition = self.get(tenant_id, resolved.form_definition_id).await?;
         if !definition.is_active {
             return Err(AppError::Conflict(
-                "This form has been retired and is no longer accepting submissions. An active form"
-                    .to_string(),
+                "This form has been retired and is no longer accepting submissions.".to_string(),
             ));
         }
 
@@ -502,7 +508,6 @@ impl FormsService {
 
         Ok(PublicSubmissionReceipt {
             ticket_number: ticket.ticket_number,
-            ticket_id: Some(ticket.id),
         })
     }
 }

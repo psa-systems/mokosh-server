@@ -106,6 +106,7 @@ mod tests {
             support_phone: Some("+15555550100".into()),
             support_contact_name: Some("Alice".into()),
             portal_domain: Some("portal.acme.example".into()),
+            ..Default::default()
         }
     }
 
@@ -174,8 +175,10 @@ mod tests {
 
     #[test]
     fn single_field_override_leaves_others_from_tenant() {
-        let mut co = CompanyBranding::default();
-        co.primary_color = Some("#deadbeef".into());
+        let co = CompanyBranding {
+            primary_color: Some("#deadbeef".into()),
+            ..CompanyBranding::default()
+        };
         let out = effective_branding(&tenant_full(), &co);
         // Overridden field wins.
         assert_eq!(out.primary_color.as_deref(), Some("#deadbeef"));

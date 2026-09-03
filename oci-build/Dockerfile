@@ -7,12 +7,49 @@ RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static lld
 
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
+# PMS-781: dependency layer. Only the manifests land here, so the expensive
+# third-party compile below is an image layer that no change under `src/` or
+# `crates/*/src/` can invalidate - and, unlike a `target/` cache mount, a layer
+# is something the CI `type=gha,mode=max` cache actually exports.
+#
+# Cargo needs a source file for every target a manifest declares, so each
+# workspace crate gets a stub. `build.rs` is stubbed too: the real one calls
+# `build_metadata::emit`, and `build-metadata`'s source only arrives with the
+# real sources below.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/build-metadata/Cargo.toml ./crates/build-metadata/
+COPY crates/mokosh-types/Cargo.toml ./crates/mokosh-types/
+RUN mkdir -p src/bin crates/build-metadata/src crates/mokosh-types/src \
+    && echo 'fn main() {}' > build.rs \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo 'fn main() {}' > src/bin/mokosh-bootstrap.rs \
+    && touch src/lib.rs \
+             crates/build-metadata/src/lib.rs \
+             crates/mokosh-types/src/lib.rs
+
+# `cargo clean` drops the three stub-built workspace crates and keeps every
+# dependency artifact. It is deterministic where relying on mtimes is not: COPY
+# preserves the build context's timestamps, which are older than this layer, so
+# without the clean cargo would call the stubs fresh and the image would ship a
+# `fn main() {}` binary.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --bins \
+    && cargo clean --release --package mokosh-server \
+                             --package mokosh-types \
+                             --package build-metadata
+
 # Build-time version metadata. The `.git` directory is intentionally not
 # copied into the build context, so `build.rs` cannot derive these from
 # `git` itself - they must be passed in by the caller (CI, `just
 # build-docker`, etc). When unset, `build.rs` falls back to "unknown"
 # and the package version, which is fine for ad-hoc local builds but
 # will not reflect the actual commit.
+#
+# These sit BELOW the dependency layer on purpose: the values change on every
+# build (the build date always, the git hash on every commit), and an ENV
+# change invalidates every layer under it. Above the dependency build they
+# would recompile the whole dependency graph once per build and the layer
+# would never be reused.
 ARG MOKOSH_GIT_HASH=""
 ARG MOKOSH_GIT_DESCRIBE=""
 ARG MOKOSH_BUILD_DATE=""
@@ -22,14 +59,14 @@ ENV MOKOSH_GIT_DESCRIBE=${MOKOSH_GIT_DESCRIBE}
 ENV MOKOSH_BUILD_DATE=${MOKOSH_BUILD_DATE}
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
-# Copy manifests, source, workspace members, build script, and migrations
-# (sqlx::migrate! reads migrations at compile time; workspace members
-# must be present so cargo can resolve the workspace; build.rs is needed
-# so the version metadata env vars get baked into the binaries).
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY src ./src
-COPY crates ./crates
+# Real sources, least-frequently-changed first. All four are required at
+# compile time: sqlx::migrate! reads migrations/, cargo needs the workspace
+# members to resolve the workspace, and build.rs bakes the version metadata
+# env vars into the binaries.
 COPY migrations ./migrations
+COPY build.rs ./
+COPY crates ./crates
+COPY src ./src
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bins

@@ -501,7 +501,8 @@ async fn term_id(app: &common::TestApp, token: &str, name: &str) -> String {
         .to_string()
 }
 
-/// Migration 050 seeds net30 as the single default per tenant; setting a new
+/// Migration 050 seeds Net 30 (PMS-934 renamed it from `net30`) as the single
+/// default per tenant; setting a new
 /// default clears the prior one.
 #[sqlx::test]
 async fn payment_terms_seeded_and_single_default(pool: PgPool) {
@@ -520,10 +521,13 @@ async fn payment_terms_seeded_and_single_default(pool: PgPool) {
         .await
         .expect("JSON");
     let rows = list["data"].as_array().expect("data");
+    // PMS-934: the seeded names are readable now. `name` is the display field
+    // and the invoice dropdown renders it verbatim, so the seed no longer puts
+    // an identifier there.
     let net30 = rows
         .iter()
-        .find(|t| t["name"].as_str() == Some("net30"))
-        .expect("net30 seeded");
+        .find(|t| t["name"].as_str() == Some("Net 30"))
+        .expect("Net 30 seeded");
     assert_eq!(
         net30["is_default"].as_bool(),
         Some(true),
@@ -566,8 +570,8 @@ async fn payment_terms_seeded_and_single_default(pool: PgPool) {
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["name"].as_str() == Some("net30"))
-        .expect("net30 row");
+        .find(|t| t["name"].as_str() == Some("Net 30"))
+        .expect("Net 30 row");
     assert_eq!(
         n30["is_default"].as_bool(),
         Some(false),
@@ -595,7 +599,7 @@ async fn invoice_payment_term_link_rename_and_delete_guard(pool: PgPool) {
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
 
-    let net30 = term_id(&app, &token, "net30").await;
+    let net30 = term_id(&app, &token, "Net 30").await;
 
     let invoice: serde_json::Value = app
         .client
@@ -616,7 +620,7 @@ async fn invoice_payment_term_link_rename_and_delete_guard(pool: PgPool) {
         .expect("invoice JSON");
     let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
     assert_eq!(invoice["payment_term_id"].as_str(), Some(net30.as_str()));
-    assert_eq!(invoice["payment_term_name"].as_str(), Some("net30"));
+    assert_eq!(invoice["payment_term_name"].as_str(), Some("Net 30"));
 
     // Rename the term; the invoice's joined name follows (FK, not a copy).
     let put = app
@@ -750,14 +754,33 @@ async fn payment_gateway_secret_is_write_only(pool: PgPool) {
         "a stored gateway reports configured = true"
     );
 
-    // Capture the encrypted secret as stored, to prove a metadata-only update
-    // leaves it untouched.
-    let secret_before: String = sqlx::query_scalar(
+    // PMS-968: the credential is in the secret store now, not in the row. The
+    // column being NULL is what says so, and the ciphertext lives in `secrets`
+    // under the key the row's own (tenant_id, provider) gives.
+    let column: Option<String> = sqlx::query_scalar(
         "SELECT config_encrypted FROM payment_gateway_configs WHERE provider = 'stripe'",
     )
     .fetch_one(&app.pool)
     .await
+    .expect("read gateway column");
+    assert!(
+        column.is_none(),
+        "a credential written through the API lives in the secret store, not the row"
+    );
+
+    // Capture the stored secret, to prove a metadata-only update leaves it
+    // untouched. Still ciphertext at rest: the database backend encrypts with
+    // the same host key the column used to.
+    let secret_before: String = sqlx::query_scalar(
+        "SELECT value_encrypted FROM secrets WHERE name LIKE 'PAYMENT_GATEWAY%'",
+    )
+    .fetch_one(&app.pool)
+    .await
     .expect("read stored secret");
+    assert!(
+        !secret_before.contains(SECRET),
+        "the stored secret must be ciphertext, not the plaintext"
+    );
 
     // 2. `GET /payment-gateways` exposes metadata but never the secret.
     let resp = app
@@ -807,16 +830,22 @@ async fn payment_gateway_secret_is_write_only(pool: PgPool) {
         resp.status()
     );
 
-    let (secret_after, is_active_after, is_test_after): (String, bool, bool) = sqlx::query_as(
-        "SELECT config_encrypted, is_active, is_test_mode \
+    let (is_active_after, is_test_after): (bool, bool) = sqlx::query_as(
+        "SELECT is_active, is_test_mode \
          FROM payment_gateway_configs WHERE provider = 'stripe'",
     )
     .fetch_one(&app.pool)
     .await
     .expect("read gateway after metadata update");
+    let secret_after: String = sqlx::query_scalar(
+        "SELECT value_encrypted FROM secrets WHERE name LIKE 'PAYMENT_GATEWAY%'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("read stored secret after metadata update");
     assert_eq!(
         secret_after, secret_before,
-        "a config-less update must preserve the stored encrypted secret"
+        "a config-less update must preserve the stored secret, wherever it lives"
     );
     assert!(
         !is_active_after,
@@ -1082,4 +1111,90 @@ async fn deleting_a_payment_recomputes_from_remaining(pool: PgPool) {
         paid,
         "amount_paid always equals SUM(payments.amount)"
     );
+}
+
+/// PMS-1004: a generated line describes the work, not the row.
+///
+/// `Time entry {uuid}` was the description of every line the builder wrote,
+/// and it reached the API, the page and the PDF a customer receives. The
+/// line now names the date, the work type, the ticket and the notes.
+#[sqlx::test]
+async fn a_generated_line_describes_the_work_not_the_row(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seed_work_type(&pool).await;
+    let (ticket_id, _note_id) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let ticket_number: String =
+        sqlx::query_scalar("SELECT ticket_number FROM tickets WHERE id = $1")
+            .bind(ticket_id)
+            .fetch_one(&pool)
+            .await
+            .expect("ticket number");
+
+    let with_ticket = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO time_entries (
+            id, tenant_id, user_id, date, duration_minutes, work_type_id,
+            company_id, ticket_id, notes, is_billable, billing_status,
+            hourly_rate, total_amount
+        )
+        VALUES ($1, $2, $3, '2026-08-27', 60, $4, $5, $6,
+                'Rebooted the print spooler' || E'\n' || 'second line stays off the invoice',
+                TRUE, 'ready_to_bill', 150.00, 150.00)
+        "#,
+    )
+    .bind(with_ticket)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(admin_id)
+    .bind(work_type_id)
+    .bind(company_id)
+    .bind(ticket_id)
+    .execute(&pool)
+    .await
+    .expect("seed entry with a ticket");
+    let bare = seed_time_entry(
+        &pool,
+        admin_id,
+        company_id,
+        work_type_id,
+        30,
+        "150.00",
+        "75.00",
+    )
+    .await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let resp = app
+        .client
+        .post(app.url("/api/v1/invoices/from-time-entries"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "company_id": company_id }))
+        .send()
+        .await
+        .expect("generate invoice");
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let invoice: serde_json::Value = resp.json().await.expect("invoice JSON");
+    let lines = invoice["lines"].as_array().expect("lines");
+    assert_eq!(lines.len(), 2);
+
+    let descriptions: Vec<&str> = lines
+        .iter()
+        .map(|l| l["description"].as_str().expect("description"))
+        .collect();
+    assert_eq!(
+        descriptions[0],
+        format!("2026-08-27 Billing Test Work: {ticket_number} Attachment ticket - Rebooted the print spooler"),
+        "the dated entry sorts first and names its ticket and notes"
+    );
+    assert!(
+        descriptions[1].ends_with(" Billing Test Work"),
+        "an entry with no ticket and no notes is its date and work type: {}",
+        descriptions[1]
+    );
+    for (line, id) in descriptions.iter().zip([with_ticket, bare]) {
+        assert!(!line.contains(&id.to_string()), "no UUID on a line: {line}");
+        assert!(!line.contains("Time entry"), "{line}");
+    }
 }

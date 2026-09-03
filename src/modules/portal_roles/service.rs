@@ -60,6 +60,8 @@ impl PortalRoleService {
         // `portal_role_routes` at `/api/v1/portal-roles`) also carries
         // the per-role contacts_count for the Settings > Contact
         // Roles table.
+        // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(Uuid, String, Vec<String>, bool, Option<Uuid>, i64)> = match company_id {
             None => {
                 sqlx::query_as(
@@ -105,6 +107,8 @@ impl PortalRoleService {
     }
 
     pub async fn get_role(&self, tenant_id: TenantId, role_id: Uuid) -> AppResult<PortalRole> {
+        // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+        #[allow(clippy::type_complexity)]
         let row: Option<(
             Uuid,
             Uuid,

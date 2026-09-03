@@ -161,7 +161,7 @@ pub fn check_mime(raw: &str) -> AppResult<&'static str> {
         .map(|(m, _)| *m)
         .ok_or_else(|| {
             AppError::BadRequest(format!(
-                "unsupported image type `{base}`; use PNG, JPEG, WebP or GIF"
+                "Unsupported image type `{base}`. Use PNG, JPEG, WebP or GIF."
             ))
         })
 }
@@ -215,12 +215,12 @@ impl BrandingAssetStore {
     ) -> AppResult<&'static str> {
         let mime = check_mime(mime)?;
         if bytes.is_empty() {
-            return Err(AppError::BadRequest("the uploaded file is empty".into()));
+            return Err(AppError::BadRequest("The uploaded file is empty.".into()));
         }
         let cap = self.max_bytes(kind, scope);
         if bytes.len() as u64 > cap {
             return Err(AppError::BadRequest(format!(
-                "image is larger than the {} KiB limit",
+                "The image is larger than the {} KiB limit.",
                 cap / 1024
             )));
         }

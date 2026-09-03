@@ -72,7 +72,7 @@ async fn staff_upload_company_asset(
     multipart: Multipart,
 ) -> AppResult<Response> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden("You do not have permission to perform this action.".to_string()));
     }
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
@@ -94,7 +94,7 @@ async fn staff_delete_company_asset(
     Path((company_id, asset)): Path<(Uuid, String)>,
 ) -> AppResult<Response> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden("You do not have permission to perform this action.".to_string()));
     }
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
@@ -120,7 +120,7 @@ async fn staff_upload_tenant_asset(
     multipart: Multipart,
 ) -> AppResult<Response> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden("You do not have permission to perform this action.".to_string()));
     }
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
@@ -142,7 +142,7 @@ async fn staff_delete_tenant_asset(
     Path(asset): Path<String>,
 ) -> AppResult<Response> {
     if !user.role.is_admin() {
-        return Err(AppError::Forbidden("Access denied".to_string()));
+        return Err(AppError::Forbidden("You do not have permission to perform this action.".to_string()));
     }
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
@@ -374,7 +374,7 @@ async fn read_multipart_file(mut multipart: Multipart) -> AppResult<(String, Vec
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| AppError::BadRequest(format!("multipart parse: {e}")))?
+        .map_err(|e| AppError::BadRequest(format!("Could not parse the multipart body: {e}.")))?
     {
         if field.name().unwrap_or_default() != "file" {
             continue;
@@ -386,11 +386,11 @@ async fn read_multipart_file(mut multipart: Multipart) -> AppResult<(String, Vec
         let bytes = field
             .bytes()
             .await
-            .map_err(|e| AppError::BadRequest(format!("multipart read: {e}")))?;
+            .map_err(|e| AppError::BadRequest(format!("Could not read the multipart body: {e}.")))?;
         return Ok((mime, bytes.to_vec()));
     }
     Err(AppError::BadRequest(
-        "missing 'file' part in multipart body".into(),
+        "Missing 'file' part in the multipart body.".into(),
     ))
 }
 

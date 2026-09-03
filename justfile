@@ -20,49 +20,153 @@ install-hooks:
     ^chmod +x $hook
     print $"Wrote ($hook) -> just pre-commit"
 
-# Mirrors check.yml one-to-one so a green hook means a green Check run. The
-# `--all-targets` clippy/check steps compile the tests/*.rs integration binaries
-# too (PMS-640 mounts ./tests into the `server` service), so a harness-breaking
-# signature change fails here rather than only in CI. The Postgres-backed suite
-# is still NOT run here (compile-only); use `just test-integration` (mirrors
-# integration.yml) to actually run it. PMS-267.
-# Run the fast, database-free checks inside the dev compose `server` container.
+# The cargo half of check.yml (fmt, clippy, compile, unit tests, doc tests) run
+# in the dev compose `server` container. It does NOT run check.yml's repo guard
+# scripts; `just check` runs those, so the two together cover check.yml and
+# neither covers it alone (PMS-851; full mapping in
+# docs/dev-docs/local-vs-ci-checks.md). The `--all-targets` clippy/check steps
+# compile the tests/*.rs integration binaries too (PMS-640 mounts ./tests into
+# the `server` service), so a harness-breaking signature change fails here
+# rather than only in CI. The Postgres-backed suite is still NOT run here
+# (compile-only); use `just test-integration` (mirrors integration.yml) to
+# actually run it. PMS-267.
+[doc("Run check.yml's fast, database-free cargo checks inside the dev compose `server` container.")]
 [group: 'hooks']
 pre-commit: ensure-env
     #!/usr/bin/env nu
     print "\n[pre-commit] cargo fmt --all --check"
     ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo fmt --all --check
-    print "\n[pre-commit] cargo clippy --all-targets -- -D warnings"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --all-targets -- -D warnings
-    print "\n[pre-commit] cargo check --all-targets"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --all-targets
+    print "\n[pre-commit] cargo clippy --workspace --all-targets -- -D warnings"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --workspace --all-targets -- -D warnings
+    print "\n[pre-commit] cargo check --workspace --all-targets"
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --workspace --all-targets
     print "\n[pre-commit] unit tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --lib
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --workspace --lib
     print "\n[pre-commit] doc tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --doc
+    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --workspace --doc
     print "\n[pre-commit] all checks passed"
 
 # -- Checks ----------------------------------------------------------------------
 
-# Umbrella check: build + clippy + fmt + docker builder stage.
+# Every check.yml step except its two cargo test steps: all thirteen repo guard
+# steps plus compile, clippy and fmt. `just pre-commit` runs the unit and doc
+# tests, so the two recipes together cover check.yml and neither covers it alone
+# (PMS-851; per-step mapping in docs/dev-docs/local-vs-ci-checks.md).
+#
+# Deliberately NOT here, and why:
+# - `check-docker` builds an OCI builder stage (minutes, needs a Docker builder
+#   and the crates.io network), and no check.yml step builds an image either;
+#   build-oci-image.yml owns that. Run it by hand before touching
+#   oci-build/Dockerfile.
+# - `test-integration` needs a Postgres container, which is why PMS-267 split it
+#   into integration.yml. Run it by hand before touching the tests/*.rs suite.
+[doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-mail-copy check-runner-labels check-oci-cache
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-validate-parity check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
+
+# Keep every relative Markdown link pointing at a file that exists (PMS-850).
+# The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and
+# three doc audits reported the same set because a broken link fails silently.
+[doc("Fail if a relative Markdown link does not resolve to an existing path (PMS-850).")]
+[group: 'check']
+check-doc-links:
+    nu scripts/check-doc-links.nu
+
+# Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if
+# README.md or docs/quickstart.md names a recipe the justfile does not define.
+[doc("Fail if README.md or docs/quickstart.md names a recipe the justfile lacks (PMS-843).")]
+[group: 'check']
+check-doc-recipes:
+    nu scripts/check-doc-recipes.nu
+
+# Keep config-comment `docs/` pointers resolving (PMS-855). .env.example is
+# minted into every clone's .env, so a dead pointer there reaches every
+# developer. Fails if one of the three config files names a missing path.
+[doc("Fail if .env.example, compose.dev.yml or the justfile names a docs/ path that does not exist (PMS-855).")]
+[group: 'check']
+check-config-doc-paths:
+    nu scripts/check-config-doc-paths.nu
+
+# Keep .env.example and compose.dev.yml in step with what the code reads
+# (PMS-836). Fails if a variable the code reads has no .env.example key or no
+# compose.dev.yml server line (so it cannot be set in dev at all), or if
+# .env.example declares a key nothing consumes.
+[doc("Fail if a var the code reads is missing from .env.example or compose.dev.yml (PMS-836).")]
+[group: 'check']
+check-env-example:
+    nu scripts/check-env-example.nu
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
 # share a numeric prefix (sqlx keys its ledger on that prefix).
+[doc("Fail if two migrations share a numeric prefix (PMS-198).")]
 [group: 'check']
 check-migrations:
     nu scripts/check-migration-prefixes.nu
 
+# Enforce migration immutability (DEV-395). sqlx re-verifies applied-migration
+# checksums on boot, so editing one stops every deployed database. Needs
+# origin/main fetched with history (check.yml clones with fetch-depth: 0); run
+# `git fetch origin main` first on a shallow clone.
+[doc("Fail if a migration already on main is modified, renamed, or deleted (DEV-395).")]
+[group: 'check']
+check-migration-immutability:
+    nu scripts/check-migration-immutability.nu
+
+# Keep request-serving queries off the bare app pool (PMS-692). A `.pool()` call
+# hits the NOBYPASSRLS pool and fail-closes RLS-covered rows to zero, so it is
+# legitimate only on an RLS-exempt table or a pre-auth path, with an adjacent
+# `// SAFETY (PMS-285` note saying which.
+[doc("Fail if a serving `.pool()` call appears without its `// SAFETY (PMS-285` note (PMS-692).")]
+[group: 'check']
+check-pool-safety:
+    nu scripts/check-pool-safety.nu
+
+# Report CI runs that outlived their own job's `timeout-minutes` (PMS-906).
+# NOT part of `just check`: it needs network access and a FORGEJO_TOKEN, and it
+# answers a question about history rather than about the diff. A run that
+# exceeds its bound and still reports success was never bounded, because
+# nothing was executing it - which is the one thing PMS-829's job bounds cannot
+# catch.
+[doc("Report CI runs that outlived their job's timeout-minutes (PMS-906). Needs FORGEJO_TOKEN.")]
+[group: 'ci']
+ci-stalls days="3":
+    nu scripts/check-ci-stalls.nu {{days}}
+
+# Prove the stall report still reports (PMS-906). Fixtures, no network.
+[doc("Self-test for `just ci-stalls`; runs on fixtures, needs no token.")]
+[group: 'ci']
+ci-stalls-self-test:
+    nu scripts/check-ci-stalls.nu --self-test
+
+# Keep a Create*Request and its Update*Request agreeing about every same-named
+# field (PMS-867). A cap on one side and nothing on the other is two contracts
+# for one column: over the max the update path 500s on a raw Postgres 22001
+# where create answers 422, and under the min it stores `""` where create
+# refuses it.
+[doc("Fail if a Create*Request and its Update*Request validate a field differently (PMS-867).")]
+[group: 'check']
+check-validate-parity:
+    nu scripts/check-create-update-validate-parity.nu
+
 # Keep transactional email body copy in notification_templates, not in Rust
 # (PMS-700). Fails if a `Mailer` helper re-adds a seeded template's wording.
+[doc("Fail if a `Mailer` helper duplicates a seeded template's copy (PMS-700).")]
 [group: 'check']
 check-mail-copy:
     nu scripts/check-no-duplicate-mail-copy.nu
 
+# Keep every 429 coming from the one shared builder (PMS-773). Fails if a route
+# file constructs a TOO_MANY_REQUESTS response itself, or if a handler computes
+# a retry delay and discards it.
+[doc("Fail if a 429 response is built outside the shared builder (PMS-773).")]
+[group: 'check']
+check-rate-limit-helper:
+    nu scripts/check-rate-limit-helper.nu
+
 # Keep CI jobs on the right runner label (PMS-719). Fails if a compiling job
 # requests the base label, if a workflow installs a C toolchain at run time,
 # or if a runs-on carries no comment justifying its label.
+[doc("Fail if a CI job requests the wrong runner label (PMS-719).")]
 [group: 'check']
 check-runner-labels:
     nu scripts/check-runner-labels.nu
@@ -70,19 +174,59 @@ check-runner-labels:
 # Keep the OCI build on the type=gha runner cache (PMS-720, GOV-20). Fails if a
 # buildx workflow drops the docker-container driver or the runtime-env step, or
 # if the retired inline / registry :buildcache backends come back.
+[doc("Fail if the OCI build leaves the type=gha runner cache (PMS-720).")]
 [group: 'check']
 check-oci-cache:
     nu scripts/check-oci-build-cache.nu
 
+# Keep `:latest` publishable from main only, and branch builds on the allow-list
+# in oci-build/get-tags.nu (PMS-733). Fails if the workflow's push filter or ref
+# guard drifts from that list, or if the tag resolver stops honouring it.
+[doc("Fail if the publish tags drift from oci-build/get-tags.nu (PMS-733).")]
+[group: 'check']
+check-oci-publish-tags:
+    nu scripts/check-oci-publish-tags.nu
+
+# Build a commit once on the pull-request-to-main path (DEV-612). Fails if a
+# workflow that compiles declares both `push: main` and `pull_request: main`, or
+# if no compiling workflow gates pull requests into main at all.
+[doc("Fail if a compiling workflow builds the same tree twice (DEV-612).")]
+[group: 'check']
+check-single-build:
+    nu scripts/check-single-build.nu
+
+# Keep [workspace.dependencies] describing what the workspace shares (PMS-785).
+# Fails if an entry is inherited by no member, or if a member re-pins a crate
+# the workspace table already pins.
+[doc("Fail if [workspace.dependencies] and its members disagree (PMS-785).")]
+[group: 'check']
+check-workspace-deps:
+    nu scripts/check-workspace-deps.nu
+
+# Fail loud on a dependency declared in Cargo.toml with no call site (PMS-780).
+# `pulldown-cmark` and `minijinja` sat there unused, compiled on every cold
+# build. Install once: `cargo install --locked cargo-machete`.
+[doc("Fail on a dependency declared in Cargo.toml with no call site (PMS-780).")]
+[group: 'check']
+check-unused-deps:
+    #!/usr/bin/env nu
+    if (which cargo-machete | is-empty) {
+        print --stderr "cargo-machete not installed: cargo install --locked cargo-machete"
+        exit 1
+    }
+    cargo machete
+
 # Check compilation
 [group: 'check']
 check-compile:
-    cargo check --all-targets
+    cargo check --workspace --all-targets
 
-# Run clippy lints
+# Run clippy with check.yml's `-D warnings` (PMS-851). Without it a lint that
+# fails the Check job passed here, which is the drift this gate exists to catch.
+[doc("Run clippy over all targets with `-D warnings`, exactly as check.yml does.")]
 [group: 'check']
 check-clippy:
-    cargo clippy --all-targets
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Check formatting
 [group: 'check']
@@ -97,7 +241,7 @@ fmt:
 # Run tests
 [group: 'test']
 test:
-    cargo test
+    cargo test --workspace
 
 # Mirrors .forgejo/workflows/integration.yml one-to-one. Unlike `just pre-commit`
 # this omits `--no-deps`, so the compose `postgres` dependency starts. PMS-267.
@@ -122,15 +266,21 @@ test-integration: ensure-env
 # Postgres-backed setup as `test-integration`, including its superuser
 # DATABASE_URL override (see the note there for why `mokosh_migrator` cannot
 # run a `#[sqlx::test]` suite).
+[doc("Run the demo-critical subset of the integration suite: seed_demo plus data_transfer (PMS-677).")]
 [group: 'test']
 verify-demo: ensure-env
     docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --test seed_demo --test data_transfer -- --test-threads=4'
 
 # Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
 # pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
+# bun, not npm: e2e/ has a bun.lock and no package-lock.json, so `npm ci` fails
+# outright, and e2e.yml installs with bun too (PMS-852). All three browsers, not
+# just chromium: the `setup` project runs on Firefox and there is a `webkit`
+# project, so a chromium-only install dies before the first assertion.
+[doc("Run the Playwright E2E suite against staging or $E2E_BASE_URL; trailing args go to `playwright test` (PMS-140).")]
 [group: 'test']
 test-e2e *args:
-    cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test {{args}}
+    cd e2e && bun install --frozen-lockfile && bun x playwright install chromium firefox webkit && bun x playwright test {{args}}
 
 # Build release binaries
 [group: 'build']
@@ -150,7 +300,7 @@ check-docker:
 # random value for every self-owned secret so a generic password never lands in
 # .env (PMS-490). Only the create path generates; an existing .env is left
 # untouched, so the recipe stays idempotent as a dependency of other recipes.
-# Third-party credentials (Google, Stripe, Twilio, Slack, Infisical client) stay
+# Third-party credentials (Stripe, Twilio, Slack, Infisical client) stay
 # empty placeholders because they cannot be generated. Passwords that get
 # interpolated into postgres:// URLs are hex (URL-safe alphanumeric); the URL
 # lines are rebuilt from the same generated values so host-side tools (sqlx-cli)
@@ -172,6 +322,7 @@ ensure-env:
     let infisical_pg_password = (^openssl rand -hex 24 | str trim)
     let infisical_encryption_key = (^openssl rand -hex 16 | str trim)
     let infisical_auth_secret = (^openssl rand -base64 32 | str trim)
+    let minio_root_password = (^openssl rand -hex 24 | str trim)
     # Scalar KEY=value replacements plus URL lines rebuilt from the same passwords.
     let overrides = {
         MOKOSH_PG_PASSWORD: $pg_password
@@ -182,6 +333,7 @@ ensure-env:
         INFISICAL_PG_PASSWORD: $infisical_pg_password
         INFISICAL_ENCRYPTION_KEY: $infisical_encryption_key
         INFISICAL_AUTH_SECRET: $infisical_auth_secret
+        MINIO_ROOT_PASSWORD: $minio_root_password
         DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
         MOKOSH_ADMIN_DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
         MOKOSH_APP_DATABASE_URL: $"postgres://mokosh_app:($app_password)@localhost:5433/mokosh"
@@ -204,7 +356,7 @@ ensure-env:
     $"($rendered)\n" | save .env
     print "ensure-env: created .env with freshly generated self-owned secrets"
 
-# Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical — use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
+# Bring up the Traefik-routed dev stack (mokosh-server + Postgres + mailpit; no Infisical, use just dev-infisical). Routed at https://{USER}-mokosh-api.a8n.run. Trailing args go to `docker compose up` (e.g. --build --detach).
 [doc("Start the Traefik-routed dev stack in Docker. Trailing args go to `docker compose up` (e.g. --build --detach).")]
 [group: 'dev']
 dev *args: ensure-env
@@ -260,14 +412,60 @@ dev-infisical *args: ensure-env
     let updated = (
         open .env --raw
         | lines
-        | where not ($it | str starts-with 'MOKOSH_SERVER_INFISICAL_BASE_URL=')
-        | append 'MOKOSH_SERVER_INFISICAL_BASE_URL=http://infisical:8080'
+        | where not ($it | str starts-with 'MOKOSH_SERVER_INFISICAL_ADDRESS=')
+        | append 'MOKOSH_SERVER_INFISICAL_ADDRESS=http://infisical:8080'
         | str join "\n"
     )
     if ('.env.new' | path exists) { rm .env.new }
     $"($updated)\n" | save .env.new
     mv .env.new .env
     docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
+
+# Start only MinIO (opt-in; not started by `just dev`). PMS-958.
+[doc("Start a MinIO object store and point the blank S3_* keys in .env at it (compose profile: s3)")]
+[group: 'dev']
+dev-s3 *args: ensure-env
+    #!/usr/bin/env nu
+    # Fill in the S3_* keys that are blank so `just test-integration` runs the
+    # S3 suite against this MinIO. STORAGE_BACKEND is left alone on purpose:
+    # the server keeps writing to the attachments volume until an operator
+    # sets it to `s3` and restarts `server`, the way `dev-infisical` only
+    # points at Infisical and never flips SECRET_BACKEND.
+    let lines = (open .env --raw | lines)
+    def value-of [lines: list<string>, key: string] {
+        $lines
+        | where ($it | str starts-with $"($key)=")
+        | append $"($key)="
+        | first
+        | str replace $"($key)=" ''
+        | str trim
+    }
+    let root_user = (value-of $lines 'MINIO_ROOT_USER')
+    let root_password = (value-of $lines 'MINIO_ROOT_PASSWORD')
+    if ($root_user | is-empty) or ($root_password | is-empty) {
+        error make { msg: "MINIO_ROOT_USER / MINIO_ROOT_PASSWORD are missing or blank in .env; copy both keys from .env.example and give the password a value (a .env generated before PMS-958 has neither)" }
+    }
+    let wanted = {
+        S3_ENDPOINT: 'http://minio:9000'
+        S3_BUCKET: 'mokosh'
+        S3_REGION: 'us-east-1'
+        S3_PATH_STYLE: 'true'
+        S3_ACCESS_KEY_ID: $root_user
+        S3_SECRET_ACCESS_KEY: $root_password
+    }
+    mut updated = $lines
+    for key in ($wanted | columns) {
+        if (value-of $updated $key | is-not-empty) { continue }
+        $updated = (
+            $updated
+            | where not (($it | str starts-with $"($key)=") or ($it | str starts-with $"# ($key)="))
+            | append $"($key)=($wanted | get $key)"
+        )
+    }
+    if ('.env.new' | path exists) { rm .env.new }
+    $"($updated | str join "\n")\n" | save .env.new
+    mv .env.new .env
+    docker compose --file {{ compose_file }} --profile s3 up {{ args }} minio
 
 # Stop the dev stack. Volumes preserved. `--remove-orphans` cleans up any
 # stray containers left over from an older multi-file layout.
@@ -326,7 +524,7 @@ migrate-create name:
 
 # -- Cleanup ------------------------------------------------------------------
 
-# Tear down this repo's dev footprint: stop the dev stack (compose.dev.yml) with its network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
+# Tear down this repo's dev footprint: stop the dev stack (compose.dev.yml) with its network, remove this repo's named volumes (Postgres data, Infisical Postgres data, cargo build target, uploaded attachments/logos), delete the local target/ build dir, and remove the generated .env. Scoped to this repo via the ${USER}-suffixed volume names; safe on a shared host.
 [group: 'cleanup']
 dev-clean: ensure-env
     #!/usr/bin/env nu
@@ -336,6 +534,8 @@ dev-clean: ensure-env
         $"dev-mokosh-postgres-data-($suffix)"
         $"dev-mokosh-infisical-postgres-data-($suffix)"
         $"dev-mokosh-server-target-($suffix)"
+        # PMS-836: uploads (ticket attachments + tenant logos under ATTACHMENT_DIR).
+        $"dev-mokosh-attachments-($suffix)"
     ]
     let existing = docker volume ls --quiet | lines
     for vol in $vols {
@@ -377,6 +577,7 @@ dev-clean-all: dev-clean
 
 # Create a release: bump major (vx.0.0), minor (v0.x.0), or hotfix (v0.0.x), push the branch, and open the PR via fj.
 # After the PR merges, the create-release workflow creates the tag and release automatically.
+[doc("Bump the version (major|minor|hotfix), push the release branch, and open the release PR.")]
 [group: 'release']
 create-release bump: ensure-env
     #!/usr/bin/env nu

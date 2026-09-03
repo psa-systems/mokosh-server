@@ -37,6 +37,10 @@ jobs:
     name: Gate (release-branch merges only)
     # Base label: one bash branch-name test, no compile.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+
+    # Backstop, not a target (PMS-829): one bash branch-name test, observed in
+    # seconds. Nothing here can legitimately take minutes.
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
@@ -63,6 +67,12 @@ jobs:
     if: needs.gate.outputs.do_release == 'true'
     # Base label: nu + git + the Forgejo release API, no compile.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+
+    # Backstop, not a target (PMS-829): this workflow's green runs topped out at
+    # 1.2 minutes end to end, and most of those measure `gate` alone because
+    # this job only runs on a release-branch merge. The headroom is for the
+    # `fetch-depth: 0` clone and the release API call.
+    timeout-minutes: 15
     permissions:
       contents: write
 

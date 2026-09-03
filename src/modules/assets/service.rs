@@ -137,7 +137,7 @@ impl AssetsService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("AssetType".to_string()));
+            return Err(AppError::NotFound("Asset type".to_string()));
         }
         tx.commit().await?;
         Ok(AssetTypeResponse {
@@ -160,7 +160,7 @@ impl AssetsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("AssetType".to_string()));
+            return Err(AppError::NotFound("Asset type".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -197,8 +197,14 @@ impl AssetsService {
         // search; without this the picker's `?q=...` was silently
         // dropped, so the dropdown listed every asset regardless of
         // typed text.
+        // PMS-894: also match the serial number. The SPA's asset list searches
+        // both, so a search moved server-side on name alone loses the field an
+        // operator is most likely to paste in - the operator types a serial,
+        // gets nothing, and concludes the asset is not there.
         if filter.q.is_some() {
-            conditions.push(format!("a.name ILIKE ${idx}"));
+            conditions.push(format!(
+                "(a.name ILIKE ${idx} OR a.serial_number ILIKE ${idx})"
+            ));
             idx += 1;
         }
         let where_clause = conditions.join(" AND ");
@@ -683,7 +689,7 @@ impl AssetsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("AssetRelationship".to_string()));
+            return Err(AppError::NotFound("Asset relationship".to_string()));
         }
         tx.commit().await?;
         Ok(())
@@ -754,7 +760,7 @@ impl AssetsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("ConfigurationItem".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Configuration item".to_string()))?;
         let value = crate::utils::crypto::decrypt(&r.value_encrypted, &self.encryption_key)?;
         sqlx::query(
             r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
@@ -843,7 +849,7 @@ impl AssetsService {
             .await?
             .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("ConfigurationItem".to_string()));
+            return Err(AppError::NotFound("Configuration item".to_string()));
         }
         tx.commit().await?;
         Ok(())

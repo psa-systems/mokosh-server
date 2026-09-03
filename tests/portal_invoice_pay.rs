@@ -25,7 +25,7 @@ use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const NO_GATEWAY: &str = "no active payment provider is configured for this account";
+const NO_GATEWAY: &str = "no active payment provider is configured";
 
 async fn seed_contact_with_roles(
     app: &common::TestApp,
@@ -181,7 +181,7 @@ async fn contact_with_invoices_pay_reaches_service_400_no_gateway(pool: PgPool) 
         .or_else(|| body["message"].as_str())
         .unwrap_or("");
     assert!(
-        msg.contains(NO_GATEWAY),
+        msg.to_ascii_lowercase().contains(NO_GATEWAY),
         "PMS-914: no-gateway message expected, got {body}"
     );
 }
@@ -260,7 +260,7 @@ async fn staff_bypasses_invoices_pay_cap_400_no_gateway(pool: PgPool) {
         .or_else(|| body["message"].as_str())
         .unwrap_or("");
     assert!(
-        msg.contains(NO_GATEWAY),
+        msg.to_ascii_lowercase().contains(NO_GATEWAY),
         "PMS-914: no-gateway message expected, got {body}"
     );
 }
@@ -285,7 +285,63 @@ async fn pay_body_rejects_non_url_success_url(pool: PgPool) {
         .expect("pay");
     assert_eq!(
         resp.status(),
-        StatusCode::BAD_REQUEST,
-        "PMS-914: DTO validation must refuse non-URL success_url"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "PMS-914: DTO validation refuses non-URL success_url with 422 (AppError::Validation)"
+    );
+}
+
+/// MAPPS-667 (mokosh-invoices P1b): a Draft invoice cannot be paid. The
+/// pre-P1b guard refused only `void` + `written_off`; a Draft is by
+/// definition an invoice not yet shown to the customer, so paying one
+/// from the contact plane is either a leak (list surfaced a row it
+/// shouldn't have) or an accident on the staff plane that would charge
+/// a card for an amount not yet finalized. Security-review F9.
+#[sqlx::test]
+async fn contact_with_invoices_pay_refuses_draft_400(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "pay-draft", &["Billing Contact"]).await;
+    // Seed a Draft invoice on the contact's own Company. Uses raw SQL
+    // rather than the seed helper so the status is explicit.
+    let invoice_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO invoices (id, tenant_id, invoice_number, company_id, status, \
+         invoice_date, due_date, subtotal, total, amount_paid, balance_due, currency) \
+         VALUES ($1, $2, $3, $4, 'draft', CURRENT_DATE, CURRENT_DATE + 30, 100, 100, 0, 100, 'USD')",
+    )
+    .bind(invoice_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(format!("PIP-DRAFT-{}", &invoice_id.simple().to_string()[..8]))
+    .bind(own_company)
+    .execute(&pool)
+    .await
+    .expect("seed draft invoice");
+
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/invoices/{invoice_id}/pay")))
+        .bearer_auth(&token)
+        .json(&pay_body())
+        .send()
+        .await
+        .expect("pay");
+    // The service's status-guard fires before the no-gateway 400, so a
+    // Draft invoice returns the status-specific error even in the
+    // test's no-gateway environment. Message includes the status name
+    // so a caller can render "This invoice is a draft" copy without
+    // matching on a status-agnostic string.
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "MAPPS-667: pay on a Draft invoice must refuse before the gateway check"
+    );
+    let body: serde_json::Value = resp.json().await.expect("json");
+    let msg = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or("");
+    assert!(
+        msg.contains("'draft'"),
+        "MAPPS-667: refusal message must name the status, got {body}"
     );
 }

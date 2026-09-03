@@ -13,6 +13,7 @@ use std::sync::Arc;
 use axum::{
     extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -20,10 +21,10 @@ use governor::clock::{Clock, DefaultClock};
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 
-use super::models::{PublicFormResponse, PublicSubmissionReceipt, SubmitFormRequest};
+use super::models::SubmitFormRequest;
 use super::service::FormsService;
 use crate::utils::client_ip::{extract_client_ip, trusted_proxies};
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::{rate_limited_response, AppError};
 
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
@@ -95,10 +96,14 @@ fn client_ip(addr: SocketAddr, headers: &HeaderMap) -> IpAddr {
     extract_client_ip(addr.ip(), headers, trusted_proxies())
 }
 
-fn rate_limited(retry_after: u64) -> AppError {
+/// PMS-773: the limiter already computed the wait, so it reaches the client in
+/// the shared 429 (a `Retry-After` header plus `retry_after_seconds`) instead
+/// of being logged and dropped. This surface is the least tolerant of a bare
+/// refusal: the caller is an external client mid-form with no account, and
+/// several of them can share one NAT address.
+fn rate_limited(retry_after: u64) -> Response {
     tracing::warn!(retry_after, "public request-form surface rate limited");
-    let _ = retry_after;
-    AppError::RateLimited
+    rate_limited_response(retry_after, "Too many requests, please try again shortly")
 }
 
 /// Render the form behind a link. Resolving is what validates the token, so a
@@ -109,12 +114,13 @@ async fn get_public_form(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(token): Path<String>,
-) -> AppResult<Json<PublicFormResponse>> {
-    s.limiter
-        .check(client_ip(addr, &headers))
-        .map_err(rate_limited)?;
+) -> Result<Response, AppError> {
+    if let Err(retry_after) = s.limiter.check(client_ip(addr, &headers)) {
+        return Ok(rate_limited(retry_after));
+    }
     let resolved = s.service.resolve_request_token(&token).await?;
-    Ok(Json(s.service.public_form_for_token(&resolved).await?))
+    let form = s.service.public_form_for_token(&resolved).await?;
+    Ok(Json(form).into_response())
 }
 
 /// Submit the form behind a link: validate, store, create the ticket, burn the
@@ -125,14 +131,14 @@ async fn submit_public_form(
     headers: HeaderMap,
     Path(token): Path<String>,
     Json(body): Json<SubmitFormRequest>,
-) -> AppResult<(StatusCode, Json<PublicSubmissionReceipt>)> {
-    s.limiter
-        .check(client_ip(addr, &headers))
-        .map_err(rate_limited)?;
+) -> Result<Response, AppError> {
+    if let Err(retry_after) = s.limiter.check(client_ip(addr, &headers)) {
+        return Ok(rate_limited(retry_after));
+    }
     let resolved = s.service.resolve_request_token(&token).await?;
     let receipt = s
         .service
         .submit_via_request_link(&resolved, &body.payload)
         .await?;
-    Ok((StatusCode::CREATED, Json(receipt)))
+    Ok((StatusCode::CREATED, Json(receipt)).into_response())
 }

@@ -159,6 +159,7 @@ fn default_active() -> String {
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAssetRequest {
     pub asset_tag: Option<String>,
+    #[validate(length(min = 1, max = 255))]
     pub name: Option<String>,
     pub asset_type_id: Option<Uuid>,
     pub site_id: Option<Uuid>,

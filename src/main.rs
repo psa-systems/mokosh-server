@@ -1,8 +1,8 @@
 //! Mokosh Server - API server entrypoint
 
+use mokosh_server::utils::deployment::DeploymentMode;
 use mokosh_server::{api::create_api_router, version::VersionInfo, Database};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// Application configuration loaded from environment
@@ -24,12 +24,12 @@ pub struct AppConfig {
     pub base_url: String,
     pub run_migrations: bool,
     pub encryption_key: String,
-    /// Exact origin allowed to receive `postMessage` from the Google
-    /// OAuth callback HTML (the SPA's browser-visible origin).
+    /// Browser-visible origin of the client that talks to this API: the
+    /// CORS_ORIGIN default and the base for emailed reset / invite links.
     ///
     /// On both deployed environments this is the APEX, not the mokosh-apps
-    /// SPA: bunyip-web hosts the login UI and opens the OAuth popup, so the
-    /// popup's parent-origin check requires the apex byte-for-byte
+    /// SPA: bunyip-web hosts the login UI there, so this is the apex
+    /// byte-for-byte
     /// (staging `https://a8n.systems`, prod `https://psa.systems`). Do not
     /// reuse it as a base for links to mokosh-apps pages - use
     /// [`AppConfig::spa_base_url`].
@@ -39,8 +39,8 @@ pub struct AppConfig {
     /// emailed links to pages that exist ONLY in mokosh-apps.
     ///
     /// Separate from [`AppConfig::client_origin`] and from `BASE_URL`, both of
-    /// which point at the apex on purpose because bunyip-web owns login, the
-    /// OAuth popup and `/reset-password` there. The request-form link is the
+    /// which point at the apex on purpose because bunyip-web owns login and
+    /// `/reset-password` there. The request-form link is the
     /// first emailed link whose page bunyip does NOT have, and pointing it at
     /// the apex sent every client to bunyip's 404.
     ///
@@ -69,9 +69,6 @@ pub struct AppConfig {
     /// staging `https://msp.a8n.systems,https://a8n.systems`, prod
     /// `https://msp.psa.systems,https://psa.systems`).
     pub cors_origins: Vec<String>,
-    /// Lowercased exact-email allowlist; only these emails may auto-provision
-    /// a super_admin on first Google sign-in (everyone else is rejected).
-    pub oauth_super_admin_emails: Vec<String>,
     /// PMS-591: shared secret Bunyip signs its `account_deleted` webhook
     /// payload with. Bunyip signs every outbound webhook with ONE service-wide
     /// HMAC-SHA256 secret (see `bunyip crates/bunyip-domain/src/services/webhook.rs`
@@ -103,6 +100,10 @@ pub struct AppConfig {
     /// effect on the next create call (no restart needed for lowering /
     /// raising - re-read at each create request).
     pub max_tenants: Option<usize>,
+    /// PMS-902 / PMS-904: whether this instance owns its platform identities
+    /// (`self-hosted`, the default) or federates them to Bunyip SSO (`saas`).
+    /// Read from `MOKOSH_DEPLOYMENT_MODE`; see [`DeploymentMode`].
+    pub deployment_mode: DeploymentMode,
 }
 
 /// Dev-only fallback for `JWT_SECRET`. Accepted only in dev/test
@@ -156,7 +157,7 @@ fn is_hex64(s: &str) -> bool {
 /// In dev/test an unset var falls back to `dev_value`. In every other
 /// environment an unset var - or one explicitly set to `dev_value` - is a
 /// fatal boot error, consistent with the other fail-loud startup checks
-/// (SMTP/Google/migrations) (PMS-499).
+/// (SMTP/migrations) (PMS-499).
 fn resolve_secret(
     var_name: &str,
     environment: &str,
@@ -191,16 +192,6 @@ fn resolve_secret(
 impl AppConfig {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         dotenvy::dotenv().ok();
-
-        // Exact-email allowlist (fail-closed): empty by default so no Google
-        // identity can self-provision a super_admin until an operator sets
-        // OAUTH_SUPER_ADMIN_EMAILS explicitly.
-        let oauth_super_admin_emails = std::env::var("OAUTH_SUPER_ADMIN_EMAILS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
 
         let environment =
             std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
@@ -301,7 +292,6 @@ impl AppConfig {
                     vec![std::env::var("CLIENT_ORIGIN")
                         .unwrap_or_else(|_| "http://localhost:4301".to_string())]
                 }),
-            oauth_super_admin_emails,
             bunyip_webhook_secret,
             // PMS-657: optional IP2Location DB path for login-location alerts.
             ip2location_db_path: std::env::var("IP2LOCATION_DB_PATH")
@@ -328,6 +318,10 @@ impl AppConfig {
                 .ok()
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .filter(|n| *n > 0),
+            // PMS-902: self-hosted (default) or saas. Unset and unrecognised
+            // both resolve to self-hosted, so a typo cannot silently stop a
+            // self-hosted deployment's account email.
+            deployment_mode: DeploymentMode::from_env(),
         })
     }
 
@@ -397,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // failed verification migration (040) boot a server that never became
     // healthy - the container went unhealthy and Traefik dropped its router,
     // so every request 404'd with no hint at the real cause. Fail loud at boot,
-    // consistent with the other startup checks (SMTP/Google/ENCRYPTION_KEY/CORS
+    // consistent with the other startup checks (SMTP/ENCRYPTION_KEY/CORS
     // all hard-fail). `RUN_MIGRATIONS=false` still skips the step entirely for
     // operators who manage migrations out of band.
     if config.run_migrations {
@@ -423,24 +417,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Auth: bunyip-as-OP Resource-Server + legacy HS256 cookie (mokosh-auth removed)"
     );
 
-    // Build the Google OAuth client from env. Hard-fail at startup if the
-    // env vars are missing - the /api/v1/auth/google routes would 500 on
-    // every request otherwise, which is harder to diagnose.
-    let google_oauth_config = google_oauth_flow::Config::from_env()
-        .expect("Failed to read GOOGLE_OAUTH_* env (see .env.example)");
-    let google_oauth = Arc::new(
-        google_oauth_flow::Client::new(google_oauth_config)
-            .expect("Failed to build Google OAuth client (invalid redirect URI?)"),
-    );
-
-    // Browsers drop `Secure` cookies on plain HTTP, so disable the flag
-    // only in dev/test. Everywhere else (staging, production, or an
-    // unrecognized ENVIRONMENT) defaults to secure so the OAuth state
-    // cookie is not exposed over a downgraded connection.
-    let cookie_secure = !config.is_dev_or_test();
-
     let encryption_key = mokosh_server::utils::crypto::parse_encryption_key(&config.encryption_key)
         .expect("ENCRYPTION_KEY must be 32 bytes (or 64 hex chars)");
+
+    // PMS-789: load the deployment's product name into the process cache
+    // before anything can render it. Warn-and-continue rather than hard-fail:
+    // the consumers are display strings with a working default, and refusing to
+    // boot over one would be a worse failure than showing "Mokosh".
+    if let Err(e) = mokosh_server::modules::settings::app_name::resolve_and_cache(&db).await {
+        tracing::warn!(error = %e, "could not load the app-name setting; using the default");
+    }
 
     // Build the host-crate mailer. PMS-638: the config resolves from the
     // DB-backed system email setting when present, otherwise the SMTP_* env
@@ -538,6 +524,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
+    // PMS-968: the secret store, built once for the whole process. A
+    // misconfigured backend ends startup here rather than surfacing when a
+    // customer tries to pay. Built before the scheduler because the credential
+    // mover needs it, and shared with the router below so every reader of a
+    // gateway credential is looking in the same place.
+    let secrets = mokosh_server::secrets::store_from_env(db.clone(), encryption_key)
+        .expect("secret store configuration");
+
+    // PMS-958: the object store, built once for the whole process for the
+    // same reason. Every service that keeps bytes reaches it through
+    // `storage::shared()` rather than a constructor argument (there are
+    // thirteen of those constructions across the router, the tenants routes,
+    // billing and the seeders), so this first touch is what turns a
+    // misconfigured backend into a boot failure instead of a 500 on the first
+    // upload.
+    mokosh_server::storage::init_from_env().expect("storage backend configuration");
+
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
     // now run on the Scheduler too; the intervals match their former raw
@@ -603,6 +606,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // /portal/* customer-portal surface. The contact plane replaces
     // it in prompt 004+; export gets rebuilt if the operator still
     // needs it on the contact side.
+
+    // PMS-960: one-shot in effect. A KB attachment used to be stored at a
+    // flat `kb-articles/{id}` with no tenant in the path; it is now under
+    // its tenant like everything else, and this walks the files already on
+    // the volume over to it. The Scheduler fires every job once immediately
+    // at startup, so the work happens at boot without blocking it, and the
+    // hourly interval is what makes a failed rename retry rather than wait
+    // for the next restart. Once every file has moved the tick is one query
+    // that returns no rows.
+    let kb_attachment_mover =
+        mokosh_server::modules::knowledge_base::KbAttachmentMover::new(db.clone());
+    scheduler.register(kb_attachment_mover, std::time::Duration::from_secs(3600));
+
+    // PMS-968: one-shot move of pre-existing gateway credentials into the
+    // configured secret store. The scheduler fires every job once at startup,
+    // so an hour gives the one-shot behaviour plus a retry if the store was
+    // briefly unreachable, and once the move is done the tick is one query
+    // returning no rows.
+    let gateway_credential_mover = mokosh_server::modules::billing::GatewayCredentialMover::new(
+        db.clone(),
+        secrets.clone(),
+        encryption_key,
+    );
+    scheduler.register(
+        gateway_credential_mover,
+        std::time::Duration::from_secs(3600),
+    );
+
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.
@@ -652,12 +683,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let psa_router = create_api_router(
         db.clone(),
         config.jwt_secret,
-        google_oauth,
         config.client_origin,
         config.spa_base_url,
         config.cors_origins,
-        config.oauth_super_admin_emails,
-        cookie_secure,
         bunyip_verifier,
         shared_mailer,
         encryption_key,
@@ -668,6 +696,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.abuse_contact_email,
         config.public_api_base_url,
         config.max_tenants,
+        config.deployment_mode,
+        secrets.clone(),
     );
     let router = psa_router;
 

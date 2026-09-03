@@ -243,14 +243,18 @@ fn render_snapshot(name: &str, layout: &serde_json::Value) -> String {
 }
 
 /// Pull a flat list of widget keys / labels out of the SPA-owned
-/// `layout` blob. The blob is opaque to the server, but the SPA
-/// convention (PMS-453) is one of:
+/// `layout` blob. The blob is opaque to the server; the shape the SPA
+/// actually writes (PMS-453) is
+/// `{ "widgets": [{"widget_key": "...", "grid_col": 1, ...}, ...] }`,
+/// and these hand-authored shapes are also accepted:
 ///   - `{ "widgets": [{"key": "..."}, ...] }`
 ///   - `{ "widgets": ["...", ...] }`
 ///   - `{ "rows": [{"widgets": [...]}, ...] }`
 ///
-/// This pulls keys from any of the three shapes; unknown shapes
-/// return an empty Vec so the snapshot still renders.
+/// This pulls keys from any of the shapes; unknown shapes return an
+/// empty Vec so the snapshot still renders. The raw key is rendered
+/// rather than a catalog title because the widget catalog lives in the
+/// SPA, not here.
 fn extract_widget_keys(layout: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
     walk(layout, &mut out);
@@ -260,10 +264,15 @@ fn extract_widget_keys(layout: &serde_json::Value) -> Vec<String> {
 fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
     match v {
         serde_json::Value::Object(map) => {
-            if let Some(key) = map.get("key").and_then(|k| k.as_str()) {
-                out.push(key.to_string());
-            } else if let Some(label) = map.get("label").and_then(|l| l.as_str()) {
-                out.push(label.to_string());
+            // `widget_key` is what the SPA's WidgetSpec serialises; `key`
+            // and `label` stay as fallbacks for hand-authored blobs.
+            let name = map
+                .get("widget_key")
+                .and_then(|v| v.as_str())
+                .or_else(|| map.get("key").and_then(|v| v.as_str()))
+                .or_else(|| map.get("label").and_then(|v| v.as_str()));
+            if let Some(name) = name {
+                out.push(name.to_string());
             }
             for child in map.values() {
                 walk(child, out);
@@ -287,24 +296,55 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The exact document the SPA's `WidgetSpec` serialises (PMS-770).
     #[test]
     fn snapshot_lists_widget_keys() {
         let layout = json!({
             "widgets": [
-                {"key": "open_tickets", "size": "lg"},
-                {"key": "weekly_hours", "size": "sm"},
+                {"widget_key": "open_tickets", "grid_col": 1, "grid_row": 1, "grid_col_span": 4, "grid_row_span": 1},
+                {"widget_key": "weekly_hours", "grid_col": 1, "grid_row": 2, "grid_col_span": 4, "grid_row_span": 1},
             ]
         });
         let snap = render_snapshot("My Board", &layout);
         assert!(snap.contains("My Board"));
         assert!(snap.contains("open_tickets"));
         assert!(snap.contains("weekly_hours"));
+        assert!(!snap.contains("no widgets configured"));
+    }
+
+    #[test]
+    fn snapshot_lists_legacy_key_and_label_widgets() {
+        let layout = json!({
+            "widgets": [
+                {"key": "open_tickets", "size": "lg"},
+                {"label": "Weekly hours", "size": "sm"},
+            ]
+        });
+        let snap = render_snapshot("Legacy Board", &layout);
+        assert!(snap.contains("open_tickets"));
+        assert!(snap.contains("Weekly hours"));
+        assert!(!snap.contains("no widgets configured"));
     }
 
     #[test]
     fn snapshot_handles_empty_layout() {
         let snap = render_snapshot("Empty", &json!({}));
         assert!(snap.contains("no widgets configured"));
+    }
+
+    /// The empty state belongs to an empty dashboard only, not to the
+    /// populated document the SPA writes.
+    #[test]
+    fn snapshot_empty_state_only_for_empty_widget_list() {
+        let snap = render_snapshot("Empty", &json!({ "widgets": [] }));
+        assert!(snap.contains("no widgets configured"));
+
+        let populated = render_snapshot(
+            "Populated",
+            &json!({ "widgets": [{"widget_key": "open_tickets", "grid_col": 1, "grid_row": 1, "grid_col_span": 4, "grid_row_span": 1}] }),
+        );
+        assert!(populated.contains("open_tickets"));
+        assert!(!populated.contains("no widgets configured"));
     }
 
     #[test]

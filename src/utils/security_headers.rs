@@ -11,13 +11,13 @@
 //! This middleware is the mokosh-server half of that decision: parity with
 //! bunyip-api's `SecurityHeaders`. It attaches HSTS, nosniff, frame-deny, a
 //! restrictive Referrer-Policy / Permissions-Policy, and a CSP tuned for this
-//! surface (a JSON API whose browser-rendered pages are the `not_a_frontend`
-//! fallback and the Google OAuth popup) to every response.
+//! surface (a JSON API whose only browser-rendered page is the
+//! `not_a_frontend` fallback) to every response.
 //!
 //! A header the handler already set wins: the middleware only fills in the
-//! ones that are absent. The OAuth callback relies on that to swap in its own
-//! nonce CSP ([`csp_with_script_nonce`], PMS-691) instead of loosening the
-//! global policy for every response.
+//! ones that are absent. PMS-691's `csp_with_script_nonce` helper went away
+//! with the Google OAuth popup in PMS-837 (its only caller); the `or_insert`
+//! contract stays because it is what lets any future handler own its own CSP.
 
 use axum::http::{header::HeaderName, HeaderValue};
 
@@ -55,17 +55,6 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
          frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
     ),
 ];
-
-/// CSP for a response that must run one specific inline script, identified by
-/// `nonce`. Same denials as the global policy with `script-src 'nonce-...'`
-/// added; deliberately no `'unsafe-inline'`, so only the nonced script runs.
-/// The only caller is the Google OAuth popup page (PMS-691).
-pub fn csp_with_script_nonce(nonce: &str) -> String {
-    format!(
-        "default-src 'none'; script-src 'nonce-{nonce}'; \
-         frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
-    )
-}
 
 /// Axum middleware that adds the [`SECURITY_HEADERS`] set to every response.
 /// Mounted as a global layer on the outermost router so it covers the API, the
@@ -132,9 +121,9 @@ mod tests {
         );
     }
 
-    /// PMS-691: the nonce relaxation belongs to the OAuth callback alone. Every
-    /// other response keeps `default-src 'none'` with no `script-src` at all,
-    /// so an injected inline script has nothing to run under.
+    /// PMS-691 / PMS-837: no response relaxes `script-src` any more. Every
+    /// response keeps `default-src 'none'` with no `script-src` at all, so an
+    /// injected inline script has nothing to run under.
     #[tokio::test]
     async fn global_csp_has_no_script_src_relaxation() {
         let response = app()
@@ -157,7 +146,7 @@ mod tests {
     /// handler set for itself (PMS-691).
     #[tokio::test]
     async fn handler_set_csp_survives_the_middleware() {
-        let handler_csp = csp_with_script_nonce("dGVzdC1ub25jZQ");
+        let handler_csp = "default-src 'none'; img-src 'self'".to_string();
         let expected = handler_csp.clone();
         let app = Router::new()
             .route(
@@ -191,13 +180,5 @@ mod tests {
         );
         // The rest of the set is still filled in.
         assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
-    }
-
-    #[test]
-    fn nonce_csp_denies_everything_but_the_nonced_script() {
-        let csp = csp_with_script_nonce("abc123");
-        assert!(csp.contains("script-src 'nonce-abc123'"), "{csp}");
-        assert!(csp.contains("default-src 'none'"), "{csp}");
-        assert!(!csp.contains("unsafe-inline"), "{csp}");
     }
 }

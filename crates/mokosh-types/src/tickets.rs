@@ -543,26 +543,67 @@ pub enum SlaStatus {
     NotApplicable,
 }
 
-/// Compute the SLA status from the two fields it depends on.
+/// Lower bound on the at-risk lead, so a sub-minute SLA window still warns
+/// before it breaches.
+pub const SLA_AT_RISK_LEAD_FLOOR: chrono::Duration = chrono::Duration::minutes(5);
+/// Upper bound on the at-risk lead, so a multi-week resolution target does not
+/// warn days in advance.
+pub const SLA_AT_RISK_LEAD_CEIL: chrono::Duration = chrono::Duration::hours(24);
+
+/// How long before `due` a milestone counts as at risk: 20% of the SLA window
+/// (`due - created_at`), clamped to `[SLA_AT_RISK_LEAD_FLOOR,
+/// SLA_AT_RISK_LEAD_CEIL]`. A non-positive window falls back to the floor.
 ///
-/// Shared by [`Ticket::sla_status`] and the joined-row mapping in the
-/// server's tickets service, so the threshold logic lives in one place.
-pub fn compute_sla_status(
-    closed_at: Option<DateTime<Utc>>,
-    sla_due_date: Option<DateTime<Utc>>,
-) -> SlaStatus {
-    if closed_at.is_some() {
+/// PMS-893: this is the server's SLA-sweep worker's arithmetic, moved here so
+/// the badge and the alert cannot disagree about when a ticket is in trouble.
+/// The worker's numbers won because they are the ones a human already trusts:
+/// they decide whether somebody gets woken up.
+pub fn sla_at_risk_lead(created_at: DateTime<Utc>, due: DateTime<Utc>) -> chrono::Duration {
+    let window = due - created_at;
+    if window <= chrono::Duration::zero() {
+        return SLA_AT_RISK_LEAD_FLOOR;
+    }
+    // 20% via integer milliseconds to avoid float round-trips.
+    let lead = chrono::Duration::milliseconds(window.num_milliseconds() / 5);
+    lead.clamp(SLA_AT_RISK_LEAD_FLOOR, SLA_AT_RISK_LEAD_CEIL)
+}
+
+/// Everything [`compute_sla_status`] reads, so a caller cannot silently omit
+/// one of the three conditions that stop the clock (PMS-893: omitting two of
+/// them is exactly how the badge came to contradict the alerts).
+#[derive(Debug, Clone, Copy)]
+pub struct SlaClock {
+    pub created_at: DateTime<Utc>,
+    pub sla_due_date: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+    /// PMS-893: resolved stops the clock. The work is done; the ticket is
+    /// often left open only for the customer to confirm, and labelling that
+    /// `Breached` reports a missed SLA that was met.
+    pub resolved_at: Option<DateTime<Utc>>,
+    /// PMS-893: a ticket sitting in a status flagged `is_closed` is finished
+    /// even when no `closed_at` timestamp was stamped.
+    pub status_is_closed: bool,
+}
+
+/// Compute the SLA status of a ticket.
+///
+/// Shared by [`Ticket::sla_status`] and the joined-row mapping in the server's
+/// tickets service, so the threshold logic lives in one place - and, since
+/// PMS-893, by the SLA-sweep worker, so the badge on the screen and the alert
+/// in someone's inbox answer the same question the same way.
+pub fn compute_sla_status(clock: &SlaClock) -> SlaStatus {
+    if clock.closed_at.is_some() || clock.resolved_at.is_some() || clock.status_is_closed {
         return SlaStatus::NotApplicable;
     }
 
-    let Some(due) = sla_due_date else {
+    let Some(due) = clock.sla_due_date else {
         return SlaStatus::NotApplicable;
     };
 
     let now = Utc::now();
     if now > due {
         SlaStatus::Breached
-    } else if (due - now).num_hours() < 2 {
+    } else if now >= due - sla_at_risk_lead(clock.created_at, due) {
         SlaStatus::Warning
     } else {
         SlaStatus::OnTrack
@@ -570,9 +611,19 @@ pub fn compute_sla_status(
 }
 
 impl Ticket {
-    /// Calculate SLA status
+    /// Calculate SLA status.
     pub fn sla_status(&self) -> SlaStatus {
-        compute_sla_status(self.closed_at, self.sla_due_date)
+        compute_sla_status(&SlaClock {
+            created_at: self.created_at,
+            sla_due_date: self.sla_due_date,
+            closed_at: self.closed_at,
+            resolved_at: self.resolved_at,
+            // A `Ticket` carries `status_id`, not the joined status row, so it
+            // cannot tell whether that status is a closed one. False is what
+            // this path already assumed; the server's `TicketResponse` mapping
+            // has the joined flag and passes it.
+            status_is_closed: false,
+        })
     }
 }
 
@@ -615,6 +666,23 @@ pub struct CreateNoteRequest {
     pub send_email: bool,
 }
 
+/// Edit an existing note's text (PMS-931).
+///
+/// Content only. `note_type` is deliberately absent: flipping an internal note
+/// to public would publish text written on the understanding that it never
+/// leaves the building, and flipping a public one to internal would retract
+/// something a customer may already have read. Either is a different operation
+/// from correcting a typo and neither should ride along inside one.
+///
+/// `send_email` is absent for the same shape of reason. It is a create-time
+/// concern: a public note that WAS emailed cannot be edited at all, and one
+/// that was not is not going to start now.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateNoteRequest {
+    #[validate(length(min = 1))]
+    pub content: String,
+}
+
 /// Note response
 #[derive(Debug, Clone, Serialize)]
 pub struct TicketNoteResponse {
@@ -631,6 +699,10 @@ pub struct TicketNoteResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_contact_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    /// PMS-931: when the note was last written. Equal to `created_at` for a
+    /// note nobody has edited, because both come from the same transaction's
+    /// `NOW()`, so a client marks a note as edited on a strict `>`.
+    pub updated_at: DateTime<Utc>,
 }
 
 // ============================================================================
@@ -857,6 +929,100 @@ mod tests {
         assert_eq!(AutomationTrigger::OnSlaBreach.as_str(), "on_sla_breach");
     }
 
+    /// PMS-893: the three conditions that stop the clock, each on its own.
+    ///
+    /// Before this, `compute_sla_status` honoured only `closed_at`, while the
+    /// SLA sweep worker excluded resolved, closed AND closed-status tickets.
+    /// The product gave two answers to one question: the worker stayed quiet
+    /// and the API labelled the same ticket `Breached`.
+    #[test]
+    fn every_way_of_finishing_a_ticket_stops_the_clock() {
+        let overdue = SlaClock {
+            created_at: Utc::now() - chrono::Duration::hours(4),
+            sla_due_date: Some(Utc::now() - chrono::Duration::hours(1)),
+            closed_at: None,
+            resolved_at: None,
+            status_is_closed: false,
+        };
+        // Unfinished and past due is the one case that should be red.
+        assert_eq!(compute_sla_status(&overdue), SlaStatus::Breached);
+
+        assert_eq!(
+            compute_sla_status(&SlaClock {
+                closed_at: Some(Utc::now()),
+                ..overdue
+            }),
+            SlaStatus::NotApplicable,
+        );
+        assert_eq!(
+            compute_sla_status(&SlaClock {
+                resolved_at: Some(Utc::now()),
+                ..overdue
+            }),
+            SlaStatus::NotApplicable,
+            "a resolved ticket has met its SLA; the work is done"
+        );
+        assert_eq!(
+            compute_sla_status(&SlaClock {
+                status_is_closed: true,
+                ..overdue
+            }),
+            SlaStatus::NotApplicable,
+            "a closed status finishes a ticket even with no closed_at stamp"
+        );
+    }
+
+    /// PMS-893: the at-risk band is the worker's, so the badge turns amber when
+    /// the alert fires rather than hours later (or, on a short SLA, hours
+    /// earlier). Pins both clamp ends, because the clamps are what stop a
+    /// month-long target warning for a week and a five-minute one never warning
+    /// at all.
+    #[test]
+    fn the_warning_band_is_proportional_and_clamped() {
+        let created = Utc::now();
+
+        // 20% of a 10-hour window.
+        assert_eq!(
+            sla_at_risk_lead(created, created + chrono::Duration::hours(10)),
+            chrono::Duration::hours(2)
+        );
+        // 20% of 10 minutes is 2, below the floor.
+        assert_eq!(
+            sla_at_risk_lead(created, created + chrono::Duration::minutes(10)),
+            SLA_AT_RISK_LEAD_FLOOR
+        );
+        // 20% of 30 days is 6 days, above the ceiling.
+        assert_eq!(
+            sla_at_risk_lead(created, created + chrono::Duration::days(30)),
+            SLA_AT_RISK_LEAD_CEIL
+        );
+        // A due date at or before creation still warns rather than dividing by
+        // a non-positive window.
+        assert_eq!(sla_at_risk_lead(created, created), SLA_AT_RISK_LEAD_FLOOR);
+        assert_eq!(
+            sla_at_risk_lead(created, created - chrono::Duration::hours(1)),
+            SLA_AT_RISK_LEAD_FLOOR
+        );
+    }
+
+    /// The regression the flat two-hour band caused, stated as a test: on a
+    /// long target the badge stayed green until two hours out, a full day after
+    /// the worker had already sent the at-risk alert.
+    #[test]
+    fn a_long_target_warns_a_day_out_not_two_hours_out() {
+        let created = Utc::now() - chrono::Duration::days(29);
+        let due = Utc::now() + chrono::Duration::hours(20);
+        let clock = SlaClock {
+            created_at: created,
+            sla_due_date: Some(due),
+            closed_at: None,
+            resolved_at: None,
+            status_is_closed: false,
+        };
+        // 20 hours left, inside the 24-hour ceiling: amber, as the worker says.
+        assert_eq!(compute_sla_status(&clock), SlaStatus::Warning);
+    }
+
     #[test]
     fn test_ticket_sla_status() {
         // Create a test ticket
@@ -894,6 +1060,7 @@ mod tests {
             is_billable: false,
             billing_status: BillingStatus::NotBilled,
             asset_id: None,
+            procedure_kb_article_id: None,
             custom_fields: serde_json::json!({}),
             tags: vec![],
             created_by_id: Uuid::new_v4(),
@@ -905,17 +1072,31 @@ mod tests {
         // Test no SLA due date (should be NotApplicable)
         assert_eq!(ticket.sla_status(), SlaStatus::NotApplicable);
 
-        // Test on track (due date in future, more than 2 hours)
-        ticket.sla_due_date = Some(Utc::now() + chrono::Duration::hours(3));
+        // On track: the due date is far enough out that `now` has not reached
+        // `due - lead`. A 10-hour window gives a 2-hour lead.
+        ticket.created_at = Utc::now() - chrono::Duration::hours(1);
+        ticket.sla_due_date = Some(Utc::now() + chrono::Duration::hours(9));
         assert_eq!(ticket.sla_status(), SlaStatus::OnTrack);
 
-        // Test warning (due date in less than 2 hours)
-        ticket.sla_due_date = Some(Utc::now() + chrono::Duration::hours(1));
+        // Warning: inside the final 20% of the window. PMS-893: the band is
+        // proportional, so this 4-hour window warns with 48 minutes left, where
+        // the old flat two hours would have called the whole thing a warning
+        // from the moment it opened.
+        ticket.created_at = Utc::now() - chrono::Duration::hours(3);
+        ticket.sla_due_date = Some(Utc::now() + chrono::Duration::minutes(40));
         assert_eq!(ticket.sla_status(), SlaStatus::Warning);
 
         // Test breached (due date in past)
         ticket.sla_due_date = Some(Utc::now() - chrono::Duration::hours(2));
         assert_eq!(ticket.sla_status(), SlaStatus::Breached);
+
+        // PMS-893: resolving stops the clock. This is the ticket that used to
+        // render a red breach badge after the work was finished, while the SLA
+        // sweep worker - which excludes `resolved_at IS NOT NULL` - had
+        // deliberately never alerted on it.
+        ticket.resolved_at = Some(Utc::now());
+        assert_eq!(ticket.sla_status(), SlaStatus::NotApplicable);
+        ticket.resolved_at = None;
 
         // Test closed ticket (should be NotApplicable)
         ticket.closed_at = Some(Utc::now());

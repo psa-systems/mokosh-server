@@ -11,6 +11,7 @@ use crate::utils::crypto::{generate_token, hash_password};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::validation::slugify;
 
+use super::branding::validate_branding_patch;
 use super::models::*;
 
 /// Resolve the tenant whose migration-`023` seed rows are copied into every
@@ -24,12 +25,22 @@ use super::models::*;
 /// `Uuid::from_u128(1)` (== `00000000-0000-0000-0000-000000000001`), the same
 /// constant `auth::bootstrap` uses. A malformed env value is a configuration
 /// error, not a panic.
+///
+/// PMS-836: an empty value reads as unset, like every other optional var here.
+/// `compose.dev.yml` enumerates the environment, so a forwarded-but-unset key
+/// arrives as `""`; without this it would fail tenant provisioning outright.
 fn seed_source_tenant_id() -> AppResult<Uuid> {
-    match std::env::var("MOKOSH_SEED_TENANT_ID") {
-        Ok(raw) => Uuid::parse_str(raw.trim()).map_err(|e| {
+    parse_seed_source_tenant_id(std::env::var("MOKOSH_SEED_TENANT_ID").ok().as_deref())
+}
+
+/// The pure parse, split out so it is unit-testable without process env
+/// (same shape as `seed::service::seed_enabled_for`).
+fn parse_seed_source_tenant_id(raw: Option<&str>) -> AppResult<Uuid> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(value) => Uuid::parse_str(value).map_err(|e| {
             AppError::Configuration(format!("MOKOSH_SEED_TENANT_ID is not a valid UUID: {e}"))
         }),
-        Err(_) => Ok(Uuid::from_u128(1)),
+        None => Ok(Uuid::from_u128(1)),
     }
 }
 
@@ -89,10 +100,20 @@ fn personal_tenant_name(given_name: Option<&str>, email: Option<&str>) -> String
     }
 }
 
+/// How long a tenant stays memoized as "already seeded" (PMS-777). The entry
+/// is a pure memoization of an idempotent guard, so the only failure mode is a
+/// stale positive after somebody empties a lookup table by hand; it clears
+/// within the TTL and a restart re-checks everything.
+const SEEDED_TENANT_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Cap on memoized tenants (PMS-777). Bounds the map on a deployment with many
+/// tenants; an evicted entry just costs one more probe.
+const SEEDED_TENANT_CAPACITY: u64 = 10_000;
+
 /// Tenant management service
 #[derive(Clone)]
 pub struct TenantService {
-    db: Database,
+    pub(crate) db: Database,
     // PMS-729 finalize: when the notifications dispatcher and the SPA base
     // URL are wired in, `create_tenant` mints a `password_reset_tokens` row
     // for the freshly created admin user and dispatches `auth.welcome` so
@@ -111,6 +132,11 @@ pub struct TenantService {
     /// the env at boot re-boots into the new ceiling with no restart of
     /// downstream services.
     max_tenants: Option<usize>,
+    /// PMS-777: tenants this process has already seen `ensure_default_config`
+    /// succeed for. `ensure_default_config` runs on the per-request bunyip auth
+    /// path, where its three `SELECT EXISTS` guards cost round trips forever to
+    /// answer a question that flips at most once per tenant.
+    seeded_tenants: moka::future::Cache<Uuid, ()>,
 }
 
 impl TenantService {
@@ -120,6 +146,10 @@ impl TenantService {
             notifications: None,
             frontend_base_url: None,
             max_tenants: None,
+            seeded_tenants: moka::future::Cache::builder()
+                .max_capacity(SEEDED_TENANT_CAPACITY)
+                .time_to_live(SEEDED_TENANT_TTL)
+                .build(),
         }
     }
 
@@ -521,6 +551,8 @@ impl TenantService {
     /// did not send would strand the super-admin with a half-created
     /// tenant that already exists in the DB. The admin can still trigger
     /// a password-reset from the login page as a fallback.
+    // Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+    #[allow(dead_code)]
     async fn provision_portal_admin_and_send_welcome(
         &self,
         tenant_id: Uuid,
@@ -570,6 +602,8 @@ impl TenantService {
     /// closed if `own_company_id` is still NULL: that means the
     /// caller skipped `ensure_own_company` (a programming error - the
     /// contacts.company_id FK is NOT NULL).
+    // Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+    #[allow(dead_code)]
     async fn insert_portal_admin_contact(
         &self,
         tenant_id: Uuid,
@@ -819,6 +853,8 @@ impl TenantService {
         // Cross-tenant super-admin read against the RLS-protected `contacts`
         // table: run under the tenant GUC so the SELECT sees the row.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+        #[allow(clippy::type_complexity)]
         let admin: Option<(Uuid, Option<String>, String, String, Option<String>)> = sqlx::query_as(
             "SELECT id, email, first_name, last_name, portal_password_hash FROM contacts \
                  WHERE tenant_id = $1 AND is_portal_user = TRUE AND portal_role = 'admin' \
@@ -900,8 +936,24 @@ impl TenantService {
     /// (`tickets/service.rs`) - 500s. The placement path calls this so any
     /// tenant a user actually lands in is seeded.
     pub async fn ensure_default_config(&self, tenant_id: Uuid) -> AppResult<()> {
-        // This runs on the per-request bunyip auth path (place_bunyip_user), so
-        // the already-seeded common case must stay cheap: a couple of
+        // PMS-777: this runs on the per-request bunyip auth path
+        // (place_bunyip_user). "Cheap" still meant three round-trip-bearing
+        // probes on every authenticated request, forever, for a condition that
+        // flips at most once per tenant. Memoize the Ok answer in process so a
+        // tenant is probed once per TTL instead of once per request; a tenant
+        // this process has not seen still runs the full guarded path below.
+        if self.seeded_tenants.get(&tenant_id).await.is_some() {
+            return Ok(());
+        }
+        self.seed_default_config(tenant_id).await?;
+        self.seeded_tenants.insert(tenant_id, ()).await;
+        Ok(())
+    }
+
+    /// The guarded seeding itself, split out of [`Self::ensure_default_config`]
+    /// so the PMS-777 memo wraps exactly one success path.
+    async fn seed_default_config(&self, tenant_id: Uuid) -> AppResult<()> {
+        // The already-seeded case stays cheap on its own terms too: a couple of
         // `SELECT EXISTS` and no write transaction. The sequence step is guarded
         // here; the lookup step is guarded inside `copy_default_config`.
         //
@@ -1187,16 +1239,13 @@ impl TenantService {
             query.push_str(&format!(", settings = ${}", param_idx));
             param_idx += 1;
         }
-        // PMS-758: an object or nothing. A string or an array here would
-        // replace the document with something no reader can destructure, and
-        // `||` on two non-objects concatenates rather than merges.
+        // PMS-776: check the document before it is merged. These keys are read
+        // by a client, not by us: three of them compose the contact sentence in
+        // a client's email and `logo_url` becomes an `<img src>` in the same
+        // message, so a malformed value is one the MSP appears to have
+        // published. Includes the PMS-758 object check.
         if let Some(branding) = request.branding.as_ref() {
-            if !branding.is_object() {
-                return Err(AppError::validation_field(
-                    "branding",
-                    "must be an object of branding keys",
-                ));
-            }
+            validate_branding_patch(branding)?;
         }
         if request.branding.is_some() {
             // PMS-758: MERGE, not replace. `branding` is a JSONB document and
@@ -1294,6 +1343,8 @@ impl TenantService {
         // column) but TenantAdminInfo.email is String; fill an empty
         // string when absent (the update path 400s empty email inputs
         // so the round-trip is safe).
+        // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+        #[allow(clippy::type_complexity)]
         let admin: Option<(Uuid, Option<String>, String, String, Option<String>)> = sqlx::query_as(
             "SELECT id, email, first_name, last_name, portal_password_hash FROM contacts \
              WHERE tenant_id = $1 AND is_portal_user = TRUE AND portal_role = 'admin' \
@@ -1576,8 +1627,14 @@ impl TenantService {
                 .fetch_one(&mut *tx)
                 .await?;
 
+        // PMS-957: the cast is load-bearing. Postgres `SUM(bigint)` returns
+        // NUMERIC, so decoding it as `i64` fails - and it failed on an EMPTY
+        // table too, because `COALESCE` types its zero to match. This endpoint
+        // therefore 500'd for every tenant since it was written, which is why
+        // nobody noticed the figure it was trying to report was also always
+        // zero: nothing ever got a number back to disbelieve.
         let storage_bytes: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(file_size), 0) FROM files WHERE tenant_id = $1",
+            "SELECT COALESCE(SUM(file_size), 0)::bigint FROM files WHERE tenant_id = $1",
         )
         .bind(tenant_id)
         .fetch_one(&mut *tx)
@@ -1950,8 +2007,8 @@ impl TenantService {
         // Payment terms (PMS-333)
         sqlx::query(
             r#"
-            INSERT INTO payment_terms (tenant_id, name, is_default, is_active, sort_order)
-            SELECT $1, name, is_default, is_active, sort_order
+            INSERT INTO payment_terms (tenant_id, name, is_default, is_active, sort_order, net_days)
+            SELECT $1, name, is_default, is_active, sort_order, net_days
             FROM payment_terms WHERE tenant_id = $2
             "#,
         )
@@ -2058,6 +2115,30 @@ impl TenantService {
         )
         .bind(new_tenant_id)
         .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
+        // PMS-943: timesheets are the one module whose starting value is not the
+        // default tenant's. Copying it would give every self-signed-up personal
+        // tenant the default tenant's `org` answer, which is the submit-a-week-
+        // to-yourself flow this feature exists to remove. It is read off the new
+        // tenant's own `kind` instead, and written after the copy so it wins.
+        //
+        // An UPDATE, not an upsert: the copy above supplies the row, because
+        // migration 120 gives the default tenant one. Should that ever stop
+        // being true, no row means the module is off, which is the safe answer
+        // for a tenant whose kind could not be consulted.
+        sqlx::query(
+            r#"
+            UPDATE module_config mc
+            SET is_enabled = (t.kind = 'org'), updated_at = NOW()
+            FROM tenants t
+            WHERE t.id = mc.tenant_id
+              AND mc.tenant_id = $1
+              AND mc.module_name = 'timesheets'
+            "#,
+        )
+        .bind(new_tenant_id)
         .execute(&mut *tx)
         .await?;
 
@@ -2204,6 +2285,24 @@ impl From<TenantRow> for Tenant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PMS-836: compose.dev.yml forwards this key with an empty default, so
+    // "set but empty" has to mean the same as unset.
+    #[test]
+    fn an_empty_seed_tenant_id_falls_back_to_the_migration_seed() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                parse_seed_source_tenant_id(raw).unwrap(),
+                Uuid::from_u128(1),
+                "{raw:?} must read as unset"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_seed_tenant_id_is_a_configuration_error() {
+        assert!(parse_seed_source_tenant_id(Some("not-a-uuid")).is_err());
+    }
 
     #[test]
     fn a_real_given_name_wins() {

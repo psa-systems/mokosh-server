@@ -7,7 +7,14 @@
 // billing, tickets, forms) are unconditional, and a single-tenant build still
 // has an organisation with a name.
 pub mod identity;
+// PMS-776: the shape table for a branding value a client is shown. Ungated for
+// the same reason, and one gate looser than the rest of the tenant surface
+// because the settings validator that shares it is ungated.
+pub mod branding;
 mod models;
+// PMS-896: the organisation record as onboarding submits it. Ungated with
+// `branding`, whose table it validates against.
+pub mod organization;
 
 // PMS-21 AC3: `routes` and `service` only need to exist when this
 // build actually exposes tenant management. The router gates the
@@ -15,8 +22,9 @@ mod models;
 // gate to match drops the unused-code compilation in single-tenant
 // builds (previously the modules compiled as dead code under the
 // looser `feature = "server"` gate).
-// MAPPS-429: tenant logo storage. Gated with the rest of the tenant surface.
-#[cfg(all(feature = "server", feature = "multi-tenant"))]
+// MAPPS-429: tenant logo storage. Ungated since PMS-776: `branding` validates
+// `logo_mime` and `logo_url` against the same set the upload and the public
+// route use, and `branding` is reachable from the ungated settings validator.
 pub mod logo;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
 mod routes;

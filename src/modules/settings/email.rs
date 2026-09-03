@@ -66,6 +66,14 @@ pub struct EmailSettingsInput {
     pub password: Option<String>,
 }
 
+/// PMS-788: address for `POST /settings/email/test-send`. Sends a one-off test
+/// message through the live mailer so email can be exercised without going
+/// through a password reset.
+#[derive(Debug, Deserialize)]
+pub struct TestEmailRequest {
+    pub to: String,
+}
+
 /// Read view for `GET /settings/email`. The password is never returned; only
 /// whether one is set.
 #[derive(Debug, Serialize)]
@@ -187,7 +195,7 @@ pub async fn put_email_settings(
     }
     if let Some(from) = input.from.as_deref().filter(|s| !s.is_empty()) {
         from.parse::<lettre::message::Mailbox>().map_err(|e| {
-            AppError::BadRequest(format!("from {from:?} is not a valid address: {e}"))
+            AppError::BadRequest(format!("From {from:?} is not a valid address: {e}"))
         })?;
     }
 

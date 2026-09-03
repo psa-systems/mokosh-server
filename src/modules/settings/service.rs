@@ -108,7 +108,7 @@ impl SettingsService {
         .bind(key)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or_else(|| AppError::NotFound("TenantSetting".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Tenant setting".to_string()))?;
         Ok(row.into())
     }
 
@@ -164,7 +164,7 @@ impl SettingsService {
         .rows_affected();
         tx.commit().await?;
         if n == 0 {
-            return Err(AppError::NotFound("TenantSetting".to_string()));
+            return Err(AppError::NotFound("Tenant setting".to_string()));
         }
         Ok(())
     }
@@ -353,6 +353,24 @@ pub async fn read_max_minutes_per_day(db: &Database, tenant_id: TenantId) -> App
         .map(|n| n.clamp(1, 24))
         .unwrap_or(24);
     Ok((hours as i32) * 60)
+}
+
+/// PMS-943: does this employer track breaks (`timesheets/track_breaks`)?
+///
+/// Tenant-level rather than per company: the employee taking the break is the
+/// MSP's, and a client company has none of the MSP's staff, so a per-company
+/// setting would be keyed on the wrong entity. Unset means off, so an employer
+/// that has never thought about it is not asked to.
+pub async fn read_track_breaks(db: &Database, tenant_id: TenantId) -> AppResult<bool> {
+    let mut tx = db.begin_with_tenant(tenant_id).await?;
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'timesheets' AND key = 'track_breaks'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(value.and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
 /// PMS-469: read the fallback `companies.id` that the email-intake

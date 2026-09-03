@@ -8,8 +8,6 @@
 //! in both places or one path stayed vulnerable. This module owns the
 //! single source of truth.
 
-use std::net::IpAddr;
-
 /// What the login handler should do about a login-location observation.
 ///
 /// - `Record` on a first login (`previous == None`): stamp the country
@@ -37,33 +35,10 @@ pub fn login_location_decision(previous: Option<&str>, current: &str) -> LoginLo
     }
 }
 
-/// Private / loopback / link-local / unspecified / broadcast addresses
-/// can never map to a public country. Skip them so a request behind a
-/// misconfigured proxy (or in dev) does not register as a country
-/// change.
-///
-/// Handles the IPv4-mapped-IPv6 case (`::ffff:a.b.c.d`) that the v6
-/// predicates alone miss - see post-code-review finding #9.
-pub fn is_non_public_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_non_public_ip(&IpAddr::V4(v4));
-            }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-        }
-    }
-}
+// PMS-805 makes `crate::utils::net::is_non_public_ip` the sole definition
+// (its `exactly_one_definition_in_the_crate` test enforces this). Callers on
+// the contact-login branch that used this module's copy should import from
+// `crate::utils::net` directly.
 
 #[cfg(test)]
 mod tests {
@@ -93,43 +68,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn public_ipv4_is_geolocatable() {
-        assert!(!is_non_public_ip(&"203.0.113.7".parse().unwrap()));
-    }
-
-    #[test]
-    fn private_ipv4_ranges_are_non_public() {
-        for ip in [
-            "10.0.0.1",
-            "172.16.0.1",
-            "192.168.1.1",
-            "127.0.0.1",
-            "169.254.0.1",
-            "0.0.0.0",
-        ] {
-            assert!(is_non_public_ip(&ip.parse().unwrap()), "{ip}");
-        }
-    }
-
-    #[test]
-    fn ipv6_loopback_and_link_local_are_non_public() {
-        for ip in ["::1", "fe80::1", "fc00::1", "::"] {
-            assert!(is_non_public_ip(&ip.parse().unwrap()), "{ip}");
-        }
-    }
-
-    #[test]
-    fn ipv4_mapped_ipv6_private_ranges_are_non_public() {
-        for ip in [
-            "::ffff:10.0.0.1",
-            "::ffff:172.16.0.1",
-            "::ffff:192.168.1.1",
-            "::ffff:127.0.0.1",
-        ] {
-            assert!(is_non_public_ip(&ip.parse().unwrap()), "{ip}");
-        }
-        // A mapped PUBLIC v4 must remain public.
-        assert!(!is_non_public_ip(&"::ffff:203.0.113.7".parse().unwrap()));
-    }
+    // is_non_public_ip tests moved to `crate::utils::net` alongside its
+    // sole definition (PMS-805).
 }

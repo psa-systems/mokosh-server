@@ -2,7 +2,7 @@
 //! JwtClaims.mid + AuthState identity-plane enrichment.
 //!
 //! Covers the wire path the client's `use_memberships_loader`
-//! (mokosh-clients/src/hooks/auth.rs:299) already calls, plus the
+//! (mokosh-apps/src/hooks/auth.rs:299) already calls, plus the
 //! legacy-token fallback path (a pre-phase-2 token with no `mid`
 //! claim still resolves the active membership via
 //! `(email, tenant_id)` lookup so no rolling-deploy 401 storm).

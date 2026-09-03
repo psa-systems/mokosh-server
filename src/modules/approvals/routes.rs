@@ -5,6 +5,16 @@
 //! remaining two prefixes - `/change-requests/...` and `/quotes/...` -
 //! now that migration 078 ships the minimal `change_requests` and
 //! `quotes` parent tables `assert_parent_exists` needs.
+//!
+//! PMS-944 draws a line through the four targets. A `change_request` and a
+//! `quote` approve a DECISION, and a client asking for sign-off on a quote has
+//! nothing to do with employment, so those are untouched. A `time_entry`
+//! approves a unit of WORK, which is the employee-facing control David asked to
+//! confine to timesheets, so both of its routes sit behind `RequireTimesheets`.
+//! A `ticket` needed no change: nothing about a ticket is blocked by an
+//! approval - `tickets` has no approval column, and `ApprovalsService::decide`
+//! writes only its own table - so the sign-off is offered, never required, and
+//! removing it would delete a working feature rather than a gate.
 
 use std::sync::Arc;
 
@@ -20,7 +30,7 @@ use super::models::{
     ApprovalResponse, ApprovalTarget, CreateApprovalRequest, DecideApprovalRequest,
 };
 use super::service::ApprovalsService;
-use crate::modules::auth::RequireAuth;
+use crate::modules::auth::{RequireAuth, RequireTimesheets};
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
@@ -91,12 +101,19 @@ async fn create_for_ticket(
 /// PMS-470: list approvals on a time_entry. Tenant-scoped via the
 /// `time_entries` lookup so a guessed UUID returns 404 instead of an
 /// empty 200 (mirrors the ticket-route posture).
+///
+/// PMS-944: behind `RequireTimesheets`. Approving a unit of work is an
+/// employee-facing control, so it exists where timesheets do and nowhere else.
+/// A one-person MSP has the flag off (PMS-943) and gets a 404 here, which is
+/// what "no approval step exists at all" has to mean for a route: not an empty
+/// list, which would read as a feature that is present and unused.
 async fn list_for_time_entry(
     State(s): State<ApprovalsRouterState>,
     RequireAuth(u): RequireAuth,
+    _timesheets: RequireTimesheets,
     Path(entity_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<ApprovalResponse>>> {
-    assert_parent_exists(&s, "time_entries", u.tenant_id, entity_id).await?;
+    assert_parent_exists(&s, "time_entries", "Time entry", u.tenant_id, entity_id).await?;
     let rows = s
         .service
         .list_for_entity(u.tenant_id, ApprovalTarget::TimeEntry, entity_id)
@@ -104,14 +121,18 @@ async fn list_for_time_entry(
     Ok(Json(rows))
 }
 
+/// PMS-944: behind `RequireTimesheets`, for the reason on `list_for_time_entry`.
+/// This is the one that matters, because it is the only way a time-entry
+/// approval can come into existence.
 async fn create_for_time_entry(
     State(s): State<ApprovalsRouterState>,
     RequireAuth(u): RequireAuth,
+    _timesheets: RequireTimesheets,
     Path(entity_id): Path<Uuid>,
     Json(req): Json<CreateApprovalRequest>,
 ) -> AppResult<Json<ApprovalResponse>> {
     req.validate().map_err(AppError::from)?;
-    assert_parent_exists(&s, "time_entries", u.tenant_id, entity_id).await?;
+    assert_parent_exists(&s, "time_entries", "Time entry", u.tenant_id, entity_id).await?;
     let row = s
         .service
         .create_for_entity(u.tenant_id, ApprovalTarget::TimeEntry, entity_id, u.id, req)
@@ -127,7 +148,14 @@ async fn list_for_change_request(
     RequireAuth(u): RequireAuth,
     Path(entity_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<ApprovalResponse>>> {
-    assert_parent_exists(&s, "change_requests", u.tenant_id, entity_id).await?;
+    assert_parent_exists(
+        &s,
+        "change_requests",
+        "Change request",
+        u.tenant_id,
+        entity_id,
+    )
+    .await?;
     let rows = s
         .service
         .list_for_entity(u.tenant_id, ApprovalTarget::ChangeRequest, entity_id)
@@ -142,7 +170,14 @@ async fn create_for_change_request(
     Json(req): Json<CreateApprovalRequest>,
 ) -> AppResult<Json<ApprovalResponse>> {
     req.validate().map_err(AppError::from)?;
-    assert_parent_exists(&s, "change_requests", u.tenant_id, entity_id).await?;
+    assert_parent_exists(
+        &s,
+        "change_requests",
+        "Change request",
+        u.tenant_id,
+        entity_id,
+    )
+    .await?;
     let row = s
         .service
         .create_for_entity(
@@ -162,7 +197,7 @@ async fn list_for_quote(
     RequireAuth(u): RequireAuth,
     Path(entity_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<ApprovalResponse>>> {
-    assert_parent_exists(&s, "quotes", u.tenant_id, entity_id).await?;
+    assert_parent_exists(&s, "quotes", "Quote", u.tenant_id, entity_id).await?;
     let rows = s
         .service
         .list_for_entity(u.tenant_id, ApprovalTarget::Quote, entity_id)
@@ -177,7 +212,7 @@ async fn create_for_quote(
     Json(req): Json<CreateApprovalRequest>,
 ) -> AppResult<Json<ApprovalResponse>> {
     req.validate().map_err(AppError::from)?;
-    assert_parent_exists(&s, "quotes", u.tenant_id, entity_id).await?;
+    assert_parent_exists(&s, "quotes", "Quote", u.tenant_id, entity_id).await?;
     let row = s
         .service
         .create_for_entity(u.tenant_id, ApprovalTarget::Quote, entity_id, u.id, req)
@@ -231,6 +266,7 @@ async fn cancel(
 async fn assert_parent_exists(
     s: &ApprovalsRouterState,
     table: &'static str,
+    noun: &'static str,
     tenant_id: Uuid,
     entity_id: Uuid,
 ) -> AppResult<()> {
@@ -247,9 +283,9 @@ async fn assert_parent_exists(
     .fetch_optional(&mut *tx)
     .await?;
     if exists.is_none() {
-        return Err(AppError::NotFound(format!(
-            "{table} not found in tenant scope"
-        )));
+        // The message names the human noun, not `table`: the raw table name
+        // reached the client as `time_entries not found ...` (PMS-775).
+        return Err(AppError::NotFound(noun.to_string()));
     }
     Ok(())
 }

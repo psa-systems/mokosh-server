@@ -10,8 +10,9 @@ import { attachPageDiagnostics } from '../lib/page-diagnostics';
 // call counts toward the per-email rate limit (5/min in
 // src/modules/auth/routes.rs). Setup runs first (1 login) and may retry
 // once on CI (2). Splitting login/logout into two tests would add another
-// 2-4 logins (test bodies + retries) and cross the cap, so keep auth-ui
-// down to one login attempt per project run.
+// 2-4 logins (test bodies + retries) and cross the cap, so keep this spec
+// down to one login attempt per project run. It runs once per browser
+// project (chromium, firefox, webkit), so the cap is per-browser too.
 //
 // Load-bearing defenses still in tree: the diagnostic capture
 // (`attachPageDiagnostics`) and the click-retry-if-menu-not-open loop in
@@ -22,7 +23,7 @@ import { attachPageDiagnostics } from '../lib/page-diagnostics';
 // PMS-148: re-fixme'd after the PMS-142 v2 un-fixme (PR #130) merged and
 // the post-merge CI run exposed a NEW failure mode unrelated to the
 // original BUNYIP-53 /logout bug (which is now fixed and deployed). The
-// auth-ui project's login deterministically stalls when run after the
+// browser projects' login deterministically stalls when run after the
 // `setup` project finishes: the form submit click no-op's (no POST in
 // the request log), URL stuck at the hub `/login`. Setup's login in the
 // same run succeeds.
@@ -34,8 +35,9 @@ import { attachPageDiagnostics } from '../lib/page-diagnostics';
 // reaches /login, so `expectAtLoginScreen` times out. That is a logout-redirect
 // behaviour question (where should a logged-out user land?), separate from this
 // spec's form-validation purpose and from the login path. Re-`fixme`'d to keep
-// `form-ui` isolated (one fewer login => under the 5/min cap) while the logout
-// redirect is tracked under PMS-148; un-fixme once that lands.
+// `form-validation.spec.ts` the only live browser login (one fewer login =>
+// under the 5/min cap) while the logout redirect is tracked under PMS-148;
+// un-fixme once that lands.
 test.describe('auth login / session', () => {
   test.fixme('login + logout round-trip', async ({ page }) => {
     const diag = attachPageDiagnostics(page);
@@ -61,7 +63,7 @@ test.describe('auth login / session', () => {
 });
 
 // Open the avatar-button user menu in the top bar, then click Logout in the
-// popup. Markup pinned in mokosh-clients/src/components/layout.rs:386 - the
+// popup. Markup pinned in mokosh-apps/src/components/layout.rs:386 - the
 // button carries `aria-label="User menu"`, the dropdown is `role="menu"`,
 // and Logout is a `button` (not an `<a>`) so the menu does not navigate
 // before the SPA's logout handler can clear local state. The logout handler
@@ -101,7 +103,7 @@ async function logout(page: Page): Promise<void> {
     throw new Error(
       `User menu did not open after ${MENU_OPEN_ATTEMPTS} clicks on the avatar ` +
         `(${MENU_OPEN_WAIT_MS / 1000}s wait each). SPA likely still not interactive ` +
-        `or the markup has changed - check mokosh-clients/src/components/layout.rs.`,
+        `or the markup has changed - check mokosh-apps/src/components/layout.rs.`,
     );
   }
 

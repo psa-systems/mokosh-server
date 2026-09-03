@@ -17,14 +17,24 @@
 //!     rules endpoint rejects a template-less rule (PMS-701).
 //!   * An authored `body_html` reaches the mailer as the HTML alternative,
 //!     and a NULL one still sends single-part plain text (PMS-700).
+//!   * The seeded transactional greetings read correctly with and without a
+//!     recipient name (PMS-774).
+//!   * `POST /notifications/preview` renders exactly what `dispatch` would
+//!     send, writes nothing, and stays inside the caller's tenant (PMS-808).
+//!   * A row left claimed (`status = 'sending'`) by a tick that died is
+//!     retried once its claim expires, and a live claim is left alone
+//!     (PMS-782). The rest of PMS-782 lives in
+//!     `tests/notification_dispatch_query_budget.rs` and
+//!     `tests/notification_worker_transactions.rs`, which each need a
+//!     process-global tracing subscriber.
 
 mod common;
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use mokosh_server::modules::notifications::DispatcherWorker;
-use mokosh_server::utils::email::{LogMailer, Mailer};
+use mokosh_server::modules::notifications::{render_template, DispatcherWorker};
+use mokosh_server::utils::email::{salutation, LogMailer, Mailer};
 use mokosh_server::utils::error::AppResult;
 use mokosh_server::Database;
 use sqlx::PgPool;
@@ -469,6 +479,69 @@ async fn seeded_templates_have_real_newlines_and_flat_placeholders(pool: PgPool)
     }
 }
 
+/// PMS-774: every transactional message opens the same way, and reads
+/// correctly when the recipient's name is not known.
+///
+/// Migration 106 moved the greeting word into `forms.request_link` and
+/// `auth.welcome` and left the name in the data. Rendering the seeded bodies
+/// with the blank-name salutation is what proves the pair is in step: a
+/// template that kept its own "Hello" would render "Hello Hello," and one that
+/// still asked for `{{display_name}}` alone would open on a bare comma.
+#[sqlx::test]
+async fn the_seeded_greetings_read_correctly_without_a_name(pool: PgPool) {
+    type BodyRow = (String, Option<String>, Option<String>);
+    for event_type in ["forms.request_link", "auth.welcome"] {
+        let rows: Vec<BodyRow> = sqlx::query_as(
+            "SELECT name, body_text, body_html FROM notification_templates \
+             WHERE event_type = $1 AND channel_type = 'email'",
+        )
+        .bind(event_type)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch the seeded template");
+
+        assert!(!rows.is_empty(), "{event_type} must be seeded");
+
+        for (name, body_text, body_html) in rows {
+            for (column, body) in [("body_text", body_text), ("body_html", body_html)] {
+                let Some(body) = body else { continue };
+                assert!(
+                    body.contains("{{salutation}},"),
+                    "{name}.{column} must open from the shared helper: {body}",
+                );
+
+                // The composers supply both keys on every send, so render with
+                // both: the blank name is the case the greeting has to carry.
+                let context = serde_json::json!({
+                    "salutation": salutation(""),
+                    "display_name": "",
+                });
+                let (rendered, _) = render_template(&body, &context);
+                assert!(
+                    rendered.contains("Hello,"),
+                    "{name}.{column} must greet an unnamed recipient as \"Hello,\": {rendered}",
+                );
+                assert!(
+                    !rendered.contains("Hello ,") && !rendered.contains(">,<"),
+                    "{name}.{column} left a stray space or comma: {rendered}",
+                );
+
+                let (named, _) = render_template(
+                    &body,
+                    &serde_json::json!({
+                        "salutation": salutation("David"),
+                        "display_name": "David",
+                    }),
+                );
+                assert!(
+                    named.contains("Hello David,"),
+                    "{name}.{column} must greet a named recipient once, by name: {named}",
+                );
+            }
+        }
+    }
+}
+
 /// PMS-700: `dispatch` selected `body_html` but never read it, and `deliver`
 /// only ever called the plain-text send, so every authored HTML body was
 /// dropped. The rendered HTML must now ride the `notifications` row and reach
@@ -613,5 +686,357 @@ async fn dispatch_carries_rendered_body_html_to_the_mailer(pool: PgPool) {
         text_send.html.is_none(),
         "a NULL body_html must stay a single-part plain-text send, got: {:?}",
         text_send.html,
+    );
+}
+
+/// Seed one email template + one active rule for `event_type` under
+/// `tenant_id`, shaped like the request-form link the SPA previews
+/// (PMS-808): the company name comes from the context, the link only
+/// exists at send time. Returns the template id.
+async fn seed_preview_rule(pool: &PgPool, tenant_id: Uuid, event_type: &str) -> Uuid {
+    let template_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO notification_templates
+            (id, tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+        VALUES ($1, $2, 'Preview Template', $3, 'email', $4, $5, $6, TRUE)
+        "#,
+    )
+    .bind(template_id)
+    .bind(tenant_id)
+    .bind(event_type)
+    .bind("A form to fill in for {{company_name}}")
+    .bind("Open {{link}} to fill in the form for {{company_name}}.")
+    .bind("<p>Open <a href=\"{{link}}\">the form</a> for {{company_name}}.</p>")
+    .execute(pool)
+    .await
+    .expect("seed preview template");
+
+    sqlx::query(
+        r#"
+        INSERT INTO notification_rules
+            (id, tenant_id, name, event_type, channels, recipients, template_id, is_active)
+        VALUES ($1, $2, 'Request form link', $3, ARRAY['email']::VARCHAR(20)[],
+                '{"user_ids": [], "emails": []}'::jsonb, $4, TRUE)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(event_type)
+    .bind(template_id)
+    .execute(pool)
+    .await
+    .expect("seed preview rule");
+
+    template_id
+}
+
+async fn preview(
+    app: &common::TestApp,
+    token: &str,
+    body: serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let resp = app
+        .client
+        .post(app.url("/api/v1/notifications/preview"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("send preview");
+    let status = resp.status();
+    let text = resp.text().await.expect("preview body");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "preview should 200, got {status} body={text}",
+    );
+    serde_json::from_str::<serde_json::Value>(&text)
+        .expect("preview JSON")
+        .as_array()
+        .expect("preview returns an array")
+        .clone()
+}
+
+/// PMS-808: the preview must be what `dispatch` renders, not a second
+/// copy of the rendering that can drift from it, and asking for it must
+/// leave the queue exactly as it was.
+#[sqlx::test]
+async fn preview_renders_what_dispatch_sends_and_queues_nothing(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let event_type = "test.preview_matches_dispatch";
+    let template_id = seed_preview_rule(&pool, tenant_id, event_type).await;
+
+    // `link` is deliberately absent: it is minted when the mail is sent.
+    let request = serde_json::json!({
+        "event_type": event_type,
+        "context": {
+            "recipient_email": "preview@example.test",
+            "company_name": "Dental Arts Practice",
+        },
+    });
+
+    // Scoped to this test's own template and recipient: the tenant-wide
+    // table also carries whatever the first-visit demo seed dispatches,
+    // which is not synchronous with this request.
+    let queued_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications \
+         WHERE tenant_id = $1 AND (template_id = $2 OR recipient = 'preview@example.test')",
+    )
+    .bind(tenant_id)
+    .bind(template_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count queue before");
+    assert_eq!(queued_before, 0, "fixture starts with an empty queue");
+
+    let entries = preview(&app, &token, request.clone()).await;
+    assert_eq!(entries.len(), 1, "one rule fires: {entries:?}");
+    let entry = &entries[0];
+
+    assert_eq!(entry["rule_name"], "Request form link");
+    assert_eq!(entry["channel"], "email");
+    assert_eq!(
+        entry["recipients"],
+        serde_json::json!(["preview@example.test"]),
+        "recipients come from the rule logic, not from anything the caller can address",
+    );
+    assert_eq!(
+        entry["subject"], "A form to fill in for Dental Arts Practice",
+        "the context keys that ARE present must render",
+    );
+    assert_eq!(
+        entry["unresolved"],
+        serde_json::json!(["link"]),
+        "a send-time value must be named, not fabricated: {entry}",
+    );
+    assert!(
+        entry["body_text"]
+            .as_str()
+            .expect("body_text is a string")
+            .contains("Open {{link}} to fill in the form for Dental Arts Practice."),
+        "an unresolved placeholder stays literal in the body: {entry}",
+    );
+    assert!(
+        entry["body_html"]
+            .as_str()
+            .expect("body_html is a string")
+            .contains("href=\"{{link}}\""),
+        "the HTML alternative renders the same way: {entry}",
+    );
+
+    // Nothing was queued, and nothing was audited, by asking.
+    let queued_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications \
+         WHERE tenant_id = $1 AND (template_id = $2 OR recipient = 'preview@example.test')",
+    )
+    .bind(tenant_id)
+    .bind(template_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count queue after");
+    assert_eq!(
+        queued_after, queued_before,
+        "preview must not write a notifications row",
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE tenant_id = $1 AND entity_type LIKE 'notification%'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit rows");
+    assert_eq!(audited, 0, "preview must not write an audit entry");
+
+    // The same event and context, actually dispatched, must render
+    // identically: one function does the rendering for both paths.
+    let dispatch_resp = app
+        .client
+        .post(app.url("/api/v1/notifications/dispatch"))
+        .bearer_auth(&token)
+        .json(&request)
+        .send()
+        .await
+        .expect("send dispatch");
+    assert!(
+        dispatch_resp.status().is_success(),
+        "dispatch should 2xx, got {}",
+        dispatch_resp.status(),
+    );
+
+    let (subject, body, body_html): (Option<String>, String, Option<String>) = sqlx::query_as(
+        "SELECT subject, body, body_html FROM notifications \
+         WHERE tenant_id = $1 AND template_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(template_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch the dispatched row");
+
+    assert_eq!(
+        entry["subject"].as_str(),
+        subject.as_deref(),
+        "preview subject must equal the dispatched subject",
+    );
+    assert_eq!(
+        entry["body_text"].as_str(),
+        Some(body.as_str()),
+        "preview body_text must equal the dispatched body",
+    );
+    assert_eq!(
+        entry["body_html"].as_str(),
+        body_html.as_deref(),
+        "preview body_html must equal the dispatched body_html",
+    );
+}
+
+/// PMS-808: no active rule means no email would be sent at all, which is
+/// a real answer an operator wants before clicking Send, not an error.
+#[sqlx::test]
+async fn preview_of_an_event_with_no_rule_is_an_empty_array(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let entries = preview(
+        &app,
+        &token,
+        serde_json::json!({
+            "event_type": "test.no_rule_matches_this",
+            "context": {"company_name": "Dental Arts Practice"},
+        }),
+    )
+    .await;
+    assert!(
+        entries.is_empty(),
+        "expected an empty array, got {entries:?}"
+    );
+}
+
+/// PMS-808: the preview reads templates and rules through
+/// `begin_with_tenant` like every other template read, so it cannot show
+/// one tenant what another tenant's mail says.
+#[sqlx::test]
+async fn preview_cannot_read_another_tenants_templates(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let own_token = common::login(&app, &email, &password).await;
+    let event_type = "test.preview_tenant_scope";
+    seed_preview_rule(&pool, common::DEFAULT_TENANT_ID, event_type).await;
+
+    let (other_tenant, _other_id, other_email, other_password) =
+        common::seed_tenant_with_admin(&pool, "preview-other").await;
+    let other_resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": other_email,
+            "password": other_password,
+            "tenant_id": other_tenant,
+        }))
+        .send()
+        .await
+        .expect("send other-tenant login");
+    assert!(
+        other_resp.status().is_success(),
+        "other-tenant login should 2xx, got {}",
+        other_resp.status(),
+    );
+    let other_token = other_resp
+        .json::<serde_json::Value>()
+        .await
+        .expect("login JSON")["access_token"]
+        .as_str()
+        .expect("login response has access_token")
+        .to_string();
+
+    let request = serde_json::json!({
+        "event_type": event_type,
+        "context": {
+            "recipient_email": "preview@example.test",
+            "company_name": "Dental Arts Practice",
+        },
+    });
+
+    // The owning tenant sees its own template...
+    let own = preview(&app, &own_token, request.clone()).await;
+    assert_eq!(own.len(), 1, "the owning tenant sees its rule: {own:?}");
+
+    // ...and the other tenant sees nothing at all for the same event.
+    let other = preview(&app, &other_token, request).await;
+    assert!(
+        other.is_empty(),
+        "a tenant must not preview another tenant's templates, got {other:?}",
+    );
+}
+
+/// PMS-782: a tick claims its batch by flipping rows to `sending` with a
+/// bounded claim (`next_attempt_at = NOW() + the claim timeout`) and only then
+/// sends, so a worker that dies mid-tick leaves rows claimed. A later tick must
+/// pick those rows back up once the claim has expired, and must leave a claim
+/// that is still live alone.
+#[sqlx::test]
+async fn a_stale_claim_is_retried_and_a_live_one_is_left_alone(pool: PgPool) {
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+
+    let stale = Uuid::new_v4();
+    let live = Uuid::new_v4();
+    for (id, claim_offset) in [(stale, "-1 minute"), (live, "10 minutes")] {
+        sqlx::query(
+            r#"INSERT INTO notifications
+                   (id, tenant_id, user_id, channel_type, subject, body, status,
+                    attempt_count, next_attempt_at)
+               VALUES ($1, $2, $3, 'in_app', 'Crashed mid-tick', 'body', 'sending',
+                       1, NOW() + $4::interval)"#,
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(admin_id)
+        .bind(claim_offset)
+        .execute(&pool)
+        .await
+        .expect("seed claimed row");
+    }
+
+    let worker = DispatcherWorker::new(Database::from_pool(pool.clone()), Arc::new(LogMailer));
+    let stats = worker.run_tick(10).await.expect("worker tick");
+
+    assert_eq!(
+        stats.examined, 1,
+        "only the expired claim is due; the live one belongs to another tick",
+    );
+    assert_eq!(stats.sent, 1, "the reclaimed row must be delivered");
+
+    let (status, attempt): (Option<String>, i32) =
+        sqlx::query_as("SELECT status, attempt_count FROM notifications WHERE id = $1")
+            .bind(stale)
+            .fetch_one(&pool)
+            .await
+            .expect("re-fetch the stale row");
+    assert_eq!(
+        status.as_deref(),
+        Some("sent"),
+        "an expired claim must be retried, not stuck in 'sending'",
+    );
+    assert_eq!(
+        attempt, 2,
+        "the reclaiming tick counts as this row's second attempt",
+    );
+
+    let live_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM notifications WHERE id = $1")
+            .bind(live)
+            .fetch_one(&pool)
+            .await
+            .expect("re-fetch the live row");
+    assert_eq!(
+        live_status.as_deref(),
+        Some("sending"),
+        "a claim that has not expired must not be stolen",
     );
 }

@@ -88,8 +88,11 @@ fn default_draft() -> String {
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateKbArticleRequest {
+    #[validate(length(min = 1, max = 255))]
     pub title: Option<String>,
+    #[validate(length(min = 1, max = 255))]
     pub slug: Option<String>,
+    #[validate(length(min = 1))]
     pub content: Option<String>,
     pub summary: Option<String>,
     pub category_id: Option<Uuid>,
@@ -101,6 +104,29 @@ pub struct UpdateKbArticleRequest {
     /// is not `client_specific` the scope is cleared regardless.
     #[serde(default)]
     pub company_ids: Option<Vec<Uuid>>,
+}
+
+/// PMS-922: the in-progress body an author has not saved yet.
+///
+/// Deliberately NOT `UpdateKbArticleRequest`. A draft holds the two fields the
+/// editor changes continuously; everything else (visibility, status, category,
+/// scope) is a deliberate act the author performs once and saves. Widening this
+/// to the whole article would make a draft a shadow copy that can drift from
+/// the record in ways nothing reconciles.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct SaveKbDraftRequest {
+    #[validate(length(min = 1, max = 255))]
+    pub title: String,
+    pub content: String,
+}
+
+/// A stored draft, as the editor reads it back.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbDraftResponse {
+    pub article_id: Uuid,
+    pub title: String,
+    pub content: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]

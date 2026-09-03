@@ -26,8 +26,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use mokosh_types::contacts::{
-    CompanyStatus, CompanyType, ContactType, CreateCompanyRequest, CreateContactRequest,
-    PreferredContactMethod,
+    CompanyStatus, CompanyType, ContactCompanyLinkInput, ContactPhoneInput, ContactType,
+    CreateCompanyRequest, CreateContactRequest, PhoneType, PreferredContactMethod,
 };
 use mokosh_types::tickets::CreateTicketRequest;
 
@@ -158,30 +158,83 @@ pub fn demo_companies(sla_policy_id: Uuid) -> Vec<CreateCompanyRequest> {
         .collect()
 }
 
+/// Index of the demo contact that shows off the PMS-806 collections: linked to
+/// BOTH bundle companies and carrying two phone types, so the feature is
+/// visible in demo data instead of only in tests.
+pub const fn demo_multi_company_contact_index() -> usize {
+    0
+}
+
 /// The demo contacts, each linked to its bundle company via `company_ids`
 /// (indexed by the contact's `company_index`).
+///
+/// One contact (see [`demo_multi_company_contact_index`]) drives the PMS-806
+/// child lists directly; the rest keep the scalar `company_id` / `phone` shape,
+/// so the bundle exercises both write paths.
 pub fn demo_contacts(company_ids: &[Uuid]) -> Vec<CreateContactRequest> {
     demo_seed()
         .contacts
         .iter()
-        .map(|c| CreateContactRequest {
-            company_id: company_ids.get(c.company_index).copied(),
-            company_name: None,
-            first_name: c.first_name.clone(),
-            last_name: c.last_name.clone(),
-            email: Some(c.email.clone()),
-            phone: Some("+1-555-0100".to_string()),
-            mobile: None,
-            fax: None,
-            title: Some(c.title.clone()),
-            department: None,
-            contact_type: ContactType::default(),
-            preferred_contact_method: PreferredContactMethod::default(),
-            timezone: None,
-            custom_fields: serde_json::Value::Null,
-            tags: vec!["demo".to_string()],
-            notes: None,
-            create_portal_access: false,
+        .enumerate()
+        .map(|(i, c)| {
+            let multi = i == demo_multi_company_contact_index() && company_ids.len() >= 2;
+            CreateContactRequest {
+                company_id: if multi {
+                    None
+                } else {
+                    company_ids.get(c.company_index).copied()
+                },
+                company_name: None,
+                first_name: c.first_name.clone(),
+                last_name: c.last_name.clone(),
+                email: Some(c.email.clone()),
+                phone: if multi {
+                    None
+                } else {
+                    Some("+1-555-0100".to_string())
+                },
+                mobile: None,
+                fax: None,
+                title: Some(c.title.clone()),
+                department: None,
+                contact_type: ContactType::default(),
+                preferred_contact_method: PreferredContactMethod::default(),
+                timezone: None,
+                custom_fields: serde_json::Value::Null,
+                tags: vec!["demo".to_string()],
+                notes: None,
+                create_portal_access: false,
+                phones: multi.then(|| {
+                    vec![
+                        ContactPhoneInput {
+                            phone_type: PhoneType::Work,
+                            number: Some("+15550100".to_string()),
+                            extension: Some("204".to_string()),
+                            is_primary: true,
+                        },
+                        ContactPhoneInput {
+                            phone_type: PhoneType::Mobile,
+                            number: Some("+15550188".to_string()),
+                            extension: None,
+                            is_primary: false,
+                        },
+                    ]
+                }),
+                companies: multi.then(|| {
+                    vec![
+                        ContactCompanyLinkInput {
+                            company_id: company_ids[c.company_index],
+                            title: Some(c.title.clone()),
+                            is_primary: true,
+                        },
+                        ContactCompanyLinkInput {
+                            company_id: company_ids[1 - c.company_index],
+                            title: Some("Consulting IT Director".to_string()),
+                            is_primary: false,
+                        },
+                    ]
+                }),
+            }
         })
         .collect()
 }
@@ -307,10 +360,33 @@ mod tests {
         let contacts = demo_contacts(&company_ids);
         assert_eq!(contacts.len(), 4);
         assert_eq!(contacts[0].first_name, "Alice");
+        // PMS-806: every contact except the multi-company demo one keeps the
+        // scalar single-company shape.
         assert!(contacts
             .iter()
             .zip(&seed.contacts)
-            .all(|(dto, src)| dto.company_id == Some(company_ids[src.company_index])));
+            .enumerate()
+            .filter(|(i, _)| *i != demo_multi_company_contact_index())
+            .all(|(_, (dto, src))| dto.company_id == Some(company_ids[src.company_index])));
+
+        // PMS-806: the demo bundle ships one contact linked to BOTH companies
+        // and carrying two phone types, so the feature is visible in demo data.
+        let multi = &contacts[demo_multi_company_contact_index()];
+        assert!(
+            multi.company_id.is_none(),
+            "links drive the write, not the FK"
+        );
+        let links = multi.companies.as_ref().expect("multi-company links");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].company_id, company_ids[0]);
+        assert!(links[0].is_primary);
+        assert_eq!(links[1].company_id, company_ids[1]);
+        assert!(!links[1].is_primary);
+        let phones = multi.phones.as_ref().expect("typed phone list");
+        assert_eq!(phones.len(), 2);
+        assert_eq!(phones[0].phone_type, PhoneType::Work);
+        assert!(phones[0].is_primary);
+        assert_eq!(phones[1].phone_type, PhoneType::Mobile);
 
         let manager = Uuid::new_v4();
         let projects = demo_projects(&company_ids, manager);

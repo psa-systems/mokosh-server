@@ -2,6 +2,7 @@
 
 use crate::modules::auth::TenantId;
 use chrono::Utc;
+use mokosh_types::auth::CurrentUser;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -432,10 +433,7 @@ impl TicketService {
             "NOT EXISTS (SELECT 1 FROM ticket_statuses s \
              WHERE s.id = t.status_id AND s.is_closed = TRUE)",
         );
-        let order_by = pagination.order_by(
-            "t.created_at",
-            &["created_at", "updated_at", "sla_due_date", "priority_id"],
-        );
+        let order_by = pagination.order_by("t.created_at", mokosh_types::sort::TICKETS_BARE)?;
 
         let query = format!(
             r#"
@@ -921,6 +919,150 @@ impl TicketService {
             self.send_note_email(tenant_id, ticket_id, note_id, &request.content)
                 .await;
         }
+
+        self.get_note(tenant_id, note_id).await
+    }
+
+    /// Why a note cannot be edited, or `None` when it can (PMS-931).
+    ///
+    /// An edit rewrites the record of what was said, and for some of these rows
+    /// the record is the point. Returned as a sentence because the caller turns
+    /// it into a 409 and the agent has to be able to act on it.
+    fn note_edit_block(note: &TicketNote) -> Option<String> {
+        // The customer's own words, posted through the portal (PMS-449). An
+        // agent editing them is putting words in the customer's mouth.
+        if note.created_by_contact_id.is_some() {
+            return Some(
+                "This note was written by the customer through the portal and cannot be edited."
+                    .to_string(),
+            );
+        }
+        match note.note_type {
+            // Never left the building.
+            NoteType::Internal | NoteType::Resolution => None,
+            NoteType::Public => {
+                // The customer holds the original in their inbox. Editing this
+                // row makes the system disagree with the customer's own
+                // evidence, which is the disagreement an MSP loses.
+                if note.is_email_sent {
+                    Some(
+                        "This note was emailed to the customer, so the copy they hold cannot be \
+                         changed. Add a new note instead."
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }
+            }
+            // Nothing writes one today, but the type exists to mirror a time
+            // entry and the edit belongs on the entry.
+            NoteType::TimeEntry => {
+                Some("A time-entry note is edited through its time entry.".to_string())
+            }
+        }
+    }
+
+    /// Edit a note's text (PMS-931).
+    ///
+    /// `/tickets/{id}/notes` served GET and POST and nothing else, so a note was
+    /// append-only for everyone at every role, its author included. That is the
+    /// correction MAPPS-593 needed: there was no update path being denied to
+    /// admins, there was no update path.
+    ///
+    /// Two gates, and they answer differently on purpose. WHO may edit is a
+    /// permission, so a caller who is neither the author nor an admin gets 403.
+    /// WHETHER this row may be edited at all is the row's state rather than the
+    /// caller's rights, so it gets 409 with a message naming the reason; see
+    /// [`Self::note_edit_block`].
+    ///
+    /// The audit row carries the old content as well as the new one, which is
+    /// what makes editing acceptable at all: the original survives the edit and
+    /// the change-history pane renders it as a diff like any other change.
+    pub async fn update_note(
+        &self,
+        tenant_id: TenantId,
+        ticket_id: Uuid,
+        note_id: Uuid,
+        editor: &CurrentUser,
+        request: &UpdateNoteRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<TicketNote> {
+        let note = self.get_note(tenant_id, note_id).await?;
+
+        // A note id from another ticket is a 404, not somebody else's note
+        // edited through the wrong path. Same answer as an id that does not
+        // exist, so this is not an existence oracle for other tickets' notes.
+        if note.ticket_id != ticket_id {
+            return Err(AppError::NotFound("Note".to_string()));
+        }
+
+        // The author, or an admin. `Manager` is deliberately absent: editing
+        // another person's words is worth granting on purpose rather than by
+        // inheriting `can_manage_users`.
+        if note.created_by_id != editor.id && !editor.role.is_admin() {
+            return Err(AppError::Forbidden(
+                "You can only edit notes you wrote.".to_string(),
+            ));
+        }
+
+        if let Some(reason) = Self::note_edit_block(&note) {
+            return Err(AppError::Conflict(reason));
+        }
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_notes t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // `updated_at` is set explicitly: `ticket_notes` carries no trigger for
+        // it, which is why the column has sat equal to `created_at` on every row
+        // since migration 005.
+        sqlx::query(
+            "UPDATE ticket_notes SET content = $1, updated_at = NOW() \
+             WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(&request.content)
+        .bind(tenant_id)
+        .bind(note_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // The ticket was touched, the same as adding a note does. NOT
+        // `first_response_at`: that records when the customer was first
+        // answered, which an edit does not change.
+        sqlx::query(
+            "UPDATE tickets SET updated_at = NOW(), last_updated_by_id = $1 \
+             WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(editor.id)
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM ticket_notes t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "ticket_notes",
+            Some(note_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
 
         self.get_note(tenant_id, note_id).await
     }
@@ -1430,7 +1572,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketStatus".to_string()));
+            return Err(AppError::NotFound("Ticket status".to_string()));
         }
         tx.commit().await?;
         Ok(TicketStatus {
@@ -1447,7 +1589,7 @@ impl TicketService {
     /// Delete a ticket status. 409 if still referenced by a ticket.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_status(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
-        self.delete_lookup(tenant_id, "ticket_statuses", id, "TicketStatus", "status")
+        self.delete_lookup(tenant_id, "ticket_statuses", id, "Ticket status", "status")
             .await
     }
 
@@ -1545,7 +1687,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketPriority".to_string()));
+            return Err(AppError::NotFound("Ticket priority".to_string()));
         }
         tx.commit().await?;
         Ok(TicketPriority {
@@ -1567,7 +1709,7 @@ impl TicketService {
             tenant_id,
             "ticket_priorities",
             id,
-            "TicketPriority",
+            "Ticket priority",
             "priority",
         )
         .await
@@ -1651,7 +1793,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketType".to_string()));
+            return Err(AppError::NotFound("Ticket type".to_string()));
         }
         tx.commit().await?;
         Ok(TicketType {
@@ -1668,7 +1810,7 @@ impl TicketService {
     /// Delete a ticket type. 409 if still referenced by a ticket.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_type(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
-        self.delete_lookup(tenant_id, "ticket_types", id, "TicketType", "type")
+        self.delete_lookup(tenant_id, "ticket_types", id, "Ticket type", "type")
             .await
     }
 
@@ -1766,7 +1908,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketQueue".to_string()));
+            return Err(AppError::NotFound("Ticket queue".to_string()));
         }
         tx.commit().await?;
         Ok(TicketQueue {
@@ -1784,7 +1926,7 @@ impl TicketService {
     /// Delete a ticket queue. 409 if still referenced by a ticket.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_queue(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
-        self.delete_lookup(tenant_id, "ticket_queues", id, "TicketQueue", "queue")
+        self.delete_lookup(tenant_id, "ticket_queues", id, "Ticket queue", "queue")
             .await
     }
 
@@ -1943,7 +2085,7 @@ impl TicketService {
         .await?
         .rows_affected();
         if n == 0 {
-            return Err(AppError::NotFound("TicketCategory".to_string()));
+            return Err(AppError::NotFound("Ticket category".to_string()));
         }
         tx.commit().await?;
         Ok(TicketCategoryResponse {
@@ -1964,7 +2106,7 @@ impl TicketService {
             tenant_id,
             "ticket_categories",
             id,
-            "TicketCategory",
+            "Ticket category",
             "category",
         )
         .await
@@ -2317,7 +2459,7 @@ impl TicketService {
         .await?;
         tx.commit().await?;
         row.map(TicketNote::from)
-            .ok_or(AppError::NotFound("TicketNote".to_string()))
+            .ok_or(AppError::NotFound("Ticket note".to_string()))
     }
 
     /// Portal contact reopens one of their own company's tickets. Only
@@ -2578,10 +2720,18 @@ impl TicketService {
             count_where,
             binds,
         } = build_ticket_filter_sql(filter, caller_id, "ts.is_closed = FALSE");
-        let order_by = pagination.order_by(
-            "t.created_at",
-            &["created_at", "updated_at", "sla_due_date", "priority_id"],
-        );
+        // PMS-894: the SPA's ticket list sorts on ticket number, company,
+        // status, priority and assignee, and none of them were sortable here -
+        // `order_by` drops an unknown field and sorts by the default, so a
+        // client that started sending them would have got `created_at DESC`
+        // and a 200. Every expression below names an alias `TICKET_RESPONSE_SELECT`
+        // already establishes; the plain `order_by` cannot express them,
+        // because the name a client sends is not the SQL that sorts by it.
+        //
+        // Priority sorts by `sort_order`, not by name or id: the rank is what
+        // someone means by "sort by priority", and sorting by a UUID is
+        // meaningless while sorting by name puts High above Urgent.
+        let order_by = pagination.order_by_mapped("t.created_at", TICKET_SORT_COLUMNS)?;
 
         let query = format!(
             "{select} WHERE {data_where} ORDER BY {order_by} LIMIT $2 OFFSET $3",
@@ -2675,14 +2825,28 @@ fn build_ticket_filter_sql(
     let mut binds = Vec::new();
 
     if let Some(q) = &filter.q {
-        data_conds.push(format!(
-            "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
-            idx = data_idx
-        ));
-        count_conds.push(format!(
-            "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx})",
-            idx = count_idx
-        ));
+        // PMS-894: the SPA searches company and assignee as well as title and
+        // number, so a search moved server-side without these silently finds
+        // less than the same box did in the browser.
+        //
+        // Correlated EXISTS rather than joins, for two reasons. This predicate
+        // is shared by the data query and by two count queries whose FROM
+        // clauses differ and carry no company or user join, and an INNER JOIN
+        // to `users` would drop every unassigned ticket from the result -
+        // turning a search into a filter nobody asked for. Both tables are
+        // RLS-covered and this runs inside the tenant transaction.
+        let text_match = |idx: u32| {
+            format!(
+                "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx} \
+                  OR EXISTS (SELECT 1 FROM companies c \
+                             WHERE c.id = t.company_id AND c.name ILIKE ${idx}) \
+                  OR EXISTS (SELECT 1 FROM users u \
+                             WHERE u.id = t.assigned_to_id \
+                               AND (u.first_name || ' ' || u.last_name) ILIKE ${idx}))"
+            )
+        };
+        data_conds.push(text_match(data_idx));
+        count_conds.push(text_match(count_idx));
         data_idx += 1;
         count_idx += 1;
         binds.push(TicketFilterBind::Text(format!("%{q}%")));
@@ -2806,7 +2970,10 @@ SELECT
     t.asset_id, t.procedure_kb_article_id,
     t.sla_due_date, t.is_billable, t.billing_status,
     t.estimated_hours, t.actual_hours, t.tags,
-    t.closed_at, t.created_at, t.updated_at,
+    -- PMS-893: `resolved_at` stops the SLA clock, the same way the sweep
+    -- worker has always treated it. Without it here the badge contradicted
+    -- the alerts on every resolved-but-open ticket.
+    t.resolved_at, t.closed_at, t.created_at, t.updated_at,
     ts.id   AS status_id,
     ts.name AS status_name,
     ts.color AS status_color,
@@ -2959,6 +3126,7 @@ struct TicketResponseRow {
     estimated_hours: Option<rust_decimal::Decimal>,
     actual_hours: rust_decimal::Decimal,
     tags: Vec<String>,
+    resolved_at: Option<chrono::DateTime<Utc>>,
     closed_at: Option<chrono::DateTime<Utc>>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
@@ -2980,12 +3148,40 @@ struct TicketResponseRow {
     created_by_name: String,
 }
 
+/// PMS-897: the public sort key each joined column answers to.
+///
+/// The keys are `mokosh_types::sort::TICKETS`, asserted by a test below - this
+/// is the one allow-list the compiler cannot pair for us, because the
+/// expressions must NOT be shared. `order_by_mapped` exists so a joined column
+/// can be sorted without the API ever naming it, and exporting these pairs
+/// would give that away.
+const TICKET_SORT_COLUMNS: &[(&str, &str)] = &[
+    ("created_at", "t.created_at"),
+    ("updated_at", "t.updated_at"),
+    ("sla_due_date", "t.sla_due_date"),
+    ("ticket_number", "t.ticket_number"),
+    ("company_name", "co.name"),
+    ("status", "ts.name"),
+    // The rank, not the id or the name: a UUID is meaningless to sort by, and
+    // the name puts High above Urgent.
+    ("priority", "tp.sort_order"),
+    ("assigned_to_name", "au.first_name"),
+];
+
 impl From<TicketResponseRow> for TicketResponse {
     fn from(r: TicketResponseRow) -> Self {
         // The joined row already carries everything `compute_sla_status`
         // needs, so reuse the shared helper instead of rebuilding a full
-        // Ticket just to call its method.
-        let sla_status = compute_sla_status(r.closed_at, r.sla_due_date);
+        // Ticket just to call its method. PMS-893: that now means all three
+        // conditions that stop the clock, including the two this mapping used
+        // to drop on the floor while the SLA sweep worker honoured them.
+        let sla_status = compute_sla_status(&SlaClock {
+            created_at: r.created_at,
+            sla_due_date: r.sla_due_date,
+            closed_at: r.closed_at,
+            resolved_at: r.resolved_at,
+            status_is_closed: r.status_is_closed.unwrap_or(false),
+        });
 
         TicketResponse {
             id: r.id,
@@ -3193,6 +3389,138 @@ impl From<TicketCategoryRow> for TicketCategoryResponse {
             description: row.description,
             is_active: row.is_active,
             sort_order: row.sort_order,
+        }
+    }
+}
+
+#[cfg(test)]
+mod pms897_tests {
+    use super::TICKET_SORT_COLUMNS;
+
+    /// PMS-897: the one allow-list pairing the compiler cannot check.
+    ///
+    /// Every other `order_by` call site takes `mokosh_types::sort::*` directly,
+    /// so a drift is a compile error. This site cannot: its entries pair a
+    /// public key with a SQL expression, and the expressions must never cross
+    /// the wire, so only the KEY half is shared. This test is what stands in
+    /// for the compiler - add a sortable column here without adding its key to
+    /// the crate and the client will never know it exists; remove one and the
+    /// client will offer a sort that 422s.
+    #[test]
+    fn the_mapped_keys_are_exactly_the_shared_list() {
+        let keys: Vec<&str> = TICKET_SORT_COLUMNS.iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            keys,
+            mokosh_types::sort::TICKETS.to_vec(),
+            "the ticket sort keys must match mokosh_types::sort::TICKETS, in order"
+        );
+    }
+
+    /// And the expressions must stay on this side of the wire.
+    #[test]
+    fn no_sql_expression_leaked_into_the_shared_keys() {
+        for (key, expr) in TICKET_SORT_COLUMNS {
+            assert!(
+                !mokosh_types::sort::TICKETS.contains(expr) || key == expr,
+                "`{expr}` is a SQL expression and must not be an accepted wire key"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pms931_note_edit_tests {
+    use super::*;
+
+    fn note(note_type: NoteType, emailed: bool, contact: Option<Uuid>) -> TicketNote {
+        TicketNote {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            ticket_id: Uuid::new_v4(),
+            note_type,
+            content: "text".to_string(),
+            content_html: None,
+            is_email_sent: emailed,
+            email_sent_at: None,
+            created_by_id: Uuid::new_v4(),
+            created_by_name: None,
+            created_by_contact_id: contact,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// The reported case, and the one that is unambiguously safe: an internal
+    /// note never left the building, so correcting it costs nobody anything.
+    #[test]
+    fn an_internal_note_is_editable() {
+        assert!(TicketService::note_edit_block(&note(NoteType::Internal, false, None)).is_none());
+    }
+
+    /// A resolution note is staff-authored and the portal filters on
+    /// `note_type = 'public'`, so it is not customer-visible either.
+    #[test]
+    fn a_resolution_note_is_editable() {
+        assert!(TicketService::note_edit_block(&note(NoteType::Resolution, false, None)).is_none());
+    }
+
+    /// A public note the customer may have READ in the portal is still
+    /// editable: there is no copy of it outside the system to disagree with.
+    #[test]
+    fn a_public_note_that_was_never_emailed_is_editable() {
+        assert!(TicketService::note_edit_block(&note(NoteType::Public, false, None)).is_none());
+    }
+
+    /// And one that WAS emailed is not, at any role. The customer holds the
+    /// original in their inbox, and an edited row makes the system disagree
+    /// with the customer's own evidence.
+    #[test]
+    fn an_emailed_public_note_is_frozen() {
+        let reason = TicketService::note_edit_block(&note(NoteType::Public, true, None))
+            .expect("an emailed note refuses");
+        assert!(reason.contains("emailed"), "{reason}");
+        assert!(
+            reason.contains("new note"),
+            "and says what to do instead: {reason}"
+        );
+    }
+
+    /// The customer's own words, posted through the portal (PMS-449). An agent
+    /// editing them is putting words in the customer's mouth, so the refusal
+    /// holds whatever the note type says.
+    #[test]
+    fn a_note_the_customer_wrote_is_never_editable_by_an_agent() {
+        for note_type in [NoteType::Public, NoteType::Internal, NoteType::Resolution] {
+            let reason =
+                TicketService::note_edit_block(&note(note_type, false, Some(Uuid::new_v4())))
+                    .expect("a portal-authored note refuses");
+            assert!(reason.contains("customer"), "{note_type:?}: {reason}");
+        }
+    }
+
+    /// Nothing writes one today, but the type mirrors a time entry and the edit
+    /// belongs on the entry rather than on its shadow.
+    #[test]
+    fn a_time_entry_note_is_edited_through_its_time_entry() {
+        let reason = TicketService::note_edit_block(&note(NoteType::TimeEntry, false, None))
+            .expect("a time-entry note refuses");
+        assert!(reason.contains("time entry"), "{reason}");
+    }
+
+    /// Every refusal is a whole sentence an agent can act on, because it
+    /// reaches them as the body of a 409 and "Conflict" alone tells them
+    /// nothing about which of four rules they hit.
+    #[test]
+    fn every_refusal_is_a_sentence() {
+        let refusals = [
+            note(NoteType::Public, true, None),
+            note(NoteType::TimeEntry, false, None),
+            note(NoteType::Internal, false, Some(Uuid::new_v4())),
+        ];
+        for n in refusals {
+            let reason = TicketService::note_edit_block(&n).expect("refuses");
+            assert!(reason.ends_with('.'), "{reason}");
+            assert!(reason.split_whitespace().count() >= 6, "{reason}");
         }
     }
 }

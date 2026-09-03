@@ -714,6 +714,192 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
 }
 
 // ============================================================================
+// PMS-871: users.mfa_secret is AES-256-GCM at rest
+// ============================================================================
+
+/// The key `common::boot` hands `create_api_router`, and therefore the one the
+/// booted `AuthService` seals `users.mfa_secret` with.
+const TEST_ENCRYPTION_KEY: [u8; 32] = [0u8; 32];
+
+async fn stored_mfa_secret(pool: &PgPool, user_id: Uuid) -> String {
+    sqlx::query_scalar::<_, Option<String>>("SELECT mfa_secret FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("read mfa_secret")
+        .expect("mfa_secret is set")
+}
+
+/// PMS-871: enrolment persists ciphertext, not the base32 shared secret, and
+/// the whole enrol -> enable -> login round trip still works over it. Before
+/// this, anyone who could read `users` (a `pg_dump`, a replica, a SQL read
+/// primitive) could mint valid second factors for every user in every tenant.
+#[sqlx::test]
+async fn mfa_enrolment_persists_ciphertext(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let setup: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/setup"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send mfa setup")
+        .json()
+        .await
+        .expect("mfa setup JSON");
+    let secret_b32 = setup["secret"]
+        .as_str()
+        .expect("secret in mfa setup")
+        .to_string();
+    let secret = mokosh_server::utils::totp::base32_decode(&secret_b32).expect("decode mfa secret");
+
+    let stored = stored_mfa_secret(&app.pool, uid).await;
+    assert_ne!(
+        stored, secret_b32,
+        "the column must not hold the base32 secret"
+    );
+    assert!(
+        !stored.contains(&secret_b32),
+        "the column must not embed the base32 secret either"
+    );
+    assert_eq!(
+        mokosh_server::utils::crypto::decrypt(&stored, &TEST_ENCRYPTION_KEY)
+            .expect("stored value is AES-256-GCM ciphertext under ENCRYPTION_KEY"),
+        secret_b32,
+        "and it must decrypt back to exactly that secret"
+    );
+
+    // The staged ciphertext is what `enable_mfa` verifies against.
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let enable = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/enable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "code": code_now }))
+        .send()
+        .await
+        .expect("send mfa enable");
+    assert!(
+        enable.status().is_success(),
+        "enable mfa should succeed, got {}",
+        enable.status()
+    );
+
+    // And so is the login challenge.
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let login = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": code_now,
+        }))
+        .send()
+        .await
+        .expect("send login with mfa_code");
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = login.json().await.expect("login JSON");
+    assert!(
+        !body["access_token"].as_str().unwrap_or("").is_empty(),
+        "TOTP against the encrypted secret must still authenticate"
+    );
+    assert_eq!(
+        stored_mfa_secret(&app.pool, uid).await,
+        stored,
+        "a verification against an already-encrypted row rewrites nothing"
+    );
+}
+
+/// PMS-871: a user enrolled BEFORE the column was encrypted keeps working with
+/// the authenticator they already have, and the row upgrades itself to
+/// ciphertext on that first successful verification. No SQL migration can do
+/// this (a migration has no `ENCRYPTION_KEY`), so an in-place upgrade on use is
+/// what saves every enrolled user a forced re-enrolment.
+#[sqlx::test]
+async fn legacy_plaintext_mfa_secret_logs_in_and_upgrades(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    // Writes the raw base32 secret straight onto the row: exactly the shape
+    // every pre-PMS-871 enrolment left behind.
+    let secret = seed_mfa_enabled(&pool, uid).await;
+    let plaintext = stored_mfa_secret(&pool, uid).await;
+    assert_eq!(
+        mokosh_server::utils::totp::base32_decode(&plaintext).expect("plaintext is base32"),
+        secret,
+        "the fixture really did leave a plaintext secret at rest"
+    );
+    let app = common::boot(pool).await;
+
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let login = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": code_now,
+        }))
+        .send()
+        .await
+        .expect("send login with mfa_code");
+    assert_eq!(
+        login.status(),
+        reqwest::StatusCode::OK,
+        "a pre-encryption enrolment must still be able to log in"
+    );
+    let body: serde_json::Value = login.json().await.expect("login JSON");
+    assert!(
+        !body["access_token"].as_str().unwrap_or("").is_empty(),
+        "the legacy secret verified, so tokens are issued"
+    );
+
+    let upgraded = stored_mfa_secret(&app.pool, uid).await;
+    assert_ne!(
+        upgraded, plaintext,
+        "the successful verification must have rewritten the row as ciphertext"
+    );
+    assert_eq!(
+        mokosh_server::utils::crypto::decrypt(&upgraded, &TEST_ENCRYPTION_KEY)
+            .expect("the upgraded value is ciphertext"),
+        plaintext,
+        "and it must still be the same shared secret"
+    );
+
+    // The upgraded row is what the next login verifies against, on the same
+    // authenticator. A different step than above, so PMS-502 anti-replay does
+    // not reject it for reasons unrelated to this test.
+    let next_step_code = mokosh_server::utils::totp::code_at(
+        &secret,
+        Utc::now() + Duration::seconds(mokosh_server::utils::totp::TOTP_STEP_SECS),
+    );
+    let again = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": next_step_code,
+        }))
+        .send()
+        .await
+        .expect("send second login with mfa_code");
+    assert_eq!(again.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = again.json().await.expect("second login JSON");
+    assert!(
+        !body["access_token"].as_str().unwrap_or("").is_empty(),
+        "the same authenticator still works once the row is encrypted"
+    );
+    assert_eq!(
+        stored_mfa_secret(&app.pool, uid).await,
+        upgraded,
+        "and the upgrade happens once, not on every login"
+    );
+}
+
+// ============================================================================
 // PMS-502: second-factor anti-replay + per-account attempt lockout
 // ============================================================================
 
@@ -878,6 +1064,26 @@ async fn mfa_failed_codes_lock_account(pool: PgPool) {
         reqwest::StatusCode::TOO_MANY_REQUESTS,
         "a correct code is still rejected while the account is locked"
     );
+    // PMS-773: the lockout knows exactly when it lifts, so the refusal says so
+    // in the header and in the body rather than "try again later".
+    let retry_after: u64 = locked
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .expect("the MFA lockout 429 carries a Retry-After header");
+    assert!(retry_after >= 1, "the wait is at least one second");
+    assert_eq!(
+        locked
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "a refusal must never be cached"
+    );
+    let body: serde_json::Value = locked.json().await.expect("429 body is JSON");
+    assert_eq!(body["error"], "rate_limited");
+    assert_eq!(body["retry_after_seconds"], retry_after);
 }
 
 // ============================================================================
@@ -920,7 +1126,6 @@ fn auth_service(pool: &PgPool) -> Arc<AuthService> {
     Arc::new(AuthService::new(
         Database::from_pool(pool.clone()),
         "test-secret".into(),
-        vec![],
     ))
 }
 
@@ -967,7 +1172,7 @@ async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
         match h.await.expect("login task joins") {
             None => panic!("a wrong second-factor code must never log in"),
             Some(AppError::Unauthorized) => evaluated += 1,
-            Some(AppError::RateLimited) => {}
+            Some(AppError::RateLimited { .. }) => {}
             Some(other) => panic!("unexpected login failure: {other:?}"),
         }
     }
@@ -997,9 +1202,10 @@ async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
         .login(&login_request(&email, &password, &codes[20]), None, None)
         .await
         .expect_err("21st attempt must fail");
+    // PMS-773: and it carries the wait, so the caller is told when to return.
     assert!(
-        matches!(err, AppError::RateLimited),
-        "the lockout is armed, so the next attempt is rate-limited, got {err:?}"
+        matches!(err, AppError::RateLimited { retry_after_seconds: Some(secs) } if secs >= 1),
+        "the lockout is armed, so the next attempt is rate-limited with its remaining wait, got {err:?}"
     );
 }
 
@@ -1137,9 +1343,10 @@ async fn failed_recovery_codes_lock_account(pool: PgPool) {
         )
         .await
         .expect_err("4th attempt must fail");
+    // PMS-773: and it carries the wait, so the caller is told when to return.
     assert!(
-        matches!(err, AppError::RateLimited),
-        "the lockout is armed, so the next attempt is rate-limited, got {err:?}"
+        matches!(err, AppError::RateLimited { retry_after_seconds: Some(secs) } if secs >= 1),
+        "the lockout is armed, so the next attempt is rate-limited with its remaining wait, got {err:?}"
     );
 }
 
@@ -1762,11 +1969,7 @@ async fn get_user_sessions_is_tenant_scoped(pool: PgPool) {
         insert_active_session(&pool, common::DEFAULT_TENANT_ID, user_id, "hash-a").await;
     let _session_b = insert_active_session(&pool, tenant_b_id, user_id, "hash-b").await;
 
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let (sessions, total) = auth
         .get_user_sessions(
             common::DEFAULT_TENANT_ID,
@@ -1797,11 +2000,7 @@ async fn logout_all_is_tenant_scoped(pool: PgPool) {
     insert_active_session(&pool, common::DEFAULT_TENANT_ID, user_id, "hash-a").await;
     let session_b = insert_active_session(&pool, tenant_b_id, user_id, "hash-b").await;
 
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     auth.logout_all(common::DEFAULT_TENANT_ID, user_id)
         .await
         .expect("logout_all");
@@ -1827,15 +2026,24 @@ async fn logout_all_is_tenant_scoped(pool: PgPool) {
     );
 }
 
-/// PMS-260: the two intentionally-cross-tenant login helpers
-/// (`auth::find_user_placement`, `invitations::newest_pending_for`) read across
-/// tenants by design and are only safe because the sole caller is the
-/// pre-session bunyip login/placement path (`middleware::place_bunyip_user`).
-/// This guard pins that invariant: no HTTP route handler (`*/routes.rs`) may
-/// reference them, where an authenticated caller could probe other tenants.
+/// PMS-260: the intentionally-cross-tenant login helpers
+/// (`auth::find_user_placement`, `auth::find_bunyip_principal`,
+/// `invitations::newest_pending_for`) read across tenants by design and are
+/// only safe because the sole caller is the pre-session bunyip login/placement
+/// path (`middleware::place_bunyip_user`). This guard pins that invariant: no
+/// HTTP route handler (`*/routes.rs`) may reference them, where an
+/// authenticated caller could probe other tenants.
+///
+/// PMS-777 added `find_bunyip_principal`, which merges the `users` read and the
+/// invite probe into one statement on the same privileged pool, so it inherits
+/// the same restriction.
 #[test]
 fn routes_do_not_reach_global_login_helpers() {
-    const FORBIDDEN: [&str; 2] = ["find_user_placement", "newest_pending_for"];
+    const FORBIDDEN: [&str; 3] = [
+        "find_user_placement",
+        "find_bunyip_principal",
+        "newest_pending_for",
+    ];
 
     let modules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules");
 
@@ -2951,5 +3159,469 @@ async fn client_admin_setup_isolates_credentials_when_email_collides(pool: PgPoo
         account2_hash.as_deref(),
         Some(tenant_b_hash.as_str()),
         "MAPPS-548: tenant-b admin's users row must keep its original hash"
+    );
+}
+
+/// MAPPS-531: signing out invalidates the access token, not only the refresh
+/// session.
+///
+/// `logout` deletes the `user_sessions` row, and until this change nothing on
+/// the access path consulted that table: the middleware decoded the JWT,
+/// checked the user and tenant were active, and let it through. So a bearer
+/// minted just before sign-out kept authenticating every `/api/v1/*` request
+/// for the rest of its hour - the residual half of the defect MAPPS-522 was
+/// filed to close, and the half that lets a signed-out bearer read tenant data.
+#[sqlx::test]
+async fn logout_invalidates_the_access_token_not_just_the_refresh_session(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send /auth/me")
+                .status()
+        }
+    };
+
+    assert_eq!(me(token.clone()).await, reqwest::StatusCode::OK);
+
+    let signed_out = app
+        .client
+        .post(app.url("/api/v1/auth/logout"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send logout");
+    assert!(
+        signed_out.status().is_success(),
+        "logout expected 2xx, got {}",
+        signed_out.status()
+    );
+
+    assert_ne!(
+        me(token).await,
+        reqwest::StatusCode::OK,
+        "the access token must stop working the moment its session is signed out"
+    );
+}
+
+/// MAPPS-531: and it invalidates only THAT session.
+///
+/// This is why the fix keys on the token's `sid` rather than stamping the user
+/// row the way PMS-681 does for a password change: a stamp cannot tell two
+/// sessions apart, so signing out of one device would sign the user out
+/// everywhere. Signing out on a laptop must not sign the same person out on
+/// their phone.
+#[sqlx::test]
+async fn logout_leaves_the_users_other_sessions_alone(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    // Two independent logins for the same user: two `user_sessions` rows, two
+    // access tokens carrying different `sid` claims.
+    let laptop = common::login(&app, &email, &password).await;
+    let phone = common::login(&app, &email, &password).await;
+    assert_ne!(laptop, phone, "two logins must not hand back one token");
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send /auth/me")
+                .status()
+        }
+    };
+
+    let signed_out = app
+        .client
+        .post(app.url("/api/v1/auth/logout"))
+        .bearer_auth(&laptop)
+        .send()
+        .await
+        .expect("send logout");
+    assert!(signed_out.status().is_success());
+
+    assert_ne!(
+        me(laptop).await,
+        reqwest::StatusCode::OK,
+        "the signed-out session is over"
+    );
+    assert_eq!(
+        me(phone).await,
+        reqwest::StatusCode::OK,
+        "the other session is untouched"
+    );
+}
+
+/// PMS-880 (audit F3): `POST /api/v1/auth/logout-all` sheds every device, and
+/// an access token minted before the call is refused on its next request.
+///
+/// This is the compromise-recovery half of the finding: `logout` ends the one
+/// session the caller is holding, and until this route existed nothing reached
+/// `AuthService::logout_all` at all, so "sign me out everywhere" was not a
+/// request a client could make. The rejection rides the same MAPPS-531 `sid`
+/// check the single-session test above pins, which is why no per-user stamp was
+/// added: deleting every row for the user fails that check for every token they
+/// hold.
+#[sqlx::test]
+async fn logout_all_refuses_every_access_token_minted_before_it(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    // Two devices, two sessions, two access tokens.
+    let laptop = common::login(&app, &email, &password).await;
+    let phone = common::login(&app, &email, &password).await;
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send /auth/me")
+                .status()
+        }
+    };
+
+    assert_eq!(me(laptop.clone()).await, reqwest::StatusCode::OK);
+    assert_eq!(me(phone.clone()).await, reqwest::StatusCode::OK);
+
+    // The route is authenticated: an anonymous caller cannot sign anyone out.
+    let anonymous = app
+        .client
+        .post(app.url("/api/v1/auth/logout-all"))
+        .send()
+        .await
+        .expect("send anonymous logout-all");
+    assert_eq!(
+        anonymous.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "logout-all must require a bearer"
+    );
+    assert_eq!(
+        me(phone.clone()).await,
+        reqwest::StatusCode::OK,
+        "the refused call must not have revoked anything"
+    );
+
+    let signed_out = app
+        .client
+        .post(app.url("/api/v1/auth/logout-all"))
+        .bearer_auth(&laptop)
+        .send()
+        .await
+        .expect("send logout-all");
+    assert!(
+        signed_out.status().is_success(),
+        "logout-all expected 2xx, got {}",
+        signed_out.status()
+    );
+
+    assert_ne!(
+        me(laptop).await,
+        reqwest::StatusCode::OK,
+        "the calling device's access token must stop working"
+    );
+    assert_ne!(
+        me(phone).await,
+        reqwest::StatusCode::OK,
+        "an access token minted before logout-all must be refused on its next request"
+    );
+
+    // And the user can sign back in: logout-all revokes, it does not lock out.
+    let _fresh = common::login(&app, &email, &password).await;
+}
+
+/// PMS-880: the third sign-out path, `DELETE /auth/me/sessions/{id}`, revokes
+/// the access token too.
+///
+/// Signing another device out from the sessions screen deletes its
+/// `user_sessions` row, so it fails the same `sid` check `logout` and
+/// `logout-all` fail. Pinned here because "sign out my lost phone" is the one
+/// of the three where a token that outlived the click is most obviously wrong,
+/// and nothing asserted it.
+#[sqlx::test]
+async fn revoking_a_session_refuses_that_devices_access_token(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    let laptop = common::login(&app, &email, &password).await;
+    let phone = common::login(&app, &email, &password).await;
+
+    let me = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me");
+        async move {
+            client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("send /auth/me")
+                .status()
+        }
+    };
+
+    // The laptop lists its sessions and picks the one that is not itself.
+    let listed = app
+        .client
+        .get(app.url("/api/v1/auth/me/sessions"))
+        .bearer_auth(&laptop)
+        .send()
+        .await
+        .expect("GET /auth/me/sessions")
+        .json::<serde_json::Value>()
+        .await
+        .expect("sessions body");
+    let other = listed["data"]
+        .as_array()
+        .expect("sessions array")
+        .iter()
+        .find(|s| s["is_current"] == serde_json::Value::Bool(false))
+        .expect("the other device's session")["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let revoked = app
+        .client
+        .delete(app.url(&format!("/api/v1/auth/me/sessions/{other}")))
+        .bearer_auth(&laptop)
+        .send()
+        .await
+        .expect("send session delete");
+    assert!(
+        revoked.status().is_success(),
+        "session delete expected 2xx, got {}",
+        revoked.status()
+    );
+
+    assert_ne!(
+        me(phone).await,
+        reqwest::StatusCode::OK,
+        "the revoked device's access token must stop working"
+    );
+    assert_eq!(
+        me(laptop).await,
+        reqwest::StatusCode::OK,
+        "the device that did the revoking is untouched"
+    );
+}
+
+// ============================================================================
+// PMS-881 (audit F6): rate limit on the password re-auth
+// ============================================================================
+
+/// PMS-881: `PUT /auth/me/password` re-checks the current password, and that
+/// check is throttled per account (5 failures/min) exactly as `/login` is.
+/// Pre-fix an attacker holding a stolen session could grind the password at
+/// full request rate; the sixth failure now costs a 429 with `Retry-After`.
+#[sqlx::test]
+async fn change_password_reauth_rate_limit_triggers_429(pool: PgPool) {
+    let (_uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let wrong = serde_json::json!({
+        "current_password": "not-the-current-password",
+        "new_password": "a-brand-new-password",
+        "confirm_password": "a-brand-new-password",
+    });
+    let attempt = |body: serde_json::Value| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me/password");
+        let token = token.clone();
+        async move {
+            client
+                .put(url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("send change-password attempt")
+        }
+    };
+
+    // The first five failures are rejected on their merits, not throttled.
+    for i in 0..5 {
+        let resp = attempt(wrong.clone()).await;
+        assert_ne!(
+            resp.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "attempt {i} is within the 5/min account quota"
+        );
+        assert!(
+            resp.status().is_client_error(),
+            "attempt {i} must be rejected, got {}",
+            resp.status()
+        );
+    }
+
+    let resp = attempt(wrong.clone()).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the sixth failed re-auth must trip the limiter"
+    );
+    let secs: u64 = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .expect("Retry-After header present on 429")
+        .to_str()
+        .expect("Retry-After is ASCII")
+        .parse()
+        .expect("Retry-After parses as a positive integer");
+    assert!(secs >= 1, "Retry-After must be at least 1 second");
+    let body: serde_json::Value = resp.json().await.expect("rate-limit body is JSON");
+    assert_eq!(body["error"].as_str(), Some("rate_limited"));
+
+    // And the correct password gets the same 429 while the window is open:
+    // the gate runs before the credential check, so an exhausted budget stops
+    // the guessing rather than merely reporting it differently.
+    let resp = attempt(serde_json::json!({
+        "current_password": password,
+        "new_password": "a-brand-new-password",
+        "confirm_password": "a-brand-new-password",
+    }))
+    .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "an exhausted budget blocks the password comparison itself"
+    );
+}
+
+/// PMS-881: the same holds for `POST /auth/me/mfa/disable`, and the two routes
+/// share ONE budget. Three failures on the password route plus two on the MFA
+/// route is five, so the sixth attempt is throttled on either of them: moving
+/// to the other endpoint must not hand the attacker a fresh budget.
+#[sqlx::test]
+async fn mfa_disable_reauth_shares_the_change_password_budget(pool: PgPool) {
+    let (_uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let bad_change = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me/password");
+        async move {
+            client
+                .put(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "current_password": "not-the-current-password",
+                    "new_password": "a-brand-new-password",
+                    "confirm_password": "a-brand-new-password",
+                }))
+                .send()
+                .await
+                .expect("send change-password attempt")
+        }
+    };
+    let bad_disable = |token: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me/mfa/disable");
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "password": "not-the-current-password" }))
+                .send()
+                .await
+                .expect("send mfa-disable attempt")
+        }
+    };
+
+    for i in 0..3 {
+        let status = bad_change(token.clone()).await.status();
+        assert_ne!(
+            status,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "change-password failure {i} is within quota"
+        );
+    }
+    for i in 0..2 {
+        let status = bad_disable(token.clone()).await.status();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "mfa-disable failure {i} is a rejected re-auth, within quota"
+        );
+    }
+
+    assert_eq!(
+        bad_disable(token.clone()).await.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "five failures across the two routes exhaust the shared budget"
+    );
+    assert_eq!(
+        bad_change(token.clone()).await.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the other route is throttled out of the same budget"
+    );
+}
+
+/// PMS-881: only a FAILED re-auth spends budget. Four failures, then a
+/// successful `disable_mfa`, then a fifth failure - which must still be the
+/// plain 401, because the success in the middle charged nothing. Were success
+/// counted, the fifth would already be over the 5/min account quota.
+#[sqlx::test]
+async fn successful_reauth_does_not_spend_rate_limit_budget(pool: PgPool) {
+    let (_uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let disable = |submitted: String| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/auth/me/mfa/disable");
+        let token = token.clone();
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "password": submitted }))
+                .send()
+                .await
+                .expect("send mfa-disable attempt")
+                .status()
+        }
+    };
+
+    for i in 0..4 {
+        assert_eq!(
+            disable("not-the-current-password".to_string()).await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "failure {i} is within quota"
+        );
+    }
+    assert!(
+        disable(password.clone()).await.is_success(),
+        "the correct password still gets through under quota"
+    );
+    assert_eq!(
+        disable("not-the-current-password".to_string()).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the fifth failure is still within quota: the success spent none of it"
+    );
+    assert_eq!(
+        disable("not-the-current-password".to_string()).await,
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "the sixth failure exhausts it"
     );
 }

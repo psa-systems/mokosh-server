@@ -98,6 +98,7 @@ pub(crate) fn appointment_range_ok(start: DateTime<Utc>, end: DateTime<Utc>) -> 
 
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateAppointmentRequest {
+    #[validate(length(min = 1, max = 255))]
     pub title: Option<String>,
     pub description: Option<String>,
     pub appointment_type: Option<String>,
@@ -361,6 +362,7 @@ pub struct UpdateSchedulingTemplateRequest {
     pub travel_before_minutes: Option<i32>,
     #[validate(range(min = 0))]
     pub travel_after_minutes: Option<i32>,
+    #[validate(length(max = 255))]
     pub default_title: Option<String>,
     pub default_location: Option<String>,
     pub default_ticket_id: Option<Uuid>,

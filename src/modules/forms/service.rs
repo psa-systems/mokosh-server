@@ -270,7 +270,7 @@ impl FormsService {
         .await?;
         if taken {
             return Err(AppError::Conflict(format!(
-                "A form with slug `{}`",
+                "A form with slug `{}` already exists",
                 req.slug
             )));
         }
@@ -318,19 +318,27 @@ impl FormsService {
             check_field_set(fields)?;
         }
         if req.fields.is_some() || req.rules.is_some() {
-            let names: Vec<(String, Option<Vec<String>>)> = match &req.fields {
+            let known: Vec<RuleField> = match &req.fields {
                 Some(fields) => fields
                     .iter()
-                    .map(|f| (f.name.clone(), f.options.clone()))
+                    .map(|f| RuleField {
+                        name: f.name.clone(),
+                        field_type: f.field_type,
+                        options: f.options.clone(),
+                    })
                     .collect(),
                 None => existing
                     .fields
                     .iter()
-                    .map(|f| (f.name.clone(), f.options.clone()))
+                    .map(|f| RuleField {
+                        name: f.name.clone(),
+                        field_type: f.field_type,
+                        options: f.options.clone(),
+                    })
                     .collect(),
             };
             let rules = req.rules.as_deref().unwrap_or(&existing.rules);
-            check_rules_against_names(rules, &names)?;
+            check_rules_against_fields(rules, &known)?;
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -379,82 +387,10 @@ impl FormsService {
         self.get(tenant_id, id).await
     }
 
-    /// Delete a definition. Submissions hold an `ON DELETE RESTRICT` FK, so a
-    /// definition that has ever been submitted cannot be deleted; retire it
-    /// with `is_active = false` instead. That is reported as a 409 rather
-    /// than a raw database error.
-    pub async fn delete(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let submitted: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM form_submissions WHERE tenant_id = $1 AND form_definition_id = $2",
-        )
-        .bind(tenant_id)
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if submitted > 0 {
-            return Err(AppError::Conflict(format!(
-                "This form has {submitted} submission(s) and cannot be deleted; set is_active to false to retire it. A conflicting form"
-            )));
-        }
-        let affected = sqlx::query("DELETE FROM form_definitions WHERE tenant_id = $1 AND id = $2")
-            .bind(tenant_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        tx.commit().await?;
-        if affected == 0 {
-            return Err(AppError::NotFound("Form definition".to_string()));
-        }
-        Ok(())
-    }
-
-    /// Validate a payload against a definition and store it.
-    ///
-    /// A retired (`is_active = false`) definition refuses new submissions:
-    /// retiring is how an operator stops collecting, so accepting one anyway
-    /// would make the flag decorative.
-    pub async fn submit(
-        &self,
-        tenant_id: TenantId,
-        definition_id: Uuid,
-        payload: &serde_json::Value,
-        submitted_by_contact_id: Option<Uuid>,
-    ) -> AppResult<FormSubmissionResponse> {
-        let definition = self.get(tenant_id, definition_id).await?;
-        if !definition.is_active {
-            return Err(AppError::Conflict(
-                "This form has been retired and is no longer accepting submissions. An active form"
-                    .to_string(),
-            ));
-        }
-
-        let normalised = validate_submission(
-            &definition.fields,
-            &definition.rules,
-            payload,
-            Utc::now().date_naive(),
-        )?;
-
-        let id = Uuid::new_v4();
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row = sqlx::query_as::<_, SubmissionRow>(
-            "INSERT INTO form_submissions \
-               (id, tenant_id, form_definition_id, payload, submitted_by_contact_id) \
-             VALUES ($1, $2, $3, $4, $5) \
-             RETURNING id, form_definition_id, payload, submitted_by_contact_id, ticket_id, created_at",
-        )
-        .bind(id)
-        .bind(tenant_id)
-        .bind(definition_id)
-        .bind(serde_json::Value::Object(normalised))
-        .bind(submitted_by_contact_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(row.into())
-    }
+    // PMS-840: no `delete` and no agent-side `submit`. Their routes were
+    // retired as unconsumed, `is_active` is how an operator stops collecting,
+    // and `submit_via_request_link` is now the only writer of
+    // `form_submissions`.
 
     /// PMS-729 phase 2 §7 slice B / I8: list every portal-visible active
     /// form for a tenant. `portal_visible = TRUE AND is_active = TRUE`;
@@ -665,7 +601,6 @@ impl FormsService {
 
         Ok(super::models::PublicSubmissionReceipt {
             ticket_number: ticket.ticket_number,
-            ticket_id: Some(ticket.id),
         })
     }
 
@@ -772,6 +707,17 @@ fn check_field_set(fields: &[CreateFormFieldRequest]) -> AppResult<()> {
                 "duplicate",
             ));
         }
+        // PMS-898: refuse a field type this build cannot name. The catch-all
+        // exists so a READER older than a type still renders the form; storing
+        // one would leave a field this server cannot validate and a column
+        // value its CHECK constraint would reject anyway.
+        if f.field_type == FieldType::Unknown {
+            errors.push(FieldError::new(
+                format!("fields[{i}].field_type"),
+                format!("`{}` has an unknown field type", f.name),
+                "unknown_field_type",
+            ));
+        }
         if f.field_type == FieldType::Select && f.options.as_ref().is_none_or(|o| o.is_empty()) {
             errors.push(FieldError::new(
                 format!("fields[{i}].options"),
@@ -799,54 +745,74 @@ fn check_field_set(fields: &[CreateFormFieldRequest]) -> AppResult<()> {
     }
 }
 
+/// The parts of a field the rule checker needs. The type matters as much as
+/// the name: it is what bounds the values `equals` can usefully be compared
+/// against (PMS-842).
+struct RuleField {
+    name: String,
+    field_type: FieldType,
+    options: Option<Vec<String>>,
+}
+
 fn check_rules(rules: &[FormRule], fields: &[CreateFormFieldRequest]) -> AppResult<()> {
-    let names: Vec<(String, Option<Vec<String>>)> = fields
+    let known: Vec<RuleField> = fields
         .iter()
-        .map(|f| (f.name.clone(), f.options.clone()))
+        .map(|f| RuleField {
+            name: f.name.clone(),
+            field_type: f.field_type,
+            options: f.options.clone(),
+        })
         .collect();
-    check_rules_against_names(rules, &names)
+    check_rules_against_fields(rules, &known)
 }
 
 /// A rule that names a field the form does not have can never fire, so it is
 /// a typo rather than a feature. Rejecting it here means the interpreter
-/// never has to explain a silently-inert rule to a confused author.
-fn check_rules_against_names(
-    rules: &[FormRule],
-    names: &[(String, Option<Vec<String>>)],
-) -> AppResult<()> {
+/// never has to explain a silently-inert rule to a confused author. The same
+/// reasoning covers an `equals` outside the condition field's value domain.
+fn check_rules_against_fields(rules: &[FormRule], known: &[RuleField]) -> AppResult<()> {
     let mut errors = Vec::new();
     for (i, rule) in rules.iter().enumerate() {
+        // PMS-898: refuse a rule kind this build cannot name. Storing one
+        // would persist a rule the server can never enforce, and the client
+        // would render a form whose constraints exist only in the payload that
+        // created it. The read path ignores an unknown rule instead; only
+        // writes are strict.
         let FormRule::RequiredIf {
             field,
             when_field,
             equals,
-        } = rule;
-        if !names.iter().any(|(n, _)| n == field) {
+        } = rule
+        else {
+            errors.push(FieldError::new(
+                format!("rules[{i}].kind"),
+                "Unknown rule kind".to_string(),
+                "unknown_rule_kind",
+            ));
+            continue;
+        };
+        if !known.iter().any(|f| &f.name == field) {
             errors.push(FieldError::new(
                 format!("rules[{i}].field"),
                 format!("Rule targets unknown field `{field}`"),
                 "unknown_field",
             ));
         }
-        match names.iter().find(|(n, _)| n == when_field) {
+        match known.iter().find(|f| &f.name == when_field) {
             None => errors.push(FieldError::new(
                 format!("rules[{i}].when_field"),
                 format!("Rule reads unknown field `{when_field}`"),
                 "unknown_field",
             )),
-            // When the condition reads a select, `equals` must be one of its
-            // options or the rule can never fire.
-            Some((_, Some(options))) if !options.iter().any(|o| o == equals) => {
-                errors.push(FieldError::new(
-                    format!("rules[{i}].equals"),
-                    format!(
-                        "`{equals}` is not an option of `{when_field}` (one of: {})",
-                        options.join(", ")
-                    ),
-                    "option",
-                ));
+            Some(condition) => {
+                if let Some(message) = equals_outside_domain(condition, equals) {
+                    errors.push(FieldError::new(
+                        format!("rules[{i}].equals"),
+                        message,
+                        "option",
+                    ));
+                }
             }
-            Some(_) => {}
         }
     }
     if errors.is_empty() {
@@ -856,5 +822,114 @@ fn check_rules_against_names(
             "one or more fields are invalid",
             errors,
         ))
+    }
+}
+
+/// The reason `equals` can never match an answer to `condition`, if any.
+///
+/// A select is bounded by its option set and a boolean by `true`/`false`; the
+/// free-text types accept anything, so nothing there is refusable. A select
+/// carrying no option set is left to `check_field_set`, which rejects it on
+/// its own terms rather than as a rule error.
+fn equals_outside_domain(condition: &RuleField, equals: &str) -> Option<String> {
+    match condition.field_type {
+        FieldType::Select => {
+            let options = condition.options.as_ref()?;
+            if options.iter().any(|o| o == equals) {
+                return None;
+            }
+            Some(format!(
+                "`{equals}` is not an option of `{}` (one of: {})",
+                condition.name,
+                options.join(", ")
+            ))
+        }
+        FieldType::Boolean => (equals != "true" && equals != "false").then(|| {
+            format!(
+                "`{equals}` is not a value of `{}` (one of: true, false)",
+                condition.name
+            )
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn known(name: &str, field_type: FieldType, options: Option<Vec<String>>) -> RuleField {
+        RuleField {
+            name: name.to_string(),
+            field_type,
+            options,
+        }
+    }
+
+    fn errors_of(err: &AppError) -> Vec<(String, String)> {
+        match err {
+            AppError::Validation { errors, .. } => errors
+                .iter()
+                .map(|e| (e.field.clone(), e.code.clone()))
+                .collect(),
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    fn rule(field: &str, when_field: &str, equals: &str) -> FormRule {
+        FormRule::RequiredIf {
+            field: field.to_string(),
+            when_field: when_field.to_string(),
+            equals: equals.to_string(),
+        }
+    }
+
+    /// PMS-842: a boolean condition only ever answers `true` or `false`, so an
+    /// `equals` outside that pair is a rule that can never fire and is refused
+    /// at authoring time rather than stored inert.
+    #[test]
+    fn a_boolean_condition_bounds_equals_to_true_or_false() {
+        let fields = vec![
+            known("keep_mailbox", FieldType::Boolean, None),
+            known("forward_to", FieldType::Email, None),
+        ];
+
+        for accepted in ["true", "false"] {
+            check_rules_against_fields(&[rule("forward_to", "keep_mailbox", accepted)], &fields)
+                .unwrap_or_else(|e| panic!("`{accepted}` must be authorable, got {e:?}"));
+        }
+
+        let err = check_rules_against_fields(&[rule("forward_to", "keep_mailbox", "yes")], &fields)
+            .expect_err("`yes` can never equal a JSON boolean");
+        assert_eq!(
+            errors_of(&err),
+            vec![("rules[0].equals".to_string(), "option".to_string())]
+        );
+    }
+
+    /// The select check keeps working, and the free-text types stay unbounded.
+    #[test]
+    fn a_select_condition_still_bounds_equals_and_text_does_not() {
+        let fields = vec![
+            known(
+                "handling",
+                FieldType::Select,
+                Some(vec!["forward".into(), "delete".into()]),
+            ),
+            known("employee_name", FieldType::Text, None),
+            known("forward_to", FieldType::Email, None),
+        ];
+
+        check_rules_against_fields(&[rule("forward_to", "handling", "forward")], &fields)
+            .expect("an on-menu option is authorable");
+        let err = check_rules_against_fields(&[rule("forward_to", "handling", "shred")], &fields)
+            .expect_err("off-menu option");
+        assert_eq!(
+            errors_of(&err),
+            vec![("rules[0].equals".to_string(), "option".to_string())]
+        );
+
+        check_rules_against_fields(&[rule("forward_to", "employee_name", "Dana")], &fields)
+            .expect("a text condition accepts any comparison value");
     }
 }

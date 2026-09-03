@@ -13,8 +13,8 @@
 -- 023) as the per-tenant copy template and are not owned by any one user.
 --
 -- Business-table set and child-table parent joins follow the PMS-255 inventory
--- in dev-docs/rls-per-user-isolation.md. Run with, e.g.:
---   psql "$DATABASE_URL" -f dev-docs/audits/pms-263-verify-no-comingled-business-rows.sql
+-- in docs/rls-per-user-isolation.md. Run with, e.g.:
+--   psql "$DATABASE_URL" -f docs/dev-docs/pms-263-verify-no-comingled-business-rows.sql
 
 \set default_tenant '00000000-0000-0000-0000-000000000001'
 

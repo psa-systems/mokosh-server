@@ -8,12 +8,17 @@ on:
   push:
     branches:
       - "main"
+      # Allow-listed feature branches publish their own branch tag and never
+      # :latest, so staging can run a branch (PMS-733). Keep this list in sync
+      # with BRANCH_ALLOW_LIST in oci-build/get-tags.nu; scripts/check-oci-publish-tags.nu
+      # fails the build if the two disagree.
+      - "mokosh-client-login"
     tags:
       - "v*"
     paths:
       - "src/**"
       # Workspace crates also produce compiled output; without this
-      # glob, edits limited to e.g. crates/google-oauth-flow/src/...
+      # glob, edits limited to e.g. crates/mokosh-types/src/...
       # never re-publish :latest.
       - "crates/**"
       - "migrations/**"
@@ -40,11 +45,19 @@ jobs:
     name: Build and push mokosh-server image
     # Only main and version tags publish the production image. workflow_dispatch
     # from a feature branch must not overwrite :latest, so gate the job on the
-    # ref in addition to the push-trigger branch filter above.
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    # ref in addition to the push-trigger branch filter above. The allow-listed
+    # branches appended to it publish their own branch tag only; the mode
+    # computation below never resolves `latest` off main (PMS-733).
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/mokosh-client-login'
     # Base label: the musl compile happens inside `docker buildx`, so the runner
     # only needs docker, nu and git. Nothing compiles natively here.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+
+    # Backstop, not a target (PMS-829): 10 green runs took 6.3-20.5 minutes,
+    # median 14.8. The headroom is for a cold `type=gha` cache, where the
+    # dependency layer recompiles ~330 crates (PMS-781); the wedge this bounds
+    # is a registry or cache round trip that never returns.
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -79,10 +92,11 @@ jobs:
         run: |
           # Derive the publish mode from the trigger, never from git describe:
           # a tag ref -> release (push :vX.Y.Z only), a main push -> latest
-          # (push :latest only), a manual run -> dry-run. A release commit fires
-          # BOTH the main-push and the tag-push events; resolving disjoint tags
-          # per trigger is what stops the two runs from racing to overwrite the
-          # same :latest tag (governance GOV-13).
+          # (push :latest only), an allow-listed branch push -> branch (push
+          # that branch's tag only), a manual run -> dry-run. A release commit
+          # fires BOTH the main-push and the tag-push events; resolving disjoint
+          # tags per trigger is what stops the two runs from racing to overwrite
+          # the same :latest tag (governance GOV-13).
           let event = "${{ github.event_name }}"
           let ref_type = "${{ github.ref_type }}"
           let ref_name = "${{ github.ref_name }}"
@@ -91,8 +105,13 @@ jobs:
             "dry-run"
           } else if $ref_type == "tag" {
             "release"
-          } else {
+          } else if $ref_name == "main" {
             "latest"
+          } else {
+            # get-tags.nu rejects a branch that is not on its allow-list, so an
+            # unlisted ref that somehow reaches this job fails loud instead of
+            # falling through to :latest.
+            "branch"
           }
           # A manual run only mutates the registry if dry_run is explicitly false;
           # the input defaults to true, and push events always publish for real.
@@ -127,7 +146,9 @@ jobs:
       - name: Set up buildx builder
         # The `docker-container` driver is required for any cache export;
         # the default `docker` driver only carries inline metadata, which
-        # misses the dependency-build layer (governance CI.md, GOV-20).
+        # misses the dependency-build layer ("OCI build workflow" in CI.md of
+        # dev.a8n.run/niceguyit/governance, GOV-20; not a file in this
+        # repository).
         run: docker buildx create --name container-builder --driver docker-container --use
 
       - name: Export Actions runtime env for buildx gha cache

@@ -19,6 +19,8 @@ RUN mkdir --parents /app /data /config
 
 WORKDIR /app
 
-EXPOSE 4301
+# The server listens on $PORT, which compose.dev.yml sets from MOKOSH_PORT
+# (default 8080 in .env.example, same as oci-build/Dockerfile).
+EXPOSE 8080
 
 CMD ["cargo", "run", "--bin", "mokosh-server"]

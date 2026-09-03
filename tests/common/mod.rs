@@ -58,6 +58,11 @@ pub struct TestApp {
     /// rows). `#[allow(dead_code)]` for the same per-binary reason as `pool`.
     #[allow(dead_code)]
     pub app_pool: Option<PgPool>,
+    /// PMS-991: the swappable mailer the router was built with, so a suite
+    /// can `swap` in a capturing one and assert on what the API sent.
+    /// `#[allow(dead_code)]` for the same per-binary reason as `pool`.
+    #[allow(dead_code)]
+    pub mailer: Arc<SharedMailer>,
 }
 
 impl TestApp {
@@ -90,11 +95,115 @@ pub async fn seed_company(pool: &PgPool) -> Uuid {
     id
 }
 
+/// Seed a ticket plus one internal note on it under the default tenant,
+/// reusing the seeded statuses / priorities / queues. Returns
+/// `(ticket_id, note_id)`.
+///
+/// Shared by the two attachment binaries (`ticket_note_attachments.rs` and
+/// `attachment_download_streaming.rs`, split apart in PMS-822) so the fixture
+/// cannot drift between them. `#[allow(dead_code)]` for the same per-binary
+/// reason as the other helpers.
+#[allow(dead_code)]
+pub async fn seed_ticket_and_note(pool: &PgPool, admin_id: Uuid, company_id: Uuid) -> (Uuid, Uuid) {
+    let status_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_statuses WHERE tenant_id = $1 LIMIT 1")
+            .bind(DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("status");
+    let priority_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_priorities WHERE tenant_id = $1 LIMIT 1")
+            .bind(DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("priority");
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("queue");
+    let ticket_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO tickets
+           (id, tenant_id, ticket_number, title, status_id, priority_id,
+            queue_id, company_id, created_by_id)
+           VALUES ($1, $2, $3, 'Attachment ticket', $4, $5, $6, $7, $8)"#,
+    )
+    .bind(ticket_id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(format!("T-{}", &ticket_id.to_string()[..8]))
+    .bind(status_id)
+    .bind(priority_id)
+    .bind(queue_id)
+    .bind(company_id)
+    .bind(admin_id)
+    .execute(pool)
+    .await
+    .expect("seed ticket");
+    let note_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO ticket_notes
+           (id, tenant_id, ticket_id, content, note_type, created_by_id)
+           VALUES ($1, $2, $3, 'parent note', 'internal', $4)"#,
+    )
+    .bind(note_id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(ticket_id)
+    .bind(admin_id)
+    .execute(pool)
+    .await
+    .expect("seed note");
+    (ticket_id, note_id)
+}
+
 /// Parse a decimal string literal into a [`Decimal`] for test fixtures
 /// that bind money columns. Panics on malformed input (test-only).
 #[allow(dead_code)]
 pub fn dec(s: &str) -> Decimal {
     s.parse().expect("parse Decimal literal")
+}
+
+/// A storage root private to this test binary's run, exported as
+/// `ATTACHMENT_DIR`.
+///
+/// Nine suites used to name a fixed path under `/tmp` (`/tmp/mokosh-pms923-test`
+/// and friends). `/tmp` is world-writable with the sticky bit, so whichever OS
+/// user ran the suite FIRST on a host owned that directory, and `LocalStore`
+/// created it with that process's umask. A second user on the same host then
+/// could not write into it, `StorageConfig` failed with `Permission denied`,
+/// and the API surfaced a 500 - which reads as a defect in the storage seam and
+/// costs a triage cycle before anyone thinks to `ls -ld /tmp`. CI never saw it,
+/// because each job gets a fresh container, so it only ever bit the place it
+/// was most expensive to diagnose.
+///
+/// One root per binary rather than one per test case, because `ATTACHMENT_DIR`
+/// is process-global env and `#[sqlx::test]` cases within a binary run
+/// concurrently: a case that gave itself a private root would change the root
+/// under its neighbours mid-run. Every case in a binary therefore shares this
+/// one, which is safe for the same reason the old shared path was safe within a
+/// suite - stored objects are named by uuid, so two cases cannot collide.
+///
+/// The `TempDir` is parked in a `OnceLock` to keep it alive for the whole run.
+/// A static is never dropped, so the directory outlives the process rather than
+/// being cleaned up; that is the deliberate trade. `tempfile` gives it a random
+/// name, so the property that actually matters - no two runs and no two users
+/// ever address the same directory - holds, and what is left behind is an empty
+/// tree under `/tmp` that the OS reclaims.
+#[allow(dead_code)]
+pub fn storage_root() -> &'static std::path::Path {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+    let dir = ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("mokosh-test-storage-")
+            .tempdir()
+            .expect("create a private storage root for this test run")
+    });
+    // Re-exported on every call, not only on the first: a suite may set other
+    // storage env beside this one, and the cost of being sure is one setenv.
+    std::env::set_var("ATTACHMENT_DIR", dir.path());
+    dir.path()
 }
 
 /// Bring up the API against `pool` on a random localhost port.
@@ -191,6 +300,12 @@ async fn boot_with_db(
     app_pool: Option<PgPool>,
     bunyip: Option<mokosh_server::modules::auth::oidc_rs::Verifier>,
 ) -> TestApp {
+    // PMS-958: the object store is process-wide and built on first use, so
+    // the root has to be chosen before anything in this binary can ask for
+    // it. Every suite that stores bytes already calls this itself; doing it
+    // here as well means a suite that never touches storage cannot pin the
+    // compiled-in `./attachments` root for a neighbour that does.
+    storage_root();
     // Route the server's tracing events to libtest's per-thread capture so
     // a failing test surfaces the real cause in its panic output (e.g. the
     // sqlx error swallowed by `AppError::Database("Database operation
@@ -204,32 +319,29 @@ async fn boot_with_db(
         )
         .try_init();
 
-    // Stub Google OAuth client - tests never drive the Google flow.
-    let google_oauth = Arc::new(
-        google_oauth_flow::Client::new(google_oauth_flow::Config {
-            client_id: "test-client".into(),
-            client_secret: "test-secret".into(),
-            redirect_uri: "http://localhost/callback".into(),
-        })
-        .expect("build stub google_oauth client"),
-    );
-
     // create_api_router now takes the swappable handle (PMS-638); wrap the
     // test LogMailer so the signature matches. Tests never swap it.
     let mailer = Arc::new(SharedMailer::new(Arc::new(LogMailer)));
+    let mailer_handle = mailer.clone();
     let encryption_key = [0u8; 32];
+    // PMS-968: the database backend under the same zero key the router is
+    // given, so a suite that stores a gateway credential can read it back.
+    // Deliberately not `store_from_env`: process env is shared across the cases
+    // in a binary, so reading SECRET_BACKEND here would let one suite's
+    // configuration decide another's.
+    let secrets = std::sync::Arc::new(mokosh_server::secrets::DatabaseSecretStore::new(
+        db.clone(),
+        encryption_key,
+    ));
 
     let router = create_api_router(
         db,
         "test-jwt-secret-that-is-clearly-not-for-prod".into(),
-        google_oauth,
         "http://localhost".into(),
         // MAPPS-425 spa_base_url: deliberately different from client_origin so
         // a test asserting an emailed link's host cannot pass by accident.
         "http://spa.localhost".into(),
         vec!["http://localhost".into()],
-        Vec::new(),
-        false,  // cookie_secure: irrelevant for bearer-token tests
         bunyip, // bunyip RS verifier: None unless the suite booted via `boot_with_bunyip`
         mailer,
         encryption_key,
@@ -252,6 +364,13 @@ async fn boot_with_db(
         // suites that spin up dozens of tenants stay unblocked. Cap-behavior
         // specs override this by building their own router.
         None,
+        // PMS-904: self-hosted, so the integration suite exercises the mode
+        // that sends everything. The suppression is a unit test on
+        // `AuthService`, which can hold both modes in one binary; flipping the
+        // shared router here would silently change what every other suite is
+        // testing.
+        mokosh_server::utils::deployment::DeploymentMode::SelfHosted,
+        secrets,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -278,6 +397,7 @@ async fn boot_with_db(
         client,
         pool,
         app_pool,
+        mailer: mailer_handle,
     }
 }
 

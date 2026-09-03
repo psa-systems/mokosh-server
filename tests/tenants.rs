@@ -12,7 +12,6 @@ use sqlx::PgPool;
 
 use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::AuthService;
-use mokosh_server::modules::notifications::NotificationsService;
 use mokosh_server::modules::tenants::{CreateTenantRequest, TenantService};
 use mokosh_server::Database;
 
@@ -41,11 +40,7 @@ async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
         .await
         .expect("provision target tenant");
 
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
 
     // First org-claimed login: the user moves out of the default tenant.
     let moved = auth
@@ -881,6 +876,100 @@ async fn ensure_default_config_backfills_own_company_idempotently(pool: PgPool) 
     );
 }
 
+/// PMS-777: `ensure_default_config` runs on the per-request bunyip auth path,
+/// where its three `SELECT EXISTS` guards were three round trips on every
+/// authenticated request forever, to answer a question that flips at most once
+/// per tenant. A tenant this process has already seeded is memoized, so the
+/// second call issues no statement at all.
+///
+/// Proving "no statement" without reading the server log: empty the tables the
+/// guards read, then call again. A call that still probed would find them empty
+/// and re-seed; a memoized call cannot, so the tables stay empty.
+#[sqlx::test]
+async fn a_seeded_tenant_is_not_probed_again(pool: PgPool) {
+    let tenant = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind)
+         VALUES ($1, 'Memoized', 'memoized-777', 'active', 'org')",
+    )
+    .bind(tenant)
+    .execute(&pool)
+    .await
+    .expect("insert bare tenant");
+
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    svc.ensure_default_config(tenant).await.expect("first seed");
+
+    let statuses = |p: PgPool| async move {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ticket_statuses WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(&p)
+            .await
+            .expect("count statuses")
+    };
+    assert!(
+        statuses(pool.clone()).await > 0,
+        "first sight of a tenant still runs the seeding in full"
+    );
+
+    // Empty everything the three guards read.
+    for table in ["ticket_statuses", "ticket_sequences"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE tenant_id = $1"))
+            .bind(tenant)
+            .execute(&pool)
+            .await
+            .expect("clear guard table");
+    }
+    sqlx::query("UPDATE tenants SET own_company_id = NULL WHERE id = $1")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .expect("clear own_company_id");
+
+    svc.ensure_default_config(tenant)
+        .await
+        .expect("second ensure_default_config");
+
+    assert_eq!(
+        statuses(pool.clone()).await,
+        0,
+        "a memoized tenant must issue no statement, so nothing is re-seeded"
+    );
+    let seq_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ticket_sequences WHERE tenant_id = $1")
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .expect("count sequence rows");
+    assert_eq!(seq_rows, 0, "the sequence guard is not re-probed either");
+
+    // The memo is keyed per tenant, not a global "seeding is done" switch: the
+    // very same service still runs the full guarded path for a tenant it has
+    // not seen.
+    let unseen = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind)
+         VALUES ($1, 'Unseen', 'unseen-777', 'active', 'org')",
+    )
+    .bind(unseen)
+    .execute(&pool)
+    .await
+    .expect("insert second bare tenant");
+    svc.ensure_default_config(unseen)
+        .await
+        .expect("first sight of a second tenant");
+    let unseen_statuses: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ticket_statuses WHERE tenant_id = $1")
+            .bind(unseen)
+            .fetch_one(&pool)
+            .await
+            .expect("count statuses for the second tenant");
+    assert!(
+        unseen_statuses > 0,
+        "a tenant this process has not seen is seeded in full"
+    );
+}
+
 // ============================================================================
 // PMS-751: the caller's own tenant, addressed without an id
 // ============================================================================
@@ -940,6 +1029,167 @@ async fn current_reads_and_renames_the_callers_own_tenant(pool: PgPool) {
         .await
         .expect("renamed tenant");
     assert_eq!(stored, "Acme IT");
+}
+
+/// PMS-896: the organisation record round-trips through the surface the
+/// onboarding flow writes to, with and without the one optional field.
+///
+/// End to end rather than on the conversion alone: the point of the endpoint is
+/// that the record lands on the CALLER'S tenant with no id in the request, and
+/// that `GET /current` reads back what was submitted.
+#[sqlx::test]
+async fn the_organisation_record_persists_with_and_without_a_website(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let with_website = app
+        .client
+        .put(app.url("/api/v1/tenants/current/organization"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Contoso IT",
+            "contact_name": "Dana",
+            "phone": "555-0100",
+            "email": "help@contoso.example",
+            "website": "https://contoso.example",
+        }))
+        .send()
+        .await
+        .expect("send organisation submission");
+    assert_eq!(with_website.status(), reqwest::StatusCode::OK);
+
+    let (name, branding): (String, serde_json::Value) =
+        sqlx::query_as("SELECT name, branding FROM tenants WHERE id = $1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("the caller's own tenant row");
+    assert_eq!(name, "Contoso IT");
+    assert_eq!(branding["support_phone"], serde_json::json!("555-0100"));
+    assert_eq!(
+        branding["support_email"],
+        serde_json::json!("help@contoso.example")
+    );
+    assert_eq!(branding["support_contact_name"], serde_json::json!("Dana"));
+    assert_eq!(
+        branding["website"],
+        serde_json::json!("https://contoso.example")
+    );
+
+    // The same submission with the optional field omitted is accepted, and
+    // clears the website rather than leaving the old one behind: this is a
+    // whole-record submission, not a patch.
+    let without_website: serde_json::Value = app
+        .client
+        .put(app.url("/api/v1/tenants/current/organization"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Contoso IT",
+            "contact_name": "Dana",
+            "phone": "555-0100",
+            "email": "help@contoso.example",
+        }))
+        .send()
+        .await
+        .expect("send organisation submission")
+        .json()
+        .await
+        .expect("organisation JSON");
+    assert_eq!(
+        without_website["branding"]["website"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        without_website["branding"]["support_phone"],
+        serde_json::json!("555-0100")
+    );
+
+    // What the settings page reads back is what was submitted.
+    let read: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send read")
+        .json()
+        .await
+        .expect("current tenant JSON");
+    assert_eq!(read["name"], serde_json::json!("Contoso IT"));
+    assert_eq!(read["branding"]["website"], serde_json::Value::Null);
+    assert_eq!(
+        read["branding"]["support_email"],
+        serde_json::json!("help@contoso.example")
+    );
+}
+
+/// PMS-896: phone and email are required, so a submission missing either is
+/// refused and nothing is written. The generic `PUT /current` patch cannot say
+/// this (a logo upload sends two keys and no phone), which is why the
+/// organisation record has its own surface.
+#[sqlx::test]
+async fn an_organisation_submission_requires_a_phone_and_an_email(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for body in [
+        serde_json::json!({ "name": "Contoso IT", "email": "help@contoso.example" }),
+        serde_json::json!({ "name": "Contoso IT", "phone": "555-0100" }),
+        serde_json::json!({ "name": "Contoso IT", "phone": "555-0100", "email": "help@contoso.example", "website": "javascript:alert(1)" }),
+    ] {
+        let resp = app
+            .client
+            .put(app.url("/api/v1/tenants/current/organization"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .expect("send organisation submission");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "expected a refusal for {body}"
+        );
+    }
+
+    let name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("tenant name");
+    assert_ne!(name, "Contoso IT", "a refused submission writes nothing");
+}
+
+/// PMS-896: the organisation surface carries the same admin gate as the rename
+/// it performs (PMS-751); a non-admin's onboarding does not reach it
+/// (MAPPS-524).
+#[sqlx::test]
+async fn a_non_admin_cannot_submit_the_organisation_record(pool: PgPool) {
+    let (_tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "pms896-tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &tech_email, &tech_password).await;
+
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current/organization"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Renamed by a technician",
+            "phone": "555-0100",
+            "email": "help@contoso.example",
+        }))
+        .send()
+        .await
+        .expect("send organisation submission");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
 }
 
 /// `current` is not a uuid, and must never be parsed as one: a static segment
@@ -1262,6 +1512,126 @@ async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool
         Some("image/png"),
         "clearing one key must not disturb another"
     );
+}
+
+/// PMS-776: the PATCH document is checked before it is merged.
+///
+/// These keys are read by a client, not by us: three of them compose the
+/// contact sentence in a client's email and `logo_url` becomes an `<img src>`
+/// in the same message, so a malformed value is one the MSP appears to have
+/// published over its own SMTP identity.
+#[sqlx::test]
+async fn branding_a_client_will_read_is_validated_on_write(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for (case, branding) in [
+        (
+            "an address that is not an address",
+            serde_json::json!({ "support_email": "call us on 555-0100" }),
+        ),
+        (
+            "a logo pointing outside the public route",
+            serde_json::json!({ "logo_url": "https://evil.example/logo.png" }),
+        ),
+        (
+            "a key no reader destructures",
+            serde_json::json!({ "supprt_email": "help@acme.example" }),
+        ),
+        (
+            "a colour that is not a colour",
+            serde_json::json!({ "primary_color": "red" }),
+        ),
+        (
+            "a phone number that is a sentence",
+            serde_json::json!({ "support_phone": "call the service desk" }),
+        ),
+    ] {
+        let resp = app
+            .client
+            .put(app.url("/api/v1/tenants/current"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "branding": branding }))
+            .send()
+            .await
+            .expect("send branding");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{case} must be refused, got {}",
+            resp.status()
+        );
+    }
+
+    // The values the settings page and the logo upload actually send still go
+    // through untouched.
+    let ok = app
+        .client
+        .put(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "branding": {
+                "support_email": "help@acme.example",
+                "support_phone": "+1 555-0100",
+                "support_contact_name": "Dana",
+                "primary_color": "#0066cc",
+            }
+        }))
+        .send()
+        .await
+        .expect("send valid branding");
+    assert_eq!(ok.status(), reqwest::StatusCode::OK);
+
+    // Nothing was merged from the refused writes.
+    let current: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/tenants/current"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get current")
+        .json()
+        .await
+        .expect("tenant JSON");
+    assert_eq!(
+        current["branding"]["support_email"].as_str(),
+        Some("help@acme.example")
+    );
+    assert!(current["branding"]["logo_url"].is_null());
+}
+
+/// PMS-776: the two endpoints that write a branding value agree about it.
+/// They still write to different stores (PMS-703 F18); what they no longer do
+/// is disagree about which values are legal.
+#[sqlx::test]
+async fn the_settings_endpoint_validates_branding_like_the_tenants_endpoint(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for (key, value, expected) in [
+        ("support_email", "call us on 555-0100", false),
+        ("support_email", "help@acme.example", true),
+        ("logo_url", "https://evil.example/logo.png", false),
+        ("secondary_color", "#00AA55", true),
+        ("supprt_email", "help@acme.example", false),
+    ] {
+        let resp = app
+            .client
+            .put(app.url(&format!("/api/v1/settings/branding/{key}")))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "value": value }))
+            .send()
+            .await
+            .expect("send setting");
+        assert_eq!(
+            resp.status().is_success(),
+            expected,
+            "branding/{key} = {value} got {}",
+            resp.status()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,11 +1983,7 @@ async fn update_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
 #[sqlx::test]
 async fn ensure_principal_usable_passes_when_no_entitlement_row(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let user = auth
         .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
         .await
@@ -1632,11 +1998,7 @@ async fn ensure_principal_usable_passes_when_no_entitlement_row(pool: PgPool) {
 #[sqlx::test]
 async fn ensure_principal_usable_passes_when_entitlement_active(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "active", None, None)
         .await
         .expect("write entitlement");
@@ -1655,11 +2017,7 @@ async fn ensure_principal_usable_passes_when_entitlement_active(pool: PgPool) {
 #[sqlx::test]
 async fn ensure_principal_usable_rejects_when_entitlement_suspended(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     auth.set_tenant_entitlement(
         common::DEFAULT_TENANT_ID,
         "suspended",
@@ -1689,11 +2047,7 @@ async fn ensure_principal_usable_rejects_when_entitlement_suspended(pool: PgPool
 #[sqlx::test]
 async fn ensure_principal_usable_rejects_when_entitlement_expired(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let past = chrono::Utc::now() - chrono::Duration::hours(1);
     auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "active", Some(past), None)
         .await
@@ -1713,11 +2067,7 @@ async fn ensure_principal_usable_rejects_when_entitlement_expired(pool: PgPool) 
 #[sqlx::test]
 async fn set_tenant_entitlement_upserts_on_repeat_writes(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
 
     auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "suspended", None, None)
         .await
@@ -1754,11 +2104,7 @@ async fn set_tenant_entitlement_upserts_on_repeat_writes(pool: PgPool) {
 /// yields a clean 400 instead of a raw sqlx violation).
 #[sqlx::test]
 async fn set_tenant_entitlement_rejects_unknown_status(pool: PgPool) {
-    let auth = AuthService::new(
-        Database::from_pool(pool.clone()),
-        "test-secret".into(),
-        vec![],
-    );
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let err = auth
         .set_tenant_entitlement(common::DEFAULT_TENANT_ID, "not-a-status", None, None)
         .await

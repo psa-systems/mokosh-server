@@ -4,12 +4,13 @@
 # real database. Split out of check.yml (PMS-267) so the fast fmt/clippy/compile
 # gate is not blocked on a Postgres spin-up. Mirrored locally by
 # `just test-integration`.
+#
+# DEV-612: pull_request only. The `push: main` run landed after the merge, so it
+# gated nothing, and re-ran a 440s suite against a tree the pull-request run had
+# usually already tested. scripts/check-single-build.nu fails if it comes back.
 name: Integration
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
@@ -21,6 +22,11 @@ jobs:
     # the dev image ships the C toolchain + OpenSSL headers that needs. Base
     # fails at `linker cc not found` (PMS-706, same cause as check.yml).
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+
+    # Outer backstop (PMS-823). The inner `timeout` around cargo test is what
+    # produces a diagnostic; this only stops a wedge elsewhere in the job from
+    # running until the runner's own limit.
+    timeout-minutes: 45
 
     # Postgres service for `cargo test --tests`. `#[sqlx::test]` creates a
     # fresh database per invocation against the URL in DATABASE_URL, so
@@ -56,8 +62,9 @@ jobs:
         # is also too full to usefully restore a multi-GB cargo cache, so
         # failing first saves that download and leaves less on disk for
         # whatever runs next.
-        # PMS-740. `cargo test --tests` links 22 debug test binaries, each
-        # several hundred MB, several concurrently under CARGO_BUILD_JOBS.
+        # PMS-740. `cargo test --tests` links one debug binary per `tests/*.rs`
+        # suite, each several hundred MB, several concurrently under
+        # CARGO_BUILD_JOBS.
         # When the runner filesystem fills mid-write, `rust-lld` writes its
         # output through an mmap and takes SIGBUS, which surfaces as:
         #
@@ -70,9 +77,14 @@ jobs:
         #
         # 25G is chosen as roughly twice the peak this suite's link stage has
         # been observed to need. Raise it if the suite grows rather than
-        # lowering it after a near miss.
+        # lowering it after a near miss. How much the suite has grown is
+        # counted at run time and printed below rather than written into this
+        # comment: the hand-maintained literal that used to sit here read 22
+        # while the tree held 81 (PMS-858).
         run: |
+          suites=$(ls tests/*.rs | wc -l)
           avail_gb=$(df -P -BG . | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+          echo "Integration suites to link: ${suites} debug test binaries"
           echo "Free space on the workspace filesystem: ${avail_gb}G"
           df -h .
           if [ "${avail_gb}" -lt 25 ]; then
@@ -86,15 +98,70 @@ jobs:
           cache-on-failure: true
 
       - name: Cap build parallelism
-        # nproc/2 cap: never claim more than half the host (see CI.md "Concurrency cap").
+        # nproc/2 cap: never claim more than half the host (see "Concurrency
+        # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
+        # this repository).
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
+
+      - name: Start MinIO for the S3 storage suite
+        # PMS-958. `tests/s3_storage.rs` round-trips the S3 backend against a
+        # real object store and skips (loudly) when S3_ENDPOINT is unset, so
+        # this step is what makes it run here. A `services:` entry cannot do
+        # it: the MinIO image carries no command, `server /data` has to be
+        # passed, and Forgejo (like GitHub) service containers have no
+        # `command` key and `--entrypoint` takes a binary without arguments.
+        # So the pinned release binary runs in the job, verified against the
+        # checksum MinIO publishes beside it. Bump both lines together.
+        #
+        # Only this suite sets STORAGE_BACKEND=s3, in its own process; the
+        # variables below are read by nothing else, so every other suite
+        # keeps exercising the local backend.
+        env:
+          MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+          MINIO_SHA256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+        run: |
+          set -euo pipefail
+          if [ "$(uname -m)" != "x86_64" ]; then
+            echo "::error::MinIO pin is for linux-amd64; runner is $(uname -m)"
+            exit 1
+          fi
+          curl --fail --location --silent --show-error \
+            --output /tmp/minio \
+            "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_RELEASE}"
+          echo "${MINIO_SHA256}  /tmp/minio" | sha256sum --check --strict
+          chmod +x /tmp/minio
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER=mokosh MINIO_ROOT_PASSWORD=mokosh-ci-password \
+            nohup /tmp/minio server /tmp/minio-data --address 127.0.0.1:9000 \
+            > /tmp/minio.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl --silent --fail http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --silent --fail http://127.0.0.1:9000/minio/health/live > /dev/null || {
+            echo "::error::MinIO did not become healthy; log follows"
+            cat /tmp/minio.log
+            exit 1
+          }
+          {
+            echo "S3_ENDPOINT=http://127.0.0.1:9000"
+            echo "S3_BUCKET=mokosh-ci"
+            echo "S3_REGION=us-east-1"
+            echo "S3_PATH_STYLE=true"
+            echo "S3_ACCESS_KEY_ID=mokosh"
+            echo "S3_SECRET_ACCESS_KEY=mokosh-ci-password"
+          } >> "$GITHUB_ENV"
 
       - name: Integration tests
         # cargo test --tests runs every integration suite (all `tests/*.rs`
         # binaries) plus the lib unit tests, so new suites are picked up
-        # automatically instead of via a hand-maintained --test allowlist
-        # that silently dropped 13 of 22 suites from CI.
+        # automatically instead of via a hand-maintained --test allowlist,
+        # which at the time it was removed silently dropped 13 of the 22
+        # suites that then existed. That count is history, not a description
+        # of the tree; the suite count is printed by the disk-headroom step.
         #
         # --test-threads=4 caps in-flight `#[sqlx::test]` cases per binary.
         # Each test creates a per-test database AND holds the sqlx-test
@@ -109,14 +176,28 @@ jobs:
         # it, when the space has already been released and the filesystem
         # looks healthy. That gap is why the first two occurrences could not
         # be pinned down (PMS-740).
+        #
+        # The inner `timeout` bounds the harness itself (PMS-823). Run #4017
+        # wedged mid-suite, so `status=$?` never ran and none of the reporting
+        # below it did either; the log just stopped. SIGQUIT gives the Rust
+        # process a chance to dump state before --kill-after escalates to
+        # SIGKILL. 25m is several times the healthy wall clock (that run
+        # reached its last suite about 4 minutes in).
+        env:
+          RUST_BACKTRACE: 1
         run: |
           ( while :; do df -P -BM . | awk 'NR==2 {gsub(/M/, "", $4); print $4}'; sleep 5; done ) > /tmp/disk-samples.txt 2>/dev/null &
           sampler=$!
           set +e
-          cargo test --tests -- --test-threads=4
+          timeout --signal=QUIT --kill-after=30s 25m cargo test --tests -- --test-threads=4
           status=$?
           set -e
           kill "${sampler}" 2>/dev/null || true
+          # 124 = SIGQUIT ended it, 137 = it ignored SIGQUIT and --kill-after
+          # escalated. Both mean the bound fired, not an assertion failure.
+          if [ "${status}" -eq 124 ] || [ "${status}" -eq 137 ]; then
+            echo "::error::The test harness did not finish within 25m and was killed (exit ${status}); this is the PMS-823 test-hang signature, not a test failure. Look for the last 'has been running for over 60 seconds' line above to identify the blocking case."
+          fi
           if [ -s /tmp/disk-samples.txt ]; then
             low=$(sort -n /tmp/disk-samples.txt | head -1)
             echo "Lowest free space seen during the build: ${low}M"

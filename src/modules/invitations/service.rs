@@ -50,7 +50,7 @@ impl InvitationsService {
     ) -> AppResult<InvitationResponse> {
         if !INVITABLE_ROLES.contains(&request.role.as_str()) {
             return Err(AppError::BadRequest(format!(
-                "role must be one of {}",
+                "Role must be one of {}",
                 INVITABLE_ROLES.join(", ")
             )));
         }
@@ -79,10 +79,30 @@ impl InvitationsService {
 
         // A tenant that starts inviting people is no longer a one-person
         // personal tenant - promote it so it reads as an org everywhere.
-        sqlx::query("UPDATE tenants SET kind = 'org', updated_at = NOW() WHERE id = $1 AND kind = 'personal'")
+        let promoted = sqlx::query("UPDATE tenants SET kind = 'org', updated_at = NOW() WHERE id = $1 AND kind = 'personal'")
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        // PMS-943: and that is the moment timesheets start to mean something.
+        // The flag's starting value is read off `kind`, so a tenant promoted
+        // out of `personal` would otherwise keep the answer it was given when
+        // it was one person - an employer with staff and no timesheets, until
+        // somebody found the module setting.
+        //
+        // Only on the promotion itself (`rows_affected`), so an established org
+        // that deliberately turned timesheets off does not get them switched
+        // back on by its next invitation.
+        if promoted > 0 {
+            sqlx::query(
+                "UPDATE module_config SET is_enabled = TRUE, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND module_name = 'timesheets'",
+            )
             .bind(tenant_id)
             .execute(&mut *tx)
             .await?;
+        }
 
         // PMS-246: email the invitee. Enqueue a `notifications` email row in the
         // same transaction; the dispatcher worker (with the SMTP mailer) drains
@@ -94,9 +114,13 @@ impl InvitationsService {
                 .bind(tenant_id)
                 .fetch_one(&mut *tx)
                 .await?;
-            let subject = format!("You have been invited to {tenant_name} on Mokosh");
+            // PMS-789: the product name is the deployment's, read from the
+            // in-process cache rather than queried - this is inside an open
+            // tenant transaction, and the value lives on the system tenant.
+            let app = crate::utils::app_name::app_name();
+            let subject = format!("You have been invited to {tenant_name} on {app}");
             let body = format!(
-                "You have been invited to join {tenant_name} on Mokosh as a {role}.\n\n\
+                "You have been invited to join {tenant_name} on {app} as a {role}.\n\n\
                  Sign in to accept the invitation:\n{app_url}\n\n\
                  The invitation expires in {ttl} days. If you did not expect this, you can ignore this email.",
                 role = request.role,

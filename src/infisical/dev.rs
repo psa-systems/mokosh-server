@@ -38,7 +38,7 @@ pub async fn run_dev_bootstrap(config: DevBootstrapConfig) -> Result<BootstrapOu
 
     let output = bootstrap_infisical(&config.url, &config.input).await?;
 
-    // Deliberately do NOT write INFISICAL_BASE_URL: the URL used here is
+    // Deliberately do NOT write INFISICAL_ADDRESS: the URL used here is
     // how the host CLI reaches Infisical (e.g. `http://localhost:28002`),
     // which is not the URL the Mokosh service inside the compose network
     // uses (`http://infisical:8080`). The correct in-network URL is carried

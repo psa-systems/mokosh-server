@@ -161,7 +161,7 @@ impl std::error::Error for AuthRequired {}
 /// Returned by `GET /api/v1/auth/memberships` and populated on `AuthState`
 /// so extractors can inspect the caller's full membership set without a
 /// second round-trip. Client redefines the same shape locally in
-/// `mokosh-clients/src/hooks/auth.rs` until phase 3 consolidates.
+/// `mokosh-apps/src/hooks/auth.rs` until phase 3 consolidates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MembershipView {
     pub tenant_id: Uuid,
@@ -790,6 +790,30 @@ pub struct ListUsersFilter {
     pub q: Option<String>,
     pub role: Option<UserRole>,
     pub status: Option<UserStatus>,
+}
+
+/// PMS-921: the minimum needed to name a colleague, readable by any
+/// authenticated user of the tenant.
+///
+/// Deliberately NOT a subset of [`UserResponse`] built by trimming fields.
+/// This is its own type so that adding a field to `UserResponse`, which serves
+/// user management and carries role, status, MFA state and login history,
+/// cannot widen what an unprivileged caller sees. The two have different
+/// audiences and must be able to evolve apart.
+///
+/// `handle` rather than `email`: it is the local part of the address, which is
+/// what an author types to mention somebody and what mention resolution
+/// matches on. A technician can already see every colleague's display name
+/// (`assigned_to_name`, `created_by_name` and article authorship are on
+/// surfaces they read all day), so the name is not a new disclosure. A
+/// contactable address would be.
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryEntry {
+    pub id: Uuid,
+    /// The person's display name.
+    pub name: String,
+    /// The local part of their email address, lowercased.
+    pub handle: String,
 }
 
 /// User list response (for API)

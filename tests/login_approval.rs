@@ -73,7 +73,6 @@ fn service(pool: PgPool, mailer: Arc<CapturingMailer>) -> AuthService {
     AuthService::with_mailer(
         Database::from_pool(pool),
         "test-jwt-secret-please-change".to_string(),
-        vec![],
         mailer,
         "http://localhost:4301".to_string(),
     )
@@ -191,7 +190,6 @@ async fn gate_disabled_never_flags_a_new_device(pool: PgPool) {
     let svc = AuthService::with_mailer(
         Database::from_pool(pool.clone()),
         "test-jwt-secret-please-change".to_string(),
-        vec![],
         mailer.clone(),
         "http://localhost:4301".to_string(),
     );
