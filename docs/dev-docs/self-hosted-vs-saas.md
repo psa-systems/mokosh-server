@@ -56,7 +56,7 @@ environment that is not in this repository, and not a merely inaccurate one: a
 deployment that sets neither would change backend on the next restart, and
 `InfisicalSecretStore::from_env` refuses to build without its own variables, so
 the guess would present as a deployment that no longer boots. Moving those rows
-needs the deployed values read first.
+needs the deployed values read first, which is PMS-1018.
 
 **The profile supplies defaults and locks nothing.** Explicit configuration
 wins for its own kind - `SECRET_BACKEND`, `STORAGE_BACKEND`, `SMTP_HOST`,

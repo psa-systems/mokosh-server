@@ -376,8 +376,7 @@ pub const SELF_HOSTED_PROVIDER_DEFAULTS: [ProviderDefaults; 5] = [
 /// that sets neither would change backend on the next restart, and
 /// `InfisicalSecretStore::from_env` refuses to build without its own
 /// variables, so the guess would present as a deployment that no longer boots.
-/// Moving those rows needs the deployed values read first; PMS-1011 records
-/// that as its own follow-up.
+/// Moving those rows needs the deployed values read first, which is PMS-1018.
 pub const SAAS_PROVIDER_DEFAULTS: [ProviderDefaults; 5] = [
     ProviderDefaults {
         kind: ProviderKind::Configuration,
