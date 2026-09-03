@@ -13,13 +13,75 @@ identity**, and everything else here follows from that one fact.
 | Portal identity and portal email | unchanged | unchanged |
 | Business notifications | unchanged | unchanged |
 
-`self-hosted` is today's behaviour byte for byte. An unset or unrecognised
-value resolves to it, and the direction is deliberate: falling back to `saas`
+`self-hosted` is today's behaviour byte for byte. An unset value resolves to
+it, and so does an unrecognised one *for mail dispatch*: falling back to `saas`
 on a typo would silently stop a self-hosted deployment's password-reset mail,
 which reaches the operator as a broken product with nothing in the log.
 Falling back to `self-hosted` costs a SaaS instance a redundant email at worst.
-An unrecognised value logs at `warn`; an empty value is treated as unset,
-because a forwarded-but-unset compose key arrives as `""` (PMS-836).
+An unrecognised value logs at `warn` there; an empty value is treated as unset,
+because a forwarded-but-unset compose key arrives as `""` (PMS-836). Provider
+selection reads the same variable and refuses an unrecognised value outright -
+see [Default providers](#default-providers-pms-1011) below.
+
+## Default providers (PMS-1011)
+
+The mode is also the **hosting profile**: it supplies the default provider for
+each capability, and the table is data in `src/utils/deployment.rs`
+(`SELF_HOSTED_PROVIDER_DEFAULTS`, `SAAS_PROVIDER_DEFAULTS`), so a third mode
+later is a data addition rather than a new `match` at every selection point.
+There is no second deployment-shape variable.
+
+| provider kind | `self-hosted` | `saas` |
+|---|---|---|
+| configuration | `environment` | `environment` |
+| secrets | `database` | `database` |
+| authentication | `local` | `bunyip`, then `local` |
+| email | `log` | `log` |
+| storage | `local` | `local` |
+
+Nothing in the `self-hosted` column reaches outside the deployment, which is
+what "the customer image boots and serves with no Bunyip, no Infisical and no
+object store" means concretely;
+`the_self_hosted_defaults_need_no_external_service` enforces it against
+`EXTERNAL_SERVICE_PROVIDERS`.
+
+Authentication is the one row that differs, and it is the row the mode exists
+for: bunyip first, with the legacy local path still enabled behind it until
+PMS-981 deprecates it, which is what a `saas` instance does today. The other
+four rows match `self-hosted` deliberately. The `saas` profile has to reproduce
+CURRENT deployed behaviour, and current deployed behaviour for secrets,
+storage, email and configuration is whatever that deployment's own environment
+sets. Writing `infisical` or `s3` into the table would be a guess about an
+environment that is not in this repository, and not a merely inaccurate one: a
+deployment that sets neither would change backend on the next restart, and
+`InfisicalSecretStore::from_env` refuses to build without its own variables, so
+the guess would present as a deployment that no longer boots. Moving those rows
+needs the deployed values read first.
+
+**The profile supplies defaults and locks nothing.** Explicit configuration
+wins for its own kind - `SECRET_BACKEND`, `STORAGE_BACKEND`, `SMTP_HOST`,
+`OIDC_ISSUER` - and every provider stays available at runtime in both modes, so
+an operator can enable a second one during a migration.
+
+Each kind's resolution records **who decided it**, profile or explicit
+(`EnablementSource`), and `main` logs one line per kind at boot. Every kind is
+logged, not only the deviations: a provider left on by a default has to be
+visible rather than assumed, which is the whole point of recording the source.
+
+### The parse behaviour is split by consequence
+
+Two readers of one variable, with two different failure modes:
+
+- `DeploymentMode::parse` / `from_env` - warn and fall back to `self-hosted`.
+  Used where the answer only gates behaviour with a safe default, which is mail
+  dispatch, for the reason argued above.
+- `DeploymentMode::parse_for_providers` / `from_env_for_providers` - refuse an
+  unrecognised value and name the legal ones. Used where the answer chooses a
+  provider. The fallback's reasoning does not carry here: the same typo would
+  silently select a different set of providers, and a boot that ends with a
+  message naming the legal values is far the cheaper failure. `main` reads it
+  before the database is touched, so the failure names the mode rather than
+  arriving from whichever provider happened to resolve first.
 
 ## The condition is a conjunction (PMS-905)
 

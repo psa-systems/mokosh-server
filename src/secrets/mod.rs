@@ -55,6 +55,7 @@ use std::fmt;
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::utils::deployment::{provider, DeploymentMode, EnablementSource, ProviderKind};
 use crate::utils::error::{AppError, AppResult};
 
 pub mod database;
@@ -225,16 +226,33 @@ pub enum SecretBackend {
 impl SecretBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
-            SecretBackend::Database => "database",
-            SecretBackend::Infisical => "infisical",
+            SecretBackend::Database => provider::DATABASE,
+            SecretBackend::Infisical => provider::INFISICAL,
+        }
+    }
+
+    /// A provider NAME to a backend. Blank is not a name: a caller resolves an
+    /// unset `SECRET_BACKEND` through the hosting profile before it gets here,
+    /// so this arm cannot quietly become a second place that knows the default.
+    pub fn parse_name(raw: &str) -> AppResult<Self> {
+        match raw.trim() {
+            provider::DATABASE => Ok(SecretBackend::Database),
+            provider::INFISICAL => Ok(SecretBackend::Infisical),
+            other => Err(AppError::Configuration(format!(
+                "SECRET_BACKEND {other:?} is not a known backend; expected 'database' or 'infisical'"
+            ))),
         }
     }
 }
 
-/// Backend selection.
+/// Backend selection, and which of the two decided it.
 #[derive(Clone, Copy, Debug)]
 pub struct SecretsConfig {
     pub backend: SecretBackend,
+    /// PMS-1011: whether the hosting profile's default stands or the operator
+    /// overrode it. Reported in the boot record, so a backend nobody chose is
+    /// visible rather than assumed.
+    pub source: EnablementSource,
 }
 
 impl SecretsConfig {
@@ -243,30 +261,61 @@ impl SecretsConfig {
     /// `ATTACHMENT_DIR`. A second reader is how two parts of one process come
     /// to disagree about where secrets are.
     ///
-    /// An unset or blank value is `Database`, because a forwarded-but-unset
-    /// variable arrives as `""` (PMS-836) and the default has to be the one
-    /// that needs no other service. An unrecognised value is a hard error
-    /// rather than a fallback to the default: an operator who wrote
-    /// `SECRET_BACKEND=infisical ` with a typo asked for Infisical, and quietly
-    /// giving them the database is the silent degrade this module refuses
-    /// everywhere else.
+    /// An unset or blank value takes the hosting profile's default for
+    /// [`ProviderKind::Secrets`] (PMS-1011), which is `database` in both
+    /// modes: a forwarded-but-unset variable arrives as `""` (PMS-836), and
+    /// the default has to be the one that needs no other service. An
+    /// unrecognised value is a hard error rather than a fallback to the
+    /// default: an operator who wrote `SECRET_BACKEND=infisical ` with a typo
+    /// asked for Infisical, and quietly giving them the database is the silent
+    /// degrade this module refuses everywhere else. So is an unrecognised
+    /// `MOKOSH_DEPLOYMENT_MODE`, which is why the profile is read through the
+    /// strict entry point here.
     pub fn from_env() -> AppResult<Self> {
-        Self::parse(&std::env::var("SECRET_BACKEND").unwrap_or_default())
+        Self::resolve(
+            DeploymentMode::from_env_for_providers()?,
+            &std::env::var("SECRET_BACKEND").unwrap_or_default(),
+        )
     }
 
     /// The rule itself, split out so it can be tested without writing to
     /// process-global env under a concurrent test runner.
+    pub fn resolve(mode: DeploymentMode, raw: &str) -> AppResult<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            let name = mode
+                .default_providers_for(ProviderKind::Secrets)
+                .first()
+                .copied()
+                .ok_or_else(|| {
+                    AppError::Configuration(format!(
+                        "hosting profile {mode} names no secrets provider"
+                    ))
+                })?;
+            return Ok(Self {
+                backend: SecretBackend::parse_name(name)?,
+                source: EnablementSource::Profile,
+            });
+        }
+        Ok(Self {
+            backend: SecretBackend::parse_name(raw)?,
+            source: EnablementSource::Explicit,
+        })
+    }
+
+    /// [`resolve`](Self::resolve) against the default hosting profile, which
+    /// is what an unset `MOKOSH_DEPLOYMENT_MODE` resolves to.
     pub fn parse(raw: &str) -> AppResult<Self> {
-        let backend = match raw.trim() {
-            "" | "database" => SecretBackend::Database,
-            "infisical" => SecretBackend::Infisical,
-            other => {
-                return Err(AppError::Configuration(format!(
-                    "SECRET_BACKEND {other:?} is not a known backend; expected 'database' or 'infisical'"
-                )))
-            }
-        };
-        Ok(Self { backend })
+        Self::resolve(DeploymentMode::default(), raw)
+    }
+
+    /// What this deployment explicitly configured, for the boot record. `None`
+    /// when the profile's default stands.
+    pub fn explicit_providers(&self) -> Option<Vec<&'static str>> {
+        match self.source {
+            EnablementSource::Explicit => Some(vec![self.backend.as_str()]),
+            EnablementSource::Profile => None,
+        }
     }
 }
 
@@ -277,10 +326,14 @@ impl SecretsConfig {
 /// callers build it once at startup where a `Result` can end the process, which
 /// is what makes "a half-configured deployment fails at boot rather than when a
 /// customer tries to pay" true rather than aspirational.
+///
+/// Returns the resolution alongside the store (PMS-1011) so the boot record can
+/// report which backend serves secrets and whether the hosting profile or the
+/// operator chose it, without a second reader of `SECRET_BACKEND`.
 pub fn store_from_env(
     db: crate::db::Database,
     encryption_key: [u8; 32],
-) -> AppResult<std::sync::Arc<dyn SecretStore>> {
+) -> AppResult<(std::sync::Arc<dyn SecretStore>, SecretsConfig)> {
     let config = SecretsConfig::from_env()?;
     let store: std::sync::Arc<dyn SecretStore> = match config.backend {
         SecretBackend::Database => {
@@ -288,8 +341,12 @@ pub fn store_from_env(
         }
         SecretBackend::Infisical => std::sync::Arc::new(InfisicalSecretStore::from_env()?),
     };
-    tracing::info!(backend = config.backend.as_str(), "secret store selected");
-    Ok(store)
+    tracing::info!(
+        backend = config.backend.as_str(),
+        source = config.source.as_str(),
+        "secret store selected"
+    );
+    Ok((store, config))
 }
 
 #[cfg(test)]
@@ -372,6 +429,33 @@ mod tests {
             SecretsConfig::parse("infisical").unwrap().backend,
             SecretBackend::Infisical
         );
+    }
+
+    /// PMS-1011: the hosting profile supplies the default, an explicit value
+    /// overrides it, and the resolution says which happened. Both modes
+    /// default to the database today; the assertion is that the PROFILE
+    /// decided, not that the two rows happen to agree.
+    #[test]
+    fn the_profile_supplies_the_default_and_an_explicit_value_overrides_it() {
+        for mode in [DeploymentMode::SelfHosted, DeploymentMode::Saas] {
+            let from_profile = SecretsConfig::resolve(mode, "  ").unwrap();
+            assert_eq!(
+                from_profile.backend.as_str(),
+                mode.default_providers_for(ProviderKind::Secrets)[0],
+                "{mode}"
+            );
+            assert_eq!(from_profile.source, EnablementSource::Profile, "{mode}");
+            assert!(from_profile.explicit_providers().is_none(), "{mode}");
+
+            let explicit = SecretsConfig::resolve(mode, " infisical ").unwrap();
+            assert_eq!(explicit.backend, SecretBackend::Infisical, "{mode}");
+            assert_eq!(explicit.source, EnablementSource::Explicit, "{mode}");
+            assert_eq!(
+                explicit.explicit_providers().unwrap(),
+                vec![provider::INFISICAL],
+                "{mode}"
+            );
+        }
     }
 
     /// A typo asked for something. Answering with the default would mean an

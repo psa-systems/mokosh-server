@@ -55,6 +55,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncRead;
 use uuid::Uuid;
 
+use crate::utils::deployment::{provider, DeploymentMode, EnablementSource, ProviderKind};
 use crate::utils::error::{AppError, AppResult};
 
 /// Storage root when `ATTACHMENT_DIR` is unset.
@@ -531,29 +532,61 @@ pub enum StorageBackend {
 impl StorageBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
-            StorageBackend::Local => "local",
-            StorageBackend::S3 => "s3",
+            StorageBackend::Local => provider::LOCAL,
+            StorageBackend::S3 => provider::S3,
         }
     }
 
     /// The ONE reader of `STORAGE_BACKEND`, the way [`StorageConfig::from_env`]
     /// is the only reader of `ATTACHMENT_DIR`.
-    pub fn from_env() -> AppResult<Self> {
-        Self::parse(&std::env::var("STORAGE_BACKEND").unwrap_or_default())
+    ///
+    /// Returns the source alongside the backend (PMS-1011), because "nobody
+    /// configured this and the hosting profile chose local" and "the operator
+    /// asked for local" are different facts and the boot record reports both.
+    /// The profile is read through the strict entry point, so an unrecognised
+    /// `MOKOSH_DEPLOYMENT_MODE` ends startup here rather than silently
+    /// selecting another profile's store.
+    pub fn from_env() -> AppResult<(Self, EnablementSource)> {
+        Self::resolve(
+            DeploymentMode::from_env_for_providers()?,
+            &std::env::var("STORAGE_BACKEND").unwrap_or_default(),
+        )
     }
 
-    /// An unset or blank value is `Local`, because a forwarded-but-unset
-    /// variable arrives as `""` (PMS-836) and the default has to be the one
-    /// that needs no other service: no integration is a hard requirement. An
-    /// unrecognised value is a hard error rather than a fall back to local,
-    /// the same rule `SECRET_BACKEND` follows: an operator who wrote
-    /// `STORAGE_BACKEND=s3 ` with a typo asked for S3, and quietly writing
-    /// their uploads to a container filesystem instead is the silent degrade
-    /// this crate refuses everywhere else.
+    /// An unset or blank value takes the hosting profile's default for
+    /// [`ProviderKind::Storage`], which is `local` in both modes: a
+    /// forwarded-but-unset variable arrives as `""` (PMS-836) and the default
+    /// has to be the one that needs no other service, since no integration is
+    /// a hard requirement.
+    pub fn resolve(mode: DeploymentMode, raw: &str) -> AppResult<(Self, EnablementSource)> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            let name = mode
+                .default_providers_for(ProviderKind::Storage)
+                .first()
+                .copied()
+                .ok_or_else(|| {
+                    AppError::Configuration(format!(
+                        "hosting profile {mode} names no storage provider"
+                    ))
+                })?;
+            return Ok((Self::parse(name)?, EnablementSource::Profile));
+        }
+        Ok((Self::parse(raw)?, EnablementSource::Explicit))
+    }
+
+    /// A provider NAME to a backend. An unrecognised value is a hard error
+    /// rather than a fall back to local, the same rule `SECRET_BACKEND`
+    /// follows: an operator who wrote `STORAGE_BACKEND=s3 ` with a typo asked
+    /// for S3, and quietly writing their uploads to a container filesystem
+    /// instead is the silent degrade this crate refuses everywhere else. Blank
+    /// is not a name; [`resolve`](Self::resolve) settles it against the
+    /// profile before it reaches here, so this cannot become a second place
+    /// that knows the default.
     pub fn parse(raw: &str) -> AppResult<Self> {
         match raw.trim() {
-            "" | "local" => Ok(StorageBackend::Local),
-            "s3" => Ok(StorageBackend::S3),
+            provider::LOCAL => Ok(StorageBackend::Local),
+            provider::S3 => Ok(StorageBackend::S3),
             other => Err(AppError::Configuration(format!(
                 "STORAGE_BACKEND {other:?} is not a known backend; expected 'local' or 's3'"
             ))),
@@ -569,12 +602,16 @@ impl StorageBackend {
 /// cannot fail to build, but the S3 one refuses a half-configured deployment
 /// here rather than on the first upload.
 pub fn store_from_env() -> AppResult<Arc<dyn ObjectStore>> {
-    let backend = StorageBackend::from_env()?;
+    let (backend, source) = StorageBackend::from_env()?;
     let store: Arc<dyn ObjectStore> = match backend {
         StorageBackend::Local => Arc::new(LocalStore::from_env()),
         StorageBackend::S3 => Arc::new(s3::S3Store::from_env()?),
     };
-    tracing::info!(backend = backend.as_str(), "storage backend selected");
+    tracing::info!(
+        backend = backend.as_str(),
+        source = source.as_str(),
+        "storage backend selected"
+    );
     Ok(store)
 }
 
@@ -983,8 +1020,23 @@ mod tests {
     /// error because the operator asked for something and did not get it.
     #[test]
     fn blank_is_local_and_a_typo_is_an_error() {
-        assert_eq!(StorageBackend::parse("").unwrap(), StorageBackend::Local);
-        assert_eq!(StorageBackend::parse("  ").unwrap(), StorageBackend::Local);
+        // Blank is settled by the hosting profile (PMS-1011), which names
+        // `local` in both modes, so an unconfigured deployment resolves
+        // exactly where it always did.
+        for mode in [DeploymentMode::SelfHosted, DeploymentMode::Saas] {
+            for blank in ["", "  "] {
+                assert_eq!(
+                    StorageBackend::resolve(mode, blank).unwrap(),
+                    (StorageBackend::Local, EnablementSource::Profile),
+                    "{mode} {blank:?}"
+                );
+            }
+            assert_eq!(
+                StorageBackend::resolve(mode, " s3 ").unwrap(),
+                (StorageBackend::S3, EnablementSource::Explicit),
+                "{mode}"
+            );
+        }
         assert_eq!(
             StorageBackend::parse("local").unwrap(),
             StorageBackend::Local
@@ -994,6 +1046,10 @@ mod tests {
             assert!(
                 StorageBackend::parse(typo).is_err(),
                 "{typo:?} must not fall back to local"
+            );
+            assert!(
+                StorageBackend::resolve(DeploymentMode::SelfHosted, typo).is_err(),
+                "{typo:?} must not fall back to the profile default either"
             );
         }
     }
