@@ -1109,6 +1109,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
         let tenant_id = user.tenant_id;
 
@@ -1134,6 +1135,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
         let tenant_id = user.tenant_id;
         let state = AuthState::authenticated(user, tenant_id);
@@ -1159,6 +1161,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
 
         assert_eq!(user.full_name(), "John Doe");
@@ -1180,6 +1183,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
 
         assert_eq!(user.initials(), "JD");
@@ -1204,6 +1208,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);
@@ -1229,6 +1234,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);
