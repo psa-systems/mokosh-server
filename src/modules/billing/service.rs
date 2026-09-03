@@ -2205,9 +2205,7 @@ impl BillingService {
         .bind(tenant_id)
         .fetch_all(&mut *tx)
         .await?;
-        Ok(rows
-            .into_iter()
-            .find(|(id, _)| provider::is_supported(id)))
+        Ok(rows.into_iter().find(|(id, _)| provider::is_supported(id)))
     }
 
     /// Build a Stripe provider scoped to the tenant's ACTIVE gateway for the

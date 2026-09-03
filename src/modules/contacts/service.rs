@@ -1437,13 +1437,15 @@ impl ContactService {
         Ok(rows
             .into_iter()
             .map(
-                |(id, name, capabilities, is_builtin, company_id, contacts_count)| PortalRoleSummary {
-                    id,
-                    name,
-                    capabilities,
-                    is_builtin,
-                    company_id,
-                    contacts_count,
+                |(id, name, capabilities, is_builtin, company_id, contacts_count)| {
+                    PortalRoleSummary {
+                        id,
+                        name,
+                        capabilities,
+                        is_builtin,
+                        company_id,
+                        contacts_count,
+                    }
                 },
             )
             .collect())
@@ -1541,7 +1543,8 @@ impl ContactService {
                 .flatten();
         if own_company_id == Some(company_id) {
             return Err(AppError::BadRequest(
-                "Portal access cannot be granted to a contact on the tenant's own_company.".to_string(),
+                "Portal access cannot be granted to a contact on the tenant's own_company."
+                    .to_string(),
             ));
         }
 

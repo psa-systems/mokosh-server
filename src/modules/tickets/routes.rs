@@ -12,9 +12,9 @@ use validator::Validate;
 use super::{
     AttachmentService, CreateNoteRequest, CreateTicketRequest, NoteType, TicketCategoryResponse,
     TicketFilter, TicketNoteResponse, TicketPriority, TicketQueue, TicketResponse, TicketService,
-    TicketStatus, TicketType, UpdateNoteRequest, UpdateTicketRequest,
-    UpsertTicketCategoryRequest, UpsertTicketPriorityRequest, UpsertTicketQueueRequest,
-    UpsertTicketStatusRequest, UpsertTicketTypeRequest,
+    TicketStatus, TicketType, UpdateNoteRequest, UpdateTicketRequest, UpsertTicketCategoryRequest,
+    UpsertTicketPriorityRequest, UpsertTicketQueueRequest, UpsertTicketStatusRequest,
+    UpsertTicketTypeRequest,
 };
 use crate::db::Database;
 use crate::modules::approvals::{ApprovalResponse, ApprovalsService};

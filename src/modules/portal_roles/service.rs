@@ -94,13 +94,15 @@ impl PortalRoleService {
         Ok(rows
             .into_iter()
             .map(
-                |(id, name, capabilities, is_builtin, company_id, contacts_count)| PortalRoleSummary {
-                    id,
-                    name,
-                    capabilities,
-                    is_builtin,
-                    company_id,
-                    contacts_count,
+                |(id, name, capabilities, is_builtin, company_id, contacts_count)| {
+                    PortalRoleSummary {
+                        id,
+                        name,
+                        capabilities,
+                        is_builtin,
+                        company_id,
+                        contacts_count,
+                    }
                 },
             )
             .collect())

@@ -478,8 +478,7 @@ async fn contact_portal_host_returns_hint_for_known_and_404s_for_unknown(pool: P
 /// `ok_or(Unauthorized)` branch in `contact_portal::service::login`.
 #[sqlx::test]
 async fn contact_login_with_no_credential_returns_401(pool: PgPool) {
-    let (_contact_id, slug, _token) =
-        seed_portal_contact(&pool, "no-cred@mcl.example").await;
+    let (_contact_id, slug, _token) = seed_portal_contact(&pool, "no-cred@mcl.example").await;
     // Deliberately skip set-password so `portal_password_hash` stays NULL.
     let app = common::boot(pool.clone()).await;
 
@@ -507,8 +506,7 @@ async fn contact_login_with_no_credential_returns_401(pool: PgPool) {
 /// weakens the NULL-hash guard.
 #[sqlx::test]
 async fn contact_login_with_empty_password_returns_400(pool: PgPool) {
-    let (_contact_id, slug, _token) =
-        seed_portal_contact(&pool, "empty-pw@mcl.example").await;
+    let (_contact_id, slug, _token) = seed_portal_contact(&pool, "empty-pw@mcl.example").await;
     let app = common::boot(pool.clone()).await;
 
     let resp = app

@@ -23,8 +23,8 @@ pub mod contacts;
 pub mod datetime;
 pub mod forms;
 pub mod mileage_tracking;
-pub mod teams;
 pub mod sort;
+pub mod teams;
 pub mod tenants;
 // PMS-924: `sanitize_invisible`, the one definition of "a value that looks the
 // same to a person is the same value in the database".

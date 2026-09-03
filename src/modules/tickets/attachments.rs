@@ -622,10 +622,14 @@ impl AttachmentService {
 
 #[derive(Clone, Copy, Debug)]
 enum Uploader {
-    Agent { user_id: Uuid },
+    Agent {
+        user_id: Uuid,
+    },
     // Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
     #[allow(dead_code)]
-    Portal { contact_id: Uuid },
+    Portal {
+        contact_id: Uuid,
+    },
 }
 
 impl Uploader {

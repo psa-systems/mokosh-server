@@ -189,9 +189,7 @@ async fn readiness_ready_when_gateway_and_payable(pool: PgPool) {
 
     let resp = app
         .client
-        .get(app.url(&format!(
-            "/api/v1/invoices/{invoice_id}/payment-readiness"
-        )))
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
         .bearer_auth(&token)
         .send()
         .await
@@ -231,9 +229,7 @@ async fn readiness_not_payable_when_draft(pool: PgPool) {
 
     let resp = app
         .client
-        .get(app.url(&format!(
-            "/api/v1/invoices/{invoice_id}/payment-readiness"
-        )))
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
         .bearer_auth(&token)
         .send()
         .await
@@ -263,9 +259,7 @@ async fn readiness_not_ready_when_no_gateway(pool: PgPool) {
 
     let resp = app
         .client
-        .get(app.url(&format!(
-            "/api/v1/invoices/{invoice_id}/payment-readiness"
-        )))
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
         .bearer_auth(&token)
         .send()
         .await
@@ -294,9 +288,7 @@ async fn readiness_cross_company_404(pool: PgPool) {
 
     let resp = app
         .client
-        .get(app.url(&format!(
-            "/api/v1/invoices/{invoice_id}/payment-readiness"
-        )))
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
         .bearer_auth(&token)
         .send()
         .await
@@ -318,14 +310,16 @@ async fn readiness_button_label_uses_override_when_set(pool: PgPool) {
         seed_contact_with_roles(&app, &pool, "ready-override", &["Billing Contact"]).await;
     let invoice_id = seed_sent_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
     seed_stripe_gateway(&pool, common::DEFAULT_TENANT_ID).await;
-    set_stripe_client_display_name(&pool, common::DEFAULT_TENANT_ID, "Pay with your credit card")
-        .await;
+    set_stripe_client_display_name(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "Pay with your credit card",
+    )
+    .await;
 
     let resp = app
         .client
-        .get(app.url(&format!(
-            "/api/v1/invoices/{invoice_id}/payment-readiness"
-        )))
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
         .bearer_auth(&token)
         .send()
         .await
@@ -351,9 +345,7 @@ async fn readiness_button_label_falls_back_when_override_is_blank(pool: PgPool) 
 
     let resp = app
         .client
-        .get(app.url(&format!(
-            "/api/v1/invoices/{invoice_id}/payment-readiness"
-        )))
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
         .bearer_auth(&token)
         .send()
         .await
@@ -399,8 +391,7 @@ async fn list_invoices_contact_plane_hides_drafts(pool: PgPool) {
         "MAPPS-670: the surviving row is the sent invoice"
     );
     assert!(
-        rows.iter()
-            .all(|r| r["status"].as_str() != Some("draft")),
+        rows.iter().all(|r| r["status"].as_str() != Some("draft")),
         "MAPPS-670: no draft may leak into the contact list"
     );
     assert_eq!(
@@ -433,8 +424,7 @@ async fn list_invoices_contact_plane_ignores_client_exclude_draft_override(pool:
     let body: serde_json::Value = resp.json().await.expect("json");
     let rows = body["data"].as_array().expect("data array");
     assert!(
-        rows.iter()
-            .all(|r| r["status"].as_str() != Some("draft")),
+        rows.iter().all(|r| r["status"].as_str() != Some("draft")),
         "MAPPS-670: exclude_draft override in the URL must NOT re-expose drafts to a contact"
     );
 }
@@ -449,9 +439,7 @@ async fn readiness_no_invoices_read_cap_403(pool: PgPool) {
 
     let resp = app
         .client
-        .get(app.url(&format!(
-            "/api/v1/invoices/{invoice_id}/payment-readiness"
-        )))
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
         .bearer_auth(&token)
         .send()
         .await
