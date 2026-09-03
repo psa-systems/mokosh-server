@@ -7,12 +7,12 @@ name: Build OCI container
 on:
   push:
     branches:
-      #- "main"
+      - "main"
       # Allow-listed feature branches publish their own branch tag and never
       # :latest, so staging can run a branch (PMS-733). Keep this list in sync
       # with BRANCH_ALLOW_LIST in oci-build/get-tags.nu; scripts/check-oci-publish-tags.nu
       # fails the build if the two disagree.
-      - "mokosh-client-login"
+      - "mokosh-contact-login"
     tags:
       - "v*"
     paths:
@@ -48,7 +48,7 @@ jobs:
     # ref in addition to the push-trigger branch filter above. The allow-listed
     # branches appended to it publish their own branch tag only; the mode
     # computation below never resolves `latest` off main (PMS-733).
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/mokosh-client-login'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/mokosh-contact-login'
     # Base label: the musl compile happens inside `docker buildx`, so the runner
     # only needs docker, nu and git. Nothing compiles natively here.
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
