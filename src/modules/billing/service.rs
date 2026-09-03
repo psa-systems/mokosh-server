@@ -2802,6 +2802,16 @@ impl BillingService {
         } else {
             None
         };
+        // PMS-1001: the invoice records the person it was actually sent to.
+        // `resolve_invoice_recipient` falls back to the company's default
+        // pointer, and until this that fallback was never written down: the
+        // mail went to a person while the document rendered below named an
+        // organization and nobody else. Written before the render in this same
+        // transaction so `load_invoice` reads it, and COALESCEd below so a
+        // later update cannot move it off whoever received the document.
+        let billing_contact_id = request
+            .billing_contact_id
+            .or_else(|| recipient.as_ref().map(|(id, _)| *id));
         // PMS-911: the MSP's identity as it stands right now, frozen onto the
         // invoice on the transition that freezes the invoice. In this
         // transaction, because a post-commit step is best-effort and an
@@ -2839,7 +2849,7 @@ impl BillingService {
             "#,
         )
         .bind(invoice_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
         .bind(due_date)
@@ -3184,6 +3194,64 @@ impl BillingService {
             contact_name,
             contact_email,
         })
+    }
+
+    /// PMS-1001: who a credit note is addressed to.
+    ///
+    /// The contact its own invoice was addressed to, read from that invoice's
+    /// `billing_contact_id` rather than from the company's current pointer, for
+    /// the reason the invoice reads its own column: reassigning the billing
+    /// role must not change who a document already issued says it went to.
+    pub async fn credit_to(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        invoice_id: Uuid,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let contact = Self::invoice_billing_contact_in_tx(&mut tx, tenant_id, invoice_id).await?;
+        Self::bill_to_in_tx(&mut tx, tenant_id, company_id, contact).await
+    }
+
+    /// PMS-1001: who a statement is addressed to.
+    ///
+    /// The company's CURRENT default billing contact, and deliberately not an
+    /// invoice's. A statement spans many invoices that may each name a
+    /// different person, and PMS-954 made it a read model that stores nothing,
+    /// so it renders from today exactly as its issuer and its branding already
+    /// do. There is no historical recipient for it to name.
+    pub async fn statement_account(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let contact: Option<Uuid> = sqlx::query_scalar(
+            "SELECT default_billing_contact_id FROM companies WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        Self::bill_to_in_tx(&mut tx, tenant_id, company_id, contact).await
+    }
+
+    /// The contact an invoice names, for a document addressed to whoever
+    /// received that invoice.
+    async fn invoice_billing_contact_in_tx(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+    ) -> AppResult<Option<Uuid>> {
+        let contact: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT billing_contact_id FROM invoices WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(contact.flatten())
     }
 
     /// PMS-911: the tenant's identity as it stands now, for a document that is
@@ -3739,7 +3807,11 @@ impl BillingService {
         // snapshot.
         let note = Self::load_credit_note(&mut tx, tenant_id, credit_note_id).await?;
         let issuer = Self::tenant_issuer_in_tx(&mut tx, tenant_id).await?;
-        let credit_to = Self::bill_to_in_tx(&mut tx, tenant_id, note.company_id, None).await?;
+        // PMS-1001: addressed to whoever the corrected invoice was addressed
+        // to, so a credit note names the same person as the document it undoes.
+        let contact =
+            Self::invoice_billing_contact_in_tx(&mut tx, tenant_id, note.invoice_id).await?;
+        let credit_to = Self::bill_to_in_tx(&mut tx, tenant_id, note.company_id, contact).await?;
         let logo = crate::modules::billing::issuer::live_logo_bytes(tenant_id.get(), &issuer).await;
         let bytes = crate::pdf::render(&crate::modules::billing::documents::credit_note(
             &note, &issuer, &credit_to, logo,
