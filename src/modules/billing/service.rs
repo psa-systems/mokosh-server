@@ -4212,25 +4212,25 @@ impl BillingService {
         .fetch_one(&mut *tx)
         .await?;
 
-        let rows: Vec<ProductRow> = sqlx::query_as(
+        let sql = format!(
             r#"
-            SELECT id, sku, name, description, unit_price, unit, is_taxable,
-                   is_active, created_at, updated_at
-            FROM products
-            WHERE tenant_id = $1
-              AND ($2::bool IS NULL OR is_active = $2)
-              AND ($3::text IS NULL OR name ILIKE $3 OR sku ILIKE $3)
-            ORDER BY name
+            SELECT {PRODUCT_COLUMNS}
+            FROM products p
+            WHERE p.tenant_id = $1
+              AND ($2::bool IS NULL OR p.is_active = $2)
+              AND ($3::text IS NULL OR p.name ILIKE $3 OR p.sku ILIKE $3)
+            ORDER BY p.name
             LIMIT $4 OFFSET $5
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(filter.is_active)
-        .bind(pattern.as_deref())
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+            "#
+        );
+        let rows: Vec<ProductRow> = sqlx::query_as(&sql)
+            .bind(tenant_id)
+            .bind(filter.is_active)
+            .bind(pattern.as_deref())
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
 
         Ok((
             rows.into_iter().map(ProductResponse::from).collect(),
@@ -4244,17 +4244,17 @@ impl BillingService {
         product_id: Uuid,
     ) -> AppResult<ProductResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<ProductRow> = sqlx::query_as(
+        let sql = format!(
             r#"
-            SELECT id, sku, name, description, unit_price, unit, is_taxable,
-                   is_active, created_at, updated_at
-            FROM products WHERE id = $1 AND tenant_id = $2
-            "#,
-        )
-        .bind(product_id)
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+            SELECT {PRODUCT_COLUMNS}
+            FROM products p WHERE p.id = $1 AND p.tenant_id = $2
+            "#
+        );
+        let row: Option<ProductRow> = sqlx::query_as(&sql)
+            .bind(product_id)
+            .bind(tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
         row.map(ProductResponse::from)
             .ok_or_else(|| AppError::NotFound("Product".to_string()))
     }
@@ -4268,32 +4268,32 @@ impl BillingService {
     ) -> AppResult<ProductResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id = Uuid::new_v4();
-        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(
+        let sql = format!(
             r#"
-            INSERT INTO products (id, tenant_id, sku, name, description,
-                                  unit_price, unit, is_taxable, is_active)
+            INSERT INTO products AS p (id, tenant_id, sku, name, description,
+                                       unit_price, unit, is_taxable, is_active)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id, sku, name, description, unit_price, unit, is_taxable,
-                      is_active, created_at, updated_at
-            "#,
-        )
-        .bind(id)
-        .bind(tenant_id)
-        .bind(
-            request
-                .sku
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        )
-        .bind(request.name.trim())
-        .bind(&request.description)
-        .bind(request.unit_price)
-        .bind(request.unit.trim())
-        .bind(request.is_taxable)
-        .bind(request.is_active)
-        .fetch_one(&mut *tx)
-        .await;
+            RETURNING {PRODUCT_COLUMNS}
+            "#
+        );
+        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(&sql)
+            .bind(id)
+            .bind(tenant_id)
+            .bind(
+                request
+                    .sku
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            )
+            .bind(request.name.trim())
+            .bind(&request.description)
+            .bind(request.unit_price)
+            .bind(request.unit.trim())
+            .bind(request.is_taxable)
+            .bind(request.is_active)
+            .fetch_one(&mut *tx)
+            .await;
         let row = row.map_err(Self::product_conflict)?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -4341,33 +4341,33 @@ impl BillingService {
         // Editing the catalog price is legal and changes nothing already
         // written: `invoice_lines.unit_price` is the price at the moment the
         // line was written, and nothing reads through to here at render time.
-        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(
+        let sql = format!(
             r#"
-            UPDATE products SET sku = $3, name = $4, description = $5,
-                                unit_price = $6, unit = $7, is_taxable = $8,
-                                is_active = $9, updated_at = NOW()
-            WHERE id = $1 AND tenant_id = $2
-            RETURNING id, sku, name, description, unit_price, unit, is_taxable,
-                      is_active, created_at, updated_at
-            "#,
-        )
-        .bind(product_id)
-        .bind(tenant_id)
-        .bind(
-            request
-                .sku
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        )
-        .bind(request.name.trim())
-        .bind(&request.description)
-        .bind(request.unit_price)
-        .bind(request.unit.trim())
-        .bind(request.is_taxable)
-        .bind(request.is_active)
-        .fetch_one(&mut *tx)
-        .await;
+            UPDATE products AS p SET sku = $3, name = $4, description = $5,
+                                     unit_price = $6, unit = $7, is_taxable = $8,
+                                     is_active = $9, updated_at = NOW()
+            WHERE p.id = $1 AND p.tenant_id = $2
+            RETURNING {PRODUCT_COLUMNS}
+            "#
+        );
+        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(&sql)
+            .bind(product_id)
+            .bind(tenant_id)
+            .bind(
+                request
+                    .sku
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            )
+            .bind(request.name.trim())
+            .bind(&request.description)
+            .bind(request.unit_price)
+            .bind(request.unit.trim())
+            .bind(request.is_taxable)
+            .bind(request.is_active)
+            .fetch_one(&mut *tx)
+            .await;
         let row = row.map_err(Self::product_conflict)?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -5253,6 +5253,23 @@ impl From<StatementCreditRow> for StatementCreditLine {
 
 // ---- PMS-955: product catalog row type -------------------------------------
 
+/// The columns every product read selects, with `products` aliased as `p`.
+///
+/// One list for `list_products`, `get_product` and the `RETURNING` of create
+/// and update, so the four responses cannot drift. `in_use` (PMS-1002) is
+/// computed here rather than by a second query per row: whether anything
+/// names the product is a fact about two FK columns, and an `EXISTS` on each
+/// is the cheapest true answer. Both tables are tenant-isolated (RLS: a
+/// column on `contract_items`, the parent-join policy of migration 041 on
+/// `invoice_lines`), and a product can only be referenced from its own tenant
+/// (`assert_product_sellable`), so no tenant filter is repeated in the
+/// subselects.
+const PRODUCT_COLUMNS: &str = "\
+    p.id, p.sku, p.name, p.description, p.unit_price, p.unit, p.is_taxable, \
+    p.is_active, p.created_at, p.updated_at, \
+    (EXISTS (SELECT 1 FROM invoice_lines il WHERE il.product_id = p.id) \
+     OR EXISTS (SELECT 1 FROM contract_items ci WHERE ci.product_id = p.id)) AS in_use";
+
 #[derive(sqlx::FromRow)]
 struct ProductRow {
     id: Uuid,
@@ -5263,6 +5280,7 @@ struct ProductRow {
     unit: String,
     is_taxable: bool,
     is_active: bool,
+    in_use: bool,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -5278,6 +5296,7 @@ impl From<ProductRow> for ProductResponse {
             unit: r.unit,
             is_taxable: r.is_taxable,
             is_active: r.is_active,
+            in_use: r.in_use,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

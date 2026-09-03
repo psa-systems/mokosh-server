@@ -889,6 +889,13 @@ pub struct ProductResponse {
     /// Retirement is deactivation, never deletion: the documents that sold it
     /// still name it, and the database refuses to drop a referenced row.
     pub is_active: bool,
+    /// Whether any invoice line or contract item names this product
+    /// (PMS-1002). Advisory: a client uses it to show "In use" and to withhold
+    /// Delete where the FK would refuse it, but the FK is the guard, so a
+    /// product sold between the read and the click is still refused with a
+    /// 409. A boolean rather than a count, because "how many sold" is a
+    /// different question that no list here answers.
+    pub in_use: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
