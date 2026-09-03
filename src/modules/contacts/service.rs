@@ -2644,6 +2644,27 @@ impl ContactService {
                 .collect(),
         };
 
+        // MAPPS: bug reproduced on the post-main-merge branch where the
+        // SPA "+ New Contact" flow from a Company page CREATED the
+        // contact successfully but `contacts.company_id` stayed NULL,
+        // so `grant_portal_access` refused with "contact has no
+        // company_id". The row DID exist in `contact_companies` (the
+        // write and the primary promotion both succeeded), but
+        // whichever of the write / recompute pair failed left the
+        // scalar mirror empty. Belt-and-suspenders: derive the
+        // scalar `contacts.company_id` at INSERT time from the
+        // primary link (or the first, matching write_contact_companies'
+        // fallback) so the mirror lands populated regardless of what
+        // recompute_contact_mirrors sees when it runs a few lines
+        // later.
+        let insert_company_id = request.company_id.or_else(|| {
+            links
+                .iter()
+                .find(|l| l.is_primary)
+                .or_else(|| links.first())
+                .map(|l| l.company_id)
+        });
+
         // PMS-402: the stored freeform name is mutually exclusive with the FK.
         // When company_id is set, the CRM name is authoritative (resolved via
         // the read-side join), so persist NULL; otherwise store the freeform
@@ -2717,7 +2738,7 @@ impl ContactService {
         )
         .bind(contact_id)
         .bind(tenant_id)
-        .bind(request.company_id)
+        .bind(insert_company_id)
         .bind(stored_company_name)
         .bind(&request.first_name)
         .bind(&request.last_name)
