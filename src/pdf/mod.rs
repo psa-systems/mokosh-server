@@ -18,7 +18,7 @@
 //! Anything needing real flow - wrapped paragraphs, nested blocks - is a bigger
 //! decision than either needs and would be made against the work that wants it.
 //!
-//! ## Why `printpdf` and a base-14 font
+//! ## Why `printpdf`
 //!
 //! Pure Rust, so `oci-build/Dockerfile` stays a static musl binary with no
 //! runtime dependency. Pulling `wkhtmltopdf` in would add a large native
@@ -26,32 +26,55 @@
 //! ships one binary. `default-features = false` because the defaults carry HTML
 //! rendering and hyphenation dictionaries that nothing here uses.
 //!
-//! [`BuiltinFont::Helvetica`] serializes as a standard Type1 font reference
-//! rather than embedded bytes, so no font is vendored into the repo and the
-//! output stays small.
+//! ## Why an embedded font rather than a base-14 one (PMS-1007)
+//!
+//! A base-14 font like Helvetica costs no vendored bytes, but it is
+//! `WinAnsiEncoding`: only Latin-1 is representable, and everything above
+//! U+00FF was replaced with `?`. Report data is tenant text and so is an
+//! invoice, so that printed a customer's own name back at them wrong -
+//! `Łukasiewicz`, any Greek, Cyrillic, Hebrew or CJK name, and the euro sign -
+//! on a document they keep. Latin-1 accents survived, which is what hid it:
+//! `Café Ltd` came out right.
+//!
+//! So Noto Sans (regular and bold) is vendored in `fonts/` beside this file
+//! and embedded, which covers Latin, Latin Extended, Greek and Cyrillic. It is
+//! under the SIL Open Font License 1.1 and `fonts/OFL.txt` is that licence; the
+//! release image copies it in beside the binary, because the licence has to
+//! travel with the font bytes and those bytes are compiled in.
+//!
+//! `src/pdf/fonts` rather than a top-level `assets/`, so the files arrive
+//! wherever the crate's sources do: `oci-build/Dockerfile` already copies
+//! `src/` and `compose.dev.yml` already mounts it, and a font that reaches
+//! neither is a build that does not compile.
 //!
 //! ## The cost of that, stated rather than discovered
 //!
-//! A base-14 font is `WinAnsiEncoding`, so only Latin-1 is representable, and
-//! report data is tenant text: a company name or a work-type name can hold
-//! anything. [`to_win_ansi`] folds what it can (typographic quotes, dashes, an
-//! ellipsis, a non-breaking space) and replaces the rest with `?` rather than
-//! emitting bytes a reader will render as something else.
+//! Two weights of a whole font are about 850 KB in the binary, and printpdf
+//! embeds the full font program (subsetting is behind its `text_layout`
+//! feature, which pulls a layout engine and a system font-discovery crate in
+//! for glyphs we already know how to name), so a rendered document carries the
+//! deflated faces it used: a one-line invoice went from about 8.5 KB to about
+//! 460 KB. That is the trade for a name that is spelled right, and it is a
+//! per-document cost on documents PMS-959 keeps for seven years, so shrinking
+//! it is PMS-1008 rather than something this module quietly lives with.
 //!
-//! That is an acceptable trade for an internal report and will NOT be
-//! acceptable for an invoice a client receives with their own name on it. The
-//! answer there is an embedded font, which is a licensing and binary-size
-//! decision, and it belongs to PMS-959 / PMS-911 rather than being made here on
-//! their behalf.
+//! What still cannot be drawn is Noto Sans's own coverage limit, chiefly CJK,
+//! whose face is roughly twenty times the size for a case no tenant has hit.
+//! Such a character is still replaced with `?`, but [`render`] logs one `warn`
+//! naming the characters and the document, so it is an operator-visible event
+//! rather than a mangled invoice nobody hears about.
+
+use std::collections::BTreeSet;
+use std::sync::OnceLock;
 
 use printpdf::{
-    BuiltinFont, Color, Line, LinePoint, Mm, Op, PdfDocument, PdfFontHandle, PdfPage,
-    PdfSaveOptions, Point, Pt, RawImage, Rgb, TextItem, XObjectId, XObjectTransform,
+    Color, FontId, Line, LinePoint, Mm, Op, ParsedFont, PdfDocument, PdfFont, PdfFontHandle,
+    PdfPage, PdfSaveOptions, Point, Pt, RawImage, Rgb, TextItem, XObjectId, XObjectTransform,
 };
 
 use sha2::{Digest, Sha256};
 
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 
 /// A4 portrait, in millimetres.
 const PAGE_WIDTH_MM: f32 = 210.0;
@@ -65,15 +88,18 @@ const BODY_PT: f32 = 9.0;
 /// Millimetres per point, for turning a font size into a line height.
 const MM_PER_PT: f32 = 25.4 / 72.0;
 
-/// Rough advance width of a Helvetica character, as a fraction of the font
-/// size.
+/// Rough advance width of a character, as a fraction of the font size.
 ///
-/// An approximation, deliberately. Exact metrics would mean carrying the
-/// base-14 width tables, and the only thing this number decides is how many
-/// characters fit in a table column before the cell is truncated. Erring
+/// An approximation, deliberately: the only thing this number decides is how
+/// many characters fit in a table column before the cell is truncated. Erring
 /// slightly wide costs a truncated cell; erring narrow would overlap the next
-/// column, so it is set above Helvetica's true average.
-const AVERAGE_CHAR_EM: f32 = 0.52;
+/// column, so it is set above the embedded face's true average.
+///
+/// PMS-1007 raised it from the 0.52 that suited Helvetica: Noto Sans is the
+/// wider face, and keeping the old figure would have started overlapping
+/// columns rather than truncating them. `the_width_estimate_is_not_narrower_than_the_font`
+/// measures the face and fails if this drops back under it.
+const AVERAGE_CHAR_EM: f32 = 0.56;
 
 /// Left column width for a labelled field, in millimetres.
 const LABEL_WIDTH_MM: f32 = 62.0;
@@ -252,37 +278,128 @@ impl Document {
     }
 }
 
-/// Fold a string into something `WinAnsiEncoding` can carry.
+/// Noto Sans, vendored under the SIL Open Font License 1.1. The licence text
+/// sits beside these files and is copied into the release image, because the
+/// bytes it covers are compiled into the binary and cannot carry it themselves.
+const NOTO_SANS_REGULAR: &[u8] = include_bytes!("fonts/NotoSans-Regular.ttf");
+const NOTO_SANS_BOLD: &[u8] = include_bytes!("fonts/NotoSans-Bold.ttf");
+
+/// Which of the two embedded faces a run of text is set in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Weight {
+    Regular,
+    Bold,
+}
+
+impl Weight {
+    /// The PDF resource name for the face.
+    ///
+    /// A fixed string, NOT `FontId::new()`, for the reason `place_logo` mints
+    /// its `XObjectId` from a digest: printpdf's constructor is 32 random
+    /// characters, that id becomes the name in the page's resource dictionary
+    /// AND in its compressed content stream, and a random one makes two renders
+    /// of the same document differ where nothing can patch it afterwards.
+    fn id(self) -> FontId {
+        FontId(
+            match self {
+                Weight::Regular => "NotoSansRegular",
+                Weight::Bold => "NotoSansBold",
+            }
+            .to_string(),
+        )
+    }
+}
+
+/// The two faces, parsed once for the life of the process.
+struct Faces {
+    regular: ParsedFont,
+    bold: ParsedFont,
+}
+
+impl Faces {
+    fn get(&self, weight: Weight) -> &ParsedFont {
+        match weight {
+            Weight::Regular => &self.regular,
+            Weight::Bold => &self.bold,
+        }
+    }
+}
+
+/// Parse the vendored faces, once.
 ///
-/// The common cases are folded rather than dropped, because a curly quote
-/// becoming `?` in a company name reads as corruption where a straight quote
-/// reads as a plain document. Everything else becomes `?`: emitting the raw
-/// byte would render as an unrelated Latin-1 character, which is worse than a
-/// visible gap.
-pub fn to_win_ansi(s: &str) -> String {
+/// The bytes are compiled in and covered by a test, so a failure here means the
+/// vendored file is not the font it claims to be. That is reported rather than
+/// worked around: falling back to a base-14 font would silently reinstate the
+/// defect this exists to fix, and print a customer's name as `?` again with
+/// nothing in the log.
+fn faces() -> AppResult<&'static Faces> {
+    static FACES: OnceLock<Option<Faces>> = OnceLock::new();
+    let parse = |bytes: &[u8], name: &str| {
+        let mut warnings = Vec::new();
+        let face = ParsedFont::from_bytes(bytes, 0, &mut warnings);
+        for warning in &warnings {
+            tracing::warn!(font = name, message = %warning.message, "pdf: font parse warning");
+        }
+        face
+    };
+    FACES
+        .get_or_init(|| {
+            Some(Faces {
+                regular: parse(NOTO_SANS_REGULAR, "NotoSans-Regular")?,
+                bold: parse(NOTO_SANS_BOLD, "NotoSans-Bold")?,
+            })
+        })
+        .as_ref()
+        .ok_or_else(|| {
+            tracing::error!(
+                "pdf: the embedded Noto Sans faces did not parse; no document can be rendered"
+            );
+            AppError::Internal("the embedded PDF font did not parse".to_string())
+        })
+}
+
+/// Fold a string into what the embedded face can draw, recording what it could
+/// not so the caller can say so out loud.
+///
+/// A character with no glyph becomes `?` rather than reaching the content
+/// stream, where printpdf would map it to glyph 0 and a reader would draw an
+/// empty box: a question mark says "this character was lost" where a box says
+/// nothing at all. Which characters those were is [`render`]'s to report; this
+/// function only collects them, because one warning per document beats one per
+/// character in a 400-row table.
+fn for_font(s: &str, face: &ParsedFont, missing: &mut BTreeSet<char>) -> String {
     s.chars()
         .map(|c| match c {
-            '\u{2018}' | '\u{2019}' | '\u{201B}' => '\'',
-            '\u{201C}' | '\u{201D}' | '\u{201F}' => '"',
-            '\u{2013}' | '\u{2014}' | '\u{2212}' => '-',
-            '\u{00A0}' | '\u{202F}' => ' ',
+            // C0/C1 controls have no glyph and would corrupt the stream. Not
+            // "missing": nobody typed them expecting to see them.
             '\t' => ' ',
-            // C0/C1 controls have no glyph and would corrupt the stream.
             c if (c as u32) < 0x20 || ((c as u32) >= 0x7F && (c as u32) < 0xA0) => ' ',
-            c if (c as u32) <= 0xFF => c,
-            _ => '?',
+            c if face.lookup_glyph_index(c as u32).is_some() => c,
+            c => {
+                missing.insert(c);
+                '?'
+            }
         })
         .collect()
 }
 
 /// Render a document to PDF bytes.
 ///
-/// Infallible in practice - there is no IO and no parsing - but it returns
-/// `AppResult` so a backend that can fail (an embedded font that will not
-/// parse, once PMS-959 wants one) does not change every call site.
+/// Fails only when the vendored faces will not parse, which is a broken build
+/// rather than a bad document: see [`faces`].
 pub fn render(document: &Document) -> AppResult<Vec<u8>> {
-    let mut doc = PdfDocument::new(&to_win_ansi(&document.title));
-    let mut layout = Layout::new();
+    let faces = faces()?;
+    // The title also goes in the document information dictionary, which
+    // printpdf writes as UTF-16BE, so that copy carries any character at all
+    // and is passed through unfolded.
+    let mut doc = PdfDocument::new(&document.title);
+    for weight in [Weight::Regular, Weight::Bold] {
+        doc.resources
+            .fonts
+            .map
+            .insert(weight.id(), PdfFont::new(faces.get(weight).clone()));
+    }
+    let mut layout = Layout::new(faces);
 
     // The logo is placed before the title so the title block can start below
     // it if it is the taller of the two. A logo that will not decode is
@@ -301,9 +418,9 @@ pub fn render(document: &Document) -> AppResult<Vec<u8>> {
     };
 
     let title_top = layout.y_mm;
-    layout.line(&document.title, BuiltinFont::HelveticaBold, TITLE_PT);
+    layout.line(&document.title, Weight::Bold, TITLE_PT);
     if let Some(subtitle) = &document.subtitle {
-        layout.line(subtitle, BuiltinFont::Helvetica, HEADING_PT);
+        layout.line(subtitle, Weight::Regular, HEADING_PT);
     }
     // Whichever of the two blocks is taller decides where the body starts.
     layout.y_mm = layout.y_mm.min(title_top - logo_height);
@@ -326,6 +443,22 @@ pub fn render(document: &Document) -> AppResult<Vec<u8>> {
             Body::Columns(blocks) => layout.columns(blocks),
             Body::Totals(pairs) => layout.totals(pairs),
         }
+    }
+
+    // One line per document, not per character: a 400-row report of an
+    // unsupported script would otherwise emit a warning per cell and bury the
+    // fact in its own repetition.
+    let missing = std::mem::take(&mut layout.missing);
+    if !missing.is_empty() {
+        let characters: Vec<String> = missing
+            .iter()
+            .map(|c| format!("{c} (U+{:04X})", *c as u32))
+            .collect();
+        tracing::warn!(
+            document = %document.title,
+            characters = %characters.join(", "),
+            "pdf: the embedded font has no glyph for these characters; they were printed as '?'"
+        );
     }
 
     let mut bytes = doc
@@ -471,14 +604,20 @@ struct Layout {
     /// Distance from the BOTTOM of the page, because that is where PDF's origin
     /// is and converting once here beats converting at every draw.
     y_mm: f32,
+    faces: &'static Faces,
+    /// Every character the faces could not draw, gathered as the page is drawn
+    /// so [`render`] can report them once.
+    missing: BTreeSet<char>,
 }
 
 impl Layout {
-    fn new() -> Self {
+    fn new(faces: &'static Faces) -> Self {
         Self {
             pages: Vec::new(),
             ops: Vec::new(),
             y_mm: PAGE_HEIGHT_MM - MARGIN_MM,
+            faces,
+            missing: BTreeSet::new(),
         }
     }
 
@@ -513,14 +652,15 @@ impl Layout {
         self.advance(mm);
     }
 
-    fn text_at(&mut self, x_mm: f32, text: &str, font: BuiltinFont, size_pt: f32) {
+    fn text_at(&mut self, x_mm: f32, text: &str, font: Weight, size_pt: f32) {
+        let text = for_font(text, self.faces.get(font), &mut self.missing);
         self.ops.extend([
             Op::StartTextSection,
             Op::SetTextCursor {
                 pos: Point::new(Mm(x_mm), Mm(self.y_mm)),
             },
             Op::SetFont {
-                font: PdfFontHandle::Builtin(font),
+                font: PdfFontHandle::External(font.id()),
                 size: Pt(size_pt),
             },
             Op::SetFillColor {
@@ -532,21 +672,21 @@ impl Layout {
                 }),
             },
             Op::ShowText {
-                items: vec![TextItem::Text(to_win_ansi(text))],
+                items: vec![TextItem::Text(text)],
             },
             Op::EndTextSection,
         ]);
     }
 
     /// One line at the left margin, and down.
-    fn line(&mut self, text: &str, font: BuiltinFont, size_pt: f32) {
+    fn line(&mut self, text: &str, font: Weight, size_pt: f32) {
         self.text_at(MARGIN_MM, text, font, size_pt);
         self.advance(row_height(size_pt));
     }
 
     /// A section heading with its rule beneath.
     fn heading(&mut self, text: &str) {
-        self.text_at(MARGIN_MM, text, BuiltinFont::HelveticaBold, HEADING_PT);
+        self.text_at(MARGIN_MM, text, Weight::Bold, HEADING_PT);
         self.rule();
     }
 
@@ -618,20 +758,10 @@ impl Layout {
         for (i, (heading, lines)) in blocks.iter().enumerate() {
             let x = MARGIN_MM + i as f32 * (width + COLUMN_GUTTER_MM);
             self.y_mm = top;
-            self.text_at(
-                x,
-                &truncate_to(heading, width),
-                BuiltinFont::HelveticaBold,
-                HEADING_PT,
-            );
+            self.text_at(x, &truncate_to(heading, width), Weight::Bold, HEADING_PT);
             self.rule_between(x, x + width);
             for line in lines {
-                self.text_at(
-                    x,
-                    &truncate_to(line, width),
-                    BuiltinFont::Helvetica,
-                    BODY_PT,
-                );
+                self.text_at(x, &truncate_to(line, width), Weight::Regular, BODY_PT);
                 self.y_mm -= row_height(BODY_PT);
             }
             lowest = lowest.min(self.y_mm);
@@ -649,12 +779,12 @@ impl Layout {
                 // The rule that says "this one is the answer".
                 self.rule_between(x0, right);
             }
-            self.text_at(x0, label, BuiltinFont::Helvetica, BODY_PT);
+            self.text_at(x0, label, Weight::Regular, BODY_PT);
             let value = truncate_to(value, TOTALS_WIDTH_MM - LABEL_WIDTH_MM / 2.0);
             self.text_at(
                 right_aligned_x(right, &value),
                 &value,
-                BuiltinFont::HelveticaBold,
+                Weight::Bold,
                 BODY_PT,
             );
             self.advance(row_height(BODY_PT));
@@ -664,13 +794,8 @@ impl Layout {
     fn fields(&mut self, pairs: &[(String, String)]) {
         for (label, value) in pairs {
             self.keep_together(row_height(BODY_PT));
-            self.text_at(MARGIN_MM, label, BuiltinFont::Helvetica, BODY_PT);
-            self.text_at(
-                MARGIN_MM + LABEL_WIDTH_MM,
-                value,
-                BuiltinFont::HelveticaBold,
-                BODY_PT,
-            );
+            self.text_at(MARGIN_MM, label, Weight::Regular, BODY_PT);
+            self.text_at(MARGIN_MM + LABEL_WIDTH_MM, value, Weight::Bold, BODY_PT);
             self.advance(row_height(BODY_PT));
         }
     }
@@ -679,7 +804,7 @@ impl Layout {
     fn text_block(&mut self, lines: &[String]) {
         for line in lines {
             self.keep_together(row_height(BODY_PT));
-            self.text_at(MARGIN_MM, line, BuiltinFont::Helvetica, BODY_PT);
+            self.text_at(MARGIN_MM, line, Weight::Regular, BODY_PT);
             self.advance(row_height(BODY_PT));
         }
     }
@@ -698,7 +823,7 @@ impl Layout {
                 self.page_break();
                 self.header_row(headers, &widths, align);
             }
-            self.cells(row, &widths, align, BuiltinFont::Helvetica);
+            self.cells(row, &widths, align, Weight::Regular);
             self.advance(row_height(BODY_PT));
         }
         // PMS-1004: a closing rule, so the table has a bottom as well as a
@@ -710,11 +835,11 @@ impl Layout {
     }
 
     fn header_row(&mut self, headers: &[String], widths: &[f32], align: &[Align]) {
-        self.cells(headers, widths, align, BuiltinFont::HelveticaBold);
+        self.cells(headers, widths, align, Weight::Bold);
         self.rule();
     }
 
-    fn cells(&mut self, cells: &[String], widths: &[f32], align: &[Align], font: BuiltinFont) {
+    fn cells(&mut self, cells: &[String], widths: &[f32], align: &[Align], font: Weight) {
         let mut x = MARGIN_MM;
         for (i, width) in widths.iter().enumerate() {
             if let Some(cell) = cells.get(i) {
@@ -1004,30 +1129,50 @@ mod tests {
             .count()
     }
 
-    /// Only Latin-1 survives, and the common typographic characters are folded
-    /// rather than lost, because a curly quote becoming `?` in a company name
-    /// reads as corruption.
+    /// PMS-1007: what the face can draw reaches the page unchanged, and what it
+    /// cannot is both substituted AND recorded, because a silent `?` is the
+    /// defect. The typographic characters the WinAnsi fold used to flatten
+    /// (a curly quote, an em dash, a non-breaking space) are real glyphs here,
+    /// so they are no longer folded either.
     #[test]
-    fn text_is_folded_into_what_the_font_can_encode() {
+    fn text_the_face_cannot_draw_is_marked_rather_than_dropped() {
+        let face = &faces().expect("the vendored faces parse").regular;
+        let mut missing = BTreeSet::new();
+
         assert_eq!(
-            to_win_ansi("Acme\u{2019}s \u{201C}best\u{201D}"),
-            "Acme's \"best\""
+            for_font(
+                "Acme\u{2019}s \u{201C}best\u{201D} caf\u{e9}",
+                face,
+                &mut missing
+            ),
+            "Acme\u{2019}s \u{201C}best\u{201D} caf\u{e9}"
         );
-        assert_eq!(to_win_ansi("A\u{2014}B"), "A-B");
         assert_eq!(
-            to_win_ansi("caf\u{e9}"),
-            "caf\u{e9}",
-            "Latin-1 passes through"
+            for_font("\u{141}ukasiewicz \u{2014} 10 \u{20ac}", face, &mut missing),
+            "\u{141}ukasiewicz \u{2014} 10 \u{20ac}",
+            "Latin Extended and the euro sign are exactly what the old fold lost"
         );
+        assert!(
+            missing.is_empty(),
+            "nothing above was substituted: {missing:?}"
+        );
+
         assert_eq!(
-            to_win_ansi("\u{4e2d}\u{6587}"),
+            for_font("a\u{0}b\tc", face, &mut missing),
+            "a b c",
+            "a control character has no glyph, and nobody typed it to be seen"
+        );
+        assert!(missing.is_empty(), "so it is not reported: {missing:?}");
+
+        assert_eq!(
+            for_font("\u{4e2d}\u{6587}", face, &mut missing),
             "??",
-            "and the rest is visible, not silent"
+            "CJK is outside Noto Sans, so it is still visibly substituted"
         );
         assert_eq!(
-            to_win_ansi("a\u{0}b"),
-            "a b",
-            "a control character has no glyph"
+            missing.into_iter().collect::<Vec<_>>(),
+            vec!['\u{4e2d}', '\u{6587}'],
+            "and named, so the caller can say which characters were lost"
         );
     }
 
@@ -1153,6 +1298,177 @@ mod tests {
         assert!(
             widths[0] > widths[3],
             "the description still gets the most room: {widths:?}"
+        );
+    }
+
+    /// Read the text back out of rendered bytes.
+    ///
+    /// Through printpdf's own parser, which resolves the embedded font's
+    /// `/ToUnicode` CMap, so this reads what a PDF reader reads rather than
+    /// what this module thinks it wrote. Asserting on a byte length would
+    /// prove nothing: the document grew the moment a font was embedded,
+    /// whatever the glyphs say.
+    fn extracted_text(bytes: &[u8]) -> String {
+        let mut warnings = Vec::new();
+        let parsed =
+            PdfDocument::parse(bytes, &printpdf::PdfParseOptions::default(), &mut warnings)
+                .expect("the rendered bytes parse as a PDF");
+        parsed
+            .extract_text()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// PMS-1007: a customer whose name is not Latin-1 gets their name.
+    ///
+    /// Every one of these was a `?` on the base-14 font: Latin Extended-A,
+    /// Greek, Cyrillic, and the euro sign, which `WinAnsiEncoding` does encode
+    /// and the old fold dropped anyway because it only passed U+00FF and below.
+    #[test]
+    fn a_name_outside_latin_1_reaches_the_page_as_itself() {
+        let doc = Document::new("Invoice")
+            .columns(vec![(
+                "Bill to".to_string(),
+                vec![
+                    "\u{141}ukasiewicz Sp. z o.o.".to_string(),
+                    "\u{3a0}\u{3b1}\u{3c0}\u{3b1}\u{3b4}\u{3cc}\u{3c0}\u{3bf}\u{3c5}\u{3bb}\u{3bf}\u{3c2}"
+                        .to_string(),
+                    "\u{418}\u{432}\u{430}\u{43d}\u{43e}\u{432}".to_string(),
+                ],
+            )])
+            .totals(vec![("Balance due".into(), "1500.00 \u{20ac}".into())]);
+
+        let text = extracted_text(&render(&doc).expect("render"));
+        for expected in [
+            "\u{141}ukasiewicz",
+            "\u{3a0}\u{3b1}\u{3c0}\u{3b1}\u{3b4}\u{3cc}\u{3c0}\u{3bf}\u{3c5}\u{3bb}\u{3bf}\u{3c2}",
+            "\u{418}\u{432}\u{430}\u{43d}\u{43e}\u{432}",
+            "1500.00 \u{20ac}",
+        ] {
+            assert!(
+                text.contains(expected),
+                "{expected:?} is not in the rendered document: {text:?}"
+            );
+        }
+        assert!(!text.contains('?'), "nothing was substituted: {text:?}");
+    }
+
+    /// Records every event a render emits, so "exactly one warning" is a count
+    /// rather than an impression.
+    #[derive(Default)]
+    struct Warnings(std::sync::Mutex<Vec<String>>);
+
+    struct WarningLayer(std::sync::Arc<Warnings>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for WarningLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct Fields(String);
+            impl tracing::field::Visit for Fields {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!(" {}={value:?}", field.name()));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push_str(&format!(" {}={value}", field.name()));
+                }
+            }
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0 .0.lock().expect("warning log").push(fields.0);
+        }
+    }
+
+    /// PMS-1007: a character even the embedded font cannot draw is still a `?`,
+    /// but it is never a SILENT one.
+    ///
+    /// CJK is the real case: Noto Sans does not cover it and its CJK face is
+    /// roughly twenty times the size, so the substitution stays and the
+    /// warning is what makes it reach an operator. One event per render, not
+    /// one per character, and it names the characters and the document.
+    #[test]
+    fn an_undrawable_character_is_a_question_mark_and_exactly_one_warning() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let warnings = std::sync::Arc::new(Warnings::default());
+        let doc = Document::new("Invoice")
+            .lines("Bill to", vec!["\u{4e2d}\u{6587} \u{4e2d} Ltd".to_string()]);
+        let bytes = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(WarningLayer(warnings.clone())),
+            || render(&doc).expect("render"),
+        );
+
+        assert!(
+            extracted_text(&bytes).contains("?? ? Ltd"),
+            "the substitution is still visible on the page"
+        );
+        let logged = warnings.0.lock().expect("warning log").clone();
+        assert_eq!(
+            logged.len(),
+            1,
+            "exactly one warning per render: {logged:?}"
+        );
+        assert!(
+            logged[0].contains("U+4E2D") && logged[0].contains("U+6587"),
+            "and it names the characters: {:?}",
+            logged[0]
+        );
+        assert!(
+            logged[0].contains("Invoice"),
+            "and the document: {:?}",
+            logged[0]
+        );
+    }
+
+    /// A document the faces can draw in full says nothing, so the warning above
+    /// means something when it does fire.
+    #[test]
+    fn a_document_the_font_can_draw_logs_nothing() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let warnings = std::sync::Arc::new(Warnings::default());
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(WarningLayer(warnings.clone())),
+            || render(&sample().logo(Some(logo()))).expect("render"),
+        );
+        assert!(
+            warnings.0.lock().expect("warning log").is_empty(),
+            "a renderable document is silent"
+        );
+    }
+
+    /// [`AVERAGE_CHAR_EM`] has to stay at or above the face's true average, or
+    /// a truncated cell becomes an overlapping one.
+    ///
+    /// Measured from the embedded font rather than asserted from a comment, so
+    /// swapping the face for a wider one fails here instead of on a customer's
+    /// invoice.
+    #[test]
+    fn the_width_estimate_is_not_narrower_than_the_font() {
+        let face = &faces().expect("the vendored faces parse").bold;
+        let per_em = face.units_per_em as f32;
+        // The printable ASCII a business document is mostly made of.
+        let advances: Vec<f32> = (0x20u32..0x7F)
+            .filter_map(|cp| face.lookup_glyph_index(cp))
+            .filter_map(|gid| face.glyph_widths.get(&gid).copied())
+            .map(|w| w as f32 / per_em)
+            .collect();
+        assert!(advances.len() > 90, "the face is missing ASCII glyphs");
+        let mean = advances.iter().sum::<f32>() / advances.len() as f32;
+        assert!(
+            AVERAGE_CHAR_EM >= mean,
+            "the estimate {AVERAGE_CHAR_EM} is narrower than the face's mean advance {mean}"
         );
     }
 
