@@ -2665,6 +2665,26 @@ impl ContactService {
                 .map(|l| l.company_id)
         });
 
+        // MAPPS: diagnostic for the post-merge "created contact lands
+        // with company_id = NULL" report. Every isolated + integration
+        // test in this file shows write_contact_companies +
+        // recompute_contact_mirrors populate the scalar mirror
+        // correctly, so if the dev instance still hits the empty
+        // mirror the divergence is upstream of this handler (stale
+        // binary, per-tenant DB behind on schema, or a request body
+        // that isn't what the SPA claims). Log the three values the
+        // handler actually sees so the next repro's server log
+        // narrows it down; drop this line once a repro confirms the
+        // cause. Debug-level so a normal deploy stays quiet unless
+        // an operator opts in via `RUST_LOG=mokosh_server=debug`.
+        tracing::debug!(
+            request_company_id = ?request.company_id,
+            request_companies_count = links.len(),
+            request_companies_primary_at = ?links.iter().position(|l| l.is_primary),
+            resolved_insert_company_id = ?insert_company_id,
+            "create_contact: mirror-column diagnostic (MAPPS follow-up)"
+        );
+
         // PMS-402: the stored freeform name is mutually exclusive with the FK.
         // When company_id is set, the CRM name is authoritative (resolved via
         // the read-side join), so persist NULL; otherwise store the freeform
