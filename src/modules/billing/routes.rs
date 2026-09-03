@@ -63,6 +63,20 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}/pay",
             axum::routing::post(pay_invoice),
         )
+        // MAPPS-666 (mokosh-invoices P1a): a read the SPA fires on
+        // invoice-detail mount to decide whether the Pay Now button
+        // should render, and if so with what label. Fired alongside
+        // the invoice-detail fetch so the button state is decided
+        // before the caller ever clicks it: a click that always
+        // 400s because no gateway is configured is a worse UX than
+        // a greyed button with a tooltip explaining why. Contact
+        // plane gates on `invoices:read` (NOT `invoices:pay`) so a
+        // Support Contact sees the same coherent empty state a
+        // Billing Contact would.
+        .route(
+            "/invoices/{invoice_id}/payment-readiness",
+            axum::routing::get(get_invoice_payment_readiness),
+        )
         // PMS-955: the product catalog. A price list, not an inventory
         // system, and not a second home for labour pricing (`/rate-cards`).
         .route("/products", get(list_products).post(create_product))
@@ -659,6 +673,67 @@ async fn pay_invoice(
         .await?;
     Ok(Json(PayInvoiceResponse {
         checkout_url: session.url,
+    }))
+}
+
+/// MAPPS-666 (mokosh-invoices P1a): the SPA fires this once on invoice-
+/// detail mount to decide whether to render the Pay Now button + with
+/// what label. A click that always 400s because no gateway is
+/// configured is a worse UX than a greyed button with a tooltip
+/// explaining why, so surface the state up front.
+///
+/// Contact plane gates on `invoices:read` (NOT `invoices:pay`) - a
+/// Support Contact seeing the invoice should see the same coherent
+/// empty state a Billing Contact would, even though the button
+/// itself is hidden on the Support view (SPA-side `use_capability`).
+/// Staff plane keeps `assert_staff_billing_finance` for parity with
+/// every other billing read (PMS-962 in-source guard).
+async fn get_invoice_payment_readiness(
+    State(state): State<BillingRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    _finance: RequireFinance,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Json<InvoicePaymentReadinessResponse>> {
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::INVOICES_READ, &db).await?;
+        }
+    }
+    let invoice = state.service.get_invoice(tenant, invoice_id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if invoice.company_id != session.company_id {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        }
+    }
+    let provider_id = state.service.active_provider_id(tenant).await?;
+    let gateway_ready = provider_id.is_some();
+    let button_label = provider_id.as_deref().map(|id| match id {
+        "stripe" => "Pay with card".to_string(),
+        "paypal" => "Pay with PayPal".to_string(),
+        // Future providers get their name from the discriminator until
+        // a client_display_name override lands (phase 2 P2a).
+        other => format!("Pay with {other}"),
+    });
+    let invoice_payable = matches!(
+        invoice.status,
+        InvoiceStatus::Pending | InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid
+    ) && invoice.balance_due > rust_decimal::Decimal::ZERO;
+    let currency = invoice.currency.as_deref().unwrap_or("USD");
+    let balance_due_display = if currency.eq_ignore_ascii_case("USD") {
+        format!("${:.2}", invoice.balance_due)
+    } else {
+        format!("{:.2} {}", invoice.balance_due, currency)
+    };
+    Ok(Json(InvoicePaymentReadinessResponse {
+        gateway_ready,
+        button_label,
+        invoice_payable,
+        balance_due_display,
     }))
 }
 

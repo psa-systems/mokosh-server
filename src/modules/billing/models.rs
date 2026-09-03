@@ -433,6 +433,43 @@ pub struct PayInvoiceResponse {
     pub checkout_url: String,
 }
 
+/// MAPPS-666 (mokosh-invoices P1a): what the SPA reads to decide whether
+/// to render the Pay Now button + what label to put on it. Fires once on
+/// invoice-detail mount alongside the existing invoice fetch so the
+/// button state is decided before the caller ever clicks it (a click
+/// that always 400s because no gateway is configured is a worse UX than
+/// a greyed button with a tooltip explaining why).
+///
+/// Contact-plane gate on `invoices:read` (not `invoices:pay`) - a
+/// Support Contact should see whether the button WOULD be enabled for
+/// a Billing Contact, so the empty state on their view is coherent
+/// with what a Billing Contact would see.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvoicePaymentReadinessResponse {
+    /// True iff the tenant has an `is_active = TRUE` row in
+    /// `payment_gateway_configs` whose provider adapter can resolve
+    /// credentials (via the secret store or an inline legacy config).
+    /// Not just "the row exists"; the credential has to be reachable
+    /// or the mint would 400 at click time.
+    pub gateway_ready: bool,
+    /// Provider-derived default ("Pay with card" for Stripe, "Pay with
+    /// PayPal" for PayPal). Phase 2 lets the tenant override via a
+    /// `payment_gateway_configs.client_display_name` column. `None`
+    /// when `gateway_ready = false`, since there is no gateway to
+    /// name.
+    pub button_label: Option<String>,
+    /// True iff `invoice.status` is `pending | sent | partially_paid`
+    /// AND `balance_due > 0`. Draft, void, written_off, and paid
+    /// invoices are not payable.
+    pub invoice_payable: bool,
+    /// Currency-formatted `balance_due` in the invoice's own currency,
+    /// so the SPA does not have to know how to format money.
+    /// Truth-in-copy (Q10 default): shown above the Pay button so the
+    /// contact is not surprised by the currency conversion on their
+    /// card statement.
+    pub balance_due_display: String,
+}
+
 /// PMS-914: body accepted by `POST /invoices/{invoice_id}/pay`. The SPA
 /// picks `success_url` / `cancel_url` because they are per-plane
 /// (contact portal lands back on the invoice detail; staff lands back

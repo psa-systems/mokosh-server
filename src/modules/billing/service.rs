@@ -2044,6 +2044,29 @@ impl BillingService {
         Ok(providers.iter().any(|id| provider::is_supported(id)))
     }
 
+    /// MAPPS-666 (mokosh-invoices P1a): the tenant's active serveable
+    /// provider id, as a string, without building the whole provider.
+    /// Used to pick the Pay Now button's label so the SPA never has
+    /// to know about `"stripe"` / `"paypal"` string identifiers.
+    /// Returns `None` when no active row is present OR no active row's
+    /// discriminator is supported by this build.
+    pub async fn active_provider_id(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<Option<String>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let providers: Vec<String> = sqlx::query_scalar(
+            "SELECT provider FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND is_active = TRUE",
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(providers
+            .into_iter()
+            .find(|id| provider::is_supported(id)))
+    }
+
     /// Build a Stripe provider scoped to the tenant's ACTIVE gateway for the
     /// inbound-webhook path. Returns `None` when the tenant has no active Stripe
     /// config (so the handler answers 404 without confirming a tenant exists).
@@ -2085,9 +2108,15 @@ impl BillingService {
         cancel_url: &str,
     ) -> AppResult<CheckoutSession> {
         let invoice = self.get_invoice(tenant_id, invoice_id).await?;
+        // MAPPS-667 (mokosh-invoices P1b): refuse Draft too. A draft is
+        // by definition not yet shown to a customer, so paying one from
+        // the contact plane is either a leak (invoice list surfaced a
+        // row it shouldn't have) or an accident on the staff plane
+        // that would charge a card for an amount not yet finalized.
+        // Security review F9 (docs/mokosh-invoices/06-security-review.md).
         if matches!(
             invoice.status,
-            InvoiceStatus::Void | InvoiceStatus::WrittenOff
+            InvoiceStatus::Draft | InvoiceStatus::Void | InvoiceStatus::WrittenOff
         ) {
             return Err(AppError::Conflict(format!(
                 "Invoice {} cannot be paid in status '{}'",
