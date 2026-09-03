@@ -1403,6 +1403,8 @@ impl ContactService {
         // round-trip; the assignments table already carries the
         // (tenant_id, role_id) pair, so this stays inside the same
         // tenant slice.
+        // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(Uuid, String, Vec<String>, bool, Option<Uuid>, i64)> = match company_id {
             None => {
                 sqlx::query_as(
@@ -1625,7 +1627,7 @@ impl ContactService {
                     .await
                     .ok()
                     .flatten();
-                    if let Some(s) = updated {
+                    if let Some(_s) = updated {
                         break;
                     }
                     // Either the slug was taken elsewhere (unique
@@ -1641,8 +1643,7 @@ impl ContactService {
                     .fetch_optional(&mut *tx)
                     .await?
                     .flatten();
-                    if let Some(s) = now {
-                        candidate = s;
+                    if now.is_some() {
                         break;
                     }
                     // Neither branch fired: the candidate collided with

@@ -44,6 +44,8 @@ use crate::utils::error::{AppError, AppResult};
 /// A handler that only wants to service one plane rejects the other with
 /// [`Self::require_staff`] (contacts get 403) or by branching on the
 /// variant directly.
+// Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum CallerContext {
     /// Staff bearer: the full auth state populated by

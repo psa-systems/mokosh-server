@@ -1009,12 +1009,14 @@ impl NotificationsService {
         // Absent / malformed values simply skip the columns and leave
         // NULL (matches the auth.* / system-event case, where there
         // is no single entity to deep-link).
-        let ctx_entity_type: Option<String> = context
+        // MAPPS-656: dead until the contact-plane fanout is re-threaded through RenderedNotification
+        let _ctx_entity_type: Option<String> = context
             .get("entity_type")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty() && s.chars().count() <= 50);
-        let ctx_entity_id: Option<Uuid> = context
+        // MAPPS-656: dead until the contact-plane fanout is re-threaded through RenderedNotification
+        let _ctx_entity_id: Option<Uuid> = context
             .get("entity_id")
             .and_then(|v| v.as_str())
             .and_then(|s| Uuid::parse_str(s).ok());
@@ -1130,7 +1132,8 @@ impl NotificationsService {
             // but keyed on contact_id (see contact_notification_preferences,
             // migration 120). A contact who opted out sees no fanout on
             // in_app or email for this event.
-            let contact_prefs = self
+            // MAPPS-656: dead until the contact-plane fanout is re-threaded through RenderedNotification
+            let _contact_prefs = self
                 .load_contact_preferences(tenant_id, &contact_ids, event_type)
                 .await?;
 

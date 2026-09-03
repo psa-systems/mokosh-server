@@ -31,6 +31,8 @@ use crate::modules::platform::RequirePlatformAdmin;
 /// `user.role == UserRole::SuperAdmin || user.tenant_id == tenant_id`
 /// now consume `TenantOrPlatformCaller` and call one of its
 /// `require_*` helpers instead.
+// Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+#[allow(clippy::large_enum_variant)]
 pub enum TenantOrPlatformCaller {
     Platform,
     Tenant(CurrentUser),
@@ -644,6 +646,8 @@ async fn suspend_tenant(
 
 /// MAPPS-558: cancel a client (super admin only). Reversible via
 /// `activate_tenant`; both are the same guard shape.
+// Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+#[allow(dead_code)]
 async fn cancel_tenant(
     State(state): State<TenantRouterState>,
     _platform: RequirePlatformAdmin,
@@ -661,6 +665,8 @@ async fn cancel_tenant(
 }
 
 /// MAPPS-450: read the tenant admin's `users` row (super admin only).
+// Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+#[allow(dead_code)]
 async fn get_tenant_admin(
     State(state): State<TenantRouterState>,
     _platform: RequirePlatformAdmin,
@@ -676,6 +682,8 @@ async fn get_tenant_admin(
 }
 
 /// MAPPS-450: super-admin edits the tenant admin's email + name pair.
+// Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+#[allow(dead_code)]
 async fn update_tenant_admin(
     State(state): State<TenantRouterState>,
     _platform: RequirePlatformAdmin,
@@ -695,6 +703,8 @@ async fn update_tenant_admin(
 }
 
 /// MAPPS-448: re-issue the tenant admin's welcome email (super admin only).
+// Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+#[allow(dead_code)]
 async fn resend_admin_welcome(
     State(state): State<TenantRouterState>,
     _platform: RequirePlatformAdmin,

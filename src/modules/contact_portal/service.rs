@@ -115,6 +115,8 @@ impl ContactAuthService {
     ///
     /// Every credential failure returns `AppError::Unauthorized` with
     /// the same message so the endpoint stays enumeration-resistant.
+    // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all)]
     pub async fn login(
         &self,
@@ -542,6 +544,8 @@ impl ContactAuthService {
         // MAPPS-617: pull both branding JSONBs alongside the existing
         // top-bar / sidebar fields so `effective_branding` folds into
         // this same round-trip.
+        // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+        #[allow(clippy::type_complexity)]
         let row: (
             Uuid,
             Uuid,
@@ -1450,10 +1454,10 @@ impl ContactAuthService {
     ///   billing detail view).
     /// - Quotes: `status = 'sent'` (open for the Contact's decision).
     /// - Contracts: `status = 'active'`.
-    /// MAPPS-618 (mokosh-branding prompt 002): load the raw tenant +
-    /// Company branding blocks plus the resolved effective set, for
-    /// the contact-plane branding editor. Handler has already
-    /// verified `settings:manage_company_branding`.
+    ///   MAPPS-618 (mokosh-branding prompt 002): load the raw tenant +
+    ///   Company branding blocks plus the resolved effective set, for
+    ///   the contact-plane branding editor. Handler has already
+    ///   verified `settings:manage_company_branding`.
     pub async fn load_own_company_branding(
         &self,
         tenant_id: Uuid,

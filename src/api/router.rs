@@ -1144,6 +1144,156 @@ mod tests {
         assert_eq!(probe.display, "http://infisical:8080");
     }
 
+    /// The mokosh-contact-login <- main merge (chore/merge-main-into-contact-
+    /// login) panicked axum at Router construction because two builders
+    /// registered the same `(method, path)` after nesting:
+    ///
+    ///   - PMS-936 `portal_attach_file` at `.route("/{ticket_id}/attachments", post(...))`
+    ///     in `src/modules/tickets/routes.rs`, mounted under `.nest("/tickets", ...)`
+    ///     -> `POST /tickets/{ticket_id}/attachments`.
+    ///   - PMS-941 `upload_inline_agent` at `.route("/tickets/{ticket_id}/attachments", post(...))`
+    ///     in `src/modules/tickets/attachments.rs`, mounted at the top level
+    ///     via `.merge(agent_attachment_routes(...))` -> same `POST /tickets/{ticket_id}/attachments`.
+    ///
+    /// axum panics at Router construction on that overlap, so the server
+    /// dies before the first request. `integration.yml` would catch it
+    /// (every integration test boots the router through `common::boot`),
+    /// but `check.yml` runs `cargo test --lib` alone. This scan reads the
+    /// two source files directly, so a future merge that reintroduces the
+    /// same `(method, effective path)` pair on the ticket-attachments
+    /// surface fails right here, before deploy.
+    ///
+    /// Narrow by construction: guards the tickets-attachment surface, not
+    /// every route pair in the router. The general case wants a router-
+    /// construction smoke test that boots against a stub Database; until
+    /// that lands, extending this test to a second surface is one
+    /// `(src, prefix)` entry away.
+    #[test]
+    fn tickets_attachments_surface_has_no_route_overlap() {
+        const TICKETS_ROUTES: &str = include_str!("../modules/tickets/routes.rs");
+        const TICKETS_ATTACHMENTS: &str = include_str!("../modules/tickets/attachments.rs");
+
+        // `(source, mount-prefix)` pairs. Every `.route("<path>", ...)` in
+        // `source` becomes an effective `<mount-prefix><path>` for the
+        // overlap check.
+        //
+        // `mount-prefix = ""` means "mounted at the top level via
+        // `.merge(...)`"; `mount-prefix = "/tickets"` means "nested under
+        // that prefix". These match `create_api_router` above.
+        let sources: &[(&str, &str, &str)] = &[
+            ("tickets/routes.rs", TICKETS_ROUTES, "/tickets"),
+            ("tickets/attachments.rs", TICKETS_ATTACHMENTS, ""),
+        ];
+
+        let mut seen: Vec<(String, String, &str)> = Vec::new();
+        let mut collisions: Vec<String> = Vec::new();
+
+        for (label, src, prefix) in sources {
+            for raw in extract_route_lines(src) {
+                let Some((path, methods)) = parse_route_line(&raw) else {
+                    continue;
+                };
+                let effective = format!("{prefix}{path}");
+                for method in methods {
+                    if let Some((_, _, other_label)) = seen
+                        .iter()
+                        .find(|(m, p, _)| m == &method && p == &effective)
+                    {
+                        collisions.push(format!(
+                            "{method} {effective}: {other_label} and {label} both register it"
+                        ));
+                    }
+                    seen.push((method, effective.clone(), label));
+                }
+            }
+        }
+
+        assert!(
+            seen.len() > 20,
+            "the scan found only {} routes across the two sources; it has \
+             stopped matching the file shape and is no longer proving \
+             anything",
+            seen.len()
+        );
+        assert!(
+            collisions.is_empty(),
+            "overlapping route registrations that will panic axum at Router \
+             construction:\n  {}\n\nGive each handler its own path (see PMS-\
+             936 vs PMS-941 in the tickets/attachments surface for the fix \
+             pattern) rather than overloading one URL.",
+            collisions.join("\n  ")
+        );
+    }
+
+    /// Pull every `.route(...)` invocation out of a file. Handles both the
+    /// one-line shape `.route("/foo", get(handler))` and the multi-line
+    /// shape ending in `)` on a later line. Returns the argument list of
+    /// each `.route(...)` call, comma-joined between path and methods, so
+    /// downstream parsing can see the full literal.
+    fn extract_route_lines(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        let bytes = src.as_bytes();
+        while let Some(start) = src[i..].find(".route(") {
+            let start = i + start + ".route(".len();
+            // Find the balanced closing paren.
+            let mut depth = 1usize;
+            let mut end = start;
+            let mut in_str = false;
+            let mut esc = false;
+            while end < bytes.len() && depth > 0 {
+                let c = bytes[end] as char;
+                if esc {
+                    esc = false;
+                } else if c == '\\' && in_str {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = !in_str;
+                } else if !in_str {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                if depth > 0 {
+                    end += 1;
+                }
+            }
+            if depth == 0 {
+                out.push(src[start..end].to_string());
+                i = end + 1;
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Parse the arg list of a single `.route(...)` call into its path
+    /// literal and the HTTP methods registered on it. Skips lines the
+    /// parser cannot recognise (macros, non-literal paths) so the scan
+    /// keeps going.
+    fn parse_route_line(raw: &str) -> Option<(String, Vec<String>)> {
+        let raw = raw.trim();
+        let first_quote = raw.find('"')?;
+        let after = &raw[first_quote + 1..];
+        let end_quote = after.find('"')?;
+        let path = &after[..end_quote];
+        let rest = &after[end_quote + 1..];
+        let mut methods = Vec::new();
+        for name in ["get", "post", "put", "patch", "delete", "head", "options"] {
+            let needle = format!("{name}(");
+            if rest.contains(&needle) {
+                methods.push(name.to_ascii_uppercase());
+            }
+        }
+        if methods.is_empty() {
+            return None;
+        }
+        Some((path.to_string(), methods))
+    }
+
     /// Configured-but-unreachable stays an error (which /ready turns into
     /// a 503), so PMS-707's blank-is-skipped rule does not weaken the
     /// fail-loud behaviour for a real deployment.

@@ -669,11 +669,11 @@ async fn ticket_notes_contact_sees_public_only(pool: PgPool) {
         .map(|n| n["note_type"].as_str().unwrap_or_default())
         .collect();
     assert!(
-        !kinds.iter().any(|k| *k == "internal"),
+        !kinds.contains(&"internal"),
         "PMS-935: internal notes must NEVER reach a contact caller (got {kinds:?})"
     );
     assert!(
-        kinds.iter().any(|k| *k == "public"),
+        kinds.contains(&"public"),
         "PMS-935: contact GET must surface the public note (got {kinds:?})"
     );
 }

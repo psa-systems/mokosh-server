@@ -12,7 +12,6 @@ use sqlx::PgPool;
 
 use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::AuthService;
-use mokosh_server::modules::notifications::NotificationsService;
 use mokosh_server::modules::tenants::{CreateTenantRequest, TenantService};
 use mokosh_server::Database;
 

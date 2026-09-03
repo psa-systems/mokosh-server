@@ -551,6 +551,8 @@ impl TenantService {
     /// did not send would strand the super-admin with a half-created
     /// tenant that already exists in the DB. The admin can still trigger
     /// a password-reset from the login page as a fallback.
+    // Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+    #[allow(dead_code)]
     async fn provision_portal_admin_and_send_welcome(
         &self,
         tenant_id: Uuid,
@@ -600,6 +602,8 @@ impl TenantService {
     /// closed if `own_company_id` is still NULL: that means the
     /// caller skipped `ensure_own_company` (a programming error - the
     /// contacts.company_id FK is NOT NULL).
+    // Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+    #[allow(dead_code)]
     async fn insert_portal_admin_contact(
         &self,
         tenant_id: Uuid,
@@ -849,6 +853,8 @@ impl TenantService {
         // Cross-tenant super-admin read against the RLS-protected `contacts`
         // table: run under the tenant GUC so the SELECT sees the row.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+        #[allow(clippy::type_complexity)]
         let admin: Option<(Uuid, Option<String>, String, String, Option<String>)> = sqlx::query_as(
             "SELECT id, email, first_name, last_name, portal_password_hash FROM contacts \
                  WHERE tenant_id = $1 AND is_portal_user = TRUE AND portal_role = 'admin' \
@@ -1337,6 +1343,8 @@ impl TenantService {
         // column) but TenantAdminInfo.email is String; fill an empty
         // string when absent (the update path 400s empty email inputs
         // so the round-trip is safe).
+        // Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+        #[allow(clippy::type_complexity)]
         let admin: Option<(Uuid, Option<String>, String, String, Option<String>)> = sqlx::query_as(
             "SELECT id, email, first_name, last_name, portal_password_hash FROM contacts \
              WHERE tenant_id = $1 AND is_portal_user = TRUE AND portal_role = 'admin' \

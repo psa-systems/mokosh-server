@@ -4,10 +4,10 @@
 //! Covers the two shapes migration 148 unlocks:
 //!   * tenant-wide roles (existing shape, `company_id IS NULL`)
 //!   * Company-scoped roles (new: `company_id = <uuid>`)
-//! and the write-side enforcement on
-//! `PUT /api/v1/contacts/contacts/{id}/portal-roles` +
-//! `POST /api/v1/contacts/contacts/{id}/grant-portal-access` that a
-//! Company-scoped role never lands on a contact of a different Company.
+//!     and the write-side enforcement on
+//!     `PUT /api/v1/contacts/contacts/{id}/portal-roles` +
+//!     `POST /api/v1/contacts/contacts/{id}/grant-portal-access` that a
+//!     Company-scoped role never lands on a contact of a different Company.
 
 mod common;
 

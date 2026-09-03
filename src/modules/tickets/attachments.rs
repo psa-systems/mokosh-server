@@ -625,6 +625,8 @@ impl AttachmentService {
 #[derive(Clone, Copy, Debug)]
 enum Uploader {
     Agent { user_id: Uuid },
+    // Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+    #[allow(dead_code)]
     Portal { contact_id: Uuid },
 }
 
@@ -706,8 +708,19 @@ pub fn agent_attachment_routes(service: AttachmentService) -> Router {
         // PMS-941: ticket-scoped, note-free, image-only. The upload an author
         // makes while embedding a picture in a description or a note, before
         // there is necessarily a note row to hang it from.
+        //
+        // Merge note (PMS-936/PMS-941): the original PMS-941 URL was
+        // `POST /tickets/{id}/attachments`, but PMS-936 shipped a dual-plane
+        // general-attachment handler at that exact URL on the mokosh-contact-
+        // login track (JSON body, `tickets:attach_file` gated for contacts,
+        // `created_by_contact_id` stamping). Both routes are wanted; both
+        // panic axum at Router construction if they share a (method, path).
+        // Move the PMS-941 image-only inline upload to
+        // `/tickets/{id}/attachments/inline` so the generic attachment URL
+        // stays the shared plane and the inline-image contract lives at
+        // a URL that names its constraint.
         .route(
-            "/tickets/{ticket_id}/attachments",
+            "/tickets/{ticket_id}/attachments/inline",
             post(upload_inline_agent),
         )
         .route(

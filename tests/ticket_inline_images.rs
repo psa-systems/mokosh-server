@@ -57,7 +57,7 @@ async fn upload_inline(
         .expect("mime");
     let resp = app
         .client
-        .post(app.url(&format!("/api/v1/tickets/{ticket}/attachments")))
+        .post(app.url(&format!("/api/v1/tickets/{ticket}/attachments/inline")))
         .bearer_auth(token)
         .multipart(Form::new().part("file", part))
         .send()
@@ -266,7 +266,7 @@ async fn the_upload_still_needs_a_session_and_the_right_tenant(pool: PgPool) {
         .expect("mime");
     let anon = app
         .client
-        .post(app.url(&format!("/api/v1/tickets/{ticket_id}/attachments")))
+        .post(app.url(&format!("/api/v1/tickets/{ticket_id}/attachments/inline")))
         .multipart(Form::new().part("file", part))
         .send()
         .await
