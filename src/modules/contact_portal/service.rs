@@ -1041,9 +1041,23 @@ impl ContactAuthService {
         user_agent: Option<&str>,
         ip: Option<IpAddr>,
     ) -> AppResult<LoginLinkRedeemOutcome> {
+        // Diagnostic-only: log which of the five rejection branches
+        // fires (parse, missing intent row, used/expired, hash
+        // mismatch, no candidates). Response copy stays the enum-
+        // resistant generic "invalid or expired" for every failure.
+        let token_len = token.len();
         let invalid = || AppError::BadRequest("This link is invalid or has expired".to_string());
 
-        let (intent_id, secret) = parse_intent_bound_token(token).ok_or_else(invalid)?;
+        let (intent_id, secret) = match parse_intent_bound_token(token) {
+            Some(pair) => pair,
+            None => {
+                tracing::warn!(
+                    token_len = token_len,
+                    "redeem_login_link rejected: token did not parse as `{{intent_uuid}}.{{secret}}`"
+                );
+                return Err(invalid());
+            }
+        };
 
         // Load + verify + mark-used atomically in one BYPASSRLS tx so
         // a race between two clicks lands exactly one winner. This
@@ -1076,12 +1090,34 @@ impl ContactAuthService {
         let Some((_, tenant_id, intent_email, secret_hash, used_at, expires_at, scope_company_id)) =
             intent
         else {
+            tracing::warn!(
+                intent_id = %intent_id,
+                "redeem_login_link rejected: no portal_login_intents row for that intent id"
+            );
             return Err(invalid());
         };
-        if used_at.is_some() || expires_at <= Utc::now() {
+        if used_at.is_some() {
+            tracing::warn!(
+                intent_id = %intent_id,
+                used_at = ?used_at,
+                "redeem_login_link rejected: intent row is already used"
+            );
+            return Err(invalid());
+        }
+        if expires_at <= Utc::now() {
+            tracing::warn!(
+                intent_id = %intent_id,
+                expires_at = %expires_at,
+                now = %Utc::now(),
+                "redeem_login_link rejected: intent row is past expiry"
+            );
             return Err(invalid());
         }
         if !verify_password(secret, &secret_hash)? {
+            tracing::warn!(
+                intent_id = %intent_id,
+                "redeem_login_link rejected: secret hash did not verify against the row"
+            );
             return Err(invalid());
         }
         sqlx::query("UPDATE portal_login_intents SET used_at = NOW() WHERE id = $1")
@@ -1128,6 +1164,13 @@ impl ContactAuthService {
         .fetch_all(self.db.migrator_pool())
         .await?;
         if candidates.is_empty() {
+            tracing::warn!(
+                intent_id = %intent_id,
+                tenant_id = %tenant_id,
+                intent_email = %intent_email,
+                scope_company_id = ?scope_company_id,
+                "redeem_login_link rejected: intent verified but no portal contact matches (email/is_portal_user/tenant active/portal_slug present)"
+            );
             return Err(invalid());
         }
 
