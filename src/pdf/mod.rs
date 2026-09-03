@@ -10,12 +10,13 @@
 //! ## What it is not
 //!
 //! Not a layout engine. A [`Document`] is a title and a list of sections, each
-//! either labelled fields or a table, which is the shape every report in this
+//! labelled fields, plain lines, a table, or (PMS-1004) the two shapes an
+//! invoice wanted that a report did not: headed line blocks side by side and a
+//! totals block at the right margin. That is the shape every report in this
 //! codebase already has (the CSV writers emit exactly that: a header block,
-//! then one or more grouped tables). Anything needing real flow - wrapped
-//! paragraphs, columns, images - is a bigger decision than the report export
-//! needs and would be better made against the invoice work that actually wants
-//! it.
+//! then one or more grouped tables) plus what a commercial document adds to it.
+//! Anything needing real flow - wrapped paragraphs, nested blocks - is a bigger
+//! decision than either needs and would be made against the work that wants it.
 //!
 //! ## Why `printpdf` and a base-14 font
 //!
