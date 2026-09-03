@@ -406,6 +406,39 @@ impl BillingService {
         Ok(rows.into_iter().collect())
     }
 
+    /// PMS-1016: who an invoice is for, decided when it is created.
+    ///
+    /// The contact the caller named, else the company's default billing
+    /// contact, which is the same pair `resolve_invoice_recipient` picks
+    /// between at send time. Resolving it here makes a draft carry the
+    /// recipient it will be emailed to, so `GET /invoices/{id}` names one and
+    /// the live draft preview prints the same `Attn:` line as the document
+    /// stored at the send. It is stored rather than read at render time on
+    /// purpose (PMS-1001): reading the company's pointer while rendering
+    /// would let a later change re-address a document already issued.
+    ///
+    /// A company with no pointer still yields none, and the send-time guard is
+    /// unchanged: `resolve_invoice_recipient` still runs and still refuses a
+    /// send that resolves nobody.
+    async fn resolve_billing_contact(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        requested: Option<Uuid>,
+    ) -> AppResult<Option<Uuid>> {
+        if requested.is_some() {
+            return Ok(requested);
+        }
+        let default_contact: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT default_billing_contact_id FROM companies WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(default_contact.flatten())
+    }
+
     /// Fill in `company_name` on a batch of invoice responses (PMS-186).
     async fn enrich_invoices(
         &self,
@@ -644,6 +677,15 @@ impl BillingService {
         )
         .await?;
 
+        // PMS-1016: the contact the caller named, else the company's default.
+        let billing_contact_id = Self::resolve_billing_contact(
+            &mut tx,
+            tenant_id,
+            request.company_id,
+            request.billing_contact_id,
+        )
+        .await?;
+
         let invoice_id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -662,7 +704,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(&invoice_number)
         .bind(request.company_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
         .bind(due_date)
@@ -930,6 +972,15 @@ impl BillingService {
             Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, request.due_date)
                 .await?;
 
+        // PMS-1016: the contact the caller named, else the company's default.
+        let billing_contact_id = Self::resolve_billing_contact(
+            &mut tx,
+            tenant_id,
+            request.company_id,
+            request.billing_contact_id,
+        )
+        .await?;
+
         // 4. Insert the invoice header. `balance_due` starts at `total`.
         let invoice_id = Uuid::new_v4();
         sqlx::query(
@@ -948,7 +999,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(&invoice_number)
         .bind(request.company_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(invoice_date)
         .bind(due_date)
@@ -1309,6 +1360,12 @@ impl BillingService {
         // so numbers stay gapless.
         let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
+        // PMS-1016: this path has no caller to name a contact, so it is the
+        // company's default or nobody. A company with no pointer still
+        // produces a draft naming nobody, which the send-time guard refuses.
+        let billing_contact_id =
+            Self::resolve_billing_contact(&mut tx, tenant_id, company_id, None).await?;
+
         sqlx::query(
             r#"
             INSERT INTO invoices (
@@ -1317,7 +1374,7 @@ impl BillingService {
                 subtotal, tax_amount, discount_amount, total, amount_paid,
                 balance_due, currency, notes, po_number, payment_term_id
             )
-            VALUES ($1, $2, $3, $4, NULL, $5, 'draft', $6, $7, 'net30', $8, $9,
+            VALUES ($1, $2, $3, $4, $14, $5, 'draft', $6, $7, 'net30', $8, $9,
                     $10, $11, 0, $11, 'USD', $12, NULL, $13)
             "#,
         )
@@ -1336,6 +1393,7 @@ impl BillingService {
             "Recurring billing for {period_start} to {period_end}"
         ))
         .bind(payment_term_id)
+        .bind(billing_contact_id)
         .execute(&mut *tx)
         .await?;
 
