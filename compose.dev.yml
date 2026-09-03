@@ -426,6 +426,12 @@ services:
       MOKOSH_SEED_TENANT_ID: ${MOKOSH_SEED_TENANT_ID:-}
       MOKOSH_UPDATE_CHECK_URL: ${MOKOSH_UPDATE_CHECK_URL:-}
 
+      # MAPPS-457: hard ceiling on POST /api/v1/tenants. Empty leaves creation
+      # uncapped (the code default); a positive integer 409s once the total
+      # tenant count reaches it. Kept forwardable in dev so a stress-test can
+      # set the cap without a container rebuild.
+      MOKOSH_MAX_TENANTS: ${MOKOSH_MAX_TENANTS:-}
+
       RUST_LOG: ${RUST_LOG:-info,mokosh_server=debug}
     networks:
       - private
