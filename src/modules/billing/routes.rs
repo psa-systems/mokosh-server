@@ -537,9 +537,13 @@ async fn get_invoice_pdf(
         Some(stored) => stored,
         None => {
             let issuer = state.service.invoice_issuer(tenant, invoice_id).await?;
+            let bill_to = state
+                .service
+                .bill_to(tenant, invoice.company_id, invoice.billing_contact_id)
+                .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
             crate::pdf::render(&crate::modules::billing::documents::invoice(
-                &invoice, &issuer, logo,
+                &invoice, &issuer, &bill_to, logo,
             ))?
         }
     };
@@ -570,10 +574,11 @@ async fn get_credit_note_pdf(
             Some(stored) => stored,
             None => {
                 let issuer = state.service.tenant_issuer(tenant).await?;
+                let credit_to = state.service.bill_to(tenant, note.company_id, None).await?;
                 let logo =
                     crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
                 crate::pdf::render(&crate::modules::billing::documents::credit_note(
-                    &note, &issuer, logo,
+                    &note, &issuer, &credit_to, logo,
                 ))?
             }
         };
@@ -601,9 +606,13 @@ async fn get_statement_pdf(
     // Current branding, deliberately: see the module header of
     // `billing::documents` for why a statement is not snapshotted.
     let issuer = state.service.tenant_issuer(tenant).await?;
+    let account = state
+        .service
+        .bill_to(tenant, statement.company_id, None)
+        .await?;
     let logo = crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
     let bytes = crate::pdf::render(&crate::modules::billing::documents::statement(
-        &statement, &issuer, logo,
+        &statement, &issuer, &account, logo,
     ))?;
     Ok(pdf_response(
         bytes,

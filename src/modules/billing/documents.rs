@@ -18,12 +18,104 @@
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::pdf::{Document, Logo};
+use crate::pdf::{Align, Document, Logo};
 use crate::storage::{FileLedger, FileRecord, ObjectKey};
 use crate::utils::error::AppResult;
 
 use super::issuer::Issuer;
 use super::models::{CreditNoteResponse, InvoiceResponse, StatementResponse};
+
+/// PMS-1004: who a document is addressed to.
+///
+/// Before this a document said only the company's name under "Bill to", with
+/// no address and no contact, although `companies` carries a billing address
+/// and an invoice names a billing contact. Resolved by the service beside the
+/// issuer (`BillingService::bill_to`) and handed in, so this module keeps
+/// composing rather than reading.
+///
+/// Not frozen. The issuer is (PMS-911) because a rebrand must not rewrite a
+/// sent invoice; the customer's address needs no such guard, because PMS-959
+/// keeps the bytes that were sent and a live render only ever serves a draft
+/// or a document issued before PMS-959, which is the fallback rule already in
+/// force for the issuer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BillTo {
+    pub name: String,
+    /// The postal address, one line each, already composed.
+    pub address_lines: Vec<String>,
+    /// The billing contact, when the document names one.
+    pub contact_name: Option<String>,
+    pub contact_email: Option<String>,
+}
+
+impl BillTo {
+    /// The block as the document prints it: name, address, then the contact
+    /// as an attention line with their email beneath.
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![self.name.clone()];
+        lines.extend(self.address_lines.iter().cloned());
+        if let Some(contact) = self
+            .contact_name
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+        {
+            lines.push(format!("Attn: {}", contact.trim()));
+        }
+        if let Some(email) = self
+            .contact_email
+            .as_deref()
+            .filter(|e| !e.trim().is_empty())
+        {
+            lines.push(email.trim().to_string());
+        }
+        lines
+    }
+}
+
+/// Compose a postal address from the columns `companies` stores it in.
+///
+/// Line 1, line 2, then `city, state postal_code` with whichever of the three
+/// are present, then the country. A blank column is left out rather than
+/// printed as an empty line or a stray comma.
+pub fn postal_lines(
+    line1: Option<&str>,
+    line2: Option<&str>,
+    city: Option<&str>,
+    state: Option<&str>,
+    postal_code: Option<&str>,
+    country: Option<&str>,
+) -> Vec<String> {
+    fn present(value: Option<&str>) -> Option<&str> {
+        value.map(str::trim).filter(|v| !v.is_empty())
+    }
+    let mut lines = Vec::with_capacity(4);
+    lines.extend(present(line1).map(str::to_string));
+    lines.extend(present(line2).map(str::to_string));
+    let locality = match (present(city), present(state), present(postal_code)) {
+        (None, None, None) => None,
+        (city, state, postal) => {
+            let region = [state, postal]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(match (city, region.is_empty()) {
+                (Some(city), true) => city.to_string(),
+                (Some(city), false) => format!("{city}, {region}"),
+                (None, _) => region,
+            })
+        }
+    };
+    lines.extend(locality);
+    lines.extend(present(country).map(str::to_string));
+    lines
+}
+
+/// The four money columns of an items table: description left, the rest
+/// right, so quantities and amounts line up under each other.
+fn items_align() -> Vec<Align> {
+    vec![Align::Left, Align::Right, Align::Right, Align::Right]
+}
 
 /// The box a logo is fitted into, top right of the first page. Generous enough
 /// for a wordmark, small enough that a square logo cannot push the body down
@@ -81,20 +173,17 @@ fn issuer_lines(issuer: &Issuer) -> Vec<String> {
 pub fn invoice(
     invoice: &InvoiceResponse,
     issuer: &Issuer,
+    bill_to: &BillTo,
     logo_bytes: Option<Vec<u8>>,
 ) -> Document {
     let currency = invoice.currency.as_deref();
     let mut document = Document::new("Invoice")
         .subtitle(invoice.invoice_number.clone())
         .logo(logo(logo_bytes))
-        .lines("From", issuer_lines(issuer))
-        .lines(
-            "Bill to",
-            vec![invoice
-                .company_name
-                .clone()
-                .unwrap_or_else(|| "Customer".to_string())],
-        );
+        .columns(vec![
+            ("From".to_string(), issuer_lines(issuer)),
+            ("Bill to".to_string(), bill_to.lines()),
+        ]);
 
     // No status line (PMS-990). The document is stored at the first send and
     // served unchanged after, so a status printed on it would read `sent`
@@ -121,7 +210,7 @@ pub fn invoice(
     document = document.fields("Details", details);
 
     if let Some(lines) = &invoice.lines {
-        document = document.table(
+        document = document.table_aligned(
             "Items",
             vec![
                 "Description".into(),
@@ -140,6 +229,7 @@ pub fn invoice(
                     ]
                 })
                 .collect(),
+            items_align(),
         );
     }
 
@@ -167,7 +257,7 @@ pub fn invoice(
         "Balance due".to_string(),
         money(invoice.balance_due, currency),
     ));
-    document = document.fields("Totals", totals);
+    document = document.totals(totals);
 
     if let Some(notes) = &invoice.notes {
         document = document.lines("Notes", vec![notes.clone()]);
@@ -183,6 +273,7 @@ pub fn invoice(
 pub fn credit_note(
     note: &CreditNoteResponse,
     issuer: &Issuer,
+    credit_to: &BillTo,
     logo_bytes: Option<Vec<u8>>,
 ) -> Document {
     let currency = note.currency.as_deref();
@@ -202,18 +293,14 @@ pub fn credit_note(
     let mut document = Document::new("Credit Note")
         .subtitle(note.credit_note_number.clone())
         .logo(logo(logo_bytes))
-        .lines("From", issuer_lines(issuer))
-        .lines(
-            "Credit to",
-            vec![note
-                .company_name
-                .clone()
-                .unwrap_or_else(|| "Customer".to_string())],
-        )
+        .columns(vec![
+            ("From".to_string(), issuer_lines(issuer)),
+            ("Credit to".to_string(), credit_to.lines()),
+        ])
         .fields("Details", details);
 
     if let Some(lines) = &note.lines {
-        document = document.table(
+        document = document.table_aligned(
             "Items",
             vec![
                 "Description".into(),
@@ -232,17 +319,15 @@ pub fn credit_note(
                     ]
                 })
                 .collect(),
+            items_align(),
         );
     }
 
-    document = document.fields(
-        "Totals",
-        vec![
-            ("Subtotal".to_string(), money(note.subtotal, currency)),
-            ("Tax".to_string(), money(note.tax_amount, currency)),
-            ("Total credited".to_string(), money(note.total, currency)),
-        ],
-    );
+    document = document.totals(vec![
+        ("Subtotal".to_string(), money(note.subtotal, currency)),
+        ("Tax".to_string(), money(note.tax_amount, currency)),
+        ("Total credited".to_string(), money(note.total, currency)),
+    ]);
     if let Some(notes) = &note.notes {
         document = document.lines("Notes", vec![notes.clone()]);
     }
@@ -321,6 +406,7 @@ pub async fn read_issued(tenant_id: Uuid, document_id: Uuid) -> Option<Vec<u8>> 
 pub fn statement(
     statement: &StatementResponse,
     issuer: &Issuer,
+    account: &BillTo,
     logo_bytes: Option<Vec<u8>>,
 ) -> Document {
     // A statement carries no currency of its own: it spans documents that each
@@ -332,14 +418,10 @@ pub fn statement(
             statement.period_start, statement.period_end
         ))
         .logo(logo(logo_bytes))
-        .lines("From", issuer_lines(issuer))
-        .lines(
-            "Account",
-            vec![statement
-                .company_name
-                .clone()
-                .unwrap_or_else(|| "Customer".to_string())],
-        )
+        .columns(vec![
+            ("From".to_string(), issuer_lines(issuer)),
+            ("Account".to_string(), account.lines()),
+        ])
         .fields(
             "Opening",
             vec![(
@@ -349,7 +431,7 @@ pub fn statement(
         );
 
     if !statement.invoices.is_empty() {
-        document = document.table(
+        document = document.table_aligned(
             "Invoices",
             vec![
                 "Number".into(),
@@ -371,10 +453,11 @@ pub fn statement(
                     ]
                 })
                 .collect(),
+            last_right(5),
         );
     }
     if !statement.payments.is_empty() {
-        document = document.table(
+        document = document.table_aligned(
             "Payments",
             vec![
                 "Date".into(),
@@ -396,10 +479,11 @@ pub fn statement(
                     ]
                 })
                 .collect(),
+            last_right(5),
         );
     }
     if !statement.refunds.is_empty() {
-        document = document.table(
+        document = document.table_aligned(
             "Refunds",
             vec!["Date".into(), "Invoice".into(), "Amount".into()],
             statement
@@ -413,10 +497,11 @@ pub fn statement(
                     ]
                 })
                 .collect(),
+            last_right(3),
         );
     }
     if !statement.credit_notes.is_empty() {
-        document = document.table(
+        document = document.table_aligned(
             "Credit notes",
             vec![
                 "Number".into(),
@@ -438,19 +523,27 @@ pub fn statement(
                     ]
                 })
                 .collect(),
+            last_right(5),
         );
     }
 
-    document.fields(
-        "Closing",
-        vec![
-            ("Invoiced".to_string(), amount(statement.total_invoiced)),
-            ("Paid".to_string(), amount(statement.total_paid)),
-            ("Refunded".to_string(), amount(statement.total_refunded)),
-            ("Credited".to_string(), amount(statement.total_credited)),
-            ("Balance due".to_string(), amount(statement.closing_balance)),
-        ],
-    )
+    document.totals(vec![
+        ("Invoiced".to_string(), amount(statement.total_invoiced)),
+        ("Paid".to_string(), amount(statement.total_paid)),
+        ("Refunded".to_string(), amount(statement.total_refunded)),
+        ("Credited".to_string(), amount(statement.total_credited)),
+        ("Balance due".to_string(), amount(statement.closing_balance)),
+    ])
+}
+
+/// A statement table's alignment: everything left but the amount, which is
+/// always the last column.
+fn last_right(columns: usize) -> Vec<Align> {
+    let mut align = vec![Align::Left; columns];
+    if let Some(last) = align.last_mut() {
+        *last = Align::Right;
+    }
+    align
 }
 
 #[cfg(test)]
@@ -497,6 +590,69 @@ mod tests {
             lines.iter().all(|l| !l.contains('\n')),
             "no line may carry its own newline: {lines:?}"
         );
+    }
+
+    /// PMS-1004: the customer's block has its address and its contact, and a
+    /// column that is blank leaves no empty line or stray comma behind.
+    #[test]
+    fn a_bill_to_block_has_the_address_and_the_contact() {
+        let bill_to = BillTo {
+            name: "NiceGuy IT".to_string(),
+            address_lines: postal_lines(
+                Some("1 Customer Way"),
+                Some(" "),
+                Some("Springfield"),
+                Some("OR"),
+                Some("97477"),
+                Some("USA"),
+            ),
+            contact_name: Some("Bill Payer".to_string()),
+            contact_email: Some("ap@client.example".to_string()),
+        };
+        assert_eq!(
+            bill_to.lines(),
+            vec![
+                "NiceGuy IT",
+                "1 Customer Way",
+                "Springfield, OR 97477",
+                "USA",
+                "Attn: Bill Payer",
+                "ap@client.example",
+            ]
+        );
+        assert_eq!(
+            BillTo {
+                name: "Bare".to_string(),
+                ..Default::default()
+            }
+            .lines(),
+            vec!["Bare"],
+            "a company with nothing on file is its name alone"
+        );
+    }
+
+    #[test]
+    fn a_locality_line_uses_whichever_parts_are_present() {
+        assert_eq!(
+            postal_lines(None, None, Some("Sydney"), None, Some("2000"), None),
+            vec!["Sydney, 2000"]
+        );
+        assert_eq!(
+            postal_lines(
+                None,
+                None,
+                None,
+                Some("NSW"),
+                Some("2000"),
+                Some("Australia")
+            ),
+            vec!["NSW 2000", "Australia"]
+        );
+        assert_eq!(
+            postal_lines(None, None, Some("Sydney"), None, None, None),
+            vec!["Sydney"]
+        );
+        assert!(postal_lines(None, None, None, None, None, None).is_empty());
     }
 
     /// Two decimals and a currency, because `1200` where `1200.00` is meant
