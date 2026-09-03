@@ -433,6 +433,11 @@ pub struct PaymentGatewayConfigResponse {
     /// decryptable strictly server-side for actual gateway calls; to change it,
     /// send a new `config` on upsert.
     pub configured: bool,
+    /// MAPPS-671 (mokosh-invoices P2a): admin-set override for the Pay Now
+    /// button label a portal contact sees. `None` = the provider-default
+    /// label ("Pay with card" for Stripe, "Pay with PayPal" for PayPal).
+    #[serde(default)]
+    pub client_display_name: Option<String>,
 }
 
 /// PMS-711: response to the portal "Pay Now" action. The SPA redirects the
@@ -506,6 +511,14 @@ pub struct UpsertPaymentGatewayConfigRequest {
     /// a gateway for the first time.
     #[serde(default)]
     pub config: Option<serde_json::Value>,
+    /// MAPPS-671 (mokosh-invoices P2a): admin-set override for the Pay Now
+    /// button label. Omit (or `null`) to keep the current value; send an
+    /// empty string to clear (falls back to the provider default); send a
+    /// non-empty string to set. Capped at 64 chars so the button stays
+    /// readable. Values from `sanitize_json_body` reach this trimmed.
+    #[serde(default)]
+    #[validate(length(max = 64, message = "Button label must be 64 characters or fewer."))]
+    pub client_display_name: Option<String>,
 }
 
 fn default_true() -> bool {

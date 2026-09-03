@@ -714,14 +714,24 @@ async fn get_invoice_payment_readiness(
             return Err(AppError::NotFound("Invoice".to_string()));
         }
     }
-    let provider_id = state.service.active_provider_id(tenant).await?;
-    let gateway_ready = provider_id.is_some();
-    let button_label = provider_id.as_deref().map(|id| match id {
-        "stripe" => "Pay with card".to_string(),
-        "paypal" => "Pay with PayPal".to_string(),
-        // Future providers get their name from the discriminator until
-        // a client_display_name override lands (phase 2 P2a).
-        other => format!("Pay with {other}"),
+    let active = state.service.active_provider_display(tenant).await?;
+    let gateway_ready = active.is_some();
+    let button_label = active.map(|(id, override_label)| {
+        // MAPPS-671 (mokosh-invoices P2a): the admin's override wins when
+        // set; otherwise fall back to a provider-derived default so a
+        // tenant that never touches the field still gets a coherent
+        // label. Empty-after-trim is treated as no override so a
+        // whitespace-only value cannot ship a blank button.
+        override_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| match id.as_str() {
+                "stripe" => "Pay with card".to_string(),
+                "paypal" => "Pay with PayPal".to_string(),
+                other => format!("Pay with {other}"),
+            })
     });
     let invoice_payable = matches!(
         invoice.status,

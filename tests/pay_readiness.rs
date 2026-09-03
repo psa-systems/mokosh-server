@@ -166,6 +166,19 @@ async fn seed_stripe_gateway(pool: &PgPool, tenant_id: Uuid) {
     .expect("seed stripe gateway");
 }
 
+/// MAPPS-671: set the admin override on the tenant's active Stripe row.
+async fn set_stripe_client_display_name(pool: &PgPool, tenant_id: Uuid, label: &str) {
+    sqlx::query(
+        "UPDATE payment_gateway_configs SET client_display_name = $2 \
+         WHERE tenant_id = $1 AND provider = 'stripe'",
+    )
+    .bind(tenant_id)
+    .bind(label)
+    .execute(pool)
+    .await
+    .expect("set client_display_name");
+}
+
 #[sqlx::test]
 async fn readiness_ready_when_gateway_and_payable(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
@@ -292,6 +305,65 @@ async fn readiness_cross_company_404(pool: PgPool) {
         resp.status(),
         StatusCode::NOT_FOUND,
         "MAPPS-666: cross-Company invoice must 404, not leak the row's payability"
+    );
+}
+
+/// MAPPS-671 (mokosh-invoices P2a): the admin-set button label wins
+/// when set. Same seed as the ready-and-payable happy path plus one
+/// UPDATE to set the override.
+#[sqlx::test]
+async fn readiness_button_label_uses_override_when_set(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "ready-override", &["Billing Contact"]).await;
+    let invoice_id = seed_sent_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+    seed_stripe_gateway(&pool, common::DEFAULT_TENANT_ID).await;
+    set_stripe_client_display_name(&pool, common::DEFAULT_TENANT_ID, "Pay with your credit card")
+        .await;
+
+    let resp = app
+        .client
+        .get(app.url(&format!(
+            "/api/v1/invoices/{invoice_id}/payment-readiness"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("readiness");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["button_label"].as_str(),
+        Some("Pay with your credit card"),
+        "MAPPS-671: the admin's override replaces the provider default"
+    );
+}
+
+/// MAPPS-671: whitespace-only override does not ship a blank button.
+#[sqlx::test]
+async fn readiness_button_label_falls_back_when_override_is_blank(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "ready-blank", &["Billing Contact"]).await;
+    let invoice_id = seed_sent_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+    seed_stripe_gateway(&pool, common::DEFAULT_TENANT_ID).await;
+    set_stripe_client_display_name(&pool, common::DEFAULT_TENANT_ID, "   ").await;
+
+    let resp = app
+        .client
+        .get(app.url(&format!(
+            "/api/v1/invoices/{invoice_id}/payment-readiness"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("readiness");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["button_label"].as_str(),
+        Some("Pay with card"),
+        "MAPPS-671: whitespace-only override must fall through to the provider default"
     );
 }
 
