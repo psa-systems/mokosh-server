@@ -91,6 +91,11 @@ const CELL_PAD_MM: f32 = 2.0;
 /// cannot squeeze its neighbours to nothing.
 const MIN_COLUMN_MM: f32 = 16.0;
 
+/// A column whose widest cell fits in this keeps its width when the table
+/// overflows (PMS-1004): dates, quantities and amounts are never cut to make
+/// room for a description.
+const NARROW_COLUMN_MM: f32 = 34.0;
+
 /// What a section holds.
 pub enum Body {
     /// Label / value pairs, for the header block a report opens with.
@@ -771,8 +776,35 @@ fn column_widths(headers: &[String], rows: &[Vec<String>], available: f32) -> Ve
     if total <= available {
         return wanted;
     }
-    // Scale down, then lift anything under the floor and take the difference
-    // back off the columns that can afford it.
+    // PMS-1004: a narrow column keeps its width and only the wide ones give
+    // way. Scaling every column by the same factor let one long description
+    // squeeze "150.00 USD" down to "150.0..." on an invoice, which is the one
+    // cell a customer reads. A column is narrow when everything in it fits
+    // in NARROW_COLUMN_MM; the rest share what is left, in proportion.
+    let narrow = |w: &f32| *w <= NARROW_COLUMN_MM;
+    let fixed: f32 = wanted
+        .iter()
+        .filter(|w| narrow(w))
+        .map(|w| w.max(MIN_COLUMN_MM))
+        .sum();
+    let flexible: f32 = wanted.iter().filter(|w| !narrow(w)).sum();
+    let flexible_count = wanted.iter().filter(|w| !narrow(w)).count() as f32;
+    let room = available - fixed;
+    if flexible_count > 0.0 && room >= MIN_COLUMN_MM * flexible_count {
+        return wanted
+            .iter()
+            .map(|w| {
+                if narrow(w) {
+                    w.max(MIN_COLUMN_MM)
+                } else {
+                    (w * room / flexible).max(MIN_COLUMN_MM)
+                }
+            })
+            .collect();
+    }
+    // Every column is wide, or the narrow ones alone overflow the page: scale
+    // down, then lift anything under the floor and take the difference back
+    // off the columns that can afford it.
     let scale = available / total;
     let mut widths: Vec<f32> = wanted
         .iter()
@@ -1083,6 +1115,43 @@ mod tests {
             right_aligned_x(20.0, &"9".repeat(500)),
             MARGIN_MM,
             "an impossible fit is pinned to the margin rather than off the page"
+        );
+    }
+
+    /// PMS-1004: the money columns of an invoice keep their width; only the
+    /// description gives way. Before this every column scaled by the same
+    /// factor and "150.00 USD" came out as "150.0...".
+    #[test]
+    fn a_long_description_does_not_cut_the_amount_beside_it() {
+        let headers = vec![
+            "Description".to_string(),
+            "Qty".to_string(),
+            "Unit price".to_string(),
+            "Amount".to_string(),
+        ];
+        let rows = vec![vec![
+            "2026-08-24 Remote support: T000042 Printer offline - Rebooted the print spooler"
+                .to_string(),
+            "2".to_string(),
+            "150.00 USD".to_string(),
+            "1300.00 USD".to_string(),
+        ]];
+        let available = PAGE_WIDTH_MM - 2.0 * MARGIN_MM;
+        let widths = column_widths(&headers, &rows, available);
+        for (i, cell) in rows[0].iter().enumerate().skip(1) {
+            assert_eq!(
+                truncate_to(cell, widths[i]),
+                *cell,
+                "column {i} was cut: {widths:?}"
+            );
+        }
+        assert!(
+            widths.iter().sum::<f32>() <= available + 0.01,
+            "the row is wider than the page: {widths:?}"
+        );
+        assert!(
+            widths[0] > widths[3],
+            "the description still gets the most room: {widths:?}"
         );
     }
 
