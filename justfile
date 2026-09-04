@@ -323,6 +323,7 @@ ensure-env:
     let infisical_pg_password = (^openssl rand -hex 24 | str trim)
     let infisical_encryption_key = (^openssl rand -hex 16 | str trim)
     let infisical_auth_secret = (^openssl rand -base64 32 | str trim)
+    let minio_root_password = (^openssl rand -hex 24 | str trim)
     # Scalar KEY=value replacements plus URL lines rebuilt from the same passwords.
     let overrides = {
         MOKOSH_PG_PASSWORD: $pg_password
@@ -333,6 +334,7 @@ ensure-env:
         INFISICAL_PG_PASSWORD: $infisical_pg_password
         INFISICAL_ENCRYPTION_KEY: $infisical_encryption_key
         INFISICAL_AUTH_SECRET: $infisical_auth_secret
+        MINIO_ROOT_PASSWORD: $minio_root_password
         DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
         MOKOSH_ADMIN_DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
         MOKOSH_APP_DATABASE_URL: $"postgres://mokosh_app:($app_password)@localhost:5433/mokosh"
@@ -419,6 +421,52 @@ dev-infisical *args: ensure-env
     $"($updated)\n" | save .env.new
     mv .env.new .env
     docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
+
+# Start only MinIO (opt-in; not started by `just dev`). PMS-958.
+[doc("Start a MinIO object store and point the blank S3_* keys in .env at it (compose profile: s3)")]
+[group: 'dev']
+dev-s3 *args: ensure-env
+    #!/usr/bin/env nu
+    # Fill in the S3_* keys that are blank so `just test-integration` runs the
+    # S3 suite against this MinIO. STORAGE_BACKEND is left alone on purpose:
+    # the server keeps writing to the attachments volume until an operator
+    # sets it to `s3` and restarts `server`, the way `dev-infisical` only
+    # points at Infisical and never flips SECRET_BACKEND.
+    let lines = (open .env --raw | lines)
+    def value-of [lines: list<string>, key: string] {
+        $lines
+        | where ($it | str starts-with $"($key)=")
+        | append $"($key)="
+        | first
+        | str replace $"($key)=" ''
+        | str trim
+    }
+    let root_user = (value-of $lines 'MINIO_ROOT_USER')
+    let root_password = (value-of $lines 'MINIO_ROOT_PASSWORD')
+    if ($root_user | is-empty) or ($root_password | is-empty) {
+        error make { msg: "MINIO_ROOT_USER / MINIO_ROOT_PASSWORD are missing or blank in .env; copy both keys from .env.example and give the password a value (a .env generated before PMS-958 has neither)" }
+    }
+    let wanted = {
+        S3_ENDPOINT: 'http://minio:9000'
+        S3_BUCKET: 'mokosh'
+        S3_REGION: 'us-east-1'
+        S3_PATH_STYLE: 'true'
+        S3_ACCESS_KEY_ID: $root_user
+        S3_SECRET_ACCESS_KEY: $root_password
+    }
+    mut updated = $lines
+    for key in ($wanted | columns) {
+        if (value-of $updated $key | is-not-empty) { continue }
+        $updated = (
+            $updated
+            | where not (($it | str starts-with $"($key)=") or ($it | str starts-with $"# ($key)="))
+            | append $"($key)=($wanted | get $key)"
+        )
+    }
+    if ('.env.new' | path exists) { rm .env.new }
+    $"($updated | str join "\n")\n" | save .env.new
+    mv .env.new .env
+    docker compose --file {{ compose_file }} --profile s3 up {{ args }} minio
 
 # Stop the dev stack. Volumes preserved. `--remove-orphans` cleans up any
 # stray containers left over from an older multi-file layout.

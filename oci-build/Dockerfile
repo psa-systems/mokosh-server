@@ -62,7 +62,8 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 # Real sources, least-frequently-changed first. All four are required at
 # compile time: sqlx::migrate! reads migrations/, cargo needs the workspace
 # members to resolve the workspace, and build.rs bakes the version metadata
-# env vars into the binaries.
+# env vars into the binaries. (PMS-1007's vendored fonts are inside src/, which
+# is why they live there rather than in a top-level assets/.)
 COPY migrations ./migrations
 COPY build.rs ./
 COPY crates ./crates
@@ -83,6 +84,12 @@ RUN adduser --disabled-password --uid 1001 appuser
 COPY --from=builder /build/target/release/mokosh-server /app/mokosh-server
 COPY --from=builder /build/target/release/mokosh-bootstrap /app/mokosh-bootstrap
 COPY --from=builder /build/migrations /app/migrations
+
+# PMS-1007: the Noto Sans faces the PDF renderer draws with are compiled into
+# the binary, so the SIL Open Font License they are distributed under has to
+# travel separately. It is a licence obligation, not a runtime input: nothing
+# reads this file.
+COPY --from=builder /build/src/pdf/fonts/OFL.txt /app/licenses/NotoSans-OFL.txt
 
 # PMS-757: the uploads directory has to EXIST in the image, owned by the runtime
 # user, before a deployment mounts a volume over it.

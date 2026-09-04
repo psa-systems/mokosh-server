@@ -1112,3 +1112,89 @@ async fn deleting_a_payment_recomputes_from_remaining(pool: PgPool) {
         "amount_paid always equals SUM(payments.amount)"
     );
 }
+
+/// PMS-1004: a generated line describes the work, not the row.
+///
+/// `Time entry {uuid}` was the description of every line the builder wrote,
+/// and it reached the API, the page and the PDF a customer receives. The
+/// line now names the date, the work type, the ticket and the notes.
+#[sqlx::test]
+async fn a_generated_line_describes_the_work_not_the_row(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seed_work_type(&pool).await;
+    let (ticket_id, _note_id) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let ticket_number: String =
+        sqlx::query_scalar("SELECT ticket_number FROM tickets WHERE id = $1")
+            .bind(ticket_id)
+            .fetch_one(&pool)
+            .await
+            .expect("ticket number");
+
+    let with_ticket = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO time_entries (
+            id, tenant_id, user_id, date, duration_minutes, work_type_id,
+            company_id, ticket_id, notes, is_billable, billing_status,
+            hourly_rate, total_amount
+        )
+        VALUES ($1, $2, $3, '2026-08-27', 60, $4, $5, $6,
+                'Rebooted the print spooler' || E'\n' || 'second line stays off the invoice',
+                TRUE, 'ready_to_bill', 150.00, 150.00)
+        "#,
+    )
+    .bind(with_ticket)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(admin_id)
+    .bind(work_type_id)
+    .bind(company_id)
+    .bind(ticket_id)
+    .execute(&pool)
+    .await
+    .expect("seed entry with a ticket");
+    let bare = seed_time_entry(
+        &pool,
+        admin_id,
+        company_id,
+        work_type_id,
+        30,
+        "150.00",
+        "75.00",
+    )
+    .await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let resp = app
+        .client
+        .post(app.url("/api/v1/invoices/from-time-entries"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "company_id": company_id }))
+        .send()
+        .await
+        .expect("generate invoice");
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let invoice: serde_json::Value = resp.json().await.expect("invoice JSON");
+    let lines = invoice["lines"].as_array().expect("lines");
+    assert_eq!(lines.len(), 2);
+
+    let descriptions: Vec<&str> = lines
+        .iter()
+        .map(|l| l["description"].as_str().expect("description"))
+        .collect();
+    assert_eq!(
+        descriptions[0],
+        format!("2026-08-27 Billing Test Work: {ticket_number} Attachment ticket - Rebooted the print spooler"),
+        "the dated entry sorts first and names its ticket and notes"
+    );
+    assert!(
+        descriptions[1].ends_with(" Billing Test Work"),
+        "an entry with no ticket and no notes is its date and work type: {}",
+        descriptions[1]
+    );
+    for (line, id) in descriptions.iter().zip([with_ticket, bare]) {
+        assert!(!line.contains(&id.to_string()), "no UUID on a line: {line}");
+        assert!(!line.contains("Time entry"), "{line}");
+    }
+}
