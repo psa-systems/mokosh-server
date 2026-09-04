@@ -45,7 +45,7 @@
 # not "any branch": a stray push must not fill the registry. This is the single
 # source of truth - scripts/check-oci-publish-tags.nu fails the build when the
 # workflow's push filter or its ref guard disagrees with it.
-export const BRANCH_ALLOW_LIST = ["mokosh-contact-login"]
+export const BRANCH_ALLOW_LIST = []
 
 # The registry tag a branch publishes: the branch name with `/` replaced by `-`,
 # because an OCI tag may not contain `/`.

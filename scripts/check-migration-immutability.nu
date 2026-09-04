@@ -42,8 +42,8 @@ const RENAME_ALLOWED = [
     # applies and the one whose checksum every half-migrated database now
     # records; this file is the one that always failed, on every database, and
     # its branch never published an image (BRANCH_ALLOW_LIST held only
-    # `mokosh-client-login` at the time; now `mokosh-contact-login`), so no
-    # checksum for it exists anywhere. Renumbered to 130.
+    # `mokosh-client-login` at the time), so no checksum for it exists
+    # anywhere. Renumbered to 130.
     #
     # Named by its DESTINATION, because `git diff --name-only` reports a rename
     # by where the file ended up rather than where it came from.

@@ -21,15 +21,15 @@
 name: Check
 
 on:
-  push:
-    branches:
-      # PMS-825: mokosh-contact-login publishes its own image tag (PMS-733) and
-      # is long-lived, so no pull_request into main ever covers it. Without this
-      # entry staging pulls an image whose commit never ran fmt/clippy/tests.
-      # It goes away with the branch tag under PMS-824. Keep in sync with
-      # BRANCH_ALLOW_LIST in oci-build/get-tags.nu; scripts/check-oci-publish-tags.nu
-      # fails the build if a publishing branch is missing here.
-      - mokosh-contact-login
+  # PMS-825: an allow-listed publishing branch (PMS-733) is long-lived, so no
+  # pull_request into main ever covers it, and without a `push:` entry staging
+  # would pull an image whose commit never ran fmt/clippy/tests. No branch is
+  # allow-listed right now, so there is no `push:` trigger: `main` must NOT go
+  # here (DEV-612, scripts/check-single-build.nu), because every main commit
+  # arrives through a pull request the gate below already covers. Restore a
+  # `push: branches:` entry alongside any branch added to BRANCH_ALLOW_LIST in
+  # oci-build/get-tags.nu; scripts/check-oci-publish-tags.nu fails the build if
+  # a publishing branch is missing here.
   pull_request:
     branches:
       - main
