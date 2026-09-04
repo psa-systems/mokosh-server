@@ -332,28 +332,6 @@ impl BillingService {
         Ok(())
     }
 
-    /// PMS-993: the company's billing contact, the invoice recipient of record.
-    ///
-    /// `companies.default_billing_contact_id` is the single carrier: it is
-    /// per-company by construction, so "exactly one billing contact per
-    /// company" needs no uniqueness rule of its own and reassigning it demotes
-    /// the previous holder in the same write.
-    async fn resolve_company_billing_contact(
-        tx: &mut sqlx::PgConnection,
-        tenant_id: TenantId,
-        company_id: Uuid,
-    ) -> AppResult<Option<Uuid>> {
-        let found: Option<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT default_billing_contact_id FROM companies \
-             WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        Ok(found.flatten())
-    }
-
     /// Validate that `contact_id` is a contact of `company_id` in the caller's
     /// tenant (PMS-993). `invoices.billing_contact_id` was bound straight from
     /// the request at every write with no check at all, and FK checks bypass
@@ -703,25 +681,19 @@ impl BillingService {
         )
         .await?;
 
-        // PMS-993: an explicit recipient is checked, an absent one falls back
-        // to the company's billing contact, so a draft carries who it is for
-        // from the moment it is created rather than only at send.
-        let billing_contact_id = match request.billing_contact_id {
-            Some(contact_id) => {
-                Self::assert_billing_contact_for_company(
-                    &mut tx,
-                    tenant_id,
-                    request.company_id,
-                    contact_id,
-                )
-                .await?;
-                Some(contact_id)
-            }
-            None => {
-                Self::resolve_company_billing_contact(&mut tx, tenant_id, request.company_id)
-                    .await?
-            }
-        };
+        // PMS-993: FK checks bypass RLS, so an unvalidated `billing_contact_id`
+        // could address an invoice to another tenant's contact. Resolving an
+        // ABSENT one from the company is PMS-1016's scope, not this issue's.
+        let billing_contact_id = request.billing_contact_id;
+        if let Some(contact_id) = billing_contact_id {
+            Self::assert_billing_contact_for_company(
+                &mut tx,
+                tenant_id,
+                request.company_id,
+                contact_id,
+            )
+            .await?;
+        }
 
         let invoice_id = Uuid::new_v4();
         sqlx::query(
@@ -1010,22 +982,16 @@ impl BillingService {
                 .await?;
 
         // PMS-993: same recipient rule as `create_invoice`.
-        let billing_contact_id = match request.billing_contact_id {
-            Some(contact_id) => {
-                Self::assert_billing_contact_for_company(
-                    &mut tx,
-                    tenant_id,
-                    request.company_id,
-                    contact_id,
-                )
-                .await?;
-                Some(contact_id)
-            }
-            None => {
-                Self::resolve_company_billing_contact(&mut tx, tenant_id, request.company_id)
-                    .await?
-            }
-        };
+        let billing_contact_id = request.billing_contact_id;
+        if let Some(contact_id) = billing_contact_id {
+            Self::assert_billing_contact_for_company(
+                &mut tx,
+                tenant_id,
+                request.company_id,
+                contact_id,
+            )
+            .await?;
+        }
 
         // 4. Insert the invoice header. `balance_due` starts at `total`.
         let invoice_id = Uuid::new_v4();
@@ -1406,18 +1372,8 @@ impl BillingService {
         // so numbers stay gapless.
         let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
-        // PMS-993: this insert hard-coded NULL, so a recurring draft could
-        // never resolve a recipient and the sweep produced invoices nobody
-        // could send. The sweep runs cross-tenant from the worker, so the
-        // company's billing contact is the only recipient available here.
-        let billing_contact_id =
-            Self::resolve_company_billing_contact(&mut tx, tenant_id, company_id).await?;
-        if billing_contact_id.is_none() {
-            tracing::warn!(
-                target: "mokosh_server.billing", tenant = %tenant_id, company = %company_id,
-                "recurring invoice created with no billing contact; it cannot be sent",
-            );
-        }
+        // Recipient stays unset at create; PMS-1016 owns resolving it.
+        let billing_contact_id: Option<Uuid> = None;
 
         sqlx::query(
             r#"

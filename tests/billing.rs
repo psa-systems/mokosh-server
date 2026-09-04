@@ -1116,39 +1116,6 @@ async fn deleting_a_payment_recomputes_from_remaining(pool: PgPool) {
 // =====================================================================// PMS-993: the billing contact is the invoice recipient
 // ============================================================================
 
-/// AC2: a create that names no recipient inherits the company's billing
-/// contact, so a draft carries who it is for from the moment it exists.
-#[sqlx::test]
-async fn invoice_inherits_the_company_billing_contact(pool: PgPool) {
-    let (_id, email, pw) = common::seed_admin(&pool).await;
-    let company_id = common::seed_company(&pool).await;
-    let contact_id = common::seed_billing_contact(&pool, company_id).await;
-    let app = common::boot(pool).await;
-    let token = common::login(&app, &email, &pw).await;
-
-    let invoice: serde_json::Value = app
-        .client
-        .post(app.url("/api/v1/invoices"))
-        .bearer_auth(&token)
-        .json(&serde_json::json!({
-            "company_id": company_id,
-            "invoice_date": "2026-06-15",
-            "due_date": "2026-07-15",
-            "lines": [{ "line_type": "service", "description": "Work", "quantity": "1", "unit_price": "100" }],
-        }))
-        .send()
-        .await
-        .expect("create invoice")
-        .json()
-        .await
-        .expect("invoice JSON");
-    assert_eq!(
-        invoice["billing_contact_id"].as_str(),
-        Some(contact_id.to_string().as_str()),
-        "an omitted recipient resolves to the company's billing contact"
-    );
-}
-
 /// AC2 negative: a recipient from another company (or another tenant) is a
 /// 400, not a silent cross-account link. FK checks bypass RLS, so nothing else
 /// was stopping it.
