@@ -1371,6 +1371,19 @@ impl TimeTrackingService {
 
         let now = Utc::now();
         let raw = (now - timer.started_at).num_minutes().max(1) as i32;
+        // PMS-1027: the entry is dated by the day it is where the timer's
+        // OWNER is, not the UTC day. An evening stop in the Americas used to
+        // land the entry on tomorrow and draw from next month's block of
+        // hours. The owner's zone rather than the caller's, because the entry
+        // is theirs.
+        let owner_tz: String =
+            sqlx::query_scalar("SELECT timezone FROM users WHERE id = $1 AND tenant_id = $2")
+                .bind(timer.user_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .unwrap_or_else(|| "UTC".to_string());
+        let today = mokosh_types::datetime::user_today(now, &owner_tz);
 
         // Active timer might not carry work_type_id / company_id; the
         // schema requires both on time_entries. Fall back to first
@@ -1441,7 +1454,7 @@ impl TimeTrackingService {
             &mut tx,
             tenant_id,
             company_id,
-            now.date_naive(),
+            today,
             kind.kind,
             kind.billable,
         )
@@ -1463,7 +1476,7 @@ impl TimeTrackingService {
         .bind(entry_id)
         .bind(tenant_id)
         .bind(timer.user_id)
-        .bind(now.date_naive())
+        .bind(today)
         .bind(timer.started_at.time())
         .bind(now.time())
         .bind(duration)
