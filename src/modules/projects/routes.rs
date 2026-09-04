@@ -377,7 +377,9 @@ async fn create_task(
 ) -> AppResult<Json<TaskResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_task(u.tenant(), id, &req, &ctx).await?,
+        s.service
+            .create_task(u.tenant(), &u.timezone, id, &req, &ctx)
+            .await?,
     ))
 }
 

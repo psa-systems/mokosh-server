@@ -384,7 +384,7 @@ impl SeedService {
                 };
                 if let Err(e) = self
                     .projects
-                    .create_task(tenant, project.id, &task, &ctx)
+                    .create_task(tenant, "UTC", project.id, &task, &ctx)
                     .await
                 {
                     tracing::warn!(error = %e, %tenant_id, "demo task seeding skipped");

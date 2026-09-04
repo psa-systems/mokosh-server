@@ -892,6 +892,7 @@ impl ProjectsService {
     pub async fn create_task(
         &self,
         tenant_id: TenantId,
+        user_tz: &str,
         project_id: Uuid,
         request: &CreateTaskRequest,
         ctx: &AuditCtx,
@@ -926,8 +927,13 @@ impl ProjectsService {
                         .await?
                     }
                 };
+                // PMS-1027: counted from today where the caller is, not the
+                // UTC day.
                 (n > 0).then(|| {
-                    crate::utils::datetime::add_business_days(chrono::Utc::now().date_naive(), n)
+                    crate::utils::datetime::add_business_days(
+                        mokosh_types::datetime::user_today(chrono::Utc::now(), user_tz),
+                        n,
+                    )
                 })
             }
         };
