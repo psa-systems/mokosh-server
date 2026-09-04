@@ -163,6 +163,12 @@ pub struct InvoiceResponse {
     pub notes: Option<String>,
     pub po_number: Option<String>,
     pub sent_at: Option<DateTime<Utc>>,
+    /// PMS-992: who the invoice was emailed to on the send, and when. `None`
+    /// on a draft, and on an invoice marked sent without emailing
+    /// (`skip_email`), so the record says what happened rather than implying
+    /// a delivery.
+    pub emailed_at: Option<DateTime<Utc>>,
+    pub emailed_to: Option<String>,
     pub paid_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -209,7 +215,11 @@ pub struct CreateInvoiceRequest {
     pub billing_contact_id: Option<Uuid>,
     pub contract_id: Option<Uuid>,
     pub invoice_date: NaiveDate,
-    pub due_date: NaiveDate,
+    /// PMS-990: optional. Omitted, the server derives it from the invoice
+    /// date plus the net days of `payment_term_id`, or of the tenant's
+    /// default term when none is named, or thirty days when the term names
+    /// no count. Given, it is stored as given.
+    pub due_date: Option<NaiveDate>,
     #[validate(length(max = 20))]
     pub payment_terms: Option<String>,
     /// Optional FK into the tenant's `payment_terms` lookup (PMS-333). The
@@ -231,7 +241,9 @@ pub struct CreateInvoiceRequest {
 fn validate_invoice_date_range(
     req: &CreateInvoiceRequest,
 ) -> Result<(), validator::ValidationError> {
-    if req.due_date < req.invoice_date {
+    // PMS-990: a derived due date cannot precede the invoice date, so only a
+    // given one is checked.
+    if req.due_date.is_some_and(|due| due < req.invoice_date) {
         // Re-key onto `due_date` so the form shows the message inline
         // rather than as a generic banner (PMS-364).
         return Err(crate::utils::validation::cross_field_error(
@@ -292,6 +304,13 @@ pub struct UpdateInvoiceRequest {
     pub lines: Option<Vec<CreateInvoiceLineRequest>>,
     /// Transition status. Same set as the schema CHECK constraint.
     pub status: Option<InvoiceStatus>,
+    /// PMS-992: mark the invoice sent WITHOUT emailing it, for one delivered
+    /// by hand (printed, or attached to a message the operator writes). Off,
+    /// a transition to `sent` requires a resolvable recipient and an accepted
+    /// send, and is refused otherwise; on, the invoice freezes and records
+    /// nobody as emailed. Only meaningful alongside `status: sent`.
+    #[serde(default)]
+    pub skip_email: bool,
 }
 
 // ============================================================================
@@ -488,6 +507,10 @@ pub struct PaymentTermResponse {
     pub is_default: bool,
     pub is_active: bool,
     pub sort_order: i32,
+    /// PMS-990: the number of days the term means, or `None` for a term that
+    /// names no fixed count. Drives the derived due date; see
+    /// `BillingService::resolve_due_date`.
+    pub net_days: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -500,6 +523,11 @@ pub struct UpsertPaymentTermRequest {
     pub is_active: bool,
     #[serde(default)]
     pub sort_order: i32,
+    /// PMS-990: days from the invoice date to the due date. Optional, because
+    /// "On approval" is a legitimate term with no count; capped at ten years,
+    /// because a larger value is a typo.
+    #[validate(range(min = 0, max = 3650))]
+    pub net_days: Option<i32>,
 }
 
 #[cfg(test)]
@@ -527,7 +555,7 @@ mod tests {
             billing_contact_id: None,
             contract_id: None,
             invoice_date,
-            due_date,
+            due_date: Some(due_date),
             payment_terms: None,
             payment_term_id: None,
             tax_amount: None,
@@ -861,6 +889,13 @@ pub struct ProductResponse {
     /// Retirement is deactivation, never deletion: the documents that sold it
     /// still name it, and the database refuses to drop a referenced row.
     pub is_active: bool,
+    /// Whether any invoice line or contract item names this product
+    /// (PMS-1002). Advisory: a client uses it to show "In use" and to withhold
+    /// Delete where the FK would refuse it, but the FK is the guard, so a
+    /// product sold between the read and the click is still refused with a
+    /// 409. A boolean rather than a count, because "how many sold" is a
+    /// different question that no list here answers.
+    pub in_use: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

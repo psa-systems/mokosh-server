@@ -21,7 +21,9 @@
 use uuid::Uuid;
 
 use super::branding::PUBLIC_TENANT_PATH_PREFIX;
-use crate::storage::{FileLedger, FileRecord, LocalStore, ObjectKey, ObjectStore};
+use std::sync::Arc;
+
+use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
 use crate::utils::error::{AppError, AppResult};
 
 /// The on-disk suffix each allowed type is stored under. This table names
@@ -97,7 +99,7 @@ pub fn check_mime(raw: &str) -> AppResult<&'static str> {
 pub struct TenantLogoStore {
     config: TenantLogoConfig,
     /// PMS-910: where the bytes go. This module no longer knows.
-    store: LocalStore,
+    store: Arc<dyn ObjectProvider>,
     /// PMS-957: one row per stored file. A logo is the one object written to
     /// the same key over and over, so its row is upserted rather than added to,
     /// and a tenant's usage counts one logo however many times it is replaced.
@@ -108,7 +110,7 @@ impl TenantLogoStore {
     pub fn new(config: TenantLogoConfig) -> Self {
         Self {
             config,
-            store: LocalStore::from_env(),
+            store: crate::storage::shared(),
             ledger: None,
         }
     }

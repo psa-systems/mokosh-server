@@ -38,18 +38,24 @@ pub struct BillingService {
     /// disables the email (no base to build the link from).
     portal_origin: Option<String>,
     /// PMS-968: where a tenant's gateway credentials live. Injected rather than
-    /// built here, so the backend is chosen once at startup by
-    /// `secrets::store_from_env` and no constructor can pick a different one.
-    secrets: Arc<dyn crate::secrets::SecretStore>,
+    /// built here, so the provider is chosen once at startup by
+    /// `secrets::provider_from_env` and no constructor can pick a different one.
+    secrets: Arc<dyn crate::secrets::SecretProvider>,
 }
+
+/// PMS-990: the due date offset when neither the invoice's term nor the
+/// tenant's default term names a count. Thirty, because that is what the
+/// server-minted paths used before terms carried a number, and a fallback
+/// that changed it would move due dates on tenants that configured nothing.
+const DEFAULT_NET_DAYS: i32 = 30;
 
 impl BillingService {
     /// Zero-key constructor for callers that never touch secret material (the
-    /// QA seeder). Its secret store is the database one under the same zero
+    /// QA seeder). Its secret provider is the database one under the same zero
     /// key, so the two halves agree; nothing on that path reads a gateway
     /// credential.
     pub fn new(db: Database) -> Self {
-        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+        let secrets = Arc::new(crate::secrets::DatabaseSecretProvider::new(
             db.clone(),
             [0u8; 32],
         ));
@@ -385,6 +391,58 @@ impl BillingService {
         Ok(())
     }
 
+    /// PMS-990: the due date, and the term it came from.
+    ///
+    /// A given `due_date` wins, stored as given with whatever term the caller
+    /// named. Otherwise the date is the invoice date plus the net days of the
+    /// named term, or of the tenant's default term when none was named, and
+    /// the term that supplied the count is returned so the invoice records
+    /// it. A term with no count, or a tenant with no default, falls back to
+    /// thirty days: the value the two server-minted paths hardcoded before
+    /// this, so nothing changes for a tenant that never set one.
+    ///
+    /// Only an ACTIVE default is consulted. A retired default is an operator
+    /// forgetting to move the flag, and linking new invoices to a term that
+    /// no longer appears in the picker would be surprising.
+    pub(crate) async fn resolve_due_date(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        invoice_date: NaiveDate,
+        payment_term_id: Option<Uuid>,
+        due_date: Option<NaiveDate>,
+    ) -> AppResult<(NaiveDate, Option<Uuid>)> {
+        if let Some(due) = due_date {
+            return Ok((due, payment_term_id));
+        }
+        let term: Option<(Uuid, Option<i32>)> = match payment_term_id {
+            Some(id) => {
+                sqlx::query_as(
+                    "SELECT id, net_days FROM payment_terms WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id, net_days FROM payment_terms \
+                 WHERE tenant_id = $1 AND is_default = TRUE AND is_active = TRUE \
+                 ORDER BY sort_order, name LIMIT 1",
+                )
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+        };
+        let (term_id, net_days) = match term {
+            Some((id, days)) => (Some(id), days),
+            None => (payment_term_id, None),
+        };
+        let days = net_days.unwrap_or(DEFAULT_NET_DAYS);
+        Ok((invoice_date + chrono::Duration::days(days as i64), term_id))
+    }
+
     /// Resolve a set of payment-term ids to their names, tenant-scoped
     /// (PMS-333). Lets `enrich_invoices` attach `payment_term_name` without a
     /// per-row round-trip.
@@ -449,24 +507,24 @@ impl BillingService {
     /// payment-gateway-config write path so secrets never hit the DB
     /// in cleartext.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
-        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+        let secrets = Arc::new(crate::secrets::DatabaseSecretProvider::new(
             db.clone(),
             encryption_key,
         ));
         Self::with_secrets(db, encryption_key, secrets)
     }
 
-    /// PMS-968: the constructor that takes the configured secret store.
+    /// PMS-968: the constructor that takes the configured secret provider.
     ///
-    /// `with_encryption_key` keeps the database backend, which is correct for
+    /// `with_encryption_key` keeps the database provider, which is correct for
     /// the callers that have no configuration to consult (tests, the seeder).
     /// Every serving instance is built through here from
-    /// `secrets::store_from_env`, so a deployment on Infisical has all of them
+    /// `secrets::provider_from_env`, so a deployment on Infisical has all of them
     /// on Infisical rather than whichever ones remembered.
     pub fn with_secrets(
         db: Database,
         encryption_key: [u8; 32],
-        secrets: Arc<dyn crate::secrets::SecretStore>,
+        secrets: Arc<dyn crate::secrets::SecretProvider>,
     ) -> Self {
         Self {
             db,
@@ -488,7 +546,7 @@ impl BillingService {
         encryption_key: [u8; 32],
         mailer: Arc<dyn Mailer>,
         portal_origin: String,
-        secrets: Arc<dyn crate::secrets::SecretStore>,
+        secrets: Arc<dyn crate::secrets::SecretProvider>,
     ) -> Self {
         Self {
             db,
@@ -560,7 +618,7 @@ impl BillingService {
                    payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
-                   created_at, updated_at
+                   created_at, updated_at, emailed_at, emailed_to
             FROM invoices
             WHERE {data_where}
             ORDER BY {order_by}
@@ -635,6 +693,15 @@ impl BillingService {
         if let Some(pt) = request.payment_term_id {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
+        // PMS-990: the due date the caller gave, or the one the term implies.
+        let (due_date, payment_term_id) = Self::resolve_due_date(
+            &mut tx,
+            tenant_id,
+            request.invoice_date,
+            request.payment_term_id,
+            request.due_date,
+        )
+        .await?;
 
         // PMS-993: an explicit recipient is checked, an absent one falls back
         // to the company's billing contact, so a draft carries who it is for
@@ -677,7 +744,7 @@ impl BillingService {
         .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
-        .bind(request.due_date)
+        .bind(due_date)
         .bind(&request.payment_terms)
         .bind(subtotal)
         .bind(tax)
@@ -686,7 +753,7 @@ impl BillingService {
         .bind(request.currency.as_deref().unwrap_or("USD"))
         .bind(&request.notes)
         .bind(&request.po_number)
-        .bind(request.payment_term_id)
+        .bind(payment_term_id)
         .execute(&mut *tx)
         .await?;
 
@@ -793,22 +860,30 @@ impl BillingService {
         //    serialises against a concurrent generate.
         let entries: Vec<TimeEntryBillingRow> = sqlx::query_as(
             r#"
-            SELECT id, duration_minutes, hourly_rate, total_amount, ticket_id
-            FROM time_entries
-            WHERE tenant_id = $1
-              AND company_id = $2
+            SELECT te.id, te.duration_minutes, te.hourly_rate, te.total_amount,
+                   te.ticket_id, te.date, te.notes,
+                   -- PMS-1004: what the line says. The work type is NOT NULL
+                   -- on the entry, so the join cannot drop a row; the ticket
+                   -- is optional and its two columns are NULL without one.
+                   wt.name AS work_type_name,
+                   t.ticket_number, t.title AS ticket_title
+            FROM time_entries te
+            JOIN work_types wt ON wt.id = te.work_type_id
+            LEFT JOIN tickets t ON t.id = te.ticket_id
+            WHERE te.tenant_id = $1
+              AND te.company_id = $2
               -- PMS-942: employee time never reaches a client invoice, and it
               -- is excluded by what it IS rather than by which company id the
               -- caller happened to pass. The tenant's own internal company
               -- (PMS-413) is a real `companies` row, so before this its
               -- overhead time was invoiceable by naming it.
-              AND entry_kind = 'client'
-              AND is_billable = TRUE
-              AND invoice_id IS NULL
-              AND billing_status = 'ready_to_bill'
-              AND ($3::uuid[] IS NULL OR id = ANY($3))
-            ORDER BY date, created_at
-            FOR UPDATE
+              AND te.entry_kind = 'client'
+              AND te.is_billable = TRUE
+              AND te.invoice_id IS NULL
+              AND te.billing_status = 'ready_to_bill'
+              AND ($3::uuid[] IS NULL OR te.id = ANY($3))
+            ORDER BY te.date, te.created_at
+            FOR UPDATE OF te
             "#,
         )
         .bind(tenant_id)
@@ -873,7 +948,21 @@ impl BillingService {
             let unit_price = entry.hourly_rate.unwrap_or(Decimal::ZERO);
             let total = entry.total_amount.unwrap_or(quantity * unit_price);
             subtotal += total;
-            let description = format!("Time entry {}", entry.id);
+            // PMS-1004: the line describes the work, not the row.
+            let ticket =
+                entry
+                    .ticket_number
+                    .as_deref()
+                    .map(|number| super::descriptions::TicketRef {
+                        number,
+                        title: entry.ticket_title.as_deref().unwrap_or(""),
+                    });
+            let description = super::descriptions::time_entry_line(
+                entry.date,
+                &entry.work_type_name,
+                ticket,
+                entry.notes.as_deref(),
+            );
             lines.push((
                 entry.id,
                 description,
@@ -911,14 +1000,14 @@ impl BillingService {
         let discount = Decimal::ZERO;
         let total = subtotal + tax - discount;
 
-        // Default the invoice/due dates when the caller omits them:
-        // invoice today, due in 30 days (matches the `net30` term).
+        // Default the invoice date to today when the caller omits it, and
+        // the due date to what the tenant's default term implies (PMS-990).
         let invoice_date = request
             .invoice_date
             .unwrap_or_else(|| Utc::now().date_naive());
-        let due_date = request
-            .due_date
-            .unwrap_or_else(|| invoice_date + chrono::Duration::days(30));
+        let (due_date, payment_term_id) =
+            Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, request.due_date)
+                .await?;
 
         // PMS-993: same recipient rule as `create_invoice`.
         let billing_contact_id = match request.billing_contact_id {
@@ -946,10 +1035,10 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number
+                balance_due, currency, notes, po_number, payment_term_id
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11,
-                    $12, $13, 0, $13, $14, $15, $16)
+                    $12, $13, 0, $13, $14, $15, $16, $17)
             "#,
         )
         .bind(invoice_id)
@@ -968,6 +1057,7 @@ impl BillingService {
         .bind(request.currency.as_deref().unwrap_or("USD"))
         .bind(&request.notes)
         .bind(&request.po_number)
+        .bind(payment_term_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1303,10 +1393,11 @@ impl BillingService {
         let discount = Decimal::ZERO;
         let total = subtotal + tax - discount;
 
-        // Invoice today, due in 30 days (matches the `net30` default term
-        // and the time-entry invoice path).
+        // Invoice today, due when the tenant's default term says (PMS-990);
+        // thirty days when it names no count, as this path always did.
         let invoice_date = today;
-        let due_date = invoice_date + chrono::Duration::days(30);
+        let (due_date, payment_term_id) =
+            Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, None).await?;
 
         // Gapless invoice number: same per-tenant row-lock as
         // `create_invoice`. NOTE: this increments the sequence even if the
@@ -1334,10 +1425,10 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number
+                balance_due, currency, notes, po_number, payment_term_id
             )
             VALUES ($1, $2, $3, $4, $13, $5, 'draft', $6, $7, 'net30', $8, $9,
-                    $10, $11, 0, $11, 'USD', $12, NULL)
+                    $10, $11, 0, $11, 'USD', $12, NULL, $14)
             "#,
         )
         .bind(invoice_id)
@@ -1355,6 +1446,7 @@ impl BillingService {
             "Recurring billing for {period_start} to {period_end}"
         ))
         .bind(billing_contact_id)
+        .bind(payment_term_id)
         .execute(&mut *tx)
         .await?;
 
@@ -1753,7 +1845,7 @@ impl BillingService {
                 provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
                 is_active: r.is_active,
                 is_test_mode: r.is_test_mode,
-                // PMS-968: NULL means the credential is in the secret store,
+                // PMS-968: NULL means the credential is in the secret provider,
                 // so the row is configured. Non-NULL and non-empty is the
                 // pre-move state and equally configured. Only an empty string
                 // would not be, and nothing writes one.
@@ -1797,7 +1889,7 @@ impl BillingService {
             )));
         }
 
-        // PMS-968: a supplied credential goes to the configured secret store,
+        // PMS-968: a supplied credential goes to the configured secret provider,
         // and the row records only that it is there. `None` still means "keep
         // the existing secret" (write-only update semantics, PMS-342).
         //
@@ -1900,7 +1992,7 @@ impl BillingService {
                 .bind(request.provider.as_str())
                 .bind(request.is_active)
                 .bind(request.is_test_mode)
-                // NULL: the credential is in the secret store now, at the
+                // NULL: the credential is in the secret provider now, at the
                 // address this row's own (tenant_id, provider) gives.
                 .bind(Option::<String>::None)
                 .fetch_one(&mut *tx)
@@ -1998,8 +2090,8 @@ impl BillingService {
 
         // PMS-968: the credential goes with the row. Deleting the row and
         // leaving the secret would keep a disconnected tenant's live API key in
-        // the store indefinitely, and a later reconnect would silently inherit
-        // it. This runs after the DELETE, matching `SecretStore::delete` being
+        // the provider indefinitely, and a later reconnect would silently inherit
+        // it. This runs after the DELETE, matching `SecretProvider::delete` being
         // best-effort: the row is the thing that points at the secret, so a
         // secret with no row is orphaned rather than dangerous, whereas a row
         // whose secret is already gone cannot serve a payment.
@@ -2034,7 +2126,7 @@ impl BillingService {
     /// Recover a gateway's credential, from wherever this row keeps it.
     ///
     /// PMS-968: a non-NULL `config_encrypted` is the pre-move state and is
-    /// decrypted here; NULL means the credential is in the secret store, at the
+    /// decrypted here; NULL means the credential is in the secret provider, at the
     /// address the row's own `(tenant_id, provider)` gives. Both states are
     /// live at once on a deployment the mover has not finished, which is the
     /// point of keeping them distinguishable.
@@ -2055,7 +2147,7 @@ impl BillingService {
                 let key = crate::secrets::SecretKey::payment_gateway(tenant_id, provider_id);
                 self.secrets.get(&key).await?.ok_or_else(|| {
                     AppError::Configuration(format!(
-                        "gateway {provider_id:?} says its credential is in the secret store, but the store has none"
+                        "gateway {provider_id:?} says its credential is in the secret provider, but the provider has none"
                     ))
                 })
             }
@@ -2790,6 +2882,9 @@ impl BillingService {
         if let Some(pt) = request.payment_term_id {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
+        // PMS-993: FK checks bypass RLS, so an unvalidated `billing_contact_id`
+        // could address an invoice to another tenant's contact. Same hole
+        // `assert_payment_term_in_tenant` closes next door (PMS-333).
         if let Some(contact_id) = request.billing_contact_id {
             Self::assert_billing_contact_for_company(
                 &mut tx,
@@ -2800,35 +2895,54 @@ impl BillingService {
             .await?;
         }
 
-        // PMS-993: an invoice cannot be sent to nobody. On the first send,
-        // settle the recipient here and WRITE it below, because the UPDATE
-        // COALESCEs `$2` over the stored value and a `{"status":"sent"}` body
-        // carries no `billing_contact_id`: resolving without binding would pass
-        // the guard and still leave the row NULL, which is the defect this
-        // guard exists to close. Placed before `freeze_issuer` and the issued
-        // document, so a refused send leaves no frozen issuer and no document.
-        let recipient = if just_sent {
-            let mut resolved = request.billing_contact_id.or(current.billing_contact_id);
-            if resolved.is_none() {
-                resolved =
-                    Self::resolve_company_billing_contact(&mut tx, tenant_id, current.company_id)
-                        .await?;
+        // PMS-990: a term change with no due date re-derives the due date
+        // from the (possibly updated) invoice date, because an invoice moved
+        // from Net 30 to Net 15 that kept its old due date would carry a term
+        // its own dates contradict. A given due date always wins, and an
+        // update that leaves the term alone leaves the date alone.
+        let due_date = match (request.payment_term_id, request.due_date) {
+            (Some(term), None) => {
+                let invoice_date = request.invoice_date.unwrap_or(current.invoice_date);
+                Some(
+                    Self::resolve_due_date(&mut tx, tenant_id, invoice_date, Some(term), None)
+                        .await?
+                        .0,
+                )
             }
-            if resolved.is_none() {
-                return Err(AppError::Conflict(
-                    "Invoice cannot be sent: this company has no billing contact".to_string(),
-                ));
-            }
-            resolved
-        } else {
-            request.billing_contact_id
+            (_, given) => given,
         };
 
+        // PMS-992: the recipient is resolved BEFORE the transition, and a send
+        // with nobody to email is refused rather than recorded. `sent` used to
+        // mean "the operator pressed Send"; it now means the invoice was
+        // emailed to the address recorded on it, or was marked sent without
+        // emailing on purpose (`skip_email`), which is a hand-delivered invoice
+        // and says so.
+        let recipient = if just_sent && !request.skip_email {
+            let contact = request.billing_contact_id.or(current.billing_contact_id);
+            match Self::resolve_invoice_recipient(&mut tx, tenant_id, current.company_id, contact)
+                .await?
+            {
+                Ok(recipient) => Some(recipient),
+                Err(reason) => return Err(AppError::Conflict(reason)),
+            }
+        } else {
+            None
+        };
+        // PMS-1001: the invoice records the person it was actually sent to.
+        // `resolve_invoice_recipient` falls back to the company's default
+        // pointer, and until this that fallback was never written down: the
+        // mail went to a person while the document rendered below named an
+        // organization and nobody else. Written before the render in this same
+        // transaction so `load_invoice` reads it, and COALESCEd below so a
+        // later update cannot move it off whoever received the document.
+        let billing_contact_id = request
+            .billing_contact_id
+            .or_else(|| recipient.as_ref().map(|(id, _)| *id));
         // PMS-911: the MSP's identity as it stands right now, frozen onto the
         // invoice on the transition that freezes the invoice. In this
-        // transaction and not in the `just_sent` hook below it, because that
-        // hook is post-commit and best-effort: an invoice must never freeze
-        // carrying no identity.
+        // transaction, because a post-commit step is best-effort and an
+        // invoice must never freeze carrying no identity.
         let issuer_snapshot = if just_sent {
             Some(Self::freeze_issuer(&mut tx, tenant_id).await?)
         } else {
@@ -2862,10 +2976,10 @@ impl BillingService {
             "#,
         )
         .bind(invoice_id)
-        .bind(recipient)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
-        .bind(request.due_date)
+        .bind(due_date)
         .bind(request.payment_terms.as_deref())
         .bind(request.notes.as_deref())
         .bind(request.po_number.as_deref())
@@ -2904,9 +3018,16 @@ impl BillingService {
         // changing.
         if let Some(issuer) = &issuer_snapshot {
             let document = Self::load_invoice(&mut tx, tenant_id, invoice_id).await?;
+            let bill_to = Self::bill_to_in_tx(
+                &mut tx,
+                tenant_id,
+                document.company_id,
+                document.billing_contact_id,
+            )
+            .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant_id.get(), issuer).await;
             let bytes = crate::pdf::render(&crate::modules::billing::documents::invoice(
-                &document, issuer, logo,
+                &document, issuer, &bill_to, logo,
             ))?;
             crate::modules::billing::documents::store_issued(
                 &mut tx,
@@ -2917,6 +3038,30 @@ impl BillingService {
                 &bytes,
             )
             .await?;
+            // PMS-992: the email goes inside this transaction, so a send the
+            // mailer refuses rolls the transition back and the invoice stays
+            // a draft rather than a `sent` nobody received. The relay's
+            // acceptance is what "sent" means from here; delivery beyond it is
+            // the relay's.
+            if let Some((_, address)) = &recipient {
+                self.email_invoice(tenant_id, &document, address, &bytes)
+                    .await?;
+                sqlx::query(
+                    "UPDATE invoices SET emailed_at = NOW(), emailed_to = $3 \
+                     WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(invoice_id)
+                .bind(address)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                tracing::info!(
+                    target: "mokosh_server.billing",
+                    %invoice_id,
+                    "invoice marked sent without emailing (skip_email)",
+                );
+            }
         }
 
         // Audit row in the same transaction. PMS-117.
@@ -2941,16 +3086,65 @@ impl BillingService {
 
         tx.commit().await?;
 
-        // PMS-711: on the first send transition, email the billing contact a
-        // "Pay Now" link. Best-effort and post-commit: a mail failure must not
-        // undo the status change. No-op unless this instance carries a mailer
-        // (agent-facing only), the invoice actually just moved to `sent`, and
-        // the tenant has an active payment gateway.
-        if just_sent {
-            self.notify_invoice_pay_now(tenant_id, invoice_id).await;
-        }
-
         self.get_invoice(tenant_id, invoice_id).await
+    }
+
+    /// PMS-992: who an invoice goes to, or why it cannot go.
+    ///
+    /// The invoice's own billing contact when it names one, else the
+    /// company's default billing contact; either must carry an email address.
+    /// No guessing beyond that: PMS-993 settles the recipient as a contact
+    /// holding the billing role and rejects picking "some contact", so this
+    /// guard does not pick one either. `Err` is the sentence the operator
+    /// sees, naming the company and what is missing, because "no recipient"
+    /// is a state of the company rather than of the request.
+    async fn resolve_invoice_recipient(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        invoice_contact: Option<Uuid>,
+    ) -> AppResult<Result<(Uuid, String), String>> {
+        let company: Option<(String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT name, default_billing_contact_id FROM companies \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((company_name, company_contact)) = company else {
+            return Ok(Err(
+                "The invoice's company no longer exists, so it has no recipient.".to_string(),
+            ));
+        };
+        let Some(contact_id) = invoice_contact.or(company_contact) else {
+            return Ok(Err(format!(
+                "{company_name} has no billing contact, so this invoice cannot be sent. \
+                 Set a billing contact on the invoice or on the company, or mark the invoice \
+                 sent without emailing."
+            )));
+        };
+        let contact: Option<(Option<String>, String, String)> = sqlx::query_as(
+            "SELECT email, first_name, last_name FROM contacts WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match contact {
+            Some((Some(email), _, _)) if !email.trim().is_empty() => {
+                Ok(Ok((contact_id, email.trim().to_string())))
+            }
+            Some((_, first, last)) => Ok(Err(format!(
+                "{company_name}'s billing contact {first} {last} has no email address, so this \
+                 invoice cannot be sent. Add an address to the contact, choose another billing \
+                 contact, or mark the invoice sent without emailing."
+            ))),
+            None => Ok(Err(format!(
+                "{company_name}'s billing contact no longer exists, so this invoice cannot be \
+                 sent. Set a billing contact on the invoice or on the company."
+            ))),
+        }
     }
 
     /// PMS-911: read the tenant's live branding and freeze it.
@@ -3022,6 +3216,171 @@ impl BillingService {
         Ok(crate::modules::billing::issuer::resolve(&name, &branding))
     }
 
+    /// PMS-1004: who a document is addressed to, resolved beside the issuer.
+    ///
+    /// The company's billing address when any of its billing columns is set,
+    /// its postal address otherwise, and the named contact's name and email
+    /// when the document names one. A company that cannot be read resolves to
+    /// "Customer" rather than failing the render, the way `company_name`
+    /// already degrades to `None`.
+    pub async fn bill_to(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Option<Uuid>,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::bill_to_in_tx(&mut tx, tenant_id, company_id, contact_id).await
+    }
+
+    /// The same read, in a transaction the caller owns, for the documents
+    /// rendered inside their issuing transaction (PMS-959).
+    async fn bill_to_in_tx(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Option<Uuid>,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        use crate::modules::billing::documents::{postal_lines, BillTo};
+        let company: Option<CompanyAddressRow> = sqlx::query_as(
+            r#"
+            SELECT name,
+                   address_line1, address_line2, city, state, postal_code, country,
+                   billing_address_line1, billing_address_line2, billing_city,
+                   billing_state, billing_postal_code, billing_country
+            FROM companies
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(company) = company else {
+            return Ok(BillTo {
+                name: "Customer".to_string(),
+                ..Default::default()
+            });
+        };
+        let has_billing_address = [
+            &company.billing_address_line1,
+            &company.billing_address_line2,
+            &company.billing_city,
+            &company.billing_state,
+            &company.billing_postal_code,
+            &company.billing_country,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|v| !v.trim().is_empty());
+        let address_lines = if has_billing_address {
+            postal_lines(
+                company.billing_address_line1.as_deref(),
+                company.billing_address_line2.as_deref(),
+                company.billing_city.as_deref(),
+                company.billing_state.as_deref(),
+                company.billing_postal_code.as_deref(),
+                company.billing_country.as_deref(),
+            )
+        } else {
+            postal_lines(
+                company.address_line1.as_deref(),
+                company.address_line2.as_deref(),
+                company.city.as_deref(),
+                company.state.as_deref(),
+                company.postal_code.as_deref(),
+                company.country.as_deref(),
+            )
+        };
+        let contact: Option<(String, String, Option<String>)> = match contact_id {
+            Some(id) => {
+                sqlx::query_as(
+                    "SELECT first_name, last_name, email FROM contacts WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?
+            }
+            None => None,
+        };
+        let (contact_name, contact_email) = match contact {
+            Some((first, last, email)) => (
+                Some(
+                    format!("{} {}", first.trim(), last.trim())
+                        .trim()
+                        .to_string(),
+                ),
+                email,
+            ),
+            None => (None, None),
+        };
+        Ok(BillTo {
+            name: company.name,
+            address_lines,
+            contact_name,
+            contact_email,
+        })
+    }
+
+    /// PMS-1001: who a credit note is addressed to.
+    ///
+    /// The contact its own invoice was addressed to, read from that invoice's
+    /// `billing_contact_id` rather than from the company's current pointer, for
+    /// the reason the invoice reads its own column: reassigning the billing
+    /// role must not change who a document already issued says it went to.
+    pub async fn credit_to(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        invoice_id: Uuid,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let contact = Self::invoice_billing_contact_in_tx(&mut tx, tenant_id, invoice_id).await?;
+        Self::bill_to_in_tx(&mut tx, tenant_id, company_id, contact).await
+    }
+
+    /// PMS-1001: who a statement is addressed to.
+    ///
+    /// The company's CURRENT default billing contact, and deliberately not an
+    /// invoice's. A statement spans many invoices that may each name a
+    /// different person, and PMS-954 made it a read model that stores nothing,
+    /// so it renders from today exactly as its issuer and its branding already
+    /// do. There is no historical recipient for it to name.
+    pub async fn statement_account(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let contact: Option<Uuid> = sqlx::query_scalar(
+            "SELECT default_billing_contact_id FROM companies WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        Self::bill_to_in_tx(&mut tx, tenant_id, company_id, contact).await
+    }
+
+    /// The contact an invoice names, for a document addressed to whoever
+    /// received that invoice.
+    async fn invoice_billing_contact_in_tx(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+    ) -> AppResult<Option<Uuid>> {
+        let contact: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT billing_contact_id FROM invoices WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(contact.flatten())
+    }
+
     /// PMS-911: the tenant's identity as it stands now, for a document that is
     /// not snapshotted (the statement).
     pub async fn tenant_issuer(
@@ -3049,91 +3408,82 @@ impl BillingService {
         Ok(crate::modules::billing::issuer::resolve(&name, &branding))
     }
 
-    /// PMS-711: best-effort outbound invoice "Pay Now" email. Short-circuits
-    /// when this service instance has no mailer/origin, when the tenant has no
-    /// active gateway (a Pay Now button would be dead), or when the invoice has
-    /// no billing contact with an email. Every failure is logged, never
-    /// propagated: the caller has already committed the send.
-    async fn notify_invoice_pay_now(&self, tenant_id: TenantId, invoice_id: Uuid) {
-        let (Some(mailer), Some(origin)) = (self.mailer.as_ref(), self.portal_origin.as_ref())
-        else {
-            return;
+    /// PMS-991, reshaped by PMS-992: email the invoice to the resolved
+    /// recipient, inside the send transaction.
+    ///
+    /// The invoice is the message and the pay link is an extra: the mail
+    /// carries the document just rendered and adds the portal link only when
+    /// a gateway is connected and the portal origin is known. A failure is an
+    /// error the caller propagates, which rolls the transition back: an
+    /// invoice the relay refused stays a draft rather than becoming a `sent`
+    /// nobody received. A service with no mailer cannot send an invoice at
+    /// all and says so, rather than marking it sent.
+    async fn email_invoice(
+        &self,
+        tenant_id: TenantId,
+        invoice: &InvoiceResponse,
+        to: &str,
+        pdf: &[u8],
+    ) -> AppResult<()> {
+        let Some(mailer) = self.mailer.as_ref() else {
+            return Err(AppError::external_service(
+                "mail",
+                "this service cannot send email, so the invoice cannot be sent; mark it sent without emailing if it was delivered another way",
+            ));
         };
-        // Only offer online payment when a gateway is actually connected.
-        match self.has_active_gateway(tenant_id).await {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(e) => {
-                tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: gateway check failed");
-                return;
+        // The pay link is offered only when something can take the payment.
+        let portal_link = match (
+            self.portal_origin.as_ref(),
+            self.has_active_gateway(tenant_id).await,
+        ) {
+            (Some(origin), Ok(true)) => Some(format!(
+                "{}/portal/invoices/{}",
+                origin.trim_end_matches('/'),
+                invoice.id
+            )),
+            (_, Err(e)) => {
+                tracing::warn!(target: "mokosh_server.billing", invoice_id = %invoice.id, error = %e, "invoice email: gateway check failed, sending without a pay link");
+                None
             }
-        }
-        let invoice = match self.get_invoice(tenant_id, invoice_id).await {
-            Ok(inv) => inv,
-            Err(e) => {
-                tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: invoice reload failed");
-                return;
-            }
+            _ => None,
         };
-        // PMS-993: `update_invoice` refuses the send transition without a
-        // recipient and writes the resolved one, so reaching here with none
-        // means the guard was bypassed. Loud, not a silent return.
-        let Some(contact_id) = invoice.billing_contact_id else {
-            tracing::warn!(
-                target: "mokosh_server.billing", invoice = %invoice_id,
-                "pay-now email: sent invoice has no billing contact; not sending",
-            );
-            return;
-        };
-        let email = match self.billing_contact_email(tenant_id, contact_id).await {
-            Ok(Some((Some(email), _))) => email,
-            Ok(_) => return, // no contact, or contact has no email on file
-            Err(e) => {
-                tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: contact lookup failed");
-                return;
-            }
-        };
-        let base = origin.trim_end_matches('/');
-        let link = format!("{base}/portal/invoices/{invoice_id}");
         let currency = invoice.currency.as_deref().unwrap_or("USD");
         let amount_due = format!("{} {}", invoice.balance_due, currency);
         let due_date = invoice.due_date.to_string();
-
         // PMS-761: an email asking someone to pay has to say who is asking.
-        // Skipped rather than sent anonymously if the identity cannot be read:
-        // the invoice is already visible in the portal, and an unattributed
-        // payment request is the shape of invoice fraud.
-        let org = match crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await {
-            Ok(org) => org,
-            Err(e) => {
-                tracing::warn!(
-                    target: "mokosh_server.billing", error = %e,
-                    "pay-now email: organisation identity unreadable, not sending",
-                );
-                return;
-            }
-        };
+        let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id)
+            .await
+            .map_err(|e| {
+                AppError::external_service(
+                    "mail",
+                    format!("the organisation's identity could not be read, so the invoice was not sent: {e}"),
+                )
+            })?;
         let contact_line = org.contact_line("Questions about this invoice?", None);
         let from = crate::utils::email::SenderIdentity {
             org_name: org.name(),
             contact_line: &contact_line,
         };
-
-        if let Err(e) = mailer
-            .send_invoice_pay_now(
-                &email,
+        mailer
+            .send_invoice_sent(
+                to,
                 from,
-                crate::utils::email::InvoicePayNow {
+                crate::utils::email::InvoiceSent {
                     invoice_number: &invoice.invoice_number,
                     amount_due: &amount_due,
                     due_date: &due_date,
-                    portal_link: &link,
+                    portal_link: portal_link.as_deref(),
+                    pdf: Some(pdf),
                 },
             )
             .await
-        {
-            tracing::warn!(target: "mokosh_server.billing", error = %e, "pay-now email: send failed");
-        }
+            .map_err(|e| {
+                tracing::warn!(target: "mokosh_server.billing", invoice_id = %invoice.id, error = %e, "invoice email: send refused, the invoice stays a draft");
+                AppError::external_service(
+                    "mail",
+                    format!("Could not email the invoice to {to}: {e}. The invoice has not been sent."),
+                )
+            })
     }
 
     /// PMS-36: read a single invoice with `lines` populated. 404 when
@@ -3174,7 +3524,7 @@ impl BillingService {
                    payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
-                   created_at, updated_at
+                   created_at, updated_at, emailed_at, emailed_to
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -3235,7 +3585,7 @@ impl BillingService {
                 .fetch_one(&mut *tx)
                 .await?;
         let rows = sqlx::query_as::<_, PaymentTermRow>(
-            r#"SELECT id, name, is_default, is_active, sort_order
+            r#"SELECT id, name, is_default, is_active, sort_order, net_days
                FROM payment_terms WHERE tenant_id = $1 ORDER BY sort_order, name
                LIMIT $2 OFFSET $3"#,
         )
@@ -3263,8 +3613,8 @@ impl BillingService {
                 .await?;
         }
         sqlx::query(
-            r#"INSERT INTO payment_terms (id, tenant_id, name, is_default, is_active, sort_order)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
+            r#"INSERT INTO payment_terms (id, tenant_id, name, is_default, is_active, sort_order, net_days)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -3272,6 +3622,7 @@ impl BillingService {
         .bind(request.is_default)
         .bind(request.is_active)
         .bind(request.sort_order)
+        .bind(request.net_days)
         .execute(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -3299,6 +3650,7 @@ impl BillingService {
             is_default: request.is_default,
             is_active: request.is_active,
             sort_order: request.sort_order,
+            net_days: request.net_days,
         })
     }
 
@@ -3319,9 +3671,10 @@ impl BillingService {
         }
         let row: Option<PaymentTermRow> = sqlx::query_as(
             r#"UPDATE payment_terms
-               SET name = $3, is_default = $4, is_active = $5, sort_order = $6, updated_at = NOW()
+               SET name = $3, is_default = $4, is_active = $5, sort_order = $6, net_days = $7,
+                   updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2
-               RETURNING id, name, is_default, is_active, sort_order"#,
+               RETURNING id, name, is_default, is_active, sort_order, net_days"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -3329,6 +3682,7 @@ impl BillingService {
         .bind(request.is_default)
         .bind(request.is_active)
         .bind(request.sort_order)
+        .bind(request.net_days)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
@@ -3580,9 +3934,14 @@ impl BillingService {
         // snapshot.
         let note = Self::load_credit_note(&mut tx, tenant_id, credit_note_id).await?;
         let issuer = Self::tenant_issuer_in_tx(&mut tx, tenant_id).await?;
+        // PMS-1001: addressed to whoever the corrected invoice was addressed
+        // to, so a credit note names the same person as the document it undoes.
+        let contact =
+            Self::invoice_billing_contact_in_tx(&mut tx, tenant_id, note.invoice_id).await?;
+        let credit_to = Self::bill_to_in_tx(&mut tx, tenant_id, note.company_id, contact).await?;
         let logo = crate::modules::billing::issuer::live_logo_bytes(tenant_id.get(), &issuer).await;
         let bytes = crate::pdf::render(&crate::modules::billing::documents::credit_note(
-            &note, &issuer, logo,
+            &note, &issuer, &credit_to, logo,
         ))?;
         crate::modules::billing::documents::store_issued(
             &mut tx,
@@ -4052,25 +4411,25 @@ impl BillingService {
         .fetch_one(&mut *tx)
         .await?;
 
-        let rows: Vec<ProductRow> = sqlx::query_as(
+        let sql = format!(
             r#"
-            SELECT id, sku, name, description, unit_price, unit, is_taxable,
-                   is_active, created_at, updated_at
-            FROM products
-            WHERE tenant_id = $1
-              AND ($2::bool IS NULL OR is_active = $2)
-              AND ($3::text IS NULL OR name ILIKE $3 OR sku ILIKE $3)
-            ORDER BY name
+            SELECT {PRODUCT_COLUMNS}
+            FROM products p
+            WHERE p.tenant_id = $1
+              AND ($2::bool IS NULL OR p.is_active = $2)
+              AND ($3::text IS NULL OR p.name ILIKE $3 OR p.sku ILIKE $3)
+            ORDER BY p.name
             LIMIT $4 OFFSET $5
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(filter.is_active)
-        .bind(pattern.as_deref())
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+            "#
+        );
+        let rows: Vec<ProductRow> = sqlx::query_as(&sql)
+            .bind(tenant_id)
+            .bind(filter.is_active)
+            .bind(pattern.as_deref())
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
 
         Ok((
             rows.into_iter().map(ProductResponse::from).collect(),
@@ -4084,17 +4443,17 @@ impl BillingService {
         product_id: Uuid,
     ) -> AppResult<ProductResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<ProductRow> = sqlx::query_as(
+        let sql = format!(
             r#"
-            SELECT id, sku, name, description, unit_price, unit, is_taxable,
-                   is_active, created_at, updated_at
-            FROM products WHERE id = $1 AND tenant_id = $2
-            "#,
-        )
-        .bind(product_id)
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+            SELECT {PRODUCT_COLUMNS}
+            FROM products p WHERE p.id = $1 AND p.tenant_id = $2
+            "#
+        );
+        let row: Option<ProductRow> = sqlx::query_as(&sql)
+            .bind(product_id)
+            .bind(tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
         row.map(ProductResponse::from)
             .ok_or_else(|| AppError::NotFound("Product".to_string()))
     }
@@ -4108,32 +4467,32 @@ impl BillingService {
     ) -> AppResult<ProductResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id = Uuid::new_v4();
-        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(
+        let sql = format!(
             r#"
-            INSERT INTO products (id, tenant_id, sku, name, description,
-                                  unit_price, unit, is_taxable, is_active)
+            INSERT INTO products AS p (id, tenant_id, sku, name, description,
+                                       unit_price, unit, is_taxable, is_active)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id, sku, name, description, unit_price, unit, is_taxable,
-                      is_active, created_at, updated_at
-            "#,
-        )
-        .bind(id)
-        .bind(tenant_id)
-        .bind(
-            request
-                .sku
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        )
-        .bind(request.name.trim())
-        .bind(&request.description)
-        .bind(request.unit_price)
-        .bind(request.unit.trim())
-        .bind(request.is_taxable)
-        .bind(request.is_active)
-        .fetch_one(&mut *tx)
-        .await;
+            RETURNING {PRODUCT_COLUMNS}
+            "#
+        );
+        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(&sql)
+            .bind(id)
+            .bind(tenant_id)
+            .bind(
+                request
+                    .sku
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            )
+            .bind(request.name.trim())
+            .bind(&request.description)
+            .bind(request.unit_price)
+            .bind(request.unit.trim())
+            .bind(request.is_taxable)
+            .bind(request.is_active)
+            .fetch_one(&mut *tx)
+            .await;
         let row = row.map_err(Self::product_conflict)?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -4181,33 +4540,33 @@ impl BillingService {
         // Editing the catalog price is legal and changes nothing already
         // written: `invoice_lines.unit_price` is the price at the moment the
         // line was written, and nothing reads through to here at render time.
-        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(
+        let sql = format!(
             r#"
-            UPDATE products SET sku = $3, name = $4, description = $5,
-                                unit_price = $6, unit = $7, is_taxable = $8,
-                                is_active = $9, updated_at = NOW()
-            WHERE id = $1 AND tenant_id = $2
-            RETURNING id, sku, name, description, unit_price, unit, is_taxable,
-                      is_active, created_at, updated_at
-            "#,
-        )
-        .bind(product_id)
-        .bind(tenant_id)
-        .bind(
-            request
-                .sku
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        )
-        .bind(request.name.trim())
-        .bind(&request.description)
-        .bind(request.unit_price)
-        .bind(request.unit.trim())
-        .bind(request.is_taxable)
-        .bind(request.is_active)
-        .fetch_one(&mut *tx)
-        .await;
+            UPDATE products AS p SET sku = $3, name = $4, description = $5,
+                                     unit_price = $6, unit = $7, is_taxable = $8,
+                                     is_active = $9, updated_at = NOW()
+            WHERE p.id = $1 AND p.tenant_id = $2
+            RETURNING {PRODUCT_COLUMNS}
+            "#
+        );
+        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(&sql)
+            .bind(product_id)
+            .bind(tenant_id)
+            .bind(
+                request
+                    .sku
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            )
+            .bind(request.name.trim())
+            .bind(&request.description)
+            .bind(request.unit_price)
+            .bind(request.unit.trim())
+            .bind(request.is_taxable)
+            .bind(request.is_active)
+            .fetch_one(&mut *tx)
+            .await;
         let row = row.map_err(Self::product_conflict)?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -4265,7 +4624,7 @@ impl BillingService {
         if let Err(sqlx::Error::Database(e)) = &deleted {
             if e.code().as_deref() == Some("23503") {
                 return Err(AppError::Conflict(
-                    "This product is on an invoice or a contract and cannot be deleted.                      Retire it instead by marking it inactive."
+                    "This product is on an invoice or a contract and cannot be deleted. Retire it instead by marking it inactive."
                         .to_string(),
                 ));
             }
@@ -4519,6 +4878,30 @@ struct TimeEntryBillingRow {
     hourly_rate: Option<Decimal>,
     total_amount: Option<Decimal>,
     ticket_id: Option<Uuid>,
+    /// PMS-1004: what the generated line says.
+    date: chrono::NaiveDate,
+    notes: Option<String>,
+    work_type_name: String,
+    ticket_number: Option<String>,
+    ticket_title: Option<String>,
+}
+
+/// PMS-1004: the columns a document's "Bill to" is composed from.
+#[derive(sqlx::FromRow)]
+struct CompanyAddressRow {
+    name: String,
+    address_line1: Option<String>,
+    address_line2: Option<String>,
+    city: Option<String>,
+    state: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
+    billing_address_line1: Option<String>,
+    billing_address_line2: Option<String>,
+    billing_city: Option<String>,
+    billing_state: Option<String>,
+    billing_postal_code: Option<String>,
+    billing_country: Option<String>,
 }
 
 /// PMS-315: mileage entry projection for the invoice builder.
@@ -4655,6 +5038,8 @@ struct InvoiceRow {
     po_number: Option<String>,
     sent_at: Option<chrono::DateTime<Utc>>,
     paid_at: Option<chrono::DateTime<Utc>>,
+    emailed_at: Option<chrono::DateTime<Utc>>,
+    emailed_to: Option<String>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -4687,6 +5072,8 @@ impl From<InvoiceRow> for InvoiceResponse {
             po_number: r.po_number,
             sent_at: r.sent_at,
             paid_at: r.paid_at,
+            emailed_at: r.emailed_at,
+            emailed_to: r.emailed_to,
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,
@@ -4701,6 +5088,7 @@ struct PaymentTermRow {
     is_default: Option<bool>,
     is_active: Option<bool>,
     sort_order: Option<i32>,
+    net_days: Option<i32>,
 }
 
 impl From<PaymentTermRow> for PaymentTermResponse {
@@ -4711,6 +5099,7 @@ impl From<PaymentTermRow> for PaymentTermResponse {
             is_default: r.is_default.unwrap_or(false),
             is_active: r.is_active.unwrap_or(true),
             sort_order: r.sort_order.unwrap_or(0),
+            net_days: r.net_days,
         }
     }
 }
@@ -5063,6 +5452,23 @@ impl From<StatementCreditRow> for StatementCreditLine {
 
 // ---- PMS-955: product catalog row type -------------------------------------
 
+/// The columns every product read selects, with `products` aliased as `p`.
+///
+/// One list for `list_products`, `get_product` and the `RETURNING` of create
+/// and update, so the four responses cannot drift. `in_use` (PMS-1002) is
+/// computed here rather than by a second query per row: whether anything
+/// names the product is a fact about two FK columns, and an `EXISTS` on each
+/// is the cheapest true answer. Both tables are tenant-isolated (RLS: a
+/// column on `contract_items`, the parent-join policy of migration 041 on
+/// `invoice_lines`), and a product can only be referenced from its own tenant
+/// (`assert_product_sellable`), so no tenant filter is repeated in the
+/// subselects.
+const PRODUCT_COLUMNS: &str = "\
+    p.id, p.sku, p.name, p.description, p.unit_price, p.unit, p.is_taxable, \
+    p.is_active, p.created_at, p.updated_at, \
+    (EXISTS (SELECT 1 FROM invoice_lines il WHERE il.product_id = p.id) \
+     OR EXISTS (SELECT 1 FROM contract_items ci WHERE ci.product_id = p.id)) AS in_use";
+
 #[derive(sqlx::FromRow)]
 struct ProductRow {
     id: Uuid,
@@ -5073,6 +5479,7 @@ struct ProductRow {
     unit: String,
     is_taxable: bool,
     is_active: bool,
+    in_use: bool,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -5088,6 +5495,7 @@ impl From<ProductRow> for ProductResponse {
             unit: r.unit,
             is_taxable: r.is_taxable,
             is_active: r.is_active,
+            in_use: r.in_use,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

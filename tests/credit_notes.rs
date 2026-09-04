@@ -70,7 +70,7 @@ async fn send_invoice(app: &common::TestApp, token: &str, invoice_id: &str) {
         .client
         .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
         .bearer_auth(token)
-        .json(&serde_json::json!({ "status": "sent" }))
+        .json(&serde_json::json!({ "status": "sent", "skip_email": true }))
         .send()
         .await
         .expect("send invoice");

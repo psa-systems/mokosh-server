@@ -53,6 +53,18 @@ Once an invoice is sent, the customer holds a copy and can quote the totals back
 
 The question of whether `draft` / `pending` invoices need a dedicated "cancel" affordance is answered: no separate control is needed. Void already serves as the pre-send back-out for those states and keeps the row for audit. Adding a second control labelled "Cancel" with the same effect would only confuse. If product later wants the pre-send action relabelled (for example "Cancel" instead of "Void" while still in draft), that is a UI-copy change to scope as its own ticket, not a new status or a logic change.
 
+## Who the document is addressed to
+
+PMS-1001. Every document carries a customer block: "Bill to" on the invoice, "Credit to" on the credit note, "Account" on the statement. Each holds the company's name, its billing address (its postal address when no billing address is on file), and, when one resolves, an `Attn:` line naming the billing contact with their email address beneath. A document with no contact to name prints the company alone: there is no empty labelled line.
+
+Where the contact comes from differs by document, and the difference is the point:
+
+- **Invoice**: `invoices.billing_contact_id`, the invoice's own column. `update_invoice` writes it on the first transition to `sent`, recording whichever contact `resolve_invoice_recipient` picked, so the invoice names the person it was actually emailed to even when that person came from the company's `default_billing_contact_id`. Reassigning the billing role afterwards changes nothing on that invoice.
+- **Credit note**: the `billing_contact_id` of the invoice it corrects, so the two documents in one correction name the same person.
+- **Statement**: the company's *current* `default_billing_contact_id`. A statement spans many invoices that may each name a different person, and PMS-954 made it a read model that stores nothing, so it renders from today exactly as its issuer and its branding do. Reassigning the role does change the next statement.
+
+Documents issued before this landed are not re-rendered. PMS-959 stores an invoice's PDF inside the transaction that first sends it and a credit note's inside the transaction that creates it, and `GET /invoices/{id}/pdf` and `GET /credit-notes/{id}/pdf` serve those bytes whenever there are any. Only invoices sent and credit notes created after this change carry the contact; an older document keeps the bytes its customer already holds. A live render (a draft preview, or anything issued before PMS-959) does pick the contact up.
+
 ## UI
 
 The invoice detail page (`mokosh-apps`, `src/pages/billing.rs`) mirrors this model: Edit / Send / Void render only while editable (`draft` / `pending`), Record Payment renders only while collectible, and a frozen invoice shows an inline note explaining that it is a finalized record and cannot be edited, cancelled, or voided.

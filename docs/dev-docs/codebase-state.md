@@ -813,8 +813,8 @@ adds its own migration without touching others.
 > Traefik-routed stack is tracked in PMS-873; until then follow
 > [`quickstart.md`](../quickstart.md).
 
-When the dev stack is up (see [README.md](../../README.md) -
-"Quick start"):
+When the dev stack is up (see [`quickstart.md`](../quickstart.md),
+"Boot the stack"):
 
 ```nu
 # Health

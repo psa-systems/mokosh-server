@@ -11,19 +11,25 @@
 //!
 //! So this is the same shape [`crate::storage`] took for files (PMS-910): a
 //! trait, a key a caller cannot forge a path out of, the existing behaviour as
-//! the default backend, and a second backend selected by configuration that no
-//! caller can distinguish. Local storage stayed the default there and the
+//! the default provider, and a second provider selected by configuration that
+//! no caller can distinguish. Local storage stayed the default there and the
 //! database stays the default here, for the same reason: self-hosting must not
 //! acquire a dependency to keep working.
 //!
+//! PMS-1010 settled the word: a selectable implementation of a capability is a
+//! PROVIDER, here as in [`crate::storage`] and as
+//! [`crate::modules::billing::provider::PaymentProvider`] already was. The
+//! operator-facing variable is still `SECRET_BACKEND` and deliberately so:
+//! renaming it breaks every existing deployment for a vocabulary change.
+//!
 //! Nothing calls this yet. PMS-968 moves the payment-gateway credentials over.
 //!
-//! # What a backend outage means
+//! # What a provider outage means
 //!
 //! This is the decision PMS-967 exists to make rather than discover later, and
 //! it is stated here because the answer is not obvious.
 //!
-//! The database backend fails when Postgres fails, which is the whole
+//! The database provider fails when Postgres fails, which is the whole
 //! application failing, so it raises no new question. Infisical is different:
 //! it is optional today at every layer (`/ready` reports `"skipped"` when
 //! `INFISICAL_ADDRESS` is blank, and it sits behind a compose profile in dev),
@@ -42,13 +48,13 @@
 //! provider retries a failed webhook with backoff for days, so a cold miss
 //! during an outage is a delay and not a lost payment. And failing is honest:
 //! the alternative, falling back to a stale or database copy, means the
-//! deployment quietly stops using the backend the operator chose, which is the
+//! deployment quietly stops using the provider the operator chose, which is the
 //! kind of silent degrade PMS-289 and PMS-905 both came from.
 //!
 //! The cost is stated plainly: the cache holds plaintext secrets in process
 //! memory for its TTL. They are already in memory transiently on every use, and
 //! the TTL bounds how long. An operator who will not accept that keeps the
-//! database backend, which is the default.
+//! database provider, which is the default.
 
 use std::fmt;
 
@@ -58,10 +64,10 @@ use uuid::Uuid;
 use crate::utils::error::{AppError, AppResult};
 
 pub mod database;
-pub mod infisical_store;
+pub mod infisical;
 
-pub use database::DatabaseSecretStore;
-pub use infisical_store::InfisicalSecretStore;
+pub use database::DatabaseSecretProvider;
+pub use infisical::InfisicalSecretProvider;
 
 /// What a stored secret belongs to.
 ///
@@ -124,11 +130,11 @@ impl SecretKey {
 
     /// The secret's stable identity: `KIND__<tenant>__<DISCRIMINATOR>`.
     ///
-    /// One name serves both backends, as the `secrets.name` column and as the
-    /// Infisical secret name, so a deployment that switches backends is
+    /// One name serves both providers, as the `secrets.name` column and as the
+    /// Infisical secret name, so a deployment that switches providers is
     /// addressing the same secrets rather than a parallel set.
     ///
-    /// The tenant is in the name even though the database backend also filters
+    /// The tenant is in the name even though the database provider also filters
     /// on `tenant_id` and RLS confines the read. Infisical has no equivalent of
     /// either, so without it every tenant's gateway credentials would collide
     /// on one name in one folder, and the first write would overwrite the rest.
@@ -186,18 +192,18 @@ fn validate_discriminator(value: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// What a feature can ask of the secret store.
+/// What a feature can ask of the secret provider.
 ///
 /// Deliberately small, and deliberately without a method that takes a name:
 /// everything is addressed by [`SecretKey`], so there is no call that can reach
 /// a secret belonging to another tenant.
 #[async_trait]
-pub trait SecretStore: Send + Sync {
+pub trait SecretProvider: Send + Sync {
     /// The stored value, or `None` when nothing is stored for this key.
     ///
     /// A missing secret is `None` and not an error, because "this tenant has
     /// not configured the integration" is the ordinary case and every caller
-    /// has to handle it anyway. A backend that is unreachable IS an error, and
+    /// has to handle it anyway. A provider that is unreachable IS an error, and
     /// the two must never collapse into each other: treating an outage as "not
     /// configured" is how a payment integration silently turns itself off.
     async fn get(&self, key: &SecretKey) -> AppResult<Option<String>>;
@@ -206,14 +212,14 @@ pub trait SecretStore: Send + Sync {
     async fn put(&self, key: &SecretKey, value: &str) -> AppResult<()>;
 
     /// Best-effort: a secret that is already gone is not an error, matching
-    /// [`crate::storage::ObjectStore::delete`] and for the same reason - the
+    /// [`crate::storage::ObjectProvider::delete`] and for the same reason - the
     /// caller has already removed the row that pointed at it.
     async fn delete(&self, key: &SecretKey) -> AppResult<()>;
 }
 
-/// Which backend holds secrets for this deployment.
+/// Which provider holds secrets for this deployment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SecretBackend {
+pub enum SecretProviderKind {
     /// The `secrets` table, AES-256-GCM under the host `ENCRYPTION_KEY`. The
     /// default, so a deployment that configures nothing keeps working.
     Database,
@@ -222,19 +228,19 @@ pub enum SecretBackend {
     Infisical,
 }
 
-impl SecretBackend {
+impl SecretProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            SecretBackend::Database => "database",
-            SecretBackend::Infisical => "infisical",
+            SecretProviderKind::Database => "database",
+            SecretProviderKind::Infisical => "infisical",
         }
     }
 }
 
-/// Backend selection.
+/// Provider selection.
 #[derive(Clone, Copy, Debug)]
 pub struct SecretsConfig {
-    pub backend: SecretBackend,
+    pub provider: SecretProviderKind,
 }
 
 impl SecretsConfig {
@@ -257,39 +263,42 @@ impl SecretsConfig {
     /// The rule itself, split out so it can be tested without writing to
     /// process-global env under a concurrent test runner.
     pub fn parse(raw: &str) -> AppResult<Self> {
-        let backend = match raw.trim() {
-            "" | "database" => SecretBackend::Database,
-            "infisical" => SecretBackend::Infisical,
+        let provider = match raw.trim() {
+            "" | "database" => SecretProviderKind::Database,
+            "infisical" => SecretProviderKind::Infisical,
             other => {
                 return Err(AppError::Configuration(format!(
-                    "SECRET_BACKEND {other:?} is not a known backend; expected 'database' or 'infisical'"
+                    "SECRET_BACKEND {other:?} is not a known provider; expected 'database' or 'infisical'"
                 )))
             }
         };
-        Ok(Self { backend })
+        Ok(Self { provider })
     }
 }
 
-/// Build the store this deployment is configured for.
+/// Build the provider this deployment is configured for.
 ///
-/// The ONE place a `SecretBackend` becomes a `SecretStore`, so no construction
-/// site can pick a backend of its own. It is fallible and sync on purpose:
-/// callers build it once at startup where a `Result` can end the process, which
-/// is what makes "a half-configured deployment fails at boot rather than when a
-/// customer tries to pay" true rather than aspirational.
-pub fn store_from_env(
+/// The ONE place a [`SecretProviderKind`] becomes a [`SecretProvider`], so no
+/// construction site can pick a provider of its own. It is fallible and sync on
+/// purpose: callers build it once at startup where a `Result` can end the
+/// process, which is what makes "a half-configured deployment fails at boot
+/// rather than when a customer tries to pay" true rather than aspirational.
+pub fn provider_from_env(
     db: crate::db::Database,
     encryption_key: [u8; 32],
-) -> AppResult<std::sync::Arc<dyn SecretStore>> {
+) -> AppResult<std::sync::Arc<dyn SecretProvider>> {
     let config = SecretsConfig::from_env()?;
-    let store: std::sync::Arc<dyn SecretStore> = match config.backend {
-        SecretBackend::Database => {
-            std::sync::Arc::new(DatabaseSecretStore::new(db, encryption_key))
+    let provider: std::sync::Arc<dyn SecretProvider> = match config.provider {
+        SecretProviderKind::Database => {
+            std::sync::Arc::new(DatabaseSecretProvider::new(db, encryption_key))
         }
-        SecretBackend::Infisical => std::sync::Arc::new(InfisicalSecretStore::from_env()?),
+        SecretProviderKind::Infisical => std::sync::Arc::new(InfisicalSecretProvider::from_env()?),
     };
-    tracing::info!(backend = config.backend.as_str(), "secret store selected");
-    Ok(store)
+    tracing::info!(
+        provider = config.provider.as_str(),
+        "secret provider selected"
+    );
+    Ok(provider)
 }
 
 #[cfg(test)]
@@ -314,7 +323,7 @@ mod tests {
         );
     }
 
-    /// The name is the row's identity in one backend and the secret's identity
+    /// The name is the row's identity in one provider and the secret's identity
     /// in the other, so it is pinned rather than left to drift: changing it
     /// orphans every secret already written under the old one.
     #[test]
@@ -361,16 +370,16 @@ mod tests {
     /// Unset and blank both mean the default, because a forwarded-but-unset
     /// compose variable arrives as an empty string (PMS-836).
     #[test]
-    fn an_unset_backend_is_the_database() {
+    fn an_unset_provider_is_the_database() {
         for raw in ["", "   ", "database"] {
             assert_eq!(
-                SecretsConfig::parse(raw).unwrap().backend,
-                SecretBackend::Database
+                SecretsConfig::parse(raw).unwrap().provider,
+                SecretProviderKind::Database
             );
         }
         assert_eq!(
-            SecretsConfig::parse("infisical").unwrap().backend,
-            SecretBackend::Infisical
+            SecretsConfig::parse("infisical").unwrap().provider,
+            SecretProviderKind::Infisical
         );
     }
 
@@ -378,7 +387,7 @@ mod tests {
     /// operator who wrote `infisicial` keeps storing secrets in Postgres and is
     /// never told.
     #[test]
-    fn an_unrecognised_backend_is_refused_and_not_defaulted() {
+    fn an_unrecognised_provider_is_refused_and_not_defaulted() {
         for raw in ["infisicial", "vault", "DATABASE", "none"] {
             assert!(
                 SecretsConfig::parse(raw).is_err(),
@@ -392,7 +401,7 @@ mod tests {
     /// `ATTACHMENT_DIR`. Two readers is how two parts of one process come to
     /// disagree about where secrets are.
     #[test]
-    fn there_is_one_reader_of_the_backend_setting() {
+    fn there_is_one_reader_of_the_provider_setting() {
         const SRC: &str = include_str!("mod.rs");
         assert_eq!(
             SRC.matches(concat!("var(\"SECRET", "_BACKEND\")")).count(),
