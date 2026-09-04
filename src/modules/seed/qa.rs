@@ -447,6 +447,7 @@ impl QaSeeder {
                 tenant,
                 credited.id,
                 &UpdateInvoiceRequest {
+                    tax_rate_id: None,
                     billing_contact_id: None,
                     contract_id: None,
                     invoice_date: None,
@@ -1183,6 +1184,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
     vec![
         (
             CreateInvoiceRequest {
+                tax_rate_id: None,
                 company_id: company_a,
                 billing_contact_id: None,
                 contract_id: None,
@@ -1197,6 +1199,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                 po_number: Some("QA-PO-1".to_string()),
                 lines: vec![
                     CreateInvoiceLineRequest {
+                        is_taxable: true,
                         product_id: None,
                         line_type: InvoiceLineType::Service,
                         description: "QA-Managed services - June".to_string(),
@@ -1207,6 +1210,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                         sort_order: 1,
                     },
                     CreateInvoiceLineRequest {
+                        is_taxable: true,
                         product_id: None,
                         line_type: InvoiceLineType::TimeEntry,
                         description: "QA-Onsite support hours".to_string(),
@@ -1222,6 +1226,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
         ),
         (
             CreateInvoiceRequest {
+                tax_rate_id: None,
                 company_id: company_b,
                 billing_contact_id: None,
                 contract_id: None,
@@ -1236,6 +1241,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                 po_number: Some("QA-PO-2".to_string()),
                 lines: vec![
                     CreateInvoiceLineRequest {
+                        is_taxable: true,
                         product_id: None,
                         line_type: InvoiceLineType::Product,
                         description: "QA-Firewall appliance".to_string(),
@@ -1246,6 +1252,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                         sort_order: 1,
                     },
                     CreateInvoiceLineRequest {
+                        is_taxable: true,
                         product_id: None,
                         line_type: InvoiceLineType::Service,
                         description: "QA-Installation".to_string(),
@@ -1441,6 +1448,7 @@ fn qa_credited_invoice_spec(
 ) -> CreateInvoiceRequest {
     let company = company_ids.first().copied().unwrap_or_default();
     CreateInvoiceRequest {
+        tax_rate_id: None,
         company_id: company,
         billing_contact_id: None,
         contract_id: None,
@@ -1454,6 +1462,7 @@ fn qa_credited_invoice_spec(
         notes: Some("QA seed invoice (sent, then partly credited).".to_string()),
         po_number: Some("QA-PO-3".to_string()),
         lines: vec![CreateInvoiceLineRequest {
+            is_taxable: true,
             // PMS-955: the one seeded line that names a catalog row, so the
             // dataset carries a sold product and not only free-text lines.
             product_id,
