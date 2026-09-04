@@ -70,6 +70,36 @@ impl CallerContext {
         }
     }
 
+    /// Today where the CALLER is (PMS-1027): a staff user's `users.timezone`,
+    /// a contact's `contacts.timezone`, `UTC` when neither is set. A quote
+    /// valid through today has to be accepted on today where the customer
+    /// is, not on today in UTC, which from 14:00 Pacific onward is tomorrow.
+    /// The contact arm reads one column on its own tenant-GUC connection;
+    /// `ContactSession` is minted at login and does not carry the zone.
+    pub async fn today(&self, db: &Database) -> AppResult<chrono::NaiveDate> {
+        let now = chrono::Utc::now();
+        let zone = match self {
+            Self::Staff(state) => state
+                .user
+                .as_ref()
+                .map(|u| u.timezone.clone())
+                .unwrap_or_else(|| "UTC".to_string()),
+            Self::Contact(session) => {
+                let mut tx = db.begin_with_tenant(self.tenant()).await?;
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT timezone FROM contacts WHERE id = $1 AND tenant_id = $2",
+                )
+                .bind(session.id)
+                .bind(session.tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten()
+                .unwrap_or_else(|| "UTC".to_string())
+            }
+        };
+        Ok(mokosh_types::datetime::user_today(now, &zone))
+    }
+
     /// Raw tenant `Uuid` for callers that still take a bare `Uuid`.
     pub fn tenant_id(&self) -> Uuid {
         self.tenant().get()
