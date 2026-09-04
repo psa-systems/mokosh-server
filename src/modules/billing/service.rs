@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::settings::read_tenant_zone;
 use crate::utils::email::Mailer;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -1236,12 +1237,17 @@ impl BillingService {
         now: DateTime<Utc>,
         ctx: &AuditCtx,
     ) -> AppResult<Vec<Uuid>> {
-        let today = now.date_naive();
+        // PMS-1030: "today" is the tenant's day, not the UTC day. The worker
+        // runs on the hour, so for an MSP in Vancouver the 1st-of-month run
+        // used to fire at 17:00 local on the last day of the previous month
+        // and date the invoice, and the ledger's period, a month early.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let zone = read_tenant_zone(&mut tx, tenant_id).await?;
+        let today = mokosh_types::datetime::user_local_date(now, &zone);
 
         // Candidate contracts: active, recurring (not one_time), already
         // started. `end_date` is checked per-period below (a contract may
         // still be due for a period that began before it expired).
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let contracts = sqlx::query_as::<_, RecurringContractRow>(
             r#"
             SELECT id, company_id, billing_cycle, start_date, end_date

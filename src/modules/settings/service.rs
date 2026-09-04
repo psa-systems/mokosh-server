@@ -355,6 +355,30 @@ pub async fn read_max_minutes_per_day(db: &Database, tenant_id: TenantId) -> App
     Ok((hours as i32) * 60)
 }
 
+/// PMS-1030: the zone a tenant's day happens in, for the jobs that have no
+/// user to ask: the default `business_hours` row's `timezone`, else `UTC`.
+///
+/// Not a new `tenants.timezone` column: the SLA's business hours already
+/// hold the zone this MSP's day happens in, and a second home for it is how
+/// the two would come to disagree. Migration 049 keeps the default to one
+/// row per tenant. Takes a connection rather than the pool because the
+/// contract sweep reads it on the migrator pool, across tenants.
+pub async fn read_tenant_zone(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+) -> AppResult<String> {
+    let zone: Option<String> = sqlx::query_scalar(
+        r#"SELECT timezone FROM business_hours
+           WHERE tenant_id = $1 AND is_default = TRUE
+           ORDER BY created_at, id
+           LIMIT 1"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(zone.unwrap_or_else(|| "UTC".to_string()))
+}
+
 /// PMS-943: does this employer track breaks (`timesheets/track_breaks`)?
 ///
 /// Tenant-level rather than per company: the employee taking the break is the
