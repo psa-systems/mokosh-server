@@ -1169,8 +1169,7 @@ async fn place_bunyip_caller(
         Some(principal) => Some(principal.placement.clone()),
         None => auth_service.find_user_placement(sub).await.ok().flatten(),
     };
-    // `current` is recomputed below after the TEMPORARY MAPPS-458
-    // email-fallback may have widened `placement`; do not shadow here.
+    let current = placement.as_ref().map(|(t, _)| *t);
 
     // An invite to address X is consumed only by a Bunyip user with verified X.
     let invite = match (invitations, email.as_deref()) {
@@ -1197,99 +1196,13 @@ async fn place_bunyip_caller(
     // pre-existing invitation - matches the `bootstrap_admin_*`
     // regression pins in `tests/bunyip_login.rs`.
     let is_platform_admin = claims.bunyip_role.as_deref() == Some("admin");
-
-    // TEMPORARY (mokosh-contact-login staging bypass): the c-01 dev DB
-    // has drifted from bunyip's `sub` for every tenant admin (a bunyip
-    // instance reset without a mokosh-side rekey), so
-    // `find_user_placement(sub)` returns None even for accounts that
-    // have valid `users` rows under their email. Every non-platform-
-    // admin user 401s at MAPPS-458 as a result.
-    //
-    // Before rejecting, try to resolve placement by verified email. If
-    // a users row exists there, accept the request and REBIND `sub` to
-    // that row's id so the downstream `get_user_by_id(target, sub)`
-    // (line ~1290), `rehome_user_between_tenants`, and every other
-    // helper that keys on `sub` address the real mokosh users row.
-    // `users.id` is not rewritten - the 55 FKs to `users(id)` are not
-    // ON UPDATE CASCADE and rewriting the id would leave every one of
-    // them dangling. The row's id stays what it is; we just stop using
-    // the mismatched bunyip sub for this request.
-    //
-    // Remove this block on merge back to main - the production model
-    // is "invitations, not silent JIT" (MAPPS-458 / PMS-728 slice 2).
-    let (placement, sub) = match (placement, email.as_deref()) {
-        (Some(p), _) => (Some(p), sub),
-        // TEMPORARY: `email_verified` is deliberately NOT required here,
-        // because some bunyip configs on staging emit the claim as `false`
-        // (or omit it entirely) even for real user rows. Production
-        // MAPPS-458 is untouched; this fallback lives only on this branch.
-        (None, Some(em)) => {
-            tracing::warn!(
-                bunyip_sub = %sub,
-                email = %em,
-                email_verified = email_verified,
-                "TEMPORARY MAPPS-458 bypass: placement lookup by sub returned None; attempting by-email lookup"
-            );
-            match auth_service.find_user_placement_by_email(em).await {
-                Ok(Some((users_id, tenant, role))) => {
-                    tracing::warn!(
-                        bunyip_sub = %sub,
-                        users_id = %users_id,
-                        email = %em,
-                        tenant_id = %tenant,
-                        role = %role,
-                        "TEMPORARY MAPPS-458 bypass: matched users row by email; rebinding sub to that row's id and accepting"
-                    );
-                    (Some((tenant, role)), users_id)
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        bunyip_sub = %sub,
-                        email = %em,
-                        "TEMPORARY MAPPS-458 bypass: by-email lookup found no matching users row; will fall through to MAPPS-458"
-                    );
-                    (None, sub)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, sub = %sub, "find_user_placement_by_email failed; falling through to MAPPS-458");
-                    (None, sub)
-                }
-            }
-        }
-        (None, None) => {
-            tracing::warn!(
-                bunyip_sub = %sub,
-                "TEMPORARY MAPPS-458 bypass: no email in the JWT, cannot attempt by-email lookup"
-            );
-            (None, sub)
-        }
-    };
-    let current = placement.as_ref().map(|(t, _)| *t);
-
-    // TEMPORARY (mokosh-contact-login staging): the production MAPPS-458
-    // reject is disabled on this branch. The by-email fallback above
-    // handles the "existing tenant admin whose bunyip sub drifted"
-    // case; brand-new bunyip identities that match neither a users row
-    // nor a pending invitation fall through to the JIT personal-tenant
-    // path below, restoring the pre-PMS-728-slice-2 behaviour where a
-    // bunyip identity provisions its own tenant on first sight. This
-    // fits the "every bunyip user is a platform admin of their own
-    // instance" model this staging branch is validating.
-    //
-    // On merge back to main, restore the MAPPS-458 reject verbatim:
-    //
-    //     if placement.is_none() && invite.is_none() && !is_platform_admin {
-    //         tracing::info!(sub = %sub, email = email.as_deref().unwrap_or("<absent>"),
-    //             "bunyip-authenticated identity has no local placement and no pending invitation; rejecting per MAPPS-458");
-    //         return (None, None);
-    //     }
     if placement.is_none() && invite.is_none() && !is_platform_admin {
-        tracing::warn!(
+        tracing::info!(
             sub = %sub,
             email = email.as_deref().unwrap_or("<absent>"),
-            "TEMPORARY MAPPS-458 bypass: no placement, no invite, not platform admin - falling through to JIT personal-tenant provisioning"
+            "bunyip-authenticated identity has no local placement and no pending invitation; rejecting per MAPPS-458"
         );
-        // Deliberately NO `return` here on this branch.
+        return (None, None);
     }
 
     // PMS-245: a non-admin user still parked in the shared default tenant (dumped
