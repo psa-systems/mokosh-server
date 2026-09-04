@@ -123,7 +123,11 @@ async fn portal_ticket_notes_round_trip(pool: PgPool) {
         .expect("list notes");
     let status = resp.status();
     let text = resp.text().await.expect("list body");
-    assert_eq!(status, reqwest::StatusCode::OK, "contact list notes: {text}");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "contact list notes: {text}"
+    );
     let list: Value = serde_json::from_str(&text).expect("list JSON");
     let rows = list["data"].as_array().expect("data array");
     assert_eq!(rows.len(), 1, "internal notes must not leak to a contact");

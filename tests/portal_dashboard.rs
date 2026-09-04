@@ -189,7 +189,11 @@ async fn dashboard_renders_zeros_when_company_is_empty(pool: PgPool) {
         "active_quotes",
         "active_contracts",
     ] {
-        assert_eq!(body[tile].as_i64(), Some(0), "{tile} on an empty company: {body}");
+        assert_eq!(
+            body[tile].as_i64(),
+            Some(0),
+            "{tile} on an empty company: {body}"
+        );
     }
     assert_eq!(body["recent_activity"].as_array().unwrap().len(), 0);
 }
@@ -303,9 +307,21 @@ async fn dashboard_never_leaks_cross_company_data(pool: PgPool) {
 
     let token = common::contact_token(&app, &me).await;
     let body = summary(&app, &token).await;
-    assert_eq!(body["open_tickets"].as_i64(), Some(0), "cross-company ticket leaked: {body}");
-    assert_eq!(body["unpaid_invoices"].as_i64(), Some(0), "cross-company invoice leaked: {body}");
-    assert_eq!(body["active_quotes"].as_i64(), Some(0), "cross-company quote leaked: {body}");
+    assert_eq!(
+        body["open_tickets"].as_i64(),
+        Some(0),
+        "cross-company ticket leaked: {body}"
+    );
+    assert_eq!(
+        body["unpaid_invoices"].as_i64(),
+        Some(0),
+        "cross-company invoice leaked: {body}"
+    );
+    assert_eq!(
+        body["active_quotes"].as_i64(),
+        Some(0),
+        "cross-company quote leaked: {body}"
+    );
     assert!(
         body["recent_activity"].as_array().unwrap().is_empty(),
         "cross-company row in activity feed: {body}"
