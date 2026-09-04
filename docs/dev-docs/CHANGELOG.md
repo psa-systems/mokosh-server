@@ -2,6 +2,14 @@
 
 Internal, name-free history for mokosh-server. Retired point-in-time docs (milestone handoffs, audit reports) are distilled here so the tree keeps only forward-useful reference material. Entries are newest-first and vary in depth.
 
+## 2026-09-02 - README settled to the standard structure
+
+- `README.md` now carries only the agreed sections: a one-line description, the walkthrough GIF placeholder, the staging link, a link to the documentation, the Forgejo-is-the-development-home notice, security, license, and authors and credits. Everything longer than a paragraph moved into `docs/`.
+- New pages: `docs/README.md` (the public index the README links to), `docs/architecture.md` (runtime shape, the Traefik-versus-loopback rationale, migrations, images, repository layout, releases), `docs/binaries.md` (both binaries and the operator subcommands), `docs/configuration.md`, `docs/recipes.md`. The structure itself is written down in `readme-template.md` so the sibling repositories can be brought across to it.
+- Prerequisites, quick start, first-run admin bootstrap and the Infisical bootstrap were deleted rather than moved: `quickstart.md` and `first-run-onboarding.md` already carried all four in more current form, so the README copies became links.
+- Corrections made in passing, each a claim the README had outlived: tenant secrets default to the database rather than to Infisical (`SECRET_BACKEND`); `ATTACHMENT_DIR` comes from `compose.dev.yml` and is commented out in `.env.example` on purpose; the recipe list no longer claims to be exhaustive and carries the four public recipes it had drifted past; the toolchain is named as the exact pinned patch version rather than "stable" (in `CLAUDE.md` and `quickstart.md` too); the `CLAUDE.md` layout tree gained `src/cli.rs`, `pdf/`, `scheduler/`, `secrets/`, `storage/` and `version_check.rs`.
+- The doc-recipe guard's `const DOCS` grew from two entries to seven, so the commands that moved off the README are still checked against the justfile. That guard fails on a doc naming a missing recipe and never on a doc leaving its scope, so relocating commands without extending the list would have quietly reduced coverage while still reporting success.
+
 ## 2026-08-22 - `codebase-state.md` frozen at its snapshot date (PMS-849)
 
 - `codebase-state.md` is now titled and dated as the 2026-05-06 snapshot it always was, and is no longer described anywhere as living, authoritative or current. Three consecutive doc audits (2026-08-08, 2026-08-10, 2026-08-15) found it stale while it claimed to be current, after PMS-684 had already corrected it once; the claim was the defect, not any single wrong cell. It stays in place, and stays worth reading, for the `F1..F14` ids and the numbered cross-cutting issues that source comments and YouTrack issues cite.

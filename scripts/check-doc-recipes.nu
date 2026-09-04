@@ -2,19 +2,31 @@
 
 # Documented-recipe guard for the entry-point docs (PMS-843).
 #
-# README.md and docs/quickstart.md are the first commands a newcomer types, and
-# they drifted from the justfile: several sites invoked a `dev-down` recipe for
-# a stop step that has always been named `down`, so every documented restart
-# failed at its first instruction with a `just` error naming no alternative.
+# These are the first commands a newcomer types, and they drifted from the
+# justfile: several sites invoked a `dev-down` recipe for a stop step that has
+# always been named `down`, so every documented restart failed at its first
+# instruction with a `just` error naming no alternative.
 #
 # Fails when a doc names a recipe the justfile does not define (or defines as
 # `[private]`, which keeps it out of `just --list`). This checks a name against
 # the justfile, not prose wording: a rename that leaves a doc behind is a broken
 # command, and only the cross-reference can catch it.
 
-# Scoped to the two entry-point docs: other docs legitimately name recipes from
-# another repo (`just e2e-bootstrap` in the docker repo, docs/e2e.md).
-const DOCS = ["README.md" "docs/quickstart.md"]
+# The entry points plus every page that tells a reader to run a recipe. A page
+# that gains a `just <recipe>` span belongs here, or its commands leave the
+# guard silently: this fails on a doc naming a missing recipe, never on a doc
+# leaving its scope (PMS-995 moved the README's commands onto four new pages).
+# Not every doc: some legitimately name recipes from another repo
+# (`just e2e-bootstrap` in the docker repo, docs/e2e.md).
+const DOCS = [
+    "README.md"
+    "docs/README.md"
+    "docs/quickstart.md"
+    "docs/architecture.md"
+    "docs/binaries.md"
+    "docs/configuration.md"
+    "docs/recipes.md"
+]
 
 const JUSTFILE = "justfile"
 
