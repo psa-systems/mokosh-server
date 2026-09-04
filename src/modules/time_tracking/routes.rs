@@ -416,7 +416,7 @@ async fn clock_in(
     Ok(Json(
         state
             .service
-            .clock_in(user.tenant(), user.id, &request)
+            .clock_in(user.tenant(), user.id, &user.timezone, &request)
             .await?,
     ))
 }
@@ -448,7 +448,10 @@ async fn end_break(
 }
 
 /// A non-admin sees their own day; an admin may name whose. The same rule as
-/// the active-timer list and the timesheet submit above.
+/// the active-timer list and the timesheet submit above. "Today" is the
+/// CALLER's zone even when an admin reads another person's day: the person
+/// whose day it is may be in another zone, but the admin is the one asking
+/// what today is, and a named `date` sidesteps the question entirely.
 async fn work_day(
     State(state): State<TimeTrackingRouterState>,
     RequireTimeTracking { user, .. }: RequireTimeTracking,
@@ -468,7 +471,7 @@ async fn work_day(
     Ok(Json(
         state
             .service
-            .work_day(user.tenant(), user_id, query.date)
+            .work_day(user.tenant(), user_id, &user.timezone, query.date)
             .await?,
     ))
 }

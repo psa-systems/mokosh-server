@@ -384,16 +384,16 @@ pub struct WorkDaySegmentResponse {
 }
 
 /// The body of a clock-in. `date` is the client's local day, the way a time
-/// entry carries the date the client sent; absent, the UTC date of the
-/// clock-in.
+/// entry carries the date the client sent; absent, today in the user's own
+/// zone (`users.timezone`).
 #[derive(Debug, Clone, Deserialize, Default, Validate)]
 pub struct ClockInRequest {
     pub date: Option<NaiveDate>,
 }
 
 /// `GET /workday`: which day, and whose. `date` absent means the day of the
-/// open segment if there is one, else today (UTC), so a reload finds the clock
-/// where it was left. `user_id` is honoured for an admin and ignored for
+/// open segment if there is one, else today in the caller's own zone, so a
+/// reload finds the clock where it was left. `user_id` is honoured for an admin and ignored for
 /// anyone else, who sees their own day.
 #[derive(Debug, Clone, Deserialize, Default, Validate)]
 pub struct WorkDayQuery {

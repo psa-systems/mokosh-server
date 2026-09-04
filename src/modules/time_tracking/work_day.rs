@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::modules::auth::TenantId;
 use crate::modules::settings::read_track_breaks;
 use crate::utils::error::{AppError, AppResult};
+use mokosh_types::datetime::user_today;
 
 use super::models::*;
 use super::service::TimeTrackingService;
@@ -222,13 +223,16 @@ fn bucket(rows: Vec<BreakdownRow>) -> WorkDayBreakdown {
 
 impl TimeTrackingService {
     /// Clock in: open a `work` segment on `request.date` (the client's day),
-    /// or on today's UTC date. Refused while any segment is open, whatever
-    /// its date, because a day that was never clocked out is still that day.
+    /// or on today in the user's own zone (`users.timezone`, the preference
+    /// the dashboard's "today" already follows, PMS-253). Refused while any
+    /// segment is open, whatever its date, because a day that was never
+    /// clocked out is still that day.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn clock_in(
         &self,
         tenant_id: TenantId,
         user_id: Uuid,
+        user_tz: &str,
         request: &ClockInRequest,
     ) -> AppResult<WorkDaySegmentResponse> {
         let now = Utc::now();
@@ -241,7 +245,7 @@ impl TimeTrackingService {
             };
             return Err(AppError::Conflict(message.to_string()));
         }
-        let date = request.date.unwrap_or_else(|| now.date_naive());
+        let date = request.date.unwrap_or_else(|| user_today(now, user_tz));
         let segment =
             open_new_segment(&mut tx, tenant_id, user_id, date, SEGMENT_KIND_WORK, now).await?;
         tx.commit().await?;
@@ -331,12 +335,14 @@ impl TimeTrackingService {
 
     /// The day view: the day's segments and its time entries, read together.
     /// No `date` means the day of the open segment if there is one, else
-    /// today (UTC), so a reload finds the clock where it was left.
+    /// today in the user's own zone, so a reload finds the clock where it was
+    /// left.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn work_day(
         &self,
         tenant_id: TenantId,
         user_id: Uuid,
+        user_tz: &str,
         date: Option<NaiveDate>,
     ) -> AppResult<WorkDayResponse> {
         let track_breaks = read_track_breaks(&self.db, tenant_id).await?;
@@ -353,7 +359,7 @@ impl TimeTrackingService {
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
-            .unwrap_or_else(|| now.date_naive()),
+            .unwrap_or_else(|| user_today(now, user_tz)),
         };
 
         let sql = format!(

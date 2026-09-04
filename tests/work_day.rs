@@ -419,3 +419,58 @@ async fn a_technician_sees_only_their_own_day(pool: PgPool) {
         tech_id.to_string()
     );
 }
+
+/// The day a clock-in lands on with no `date` is today where the PERSON is,
+/// not today in UTC. Two zones 26 hours apart bracket UTC, so at any instant
+/// at least one of them is on a different calendar day from UTC; asserting
+/// both against `user_today` and one of them against UTC pins that the
+/// server read `users.timezone` rather than the clock on the wall.
+#[sqlx::test]
+async fn the_default_day_is_the_users_own_not_utc(pool: PgPool) {
+    let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
+    let (tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "tech@example.com",
+        "technician",
+    )
+    .await;
+    for (id, zone) in [(admin_id, "Pacific/Kiritimati"), (tech_id, "Etc/GMT+12")] {
+        sqlx::query("UPDATE users SET timezone = $2 WHERE id = $1")
+            .bind(id)
+            .bind(zone)
+            .execute(&pool)
+            .await
+            .expect("set the user's zone");
+    }
+    let app = common::boot(pool).await;
+    let admin = common::login(&app, &admin_email, &admin_password).await;
+    let tech = common::login(&app, &tech_email, &tech_password).await;
+
+    let before = chrono::Utc::now();
+    let mut dates = Vec::new();
+    for (token, zone) in [(&admin, "Pacific/Kiritimati"), (&tech, "Etc/GMT+12")] {
+        // The day view with nothing open answers "today" the same way.
+        let viewed = day(&app, token, "").await["date"].clone();
+        let response = post(&app, token, "/api/v1/workday/clock-in").await;
+        assert_eq!(response.status(), 200, "{:?}", response.text().await);
+        let segment: Value = response.json().await.expect("segment json");
+        let after = chrono::Utc::now();
+        let expected: Vec<String> = [before, after]
+            .iter()
+            .map(|t| mokosh_types::datetime::user_today(*t, zone).to_string())
+            .collect();
+        let date = segment["date"].as_str().expect("date").to_string();
+        assert!(
+            expected.contains(&date),
+            "{zone}: {date} not in {expected:?}"
+        );
+        assert_eq!(viewed, segment["date"], "{zone}: the day view agrees");
+        dates.push(date);
+    }
+    let utc_today = [before, chrono::Utc::now()].map(|t| t.date_naive().to_string());
+    assert!(
+        dates.iter().any(|d| !utc_today.contains(d)),
+        "{dates:?} are all UTC's {utc_today:?}; the zone was not read"
+    );
+}
