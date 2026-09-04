@@ -23,13 +23,13 @@ name: Check
 on:
   push:
     branches:
-      # PMS-825: mokosh-client-login publishes its own image tag (PMS-733) and
+      # PMS-825: mokosh-contact-login publishes its own image tag (PMS-733) and
       # is long-lived, so no pull_request into main ever covers it. Without this
       # entry staging pulls an image whose commit never ran fmt/clippy/tests.
       # It goes away with the branch tag under PMS-824. Keep in sync with
       # BRANCH_ALLOW_LIST in oci-build/get-tags.nu; scripts/check-oci-publish-tags.nu
       # fails the build if a publishing branch is missing here.
-      - mokosh-client-login
+      - mokosh-contact-login
   pull_request:
     branches:
       - main
@@ -187,10 +187,11 @@ jobs:
           nu scripts/check-env-example.nu
 
       - name: Documented just recipes
-        # PMS-843: README.md and docs/quickstart.md are the first commands a
-        # newcomer types. Several sites invoked a `dev-down` recipe for a stop
-        # step named `down`, so every documented restart failed at its first
-        # instruction. Fails loud when a doc names a recipe that does not exist.
+        # PMS-843: the docs in `const DOCS` (scripts/check-doc-recipes.nu) are
+        # the first commands a newcomer types. Several sites invoked a `dev-down`
+        # recipe for a stop step named `down`, so every documented restart failed
+        # at its first instruction. Fails loud when a doc names a recipe that
+        # does not exist.
         shell: nu {0}
         run: |
           nu scripts/check-doc-recipes.nu

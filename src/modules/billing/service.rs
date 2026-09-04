@@ -2802,6 +2802,16 @@ impl BillingService {
         } else {
             None
         };
+        // PMS-1001: the invoice records the person it was actually sent to.
+        // `resolve_invoice_recipient` falls back to the company's default
+        // pointer, and until this that fallback was never written down: the
+        // mail went to a person while the document rendered below named an
+        // organization and nobody else. Written before the render in this same
+        // transaction so `load_invoice` reads it, and COALESCEd below so a
+        // later update cannot move it off whoever received the document.
+        let billing_contact_id = request
+            .billing_contact_id
+            .or_else(|| recipient.as_ref().map(|(id, _)| *id));
         // PMS-911: the MSP's identity as it stands right now, frozen onto the
         // invoice on the transition that freezes the invoice. In this
         // transaction, because a post-commit step is best-effort and an
@@ -2839,7 +2849,7 @@ impl BillingService {
             "#,
         )
         .bind(invoice_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
         .bind(due_date)
@@ -3184,6 +3194,64 @@ impl BillingService {
             contact_name,
             contact_email,
         })
+    }
+
+    /// PMS-1001: who a credit note is addressed to.
+    ///
+    /// The contact its own invoice was addressed to, read from that invoice's
+    /// `billing_contact_id` rather than from the company's current pointer, for
+    /// the reason the invoice reads its own column: reassigning the billing
+    /// role must not change who a document already issued says it went to.
+    pub async fn credit_to(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        invoice_id: Uuid,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let contact = Self::invoice_billing_contact_in_tx(&mut tx, tenant_id, invoice_id).await?;
+        Self::bill_to_in_tx(&mut tx, tenant_id, company_id, contact).await
+    }
+
+    /// PMS-1001: who a statement is addressed to.
+    ///
+    /// The company's CURRENT default billing contact, and deliberately not an
+    /// invoice's. A statement spans many invoices that may each name a
+    /// different person, and PMS-954 made it a read model that stores nothing,
+    /// so it renders from today exactly as its issuer and its branding already
+    /// do. There is no historical recipient for it to name.
+    pub async fn statement_account(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<crate::modules::billing::documents::BillTo> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let contact: Option<Uuid> = sqlx::query_scalar(
+            "SELECT default_billing_contact_id FROM companies WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        Self::bill_to_in_tx(&mut tx, tenant_id, company_id, contact).await
+    }
+
+    /// The contact an invoice names, for a document addressed to whoever
+    /// received that invoice.
+    async fn invoice_billing_contact_in_tx(
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+    ) -> AppResult<Option<Uuid>> {
+        let contact: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT billing_contact_id FROM invoices WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(contact.flatten())
     }
 
     /// PMS-911: the tenant's identity as it stands now, for a document that is
@@ -3739,7 +3807,11 @@ impl BillingService {
         // snapshot.
         let note = Self::load_credit_note(&mut tx, tenant_id, credit_note_id).await?;
         let issuer = Self::tenant_issuer_in_tx(&mut tx, tenant_id).await?;
-        let credit_to = Self::bill_to_in_tx(&mut tx, tenant_id, note.company_id, None).await?;
+        // PMS-1001: addressed to whoever the corrected invoice was addressed
+        // to, so a credit note names the same person as the document it undoes.
+        let contact =
+            Self::invoice_billing_contact_in_tx(&mut tx, tenant_id, note.invoice_id).await?;
+        let credit_to = Self::bill_to_in_tx(&mut tx, tenant_id, note.company_id, contact).await?;
         let logo = crate::modules::billing::issuer::live_logo_bytes(tenant_id.get(), &issuer).await;
         let bytes = crate::pdf::render(&crate::modules::billing::documents::credit_note(
             &note, &issuer, &credit_to, logo,
@@ -4212,25 +4284,25 @@ impl BillingService {
         .fetch_one(&mut *tx)
         .await?;
 
-        let rows: Vec<ProductRow> = sqlx::query_as(
+        let sql = format!(
             r#"
-            SELECT id, sku, name, description, unit_price, unit, is_taxable,
-                   is_active, created_at, updated_at
-            FROM products
-            WHERE tenant_id = $1
-              AND ($2::bool IS NULL OR is_active = $2)
-              AND ($3::text IS NULL OR name ILIKE $3 OR sku ILIKE $3)
-            ORDER BY name
+            SELECT {PRODUCT_COLUMNS}
+            FROM products p
+            WHERE p.tenant_id = $1
+              AND ($2::bool IS NULL OR p.is_active = $2)
+              AND ($3::text IS NULL OR p.name ILIKE $3 OR p.sku ILIKE $3)
+            ORDER BY p.name
             LIMIT $4 OFFSET $5
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(filter.is_active)
-        .bind(pattern.as_deref())
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+            "#
+        );
+        let rows: Vec<ProductRow> = sqlx::query_as(&sql)
+            .bind(tenant_id)
+            .bind(filter.is_active)
+            .bind(pattern.as_deref())
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
 
         Ok((
             rows.into_iter().map(ProductResponse::from).collect(),
@@ -4244,17 +4316,17 @@ impl BillingService {
         product_id: Uuid,
     ) -> AppResult<ProductResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<ProductRow> = sqlx::query_as(
+        let sql = format!(
             r#"
-            SELECT id, sku, name, description, unit_price, unit, is_taxable,
-                   is_active, created_at, updated_at
-            FROM products WHERE id = $1 AND tenant_id = $2
-            "#,
-        )
-        .bind(product_id)
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+            SELECT {PRODUCT_COLUMNS}
+            FROM products p WHERE p.id = $1 AND p.tenant_id = $2
+            "#
+        );
+        let row: Option<ProductRow> = sqlx::query_as(&sql)
+            .bind(product_id)
+            .bind(tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
         row.map(ProductResponse::from)
             .ok_or_else(|| AppError::NotFound("Product".to_string()))
     }
@@ -4268,32 +4340,32 @@ impl BillingService {
     ) -> AppResult<ProductResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let id = Uuid::new_v4();
-        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(
+        let sql = format!(
             r#"
-            INSERT INTO products (id, tenant_id, sku, name, description,
-                                  unit_price, unit, is_taxable, is_active)
+            INSERT INTO products AS p (id, tenant_id, sku, name, description,
+                                       unit_price, unit, is_taxable, is_active)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            RETURNING id, sku, name, description, unit_price, unit, is_taxable,
-                      is_active, created_at, updated_at
-            "#,
-        )
-        .bind(id)
-        .bind(tenant_id)
-        .bind(
-            request
-                .sku
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        )
-        .bind(request.name.trim())
-        .bind(&request.description)
-        .bind(request.unit_price)
-        .bind(request.unit.trim())
-        .bind(request.is_taxable)
-        .bind(request.is_active)
-        .fetch_one(&mut *tx)
-        .await;
+            RETURNING {PRODUCT_COLUMNS}
+            "#
+        );
+        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(&sql)
+            .bind(id)
+            .bind(tenant_id)
+            .bind(
+                request
+                    .sku
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            )
+            .bind(request.name.trim())
+            .bind(&request.description)
+            .bind(request.unit_price)
+            .bind(request.unit.trim())
+            .bind(request.is_taxable)
+            .bind(request.is_active)
+            .fetch_one(&mut *tx)
+            .await;
         let row = row.map_err(Self::product_conflict)?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -4341,33 +4413,33 @@ impl BillingService {
         // Editing the catalog price is legal and changes nothing already
         // written: `invoice_lines.unit_price` is the price at the moment the
         // line was written, and nothing reads through to here at render time.
-        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(
+        let sql = format!(
             r#"
-            UPDATE products SET sku = $3, name = $4, description = $5,
-                                unit_price = $6, unit = $7, is_taxable = $8,
-                                is_active = $9, updated_at = NOW()
-            WHERE id = $1 AND tenant_id = $2
-            RETURNING id, sku, name, description, unit_price, unit, is_taxable,
-                      is_active, created_at, updated_at
-            "#,
-        )
-        .bind(product_id)
-        .bind(tenant_id)
-        .bind(
-            request
-                .sku
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        )
-        .bind(request.name.trim())
-        .bind(&request.description)
-        .bind(request.unit_price)
-        .bind(request.unit.trim())
-        .bind(request.is_taxable)
-        .bind(request.is_active)
-        .fetch_one(&mut *tx)
-        .await;
+            UPDATE products AS p SET sku = $3, name = $4, description = $5,
+                                     unit_price = $6, unit = $7, is_taxable = $8,
+                                     is_active = $9, updated_at = NOW()
+            WHERE p.id = $1 AND p.tenant_id = $2
+            RETURNING {PRODUCT_COLUMNS}
+            "#
+        );
+        let row: Result<ProductRow, sqlx::Error> = sqlx::query_as(&sql)
+            .bind(product_id)
+            .bind(tenant_id)
+            .bind(
+                request
+                    .sku
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty()),
+            )
+            .bind(request.name.trim())
+            .bind(&request.description)
+            .bind(request.unit_price)
+            .bind(request.unit.trim())
+            .bind(request.is_taxable)
+            .bind(request.is_active)
+            .fetch_one(&mut *tx)
+            .await;
         let row = row.map_err(Self::product_conflict)?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -4425,7 +4497,7 @@ impl BillingService {
         if let Err(sqlx::Error::Database(e)) = &deleted {
             if e.code().as_deref() == Some("23503") {
                 return Err(AppError::Conflict(
-                    "This product is on an invoice or a contract and cannot be deleted.                      Retire it instead by marking it inactive."
+                    "This product is on an invoice or a contract and cannot be deleted. Retire it instead by marking it inactive."
                         .to_string(),
                 ));
             }
@@ -5253,6 +5325,23 @@ impl From<StatementCreditRow> for StatementCreditLine {
 
 // ---- PMS-955: product catalog row type -------------------------------------
 
+/// The columns every product read selects, with `products` aliased as `p`.
+///
+/// One list for `list_products`, `get_product` and the `RETURNING` of create
+/// and update, so the four responses cannot drift. `in_use` (PMS-1002) is
+/// computed here rather than by a second query per row: whether anything
+/// names the product is a fact about two FK columns, and an `EXISTS` on each
+/// is the cheapest true answer. Both tables are tenant-isolated (RLS: a
+/// column on `contract_items`, the parent-join policy of migration 041 on
+/// `invoice_lines`), and a product can only be referenced from its own tenant
+/// (`assert_product_sellable`), so no tenant filter is repeated in the
+/// subselects.
+const PRODUCT_COLUMNS: &str = "\
+    p.id, p.sku, p.name, p.description, p.unit_price, p.unit, p.is_taxable, \
+    p.is_active, p.created_at, p.updated_at, \
+    (EXISTS (SELECT 1 FROM invoice_lines il WHERE il.product_id = p.id) \
+     OR EXISTS (SELECT 1 FROM contract_items ci WHERE ci.product_id = p.id)) AS in_use";
+
 #[derive(sqlx::FromRow)]
 struct ProductRow {
     id: Uuid,
@@ -5263,6 +5352,7 @@ struct ProductRow {
     unit: String,
     is_taxable: bool,
     is_active: bool,
+    in_use: bool,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -5278,6 +5368,7 @@ impl From<ProductRow> for ProductResponse {
             unit: r.unit,
             is_taxable: r.is_taxable,
             is_active: r.is_active,
+            in_use: r.in_use,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

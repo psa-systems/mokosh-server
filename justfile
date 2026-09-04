@@ -72,9 +72,10 @@ check: check-compile check-clippy check-fmt check-migrations check-migration-imm
 check-doc-links:
     nu scripts/check-doc-links.nu
 
-# Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if
-# README.md or docs/quickstart.md names a recipe the justfile does not define.
-[doc("Fail if README.md or docs/quickstart.md names a recipe the justfile lacks (PMS-843).")]
+# Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if one of
+# the docs in `const DOCS` (scripts/check-doc-recipes.nu) names a recipe the
+# justfile does not define; a new page carrying commands belongs in that list.
+[doc("Fail if a guarded doc names a recipe the justfile lacks (scope: scripts/check-doc-recipes.nu, PMS-843).")]
 [group: 'check']
 check-doc-recipes:
     nu scripts/check-doc-recipes.nu
