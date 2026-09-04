@@ -233,7 +233,7 @@ impl TimeTrackingService {
     ) -> AppResult<WorkDaySegmentResponse> {
         let now = Utc::now();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        if let Some(open) = open_segment(&mut *tx, tenant_id, user_id).await? {
+        if let Some(open) = open_segment(&mut tx, tenant_id, user_id).await? {
             let message = if open.kind == SEGMENT_KIND_BREAK {
                 "Already clocked in and on a break; end the break or clock out first"
             } else {
@@ -243,7 +243,7 @@ impl TimeTrackingService {
         }
         let date = request.date.unwrap_or_else(|| now.date_naive());
         let segment =
-            open_new_segment(&mut *tx, tenant_id, user_id, date, SEGMENT_KIND_WORK, now).await?;
+            open_new_segment(&mut tx, tenant_id, user_id, date, SEGMENT_KIND_WORK, now).await?;
         tx.commit().await?;
         Ok(segment.into_response(now))
     }
@@ -258,10 +258,10 @@ impl TimeTrackingService {
     ) -> AppResult<WorkDaySegmentResponse> {
         let now = Utc::now();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let Some(open) = open_segment(&mut *tx, tenant_id, user_id).await? else {
+        let Some(open) = open_segment(&mut tx, tenant_id, user_id).await? else {
             return Err(AppError::Conflict("Not clocked in".to_string()));
         };
-        let closed = close_segment(&mut *tx, open.id, now).await?;
+        let closed = close_segment(&mut tx, open.id, now).await?;
         tx.commit().await?;
         Ok(closed.into_response(now))
     }
@@ -278,7 +278,7 @@ impl TimeTrackingService {
         require_break_tracking(self, tenant_id).await?;
         let now = Utc::now();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let Some(open) = open_segment(&mut *tx, tenant_id, user_id).await? else {
+        let Some(open) = open_segment(&mut tx, tenant_id, user_id).await? else {
             return Err(AppError::Conflict(
                 "Not clocked in; clock in first".to_string(),
             ));
@@ -286,9 +286,9 @@ impl TimeTrackingService {
         if open.kind == SEGMENT_KIND_BREAK {
             return Err(AppError::Conflict("Already on a break".to_string()));
         }
-        close_segment(&mut *tx, open.id, now).await?;
+        close_segment(&mut tx, open.id, now).await?;
         let segment = open_new_segment(
-            &mut *tx,
+            &mut tx,
             tenant_id,
             user_id,
             open.date,
@@ -311,13 +311,13 @@ impl TimeTrackingService {
         require_break_tracking(self, tenant_id).await?;
         let now = Utc::now();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let open = match open_segment(&mut *tx, tenant_id, user_id).await? {
+        let open = match open_segment(&mut tx, tenant_id, user_id).await? {
             Some(open) if open.kind == SEGMENT_KIND_BREAK => open,
             _ => return Err(AppError::Conflict("Not on a break".to_string())),
         };
-        close_segment(&mut *tx, open.id, now).await?;
+        close_segment(&mut tx, open.id, now).await?;
         let segment = open_new_segment(
-            &mut *tx,
+            &mut tx,
             tenant_id,
             user_id,
             open.date,
