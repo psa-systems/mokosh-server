@@ -443,6 +443,43 @@ impl BillingService {
         Ok(rows.into_iter().collect())
     }
 
+    /// PMS-1016: who an invoice is for, decided when it is created.
+    ///
+    /// The contact the caller named, else the company's default billing
+    /// contact, which is the same pair `resolve_invoice_recipient` picks
+    /// between at send time. Resolving it here makes a draft carry the
+    /// recipient it will be emailed to, so `GET /invoices/{id}` names one and
+    /// the live draft preview prints the same `Attn:` line as the document
+    /// stored at the send. It is stored rather than read at render time on
+    /// purpose (PMS-1001): reading the company's pointer while rendering
+    /// would let a later change re-address a document already issued.
+    ///
+    /// A company with no pointer still yields none, and the send-time guard is
+    /// unchanged: `resolve_invoice_recipient` still runs and still refuses a
+    /// send that resolves nobody.
+    async fn resolve_billing_contact(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        requested: Option<Uuid>,
+    ) -> AppResult<Option<Uuid>> {
+        // PMS-993: an explicitly named contact is validated against this
+        // company and tenant first. FK checks bypass RLS, so an unchecked id
+        // could address the invoice to another tenant's contact.
+        if let Some(contact_id) = requested {
+            Self::assert_billing_contact_for_company(tx, tenant_id, company_id, contact_id).await?;
+            return Ok(requested);
+        }
+        let default_contact: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT default_billing_contact_id FROM companies WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(default_contact.flatten())
+    }
+
     /// Fill in `company_name` on a batch of invoice responses (PMS-186).
     async fn enrich_invoices(
         &self,
@@ -681,19 +718,14 @@ impl BillingService {
         )
         .await?;
 
-        // PMS-993: FK checks bypass RLS, so an unvalidated `billing_contact_id`
-        // could address an invoice to another tenant's contact. Resolving an
-        // ABSENT one from the company is PMS-1016's scope, not this issue's.
-        let billing_contact_id = request.billing_contact_id;
-        if let Some(contact_id) = billing_contact_id {
-            Self::assert_billing_contact_for_company(
-                &mut tx,
-                tenant_id,
-                request.company_id,
-                contact_id,
-            )
-            .await?;
-        }
+        // PMS-1016: the contact the caller named, else the company's default.
+        let billing_contact_id = Self::resolve_billing_contact(
+            &mut tx,
+            tenant_id,
+            request.company_id,
+            request.billing_contact_id,
+        )
+        .await?;
 
         let invoice_id = Uuid::new_v4();
         sqlx::query(
@@ -981,17 +1013,14 @@ impl BillingService {
             Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, request.due_date)
                 .await?;
 
-        // PMS-993: same recipient rule as `create_invoice`.
-        let billing_contact_id = request.billing_contact_id;
-        if let Some(contact_id) = billing_contact_id {
-            Self::assert_billing_contact_for_company(
-                &mut tx,
-                tenant_id,
-                request.company_id,
-                contact_id,
-            )
-            .await?;
-        }
+        // PMS-1016: the contact the caller named, else the company's default.
+        let billing_contact_id = Self::resolve_billing_contact(
+            &mut tx,
+            tenant_id,
+            request.company_id,
+            request.billing_contact_id,
+        )
+        .await?;
 
         // 4. Insert the invoice header. `balance_due` starts at `total`.
         let invoice_id = Uuid::new_v4();
@@ -1372,8 +1401,11 @@ impl BillingService {
         // so numbers stay gapless.
         let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
-        // Recipient stays unset at create; PMS-1016 owns resolving it.
-        let billing_contact_id: Option<Uuid> = None;
+        // PMS-1016: this path has no caller to name a contact, so it is the
+        // company's default or nobody. A company with no pointer still
+        // produces a draft naming nobody, which the send-time guard refuses.
+        let billing_contact_id =
+            Self::resolve_billing_contact(&mut tx, tenant_id, company_id, None).await?;
 
         sqlx::query(
             r#"

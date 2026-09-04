@@ -132,8 +132,11 @@ async fn pdf(app: &common::TestApp, token: &str, path: &str) -> (StatusCode, Vec
     (status, resp.bytes().await.expect("bytes").to_vec())
 }
 
-/// The defect itself: an invoice that named no contact is emailed to the
-/// company's default billing contact, so the document has to name that person.
+/// The defect itself: an invoice the caller named no contact for is emailed to
+/// the company's default billing contact, so the document has to name that
+/// person. Since PMS-1016 the create path resolves that same pointer, so the
+/// draft already carries the recipient and the send keeps it rather than
+/// filling it in; either way the document names whoever was emailed.
 #[sqlx::test]
 async fn a_sent_invoice_names_the_person_it_was_emailed_to(pool: PgPool) {
     install_test_attachment_env();
@@ -147,8 +150,9 @@ async fn a_sent_invoice_names_the_person_it_was_emailed_to(pool: PgPool) {
     let invoice_id = draft_invoice(&app, &token, company_id).await;
     assert_eq!(
         invoice_contact(&pool, &invoice_id).await,
-        None,
-        "the invoice was created naming nobody, which is the case that was broken"
+        Some(contact_id),
+        "PMS-1016: the create resolves the company's pointer, so the draft \
+         already names who it is for"
     );
 
     send_invoice(&app, &token, &invoice_id, false).await;
@@ -156,7 +160,7 @@ async fn a_sent_invoice_names_the_person_it_was_emailed_to(pool: PgPool) {
     assert_eq!(
         invoice_contact(&pool, &invoice_id).await,
         Some(contact_id),
-        "the send records the person it resolved and emailed"
+        "and the send records the person it emailed"
     );
     let (status, bytes) = pdf(&app, &token, &format!("/api/v1/invoices/{invoice_id}/pdf")).await;
     assert_eq!(status, StatusCode::OK);
