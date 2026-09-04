@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::settings::read_tenant_zone;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -1418,7 +1419,15 @@ impl ContractsService {
     /// (PMS-117). Pass a specific `now` for deterministic tests.
     #[tracing::instrument(skip_all)]
     pub async fn expire_due_contracts(&self, now: DateTime<Utc>) -> AppResult<(u64, u64)> {
-        let today = now.date_naive();
+        // PMS-1030: a contract ends on a date in ITS tenant's day, so the
+        // candidate scan uses the latest date any zone can be on (UTC's day
+        // plus one; no zone is further east than +14) and each tenant is then
+        // drained against its own today, read below. A contract ending
+        // 30 June in Auckland used to expire at 12:00 local on 1 July.
+        let latest_anywhere = now
+            .date_naive()
+            .checked_add_days(Days::new(1))
+            .unwrap_or_else(|| now.date_naive());
 
         // SAFETY (PMS-285): the contract-lifecycle sweep runs across EVERY
         // tenant's `contracts` (the worker owns the cadence), so it cannot set a
@@ -1432,7 +1441,7 @@ impl ContractsService {
                FROM contracts
                WHERE status = 'active' AND end_date IS NOT NULL AND end_date < $1"#,
         )
-        .bind(today)
+        .bind(latest_anywhere)
         .fetch_all(self.db.migrator_pool())
         .await?;
 
@@ -1442,6 +1451,11 @@ impl ContractsService {
         for tenant_id in tenants {
             let tid = TenantId::from_trusted(tenant_id);
             let ctx = AuditCtx::system(tenant_id);
+            let today = {
+                let mut conn = self.db.migrator_pool().acquire().await?;
+                let zone = read_tenant_zone(&mut conn, tid).await?;
+                mokosh_types::datetime::user_local_date(now, &zone)
+            };
 
             // Drain this tenant's due contracts a batch at a time. Each
             // processed row leaves the predicate (status moves off
