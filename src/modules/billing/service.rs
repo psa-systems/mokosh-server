@@ -316,6 +316,110 @@ impl BillingService {
     /// caller's tenant (PMS-333). RLS scopes the lookup, so a foreign-tenant id
     /// (whose FK would otherwise pass, since FK checks bypass RLS) is rejected
     /// with a 400 instead of silently linking across tenants.
+    /// PMS-1029: the one rule for an invoice's tax, run after its lines are
+    /// written and in the same transaction.
+    ///
+    /// The rate is the request's `tax_rate_id` (validated in the tenant and
+    /// active), else the tenant's active default, else none; the amount is
+    /// `round(taxable line total * rate / 100, 2)`, half away from zero as
+    /// money is. A given `explicit_amount` is stored as given and records no
+    /// rate: a jurisdiction this rule cannot express exists, and the SPA sends
+    /// one today. The rate applied is frozen on the invoice (`tax_rate_id`,
+    /// `tax_rate`) so the document can print it and a later edit to
+    /// `tax_rates` does not re-price an issued document.
+    ///
+    /// Writes `subtotal`, `tax_amount`, `total` and `balance_due` the way
+    /// `update_invoice` does, and deliberately NOT through
+    /// `recompute_invoice_balance`: that derives `status` for a payment event
+    /// and its fallback arm is `sent`, which would flip a draft.
+    async fn apply_tax(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        requested_rate: Option<Uuid>,
+        explicit_amount: Option<Decimal>,
+        discount: Decimal,
+    ) -> AppResult<()> {
+        let (subtotal, taxable): (Decimal, Decimal) = sqlx::query_as(
+            "SELECT COALESCE(SUM(total), 0), COALESCE(SUM(total) FILTER (WHERE is_taxable), 0) \
+             FROM invoice_lines WHERE invoice_id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let rate: Option<(Uuid, Decimal)> = match requested_rate {
+            Some(id) => Some(Self::assert_tax_rate_in_tenant(tx, tenant_id, id).await?),
+            None => {
+                sqlx::query_as(
+                    "SELECT id, rate FROM tax_rates \
+                     WHERE tenant_id = $1 AND is_default = TRUE AND is_active = TRUE \
+                     ORDER BY created_at, id LIMIT 1",
+                )
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+        };
+        let (tax, rate_id, rate_pct) = match (explicit_amount, rate) {
+            (Some(amount), _) => (amount, None, None),
+            (None, Some((id, pct))) => (
+                (taxable * pct / Decimal::from(100)).round_dp_with_strategy(
+                    2,
+                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                ),
+                Some(id),
+                Some(pct),
+            ),
+            (None, None) => (Decimal::ZERO, None, None),
+        };
+        sqlx::query(
+            r#"
+            UPDATE invoices SET
+                subtotal    = $2,
+                tax_amount  = $3,
+                tax_rate_id = $4,
+                tax_rate    = $5,
+                total       = $2 + $3 - $6,
+                balance_due = $2 + $3 - $6 - amount_paid - amount_credited,
+                updated_at  = NOW()
+            WHERE id = $1 AND tenant_id = $7
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(subtotal)
+        .bind(tax)
+        .bind(rate_id)
+        .bind(rate_pct)
+        .bind(discount)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    /// PMS-1029: a `tax_rate_id` must name an active rate in the caller's
+    /// tenant. An FK check bypasses RLS, so a foreign id would satisfy the
+    /// constraint and link silently (the PMS-333 reason for payment terms).
+    async fn assert_tax_rate_in_tenant(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        tax_rate_id: Uuid,
+    ) -> AppResult<(Uuid, Decimal)> {
+        sqlx::query_as(
+            "SELECT id, rate FROM tax_rates \
+             WHERE tenant_id = $1 AND id = $2 AND is_active = TRUE",
+        )
+        .bind(tenant_id)
+        .bind(tax_rate_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "tax_rate_id does not name an active tax rate in this tenant".to_string(),
+            )
+        })
+    }
+
     async fn assert_payment_term_in_tenant(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -643,7 +747,8 @@ impl BillingService {
                    payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
-                   created_at, updated_at, emailed_at, emailed_to
+                   created_at, updated_at, emailed_at, emailed_to,
+                   tax_rate_id, tax_rate
             FROM invoices
             WHERE {data_where}
             ORDER BY {order_by}
@@ -791,9 +896,10 @@ impl BillingService {
                 r#"
                 INSERT INTO invoice_lines (
                     id, invoice_id, line_type, description, quantity, unit_price,
-                    total, ticket_id, project_id, sort_order, product_id
+                    total, ticket_id, project_id, sort_order, product_id, is_taxable
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = $11), $12))
                 "#,
             )
             .bind(Uuid::new_v4())
@@ -807,9 +913,20 @@ impl BillingService {
             .bind(line.project_id)
             .bind(line.sort_order)
             .bind(line.product_id)
+            .bind(line.is_taxable)
             .execute(&mut *tx)
             .await?;
         }
+        // PMS-1029: tax from the lines just written, in this transaction.
+        Self::apply_tax(
+            &mut tx,
+            tenant_id,
+            invoice_id,
+            request.tax_rate_id,
+            request.tax_amount,
+            discount,
+        )
+        .await?;
 
         // Audit row in the same transaction. CREATE: old = None, after
         // captured by the new invoice id. PMS-117.
@@ -1139,6 +1256,17 @@ impl BillingService {
         // 6. Mark the source entries billed and link them to the invoice,
         //    within the same transaction. Scoped to the locked id set so
         //    a concurrently-inserted eligible entry is not swept in.
+        // PMS-1029: the named rate, else the tenant's default, over every line
+        // (time and mileage lines are taxable).
+        Self::apply_tax(
+            &mut tx,
+            tenant_id,
+            invoice_id,
+            request.tax_rate_id,
+            None,
+            Decimal::ZERO,
+        )
+        .await?;
         let billed_ids: Vec<Uuid> = entries.iter().map(|e| e.id).collect();
         sqlx::query(
             r#"
@@ -1523,9 +1651,10 @@ impl BillingService {
                 r#"
                 INSERT INTO invoice_lines (
                     id, invoice_id, line_type, description, quantity, unit_price,
-                    total, sort_order, product_id
+                    total, sort_order, product_id, is_taxable
                 )
-                VALUES ($1, $2, 'service', $3, $4, $5, $6, $7, $8)
+                VALUES ($1, $2, 'service', $3, $4, $5, $6, $7, $8,
+                        COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = $8), TRUE))
                 "#,
             )
             .bind(Uuid::new_v4())
@@ -1543,6 +1672,10 @@ impl BillingService {
             .execute(&mut *tx)
             .await?;
         }
+
+        // PMS-1029: a recurring invoice names no rate, so the tenant's default
+        // applies over the lines just written.
+        Self::apply_tax(&mut tx, tenant_id, invoice_id, None, None, Decimal::ZERO).await?;
 
         // --- 4. Audit row in the same transaction. CREATE: old = None. ---
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -2930,9 +3063,10 @@ impl BillingService {
                     INSERT INTO invoice_lines (
                         id, invoice_id, line_type, description, quantity,
                         unit_price, total, ticket_id, project_id, sort_order,
-                        product_id
+                        product_id, is_taxable
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                            COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = $11), $12))
                     "#,
                 )
                 .bind(Uuid::new_v4())
@@ -2946,6 +3080,7 @@ impl BillingService {
                 .bind(line.project_id)
                 .bind(line.sort_order)
                 .bind(line.product_id)
+                .bind(line.is_taxable)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -3092,6 +3227,21 @@ impl BillingService {
         )
         .execute(&mut *tx)
         .await?;
+        // PMS-1029: replacing the lines or naming a rate re-derives the tax
+        // over the lines now on the invoice; a given amount is stored as
+        // given; an update touching none of the three leaves the tax alone.
+        if request.lines.is_some() || request.tax_rate_id.is_some() || request.tax_amount.is_some()
+        {
+            Self::apply_tax(
+                &mut tx,
+                tenant_id,
+                invoice_id,
+                request.tax_rate_id.or(current.tax_rate_id),
+                request.tax_amount,
+                discount,
+            )
+            .await?;
+        }
 
         // PMS-959: the document the client receives, kept as it was sent.
         //
@@ -3617,7 +3767,8 @@ impl BillingService {
                    payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
-                   created_at, updated_at, emailed_at, emailed_to
+                   created_at, updated_at, emailed_at, emailed_to,
+                   tax_rate_id, tax_rate
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -3631,7 +3782,7 @@ impl BillingService {
         let line_rows = sqlx::query_as::<_, InvoiceLineRow>(
             r#"
             SELECT id, line_type, description, quantity, unit_price, total,
-                   ticket_id, project_id, sort_order, product_id
+                   ticket_id, project_id, sort_order, product_id, is_taxable
             FROM invoice_lines
             WHERE invoice_id = $1
             ORDER BY sort_order, created_at
@@ -5096,11 +5247,13 @@ struct InvoiceLineRow {
     project_id: Option<Uuid>,
     sort_order: i32,
     product_id: Option<Uuid>,
+    is_taxable: bool,
 }
 
 impl From<InvoiceLineRow> for InvoiceLineResponse {
     fn from(r: InvoiceLineRow) -> Self {
         Self {
+            is_taxable: r.is_taxable,
             id: r.id,
             line_type: InvoiceLineType::from_str(&r.line_type).unwrap_or(InvoiceLineType::Service),
             description: r.description,
@@ -5130,6 +5283,8 @@ struct InvoiceRow {
     payment_term_id: Option<Uuid>,
     subtotal: Decimal,
     tax_amount: Decimal,
+    tax_rate_id: Option<Uuid>,
+    tax_rate: Option<Decimal>,
     discount_amount: Decimal,
     total: Decimal,
     amount_paid: Decimal,
@@ -5164,6 +5319,8 @@ impl From<InvoiceRow> for InvoiceResponse {
             payment_term_name: None,
             subtotal: r.subtotal,
             tax_amount: r.tax_amount,
+            tax_rate_id: r.tax_rate_id,
+            tax_rate: r.tax_rate,
             discount_amount: r.discount_amount,
             total: r.total,
             amount_paid: r.amount_paid,

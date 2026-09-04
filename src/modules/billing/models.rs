@@ -115,6 +115,11 @@ pub struct InvoiceLineResponse {
     /// price is NOT read through this: `unit_price` below is what was charged,
     /// and it stays what was charged when the catalog changes.
     pub product_id: Option<Uuid>,
+    /// PMS-1029: whether this line counts toward the taxable subtotal. Stored
+    /// per line (a product line copies `products.is_taxable` at write time),
+    /// never read through to the product, so a catalog edit cannot re-tax an
+    /// issued document.
+    pub is_taxable: bool,
     pub description: String,
     pub quantity: Decimal,
     pub unit_price: Decimal,
@@ -150,6 +155,13 @@ pub struct InvoiceResponse {
     pub payment_term_name: Option<String>,
     pub subtotal: Decimal,
     pub tax_amount: Decimal,
+    /// PMS-1029: the rate `tax_amount` was derived from, frozen on the invoice
+    /// so the document prints it and a later edit to `tax_rates` does not
+    /// re-price an issued document. `None` means the amount was supplied by
+    /// the caller rather than derived, which is what every pre-PMS-1029 row is.
+    pub tax_rate_id: Option<Uuid>,
+    /// The percent, e.g. `13.0000`, frozen alongside `tax_rate_id`.
+    pub tax_rate: Option<Decimal>,
     pub discount_amount: Decimal,
     pub total: Decimal,
     pub amount_paid: Decimal,
@@ -203,6 +215,10 @@ pub struct CreateInvoiceLineRequest {
     /// actually charged.
     #[serde(default)]
     pub product_id: Option<Uuid>,
+    /// PMS-1029: default taxable. Ignored when `product_id` is set, because
+    /// the product's own `is_taxable` is copied onto the line instead.
+    #[serde(default = "default_true")]
+    pub is_taxable: bool,
     #[validate(length(min = 1, max = 1000))]
     pub description: String,
     /// `quantity` and `unit_price` are intentionally signed (PMS-306): a
@@ -234,7 +250,10 @@ pub struct CreateInvoiceRequest {
     /// Optional FK into the tenant's `payment_terms` lookup (PMS-333). The
     /// service validates it belongs to the caller's tenant.
     pub payment_term_id: Option<Uuid>,
+    /// PMS-1029: given, it is stored as given and records no rate; absent,
+    /// the tax is derived from `tax_rate_id`, else the tenant's default rate.
     pub tax_amount: Option<Decimal>,
+    pub tax_rate_id: Option<Uuid>,
     pub discount_amount: Option<Decimal>,
     #[validate(length(max = 3))]
     pub currency: Option<String>,
@@ -283,6 +302,8 @@ pub struct CreateInvoiceFromTimeEntriesRequest {
     pub po_number: Option<String>,
     /// Restrict to these entries. `None` bills every eligible entry.
     pub time_entry_ids: Option<Vec<Uuid>>,
+    /// PMS-1029: absent, the tenant's default rate applies.
+    pub tax_rate_id: Option<Uuid>,
 }
 
 /// Header-only update. To replace line items, send `lines = Some(...)`.
@@ -297,7 +318,10 @@ pub struct UpdateInvoiceRequest {
     /// Optional FK into the tenant's `payment_terms` lookup (PMS-333),
     /// preserved on omit; an explicit value re-links and is tenant-validated.
     pub payment_term_id: Option<Uuid>,
+    /// PMS-1029: replacing the lines or naming a rate re-derives the tax; a
+    /// given `tax_amount` still wins; an update touching neither leaves it.
     pub tax_amount: Option<Decimal>,
+    pub tax_rate_id: Option<Uuid>,
     pub discount_amount: Option<Decimal>,
     pub notes: Option<String>,
     pub po_number: Option<String>,
@@ -611,6 +635,7 @@ mod tests {
 
     fn one_line() -> CreateInvoiceLineRequest {
         CreateInvoiceLineRequest {
+            is_taxable: true,
             line_type: InvoiceLineType::Service,
             product_id: None,
             description: "Work".into(),
@@ -624,6 +649,7 @@ mod tests {
 
     fn invoice(invoice_date: NaiveDate, due_date: NaiveDate) -> CreateInvoiceRequest {
         CreateInvoiceRequest {
+            tax_rate_id: None,
             company_id: Uuid::new_v4(),
             billing_contact_id: None,
             contract_id: None,
