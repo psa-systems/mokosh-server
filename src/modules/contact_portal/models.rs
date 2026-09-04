@@ -22,12 +22,12 @@ pub struct ContactSession {
     pub tenant_id: Uuid,
     pub company_id: Uuid,
     pub email: String,
-    /// The union of every assigned role's capability set at the moment
-    /// the JWT was minted. Belt-and-braces: privileged mutation
-    /// endpoints re-load the effective set from `portal_roles` per
-    /// request so a role revoke lands within one tick (prompt 008
-    /// enforces this on the mutation paths).
-    pub caps: Vec<String>,
+    // PMS-985: this deliberately carries NO capability set. Every
+    // server-side decision loads the effective set from `portal_roles`
+    // for the request being served (see
+    // `crate::modules::auth::caller_context::load_contact_capabilities`),
+    // so a field here would only ever be the stale copy minted into the
+    // JWT, and the compiler is what stops a handler reaching for it.
     /// `contact_sessions.id` - the refresh-token session row this
     /// access token was minted from. Used by the logout + rotate paths.
     pub sid: Uuid,
@@ -42,6 +42,12 @@ pub struct ContactJwtClaims {
     pub tid: Uuid,
     pub cid: Uuid,
     pub email: String,
+    /// The effective capability set as it stood when this token was
+    /// minted, for the SPA to paint with. PMS-985: the server NEVER
+    /// reads it back - `decode_token` hands it to nobody - because it
+    /// is a snapshot and an admin can change the assignment a second
+    /// later. It stays on the wire so a cold-loading SPA has something
+    /// to render before `GET /contact/auth/me` returns.
     pub caps: Vec<String>,
     pub sid: Uuid,
     #[serde(rename = "typ")]

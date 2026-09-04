@@ -402,11 +402,14 @@ async fn dashboard_summary(
     RequireContactAuth(session): RequireContactAuth,
 ) -> AppResult<Json<ContactDashboardSummary>> {
     let tenant = TenantId::from_trusted(session.tenant_id);
-    // MAPPS-705: pass the caller's capabilities so the aggregator can
-    // skip the tiles + activity rows the caller cannot open.
+    // MAPPS-705: the aggregator skips the tiles + activity rows the
+    // caller cannot open. PMS-985: it loads that capability set itself,
+    // from `portal_roles`, for this request - it used to be handed the
+    // JWT's snapshot, so a tile a role had just granted stayed empty
+    // until the token was re-minted.
     let summary = state
         .service
-        .dashboard_summary(tenant, session.company_id, &session.caps)
+        .dashboard_summary(tenant, session.company_id, session.id)
         .await?;
     Ok(Json(summary))
 }

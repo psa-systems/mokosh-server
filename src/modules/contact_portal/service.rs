@@ -1608,7 +1608,7 @@ impl ContactAuthService {
         &self,
         tenant_id: TenantId,
         company_id: Uuid,
-        caps: &[String],
+        contact_id: Uuid,
     ) -> AppResult<super::models::ContactDashboardSummary> {
         // MAPPS-705: gate each aggregate + activity section on the
         // caller's capabilities. A tile whose underlying list the
@@ -1617,6 +1617,10 @@ impl ContactAuthService {
         // caller could not click into. A contact holding zero caps
         // sees zero rows across the board, which is what the
         // empty-state SPA landing renders.
+        //
+        // PMS-985: the set is loaded here rather than taken as an
+        // argument, so no caller can hand this a stale snapshot.
+        let caps = self.load_capabilities(tenant_id.get(), contact_id).await?;
         let has = |cap: &str| caps.iter().any(|c| c == cap);
         let can_read_tickets = has(super::capabilities::TICKETS_READ);
         let can_read_invoices = has(super::capabilities::INVOICES_READ);

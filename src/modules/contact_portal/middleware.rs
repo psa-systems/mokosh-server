@@ -10,6 +10,11 @@
 //! Distinct from the retired `portal_auth_middleware` (prompt 001)
 //! and from the staff-plane `auth_middleware`: the JWT `typ` claim
 //! check ("contact") is what stops cross-plane replay.
+//!
+//! PMS-985: the `ContactSession` this attaches carries identity and
+//! scope only, never capabilities. The token's `caps` claim is dropped
+//! here on purpose, so a handler that needs to know what the caller may
+//! do has to load it from `portal_roles` for the request it is serving.
 
 use std::sync::Arc;
 
@@ -83,7 +88,6 @@ pub async fn portal_contact_middleware(
                         tenant_id: claims.tid,
                         company_id: claims.cid,
                         email: claims.email,
-                        caps: claims.caps,
                         sid: claims.sid,
                     })
                 }
