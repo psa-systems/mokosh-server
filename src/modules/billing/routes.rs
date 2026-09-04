@@ -18,6 +18,7 @@ use crate::modules::auth::{
     CallerContext, RequireBilling, RequireCallerContext, RequireFinance, TenantScoped,
 };
 use crate::modules::contact_portal::capabilities as caps;
+use crate::modules::settings::SettingsService;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -425,6 +426,7 @@ async fn get_invoice(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoiceResponse>> {
     // mokosh-contact-login prompt 008: staff branch preserves the
@@ -434,7 +436,7 @@ async fn get_invoice(
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => {
-            assert_staff_billing_finance(auth)?;
+            assert_staff_billing_finance(auth, &settings).await?;
         }
         CallerContext::Contact(_) => {
             caller.require_capability(caps::INVOICES_READ, &db).await?;
@@ -453,6 +455,7 @@ async fn list_invoices(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Query(mut filter): Query<InvoiceFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<InvoiceResponse>>> {
@@ -460,7 +463,7 @@ async fn list_invoices(
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => {
-            assert_staff_billing_finance(auth)?;
+            assert_staff_billing_finance(auth, &settings).await?;
         }
         CallerContext::Contact(session) => {
             caller.require_capability(caps::INVOICES_READ, &db).await?;
@@ -487,10 +490,29 @@ async fn list_invoices(
 /// RequireFinance behaviour inline for a handler that now takes
 /// `RequireCallerContext` instead of the two dedicated extractors, so
 /// the staff branch still 404s a tenant with billing disabled and
-/// 403s a non-finance role. Kept as a small helper because two of the
+/// 403s a non-finance role. Kept as a small helper because five of the
 /// swept invoice handlers need it verbatim.
-fn assert_staff_billing_finance(auth: &crate::modules::auth::AuthState) -> AppResult<()> {
+///
+/// PMS-1041: the module half was missing here, so five invoice handlers
+/// served a tenant that had switched billing off. The order below is the
+/// order stacking `RequireBilling` ahead of `RequireFinance` produced and
+/// is deliberate: MODULE first, then ROLE, so a disabled module answers
+/// 404 for every staff role rather than 403 for some and stays
+/// indistinguishable from a route that is not mounted.
+///
+/// Scope: the STAFF plane only. Whether a contact session should also see
+/// 404 when the MSP disables billing is a separate product question - the
+/// contact branch gates on the PMS-1025 `caps::INVOICES_*` capabilities
+/// and is deliberately not decided here.
+async fn assert_staff_billing_finance(
+    auth: &crate::modules::auth::AuthState,
+    settings: &SettingsService,
+) -> AppResult<()> {
     let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+    // Module gate, matching `RequireModuleEnabled`: 404, not 403.
+    if !settings.is_module_enabled(user.tenant(), "billing").await? {
+        return Err(AppError::NotFound("Billing module".to_string()));
+    }
     let role = user.role.as_str();
     if !matches!(role, "super_admin" | "admin" | "finance") {
         return Err(AppError::Forbidden("Insufficient permissions".to_string()));
@@ -597,12 +619,13 @@ async fn get_invoice_pdf(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Response> {
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => {
-            assert_staff_billing_finance(auth)?;
+            assert_staff_billing_finance(auth, &settings).await?;
         }
         CallerContext::Contact(_) => {
             caller
@@ -662,6 +685,7 @@ async fn pay_invoice(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Path(invoice_id): Path<Uuid>,
     Json(request): Json<PayInvoiceRequest>,
 ) -> AppResult<Json<PayInvoiceResponse>> {
@@ -669,7 +693,7 @@ async fn pay_invoice(
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => {
-            assert_staff_billing_finance(auth)?;
+            assert_staff_billing_finance(auth, &settings).await?;
         }
         CallerContext::Contact(_) => {
             caller.require_capability(caps::INVOICES_PAY, &db).await?;
@@ -711,12 +735,13 @@ async fn get_invoice_payment_readiness(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoicePaymentReadinessResponse>> {
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => {
-            assert_staff_billing_finance(auth)?;
+            assert_staff_billing_finance(auth, &settings).await?;
         }
         CallerContext::Contact(_) => {
             caller.require_capability(caps::INVOICES_READ, &db).await?;
@@ -999,6 +1024,87 @@ mod finance_gate {
             "these handlers read financial data behind the module gate alone: \
              {missing:?}. Add `_finance: RequireFinance`, or add the name to \
              UNGATED with a comment saying why every role may read it."
+        );
+    }
+
+    /// The five dual-plane handlers whose staff branch carries the gate in the
+    /// body rather than in the argument list (PMS-1041). They take
+    /// `RequireCallerContext` because they serve the contact plane too, and
+    /// stacking `RequireBilling` on top would resolve the caller twice.
+    ///
+    /// The list is exhaustive on purpose: adding a sixth is a deliberate act,
+    /// because the inline form is the one that already lost the module gate
+    /// once and the compiler cannot see the omission.
+    const INLINE_STAFF_GATE: &[&str] = &[
+        "get_invoice",
+        "list_invoices",
+        "get_invoice_pdf",
+        "pay_invoice",
+        "get_invoice_payment_readiness",
+    ];
+
+    /// And every handler carries the MODULE gate, one way or the other
+    /// (PMS-1041).
+    ///
+    /// [`every_billing_handler_also_takes_the_finance_gate`] filters on
+    /// `RequireBilling` before it asserts anything, so a handler carrying
+    /// NEITHER gate was skipped rather than flagged, and the `seen > 20`
+    /// tripwire stayed healthy on the other thirty. That is exactly how five
+    /// invoice handlers came to serve a tenant with billing switched off: the
+    /// dual-plane conversion replaced their extractors with an inline helper
+    /// that reproduced only the role half.
+    ///
+    /// So this pass asserts the complement: every `async fn` in the file
+    /// either takes `RequireBilling` in its argument list or calls
+    /// `assert_staff_billing_finance` in its body, and the second set is
+    /// exactly [`INLINE_STAFF_GATE`].
+    #[test]
+    fn every_billing_handler_carries_the_module_gate() {
+        const SRC: &str = include_str!("routes.rs");
+        // Stop at this module: it quotes `async fn ` as a literal, and unlike
+        // the sibling scan this one has no `RequireBilling` filter to drop the
+        // match for it.
+        let handlers = SRC
+            .split_once("mod finance_gate {")
+            .map(|(before, _)| before)
+            .expect("the guard module's own header is in this file");
+
+        let mut ungated: Vec<&str> = Vec::new();
+        let mut inline: Vec<&str> = Vec::new();
+        for chunk in handlers.split("async fn ").skip(1) {
+            let Some((name, rest)) = chunk.split_once('(') else {
+                continue;
+            };
+            let Some((args, body)) = rest.split_once(") ->") else {
+                continue;
+            };
+            // The helper itself is the gate, not a handler behind it.
+            if name == "assert_staff_billing_finance" {
+                continue;
+            }
+            if args.contains("RequireBilling") {
+                continue;
+            }
+            if body.contains("assert_staff_billing_finance(") {
+                inline.push(name);
+            } else {
+                ungated.push(name);
+            }
+        }
+
+        assert!(
+            ungated.is_empty(),
+            "these handlers take no module gate at all, so a tenant with \
+             billing disabled still reaches them: {ungated:?}. Add the \
+             `RequireBilling` extractor, or call \
+             `assert_staff_billing_finance` on the staff branch and add the \
+             name to INLINE_STAFF_GATE."
+        );
+        assert_eq!(
+            inline, INLINE_STAFF_GATE,
+            "the set of handlers gating inline has changed. The inline form is \
+             the one that lost the module gate in PMS-1041, so a new member is \
+             a decision to record here, not a drive-by."
         );
     }
 

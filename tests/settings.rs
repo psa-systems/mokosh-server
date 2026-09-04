@@ -475,3 +475,192 @@ async fn enabled_module_response_unchanged(pool: PgPool) {
     assert!(body["data"].is_array());
     assert!(body["meta"].is_object());
 }
+
+// --- PMS-1041: the five dual-plane invoice routes keep the module gate ------
+
+/// The dual-plane conversion swapped `RequireBilling` + `RequireFinance` on
+/// five invoice handlers for `RequireCallerContext` plus an inline helper that
+/// reproduced only the role half, so a tenant with billing switched off still
+/// listed invoices, read one, downloaded its PDF, checked pay readiness and
+/// started a payment.
+///
+/// `disabled_module_returns_404_on_route_access` above only ever exercised
+/// `GET /invoices`, which is why the other four went unnoticed once that one
+/// was fixed. This walks the whole set, and asserts each route is unchanged
+/// when the module is on so the gate is not just answering 404 to everything.
+#[sqlx::test]
+async fn disabled_billing_404s_every_dual_plane_invoice_route(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    common::seed_billing_contact(&pool, company_id).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let invoice: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-07-15",
+            "lines": [{
+                "line_type": "service",
+                "description": "Work",
+                "quantity": "1",
+                "unit_price": "100",
+            }],
+        }))
+        .send()
+        .await
+        .expect("create invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
+
+    // `pay` is a POST and 400s with no gateway configured, so it is asserted
+    // as "not 404" when the module is on rather than as a success.
+    let pay_body = serde_json::json!({
+        "success_url": "https://example.com/paid",
+        "cancel_url": "https://example.com/cancelled",
+    });
+    let gets = [
+        "/api/v1/invoices?per_page=5".to_string(),
+        format!("/api/v1/invoices/{invoice_id}"),
+        format!("/api/v1/invoices/{invoice_id}/pdf"),
+        format!("/api/v1/invoices/{invoice_id}/payment-readiness"),
+    ];
+
+    for path in &gets {
+        let resp = app
+            .client
+            .get(app.url(path))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("baseline GET");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "{path} must serve while billing is enabled, got {}",
+            resp.status()
+        );
+    }
+    let pay = app
+        .client
+        .post(app.url(&format!("/api/v1/invoices/{invoice_id}/pay")))
+        .bearer_auth(&token)
+        .json(&pay_body)
+        .send()
+        .await
+        .expect("baseline pay");
+    assert_ne!(
+        pay.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "pay must reach the handler while billing is enabled"
+    );
+
+    let disable = app
+        .client
+        .put(app.url("/api/v1/settings/modules/billing"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "is_enabled": false }))
+        .send()
+        .await
+        .expect("disable billing");
+    assert!(disable.status().is_success());
+
+    for path in &gets {
+        let resp = app
+            .client
+            .get(app.url(path))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("gated GET");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{path} must 404 with billing disabled, got {}",
+            resp.status()
+        );
+    }
+    let pay = app
+        .client
+        .post(app.url(&format!("/api/v1/invoices/{invoice_id}/pay")))
+        .bearer_auth(&token)
+        .json(&pay_body)
+        .send()
+        .await
+        .expect("gated pay");
+    assert_eq!(
+        pay.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "pay must 404 with billing disabled, got {}",
+        pay.status()
+    );
+}
+
+/// PMS-1041: the module check runs BEFORE the role check, so a disabled
+/// module is a 404 for every staff role rather than a 403 for the roles the
+/// finance gate would have refused. That ordering is what stacking
+/// `RequireBilling` ahead of `RequireFinance` produced, and it is what keeps a
+/// disabled feature indistinguishable from a route that is not mounted.
+#[sqlx::test]
+async fn disabled_billing_404s_a_non_finance_role_rather_than_403(pool: PgPool) {
+    let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
+    let (_tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool).await;
+    let admin_token = common::login(&app, &admin_email, &admin_password).await;
+    let tech_token = common::login(&app, &tech_email, &tech_password).await;
+
+    // Billing on: the role gate is what refuses a technician.
+    let forbidden = app
+        .client
+        .get(app.url("/api/v1/invoices?per_page=5"))
+        .bearer_auth(&tech_token)
+        .send()
+        .await
+        .expect("technician GET with billing enabled");
+    assert_eq!(
+        forbidden.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a technician must be refused by the role gate, got {}",
+        forbidden.status()
+    );
+
+    let disable = app
+        .client
+        .put(app.url("/api/v1/settings/modules/billing"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({ "is_enabled": false }))
+        .send()
+        .await
+        .expect("disable billing");
+    assert!(disable.status().is_success());
+
+    // Billing off: the module gate answers first, for the technician as well
+    // as for the admin, so neither learns that the route exists.
+    for (who, token) in [("technician", &tech_token), ("admin", &admin_token)] {
+        let resp = app
+            .client
+            .get(app.url("/api/v1/invoices?per_page=5"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("GET with billing disabled");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "a disabled module must 404 the {who} too, got {}",
+            resp.status()
+        );
+    }
+}
