@@ -26,21 +26,27 @@
 //! [`ObjectKind::LegacyKbAttachment`] is the flat path it came from, kept
 //! addressable so a file the mover has not reached yet is still served.
 //!
-//! [`LocalStore::path_for`] is where every layout decision lives, and the test
+//! [`LocalProvider::path_for`] is where every layout decision lives, and the test
 //! below pins each of them, so a future change is a deliberate edit to a stated
 //! expectation rather than an accident that orphans a customer's attachments.
 //!
-//! PMS-958 found the seam documented and not built: `dyn ObjectStore` appeared
-//! nowhere, six structs held a `LocalStore` by name and four free functions
-//! constructed one inline, so "selected by configuration" had nowhere to plug
-//! in. Every caller now holds an `Arc<dyn ObjectStore>` from [`shared`], which
-//! is built once per process from `STORAGE_BACKEND` and touched first by `main`
-//! so a misconfigured backend ends startup rather than the first upload. A
-//! process-wide handle rather than a constructor argument, because the store
-//! is constructed at thirteen sites across the router, the tenants routes,
-//! billing and the seeders, and because an object-store client owns a
-//! connection pool that is only useful if it is shared; `utils::net` and
+//! PMS-958 found the seam documented and not built: `dyn ObjectProvider`
+//! appeared nowhere, six structs held a `LocalProvider` by name and four free
+//! functions constructed one inline, so "selected by configuration" had nowhere
+//! to plug in. Every caller now holds an `Arc<dyn ObjectProvider>` from
+//! [`shared`], which is built once per process from `STORAGE_BACKEND` and
+//! touched first by `main` so a misconfigured provider ends startup rather than
+//! the first upload. A process-wide handle rather than a constructor argument,
+//! because the provider is constructed at thirteen sites across the router, the
+//! tenants routes, billing and the seeders, and because an object-store client
+//! owns a connection pool that is only useful if it is shared; `utils::net` and
 //! `utils::client_ip` hold their env-derived configuration the same way.
+//!
+//! PMS-1010 settled the word: a selectable implementation of a capability is a
+//! PROVIDER, here as in [`crate::secrets`] and as
+//! [`crate::modules::billing::provider::PaymentProvider`] already was. The
+//! operator-facing variable is still `STORAGE_BACKEND` and deliberately so:
+//! renaming it breaks every existing deployment for a vocabulary change.
 
 mod ledger;
 pub mod s3;
@@ -83,8 +89,8 @@ const DEFAULT_ROOT: &str = "./attachments";
 /// Where a stored object lives, relative to the root.
 ///
 /// Each variant carries the identity its feature already uses, and NOT a path:
-/// the point of the enum is that a caller says what the object is and the store
-/// decides where that goes.
+/// the point of the enum is that a caller says what the object is and the
+/// provider decides where that goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
     /// A file attached to a ticket or a ticket note. Stored per tenant since
@@ -141,7 +147,7 @@ pub enum ObjectKind {
     /// code cannot reach, so the path has to stay addressable until the mover
     /// has been everywhere. It is its own variant rather than a flag on the one
     /// above so that reaching it means saying the word "legacy" at the call
-    /// site: a fallback hidden inside `LocalStore` would apply to every read
+    /// site: a fallback hidden inside `LocalProvider` would apply to every read
     /// and would be reachable from any tenant's key, which is precisely the
     /// hole PMS-960 closes.
     ///
@@ -194,7 +200,7 @@ impl ObjectKind {
     }
 }
 
-/// A tenant and an object. The whole address, and the only thing the store
+/// A tenant and an object. The whole address, and the only thing the provider
 /// accepts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectKey {
@@ -260,7 +266,7 @@ impl ObjectKey {
 /// streams: PMS-783 F6 removed a `tokio::fs::read` of a whole file into memory
 /// and this interface must not put it back. `ReaderStream` wraps this directly,
 /// and an object store's response body adapts to it, so the shape survives the
-/// second backend (PMS-958).
+/// second provider (PMS-958).
 pub type ObjectReader = Pin<Box<dyn AsyncRead + Send>>;
 
 /// What a feature can ask of storage.
@@ -269,7 +275,7 @@ pub type ObjectReader = Pin<Box<dyn AsyncRead + Send>>;
 /// let one reach outside its tenant, because there is no method that takes a
 /// path.
 #[async_trait]
-pub trait ObjectStore: Send + Sync + std::fmt::Debug {
+pub trait ObjectProvider: Send + Sync + std::fmt::Debug {
     async fn put(&self, key: &ObjectKey, bytes: &[u8]) -> AppResult<()>;
     /// The whole object. For a logo or a KB image, which are already read whole
     /// and are capped in the megabytes.
@@ -289,16 +295,16 @@ pub trait ObjectStore: Send + Sync + std::fmt::Debug {
     /// part-way through the `put` leaves a truncated object at the
     /// destination, and nothing afterwards can tell that from a completed
     /// move, so a corrupt image would be served forever. A rename cannot
-    /// half-happen. The S3 backend (PMS-958) has its own atomic answer
+    /// half-happen. The S3 provider (PMS-958) has its own atomic answer
     /// (server-side copy, then delete), which is exactly why the choice
-    /// belongs to the backend and not to the caller.
+    /// belongs to the provider and not to the caller.
     ///
     /// Unlike [`delete`](Self::delete) this is NOT best-effort: a missing
     /// source is an error, because the only caller is moving something it
     /// has just established is there and a silent success would mark the
     /// object migrated when nothing moved.
     async fn rename(&self, from: &ObjectKey, to: &ObjectKey) -> AppResult<()>;
-    /// Where the object is, in this backend's own words: an absolute path on
+    /// Where the object is, in this provider's own words: an absolute path on
     /// the local one, a bucket URL on an object store.
     ///
     /// Descriptive only. It exists because `ticket_attachments.storage_path`
@@ -308,7 +314,7 @@ pub trait ObjectStore: Send + Sync + std::fmt::Debug {
     fn location(&self, key: &ObjectKey) -> AppResult<String>;
 }
 
-/// Where the local backend keeps things.
+/// Where the local provider keeps things.
 #[derive(Clone, Debug)]
 pub struct StorageConfig {
     pub root: PathBuf,
@@ -334,16 +340,16 @@ impl Default for StorageConfig {
     }
 }
 
-/// The local-filesystem backend, and the only one self-hosting needs.
+/// The local-filesystem provider, and the only one self-hosting needs.
 ///
 /// It stays the default with nothing configured; an S3-compatible sibling is
 /// PMS-958 and is selected by configuration rather than assumed.
 #[derive(Clone, Debug)]
-pub struct LocalStore {
+pub struct LocalProvider {
     config: StorageConfig,
 }
 
-impl LocalStore {
+impl LocalProvider {
     pub fn new(config: StorageConfig) -> Self {
         Self { config }
     }
@@ -371,7 +377,7 @@ impl ObjectKey {
     /// Where this object lives BELOW the root, which is the half of a path that
     /// is a property of the object rather than of the deployment.
     ///
-    /// PMS-957 needs it separately from [`LocalStore::path_for`], because the
+    /// PMS-957 needs it separately from [`LocalProvider::path_for`], because the
     /// file ledger records where a file is and the root is not part of that: it
     /// is runtime configuration that differs between a dev container and a
     /// production volume, and an absolute path baked into a row goes stale the
@@ -454,7 +460,7 @@ fn validate_digest(digest: &str) -> AppResult<()> {
 }
 
 #[async_trait]
-impl ObjectStore for LocalStore {
+impl ObjectProvider for LocalProvider {
     async fn put(&self, key: &ObjectKey, bytes: &[u8]) -> AppResult<()> {
         let path = self.path_for(key)?;
         if let Some(parent) = path.parent() {
@@ -519,7 +525,7 @@ impl ObjectStore for LocalStore {
 
 /// Which implementation a deployment runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StorageBackend {
+pub enum StorageProviderKind {
     /// The filesystem under `ATTACHMENT_DIR`. The default, and the only one
     /// self-hosting needs.
     Local,
@@ -528,11 +534,11 @@ pub enum StorageBackend {
     S3,
 }
 
-impl StorageBackend {
+impl StorageProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            StorageBackend::Local => "local",
-            StorageBackend::S3 => "s3",
+            StorageProviderKind::Local => "local",
+            StorageProviderKind::S3 => "s3",
         }
     }
 
@@ -552,58 +558,58 @@ impl StorageBackend {
     /// this crate refuses everywhere else.
     pub fn parse(raw: &str) -> AppResult<Self> {
         match raw.trim() {
-            "" | "local" => Ok(StorageBackend::Local),
-            "s3" => Ok(StorageBackend::S3),
+            "" | "local" => Ok(StorageProviderKind::Local),
+            "s3" => Ok(StorageProviderKind::S3),
             other => Err(AppError::Configuration(format!(
-                "STORAGE_BACKEND {other:?} is not a known backend; expected 'local' or 's3'"
+                "STORAGE_BACKEND {other:?} is not a known provider; expected 'local' or 's3'"
             ))),
         }
     }
 }
 
-/// Build the backend this deployment is configured for.
+/// Build the provider this deployment is configured for.
 ///
-/// The ONE place a [`StorageBackend`] becomes an [`ObjectStore`], so no
-/// construction site can pick a backend of its own. Fallible, so that
-/// [`init_from_env`] can end startup on a bad configuration: the local backend
+/// The ONE place a [`StorageProviderKind`] becomes an [`ObjectProvider`], so no
+/// construction site can pick a provider of its own. Fallible, so that
+/// [`init_from_env`] can end startup on a bad configuration: the local provider
 /// cannot fail to build, but the S3 one refuses a half-configured deployment
 /// here rather than on the first upload.
-pub fn store_from_env() -> AppResult<Arc<dyn ObjectStore>> {
-    let backend = StorageBackend::from_env()?;
-    let store: Arc<dyn ObjectStore> = match backend {
-        StorageBackend::Local => Arc::new(LocalStore::from_env()),
-        StorageBackend::S3 => Arc::new(s3::S3Store::from_env()?),
+pub fn provider_from_env() -> AppResult<Arc<dyn ObjectProvider>> {
+    let provider = StorageProviderKind::from_env()?;
+    let built: Arc<dyn ObjectProvider> = match provider {
+        StorageProviderKind::Local => Arc::new(LocalProvider::from_env()),
+        StorageProviderKind::S3 => Arc::new(s3::S3Provider::from_env()?),
     };
-    tracing::info!(backend = backend.as_str(), "storage backend selected");
-    Ok(store)
+    tracing::info!(provider = provider.as_str(), "storage provider selected");
+    Ok(built)
 }
 
-static SHARED: OnceLock<Arc<dyn ObjectStore>> = OnceLock::new();
+static SHARED: OnceLock<Arc<dyn ObjectProvider>> = OnceLock::new();
 
-/// Build the process-wide store from the environment, once, and fail loudly.
+/// Build the process-wide provider from the environment, once, and fail loudly.
 ///
 /// `main` calls this before it builds anything that stores bytes, which is
-/// what makes a misconfigured backend a boot failure rather than a 500 on the
-/// first upload. A second call after the first succeeded returns the store
+/// what makes a misconfigured provider a boot failure rather than a 500 on the
+/// first upload. A second call after the first succeeded returns the provider
 /// already built and reads no configuration.
-pub fn init_from_env() -> AppResult<Arc<dyn ObjectStore>> {
-    if let Some(store) = SHARED.get() {
-        return Ok(store.clone());
+pub fn init_from_env() -> AppResult<Arc<dyn ObjectProvider>> {
+    if let Some(provider) = SHARED.get() {
+        return Ok(provider.clone());
     }
-    let store = store_from_env()?;
-    Ok(SHARED.get_or_init(|| store).clone())
+    let provider = provider_from_env()?;
+    Ok(SHARED.get_or_init(|| provider).clone())
 }
 
-/// The store every feature uses.
+/// The provider every feature uses.
 ///
 /// Built from the environment on first use when nothing called
 /// [`init_from_env`], which is the test and CLI path; a configuration that
 /// cannot build is a panic there, because there is no request to answer with a
 /// 500 and no startup to end.
-pub fn shared() -> Arc<dyn ObjectStore> {
+pub fn shared() -> Arc<dyn ObjectProvider> {
     SHARED
         .get_or_init(|| {
-            store_from_env().unwrap_or_else(|e| panic!("storage backend configuration: {e}"))
+            provider_from_env().unwrap_or_else(|e| panic!("storage provider configuration: {e}"))
         })
         .clone()
 }
@@ -612,8 +618,8 @@ pub fn shared() -> Arc<dyn ObjectStore> {
 mod tests {
     use super::*;
 
-    fn store() -> LocalStore {
-        LocalStore::new(StorageConfig {
+    fn provider() -> LocalProvider {
+        LocalProvider::new(StorageConfig {
             root: PathBuf::from("/data/attachments"),
         })
     }
@@ -624,7 +630,7 @@ mod tests {
     /// A SHA-256 shaped string: 64 hex characters.
     const DIGEST: &str = "4444444444444444444444444444444444444444444444444444444444444444";
 
-    /// Every layout this store knows, pinned.
+    /// Every layout this provider knows, pinned.
     ///
     /// This is the test that makes a layout change safe to merge: every file
     /// already on a customer's volume is at one of these paths, so a change to
@@ -633,7 +639,7 @@ mod tests {
     /// sitting on disk.
     #[test]
     fn the_layout_is_exactly_what_each_module_used_to_build() {
-        let s = store();
+        let s = provider();
         assert_eq!(
             s.path_for(&ObjectKey::ticket_attachment(TENANT, OBJECT))
                 .unwrap(),
@@ -669,7 +675,7 @@ mod tests {
     /// that reaches a path.
     #[test]
     fn only_a_real_digest_names_a_branding_logo() {
-        let s = store();
+        let s = provider();
         for hostile in [
             "../../etc/passwd",
             "..",
@@ -698,7 +704,7 @@ mod tests {
     /// about once and forgetting.
     #[test]
     fn a_kb_attachment_cannot_collide_with_a_ticket_attachment() {
-        let s = store();
+        let s = provider();
         assert_ne!(
             s.path_for(&ObjectKey::kb_attachment(TENANT, OBJECT))
                 .unwrap(),
@@ -713,7 +719,7 @@ mod tests {
     /// is the whole of what that issue asked for.
     #[test]
     fn two_tenants_cannot_address_the_same_object() {
-        let s = store();
+        let s = provider();
         assert_ne!(
             s.path_for(&ObjectKey::ticket_attachment(TENANT, OBJECT))
                 .unwrap(),
@@ -748,7 +754,7 @@ mod tests {
     /// database row, and once the mover has been everywhere the variant goes.
     #[test]
     fn the_legacy_path_is_the_one_that_ignores_its_tenant() {
-        let s = store();
+        let s = provider();
         assert_eq!(
             s.path_for(&ObjectKey::legacy_kb_attachment(TENANT, OBJECT))
                 .unwrap(),
@@ -762,7 +768,7 @@ mod tests {
     /// alphanumeric rather than by being recognised.
     #[test]
     fn a_hostile_extension_cannot_escape_the_root() {
-        let s = store();
+        let s = provider();
         for hostile in [
             "../../etc/passwd",
             "..",
@@ -821,7 +827,7 @@ mod tests {
     /// variable in code". `set_var` takes the key as a string literal and so
     /// does a `const` holding it, while a doc comment naming the variable in
     /// backticks is ordinary prose and stays allowed: two suites explain when
-    /// the store reads it, which is worth keeping.
+    /// the provider reads it, which is worth keeping.
     #[test]
     fn only_the_test_harness_picks_a_storage_root() {
         let tests = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
@@ -880,7 +886,7 @@ mod tests {
     #[tokio::test]
     async fn a_move_carries_the_bytes_and_leaves_nothing_behind() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let s = LocalStore::new(StorageConfig {
+        let s = LocalProvider::new(StorageConfig {
             root: dir.path().to_path_buf(),
         });
         let from = ObjectKey::ticket_attachment(TENANT, OBJECT);
@@ -900,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn moving_something_that_is_not_there_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let s = LocalStore::new(StorageConfig {
+        let s = LocalProvider::new(StorageConfig {
             root: dir.path().to_path_buf(),
         });
         assert!(s
@@ -983,16 +989,25 @@ mod tests {
     /// error because the operator asked for something and did not get it.
     #[test]
     fn blank_is_local_and_a_typo_is_an_error() {
-        assert_eq!(StorageBackend::parse("").unwrap(), StorageBackend::Local);
-        assert_eq!(StorageBackend::parse("  ").unwrap(), StorageBackend::Local);
         assert_eq!(
-            StorageBackend::parse("local").unwrap(),
-            StorageBackend::Local
+            StorageProviderKind::parse("").unwrap(),
+            StorageProviderKind::Local
         );
-        assert_eq!(StorageBackend::parse(" s3 ").unwrap(), StorageBackend::S3);
+        assert_eq!(
+            StorageProviderKind::parse("  ").unwrap(),
+            StorageProviderKind::Local
+        );
+        assert_eq!(
+            StorageProviderKind::parse("local").unwrap(),
+            StorageProviderKind::Local
+        );
+        assert_eq!(
+            StorageProviderKind::parse(" s3 ").unwrap(),
+            StorageProviderKind::S3
+        );
         for typo in ["S3", "minio", "filesystem", "s3,local"] {
             assert!(
-                StorageBackend::parse(typo).is_err(),
+                StorageProviderKind::parse(typo).is_err(),
                 "{typo:?} must not fall back to local"
             );
         }
@@ -1002,7 +1017,7 @@ mod tests {
     /// second is how two parts of one process come to disagree about where
     /// bytes are.
     #[test]
-    fn there_is_one_reader_of_the_backend_variable() {
+    fn there_is_one_reader_of_the_provider_variable() {
         const SRC: &str = include_str!("mod.rs");
         assert_eq!(SRC.matches("var(\"STORAGE_BACKEND\")").count(), 1);
     }

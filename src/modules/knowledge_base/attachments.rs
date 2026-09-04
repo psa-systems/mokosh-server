@@ -50,7 +50,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::{RequireManager, TenantId, TenantScoped};
-use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectStore};
+use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
 use crate::utils::error::{AppError, AppResult};
 // PMS-941: one allowlist for every publicly-readable image route. SVG is
 // refused there, for the reason the module header of `inline_image` states.
@@ -100,7 +100,7 @@ pub struct KbAttachmentService {
     db: Database,
     config: KbAttachmentConfig,
     /// PMS-910: where the bytes go. This module no longer knows.
-    store: Arc<dyn ObjectStore>,
+    store: Arc<dyn ObjectProvider>,
     /// PMS-957: one row per stored file, so the tenant rollup is a fact.
     ledger: FileLedger,
 }

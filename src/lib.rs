@@ -85,4 +85,83 @@ mod repo_hygiene {
              the one it replaced: {hits:?}"
         );
     }
+
+    /// PMS-1010: a selectable implementation is a PROVIDER, and the two words
+    /// it replaced do not come back.
+    ///
+    /// One concept had three names before that issue - the code said store, the
+    /// architecture said provider, and the tracker said backend - and a reader
+    /// could not tell whether they were three concepts. Restating the rule in
+    /// prose is what let the split survive three modules, so it is enforced
+    /// here: every item declared under `src/secrets/` and `src/storage/` has to
+    /// be named for the word that won.
+    ///
+    /// Only DECLARATIONS are checked, so `SECRET_BACKEND` and `STORAGE_BACKEND`
+    /// stay exactly as they are. They are operator-facing, and renaming them
+    /// would break every existing deployment for a vocabulary change. Prose is
+    /// not checked either: "an S3-compatible object store" is what that product
+    /// is called.
+    ///
+    /// The needles are assembled rather than written, because this file would
+    /// otherwise be a hit on itself.
+    #[test]
+    fn the_provider_seams_declare_no_store_and_no_backend() {
+        let retired = [format!("st{}", "ore"), format!("back{}", "end")];
+        // Everything that introduces a name a reader has to learn.
+        const KEYWORDS: &[&str] = &[
+            "mod ", "struct ", "enum ", "trait ", "type ", "fn ", "union ", "const ", "static ",
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut hits: Vec<String> = Vec::new();
+        let mut pending = vec![root.join("src/secrets"), root.join("src/storage")];
+
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read a provider module directory") {
+                let entry = entry.expect("read directory entry");
+                let path = entry.path();
+                if entry.file_type().expect("read entry type").is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("path came from this walk")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let source = std::fs::read_to_string(&path).expect("read a provider source file");
+
+                for line in source.lines() {
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue;
+                    }
+                    for keyword in KEYWORDS {
+                        let Some(rest) = code.split(keyword).nth(1) else {
+                            continue;
+                        };
+                        let declared: String = rest
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect::<String>()
+                            .to_ascii_lowercase();
+                        if retired.iter().any(|word| declared.contains(word.as_str())) {
+                            hits.push(format!("{relative}: {}", code.trim_end()));
+                        }
+                    }
+                }
+            }
+        }
+
+        hits.sort();
+        hits.dedup();
+        assert!(
+            hits.is_empty(),
+            "a selectable implementation is a provider (PMS-1010); these \
+             declarations still use the words it replaced: {hits:#?}"
+        );
+    }
 }

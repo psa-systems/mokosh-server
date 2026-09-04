@@ -38,9 +38,9 @@ pub struct BillingService {
     /// disables the email (no base to build the link from).
     portal_origin: Option<String>,
     /// PMS-968: where a tenant's gateway credentials live. Injected rather than
-    /// built here, so the backend is chosen once at startup by
-    /// `secrets::store_from_env` and no constructor can pick a different one.
-    secrets: Arc<dyn crate::secrets::SecretStore>,
+    /// built here, so the provider is chosen once at startup by
+    /// `secrets::provider_from_env` and no constructor can pick a different one.
+    secrets: Arc<dyn crate::secrets::SecretProvider>,
 }
 
 /// PMS-990: the due date offset when neither the invoice's term nor the
@@ -51,11 +51,11 @@ const DEFAULT_NET_DAYS: i32 = 30;
 
 impl BillingService {
     /// Zero-key constructor for callers that never touch secret material (the
-    /// QA seeder). Its secret store is the database one under the same zero
+    /// QA seeder). Its secret provider is the database one under the same zero
     /// key, so the two halves agree; nothing on that path reads a gateway
     /// credential.
     pub fn new(db: Database) -> Self {
-        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+        let secrets = Arc::new(crate::secrets::DatabaseSecretProvider::new(
             db.clone(),
             [0u8; 32],
         ));
@@ -448,24 +448,24 @@ impl BillingService {
     /// payment-gateway-config write path so secrets never hit the DB
     /// in cleartext.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
-        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+        let secrets = Arc::new(crate::secrets::DatabaseSecretProvider::new(
             db.clone(),
             encryption_key,
         ));
         Self::with_secrets(db, encryption_key, secrets)
     }
 
-    /// PMS-968: the constructor that takes the configured secret store.
+    /// PMS-968: the constructor that takes the configured secret provider.
     ///
-    /// `with_encryption_key` keeps the database backend, which is correct for
+    /// `with_encryption_key` keeps the database provider, which is correct for
     /// the callers that have no configuration to consult (tests, the seeder).
     /// Every serving instance is built through here from
-    /// `secrets::store_from_env`, so a deployment on Infisical has all of them
+    /// `secrets::provider_from_env`, so a deployment on Infisical has all of them
     /// on Infisical rather than whichever ones remembered.
     pub fn with_secrets(
         db: Database,
         encryption_key: [u8; 32],
-        secrets: Arc<dyn crate::secrets::SecretStore>,
+        secrets: Arc<dyn crate::secrets::SecretProvider>,
     ) -> Self {
         Self {
             db,
@@ -487,7 +487,7 @@ impl BillingService {
         encryption_key: [u8; 32],
         mailer: Arc<dyn Mailer>,
         portal_origin: String,
-        secrets: Arc<dyn crate::secrets::SecretStore>,
+        secrets: Arc<dyn crate::secrets::SecretProvider>,
     ) -> Self {
         Self {
             db,
@@ -1734,7 +1734,7 @@ impl BillingService {
                 provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
                 is_active: r.is_active,
                 is_test_mode: r.is_test_mode,
-                // PMS-968: NULL means the credential is in the secret store,
+                // PMS-968: NULL means the credential is in the secret provider,
                 // so the row is configured. Non-NULL and non-empty is the
                 // pre-move state and equally configured. Only an empty string
                 // would not be, and nothing writes one.
@@ -1778,7 +1778,7 @@ impl BillingService {
             )));
         }
 
-        // PMS-968: a supplied credential goes to the configured secret store,
+        // PMS-968: a supplied credential goes to the configured secret provider,
         // and the row records only that it is there. `None` still means "keep
         // the existing secret" (write-only update semantics, PMS-342).
         //
@@ -1881,7 +1881,7 @@ impl BillingService {
                 .bind(request.provider.as_str())
                 .bind(request.is_active)
                 .bind(request.is_test_mode)
-                // NULL: the credential is in the secret store now, at the
+                // NULL: the credential is in the secret provider now, at the
                 // address this row's own (tenant_id, provider) gives.
                 .bind(Option::<String>::None)
                 .fetch_one(&mut *tx)
@@ -1979,8 +1979,8 @@ impl BillingService {
 
         // PMS-968: the credential goes with the row. Deleting the row and
         // leaving the secret would keep a disconnected tenant's live API key in
-        // the store indefinitely, and a later reconnect would silently inherit
-        // it. This runs after the DELETE, matching `SecretStore::delete` being
+        // the provider indefinitely, and a later reconnect would silently inherit
+        // it. This runs after the DELETE, matching `SecretProvider::delete` being
         // best-effort: the row is the thing that points at the secret, so a
         // secret with no row is orphaned rather than dangerous, whereas a row
         // whose secret is already gone cannot serve a payment.
@@ -2015,7 +2015,7 @@ impl BillingService {
     /// Recover a gateway's credential, from wherever this row keeps it.
     ///
     /// PMS-968: a non-NULL `config_encrypted` is the pre-move state and is
-    /// decrypted here; NULL means the credential is in the secret store, at the
+    /// decrypted here; NULL means the credential is in the secret provider, at the
     /// address the row's own `(tenant_id, provider)` gives. Both states are
     /// live at once on a deployment the mover has not finished, which is the
     /// point of keeping them distinguishable.
@@ -2036,7 +2036,7 @@ impl BillingService {
                 let key = crate::secrets::SecretKey::payment_gateway(tenant_id, provider_id);
                 self.secrets.get(&key).await?.ok_or_else(|| {
                     AppError::Configuration(format!(
-                        "gateway {provider_id:?} says its credential is in the secret store, but the store has none"
+                        "gateway {provider_id:?} says its credential is in the secret provider, but the provider has none"
                     ))
                 })
             }

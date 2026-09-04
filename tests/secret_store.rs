@@ -1,6 +1,6 @@
-//! PMS-967: the database backend of the secret store, against a real database.
+//! PMS-967: the database provider of the secret seam, against a real database.
 //!
-//! The unit tests in `src/secrets/mod.rs` cover the key and the backend rule
+//! The unit tests in `src/secrets/mod.rs` cover the key and the provider rule
 //! without a database. What needs Postgres is the part where being wrong is
 //! expensive: that a stored secret round-trips through AES-256-GCM, that an
 //! absent one is `None` rather than an error, and above all that RLS confines
@@ -10,7 +10,7 @@
 mod common;
 
 use mokosh_server::db::Database;
-use mokosh_server::secrets::{DatabaseSecretStore, SecretKey, SecretStore};
+use mokosh_server::secrets::{DatabaseSecretProvider, SecretKey, SecretProvider};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -18,15 +18,15 @@ use uuid::Uuid;
 /// decrypts the way the app would decrypt it.
 const TEST_KEY: [u8; 32] = [0u8; 32];
 
-fn store(pool: &PgPool) -> DatabaseSecretStore {
-    DatabaseSecretStore::new(Database::from_pool(pool.clone()), TEST_KEY)
+fn store(pool: &PgPool) -> DatabaseSecretProvider {
+    DatabaseSecretProvider::new(Database::from_pool(pool.clone()), TEST_KEY)
 }
 
 /// A store whose serving connection is the unprivileged NOBYPASSRLS role, which
 /// is the production posture and the only way RLS is actually exercised.
-async fn rls_store(pool: &PgPool) -> DatabaseSecretStore {
+async fn rls_store(pool: &PgPool) -> DatabaseSecretProvider {
     let app_pool = common::build_app_role_pool(pool).await;
-    DatabaseSecretStore::new(Database::from_pools(app_pool, pool.clone()), TEST_KEY)
+    DatabaseSecretProvider::new(Database::from_pools(app_pool, pool.clone()), TEST_KEY)
 }
 
 #[sqlx::test]
@@ -90,7 +90,7 @@ async fn an_absent_secret_is_none(pool: PgPool) {
     assert!(store.get(&key).await.expect("get").is_none());
 }
 
-/// Deleting something that is not there is success, matching `ObjectStore` and
+/// Deleting something that is not there is success, matching `ObjectProvider` and
 /// for the same reason: the caller has already removed the row that pointed at
 /// it, so a missing secret says the same thing as a deleted one.
 #[sqlx::test]

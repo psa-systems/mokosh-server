@@ -505,22 +505,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
-    // PMS-968: the secret store, built once for the whole process. A
-    // misconfigured backend ends startup here rather than surfacing when a
+    // PMS-968: the secret provider, built once for the whole process. A
+    // misconfigured provider ends startup here rather than surfacing when a
     // customer tries to pay. Built before the scheduler because the credential
     // mover needs it, and shared with the router below so every reader of a
     // gateway credential is looking in the same place.
-    let secrets = mokosh_server::secrets::store_from_env(db.clone(), encryption_key)
-        .expect("secret store configuration");
+    let secrets = mokosh_server::secrets::provider_from_env(db.clone(), encryption_key)
+        .expect("secret provider configuration");
 
-    // PMS-958: the object store, built once for the whole process for the
+    // PMS-958: the object provider, built once for the whole process for the
     // same reason. Every service that keeps bytes reaches it through
     // `storage::shared()` rather than a constructor argument (there are
     // thirteen of those constructions across the router, the tenants routes,
     // billing and the seeders), so this first touch is what turns a
-    // misconfigured backend into a boot failure instead of a 500 on the first
+    // misconfigured provider into a boot failure instead of a 500 on the first
     // upload.
-    mokosh_server::storage::init_from_env().expect("storage backend configuration");
+    mokosh_server::storage::init_from_env().expect("storage provider configuration");
 
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
@@ -597,7 +597,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     scheduler.register(kb_attachment_mover, std::time::Duration::from_secs(3600));
 
     // PMS-968: one-shot move of pre-existing gateway credentials into the
-    // configured secret store. The scheduler fires every job once at startup,
+    // configured secret provider. The scheduler fires every job once at startup,
     // so an hour gives the one-shot behaviour plus a retry if the store was
     // briefly unreachable, and once the move is done the tick is one query
     // returning no rows.
