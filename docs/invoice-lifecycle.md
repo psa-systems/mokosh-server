@@ -26,9 +26,24 @@ Because the status transition to `void` also flows through `update_invoice`, thi
 
 ## What each state can do
 
-- `draft` / `pending` (editable): edit header and lines, Send (-> `sent`), or Void (-> `void`). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
+- `draft` / `pending` (editable): edit header and lines, Send (-> `sent`, subject to the recipient precondition below), or Void (-> `void`). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
 - `sent` / `partially_paid` (collectible): the only action is Record Payment, which runs through `record_payment` (a separate path, not `update_invoice`) and advances the status `sent` -> `partially_paid` -> `paid` as the balance is collected.
 - `paid` / `void` / `written_off` (terminal): no further lifecycle actions.
+
+## Sending requires a recipient
+
+PMS-993. An invoice cannot reach `sent` without a `billing_contact_id`, because an issued invoice with no recipient is a document nobody was ever asked to pay. The recipient is the company's billing contact, `companies.default_billing_contact_id`: per-company and single-valued, so reassigning it replaces the previous holder.
+
+`update_invoice` settles it on the first `draft`/`pending` -> `sent` transition. If the invoice already carries a `billing_contact_id` it is used; otherwise the company's billing contact is resolved and WRITTEN to the invoice in the same statement. If neither yields one, the transition is refused with a 409 and the invoice stays editable.
+
+Two properties matter and both are pinned by tests:
+
+- The refusal is total. It runs before the issuer snapshot is frozen (PMS-911) and before the issued document is stored (PMS-959), so a refused send leaves `sent_at` NULL, `issuer_snapshot` NULL and no `files` row of `entity_type = 'invoice_document'`. There is no half-sent state to clean up.
+- The resolved recipient is persisted, not merely checked. The pay-now email (PMS-711) reads `invoices.billing_contact_id` after the commit, so an invoice that passed the guard without storing what it resolved would freeze, issue a document, and still email nobody.
+
+The three create paths (`create_invoice`, `create_invoice_from_time_entries`, and the recurring sweep's `generate_one_recurring_invoice`) also fall back to the company's billing contact when the request names none, so a draft usually carries its recipient from the moment it exists. An explicitly supplied `billing_contact_id` is validated against the invoice's company and tenant and is a 400 otherwise: FK checks bypass RLS, so nothing else was stopping a cross-account link.
+
+Operationally: a company with no billing contact produces drafts that cannot be sent. `CompanyResponse.default_billing_contact_id` is what makes that visible before someone tries. The recurring sweep logs a warning naming the company when it creates a draft it knows cannot be sent.
 
 ## Why a sent invoice is immutable
 
