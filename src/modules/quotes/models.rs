@@ -190,6 +190,8 @@ pub struct QuoteLineResponse {
     pub unit_price: Decimal,
     pub total: Decimal,
     pub sort_order: i32,
+    /// PMS-1038: counts toward the taxable subtotal. Stored per line.
+    pub is_taxable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +213,10 @@ pub struct QuoteResponse {
     pub valid_until: Option<NaiveDate>,
     pub subtotal: Decimal,
     pub tax_amount: Decimal,
+    /// PMS-1038: the rate `tax_amount` is derived from, frozen on the quote.
+    /// `None` means the amount was given and `recompute_totals` leaves it.
+    pub tax_rate_id: Option<Uuid>,
+    pub tax_rate: Option<Decimal>,
     pub total: Decimal,
     pub currency: Option<String>,
     pub requested_by_id: Option<Uuid>,
@@ -250,6 +256,13 @@ pub struct QuoteLineRequest {
     pub unit_price: Decimal,
     #[serde(default)]
     pub sort_order: i32,
+    /// PMS-1038: default taxable.
+    #[serde(default = "default_true")]
+    pub is_taxable: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -269,6 +282,9 @@ pub struct CreateQuoteRequest {
     /// client-supplied value would be ignored, so accepting one would only
     /// invite the caller to believe it mattered.
     pub tax_amount: Option<Decimal>,
+    /// PMS-1038: the rate to derive the tax from; absent, the tenant's
+    /// default. Ignored when `tax_amount` is given.
+    pub tax_rate_id: Option<Uuid>,
     #[serde(default)]
     #[validate(nested)]
     pub lines: Vec<QuoteLineRequest>,
@@ -362,6 +378,9 @@ pub struct UpdateQuoteRequest {
     #[validate(length(min = 3, max = 3))]
     pub currency: Option<String>,
     pub tax_amount: Option<Decimal>,
+    /// PMS-1038: naming a rate re-derives the tax on every line change from
+    /// then on; giving `tax_amount` clears the rate and keeps the amount.
+    pub tax_rate_id: Option<Uuid>,
     /// Only the internal-workflow statuses are settable here. The client
     /// decision (`accepted` / `declined`) is written by the PMS-673 portal
     /// routes, and `converted` by the PMS-674 conversion, so neither can

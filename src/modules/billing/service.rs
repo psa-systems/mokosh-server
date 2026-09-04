@@ -349,16 +349,7 @@ impl BillingService {
         .await?;
         let rate: Option<(Uuid, Decimal)> = match requested_rate {
             Some(id) => Some(Self::assert_tax_rate_in_tenant(tx, tenant_id, id).await?),
-            None => {
-                sqlx::query_as(
-                    "SELECT id, rate FROM tax_rates \
-                     WHERE tenant_id = $1 AND is_default = TRUE AND is_active = TRUE \
-                     ORDER BY created_at, id LIMIT 1",
-                )
-                .bind(tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?
-            }
+            None => Self::default_tax_rate(tx, tenant_id).await?,
         };
         let (tax, rate_id, rate_pct) = match (explicit_amount, rate) {
             (Some(amount), _) => (amount, None, None),
@@ -397,10 +388,26 @@ impl BillingService {
         Ok(())
     }
 
+    /// PMS-1029: the tenant's active default rate, if it has one. Shared with
+    /// quotes (PMS-1038).
+    pub(crate) async fn default_tax_rate(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+    ) -> AppResult<Option<(Uuid, Decimal)>> {
+        Ok(sqlx::query_as(
+            "SELECT id, rate FROM tax_rates \
+             WHERE tenant_id = $1 AND is_default = TRUE AND is_active = TRUE \
+             ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?)
+    }
+
     /// PMS-1029: a `tax_rate_id` must name an active rate in the caller's
     /// tenant. An FK check bypasses RLS, so a foreign id would satisfy the
     /// constraint and link silently (the PMS-333 reason for payment terms).
-    async fn assert_tax_rate_in_tenant(
+    pub(crate) async fn assert_tax_rate_in_tenant(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         tax_rate_id: Uuid,
