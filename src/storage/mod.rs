@@ -61,6 +61,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncRead;
 use uuid::Uuid;
 
+use crate::utils::deployment::{provider, EnablementSource};
 use crate::utils::error::{AppError, AppResult};
 
 /// Storage root when `ATTACHMENT_DIR` is unset.
@@ -537,29 +538,56 @@ pub enum StorageProviderKind {
 impl StorageProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            StorageProviderKind::Local => "local",
-            StorageProviderKind::S3 => "s3",
+            StorageProviderKind::Local => provider::LOCAL,
+            StorageProviderKind::S3 => provider::S3,
         }
     }
 
     /// The ONE reader of `STORAGE_BACKEND`, the way [`StorageConfig::from_env`]
     /// is the only reader of `ATTACHMENT_DIR`.
-    pub fn from_env() -> AppResult<Self> {
-        Self::parse(&std::env::var("STORAGE_BACKEND").unwrap_or_default())
+    ///
+    /// Returns the source alongside the backend (PMS-1011), because "nobody
+    /// configured this and the hosting profile chose local" and "the operator
+    /// asked for local" are different facts and the boot record reports both.
+    /// The hosting profile's own strictness is the startup wiring's business:
+    /// it hands in an already-resolved provider name.
+    pub fn from_env(profile_default: &str) -> AppResult<(Self, EnablementSource)> {
+        Self::resolve(
+            profile_default,
+            &std::env::var("STORAGE_BACKEND").unwrap_or_default(),
+        )
     }
 
-    /// An unset or blank value is `Local`, because a forwarded-but-unset
-    /// variable arrives as `""` (PMS-836) and the default has to be the one
-    /// that needs no other service: no integration is a hard requirement. An
-    /// unrecognised value is a hard error rather than a fall back to local,
-    /// the same rule `SECRET_BACKEND` follows: an operator who wrote
-    /// `STORAGE_BACKEND=s3 ` with a typo asked for S3, and quietly writing
-    /// their uploads to a container filesystem instead is the silent degrade
-    /// this crate refuses everywhere else.
+    /// An unset or blank value takes `profile_default`, the hosting profile's
+    /// provider for [`ProviderKind::Storage`], which is `local` in both modes:
+    /// a forwarded-but-unset variable arrives as `""` (PMS-836) and the
+    /// default has to be the one that needs no other service, since no
+    /// integration is a hard requirement.
+    ///
+    /// The default arrives as a NAME rather than as the deployment shape, so
+    /// this module never holds that knowledge (PMS-904 confines it to the auth
+    /// service and the startup wiring) and only needs to know which provider
+    /// it got.
+    pub fn resolve(profile_default: &str, raw: &str) -> AppResult<(Self, EnablementSource)> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok((Self::parse(profile_default)?, EnablementSource::Profile));
+        }
+        Ok((Self::parse(raw)?, EnablementSource::Explicit))
+    }
+
+    /// A provider NAME to a backend. An unrecognised value is a hard error
+    /// rather than a fall back to local, the same rule `SECRET_BACKEND`
+    /// follows: an operator who wrote `STORAGE_BACKEND=s3 ` with a typo asked
+    /// for S3, and quietly writing their uploads to a container filesystem
+    /// instead is the silent degrade this crate refuses everywhere else. Blank
+    /// is not a name; [`resolve`](Self::resolve) settles it against the
+    /// profile before it reaches here, so this cannot become a second place
+    /// that knows the default.
     pub fn parse(raw: &str) -> AppResult<Self> {
         match raw.trim() {
-            "" | "local" => Ok(StorageProviderKind::Local),
-            "s3" => Ok(StorageProviderKind::S3),
+            provider::LOCAL => Ok(StorageProviderKind::Local),
+            provider::S3 => Ok(StorageProviderKind::S3),
             other => Err(AppError::Configuration(format!(
                 "STORAGE_BACKEND {other:?} is not a known provider; expected 'local' or 's3'"
             ))),
@@ -574,14 +602,24 @@ impl StorageProviderKind {
 /// [`init_from_env`] can end startup on a bad configuration: the local provider
 /// cannot fail to build, but the S3 one refuses a half-configured deployment
 /// here rather than on the first upload.
-pub fn provider_from_env() -> AppResult<Arc<dyn ObjectProvider>> {
-    let provider = StorageProviderKind::from_env()?;
+///
+/// Returns the resolution alongside the provider (PMS-1011) so the boot record
+/// can report what serves storage and whether the hosting profile or the
+/// operator chose it, without a second reader of `STORAGE_BACKEND`.
+pub fn provider_from_env(
+    profile_default: &str,
+) -> AppResult<(Arc<dyn ObjectProvider>, EnablementSource)> {
+    let (provider, source) = StorageProviderKind::from_env(profile_default)?;
     let built: Arc<dyn ObjectProvider> = match provider {
         StorageProviderKind::Local => Arc::new(LocalProvider::from_env()),
         StorageProviderKind::S3 => Arc::new(s3::S3Provider::from_env()?),
     };
-    tracing::info!(provider = provider.as_str(), "storage provider selected");
-    Ok(built)
+    tracing::info!(
+        provider = provider.as_str(),
+        source = source.as_str(),
+        "storage provider selected"
+    );
+    Ok((built, source))
 }
 
 static SHARED: OnceLock<Arc<dyn ObjectProvider>> = OnceLock::new();
@@ -592,12 +630,24 @@ static SHARED: OnceLock<Arc<dyn ObjectProvider>> = OnceLock::new();
 /// what makes a misconfigured provider a boot failure rather than a 500 on the
 /// first upload. A second call after the first succeeded returns the provider
 /// already built and reads no configuration.
-pub fn init_from_env() -> AppResult<Arc<dyn ObjectProvider>> {
-    if let Some(provider) = SHARED.get() {
-        return Ok(provider.clone());
+/// Returns the selection it made (PMS-1011), so the boot record reports what
+/// serves storage and who chose it without reading `STORAGE_BACKEND` a second
+/// time.
+pub fn init_from_env(profile_default: &str) -> AppResult<(StorageProviderKind, EnablementSource)> {
+    let (kind, source) = StorageProviderKind::from_env(profile_default)?;
+    if SHARED.get().is_none() {
+        let built: Arc<dyn ObjectProvider> = match kind {
+            StorageProviderKind::Local => Arc::new(LocalProvider::from_env()),
+            StorageProviderKind::S3 => Arc::new(s3::S3Provider::from_env()?),
+        };
+        tracing::info!(
+            provider = kind.as_str(),
+            source = source.as_str(),
+            "storage provider selected"
+        );
+        let _ = SHARED.set(built);
     }
-    let provider = provider_from_env()?;
-    Ok(SHARED.get_or_init(|| provider).clone())
+    Ok((kind, source))
 }
 
 /// The provider every feature uses.
@@ -609,7 +659,9 @@ pub fn init_from_env() -> AppResult<Arc<dyn ObjectProvider>> {
 pub fn shared() -> Arc<dyn ObjectProvider> {
     SHARED
         .get_or_init(|| {
-            provider_from_env().unwrap_or_else(|e| panic!("storage provider configuration: {e}"))
+            provider_from_env(provider::LOCAL)
+                .unwrap_or_else(|e| panic!("storage provider configuration: {e}"))
+                .0
         })
         .clone()
 }
@@ -984,18 +1036,23 @@ mod tests {
         assert_eq!(DEFAULT_ROOT, "./attachments");
     }
 
-    /// The selection rule, without touching process env. Blank is local
+    /// The selection rule, without touching process env. Blank takes the
+    /// default the startup wiring hands in (`local` in both hosting profiles,
+    /// so an unconfigured deployment resolves exactly where it always did),
     /// because a forwarded-but-unset variable arrives as `""`; a typo is an
     /// error because the operator asked for something and did not get it.
     #[test]
-    fn blank_is_local_and_a_typo_is_an_error() {
+    fn blank_takes_the_supplied_default_and_a_typo_is_an_error() {
+        for blank in ["", "  "] {
+            assert_eq!(
+                StorageProviderKind::resolve(provider::LOCAL, blank).unwrap(),
+                (StorageProviderKind::Local, EnablementSource::Profile),
+                "{blank:?}"
+            );
+        }
         assert_eq!(
-            StorageProviderKind::parse("").unwrap(),
-            StorageProviderKind::Local
-        );
-        assert_eq!(
-            StorageProviderKind::parse("  ").unwrap(),
-            StorageProviderKind::Local
+            StorageProviderKind::resolve(provider::LOCAL, " s3 ").unwrap(),
+            (StorageProviderKind::S3, EnablementSource::Explicit)
         );
         assert_eq!(
             StorageProviderKind::parse("local").unwrap(),
@@ -1010,7 +1067,13 @@ mod tests {
                 StorageProviderKind::parse(typo).is_err(),
                 "{typo:?} must not fall back to local"
             );
+            assert!(
+                StorageProviderKind::resolve(provider::LOCAL, typo).is_err(),
+                "{typo:?} must not fall back to the profile default either"
+            );
         }
+        // Blank is not a provider name; only `resolve` may settle it.
+        assert!(StorageProviderKind::parse("").is_err());
     }
 
     /// `STORAGE_BACKEND` has exactly one reader, like `ATTACHMENT_DIR`: a

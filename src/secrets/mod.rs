@@ -61,6 +61,7 @@ use std::fmt;
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::utils::deployment::{provider, EnablementSource};
 use crate::utils::error::{AppError, AppResult};
 
 pub mod database;
@@ -231,16 +232,34 @@ pub enum SecretProviderKind {
 impl SecretProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            SecretProviderKind::Database => "database",
-            SecretProviderKind::Infisical => "infisical",
+            SecretProviderKind::Database => provider::DATABASE,
+            SecretProviderKind::Infisical => provider::INFISICAL,
+        }
+    }
+
+    /// A provider NAME to a kind. Blank is not a name: the caller resolves an
+    /// unset `SECRET_BACKEND` against the hosting profile's default before it
+    /// gets here, so this arm cannot quietly become a second place that knows
+    /// the default.
+    pub fn parse_name(raw: &str) -> AppResult<Self> {
+        match raw.trim() {
+            provider::DATABASE => Ok(SecretProviderKind::Database),
+            provider::INFISICAL => Ok(SecretProviderKind::Infisical),
+            other => Err(AppError::Configuration(format!(
+                "SECRET_BACKEND {other:?} is not a known provider; expected 'database' or 'infisical'"
+            ))),
         }
     }
 }
 
-/// Provider selection.
+/// Provider selection, and which of the two decided it.
 #[derive(Clone, Copy, Debug)]
 pub struct SecretsConfig {
     pub provider: SecretProviderKind,
+    /// PMS-1011: whether the hosting profile's default stands or the operator
+    /// overrode it. Reported in the boot record, so a provider nobody chose is
+    /// visible rather than assumed.
+    pub source: EnablementSource,
 }
 
 impl SecretsConfig {
@@ -249,30 +268,52 @@ impl SecretsConfig {
     /// `ATTACHMENT_DIR`. A second reader is how two parts of one process come
     /// to disagree about where secrets are.
     ///
-    /// An unset or blank value is `Database`, because a forwarded-but-unset
-    /// variable arrives as `""` (PMS-836) and the default has to be the one
-    /// that needs no other service. An unrecognised value is a hard error
-    /// rather than a fallback to the default: an operator who wrote
-    /// `SECRET_BACKEND=infisical ` with a typo asked for Infisical, and quietly
-    /// giving them the database is the silent degrade this module refuses
-    /// everywhere else.
-    pub fn from_env() -> AppResult<Self> {
-        Self::parse(&std::env::var("SECRET_BACKEND").unwrap_or_default())
+    /// An unset or blank value takes the hosting profile's default for
+    /// [`ProviderKind::Secrets`] (PMS-1011), which is `database` in both
+    /// modes: a forwarded-but-unset variable arrives as `""` (PMS-836), and
+    /// the default has to be the one that needs no other service. An
+    /// unrecognised value is a hard error rather than a fallback to the
+    /// default: an operator who wrote `SECRET_BACKEND=infisical ` with a typo
+    /// asked for Infisical, and quietly giving them the database is the silent
+    /// degrade this module refuses everywhere else. The hosting profile's
+    /// own strictness is the startup wiring's business, not this module's: it
+    /// hands in an already-resolved name.
+    pub fn from_env(profile_default: &str) -> AppResult<Self> {
+        Self::resolve(
+            profile_default,
+            &std::env::var("SECRET_BACKEND").unwrap_or_default(),
+        )
     }
 
     /// The rule itself, split out so it can be tested without writing to
     /// process-global env under a concurrent test runner.
-    pub fn parse(raw: &str) -> AppResult<Self> {
-        let provider = match raw.trim() {
-            "" | "database" => SecretProviderKind::Database,
-            "infisical" => SecretProviderKind::Infisical,
-            other => {
-                return Err(AppError::Configuration(format!(
-                    "SECRET_BACKEND {other:?} is not a known provider; expected 'database' or 'infisical'"
-                )))
-            }
-        };
-        Ok(Self { provider })
+    ///
+    /// `profile_default` is the hosting profile's provider for
+    /// [`ProviderKind::Secrets`], resolved by the startup wiring and passed in
+    /// as a NAME. This module deliberately never holds the deployment shape:
+    /// PMS-904 confines that knowledge to the auth service and the startup
+    /// wiring, and this module only needs to know which provider it got.
+    pub fn resolve(profile_default: &str, raw: &str) -> AppResult<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(Self {
+                provider: SecretProviderKind::parse_name(profile_default)?,
+                source: EnablementSource::Profile,
+            });
+        }
+        Ok(Self {
+            provider: SecretProviderKind::parse_name(raw)?,
+            source: EnablementSource::Explicit,
+        })
+    }
+
+    /// What this deployment explicitly configured, for the boot record. `None`
+    /// when the profile's default stands.
+    pub fn explicit_providers(&self) -> Option<Vec<&'static str>> {
+        match self.source {
+            EnablementSource::Explicit => Some(vec![self.provider.as_str()]),
+            EnablementSource::Profile => None,
+        }
     }
 }
 
@@ -283,11 +324,16 @@ impl SecretsConfig {
 /// purpose: callers build it once at startup where a `Result` can end the
 /// process, which is what makes "a half-configured deployment fails at boot
 /// rather than when a customer tries to pay" true rather than aspirational.
+///
+/// Returns the resolution alongside the provider (PMS-1011) so the boot record
+/// can report what serves secrets and whether the hosting profile or the
+/// operator chose it, without a second reader of `SECRET_BACKEND`.
 pub fn provider_from_env(
     db: crate::db::Database,
     encryption_key: [u8; 32],
-) -> AppResult<std::sync::Arc<dyn SecretProvider>> {
-    let config = SecretsConfig::from_env()?;
+    profile_default: &str,
+) -> AppResult<(std::sync::Arc<dyn SecretProvider>, SecretsConfig)> {
+    let config = SecretsConfig::from_env(profile_default)?;
     let provider: std::sync::Arc<dyn SecretProvider> = match config.provider {
         SecretProviderKind::Database => {
             std::sync::Arc::new(DatabaseSecretProvider::new(db, encryption_key))
@@ -296,9 +342,10 @@ pub fn provider_from_env(
     };
     tracing::info!(
         provider = config.provider.as_str(),
+        source = config.source.as_str(),
         "secret provider selected"
     );
-    Ok(provider)
+    Ok((provider, config))
 }
 
 #[cfg(test)]
@@ -373,14 +420,53 @@ mod tests {
     fn an_unset_provider_is_the_database() {
         for raw in ["", "   ", "database"] {
             assert_eq!(
-                SecretsConfig::parse(raw).unwrap().provider,
+                SecretsConfig::resolve(provider::DATABASE, raw)
+                    .unwrap()
+                    .provider,
                 SecretProviderKind::Database
             );
         }
         assert_eq!(
-            SecretsConfig::parse("infisical").unwrap().provider,
+            SecretsConfig::resolve(provider::DATABASE, "infisical")
+                .unwrap()
+                .provider,
             SecretProviderKind::Infisical
         );
+    }
+
+    /// PMS-1011: the default the startup wiring hands in stands when nothing
+    /// is set, an explicit value overrides it, and the resolution says which
+    /// happened. The default arrives as a NAME, so this module is testable
+    /// without the deployment shape; which name each profile supplies is
+    /// `utils::deployment`'s own test.
+    #[test]
+    fn the_supplied_default_stands_and_an_explicit_value_overrides_it() {
+        for default in [provider::DATABASE, provider::INFISICAL] {
+            let from_profile = SecretsConfig::resolve(default, "  ").unwrap();
+            assert_eq!(from_profile.provider.as_str(), default, "{default}");
+            assert_eq!(from_profile.source, EnablementSource::Profile, "{default}");
+            assert!(from_profile.explicit_providers().is_none(), "{default}");
+
+            let explicit = SecretsConfig::resolve(default, " infisical ").unwrap();
+            assert_eq!(
+                explicit.provider,
+                SecretProviderKind::Infisical,
+                "{default}"
+            );
+            assert_eq!(explicit.source, EnablementSource::Explicit, "{default}");
+            assert_eq!(
+                explicit.explicit_providers().unwrap(),
+                vec![provider::INFISICAL],
+                "{default}"
+            );
+        }
+    }
+
+    /// A default the profile table could not name is a configuration error
+    /// here too, not a silent fallback.
+    #[test]
+    fn an_unknown_profile_default_is_refused() {
+        assert!(SecretsConfig::resolve("vault", "").is_err());
     }
 
     /// A typo asked for something. Answering with the default would mean an
@@ -390,7 +476,7 @@ mod tests {
     fn an_unrecognised_provider_is_refused_and_not_defaulted() {
         for raw in ["infisicial", "vault", "DATABASE", "none"] {
             assert!(
-                SecretsConfig::parse(raw).is_err(),
+                SecretsConfig::resolve(provider::DATABASE, raw).is_err(),
                 "{raw:?} must not silently become the default"
             );
         }
