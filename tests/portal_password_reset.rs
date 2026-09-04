@@ -13,8 +13,8 @@
 //! plane counterpart (`PUT /contact/auth/me` edits the profile and
 //! carries no password field). And a successful reset revoked every live
 //! refresh token; `ContactAuthService::setup_password` writes the hash
-//! and marks the token used without touching `contact_sessions`. Both
-//! are recorded on the PMS-1031 follow-up as coverage the cut removed.
+//! and marks the token used without touching `contact_sessions`. The
+//! first is on the PMS-1064 ledger; the second is PMS-1062.
 
 mod common;
 
@@ -126,8 +126,13 @@ async fn forgot_password_known_email_204_and_writes_row(pool: PgPool) {
 async fn reset_password_happy_path(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
-    let (token_id, token) =
-        seed_reset_token(&pool, contact.id, "reset-secret-abcdefghij", in_thirty_minutes()).await;
+    let (token_id, token) = seed_reset_token(
+        &pool,
+        contact.id,
+        "reset-secret-abcdefghij",
+        in_thirty_minutes(),
+    )
+    .await;
 
     let resp = reset(&app, &token, STRONG).await;
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
@@ -145,7 +150,11 @@ async fn reset_password_happy_path(pool: PgPool) {
         "new password verifies"
     );
     let login = common::contact_login_response(&app, &contact, STRONG).await;
-    assert_eq!(login.status(), reqwest::StatusCode::OK, "new password signs in");
+    assert_eq!(
+        login.status(),
+        reqwest::StatusCode::OK,
+        "new password signs in"
+    );
     let old = common::contact_login_response(&app, &contact, common::CONTACT_PASSWORD).await;
     assert_eq!(
         old.status(),
@@ -169,8 +178,13 @@ async fn reset_password_happy_path(pool: PgPool) {
 async fn reset_password_replay_returns_410_regardless_of_password(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
-    let (_, token) =
-        seed_reset_token(&pool, contact.id, "reset-secret-abcdefghij2", in_thirty_minutes()).await;
+    let (_, token) = seed_reset_token(
+        &pool,
+        contact.id,
+        "reset-secret-abcdefghij2",
+        in_thirty_minutes(),
+    )
+    .await;
 
     let first = reset(&app, &token, STRONG).await;
     assert_eq!(first.status(), reqwest::StatusCode::NO_CONTENT);
@@ -228,8 +242,13 @@ async fn reset_password_unknown_token_returns_400(pool: PgPool) {
 async fn reset_password_weak_password_returns_400_and_token_unused(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
-    let (token_id, token) =
-        seed_reset_token(&pool, contact.id, "reset-secret-abcdefghij4", in_thirty_minutes()).await;
+    let (token_id, token) = seed_reset_token(
+        &pool,
+        contact.id,
+        "reset-secret-abcdefghij4",
+        in_thirty_minutes(),
+    )
+    .await;
 
     let resp = reset(&app, &token, "short").await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);

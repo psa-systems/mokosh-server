@@ -10,8 +10,7 @@
 //! wrong TOTP ticking `portal_failed_login_count`. The contact plane has
 //! no enrolment route and `ContactAuthService::login` does not read
 //! `mfa_code` (its parameter is `_mfa_code`), so neither case can be
-//! expressed against it; both are recorded on the PMS-1031 follow-up as
-//! coverage the cut removed, not as behaviour to pin.
+//! expressed against it; both are PMS-1063, not behaviour to pin here.
 
 mod common;
 
@@ -40,8 +39,7 @@ async fn seed_company(pool: &PgPool, name: &str) -> Uuid {
 async fn login_matches_email_case_insensitively(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Case Co").await;
-    let mut contact =
-        common::seed_portal_contact(&pool, company, "Alice@Example.com", &[]).await;
+    let mut contact = common::seed_portal_contact(&pool, company, "Alice@Example.com", &[]).await;
     let app = common::boot(pool.clone()).await;
 
     contact.email = "alice@example.com".to_string();

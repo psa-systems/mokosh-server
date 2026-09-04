@@ -15,8 +15,8 @@
 //! refresh token revoked every live token in its rotation chain, and a
 //! logout did the same. A contact session (`contact_sessions`) is
 //! revoked one row at a time and carries no chain, so a replay is a
-//! 401 for the replayed token only; that gap is recorded on the
-//! PMS-1031 follow-up rather than pinned here as if it were the design.
+//! 401 for the replayed token only; that gap is PMS-1062 rather than
+//! pinned here as if it were the design.
 
 mod common;
 
