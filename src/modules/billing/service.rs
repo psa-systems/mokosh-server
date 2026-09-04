@@ -3,6 +3,7 @@
 use crate::modules::auth::TenantId;
 use crate::modules::settings::read_default_currency;
 use chrono::{DateTime, NaiveDate, Utc};
+use mokosh_types::datetime::user_today;
 
 use crate::modules::contracts::service::CycleStep;
 use rust_decimal::Decimal;
@@ -866,6 +867,7 @@ impl BillingService {
     pub async fn create_invoice_from_time_entries(
         &self,
         tenant_id: TenantId,
+        user_tz: &str,
         request: &CreateInvoiceFromTimeEntriesRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
@@ -1017,11 +1019,13 @@ impl BillingService {
         let discount = Decimal::ZERO;
         let total = subtotal + tax - discount;
 
-        // Default the invoice date to today when the caller omits it, and
-        // the due date to what the tenant's default term implies (PMS-990).
+        // Default the invoice date to today IN THE CALLER'S ZONE when the
+        // caller omits it (PMS-1027: the UTC day put an evening invoice in
+        // the Americas on tomorrow), and the due date to what the tenant's
+        // default term implies (PMS-990), counted from that date.
         let invoice_date = request
             .invoice_date
-            .unwrap_or_else(|| Utc::now().date_naive());
+            .unwrap_or_else(|| user_today(Utc::now(), user_tz));
         let (due_date, payment_term_id) =
             Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, request.due_date)
                 .await?;
@@ -3867,6 +3871,7 @@ impl BillingService {
     pub async fn create_credit_note(
         &self,
         tenant_id: TenantId,
+        user_tz: &str,
         request: &CreateCreditNoteRequest,
         ctx: &AuditCtx,
     ) -> AppResult<CreditNoteResponse> {
@@ -3945,9 +3950,12 @@ impl BillingService {
 
         let credit_note_id = Uuid::new_v4();
         let number = Self::next_credit_note_number(&mut tx, tenant_id).await?;
+        // PMS-1027: today in the caller's zone. The note is issued the instant
+        // it exists (PMS-953) and its document is stored in this transaction
+        // (PMS-959), so a wrong day here is on paper the customer keeps.
         let issue_date = request
             .issue_date
-            .unwrap_or_else(|| chrono::Utc::now().date_naive());
+            .unwrap_or_else(|| user_today(chrono::Utc::now(), user_tz));
         // The invoice's currency unless the caller names one, so the two
         // documents cannot silently disagree about what is being credited.
         let currency = match request.currency.clone().or(invoice_currency) {
