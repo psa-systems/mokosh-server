@@ -68,6 +68,13 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
         .route("/timers/active", get(list_active_timers))
         .route("/timers/start", post(start_timer))
         .route("/timers/{id}/stop", post(stop_timer))
+        // PMS-950 the work day: clock in and out, breaks, and the day view.
+        // Every one of these carries the timesheets gate as well.
+        .route("/workday", get(work_day))
+        .route("/workday/clock-in", post(clock_in))
+        .route("/workday/clock-out", post(clock_out))
+        .route("/workday/break/start", post(start_break))
+        .route("/workday/break/end", post(end_break))
         // PMS-49 time rounding rules
         .route(
             "/time-rounding-rules",
@@ -387,6 +394,83 @@ async fn stop_timer(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<TimeEntryResponse>> {
     Ok(Json(state.service.stop_timer(user.tenant(), id).await?))
+}
+
+// ============================================================================
+// PMS-950 work day
+// ============================================================================
+
+/// The clock is always the caller's own. There is no body to speak of: a
+/// missing one is the same as `{}`, so a client may POST with no content type.
+async fn clock_in(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    // PMS-943: the feature gate, on top of the module gate above. A tenant
+    // with timesheets off gets 404 here, which is what the extractor returns
+    // so a disabled feature reads exactly like a route that does not exist.
+    _timesheets: RequireTimesheets,
+    request: Option<Json<ClockInRequest>>,
+) -> AppResult<Json<WorkDaySegmentResponse>> {
+    let request = request.map(|Json(r)| r).unwrap_or_default();
+    request.validate()?;
+    Ok(Json(
+        state
+            .service
+            .clock_in(user.tenant(), user.id, &request)
+            .await?,
+    ))
+}
+
+async fn clock_out(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    _timesheets: RequireTimesheets,
+) -> AppResult<Json<WorkDaySegmentResponse>> {
+    Ok(Json(state.service.clock_out(user.tenant(), user.id).await?))
+}
+
+async fn start_break(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    _timesheets: RequireTimesheets,
+) -> AppResult<Json<WorkDaySegmentResponse>> {
+    Ok(Json(
+        state.service.start_break(user.tenant(), user.id).await?,
+    ))
+}
+
+async fn end_break(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    _timesheets: RequireTimesheets,
+) -> AppResult<Json<WorkDaySegmentResponse>> {
+    Ok(Json(state.service.end_break(user.tenant(), user.id).await?))
+}
+
+/// A non-admin sees their own day; an admin may name whose. The same rule as
+/// the active-timer list and the timesheet submit above.
+async fn work_day(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    _timesheets: RequireTimesheets,
+    Query(query): Query<WorkDayQuery>,
+) -> AppResult<Json<WorkDayResponse>> {
+    query.validate()?;
+    let user_id = match query.user_id {
+        Some(other) if user.role.is_admin() => other,
+        Some(other) if other != user.id => {
+            return Err(crate::utils::error::AppError::Forbidden(
+                "Cannot view another user's day".to_string(),
+            ));
+        }
+        _ => user.id,
+    };
+    Ok(Json(
+        state
+            .service
+            .work_day(user.tenant(), user_id, query.date)
+            .await?,
+    ))
 }
 
 // ============================================================================
