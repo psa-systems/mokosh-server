@@ -3,10 +3,10 @@
 //! `GET /api/v1/contacts/{id}/notes` feed.
 //!
 //! Pins three guarantees:
-//!   - `created_by_contact_id` is populated on a portal-originated
-//!     note and null on an agent-originated note (both the agent
-//!     ticket-notes endpoint and the portal endpoint surface the
-//!     field).
+//!   - `created_by_contact_id` is populated on a contact-originated
+//!     note and null on an agent-originated note (the ticket-notes
+//!     endpoint is dual-plane since PMS-1025 and surfaces the field
+//!     to both callers).
 //!   - `GET /api/v1/contacts/{id}/notes` returns every `public`
 //!     note authored by that contact across the tenant's tickets,
 //!     paginated.
@@ -19,8 +19,6 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const PORTAL_PASSWORD: &str = "portal-password-12345";
-
 async fn seed_company(pool: &PgPool, name: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
@@ -31,47 +29,6 @@ async fn seed_company(pool: &PgPool, name: &str) -> Uuid {
         .await
         .expect("seed company");
     id
-}
-
-async fn seed_portal_contact(pool: &PgPool, company_id: Uuid, email: &str) -> Uuid {
-    let id = Uuid::new_v4();
-    let hash =
-        mokosh_server::utils::crypto::hash_password(PORTAL_PASSWORD).expect("hash portal password");
-    sqlx::query(
-        r#"INSERT INTO contacts
-            (id, tenant_id, company_id, first_name, last_name, email,
-             is_portal_user, portal_password_hash)
-           VALUES ($1, $2, $3, 'Portal', 'Customer', $4, TRUE, $5)"#,
-    )
-    .bind(id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .bind(company_id)
-    .bind(email)
-    .bind(&hash)
-    .execute(pool)
-    .await
-    .expect("seed portal contact");
-    id
-}
-
-async fn portal_token(app: &common::TestApp, email: &str) -> String {
-    let resp = app
-        .client
-        .post(app.url("/api/v1/portal/auth/login"))
-        .json(&serde_json::json!({
-            "tenant_slug": "default",
-            "email": email,
-            "password": PORTAL_PASSWORD,
-        }))
-        .send()
-        .await
-        .expect("portal login");
-    assert!(resp.status().is_success(), "portal login should 2xx");
-    let body: Value = resp.json().await.expect("login JSON");
-    body["access_token"]
-        .as_str()
-        .expect("access_token")
-        .to_string()
 }
 
 async fn seed_ticket(pool: &PgPool, company_id: Uuid, admin_id: Uuid, title: &str) -> Uuid {
@@ -119,18 +76,24 @@ async fn seed_ticket(pool: &PgPool, company_id: Uuid, admin_id: Uuid, title: &st
 async fn note_dto_carries_contact_attribution(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "PMS-468 Co").await;
-    let contact = seed_portal_contact(&pool, company, "feed-contact@example.com").await;
+    let contact = common::seed_portal_contact(
+        &pool,
+        company,
+        "feed-contact@example.com",
+        &["Support Contact"],
+    )
+    .await;
     let ticket = seed_ticket(&pool, company, admin_id, "Note attribution").await;
 
     let app = common::boot(pool.clone()).await;
 
-    // Portal-originated note: contact_id populated.
-    let p_token = portal_token(&app, "feed-contact@example.com").await;
+    // Contact-originated note: contact_id populated.
+    let p_token = common::contact_token(&app, &contact).await;
     let _portal_note: Value = app
         .client
-        .post(app.url(&format!("/api/v1/portal/tickets/{ticket}/notes")))
+        .post(app.url(&format!("/api/v1/tickets/{ticket}/notes")))
         .bearer_auth(&p_token)
-        .json(&serde_json::json!({ "content": "I tried rebooting" }))
+        .json(&serde_json::json!({ "note_type": "public", "content": "I tried rebooting" }))
         .send()
         .await
         .expect("portal POST")
@@ -171,7 +134,7 @@ async fn note_dto_carries_contact_attribution(pool: PgPool) {
         .expect("portal row");
     assert_eq!(
         portal_row["created_by_contact_id"].as_str(),
-        Some(contact.to_string().as_str()),
+        Some(contact.id.to_string().as_str()),
         "portal note must carry contact id; row={portal_row:?}"
     );
     let agent_row = items
@@ -189,7 +152,13 @@ async fn note_dto_carries_contact_attribution(pool: PgPool) {
 async fn contact_notes_feed_lists_all_public_from_contact(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Feed Co").await;
-    let contact = seed_portal_contact(&pool, company, "feed-user@example.com").await;
+    let contact = common::seed_portal_contact(
+        &pool,
+        company,
+        "feed-user@example.com",
+        &["Support Contact"],
+    )
+    .await;
 
     // Two tickets, two portal notes from the same contact on
     // different tickets, plus one agent note that should not appear.
@@ -197,13 +166,13 @@ async fn contact_notes_feed_lists_all_public_from_contact(pool: PgPool) {
     let t2 = seed_ticket(&pool, company, admin_id, "Issue B").await;
 
     let app = common::boot(pool.clone()).await;
-    let p_token = portal_token(&app, "feed-user@example.com").await;
+    let p_token = common::contact_token(&app, &contact).await;
     for (ticket, body) in [(t1, "Note on A"), (t2, "Note on B")] {
         let _: Value = app
             .client
-            .post(app.url(&format!("/api/v1/portal/tickets/{ticket}/notes")))
+            .post(app.url(&format!("/api/v1/tickets/{ticket}/notes")))
             .bearer_auth(&p_token)
-            .json(&serde_json::json!({ "content": body }))
+            .json(&serde_json::json!({ "note_type": "public", "content": body }))
             .send()
             .await
             .expect("portal POST")
@@ -227,7 +196,7 @@ async fn contact_notes_feed_lists_all_public_from_contact(pool: PgPool) {
     // Feed: returns exactly the two portal-authored notes.
     let feed: Value = app
         .client
-        .get(app.url(&format!("/api/v1/contacts/{contact}/notes")))
+        .get(app.url(&format!("/api/v1/contacts/{}/notes", contact.id)))
         .bearer_auth(&admin_token)
         .send()
         .await
