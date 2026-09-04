@@ -233,9 +233,15 @@ pub fn invoice(
         );
     }
 
+    // PMS-1029: the rate the tax was derived from, when the invoice carries
+    // one; a supplied amount has no rate to print.
+    let tax_label = match invoice.tax_rate {
+        Some(rate) if !rate.is_zero() => format!("Tax ({}%)", rate.normalize()),
+        _ => "Tax".to_string(),
+    };
     let mut totals = vec![
         ("Subtotal".to_string(), money(invoice.subtotal, currency)),
-        ("Tax".to_string(), money(invoice.tax_amount, currency)),
+        (tax_label, money(invoice.tax_amount, currency)),
     ];
     if !invoice.discount_amount.is_zero() {
         totals.push((
