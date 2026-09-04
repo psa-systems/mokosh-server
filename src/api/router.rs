@@ -116,11 +116,11 @@ pub fn create_api_router(
     // the mail that exists only to service a local password is sent at all.
     deployment_mode: crate::utils::deployment::DeploymentMode,
     // PMS-968: where tenant-supplied secrets live, chosen once at boot by
-    // `secrets::store_from_env`. Injected rather than built here so this
-    // function cannot pick a backend, and so a deployment on Infisical has
+    // `secrets::provider_from_env`. Injected rather than built here so this
+    // function cannot pick a provider, and so a deployment on Infisical has
     // every `BillingService` below on Infisical rather than whichever ones
     // remembered to ask.
-    secrets: Arc<dyn crate::secrets::SecretStore>,
+    secrets: Arc<dyn crate::secrets::SecretProvider>,
 ) -> Router {
     let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();

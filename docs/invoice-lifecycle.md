@@ -26,9 +26,24 @@ Because the status transition to `void` also flows through `update_invoice`, thi
 
 ## What each state can do
 
-- `draft` / `pending` (editable): edit header and lines, Send (-> `sent`), or Void (-> `void`). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
+- `draft` / `pending` (editable): edit header and lines, Send (-> `sent`, subject to the recipient precondition below), or Void (-> `void`). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
 - `sent` / `partially_paid` (collectible): the only action is Record Payment, which runs through `record_payment` (a separate path, not `update_invoice`) and advances the status `sent` -> `partially_paid` -> `paid` as the balance is collected.
 - `paid` / `void` / `written_off` (terminal): no further lifecycle actions.
+
+## Sending requires a recipient
+
+PMS-993. An invoice cannot reach `sent` without a `billing_contact_id`, because an issued invoice with no recipient is a document nobody was ever asked to pay. The recipient is the company's billing contact, `companies.default_billing_contact_id`: per-company and single-valued, so reassigning it replaces the previous holder.
+
+`update_invoice` settles it on the first `draft`/`pending` -> `sent` transition. If the invoice already carries a `billing_contact_id` it is used; otherwise the company's billing contact is resolved and WRITTEN to the invoice in the same statement. If neither yields one, the transition is refused with a 409 and the invoice stays editable.
+
+Two properties matter and both are pinned by tests:
+
+- The refusal is total. It runs before the issuer snapshot is frozen (PMS-911) and before the issued document is stored (PMS-959), so a refused send leaves `sent_at` NULL, `issuer_snapshot` NULL and no `files` row of `entity_type = 'invoice_document'`. There is no half-sent state to clean up.
+- The resolved recipient is persisted, not merely checked. The pay-now email (PMS-711) reads `invoices.billing_contact_id` after the commit, so an invoice that passed the guard without storing what it resolved would freeze, issue a document, and still email nobody.
+
+The three create paths (`create_invoice`, `create_invoice_from_time_entries`, and the recurring sweep's `generate_one_recurring_invoice`) also fall back to the company's billing contact when the request names none, so a draft usually carries its recipient from the moment it exists. An explicitly supplied `billing_contact_id` is validated against the invoice's company and tenant and is a 400 otherwise: FK checks bypass RLS, so nothing else was stopping a cross-account link.
+
+Operationally: a company with no billing contact produces drafts that cannot be sent. `CompanyResponse.default_billing_contact_id` is what makes that visible before someone tries. The recurring sweep logs a warning naming the company when it creates a draft it knows cannot be sent.
 
 ## Why a sent invoice is immutable
 
@@ -37,6 +52,18 @@ Once an invoice is sent, the customer holds a copy and can quote the totals back
 ## AC3 decision: no separate pre-send "cancel"
 
 The question of whether `draft` / `pending` invoices need a dedicated "cancel" affordance is answered: no separate control is needed. Void already serves as the pre-send back-out for those states and keeps the row for audit. Adding a second control labelled "Cancel" with the same effect would only confuse. If product later wants the pre-send action relabelled (for example "Cancel" instead of "Void" while still in draft), that is a UI-copy change to scope as its own ticket, not a new status or a logic change.
+
+## Who the document is addressed to
+
+PMS-1001. Every document carries a customer block: "Bill to" on the invoice, "Credit to" on the credit note, "Account" on the statement. Each holds the company's name, its billing address (its postal address when no billing address is on file), and, when one resolves, an `Attn:` line naming the billing contact with their email address beneath. A document with no contact to name prints the company alone: there is no empty labelled line.
+
+Where the contact comes from differs by document, and the difference is the point:
+
+- **Invoice**: `invoices.billing_contact_id`, the invoice's own column. `update_invoice` writes it on the first transition to `sent`, recording whichever contact `resolve_invoice_recipient` picked, so the invoice names the person it was actually emailed to even when that person came from the company's `default_billing_contact_id`. Reassigning the billing role afterwards changes nothing on that invoice.
+- **Credit note**: the `billing_contact_id` of the invoice it corrects, so the two documents in one correction name the same person.
+- **Statement**: the company's *current* `default_billing_contact_id`. A statement spans many invoices that may each name a different person, and PMS-954 made it a read model that stores nothing, so it renders from today exactly as its issuer and its branding do. Reassigning the role does change the next statement.
+
+Documents issued before this landed are not re-rendered. PMS-959 stores an invoice's PDF inside the transaction that first sends it and a credit note's inside the transaction that creates it, and `GET /invoices/{id}/pdf` and `GET /credit-notes/{id}/pdf` serve those bytes whenever there are any. Only invoices sent and credit notes created after this change carry the contact; an older document keeps the bytes its customer already holds. A live render (a draft preview, or anything issued before PMS-959) does pick the contact up.
 
 ## UI
 

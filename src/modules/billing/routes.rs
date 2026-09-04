@@ -786,7 +786,10 @@ async fn get_credit_note_pdf(
             Some(stored) => stored,
             None => {
                 let issuer = state.service.tenant_issuer(tenant).await?;
-                let credit_to = state.service.bill_to(tenant, note.company_id, None).await?;
+                let credit_to = state
+                    .service
+                    .credit_to(tenant, note.company_id, note.invoice_id)
+                    .await?;
                 let logo =
                     crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
                 crate::pdf::render(&crate::modules::billing::documents::credit_note(
@@ -820,7 +823,7 @@ async fn get_statement_pdf(
     let issuer = state.service.tenant_issuer(tenant).await?;
     let account = state
         .service
-        .bill_to(tenant, statement.company_id, None)
+        .statement_account(tenant, statement.company_id)
         .await?;
     let logo = crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
     let bytes = crate::pdf::render(&crate::modules::billing::documents::statement(

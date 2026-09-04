@@ -27,7 +27,7 @@
 //!
 //! ## What it does about failure
 //!
-//! The rename is atomic (see [`ObjectStore::rename`]), and the ledger update
+//! The rename is atomic (see [`ObjectProvider::rename`]), and the ledger update
 //! follows it, so the two orders of partial failure are: a file that did not
 //! move, which the read fallback still serves and the next tick retries; and a
 //! file that moved with a ledger row still naming the old path, which the next
@@ -46,7 +46,7 @@ use crate::db::Database;
 use crate::scheduler::Job;
 use std::sync::Arc;
 
-use crate::storage::{ObjectKey, ObjectStore};
+use crate::storage::{ObjectKey, ObjectProvider};
 use crate::utils::error::AppResult;
 
 /// What one tick did, for the log line and for tests.
@@ -70,7 +70,7 @@ impl MoveOutcome {
 #[derive(Clone)]
 pub struct KbAttachmentMover {
     db: Database,
-    store: Arc<dyn ObjectStore>,
+    store: Arc<dyn ObjectProvider>,
 }
 
 impl KbAttachmentMover {

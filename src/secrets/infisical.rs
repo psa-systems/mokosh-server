@@ -1,4 +1,4 @@
-//! The Infisical backend, selected by `SECRET_BACKEND=infisical`.
+//! The Infisical provider, selected by `SECRET_BACKEND=infisical`.
 //!
 //! Writes into `/mokosh/integrations`, one of the three folders the first-run
 //! bootstrap already creates and grants the Universal Auth machine identity
@@ -8,7 +8,7 @@
 //!
 //! Read [`crate::secrets`] for the outage decision this implements. In short: a
 //! read-through TTL cache, and a hard failure on a miss rather than a fallback,
-//! because a fallback means quietly not using the backend the operator chose.
+//! because a fallback means quietly not using the provider the operator chose.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use super::{SecretKey, SecretStore};
+use super::{SecretKey, SecretProvider};
 use crate::infisical::InfisicalClient;
 use crate::utils::error::{AppError, AppResult};
 
@@ -86,7 +86,7 @@ impl InfisicalSecretsConfig {
     }
 }
 
-pub struct InfisicalSecretStore {
+pub struct InfisicalSecretProvider {
     client: Arc<InfisicalClient>,
     project_id: String,
     environment: String,
@@ -94,7 +94,7 @@ pub struct InfisicalSecretStore {
     ttl: Duration,
 }
 
-impl InfisicalSecretStore {
+impl InfisicalSecretProvider {
     pub fn new(config: InfisicalSecretsConfig) -> AppResult<Self> {
         let client =
             InfisicalClient::connect(&config.address, &config.client_id, &config.client_secret)?;
@@ -123,7 +123,7 @@ impl InfisicalSecretStore {
 }
 
 #[async_trait]
-impl SecretStore for InfisicalSecretStore {
+impl SecretProvider for InfisicalSecretProvider {
     async fn get(&self, key: &SecretKey) -> AppResult<Option<String>> {
         let name = key.name()?;
 

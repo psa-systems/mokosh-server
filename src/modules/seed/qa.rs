@@ -308,6 +308,15 @@ impl QaSeeder {
             primary_contact.push(first.expect("each company seeds >=1 contact"));
         }
 
+        // PMS-993: every seeded company gets a billing contact, because an
+        // invoice can no longer be sent without one and this dataset sends one.
+        // `CreateCompanyRequest` has never carried the pointer, so it is set
+        // here rather than folded into `qa_company_specs`.
+        for (&company_id, &contact_id) in company_ids.iter().zip(primary_contact.iter()) {
+            self.set_billing_contact(tid, company_id, contact_id)
+                .await?;
+        }
+
         // --- Tickets (paginating primary list, every status/priority/date) ---
         let now = Utc::now();
         for i in 0..QA_TICKET_COUNT {
@@ -621,6 +630,29 @@ impl QaSeeder {
                 .fetch_all(&mut *tx)
                 .await?;
         Ok(ids)
+    }
+
+    /// PMS-993: point a seeded company at its billing contact. Written
+    /// directly because `CreateCompanyRequest` does not carry the pointer and
+    /// `update_company` would need the whole request struct restated.
+    async fn set_billing_contact(
+        &self,
+        tid: Uuid,
+        company_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tid).await?;
+        sqlx::query(
+            "UPDATE companies SET default_billing_contact_id = $1, updated_at = NOW() \
+             WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(contact_id)
+        .bind(tid)
+        .bind(company_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Spread a freshly-created ticket across a non-default status and a past

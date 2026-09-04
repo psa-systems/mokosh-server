@@ -2754,3 +2754,196 @@ async fn an_unknown_sort_field_is_rejected_with_what_is_accepted(pool: PgPool) {
         );
     }
 }
+
+// ============================================================================
+// PMS-993: the billing contact is a per-company role
+// ============================================================================
+
+/// Helper: create a contact of `company_id` and return its id.
+async fn create_contact_at(
+    app: &common::TestApp,
+    token: &str,
+    company_id: &str,
+    first: &str,
+    email: &str,
+) -> String {
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": first,
+            "last_name": "Contact",
+            "email": email,
+        }))
+        .send()
+        .await
+        .expect("send create contact");
+    assert!(resp.status().is_success(), "create contact should 2xx");
+    let created: serde_json::Value = resp.json().await.expect("create JSON");
+    created["id"].as_str().expect("contact id").to_string()
+}
+
+async fn set_billing_contact(
+    app: &common::TestApp,
+    token: &str,
+    company_id: &str,
+    contact_id: &str,
+) -> reqwest::Response {
+    app.client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "default_billing_contact_id": contact_id }))
+        .send()
+        .await
+        .expect("send set billing contact")
+}
+
+/// AC1 + AC4: a contact can be given the billing role for a company, the
+/// company record reads it back (so a missing one is visible), and assigning a
+/// second contact replaces the first - the role is single-valued per company by
+/// construction, so there is nothing to demote separately.
+#[sqlx::test]
+async fn company_billing_contact_is_assigned_and_readable(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Acme").await;
+
+    // A company with no billing contact says so, rather than omitting the field.
+    let before: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get company")
+        .json()
+        .await
+        .expect("company JSON");
+    assert!(
+        before
+            .get("default_billing_contact_id")
+            .is_some_and(|v| v.is_null()),
+        "a company with no billing contact reports it as null, not absent"
+    );
+
+    let first = create_contact_at(&app, &token, &company_id, "First", "first@acme.example").await;
+    let resp = set_billing_contact(&app, &token, &company_id, &first).await;
+    assert!(resp.status().is_success(), "assigning the role should 2xx");
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get company")
+        .json()
+        .await
+        .expect("company JSON");
+    assert_eq!(
+        after["default_billing_contact_id"].as_str(),
+        Some(first.as_str()),
+        "the assigned billing contact reads back"
+    );
+
+    // Reassigning replaces: exactly one billing contact per company.
+    let second =
+        create_contact_at(&app, &token, &company_id, "Second", "second@acme.example").await;
+    let resp = set_billing_contact(&app, &token, &company_id, &second).await;
+    assert!(resp.status().is_success(), "reassigning should 2xx");
+    let reassigned: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get company")
+        .json()
+        .await
+        .expect("company JSON");
+    assert_eq!(
+        reassigned["default_billing_contact_id"].as_str(),
+        Some(second.as_str()),
+        "assigning a second contact replaces the first"
+    );
+}
+
+/// AC1 negative: the role can only be given to a contact OF the company. The
+/// pointer drives the invoice recipient and the portal invoice grant, so a
+/// stranger in it would address the bill outside the account.
+#[sqlx::test]
+async fn company_billing_contact_must_belong_to_the_company(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Acme").await;
+    let other_id = create_company(&app, &token, "Globex").await;
+    let stranger = create_contact_at(
+        &app,
+        &token,
+        &other_id,
+        "Stranger",
+        "stranger@globex.example",
+    )
+    .await;
+
+    let resp = set_billing_contact(&app, &token, &company_id, &stranger).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a contact of another company cannot hold this company's billing role"
+    );
+}
+
+/// The failure branch: unlinking the contact takes the role with it. A plain
+/// `PUT /contacts/{id}` with a `company_id` rewrites the whole link set, so
+/// without this the pointer would keep naming somebody who left.
+#[sqlx::test]
+async fn unlinking_the_billing_contact_clears_the_role(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Acme").await;
+    let other_id = create_company(&app, &token, "Globex").await;
+    let contact_id =
+        create_contact_at(&app, &token, &company_id, "Mover", "mover@acme.example").await;
+    assert!(
+        set_billing_contact(&app, &token, &company_id, &contact_id)
+            .await
+            .status()
+            .is_success(),
+        "assigning the role should 2xx"
+    );
+
+    // Move the contact to the other company. This is not a billing edit at all,
+    // which is exactly why the role has to follow the link.
+    let moved = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "company_id": other_id }))
+        .send()
+        .await
+        .expect("send move contact");
+    assert!(moved.status().is_success(), "moving the contact should 2xx");
+
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get company")
+        .json()
+        .await
+        .expect("company JSON");
+    assert!(
+        after["default_billing_contact_id"].is_null(),
+        "unlinking the contact clears the billing role it held"
+    );
+}

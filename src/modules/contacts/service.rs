@@ -271,6 +271,45 @@ impl ContactService {
         }
     }
 
+    /// PMS-993: `validate_fk` proves a contact is in the tenant; this proves it
+    /// is a contact OF this company. The billing contact is both the invoice
+    /// recipient and the portal invoice grant, so a stranger in the pointer
+    /// would address the bill to someone outside the account.
+    ///
+    /// Membership accepts either carrier, because both are live: the legacy
+    /// `contacts.company_id` scalar (PMS-806 keeps it as the mirror of the
+    /// primary link) and a `contact_companies` row for a multi-company contact.
+    async fn assert_contact_of_company(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Option<Uuid>,
+    ) -> AppResult<()> {
+        let Some(contact_id) = contact_id else {
+            return Ok(());
+        };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let member: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM contacts c \
+             WHERE c.tenant_id = $1 AND c.id = $3 \
+               AND (c.company_id = $2 \
+                    OR EXISTS(SELECT 1 FROM contact_companies l \
+                              WHERE l.tenant_id = $1 AND l.contact_id = c.id \
+                                AND l.company_id = $2)))",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(contact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !member {
+            return Err(AppError::BadRequest(
+                "default_billing_contact_id must reference a contact of this company".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     // ========================================================================
     // COMPANIES
     // ========================================================================
@@ -636,6 +675,12 @@ impl ContactService {
         self.validate_fk_opt(tenant_id, "users", request.account_manager_id)
             .await?;
         self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
+            .await?;
+        // PMS-993: assigning the billing contact is the role grant, so it is
+        // checked harder than a plain foreign id - tenant AND company.
+        self.validate_fk_opt(tenant_id, "contacts", request.default_billing_contact_id)
+            .await?;
+        self.assert_contact_of_company(tenant_id, company_id, request.default_billing_contact_id)
             .await?;
 
         // Build the dynamic UPDATE the same way update_site does. The
@@ -2410,6 +2455,23 @@ impl ContactService {
         sqlx::query(
             "DELETE FROM contact_companies \
              WHERE tenant_id = $1 AND contact_id = $2 AND NOT (company_id = ANY($3))",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(&keep)
+        .execute(&mut *conn)
+        .await?;
+
+        // PMS-993: the DELETE above rewrites the whole link set, and
+        // `PUT /contacts/{id}` synthesizes a single-element set from the legacy
+        // scalar `company_id`, so an unrelated edit can unlink this contact from
+        // a company that still names it `default_billing_contact_id`. A pointer
+        // at a non-member addresses invoices to a stranger and grants portal
+        // invoice access to somebody who left, so the grant goes with the link.
+        sqlx::query(
+            "UPDATE companies SET default_billing_contact_id = NULL, updated_at = NOW() \
+             WHERE tenant_id = $1 AND default_billing_contact_id = $2 \
+               AND NOT (id = ANY($3))",
         )
         .bind(tenant_id)
         .bind(contact_id)
