@@ -1,9 +1,17 @@
 //! PMS-249: end-to-end placement tests for the Bunyip SSO login path.
 //!
 //! Drives `place_bunyip_user` directly with stubbed userinfo (`email` /
-//! `email_verified`) so the invite / self-signup / isolation / role logic is
+//! `email_verified`) so the invite / rejection / isolation / role logic is
 //! exercised without a live OIDC verifier. Placement is asserted against the
 //! `users` row (the source of truth) rather than `AuthState` internals.
+//!
+//! MAPPS-458 (PMS-728 slice 2) is the policy the whole file states: bunyip is
+//! not an onboarding surface, so a `sub` with no `users` row and no pending
+//! invitation for its VERIFIED address is refused, and the platform admin
+//! (`bunyip_role = "admin"`) is the only carve-out. Every test here that needs a
+//! placed user therefore seeds an invitation or a row; a first-sight identity
+//! that just signs itself up is the shape PMS-1042 removed, not a shape to
+//! restore.
 
 mod common;
 
@@ -1289,6 +1297,15 @@ async fn suspended_tenant_is_not_placed(pool: PgPool) {
 // bounce, rejected outright by Google Workspace) and `email_verified_at` stayed
 // NULL so no invite could ever match. The row now repairs itself on the first
 // request after bunyip reports the address verified.
+//
+// MAPPS-458 (PMS-728 slice 2) removed the way such a row comes to exist: an
+// unverified first sight matches no invitation (the gate is
+// `(Some(invs), Some(em)) if email_verified`), so it is now rejected outright
+// and NO NEW row can hold the placeholder. The repair is still needed and still
+// correct for the rows already sitting on deployed databases, so the tests below
+// place the user legitimately - invited, verified - and then set the row to the
+// legacy placeholder shape with SQL. Do not restore the old first-sight setup:
+// it asserts the self-signup MAPPS-458 abolished.
 
 /// The row's stored `(email, email_verified_at IS NOT NULL)`.
 async fn email_state(pool: &PgPool, sub: Uuid) -> (String, bool) {
@@ -1299,12 +1316,66 @@ async fn email_state(pool: &PgPool, sub: Uuid) -> (String, bool) {
         .expect("user row")
 }
 
+/// MAPPS-458: a pending invitation is the only way a `users` row comes into
+/// existence on the bunyip path, so every test below that needs a placed user
+/// seeds one first. Returns the tenant the invited address will land in.
+async fn invite_into_new_org(
+    tenants: &Arc<TenantService>,
+    invitations: &Arc<InvitationsService>,
+    admin_id: Uuid,
+    email: &str,
+) -> Uuid {
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite(email, "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
+    org
+}
+
+/// Put a legitimately-placed row back into the legacy placeholder shape:
+/// `{sub}@unresolved.invalid` with no `email_verified_at`. That is exactly what
+/// a pre-MAPPS-458 unverified first sight left behind, and the only way such a
+/// row can still be met - on a database that was migrated from that era.
+async fn degrade_to_placeholder(pool: &PgPool, sub: Uuid) {
+    let affected = sqlx::query(
+        "UPDATE users SET email = $2, email_verified_at = NULL, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(sub)
+    .bind(format!("{sub}@unresolved.invalid"))
+    .execute(pool)
+    .await
+    .expect("degrade the row to the placeholder shape")
+    .rows_affected();
+    assert_eq!(
+        affected, 1,
+        "the user must already be placed before the row is degraded"
+    );
+}
+
+/// MAPPS-458: the inverse of the pre-MAPPS-458
+/// `unverified_first_sight_user_is_mirrored_under_the_placeholder`, which this
+/// test replaces. Mirroring an unverified first sight under the placeholder is
+/// how those rows came to exist; that path is now a rejection, so the address is
+/// refused placement and writes no `users` row at all.
+///
+/// The remaining cell of the matrix:
+/// `uninvited_bunyip_user_without_invite_is_rejected` covers verified and
+/// uninvited, `unverified_email_does_not_consume_an_invite` covers unverified
+/// with an invitation pending, and this one covers unverified AND uninvited.
 #[sqlx::test]
-async fn unverified_first_sight_user_is_mirrored_under_the_placeholder(pool: PgPool) {
-    // The bad-data shape this issue is about, pinned so it stays intentional.
+async fn unverified_uninvited_first_sight_is_refused_placement(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
     let sub = Uuid::new_v4();
-    place_bunyip_user(
+    let state = place_bunyip_user(
         &auth,
         Some(&tenants),
         Some(&invitations),
@@ -1315,14 +1386,21 @@ async fn unverified_first_sight_user_is_mirrored_under_the_placeholder(pool: PgP
         None,
         &claims(sub, None),
     )
-    .await
-    .expect("placed");
+    .await;
 
-    let (email, verified) = email_state(&pool, sub).await;
-    assert_eq!(email, format!("{sub}@unresolved.invalid"));
     assert!(
-        !verified,
-        "an unverified address must not stamp verified_at"
+        state.is_none(),
+        "an unverified, uninvited first sight is rejected, not mirrored (MAPPS-458)"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = $1")
+        .bind(sub)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        count, 0,
+        "no `users` row is written, so no new row can hold the unresolved-email placeholder"
     );
 }
 
@@ -1331,21 +1409,27 @@ async fn userinfo_is_fetched_while_the_row_holds_a_placeholder_email(pool: PgPoo
     // The PMS-713 hop is skipped for placed users, which is what made the
     // placeholder permanent. A placeholder row must keep fetching userinfo:
     // nothing else can tell mokosh the address was verified since.
+    //
+    // MAPPS-458: the row is placed by invitation and then degraded, because an
+    // unverified first sight no longer produces one.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
     let sub = Uuid::new_v4();
+    invite_into_new_org(&tenants, &invitations, admin_id, "david@example.com").await;
     place_bunyip_user(
         &auth,
         Some(&tenants),
         Some(&invitations),
         sub,
         Some("david@example.com".to_string()),
-        false,
+        true,
         None,
         None,
         &claims(sub, None),
     )
     .await
     .expect("placed");
+    degrade_to_placeholder(&pool, sub).await;
 
     assert!(
         bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
@@ -1355,23 +1439,29 @@ async fn userinfo_is_fetched_while_the_row_holds_a_placeholder_email(pool: PgPoo
 
 #[sqlx::test]
 async fn placeholder_email_is_repaired_once_bunyip_verifies_it(pool: PgPool) {
+    // MAPPS-458: the row is placed by invitation and then degraded to the legacy
+    // placeholder shape. Before MAPPS-458 an unverified first sight wrote that
+    // row directly; today it is rejected instead.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
     let sub = Uuid::new_v4();
-    // First sight, unverified -> placeholder.
+    let org = invite_into_new_org(&tenants, &invitations, admin_id, "david@example.com").await;
     place_bunyip_user(
         &auth,
         Some(&tenants),
         Some(&invitations),
         sub,
         Some("david@example.com".to_string()),
-        false,
+        true,
         None,
         None,
         &claims(sub, None),
     )
     .await
     .expect("first placement");
+    degrade_to_placeholder(&pool, sub).await;
     let (tenant, _) = user_tenant_role(&pool, sub).await;
+    assert_eq!(tenant, org, "the invited user lands in the inviting tenant");
 
     // Next request after the user verifies in bunyip -> the row is repaired.
     place_bunyip_user(
@@ -1405,8 +1495,14 @@ async fn a_real_address_is_never_overwritten_by_the_repair(pool: PgPool) {
     // userinfo later reports a different address keeps the stored one (bunyip
     // address changes are out of scope here) and an unverified userinfo response
     // cannot clobber a verified row.
+    //
+    // MAPPS-458: the invitation is what lets the first placement happen at all;
+    // the assertions below are unchanged. The address is verified here, so
+    // seeding the invite is the whole adaptation.
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
     let sub = Uuid::new_v4();
+    invite_into_new_org(&tenants, &invitations, admin_id, "real@example.com").await;
     place_bunyip_user(
         &auth,
         Some(&tenants),
@@ -1446,37 +1542,34 @@ async fn a_repaired_user_can_then_consume_a_pending_invite(pool: PgPool) {
     // The downstream consequence of the placeholder: `email_verified_at IS NULL`
     // plus a placeholder address means the invite gate can never open. After the
     // repair the invite for the real address is honored.
+    //
+    // MAPPS-458: the placeholder row is reached by placing the user through a
+    // FIRST invitation and degrading the row, not by an unverified first sight.
+    // A second org then invites the same address, which is the invite the repair
+    // has to make consumable.
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
 
     let sub = Uuid::new_v4();
+    let home = invite_into_new_org(&tenants, &invitations, admin_id, "invited@example.com").await;
     place_bunyip_user(
         &auth,
         Some(&tenants),
         Some(&invitations),
         sub,
         Some("invited@example.com".to_string()),
-        false,
+        true,
         None,
         None,
         &claims(sub, None),
     )
     .await
     .expect("first placement");
+    degrade_to_placeholder(&pool, sub).await;
+    let (before, _) = user_tenant_role(&pool, sub).await;
+    assert_eq!(before, home, "the first invitation placed the user");
 
-    let org = tenants
-        .ensure_personal_tenant(Uuid::new_v4(), None, None)
-        .await
-        .expect("org tenant");
-    invitations
-        .create(
-            TenantId::from_trusted(org),
-            admin_id,
-            &invite("invited@example.com", "manager"),
-            &AuditCtx::system(org),
-        )
-        .await
-        .expect("invite");
+    let org = invite_into_new_org(&tenants, &invitations, admin_id, "invited@example.com").await;
 
     place_bunyip_user(
         &auth,
