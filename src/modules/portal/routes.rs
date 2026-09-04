@@ -18,7 +18,9 @@ use axum::{
 use uuid::Uuid;
 use validator::Validate;
 
-use super::middleware::{portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth};
+use super::middleware::{
+    portal_auth_middleware, PortalAuthMiddleware, RequirePortalAuth, RequirePortalBillingContact,
+};
 use super::rate_limit::{PortalDecisionLimiter, PortalLoginLimiter};
 use super::service::{token_contact_id, PortalAuthService};
 use super::{
@@ -289,19 +291,21 @@ fn account_key(tenant_slug: &str, email: &str) -> String {
 
 async fn list_invoices(
     State(state): State<PortalRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
+    RequirePortalBillingContact(contact): RequirePortalBillingContact,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<InvoiceResponse>>> {
     // PMS-33 has landed: serve the contact's company invoices. The
     // company scope is forced from the authenticated `CurrentContact`
     // (never a query param), so a contact only ever sees its own
-    // company's invoices.
+    // company's invoices. PMS-993: the extractor gates on the billing role
+    // first, so a contact without it gets a uniform 403 here and at every
+    // invoice id, and the company-scope posture below is untouched.
     let filter = InvoiceFilter {
         company_id: Some(contact.company_id),
         ..Default::default()
     };
     // SAFETY (PMS-285): `contact.tenant_id` is a verified claim from the portal
-    // JWT (`RequirePortalAuth`), i.e. the caller's own authenticated tenant.
+    // JWT (`RequirePortalBillingContact`), the caller's own authenticated tenant.
     // Portal runs on contact sessions, not `CurrentUser`, so it cannot use the
     // `TenantScoped` extractor; `from_trusted` is the sanctioned bridge (see the
     // KB feed note below for the full rationale).
@@ -318,7 +322,7 @@ async fn list_invoices(
 
 async fn get_invoice(
     State(state): State<PortalRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
+    RequirePortalBillingContact(contact): RequirePortalBillingContact,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoiceResponse>> {
     // Read within the contact's tenant, then enforce the company scope
@@ -326,9 +330,11 @@ async fn get_invoice(
     // tenant returns 404 (not 403) so the portal never confirms the
     // existence of another company's invoice.
     // SAFETY (PMS-285): `contact.tenant_id` is a verified portal-JWT claim
-    // (`RequirePortalAuth`), the caller's own authenticated tenant; portal
-    // cannot use `TenantScoped`, so `from_trusted` is the sanctioned bridge
-    // (see KB feed note below). The company scope is enforced in code afterward.
+    // (`RequirePortalBillingContact`), the caller's own authenticated tenant;
+    // portal cannot use `TenantScoped`, so `from_trusted` is the sanctioned
+    // bridge (see KB feed note below). PMS-993: the billing role is checked in
+    // the extractor, BEFORE the company scope below, so a contact without it
+    // never learns whether the id exists. The company scope still 404s.
     let invoice = state
         .billing
         .get_invoice(contact.tenant(), invoice_id)
@@ -342,13 +348,13 @@ async fn get_invoice(
 }
 
 /// PMS-711: client-facing "Pay Now". Mints a provider checkout session for the
-/// invoice's outstanding balance and returns its URL. The company scope is
-/// enforced first (a cross-company invoice is a 404, same posture as
-/// `get_invoice`); the service then rejects a void / fully-paid invoice or a
-/// tenant with no active gateway.
+/// invoice's outstanding balance and returns its URL. PMS-993: the billing role
+/// is required, then the company scope is enforced (a cross-company invoice is a
+/// 404, same posture as `get_invoice`); the service then rejects a void /
+/// fully-paid invoice or a tenant with no active gateway.
 async fn pay_invoice(
     State(state): State<PortalRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
+    RequirePortalBillingContact(contact): RequirePortalBillingContact,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<PayInvoiceResponse>> {
     // SAFETY (PMS-285): `contact.tenant()` wraps a verified portal-JWT claim,

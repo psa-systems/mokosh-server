@@ -50,7 +50,14 @@ pub async fn portal_auth_middleware(
                 // same read carries the sign-out cutoff, because the portal
                 // plane has no session row to delete and revocation is
                 // therefore a property of this row.
-                match state.service.contact_snapshot(claims.tid, claims.sub).await {
+                // PMS-993: `cid` scopes the billing-role read to the company
+                // this session is for, so the role is re-read per request and
+                // revoking it takes effect on the next one, not the next login.
+                match state
+                    .service
+                    .contact_snapshot(claims.tid, claims.sub, claims.cid)
+                    .await
+                {
                     // MAPPS-532: signed out. The token decodes and has not
                     // expired, but it predates the contact's last sign-out, so
                     // it is exactly as good as a forged one.
@@ -65,9 +72,11 @@ pub async fn portal_auth_middleware(
                     Ok(snapshot) => {
                         outcome = BearerOutcome::Accepted;
                         // A missing row still degrades to empty names rather
-                        // than failing the request, as it did before.
-                        let (first_name, last_name) = snapshot
-                            .map(|s| (s.first_name, s.last_name))
+                        // than failing the request, as it did before. PMS-993:
+                        // the role defaults to `false` in that degrade, so a
+                        // row the middleware cannot see grants nothing.
+                        let (first_name, last_name, is_billing_contact) = snapshot
+                            .map(|s| (s.first_name, s.last_name, s.is_billing_contact))
                             .unwrap_or_default();
                         PortalAuthState::authenticated(CurrentContact {
                             id: claims.sub,
@@ -76,6 +85,7 @@ pub async fn portal_auth_middleware(
                             email: claims.email,
                             first_name,
                             last_name,
+                            is_billing_contact,
                         })
                     }
                     // MAPPS-532: this read used to degrade to empty names and
@@ -148,6 +158,42 @@ where
                 crate::modules::auth::middleware::bearer_outcome(parts),
             )),
         }
+    }
+}
+
+/// PMS-993: `RequirePortalAuth` plus the billing role. Yields the contact only
+/// when it is the billing contact of the company its session is scoped to.
+///
+/// The role is read per request from the `contacts` row (see
+/// `PortalAuthService::contact_snapshot`), never from the token, so revoking it
+/// takes effect on the next request. Unauthenticated is still a 401 with the
+/// RFC 6750 challenge; authenticated without the role is a 403, and it is the
+/// same 403 for every invoice id so it is not an existence oracle.
+#[derive(Clone)]
+pub struct RequirePortalBillingContact(pub CurrentContact);
+
+impl<S> axum::extract::FromRequestParts<S> for RequirePortalBillingContact
+where
+    S: Send + Sync,
+{
+    type Rejection = AuthRejection;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // Delegate the 401 half rather than restating it, so the two extractors
+        // cannot drift on the challenge envelope.
+        let RequirePortalAuth(contact) = <RequirePortalAuth as axum::extract::FromRequestParts<
+            S,
+        >>::from_request_parts(parts, state)
+        .await?;
+        if !contact.is_billing_contact {
+            return Err(
+                AppError::Forbidden("You do not have permission to do that".to_string()).into(),
+            );
+        }
+        Ok(RequirePortalBillingContact(contact))
     }
 }
 

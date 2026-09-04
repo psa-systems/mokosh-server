@@ -80,18 +80,59 @@ impl TestApp {
 /// `common::` and not every one seeds a company.
 #[allow(dead_code)]
 pub async fn seed_company(pool: &PgPool) -> Uuid {
+    seed_company_named(pool, "Acme Co").await
+}
+
+/// `idx_companies_tenant_name_unique` is on `(tenant_id, lower(btrim(name)))`,
+/// so a test needing a second company has to name it.
+#[allow(dead_code)]
+pub async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
         INSERT INTO companies (id, tenant_id, name)
-        VALUES ($1, $2, 'Acme Co')
+        VALUES ($1, $2, $3)
         "#,
     )
     .bind(id)
     .bind(DEFAULT_TENANT_ID)
+    .bind(name)
     .execute(pool)
     .await
     .expect("seed test company");
+    id
+}
+
+/// PMS-993: seed a contact of `company_id` and make it the company's billing
+/// contact. An invoice cannot reach `sent` without one, so every fixture that
+/// sends has to point its company at somebody. Returns the contact id.
+///
+/// Deliberately NOT folded into `seed_company`: that helper has call sites in
+/// most test binaries and several of them assert a company's contact count.
+#[allow(dead_code)]
+pub async fn seed_billing_contact(pool: &PgPool, company_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO contacts (
+            id, tenant_id, company_id, first_name, last_name, email, contact_type
+        )
+        VALUES ($1, $2, $3, 'Billing', 'Contact', $4, 'billing')
+        "#,
+    )
+    .bind(id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(format!("billing.{id}@example.com"))
+    .execute(pool)
+    .await
+    .expect("seed billing contact");
+    sqlx::query("UPDATE companies SET default_billing_contact_id = $1 WHERE id = $2")
+        .bind(id)
+        .bind(company_id)
+        .execute(pool)
+        .await
+        .expect("point company at its billing contact");
     id
 }
 
@@ -169,7 +210,7 @@ pub fn dec(s: &str) -> Decimal {
 ///
 /// Nine suites used to name a fixed path under `/tmp` (`/tmp/mokosh-pms923-test`
 /// and friends). `/tmp` is world-writable with the sticky bit, so whichever OS
-/// user ran the suite FIRST on a host owned that directory, and `LocalStore`
+/// user ran the suite FIRST on a host owned that directory, and `LocalProvider`
 /// created it with that process's umask. A second user on the same host then
 /// could not write into it, `StorageConfig` failed with `Permission denied`,
 /// and the API surfaced a 500 - which reads as a defect in the storage seam and
@@ -300,7 +341,7 @@ async fn boot_with_db(
     app_pool: Option<PgPool>,
     bunyip: Option<mokosh_server::modules::auth::oidc_rs::Verifier>,
 ) -> TestApp {
-    // PMS-958: the object store is process-wide and built on first use, so
+    // PMS-958: the object provider is process-wide and built on first use, so
     // the root has to be chosen before anything in this binary can ask for
     // it. Every suite that stores bytes already calls this itself; doing it
     // here as well means a suite that never touches storage cannot pin the
@@ -324,12 +365,12 @@ async fn boot_with_db(
     let mailer = Arc::new(SharedMailer::new(Arc::new(LogMailer)));
     let mailer_handle = mailer.clone();
     let encryption_key = [0u8; 32];
-    // PMS-968: the database backend under the same zero key the router is
+    // PMS-968: the database provider under the same zero key the router is
     // given, so a suite that stores a gateway credential can read it back.
-    // Deliberately not `store_from_env`: process env is shared across the cases
+    // Deliberately not `provider_from_env`: process env is shared across the cases
     // in a binary, so reading SECRET_BACKEND here would let one suite's
     // configuration decide another's.
-    let secrets = std::sync::Arc::new(mokosh_server::secrets::DatabaseSecretStore::new(
+    let secrets = std::sync::Arc::new(mokosh_server::secrets::DatabaseSecretProvider::new(
         db.clone(),
         encryption_key,
     ));

@@ -169,6 +169,8 @@ async fn a_statement_reconciles_across_charges_payments_and_credits(pool: PgPool
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let a = invoice_on(&app, &token, company_id, "2026-06-05", "1000").await;
     send(&app, &token, &a).await;
@@ -198,6 +200,8 @@ async fn the_opening_balance_carries_everything_before_the_period(pool: PgPool) 
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let may = invoice_on(&app, &token, company_id, "2026-05-10", "800").await;
     send(&app, &token, &may).await;
@@ -242,6 +246,8 @@ async fn a_draft_invoice_is_on_no_statement(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     invoice_on(&app, &token, company_id, "2026-05-10", "999").await;
     invoice_on(&app, &token, company_id, "2026-06-10", "777").await;
@@ -269,6 +275,8 @@ async fn a_voided_invoice_and_its_credit_note_both_appear(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let wrong = invoice_on(&app, &token, company_id, "2026-06-05", "600").await;
     send(&app, &token, &wrong).await;
@@ -302,6 +310,8 @@ async fn a_closed_period_is_not_rewritten_by_later_activity(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let june = invoice_on(&app, &token, company_id, "2026-06-10", "900").await;
     send(&app, &token, &june).await;
@@ -335,6 +345,8 @@ async fn a_voided_credit_note_leaves_the_statement(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let inv = invoice_on(&app, &token, company_id, "2026-06-05", "400").await;
     send(&app, &token, &inv).await;
@@ -375,6 +387,8 @@ async fn a_statement_is_scoped_and_its_period_is_checked(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let other: uuid::Uuid = sqlx::query_scalar(
         "INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Other Co') RETURNING id",

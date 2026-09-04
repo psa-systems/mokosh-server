@@ -170,6 +170,28 @@ impl DeploymentMode {
         self.default_providers()[kind.index()].providers
     }
 
+    /// The kind's FIRST default, which is the provider a capability starts on
+    /// when the operator configured nothing.
+    ///
+    /// This exists so a capability module never has to hold a `DeploymentMode`
+    /// of its own: the startup wiring reads the profile once and hands each
+    /// module the NAME it defaults to. PMS-904's guard depends on that (only
+    /// the auth service and the startup wiring may ask which mode this is),
+    /// and the layering is the better shape anyway, since `secrets` and
+    /// `storage` care which provider they got, not which deployment shape
+    /// chose it.
+    pub fn default_provider_for(self, kind: ProviderKind) -> AppResult<&'static str> {
+        self.default_providers_for(kind)
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                AppError::Configuration(format!(
+                    "hosting profile {self} names no {} provider",
+                    kind.as_str()
+                ))
+            })
+    }
+
     /// Resolve the whole table against what the operator explicitly
     /// configured, recording per kind which of the two decided it.
     ///

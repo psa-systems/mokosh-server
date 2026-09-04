@@ -5,10 +5,10 @@
 //! figure has always been a constant zero on every deployment, however much a
 //! tenant uploaded. This is the writer it never had.
 //!
-//! It sits beside [`crate::storage::ObjectStore`] rather than inside it,
-//! because the store moves bytes and knows nothing about a database. What binds
-//! them is the key: the ledger records `ObjectKey::relative_path`, so the row
-//! says where the object is in the store's own terms and neither has to know
+//! It sits beside [`crate::storage::ObjectProvider`] rather than inside it,
+//! because the provider moves bytes and knows nothing about a database. What
+//! binds them is the key: the ledger records `ObjectKey::relative_path`, so the
+//! row says where the object is in the provider's own terms and neither has to know
 //! the other's configuration.
 //!
 //! ## The duplication, stated

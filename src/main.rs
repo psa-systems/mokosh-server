@@ -525,23 +525,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
-    // PMS-968: the secret store, built once for the whole process. A
-    // misconfigured backend ends startup here rather than surfacing when a
+    // PMS-968: the secret provider, built once for the whole process. A
+    // misconfigured provider ends startup here rather than surfacing when a
     // customer tries to pay. Built before the scheduler because the credential
     // mover needs it, and shared with the router below so every reader of a
     // gateway credential is looking in the same place.
-    let (secrets, secrets_config) =
-        mokosh_server::secrets::store_from_env(db.clone(), encryption_key)
-            .expect("secret store configuration");
+    // The hosting profile's default is resolved HERE and handed in as a name
+    // (PMS-1011). `secrets` never holds the deployment shape, which is what
+    // keeps PMS-904's boundary intact.
+    let (secrets, secrets_config) = mokosh_server::secrets::provider_from_env(
+        db.clone(),
+        encryption_key,
+        hosting_profile
+            .default_provider_for(ProviderKind::Secrets)
+            .expect("secrets profile default"),
+    )
+    .expect("secret provider configuration");
 
-    // PMS-958: the object store, built once for the whole process for the
+    // PMS-958: the object provider, built once for the whole process for the
     // same reason. Every service that keeps bytes reaches it through
     // `storage::shared()` rather than a constructor argument (there are
     // thirteen of those constructions across the router, the tenants routes,
     // billing and the seeders), so this first touch is what turns a
-    // misconfigured backend into a boot failure instead of a 500 on the first
+    // misconfigured provider into a boot failure instead of a 500 on the first
     // upload.
-    mokosh_server::storage::init_from_env().expect("storage backend configuration");
+    let storage_default = hosting_profile
+        .default_provider_for(ProviderKind::Storage)
+        .expect("storage profile default");
+    let (storage_provider, storage_source) = mokosh_server::storage::init_from_env(storage_default)
+        .expect("storage provider configuration");
 
     // PMS-1011: the boot record. Every provider kind, what serves it, and
     // whether the hosting profile's default stands or the operator overrode
@@ -551,19 +563,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The overrides are what the capabilities above already resolved, not a
     // re-read of their variables: each owns the one reader of its own setting,
     // and a second reader here is how two parts of one process come to
-    // disagree about what is serving a capability. Storage is the exception
-    // and calls its own reader again, because `init_from_env` hands back a
-    // store rather than the selection that built it; it is the same pure read
-    // of the same variable, in a process that has not written to it.
-    let (storage_backend, storage_source) =
-        mokosh_server::storage::StorageBackend::from_env().expect("storage backend configuration");
+    // disagree about what is serving a capability.
     let provider_selection = hosting_profile.resolve_providers(
         &ProviderOverrides::new()
             .with_opt(ProviderKind::Secrets, secrets_config.explicit_providers())
             .with_opt(
                 ProviderKind::Storage,
                 (storage_source == EnablementSource::Explicit)
-                    .then(|| vec![storage_backend.as_str()]),
+                    .then(|| vec![storage_provider.as_str()]),
             )
             // A mounted verifier is what makes bunyip the platform
             // authenticator, in either mode; the legacy path stays enabled
@@ -656,7 +663,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     scheduler.register(kb_attachment_mover, std::time::Duration::from_secs(3600));
 
     // PMS-968: one-shot move of pre-existing gateway credentials into the
-    // configured secret store. The scheduler fires every job once at startup,
+    // configured secret provider. The scheduler fires every job once at startup,
     // so an hour gives the one-shot behaviour plus a retry if the store was
     // briefly unreachable, and once the move is done the tick is one query
     // returning no rows.

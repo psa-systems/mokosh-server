@@ -54,7 +54,7 @@ storage, email and configuration is whatever that deployment's own environment
 sets. Writing `infisical` or `s3` into the table would be a guess about an
 environment that is not in this repository, and not a merely inaccurate one: a
 deployment that sets neither would change backend on the next restart, and
-`InfisicalSecretStore::from_env` refuses to build without its own variables, so
+`InfisicalSecretProvider::from_env` refuses to build without its own variables, so
 the guess would present as a deployment that no longer boots. Moving those rows
 needs the deployed values read first, which is PMS-1018.
 
@@ -82,6 +82,16 @@ Two readers of one variable, with two different failure modes:
   message naming the legal values is far the cheaper failure. `main` reads it
   before the database is touched, so the failure names the mode rather than
   arriving from whichever provider happened to resolve first.
+
+`main` is also the ONLY caller of either. A capability module never holds a
+`DeploymentMode`: `main` resolves the profile once and passes each module the
+provider NAME it defaults to, via `DeploymentMode::default_provider_for`, so
+`SecretsConfig::resolve` and `StorageProviderKind::resolve` take a `&str`. That
+keeps PMS-904's
+`only_the_auth_service_and_the_startup_wiring_know_the_deployment_mode` guard a
+plain source scan for the type name, with no exception list to maintain, and it
+is the better layering regardless: `secrets` and `storage` care which provider
+they got, not which deployment shape chose it.
 
 ## The condition is a conjunction (PMS-905)
 

@@ -1,4 +1,4 @@
-//! PMS-958: the S3 backend against a real object store.
+//! PMS-958: the S3 provider against a real object store.
 //!
 //! Runs when `S3_ENDPOINT` is set and skips, saying so, when it is not. CI
 //! starts a MinIO in the job and sets the `S3_*` variables for the whole run;
@@ -8,7 +8,7 @@
 //! would write.
 //!
 //! `STORAGE_BACKEND=s3` is set by THIS process only, so every other suite in
-//! the same CI run keeps exercising the local backend. It has to be set before
+//! the same CI run keeps exercising the local provider. It has to be set before
 //! the first `boot` in this binary, because the store is process-wide and built
 //! on first use.
 //!
@@ -20,8 +20,8 @@ mod common;
 
 use std::sync::OnceLock;
 
-use mokosh_server::storage::s3::S3Store;
-use mokosh_server::storage::{ObjectKey, ObjectStore};
+use mokosh_server::storage::s3::S3Provider;
+use mokosh_server::storage::{ObjectKey, ObjectProvider};
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -29,9 +29,9 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 /// The store under test, or `None` with a skip line when no endpoint is
-/// configured. Also flips this process onto the S3 backend, once, before
+/// configured. Also flips this process onto the S3 provider, once, before
 /// anything can build the shared store.
-async fn s3() -> Option<S3Store> {
+async fn s3() -> Option<S3Provider> {
     static SELECTED: OnceLock<bool> = OnceLock::new();
     let configured = *SELECTED.get_or_init(|| {
         let endpoint = std::env::var("S3_ENDPOINT").unwrap_or_default();
@@ -45,7 +45,7 @@ async fn s3() -> Option<S3Store> {
     if !configured {
         return None;
     }
-    let store = S3Store::from_env().expect("S3 configuration");
+    let store = S3Provider::from_env().expect("S3 configuration");
     store.ensure_bucket().await.expect("create the test bucket");
     Some(store)
 }
@@ -71,7 +71,7 @@ async fn every_operation_round_trips() {
             store.read(&key).await,
             Err(mokosh_server::utils::error::AppError::NotFound(_))
         ),
-        "a missing object reads as NotFound, like the local backend"
+        "a missing object reads as NotFound, like the local provider"
     );
 
     store.put(&key, &bytes).await.expect("put");
@@ -222,7 +222,7 @@ async fn an_upload_through_the_api_lands_in_the_bucket_and_not_on_disk(pool: PgP
         .join(attachment_id.to_string());
     assert!(
         !on_disk.exists(),
-        "the local backend must not have been used: {on_disk:?} exists"
+        "the local provider must not have been used: {on_disk:?} exists"
     );
 
     let dl = app

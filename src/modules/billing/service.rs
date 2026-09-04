@@ -38,9 +38,9 @@ pub struct BillingService {
     /// disables the email (no base to build the link from).
     portal_origin: Option<String>,
     /// PMS-968: where a tenant's gateway credentials live. Injected rather than
-    /// built here, so the backend is chosen once at startup by
-    /// `secrets::store_from_env` and no constructor can pick a different one.
-    secrets: Arc<dyn crate::secrets::SecretStore>,
+    /// built here, so the provider is chosen once at startup by
+    /// `secrets::provider_from_env` and no constructor can pick a different one.
+    secrets: Arc<dyn crate::secrets::SecretProvider>,
 }
 
 /// PMS-990: the due date offset when neither the invoice's term nor the
@@ -51,11 +51,11 @@ const DEFAULT_NET_DAYS: i32 = 30;
 
 impl BillingService {
     /// Zero-key constructor for callers that never touch secret material (the
-    /// QA seeder). Its secret store is the database one under the same zero
+    /// QA seeder). Its secret provider is the database one under the same zero
     /// key, so the two halves agree; nothing on that path reads a gateway
     /// credential.
     pub fn new(db: Database) -> Self {
-        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+        let secrets = Arc::new(crate::secrets::DatabaseSecretProvider::new(
             db.clone(),
             [0u8; 32],
         ));
@@ -332,6 +332,43 @@ impl BillingService {
         Ok(())
     }
 
+    /// Validate that `contact_id` is a contact of `company_id` in the caller's
+    /// tenant (PMS-993). `invoices.billing_contact_id` was bound straight from
+    /// the request at every write with no check at all, and FK checks bypass
+    /// RLS, so a caller could address an invoice to another tenant's contact:
+    /// the PMS-333 hole that `assert_payment_term_in_tenant` closes next door.
+    ///
+    /// Membership accepts either carrier, because both are live: the legacy
+    /// `contacts.company_id` scalar (which PMS-806 keeps as the mirror of the
+    /// primary link) and a `contact_companies` row for a contact who works at
+    /// several companies.
+    async fn assert_billing_contact_for_company(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<()> {
+        let found: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM contacts c \
+             WHERE c.tenant_id = $1 AND c.id = $3 \
+               AND (c.company_id = $2 \
+                    OR EXISTS(SELECT 1 FROM contact_companies l \
+                              WHERE l.tenant_id = $1 AND l.contact_id = c.id \
+                                AND l.company_id = $2)))",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(contact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !found {
+            return Err(AppError::BadRequest(
+                "billing_contact_id does not reference a contact of this company".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// PMS-990: the due date, and the term it came from.
     ///
     /// A given `due_date` wins, stored as given with whatever term the caller
@@ -406,6 +443,43 @@ impl BillingService {
         Ok(rows.into_iter().collect())
     }
 
+    /// PMS-1016: who an invoice is for, decided when it is created.
+    ///
+    /// The contact the caller named, else the company's default billing
+    /// contact, which is the same pair `resolve_invoice_recipient` picks
+    /// between at send time. Resolving it here makes a draft carry the
+    /// recipient it will be emailed to, so `GET /invoices/{id}` names one and
+    /// the live draft preview prints the same `Attn:` line as the document
+    /// stored at the send. It is stored rather than read at render time on
+    /// purpose (PMS-1001): reading the company's pointer while rendering
+    /// would let a later change re-address a document already issued.
+    ///
+    /// A company with no pointer still yields none, and the send-time guard is
+    /// unchanged: `resolve_invoice_recipient` still runs and still refuses a
+    /// send that resolves nobody.
+    async fn resolve_billing_contact(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        requested: Option<Uuid>,
+    ) -> AppResult<Option<Uuid>> {
+        // PMS-993: an explicitly named contact is validated against this
+        // company and tenant first. FK checks bypass RLS, so an unchecked id
+        // could address the invoice to another tenant's contact.
+        if let Some(contact_id) = requested {
+            Self::assert_billing_contact_for_company(tx, tenant_id, company_id, contact_id).await?;
+            return Ok(requested);
+        }
+        let default_contact: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT default_billing_contact_id FROM companies WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(default_contact.flatten())
+    }
+
     /// Fill in `company_name` on a batch of invoice responses (PMS-186).
     async fn enrich_invoices(
         &self,
@@ -448,24 +522,24 @@ impl BillingService {
     /// payment-gateway-config write path so secrets never hit the DB
     /// in cleartext.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
-        let secrets = Arc::new(crate::secrets::DatabaseSecretStore::new(
+        let secrets = Arc::new(crate::secrets::DatabaseSecretProvider::new(
             db.clone(),
             encryption_key,
         ));
         Self::with_secrets(db, encryption_key, secrets)
     }
 
-    /// PMS-968: the constructor that takes the configured secret store.
+    /// PMS-968: the constructor that takes the configured secret provider.
     ///
-    /// `with_encryption_key` keeps the database backend, which is correct for
+    /// `with_encryption_key` keeps the database provider, which is correct for
     /// the callers that have no configuration to consult (tests, the seeder).
     /// Every serving instance is built through here from
-    /// `secrets::store_from_env`, so a deployment on Infisical has all of them
+    /// `secrets::provider_from_env`, so a deployment on Infisical has all of them
     /// on Infisical rather than whichever ones remembered.
     pub fn with_secrets(
         db: Database,
         encryption_key: [u8; 32],
-        secrets: Arc<dyn crate::secrets::SecretStore>,
+        secrets: Arc<dyn crate::secrets::SecretProvider>,
     ) -> Self {
         Self {
             db,
@@ -487,7 +561,7 @@ impl BillingService {
         encryption_key: [u8; 32],
         mailer: Arc<dyn Mailer>,
         portal_origin: String,
-        secrets: Arc<dyn crate::secrets::SecretStore>,
+        secrets: Arc<dyn crate::secrets::SecretProvider>,
     ) -> Self {
         Self {
             db,
@@ -644,6 +718,15 @@ impl BillingService {
         )
         .await?;
 
+        // PMS-1016: the contact the caller named, else the company's default.
+        let billing_contact_id = Self::resolve_billing_contact(
+            &mut tx,
+            tenant_id,
+            request.company_id,
+            request.billing_contact_id,
+        )
+        .await?;
+
         let invoice_id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -662,7 +745,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(&invoice_number)
         .bind(request.company_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
         .bind(due_date)
@@ -930,6 +1013,15 @@ impl BillingService {
             Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, request.due_date)
                 .await?;
 
+        // PMS-1016: the contact the caller named, else the company's default.
+        let billing_contact_id = Self::resolve_billing_contact(
+            &mut tx,
+            tenant_id,
+            request.company_id,
+            request.billing_contact_id,
+        )
+        .await?;
+
         // 4. Insert the invoice header. `balance_due` starts at `total`.
         let invoice_id = Uuid::new_v4();
         sqlx::query(
@@ -948,7 +1040,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(&invoice_number)
         .bind(request.company_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(invoice_date)
         .bind(due_date)
@@ -1309,6 +1401,12 @@ impl BillingService {
         // so numbers stay gapless.
         let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
+        // PMS-1016: this path has no caller to name a contact, so it is the
+        // company's default or nobody. A company with no pointer still
+        // produces a draft naming nobody, which the send-time guard refuses.
+        let billing_contact_id =
+            Self::resolve_billing_contact(&mut tx, tenant_id, company_id, None).await?;
+
         sqlx::query(
             r#"
             INSERT INTO invoices (
@@ -1317,8 +1415,8 @@ impl BillingService {
                 subtotal, tax_amount, discount_amount, total, amount_paid,
                 balance_due, currency, notes, po_number, payment_term_id
             )
-            VALUES ($1, $2, $3, $4, NULL, $5, 'draft', $6, $7, 'net30', $8, $9,
-                    $10, $11, 0, $11, 'USD', $12, NULL, $13)
+            VALUES ($1, $2, $3, $4, $13, $5, 'draft', $6, $7, 'net30', $8, $9,
+                    $10, $11, 0, $11, 'USD', $12, NULL, $14)
             "#,
         )
         .bind(invoice_id)
@@ -1335,6 +1433,7 @@ impl BillingService {
         .bind(format!(
             "Recurring billing for {period_start} to {period_end}"
         ))
+        .bind(billing_contact_id)
         .bind(payment_term_id)
         .execute(&mut *tx)
         .await?;
@@ -1734,7 +1833,7 @@ impl BillingService {
                 provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
                 is_active: r.is_active,
                 is_test_mode: r.is_test_mode,
-                // PMS-968: NULL means the credential is in the secret store,
+                // PMS-968: NULL means the credential is in the secret provider,
                 // so the row is configured. Non-NULL and non-empty is the
                 // pre-move state and equally configured. Only an empty string
                 // would not be, and nothing writes one.
@@ -1778,7 +1877,7 @@ impl BillingService {
             )));
         }
 
-        // PMS-968: a supplied credential goes to the configured secret store,
+        // PMS-968: a supplied credential goes to the configured secret provider,
         // and the row records only that it is there. `None` still means "keep
         // the existing secret" (write-only update semantics, PMS-342).
         //
@@ -1881,7 +1980,7 @@ impl BillingService {
                 .bind(request.provider.as_str())
                 .bind(request.is_active)
                 .bind(request.is_test_mode)
-                // NULL: the credential is in the secret store now, at the
+                // NULL: the credential is in the secret provider now, at the
                 // address this row's own (tenant_id, provider) gives.
                 .bind(Option::<String>::None)
                 .fetch_one(&mut *tx)
@@ -1979,8 +2078,8 @@ impl BillingService {
 
         // PMS-968: the credential goes with the row. Deleting the row and
         // leaving the secret would keep a disconnected tenant's live API key in
-        // the store indefinitely, and a later reconnect would silently inherit
-        // it. This runs after the DELETE, matching `SecretStore::delete` being
+        // the provider indefinitely, and a later reconnect would silently inherit
+        // it. This runs after the DELETE, matching `SecretProvider::delete` being
         // best-effort: the row is the thing that points at the secret, so a
         // secret with no row is orphaned rather than dangerous, whereas a row
         // whose secret is already gone cannot serve a payment.
@@ -2015,7 +2114,7 @@ impl BillingService {
     /// Recover a gateway's credential, from wherever this row keeps it.
     ///
     /// PMS-968: a non-NULL `config_encrypted` is the pre-move state and is
-    /// decrypted here; NULL means the credential is in the secret store, at the
+    /// decrypted here; NULL means the credential is in the secret provider, at the
     /// address the row's own `(tenant_id, provider)` gives. Both states are
     /// live at once on a deployment the mover has not finished, which is the
     /// point of keeping them distinguishable.
@@ -2036,7 +2135,7 @@ impl BillingService {
                 let key = crate::secrets::SecretKey::payment_gateway(tenant_id, provider_id);
                 self.secrets.get(&key).await?.ok_or_else(|| {
                     AppError::Configuration(format!(
-                        "gateway {provider_id:?} says its credential is in the secret store, but the store has none"
+                        "gateway {provider_id:?} says its credential is in the secret provider, but the provider has none"
                     ))
                 })
             }
@@ -2756,9 +2855,13 @@ impl BillingService {
         let total = subtotal + tax - discount;
         let balance_due = total - amount_paid;
 
-        // `sent_at` is stamped when the status first moves to `sent`.
+        // `sent_at` is stamped when the status first moves to `sent`. PMS-993:
+        // that transition is now named once and reused, because the recipient
+        // guard, the issuer freeze and the pay-now hook all key off it and a
+        // fourth copy of the condition is a fourth chance to drift.
         let status = request.status.unwrap_or(locked_status);
-        let sent_at = if matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none() {
+        let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
+        let sent_at = if just_sent {
             Some(Utc::now())
         } else {
             current.sent_at
@@ -2767,6 +2870,19 @@ impl BillingService {
         if let Some(pt) = request.payment_term_id {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
+        // PMS-993: FK checks bypass RLS, so an unvalidated `billing_contact_id`
+        // could address an invoice to another tenant's contact. Same hole
+        // `assert_payment_term_in_tenant` closes next door (PMS-333).
+        if let Some(contact_id) = request.billing_contact_id {
+            Self::assert_billing_contact_for_company(
+                &mut tx,
+                tenant_id,
+                current.company_id,
+                contact_id,
+            )
+            .await?;
+        }
+
         // PMS-990: a term change with no due date re-derives the due date
         // from the (possibly updated) invoice date, because an invoice moved
         // from Net 30 to Net 15 that kept its old due date would carry a term
@@ -2784,7 +2900,6 @@ impl BillingService {
             (_, given) => given,
         };
 
-        let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
         // PMS-992: the recipient is resolved BEFORE the transition, and a send
         // with nobody to email is refused rather than recorded. `sent` used to
         // mean "the operator pressed Send"; it now means the invoice was
