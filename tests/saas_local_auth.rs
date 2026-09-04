@@ -76,6 +76,7 @@ fn login_request(email: &str) -> LoginRequest {
         approval_code: None,
         device_id: None,
         tenant_id: Some(common::DEFAULT_TENANT_ID),
+        tenant_slug: None,
     }
 }
 

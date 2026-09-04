@@ -182,6 +182,14 @@ impl CalendarService {
             conditions.push(format!("start_time <= ${idx}"));
             idx += 1;
         }
+        // PMS-791 phase 4 / MAPPS-465: exact-team filter. The my_teams
+        // convenience scope is on the DTO but its expansion needs a
+        // caller_id thread-through that the calendar routes do not
+        // currently plumb; documented as follow-up on MAPPS-465.
+        if filter.team_id.is_some() {
+            conditions.push(format!("team_id = ${idx}"));
+            idx += 1;
+        }
         let where_clause = conditions.join(" AND ");
         let limit_placeholder = idx;
         let offset_placeholder = idx + 1;
@@ -189,7 +197,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
-                      recurrence_rule, recurrence_parent_id,
+                      recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
                FROM appointments WHERE {where_clause}
                ORDER BY start_time
@@ -267,7 +275,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
-                      recurrence_rule, recurrence_parent_id,
+                      recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
                FROM appointments WHERE {where_clause}
                ORDER BY start_time"#
@@ -293,7 +301,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
-                      recurrence_rule, recurrence_parent_id,
+                      recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
                FROM appointments WHERE {rwhere}
                ORDER BY start_time"#
@@ -466,14 +474,18 @@ impl CalendarService {
             .await?;
         self.validate_fk_opt(tenant_id, "tasks", request.task_id)
             .await?;
+        // PMS-791 phase 3: reject a cross-tenant team_id (mirrors the
+        // MAPPS-461 F1/F2 pattern on the teams surface).
+        self.validate_fk_opt(tenant_id, "teams", request.team_id)
+            .await?;
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"INSERT INTO appointments (
                 id, tenant_id, title, description, appointment_type, ticket_id, project_id,
                 task_id, company_id, contact_id, site_id, assigned_to_id,
-                start_time, end_time, all_day, timezone, location, recurrence_rule
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)"#,
+                start_time, end_time, all_day, timezone, location, recurrence_rule, team_id
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -493,6 +505,9 @@ impl CalendarService {
         .bind(&request.timezone)
         .bind(&request.location)
         .bind(&request.recurrence_rule)
+        // PMS-791 phase 3: nullable team routing. Validated as same-tenant
+        // via `validate_fk_opt("teams", ...)` above (added in this ticket).
+        .bind(request.team_id)
         .execute(&mut *tx)
         .await?;
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -528,7 +543,7 @@ impl CalendarService {
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
                       start_time, end_time, all_day, timezone, status, location,
-                      recurrence_rule, recurrence_parent_id,
+                      recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
                FROM appointments WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -550,6 +565,9 @@ impl CalendarService {
         // PSA audit: validate the foreign id being set so an update cannot
         // re-link this appointment to another tenant's user.
         self.validate_fk_opt(tenant_id, "users", request.assigned_to_id)
+            .await?;
+        // PMS-791 phase 3: same cross-tenant guard for team_id.
+        self.validate_fk_opt(tenant_id, "teams", request.team_id)
             .await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // PMS-343: a partial update may carry only one of start_time / end_time,
@@ -585,6 +603,7 @@ impl CalendarService {
                 timezone = COALESCE($10, timezone),
                 status = COALESCE($11, status),
                 location = COALESCE($12, location),
+                team_id = COALESCE($13, team_id),
                 updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -600,6 +619,7 @@ impl CalendarService {
         .bind(&request.timezone)
         .bind(&request.status)
         .bind(&request.location)
+        .bind(request.team_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1560,6 +1580,10 @@ impl ReminderRow {
             location: None,
             recurrence_rule: self.recurrence_rule.clone(),
             recurrence_parent_id: None,
+            // PMS-791 phase 3: expander constructs a placeholder response
+            // for range-expansion output; team_id has no meaning here
+            // (an expanded occurrence isn't a real row).
+            team_id: None,
             created_at: self.start_time,
             updated_at: self.start_time,
         }
@@ -1587,6 +1611,9 @@ struct AppointmentRow {
     location: Option<String>,
     recurrence_rule: Option<String>,
     recurrence_parent_id: Option<Uuid>,
+    // PMS-791 phase 3 / MAPPS-464: nullable team routing.
+    #[sqlx(default)]
+    team_id: Option<Uuid>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -1613,6 +1640,7 @@ impl From<AppointmentRow> for AppointmentResponse {
             location: r.location,
             recurrence_rule: r.recurrence_rule,
             recurrence_parent_id: r.recurrence_parent_id,
+            team_id: r.team_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

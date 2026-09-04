@@ -12,8 +12,12 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::ContractsService;
-use crate::modules::auth::{RequireContracts, RequireFinance, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireCallerContext, RequireContracts, RequireFinance, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -62,16 +66,27 @@ pub fn contracts_routes(service: ContractsService) -> Router {
 
 async fn list_contracts(
     State(s): State<ContractsRouterState>,
-    RequireContracts { user: u, .. }: RequireContracts,
-    _f: RequireFinance,
-    Query(f): Query<ContractFilter>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Query(mut f): Query<ContractFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContractResponse>>> {
     f.validate()?;
-    let (items, total) = s
-        .service
-        .list_contracts(u.tenant(), &f, &pagination)
-        .await?;
+    // PMS-935: dual-plane sweep. Staff branch keeps the pre-sweep
+    // RequireContracts + RequireFinance role gate via
+    // `assert_staff_contracts_finance`; contact branch loads the
+    // effective `contracts:read` capability from `portal_roles` per
+    // request and forces the filter's `company_id` to the session's
+    // Company so a spoofed query param cannot widen visibility.
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => assert_staff_contracts_finance(auth)?,
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::CONTRACTS_READ, &db).await?;
+            f.company_id = Some(session.company_id);
+        }
+    }
+    let (items, total) = s.service.list_contracts(tenant, &f, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -94,11 +109,44 @@ async fn create_contract(
 
 async fn get_contract(
     State(s): State<ContractsRouterState>,
-    RequireContracts { user: u, .. }: RequireContracts,
-    _f: RequireFinance,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ContractResponse>> {
-    Ok(Json(s.service.get_contract(u.tenant(), id).await?))
+    // PMS-935: contact-plane callers 404 (not 403) on a foreign
+    // Company's contract so a probe cannot confirm existence. Staff
+    // callers keep the pre-sweep RequireContracts + RequireFinance
+    // role gate via `assert_staff_contracts_finance`.
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => assert_staff_contracts_finance(auth)?,
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::CONTRACTS_READ, &db).await?;
+        }
+    }
+    let contract = s.service.get_contract(tenant, id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if contract.company_id != session.company_id {
+            return Err(AppError::NotFound("Contract".to_string()));
+        }
+    }
+    Ok(Json(contract))
+}
+
+/// PMS-935: reproduce the RequireContracts + RequireFinance staff
+/// gate inline for the dual-plane read handlers. The module gate
+/// piece (RequireContracts) is intentionally dropped from the swept
+/// endpoints so contact callers with `contracts:read` reach them
+/// regardless of whether the tenant has the contracts module
+/// toggled on for staff: portal capability is the authorization
+/// signal here, not the tenant's staff-side module enablement.
+fn assert_staff_contracts_finance(auth: &crate::modules::auth::AuthState) -> AppResult<()> {
+    let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+    let role = user.role.as_str();
+    if !matches!(role, "super_admin" | "admin" | "finance") {
+        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+    }
+    Ok(())
 }
 
 async fn update_contract(

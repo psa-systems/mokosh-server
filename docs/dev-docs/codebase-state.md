@@ -678,25 +678,35 @@ defines module-config helpers that read/write `tenant_settings` and
 
 This unblocks the client's `/settings/integrations` page.
 
-### F6. Wire `/api/v1/portal/*` to a contact-scoped session
+### F6. Client portal (SHIPPED)
 
-Portal endpoints all 501 ([`router.rs:90-99`](../../src/api/router.rs#L90)).
-Portal users are `Contact` rows (the schema has
-`contacts.has_portal_access`), not `User` rows. Implement:
+Fully wired under `/api/v1/contact/*` (post-mokosh-contact-login
+pivot; the legacy `/api/v1/portal/*` tree retired in that branch).
+Every visitor addresses their Company from the URL path
+(`/portal/{portal_id}/*`, MAPPS-637 / PMS-916); the server resolves
+the Company + owning tenant from the numeric `companies.portal_id`
+rather than from the Host header (the per-MSP subdomain shape
+retired with MAPPS-649 / PMS-945). Portal identity is a `contacts`
+row + a `typ:"contact"` JWT (distinct from agent `users` +
+`typ:"access"`).
 
-- `POST /api/v1/portal/auth/login` - look up `Contact` by email,
-  verify password (new `contact.password_hash` column or piggyback on
-  a `portal_users` table).
-- `POST /api/v1/portal/tickets` - create ticket scoped to
-  `contact.company_id`, internal flag = false.
-- `GET  /api/v1/portal/tickets` - list tickets where `contact_id =
-  current_contact_id`.
-- `GET  /api/v1/portal/invoices` - blocked on F7.
-- `GET  /api/v1/portal/kb` - blocked on the `knowledge_base`
-  module.
+Surface today: login (with MFA + recovery codes + Turnstile CAPTCHA),
+tickets (list / create with attachments / detail / reopen / reply
+notes), invoices (list / detail / Pay Now / PDF download), quotes
+(list / detail / accept / decline), portal-scoped KB reader,
+assets / contracts / projects (read-only), time entries (filtered +
+paginated), Company page (colleague roster + invite + delegate +
+delegations-received), data export (request + auto-poll +
+history), notifications inbox (paginated + per-entity deep-link +
+preference toggles), Settings (profile self-edit + change password +
+MFA enroll / disable + active sessions + notification preferences),
+customer-facing form-builder with file-upload fields.
 
-This is the only change that unblocks the client portal, which
-already ships rendered pages.
+Everything runs off the `contacts` row (`is_portal_user`, `portal_*`
+credential columns) - no `portal_users` join table. See the entire
+`src/modules/portal/` tree for the code, `migrations/12x_*` for the
+schema additions, and `docs/mokosh-client-login/remaining.md` for the
+short remaining polish list.
 
 ### F7. Stand up minimal read-only `/api/v1/invoices`
 

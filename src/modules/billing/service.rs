@@ -620,6 +620,13 @@ impl BillingService {
                 "(invoice_number ILIKE ${count_idx} OR po_number ILIKE ${count_idx})"
             ));
         }
+        if filter.exclude_draft {
+            // MAPPS-670 (mokosh-invoices P1e): no placeholder; the value
+            // is a fixed string set by the route only when the caller is
+            // a Contact.
+            data_conds.push("status <> 'draft'".to_string());
+            count_conds.push("status <> 'draft'".to_string());
+        }
 
         let data_where = data_conds.join(" AND ");
         let count_where = count_conds.join(" AND ");
@@ -1813,7 +1820,8 @@ impl BillingService {
 
         let rows = sqlx::query_as::<_, PaymentGatewayRow>(
             r#"
-            SELECT id, provider, is_active, is_test_mode, config_encrypted
+            SELECT id, provider, is_active, is_test_mode, config_encrypted,
+                   client_display_name
             FROM payment_gateway_configs
             WHERE tenant_id = $1
             ORDER BY provider
@@ -1838,6 +1846,7 @@ impl BillingService {
                 // pre-move state and equally configured. Only an empty string
                 // would not be, and nothing writes one.
                 configured: r.config_encrypted.as_ref().is_none_or(|c| !c.is_empty()),
+                client_display_name: r.client_display_name,
             })
             .collect();
 
@@ -1959,6 +1968,22 @@ impl BillingService {
             }
         }
 
+        // MAPPS-671: three-state client_display_name, with the "clear"
+        // signal riding on an empty string rather than a distinct null,
+        // because serde `Option<String>` collapses omit and null.
+        //   None             -> field omitted; preserve the current value
+        //                       on update, NULL on first insert.
+        //   Some(s), s empty (after trim) -> clear the override so the
+        //                       readiness handler falls back to the
+        //                       provider default.
+        //   Some(s), s non-empty          -> set to the trimmed value.
+        let cdn_provided = request.client_display_name.is_some();
+        let cdn_value: Option<String> = request
+            .client_display_name
+            .as_deref()
+            .map(str::trim)
+            .and_then(|s| (!s.is_empty()).then(|| s.to_string()));
+
         // A brand-new gateway must carry a config: there is no existing secret
         // to preserve.
         let id: Uuid = if stored_in_secret_store {
@@ -1966,13 +1991,18 @@ impl BillingService {
                 sqlx::query_scalar(
                     r#"
                     INSERT INTO payment_gateway_configs
-                        (tenant_id, provider, is_active, is_test_mode, config_encrypted)
-                    VALUES ($1, $2, $3, $4, $5)
+                        (tenant_id, provider, is_active, is_test_mode,
+                         config_encrypted, client_display_name)
+                    VALUES ($1, $2, $3, $4, $5, $6)
                     ON CONFLICT (tenant_id, provider) DO UPDATE SET
-                        is_active        = EXCLUDED.is_active,
-                        is_test_mode     = EXCLUDED.is_test_mode,
-                        config_encrypted = EXCLUDED.config_encrypted,
-                        updated_at       = NOW()
+                        is_active           = EXCLUDED.is_active,
+                        is_test_mode        = EXCLUDED.is_test_mode,
+                        config_encrypted    = EXCLUDED.config_encrypted,
+                        client_display_name = CASE
+                            WHEN $7 THEN EXCLUDED.client_display_name
+                            ELSE payment_gateway_configs.client_display_name
+                        END,
+                        updated_at          = NOW()
                     RETURNING id
                     "#,
                 )
@@ -1983,6 +2013,8 @@ impl BillingService {
                 // NULL: the credential is in the secret provider now, at the
                 // address this row's own (tenant_id, provider) gives.
                 .bind(Option::<String>::None)
+                .bind(&cdn_value)
+                .bind(cdn_provided)
                 .fetch_one(&mut *tx)
                 .await?
             }
@@ -1998,9 +2030,13 @@ impl BillingService {
                 sqlx::query_scalar(
                     r#"
                     UPDATE payment_gateway_configs
-                    SET is_active    = $3,
-                        is_test_mode = $4,
-                        updated_at   = NOW()
+                    SET is_active           = $3,
+                        is_test_mode        = $4,
+                        client_display_name = CASE
+                            WHEN $5 THEN $6
+                            ELSE client_display_name
+                        END,
+                        updated_at          = NOW()
                     WHERE tenant_id = $1 AND provider = $2
                     RETURNING id
                     "#,
@@ -2009,6 +2045,8 @@ impl BillingService {
                 .bind(request.provider.as_str())
                 .bind(request.is_active)
                 .bind(request.is_test_mode)
+                .bind(cdn_provided)
+                .bind(&cdn_value)
                 .fetch_one(&mut *tx)
                 .await?
             }
@@ -2022,6 +2060,16 @@ impl BillingService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // MAPPS-671: read back the persisted override so the response
+        // reflects it (an omit-to-preserve request keeps whatever was
+        // already stored, not `None`). Pulled from the `after` snapshot
+        // to avoid a second round trip and to stay inside the same
+        // transaction.
+        let client_display_name: Option<String> = after
+            .as_ref()
+            .and_then(|v| v.get("client_display_name"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         audit_write(
             &mut *tx,
             tenant_id,
@@ -2043,6 +2091,7 @@ impl BillingService {
             is_active: request.is_active,
             is_test_mode: request.is_test_mode,
             configured: true,
+            client_display_name,
         })
     }
 
@@ -2235,6 +2284,29 @@ impl BillingService {
         Ok(providers.iter().any(|id| provider::is_supported(id)))
     }
 
+    /// MAPPS-666 (mokosh-invoices P1a) + MAPPS-671 (P2a): the tenant's
+    /// active serveable provider id AND the admin-set button-label
+    /// override (`client_display_name`, `None` when unset). The
+    /// readiness handler falls back to a provider-default label when
+    /// the override is `None`, so the SPA never has to know
+    /// `"stripe"` / `"paypal"` string identifiers.
+    /// Returns `None` when no active row is present OR no active row's
+    /// discriminator is supported by this build.
+    pub async fn active_provider_display(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<Option<(String, Option<String>)>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT provider, client_display_name FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND is_active = TRUE",
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows.into_iter().find(|(id, _)| provider::is_supported(id)))
+    }
+
     /// Build a Stripe provider scoped to the tenant's ACTIVE gateway for the
     /// inbound-webhook path. Returns `None` when the tenant has no active Stripe
     /// config (so the handler answers 404 without confirming a tenant exists).
@@ -2276,9 +2348,15 @@ impl BillingService {
         cancel_url: &str,
     ) -> AppResult<CheckoutSession> {
         let invoice = self.get_invoice(tenant_id, invoice_id).await?;
+        // MAPPS-667 (mokosh-invoices P1b): refuse Draft too. A draft is
+        // by definition not yet shown to a customer, so paying one from
+        // the contact plane is either a leak (invoice list surfaced a
+        // row it shouldn't have) or an accident on the staff plane
+        // that would charge a card for an amount not yet finalized.
+        // Security review F9 (docs/mokosh-invoices/06-security-review.md).
         if matches!(
             invoice.status,
-            InvoiceStatus::Void | InvoiceStatus::WrittenOff
+            InvoiceStatus::Draft | InvoiceStatus::Void | InvoiceStatus::WrittenOff
         ) {
             return Err(AppError::Conflict(format!(
                 "Invoice {} cannot be paid in status '{}'",
@@ -4932,6 +5010,10 @@ struct PaymentGatewayRow {
     is_active: bool,
     is_test_mode: bool,
     config_encrypted: Option<String>,
+    /// MAPPS-671 (mokosh-invoices P2a): admin-set override for the Pay Now
+    /// button label. NULL = fall back to the provider-default in the
+    /// readiness handler.
+    client_display_name: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

@@ -26,40 +26,45 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
         _ => return Ok(()),
     };
 
-    // SAFETY (PMS-285): first-run admin bootstrap runs at startup before any
-    // request is served and seeds the very first `users` row under the default
-    // tenant, a privileged cross-tenant provisioning act. It uses the migrator
-    // (BYPASSRLS) pool; `users` is RLS-covered, so an app-pool count/insert with
-    // no GUC would fail closed and the bootstrap could never see/create rows.
-    let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+    // MAPPS-518 (MAPPS-513 stage B): bootstrap now seeds `platform_admins`
+    // (the source of truth for the platform super-admin persona post stage B),
+    // so the gate flips to counting THAT table. Also runs on the migrator
+    // pool; `platform_admins` is RLS-exempt, but keeping consistency.
+    let platform_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM platform_admins")
         .fetch_one(db.migrator_pool())
         .await?;
 
-    if user_count > 0 {
+    if platform_count > 0 {
         tracing::info!(
-            users = user_count,
-            "ADMIN_EMAIL/ADMIN_PASSWORD set but users already exist; skipping bootstrap"
+            platform_admins = platform_count,
+            "ADMIN_EMAIL/ADMIN_PASSWORD set but a platform admin already exists; skipping bootstrap"
         );
         return Ok(());
     }
 
-    let default_tenant_id = Uuid::from_u128(1);
+    // MAPPS-518 (MAPPS-513 stage B): the platform super-admin persona
+    // no longer lives in `users`. First-run bootstrap creates a
+    // `platform_admins` row instead. Sign in at `/platform/login`
+    // with these credentials; the tenant identity plane
+    // (users / identities) is untouched, so a tenant admin password
+    // reset can never clobber the platform admin credential.
+    let _default_tenant_id = Uuid::from_u128(1);
     let email = email.trim().to_ascii_lowercase();
     let password_hash = hash_password(&password)?;
-    let user_id = Uuid::new_v4();
+    let admin_id = Uuid::new_v4();
     let (first_name, last_name) = derive_name(&email);
 
     sqlx::query(
         r#"
-        INSERT INTO users (
-            id, tenant_id, email, password_hash,
-            first_name, last_name, role, status, email_verified_at
+        INSERT INTO platform_admins (
+            id, email, password_hash, first_name, last_name,
+            status, email_verified_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, 'super_admin', 'active', NOW())
+        VALUES ($1, $2, $3, $4, $5, 'active', NOW())
+        ON CONFLICT (id) DO NOTHING
         "#,
     )
-    .bind(user_id)
-    .bind(default_tenant_id)
+    .bind(admin_id)
     .bind(&email)
     .bind(&password_hash)
     .bind(&first_name)
@@ -68,9 +73,9 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
     .await?;
 
     tracing::warn!(
-        user_id = %user_id,
+        admin_id = %admin_id,
         email = %email,
-        "bootstrapped admin user from ADMIN_EMAIL/ADMIN_PASSWORD (DEV ONLY; do not use in production)"
+        "bootstrapped platform admin from ADMIN_EMAIL/ADMIN_PASSWORD (DEV ONLY; do not use in production). Sign in at /platform/login."
     );
 
     Ok(())

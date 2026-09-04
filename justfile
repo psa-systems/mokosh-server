@@ -494,6 +494,16 @@ infisical-bootstrap: ensure-env
         cargo run --quiet --bin mokosh-server -- bootstrap-infisical
     }
 
+# PMS-729: seed the client-portal login fixture set into the running dev
+# database (three tenants + one portal contact each, sharing a fixed dev
+# password). Idempotent. Refuses if ENVIRONMENT is not development/dev/test.
+# Run once after `just dev` boots to exercise the host-derived portal login
+# at http://{slug}.client.localhost:4301/portal/login.
+[doc("Seed the PMS-729 client-portal fixture tenants + contacts into the running dev DB (idempotent, dev-only).")]
+[group: 'dev']
+dev-seed-portal: ensure-env
+    docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo run --quiet --bin mokosh-bootstrap -- dev-seed-portal'
+
 # Build OCI image
 [group: 'build']
 build-docker:

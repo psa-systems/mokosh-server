@@ -1053,6 +1053,157 @@ async fn granting_portal_access_mints_setup_token(pool: PgPool) {
     );
 }
 
+/// Granting portal access at contact-create time enqueues the
+/// `auth.portal_grant` email (prompt 011) whose rendered body carries a
+/// well-formed `/portal/{slug}/set-password?token=...` link the customer
+/// can actually click. Pins the wire so a future context / template
+/// rename does not render an empty link, AND so the slug-less URL bug
+/// (dispatched an `auth.welcome` template with `/portal/set-password?...`
+/// missing the slug segment, SPA 404'd) does not regress.
+#[sqlx::test]
+async fn granting_portal_access_enqueues_setup_link_email(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Wire Co").await;
+
+    let created = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Wire",
+            "last_name": "Check",
+            "email": "wire-check@acme.example",
+            "create_portal_access": true,
+        }))
+        .send()
+        .await
+        .expect("create + grant portal");
+    assert!(created.status().is_success());
+
+    let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT channel_type, recipient, body FROM notifications \
+         WHERE tenant_id = $1 AND channel_type = 'email' AND recipient = $2",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("wire-check@acme.example")
+    .fetch_optional(&pool)
+    .await
+    .expect("query notification");
+
+    let (channel, recipient, body) =
+        row.expect("an auth.portal_grant email was enqueued for the grant");
+    assert_eq!(channel, "email");
+    assert_eq!(recipient.as_deref(), Some("wire-check@acme.example"));
+    // Read the Company's portal_slug so the URL assertion below can
+    // pin the correct slug-included shape rather than the broken
+    // slug-less one.
+    let company_uuid: uuid::Uuid = company_id.parse().expect("company_id parses as UUID");
+    let slug: String =
+        sqlx::query_scalar("SELECT portal_slug FROM companies WHERE id = $1 AND tenant_id = $2")
+            .bind(company_uuid)
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal_slug");
+    let expected_prefix = format!("/portal/{slug}/set-password?token=");
+    assert!(
+        body.contains(&expected_prefix),
+        "body must carry the /portal/{{slug}}/set-password?token=... link so the customer can complete signup, got: {body}"
+    );
+    // Regression guard: the pre-011 body carried /portal/set-password?token= with
+    // no slug segment, which the SPA router 404s on. If the fix is reverted this
+    // assertion trips before anyone hits the bug in dev.
+    assert!(
+        !body.contains("/portal/set-password?token="),
+        "regression: body must not carry the slug-less URL the SPA router 404s on, got: {body}"
+    );
+}
+
+/// PMS-729 finalize: both `create_portal_access: true` on create and
+/// `is_portal_user: true` on update write an `audit_log` row against
+/// the `contacts` entity so an admin can see who granted portal access
+/// to whom. Pins the audit-side of the grant flow: without this, a
+/// future refactor that skips the audit_write inside the create/update
+/// tx would go undetected.
+#[sqlx::test]
+async fn granting_portal_access_writes_audit_row(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Audit Co").await;
+
+    // (1) Create with create_portal_access=true -> one Create audit row.
+    let created = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Portal",
+            "last_name": "Grantee",
+            "email": "audit-grant@acme.example",
+            "create_portal_access": true,
+        }))
+        .send()
+        .await
+        .expect("create + grant portal");
+    assert!(created.status().is_success());
+    let created_json: serde_json::Value = created.json().await.expect("created JSON");
+    let contact_id: uuid::Uuid = created_json["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .expect("contact id");
+
+    let create_audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE tenant_id = $1 AND entity_type = 'contacts' AND entity_id = $2 AND action = 'create'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit create rows");
+    assert_eq!(
+        create_audit_count, 1,
+        "create_portal_access grant must write exactly one Create audit row so the grant is discoverable"
+    );
+
+    // (2) Toggle the flag off then on again -> two Update audit rows
+    //     (the revoke + the grant); asserts the update path audits too.
+    let _revoke = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "is_portal_user": false }))
+        .send()
+        .await
+        .expect("revoke");
+    let _regrant = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "is_portal_user": true }))
+        .send()
+        .await
+        .expect("re-grant");
+    let update_audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log \
+         WHERE tenant_id = $1 AND entity_type = 'contacts' AND entity_id = $2 AND action = 'update'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit update rows");
+    assert_eq!(
+        update_audit_count, 2,
+        "revoke + re-grant must write two Update audit rows so the toggle history is discoverable"
+    );
+}
+
 // ============================================================================
 // PMS-17 AC4 (F9 regression pin)
 // ============================================================================
@@ -1285,6 +1436,418 @@ async fn create_company_row(pool: &PgPool, name: &str, company_type: &str) -> St
     .await
     .expect("insert company row");
     id.to_string()
+}
+
+// ============================================================================
+// mokosh-contact-login prompt 003: portal-access lifecycle tests
+// ============================================================================
+
+/// Helper: create a Company via SQL under DEFAULT_TENANT + return its id.
+async fn seed_company_row(pool: &PgPool, name: &str) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("seed company");
+    id
+}
+
+/// Helper: create a Contact via SQL under the given Company + return its id.
+async fn seed_contact_row(pool: &PgPool, company_id: uuid::Uuid, email: &str) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contacts (id, tenant_id, company_id, first_name, last_name, email) \
+         VALUES ($1, $2, $3, 'Test', 'Contact', $4)",
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(email)
+    .execute(pool)
+    .await
+    .expect("seed contact");
+    id
+}
+
+/// mokosh-contact-login prompt 003: `POST /portal-roles` returns the
+/// three built-ins for a fresh tenant + `GET /contacts/{id}/portal-roles`
+/// starts empty for a contact who has never been granted access.
+#[sqlx::test]
+async fn portal_roles_list_returns_the_three_builtins(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/contacts/contacts/portal-roles"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list portal roles");
+    assert!(resp.status().is_success(), "GET /portal-roles should 200");
+    let rows: Vec<serde_json::Value> = resp.json().await.expect("roles JSON");
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|r| r["name"].as_str().expect("name"))
+        .collect();
+    assert!(
+        names.contains(&"Billing Contact")
+            && names.contains(&"Support Contact")
+            && names.contains(&"Read-Only"),
+        "prompt 003: /portal-roles must surface the three built-ins, got {names:?}"
+    );
+}
+
+/// mokosh-contact-login prompt 003: happy-path grant. Populates the
+/// Company's portal_slug, assigns the requested roles, flips
+/// `is_portal_user = TRUE`, mints exactly one setup token, dispatches
+/// the welcome email, returns `{portal_slug, setup_link}` from the
+/// handler.
+#[sqlx::test]
+async fn grant_portal_access_mints_slug_roles_token_and_email(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = seed_company_row(&pool, "MCL P003 Co").await;
+    let contact_id = seed_contact_row(&pool, company_id, "grant@mcl.example").await;
+
+    // Pick the "Billing Contact" built-in role.
+    let roles: Vec<serde_json::Value> = app
+        .client
+        .get(app.url("/api/v1/contacts/contacts/portal-roles"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list roles")
+        .json()
+        .await
+        .expect("roles JSON");
+    let billing_id = roles
+        .iter()
+        .find(|r| r["name"].as_str() == Some("Billing Contact"))
+        .and_then(|r| r["id"].as_str())
+        .expect("Billing Contact role id");
+
+    let resp = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/contacts/contacts/{contact_id}/grant-portal-access"
+        )))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "role_ids": [billing_id] }))
+        .send()
+        .await
+        .expect("grant");
+    assert!(
+        resp.status().is_success(),
+        "grant_portal_access should 2xx, got {}",
+        resp.status()
+    );
+    let outcome: serde_json::Value = resp.json().await.expect("outcome JSON");
+    let portal_slug = outcome["portal_slug"].as_str().expect("portal_slug");
+    let setup_link = outcome["setup_link"].as_str().expect("setup_link");
+    assert_eq!(portal_slug.len(), 16, "slug must be 16 chars");
+    assert!(
+        setup_link.contains(&format!("/portal/{portal_slug}/set-password?token=")),
+        "setup_link must carry the slug + query token, got {setup_link}"
+    );
+
+    // Slug landed on the Company.
+    let db_slug: Option<String> =
+        sqlx::query_scalar("SELECT portal_slug FROM companies WHERE id = $1")
+            .bind(company_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read slug");
+    assert_eq!(db_slug.as_deref(), Some(portal_slug));
+
+    // Contact flipped is_portal_user.
+    let is_portal_user: bool =
+        sqlx::query_scalar("SELECT is_portal_user FROM contacts WHERE id = $1")
+            .bind(contact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read is_portal_user");
+    assert!(is_portal_user);
+
+    // Role assignment landed.
+    let role_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contact_role_assignments WHERE contact_id = $1")
+            .bind(contact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count assignments");
+    assert_eq!(role_count, 1, "prompt 003: one role assigned");
+
+    // Exactly one unredeemed setup token.
+    let token_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM portal_setup_tokens \
+         WHERE contact_id = $1 AND used_at IS NULL",
+    )
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count tokens");
+    assert_eq!(token_count, 1);
+
+    // Welcome email queued.
+    let notif_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications \
+         WHERE tenant_id = $1 AND recipient = $2 AND channel_type = 'email'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("grant@mcl.example")
+    .fetch_one(&pool)
+    .await
+    .expect("count notifications");
+    assert!(notif_count >= 1, "prompt 003: welcome email queued");
+}
+
+/// mokosh-contact-login prompt 003: re-granting with a different role
+/// set REPLACES the assignment. Rewriting is atomic; the token gets
+/// re-issued (any prior unredeemed one drops).
+#[sqlx::test]
+async fn grant_portal_access_rewrites_role_set_and_reissues_token(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = seed_company_row(&pool, "MCL P003 Rewrite Co").await;
+    let contact_id = seed_contact_row(&pool, company_id, "rewrite@mcl.example").await;
+
+    let roles: Vec<serde_json::Value> = app
+        .client
+        .get(app.url("/api/v1/contacts/contacts/portal-roles"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("roles JSON");
+    let billing = roles
+        .iter()
+        .find(|r| r["name"].as_str() == Some("Billing Contact"))
+        .and_then(|r| r["id"].as_str())
+        .expect("billing")
+        .to_string();
+    let support = roles
+        .iter()
+        .find(|r| r["name"].as_str() == Some("Support Contact"))
+        .and_then(|r| r["id"].as_str())
+        .expect("support")
+        .to_string();
+
+    // First grant: Billing only.
+    app.client
+        .post(app.url(&format!(
+            "/api/v1/contacts/contacts/{contact_id}/grant-portal-access"
+        )))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "role_ids": [billing] }))
+        .send()
+        .await
+        .expect("grant billing");
+    let first_token_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM portal_setup_tokens WHERE contact_id = $1 AND used_at IS NULL",
+    )
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(first_token_count, 1);
+
+    // Re-grant: Support only. Rewrites the assignment set + reissues the token.
+    app.client
+        .post(app.url(&format!(
+            "/api/v1/contacts/contacts/{contact_id}/grant-portal-access"
+        )))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "role_ids": [support] }))
+        .send()
+        .await
+        .expect("grant support");
+
+    let role_names: Vec<String> = sqlx::query_scalar(
+        "SELECT pr.name FROM contact_role_assignments cra \
+         JOIN portal_roles pr ON pr.id = cra.role_id \
+         WHERE cra.contact_id = $1",
+    )
+    .bind(contact_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read role names");
+    assert_eq!(
+        role_names,
+        vec!["Support Contact"],
+        "prompt 003: replaces role set"
+    );
+
+    let second_token_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM portal_setup_tokens WHERE contact_id = $1 AND used_at IS NULL",
+    )
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        second_token_count, 1,
+        "prompt 003: re-grant invalidates prior token + mints one fresh"
+    );
+}
+
+/// mokosh-contact-login prompt 003: grant fails closed on a role_id
+/// from another tenant.
+#[sqlx::test]
+async fn grant_portal_access_rejects_cross_tenant_role_id(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Seed a foreign tenant + a role owned by it.
+    let foreign_tenant = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, kind) VALUES ($1, 'Foreign', 'foreign', 'org')",
+    )
+    .bind(foreign_tenant)
+    .execute(&pool)
+    .await
+    .expect("seed foreign tenant");
+    let foreign_role = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO portal_roles (id, tenant_id, name, capabilities, is_builtin) \
+         VALUES ($1, $2, 'Foreign Role', ARRAY['tickets:read'], FALSE)",
+    )
+    .bind(foreign_role)
+    .bind(foreign_tenant)
+    .execute(&pool)
+    .await
+    .expect("seed foreign role");
+
+    let company_id = seed_company_row(&pool, "MCL P003 Foreign Co").await;
+    let contact_id = seed_contact_row(&pool, company_id, "foreign@mcl.example").await;
+
+    let resp = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/contacts/contacts/{contact_id}/grant-portal-access"
+        )))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "role_ids": [foreign_role] }))
+        .send()
+        .await
+        .expect("grant with foreign role");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "prompt 003: foreign role_id must fail closed"
+    );
+}
+
+/// mokosh-contact-login prompt 003: revoke drops the assignment set,
+/// flips is_portal_user off, deletes pending tokens, marks live
+/// contact_sessions revoked.
+#[sqlx::test]
+async fn revoke_portal_access_wipes_assignments_and_sessions(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = seed_company_row(&pool, "MCL P003 Revoke Co").await;
+    let contact_id = seed_contact_row(&pool, company_id, "revoke@mcl.example").await;
+    let roles: Vec<serde_json::Value> = app
+        .client
+        .get(app.url("/api/v1/contacts/contacts/portal-roles"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    let billing = roles
+        .iter()
+        .find(|r| r["name"].as_str() == Some("Billing Contact"))
+        .and_then(|r| r["id"].as_str())
+        .expect("billing")
+        .to_string();
+    app.client
+        .post(app.url(&format!(
+            "/api/v1/contacts/contacts/{contact_id}/grant-portal-access"
+        )))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "role_ids": [billing] }))
+        .send()
+        .await
+        .expect("grant");
+
+    // Seed a live contact_sessions row so we can assert it gets
+    // revoked. Uses a bogus hash - we only care about `revoked_at`.
+    sqlx::query(
+        "INSERT INTO contact_sessions \
+         (tenant_id, contact_id, refresh_token_hash, expires_at) \
+         VALUES ($1, $2, 'bogus', NOW() + INTERVAL '30 days')",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contact_id)
+    .execute(&pool)
+    .await
+    .expect("seed session");
+
+    let resp = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/contacts/contacts/{contact_id}/revoke-portal-access"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("revoke");
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let assignments: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contact_role_assignments WHERE contact_id = $1")
+            .bind(contact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count assignments");
+    assert_eq!(assignments, 0, "prompt 003: revoke drops assignments");
+
+    let is_portal_user: bool =
+        sqlx::query_scalar("SELECT is_portal_user FROM contacts WHERE id = $1")
+            .bind(contact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read is_portal_user");
+    assert!(!is_portal_user);
+
+    let pending_tokens: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM portal_setup_tokens \
+         WHERE contact_id = $1 AND used_at IS NULL",
+    )
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count tokens");
+    assert_eq!(pending_tokens, 0);
+
+    let live_sessions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM contact_sessions \
+         WHERE contact_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count sessions");
+    assert_eq!(
+        live_sessions, 0,
+        "prompt 003: revoke must mark every live session revoked"
+    );
 }
 
 // ============================================================================

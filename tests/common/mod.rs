@@ -401,6 +401,10 @@ async fn boot_with_db(
         // MAPPS-429: a public API base IS configured here, so the request-form
         // suite can assert an emailed logo resolves absolutely.
         Some("http://api.localhost".to_string()),
+        // MAPPS-457: default test router has no tenant cap so integration
+        // suites that spin up dozens of tenants stay unblocked. Cap-behavior
+        // specs override this by building their own router.
+        None,
         // PMS-904: self-hosted, so the integration suite exercises the mode
         // that sends everything. The suppression is a unit test on
         // `AuthService`, which can hold both modes in one binary; flipping the
@@ -469,6 +473,23 @@ pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     .execute(pool)
     .await
     .expect("insert seeded admin");
+
+    // MAPPS-518 (MAPPS-513 stage B): also seed a `platform_admins` row
+    // for the same email + password so tests that hit endpoints gated
+    // by `RequirePlatformAdmin` (post stage B: list/create/suspend/
+    // activate/resend_welcome tenants, get/update tenant admin) can
+    // call `common::platform_login` to get a platform bearer. Older
+    // tests that just use `common::login` still work; the users row
+    // is unchanged.
+    sqlx::query(
+        "INSERT INTO platform_admins (email, password_hash, first_name, last_name, status) \
+         VALUES ($1, $2, 'Test', 'Admin', 'active') ON CONFLICT DO NOTHING",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(pool)
+    .await
+    .expect("insert seeded platform admin");
 
     (user_id, email, password)
 }
@@ -605,10 +626,20 @@ pub async fn seed_tenant_with_admin(
 /// [`seed_admin`]: not every integration-test binary authenticates.
 #[allow(dead_code)]
 pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
+    // PMS-728 AC1: the local password path rejects a credential presented
+    // without an explicit tenant identifier. This helper backs the whole
+    // suite's default-admin login path (which uses `seed_admin`, populating
+    // the default tenant, slug `default`, seeded by migration 002), so
+    // threading the slug in here keeps the change localised: the callers
+    // don't need to know the tenant lookup semantics.
     let resp = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "default",
+        }))
         .send()
         .await
         .expect("send /login request");
@@ -622,4 +653,96 @@ pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
         .as_str()
         .expect("login response has access_token")
         .to_string()
+}
+
+/// MAPPS-518 (MAPPS-513 stage B): drive `POST /api/v1/platform/login`
+/// and return the platform bearer. `seed_admin` seeds a matching
+/// `platform_admins` row so this works with the same email/password
+/// pair. Use this for tests that hit endpoints gated by
+/// `RequirePlatformAdmin` (list_tenants, create_tenant,
+/// suspend_tenant, activate_tenant, resend_admin_welcome,
+/// get_tenant_admin, update_tenant_admin).
+#[allow(dead_code)]
+pub async fn platform_login(app: &TestApp, email: &str, password: &str) -> String {
+    let resp = app
+        .client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&serde_json::json!({ "email": email, "password": password }))
+        .send()
+        .await
+        .expect("send /platform/login request");
+    assert!(
+        resp.status().is_success(),
+        "platform login expected 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("/platform/login JSON body");
+    body["access_token"]
+        .as_str()
+        .expect("platform login response has access_token")
+        .to_string()
+}
+
+/// PMS-791 / MAPPS-461: seed a team owned by the given tenant. Returns the
+/// team id. `manager_id` is optional; when set, the caller has typically
+/// just `seed_user`-ed that user in the same tenant.
+#[allow(dead_code)]
+pub async fn seed_team(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    name: &str,
+    manager_id: Option<Uuid>,
+) -> Uuid {
+    let team_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO teams (id, tenant_id, name, manager_id, color, is_active)
+        VALUES ($1, $2, $3, $4, '#6366F1', TRUE)
+        "#,
+    )
+    .bind(team_id)
+    .bind(tenant_id)
+    .bind(name)
+    .bind(manager_id)
+    .execute(pool)
+    .await
+    .expect("seed_team");
+    team_id
+}
+
+/// PMS-791 / MAPPS-461: add a user to a team with the given role
+/// (`"leader"` or `"member"`). Bypass the production service so tests
+/// can set up invalid states on purpose (e.g. wrong-tenant user_id).
+#[allow(dead_code)]
+pub async fn seed_team_member(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    team_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+) {
+    sqlx::query(
+        r#"
+        INSERT INTO team_members (tenant_id, team_id, user_id, role, joined_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(team_id)
+    .bind(user_id)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("seed_team_member");
+}
+
+/// PMS-791 / MAPPS-461: shorthand for the common test setup — an admin
+/// (via `seed_admin`) + a team + the admin as leader. Returns
+/// `(admin_id, admin_email, admin_password, team_id)`.
+#[allow(dead_code)]
+pub async fn seed_admin_and_team(pool: &PgPool, team_name: &str) -> (Uuid, String, String, Uuid) {
+    let (admin_id, email, password) = seed_admin(pool).await;
+    let team_id = seed_team(pool, DEFAULT_TENANT_ID, team_name, Some(admin_id)).await;
+    seed_team_member(pool, DEFAULT_TENANT_ID, team_id, admin_id, "leader").await;
+    (admin_id, email, password, team_id)
 }

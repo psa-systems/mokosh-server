@@ -241,6 +241,14 @@ services:
       # the routed hostname below (same value as OIDC_AUDIENCE).
       BASE_URL: https://${USER}-mokosh-api.a8n.run
 
+      # Serialise rustc so the final mokosh_server lib compile does
+      # not race a codegen unit against another peaking process on a
+      # memory-constrained dev box (earlyoom SIGTERMs the whole
+      # container at ~1.5 GB free). Paired with the profile.dev
+      # tuning in Cargo.toml (debug=0, codegen-units=256): together
+      # they keep rustc peak RSS under the OOM ceiling.
+      CARGO_BUILD_JOBS: "1"
+
       # Reach the in-stack postgres by service-DNS name. PMS-285: the split
       # roles activate RLS at runtime. DATABASE_URL connects as the privileged
       # `mokosh_migrator` (BYPASSRLS) - it runs migrations + bootstrap + the
@@ -315,6 +323,15 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
 
+      # MAPPS-649: the per-MSP `PORTAL_HOST_SUFFIX` env retired with the
+      # collapse onto a single portal subdomain. The portal now lives at
+      # one host (typically `portal.<apex>`) and the visitor addresses
+      # their Company from the URL path (`/portal/{portal_id}/*`). If
+      # you are upgrading an older deploy, drop `PORTAL_HOST_SUFFIX`
+      # from your own `.env` and remove any Traefik / DNS wildcard that
+      # pointed at `*.client.<apex>`. See
+      # docs/dev-docs/portal-single-host-cutover.md.
+
       # PMS-836: this map enumerates the container's environment, so a variable
       # the code reads but that has no line here CANNOT be set from .env - the
       # operator edits .env, sees no error, and the feature stays off. Every
@@ -323,7 +340,23 @@ services:
       # an untouched .env behaves exactly as before. scripts/check-env-example.nu
       # fails `just check` if a new read is added without a line here.
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+
+      # PMS-729 / MAPPS-649: CORS allow-list, comma-separated. Empty
+      # passes through as `[CLIENT_ORIGIN]` on the server side. Add the
+      # portal origin here when the SPA is served on a separate portal
+      # host in dev (e.g. `http://portal.localhost:4301`) so a browser
+      # tab on that origin can POST credentialed calls. See
+      # `.env.example` for a full example and `src/api/cors_origin.rs`
+      # for the predicate.
       CORS_ORIGIN: ${CORS_ORIGIN:-}
+
+      # PMS-729 phase 2 H8: Cloudflare Turnstile on portal login. Both
+      # keys empty (default) leaves the feature off; the per-IP failure
+      # counter still ticks so a future toggle-on picks up warm state.
+      # See .env.example for the source of the keys.
+      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+      TURNSTILE_TRIGGER_THRESHOLD: ${TURNSTILE_TRIGGER_THRESHOLD:-}
 
       # MAPPS-425 / PMS-748 / MAPPS-429: the emailed-link and email-branding
       # trio. SPA_BASE_URL falls back to CLIENT_ORIGIN, so it only needs setting
@@ -392,6 +425,12 @@ services:
       MOKOSH_DEMO_SEED: ${MOKOSH_DEMO_SEED:-}
       MOKOSH_SEED_TENANT_ID: ${MOKOSH_SEED_TENANT_ID:-}
       MOKOSH_UPDATE_CHECK_URL: ${MOKOSH_UPDATE_CHECK_URL:-}
+
+      # MAPPS-457: hard ceiling on POST /api/v1/tenants. Empty leaves creation
+      # uncapped (the code default); a positive integer 409s once the total
+      # tenant count reaches it. Kept forwardable in dev so a stress-test can
+      # set the cap without a container rebuild.
+      MOKOSH_MAX_TENANTS: ${MOKOSH_MAX_TENANTS:-}
 
       RUST_LOG: ${RUST_LOG:-info,mokosh_server=debug}
     networks:

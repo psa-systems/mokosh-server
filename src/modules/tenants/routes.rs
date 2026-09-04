@@ -14,13 +14,82 @@ use validator::Validate;
 use super::logo::{logo_path, TenantLogoConfig, TenantLogoStore};
 use super::organization::organization_update;
 use super::{
-    CreateTenantRequest, OrganizationProfileRequest, TenantResponse, TenantService, TenantUsage,
-    UpdateTenantRequest,
+    CreateTenantRequest, OrganizationProfileRequest, TenantAdminInfo, TenantResponse,
+    TenantService, TenantUsage, UpdateTenantAdminRequest, UpdateTenantRequest,
 };
-use crate::modules::auth::{RequireAuth, RequireSuperAdmin, TenantId, TenantScoped, UserRole};
+use crate::modules::auth::{
+    AuthService, CurrentUser, RequireAuth, RequireAuthState, TenantId, TenantScoped,
+};
+use crate::modules::platform::RequirePlatformAdmin;
+
+/// MAPPS-518: extractor that lets a tenant `users` caller AND a
+/// `/platform/login` bearer through the same handler. The former
+/// `role='super_admin'` cross-tenant bypass is retired, but the
+/// cross-tenant admin surface it enabled (viewing / editing an
+/// arbitrary tenant from the console) is preserved via the
+/// platform-plane bearer. Handlers that used to check
+/// `user.role == UserRole::SuperAdmin || user.tenant_id == tenant_id`
+/// now consume `TenantOrPlatformCaller` and call one of its
+/// `require_*` helpers instead.
+// Merge cleanup: box the large variant in a follow-up (out of scope for the route-overlap fix)
+#[allow(clippy::large_enum_variant)]
+pub enum TenantOrPlatformCaller {
+    Platform,
+    Tenant(CurrentUser),
+}
+
+impl<S> axum::extract::FromRequestParts<S> for TenantOrPlatformCaller
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        if RequirePlatformAdmin::from_request_parts(parts, state)
+            .await
+            .is_ok()
+        {
+            return Ok(TenantOrPlatformCaller::Platform);
+        }
+        let RequireAuth(user) = RequireAuth::from_request_parts(parts, state).await?;
+        Ok(TenantOrPlatformCaller::Tenant(user))
+    }
+}
+
+impl TenantOrPlatformCaller {
+    /// Read-side gate: platform admin can read any tenant; a tenant
+    /// caller can read only their own.
+    fn require_read_access(&self, tenant_id: Uuid) -> AppResult<()> {
+        match self {
+            TenantOrPlatformCaller::Platform => Ok(()),
+            TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id => Ok(()),
+            _ => Err(AppError::Forbidden(
+                "You do not have permission to perform this action.".to_string(),
+            )),
+        }
+    }
+
+    /// Write-side gate: platform admin can write any tenant; a tenant
+    /// caller must be the admin of their own tenant.
+    fn require_admin_write_access(&self, tenant_id: Uuid) -> AppResult<()> {
+        match self {
+            TenantOrPlatformCaller::Platform => Ok(()),
+            TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id && u.role.is_admin() => {
+                Ok(())
+            }
+            _ => Err(AppError::Forbidden(
+                "You do not have permission to perform this action.".to_string(),
+            )),
+        }
+    }
+}
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
+use mokosh_types::auth::{AdditionalTenantRequest, LoginResponse, SelfServeTenantRequest};
 
 #[derive(Clone)]
 pub struct TenantRouterState {
@@ -33,6 +102,12 @@ pub struct TenantRouterState {
     // own router state; we Arc it here too so the clone is cheap and
     // the two routers share the same instance.
     pub settings_service: Arc<SettingsService>,
+    /// MAPPS-493 (MAPPS-474 phase 4): needed by the `/tenants/self-serve`
+    /// handler so it can decode an identity_token (from the phase-3
+    /// `needs_setup` login branch) and mint a full session for the
+    /// admin of the freshly created tenant. Shared with the auth
+    /// router via the same `Arc<AuthService>` created in `api/router.rs`.
+    pub auth_service: Arc<AuthService>,
 }
 
 /// Create the tenant management router. `settings_service` is threaded
@@ -41,6 +116,7 @@ pub struct TenantRouterState {
 pub fn tenant_routes(
     tenant_service: TenantService,
     settings_service: Arc<SettingsService>,
+    auth_service: Arc<AuthService>,
 ) -> Router {
     // PMS-957: the authenticated tree is where a logo is uploaded and removed,
     // so it is the one that records what is stored.
@@ -50,11 +126,25 @@ pub fn tenant_routes(
         tenant_service: Arc::new(tenant_service),
         logos: Arc::new(logos),
         settings_service,
+        auth_service,
     };
 
     Router::new()
         .route("/", get(list_tenants))
         .route("/", post(create_tenant))
+        // MAPPS-493 (MAPPS-474 phase 4): PUBLIC (no RequireAuth); the
+        // handler decodes an identity_token from the phase-3
+        // `needs_setup` login branch and returns a full `LoginResponse`
+        // scoped to the freshly created tenant.
+        .route("/self-serve", post(self_serve_tenant))
+        // MAPPS-494 (MAPPS-474 phase 5): authenticated identity creates
+        // an ADDITIONAL organization. Bearer required; the caller
+        // becomes admin in the new tenant. Distinct from `self-serve`
+        // (which is for the zero-membership `needs_setup` login branch
+        // and returns a full session) because an authenticated caller
+        // already has a session and can pick when to switch to the new
+        // tenant via `/auth/switch-tenant/:id`.
+        .route("/additional", post(create_additional_tenant))
         // PMS-751: the caller's OWN tenant, addressed without an id.
         //
         // Declared before the `{tenant_id}` routes for readability only; axum
@@ -85,6 +175,11 @@ pub fn tenant_routes(
         .route("/{tenant_id}", put(update_tenant))
         .route("/{tenant_id}/suspend", post(suspend_tenant))
         .route("/{tenant_id}/activate", post(activate_tenant))
+        // mokosh-contact-login: the /cancel + /admin routes + the
+        // resend-welcome route (MAPPS-558 / MAPPS-450 / MAPPS-448)
+        // retired with the Clients-tab UI in prompt 001. Handlers
+        // stay in the file as dead code and will be swept in a
+        // follow-up cleanup pass.
         .route("/{tenant_id}/usage", get(get_tenant_usage))
         // Audit F5: expose existing service-level module-config helpers
         // over HTTP so the client's settings/integrations page can read
@@ -97,7 +192,7 @@ pub fn tenant_routes(
 /// List all tenants (super admin only)
 async fn list_tenants(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TenantResponse>>> {
     let (tenants, total) = state.tenant_service.list_tenants(&pagination).await?;
@@ -114,7 +209,7 @@ async fn list_tenants(
 /// Create a new tenant (super admin only)
 async fn create_tenant(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     ctx: crate::modules::audit::AuditCtx,
     Json(request): Json<CreateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
@@ -125,24 +220,151 @@ async fn create_tenant(
     Ok(Json(tenant.into()))
 }
 
-/// Get tenant by ID
-async fn get_tenant(
+/// MAPPS-493 (MAPPS-474 phase 4): trade an identity_token (from the
+/// phase-3 `needs_setup` login branch) for a new organization + a full
+/// session scoped to it. PUBLIC route (no bearer required); the
+/// identity_token in the body IS the authentication.
+///
+/// Refuses when the caller already holds at least one active membership
+/// (they should use the in-app "Create org" button instead — that lands
+/// in phase 5 as part of the switcher work).
+async fn self_serve_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
-    Path(tenant_id): Path<Uuid>,
-) -> AppResult<Json<TenantResponse>> {
-    // Super admin can view any tenant, others can only view their own
-    if user.role != UserRole::SuperAdmin && user.tenant_id != tenant_id {
-        return Err(AppError::Forbidden(
-            "You do not have permission to do that".to_string(),
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<SelfServeTenantRequest>,
+) -> AppResult<Json<LoginResponse>> {
+    request.validate()?;
+
+    // 1. Authenticate via identity_token. Wrong typ / expired -> 401.
+    let (identity_id, email) = state
+        .auth_service
+        .decode_identity_token(&request.identity_token)?;
+
+    // 2. Load the identity row for the name fields + password hash.
+    //    The trigger from phase 1 uses the identity's password_hash to
+    //    keep the new users row in sync with what the identity plane
+    //    already believes.
+    let pool = state.auth_service.db().migrator_pool();
+    let identity = crate::db::identity::IdentityRepo::find_by_id(pool, identity_id)
+        .await
+        .map_err(|_| AppError::Unauthorized)?
+        .ok_or(AppError::Unauthorized)?;
+    if identity.status != "active" {
+        return Err(AppError::Unauthorized);
+    }
+
+    // 3. Refuse when the identity already holds active memberships. Guards
+    //    against replaying a needs_setup identity_token after the identity
+    //    has been placed. Phase 5 will add an in-app "Create org" button
+    //    for authenticated identities that goes through a different route.
+    let existing = crate::db::identity::MembershipRepo::list_active_for_identity(pool, identity_id)
+        .await
+        .map_err(|_| AppError::Unauthorized)?;
+    if !existing.is_empty() {
+        return Err(AppError::conflict(
+            "You already belong to an organization. Sign in and use the in-app Create button instead.",
         ));
     }
 
-    // SAFETY (PMS-261): this super-admin surface deliberately addresses an
-    // arbitrary path `tenant_id`, not the caller's own claim. The role guard
-    // above is the gate (super-admin, or same-tenant), so `from_trusted` is
-    // sound: a non-super-admin can only reach this with `tenant_id ==
-    // user.tenant_id`.
+    // 4. Create the tenant + admin users row. Phase-1 trigger drops the
+    //    matching `tenant_memberships` row so the identity is admin in
+    //    the new tenant immediately.
+    let (_tenant, _admin_id) = state
+        .tenant_service
+        .create_tenant_for_identity(
+            &identity.email,
+            &identity.first_name,
+            &identity.last_name,
+            identity.password_hash.as_deref(),
+            &request.tenant_name,
+            request.tenant_slug.as_deref(),
+            &ctx,
+        )
+        .await?;
+
+    // 5. Mint a full session for the fresh admin. Client-side
+    //    `install_session` handles the wire response identically to
+    //    the auto-scope login branch, so the SPA lands directly on
+    //    the dashboard scoped to the new tenant.
+    let ip_address = Some(
+        crate::utils::client_ip::extract_client_ip(
+            addr.ip(),
+            &headers,
+            crate::utils::client_ip::trusted_proxies(),
+        )
+        .to_string(),
+    );
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let response = state
+        .auth_service
+        .mint_session_for_membership(_tenant.id, &email, ip_address, user_agent)
+        .await?;
+    Ok(Json(response))
+}
+
+/// MAPPS-494 (MAPPS-474 phase 5): authenticated identity creates an
+/// additional organization. The caller becomes admin in the fresh
+/// tenant. Returns the Tenant DTO; the caller separately POSTs to
+/// `/auth/switch-tenant/:id` to move their session into it.
+///
+/// Unlike `self_serve_tenant`, this handler REQUIRES a bearer session
+/// (`RequireAuthState`) and does NOT return a fresh session. The client
+/// keeps its existing session and just refetches memberships +
+/// optionally switches when ready.
+async fn create_additional_tenant(
+    State(state): State<TenantRouterState>,
+    RequireAuthState(auth_state): RequireAuthState,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(request): Json<AdditionalTenantRequest>,
+) -> AppResult<Json<TenantResponse>> {
+    request.validate()?;
+
+    let identity_id = auth_state.identity_id.ok_or(AppError::Unauthorized)?;
+
+    // Load the identity row for first/last name + password_hash. Same
+    // shape as `self_serve_tenant`: users row in the new tenant must
+    // mirror the identity plane so login stays coherent.
+    let pool = state.auth_service.db().migrator_pool();
+    let identity = crate::db::identity::IdentityRepo::find_by_id(pool, identity_id)
+        .await
+        .map_err(|_| AppError::Unauthorized)?
+        .ok_or(AppError::Unauthorized)?;
+    if identity.status != "active" {
+        return Err(AppError::Unauthorized);
+    }
+
+    let (tenant, _admin_id) = state
+        .tenant_service
+        .create_tenant_for_identity(
+            &identity.email,
+            &identity.first_name,
+            &identity.last_name,
+            identity.password_hash.as_deref(),
+            &request.tenant_name,
+            request.tenant_slug.as_deref(),
+            &ctx,
+        )
+        .await?;
+
+    Ok(Json(tenant.into()))
+}
+
+/// Get tenant by ID. MAPPS-518: platform admin OR same-tenant caller.
+async fn get_tenant(
+    State(state): State<TenantRouterState>,
+    caller: TenantOrPlatformCaller,
+    Path(tenant_id): Path<Uuid>,
+) -> AppResult<Json<TenantResponse>> {
+    caller.require_read_access(tenant_id)?;
+
+    // SAFETY (PMS-261 + MAPPS-518): allowed via same-tenant guard OR
+    // platform admin; the arbitrary path `tenant_id` is sound to
+    // bridge because the check above pins it.
     let tenant = state
         .tenant_service
         .get_tenant(TenantId::from_trusted(tenant_id))
@@ -272,6 +494,7 @@ async fn upload_current_logo(
             tenant_id,
             &UpdateTenantRequest {
                 name: None,
+                slug: None,
                 billing_email: None,
                 billing_contact_name: None,
                 settings: None,
@@ -305,6 +528,7 @@ async fn delete_current_logo(
             tenant_id,
             &UpdateTenantRequest {
                 name: None,
+                slug: None,
                 billing_email: None,
                 billing_contact_name: None,
                 settings: None,
@@ -387,23 +611,17 @@ async fn update_current_organization(
 /// Update tenant
 async fn update_tenant(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    caller: TenantOrPlatformCaller,
     ctx: crate::modules::audit::AuditCtx,
     Path(tenant_id): Path<Uuid>,
     Json(request): Json<UpdateTenantRequest>,
 ) -> AppResult<Json<TenantResponse>> {
-    // Super admin can update any tenant, admins can update their own
-    if user.role != UserRole::SuperAdmin && !(user.tenant_id == tenant_id && user.role.is_admin()) {
-        return Err(AppError::Forbidden(
-            "You do not have permission to do that".to_string(),
-        ));
-    }
+    // MAPPS-518: platform admin OR same-tenant admin.
+    caller.require_admin_write_access(tenant_id)?;
 
     request.validate()?;
 
-    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant admin, gated by
-    // the role guard above; the arbitrary path `tenant_id` is sound to bridge
-    // via `from_trusted` only because of that guard.
+    // SAFETY (PMS-261 + MAPPS-518): admin-scoped by the guard above.
     let tenant = state
         .tenant_service
         .update_tenant(TenantId::from_trusted(tenant_id), &request, &ctx)
@@ -415,7 +633,7 @@ async fn update_tenant(
 /// Suspend tenant (super admin only)
 async fn suspend_tenant(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<()> {
     // SAFETY (PMS-261): super-admin-only path (the RequireSuperAdmin extractor
@@ -430,10 +648,88 @@ async fn suspend_tenant(
     Ok(())
 }
 
+/// MAPPS-558: cancel a client (super admin only). Reversible via
+/// `activate_tenant`; both are the same guard shape.
+// Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+#[allow(dead_code)]
+async fn cancel_tenant(
+    State(state): State<TenantRouterState>,
+    _platform: RequirePlatformAdmin,
+    Path(tenant_id): Path<Uuid>,
+) -> AppResult<()> {
+    // SAFETY (PMS-261): super-admin-only path (the RequirePlatformAdmin
+    // extractor is the guard); the arbitrary path `tenant_id` is an
+    // administrative target, bridged via `from_trusted`.
+    state
+        .tenant_service
+        .cancel_tenant(TenantId::from_trusted(tenant_id))
+        .await?;
+
+    Ok(())
+}
+
+/// MAPPS-450: read the tenant admin's `users` row (super admin only).
+// Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+#[allow(dead_code)]
+async fn get_tenant_admin(
+    State(state): State<TenantRouterState>,
+    _platform: RequirePlatformAdmin,
+    Path(tenant_id): Path<Uuid>,
+) -> AppResult<Json<TenantAdminInfo>> {
+    // SAFETY (PMS-261): super-admin-only path; the arbitrary `tenant_id`
+    // is an administrative target, bridged via `from_trusted`.
+    let admin = state
+        .tenant_service
+        .get_tenant_admin(TenantId::from_trusted(tenant_id))
+        .await?;
+    Ok(Json(admin))
+}
+
+/// MAPPS-450: super-admin edits the tenant admin's email + name pair.
+// Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+#[allow(dead_code)]
+async fn update_tenant_admin(
+    State(state): State<TenantRouterState>,
+    _platform: RequirePlatformAdmin,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(tenant_id): Path<Uuid>,
+    Json(request): Json<UpdateTenantAdminRequest>,
+) -> AppResult<Json<TenantAdminInfo>> {
+    request.validate()?;
+    // SAFETY (PMS-261): super-admin-only path via RequireSuperAdmin; the
+    // arbitrary `tenant_id` is an administrative target, bridged via
+    // `from_trusted`.
+    let admin = state
+        .tenant_service
+        .update_tenant_admin(TenantId::from_trusted(tenant_id), &request, &ctx)
+        .await?;
+    Ok(Json(admin))
+}
+
+/// MAPPS-448: re-issue the tenant admin's welcome email (super admin only).
+// Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+#[allow(dead_code)]
+async fn resend_admin_welcome(
+    State(state): State<TenantRouterState>,
+    _platform: RequirePlatformAdmin,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(tenant_id): Path<Uuid>,
+) -> AppResult<()> {
+    // SAFETY (PMS-261): super-admin-only path via RequireSuperAdmin; the
+    // arbitrary `tenant_id` is an administrative target, not the caller's
+    // claim, so `from_trusted` is the sanctioned bridge.
+    state
+        .tenant_service
+        .resend_admin_welcome(TenantId::from_trusted(tenant_id), &ctx)
+        .await?;
+
+    Ok(())
+}
+
 /// Activate tenant (super admin only)
 async fn activate_tenant(
     State(state): State<TenantRouterState>,
-    _super_admin: RequireSuperAdmin,
+    _platform: RequirePlatformAdmin,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<()> {
     // SAFETY (PMS-261): super-admin-only path (the RequireSuperAdmin extractor
@@ -447,21 +743,17 @@ async fn activate_tenant(
     Ok(())
 }
 
-/// Get tenant usage statistics
+/// Get tenant usage statistics. MAPPS-518: platform admin OR
+/// same-tenant caller.
 async fn get_tenant_usage(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    caller: TenantOrPlatformCaller,
     Path(tenant_id): Path<Uuid>,
 ) -> AppResult<Json<TenantUsage>> {
-    // Super admin can view any tenant, admins can view their own
-    if user.role != UserRole::SuperAdmin && user.tenant_id != tenant_id {
-        return Err(AppError::Forbidden(
-            "You do not have permission to do that".to_string(),
-        ));
-    }
+    caller.require_read_access(tenant_id)?;
 
-    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
-    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
+    // SAFETY (PMS-261 + MAPPS-518): allowed via same-tenant guard OR
+    // platform admin; `from_trusted` sound.
     let usage = state
         .tenant_service
         .get_tenant_usage(TenantId::from_trusted(tenant_id))
@@ -479,17 +771,14 @@ async fn get_tenant_usage(
 /// implicitly to the caller's own tenant.
 async fn get_module_config(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    caller: TenantOrPlatformCaller,
     Path((tenant_id, module)): Path<(Uuid, String)>,
 ) -> AppResult<Json<ModuleConfigResponse>> {
-    if user.role != UserRole::SuperAdmin && user.tenant_id != tenant_id {
-        return Err(AppError::Forbidden(
-            "You do not have permission to do that".to_string(),
-        ));
-    }
+    // MAPPS-518: platform admin OR same-tenant caller.
+    caller.require_read_access(tenant_id)?;
 
-    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant caller, gated by
-    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
+    // SAFETY (PMS-261 + MAPPS-518): allowed via same-tenant guard OR
+    // platform admin; `from_trusted` sound.
     let config = state
         .settings_service
         .get_module_config(TenantId::from_trusted(tenant_id), &module)
@@ -502,18 +791,14 @@ async fn get_module_config(
 /// delegates to the canonical `SettingsService`.
 async fn update_module_config(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
+    caller: TenantOrPlatformCaller,
     Path((tenant_id, module)): Path<(Uuid, String)>,
     Json(request): Json<UpsertModuleConfigRequest>,
 ) -> AppResult<Json<ModuleConfigResponse>> {
-    if user.role != UserRole::SuperAdmin && !(user.tenant_id == tenant_id && user.role.is_admin()) {
-        return Err(AppError::Forbidden(
-            "You do not have permission to do that".to_string(),
-        ));
-    }
+    // MAPPS-518: platform admin OR same-tenant admin.
+    caller.require_admin_write_access(tenant_id)?;
 
-    // SAFETY (PMS-261): super-admin (any tenant) or same-tenant admin, gated by
-    // the guard above; arbitrary path `tenant_id` bridged via `from_trusted`.
+    // SAFETY (PMS-261 + MAPPS-518): admin-scoped by the guard above.
     let config = state
         .settings_service
         .upsert_module_config(TenantId::from_trusted(tenant_id), &module, &request)

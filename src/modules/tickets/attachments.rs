@@ -61,9 +61,9 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
-use crate::modules::portal::{
-    portal_auth_middleware, PortalAuthMiddleware, PortalAuthService, RequirePortalAuth,
-};
+// mokosh-contact-login: the /portal/* customer-portal surface retired on this
+// branch, so `crate::modules::portal::*` is gone with it. Portal-plane
+// attachment uploads are folded into the contact plane in a later prompt.
 use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::inline_image::check_inline_image_mime;
@@ -244,7 +244,11 @@ impl AttachmentService {
     /// Verify the ticket exists in the tenant; for portal callers,
     /// also require the ticket's company matches the contact's
     /// company. Returns NotFound on any mismatch.
-    async fn assert_ticket_visible_to_company(
+    ///
+    /// PMS-936: made `pub` so the dual-plane portal attach-file route
+    /// (which lives on the tickets router, not this attachments
+    /// router) can reuse the same leak-free scope check.
+    pub async fn assert_ticket_visible_to_company(
         &self,
         tenant_id: Uuid,
         ticket_id: Uuid,
@@ -364,6 +368,37 @@ impl AttachmentService {
             Some(contact_id),
             // PMS-450 attachments arrive from an inbound email and were never
             // offered a public URL; see the module header.
+            false,
+        )
+        .await
+    }
+
+    /// PMS-936: persist a ticket-level attachment uploaded via the
+    /// portal contact plane (or staff, when the same endpoint is
+    /// reached with a staff bearer). Takes an `Option<Uuid>` for each
+    /// of the two attribution columns so the caller can stamp
+    /// exactly one and leave the other NULL. Reuses the same on-disk
+    /// layout + size cap as the agent / email paths.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_ticket_level_attachment(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        uploaded_by_id: Option<Uuid>,
+        created_by_contact_id: Option<Uuid>,
+        file_name: String,
+        mime_type: String,
+        bytes: Vec<u8>,
+    ) -> AppResult<AttachmentResponse> {
+        self.insert_blob(
+            tenant_id,
+            ticket_id,
+            None,
+            file_name,
+            mime_type,
+            bytes,
+            uploaded_by_id,
+            created_by_contact_id,
             false,
         )
         .await
@@ -587,8 +622,14 @@ impl AttachmentService {
 
 #[derive(Clone, Copy, Debug)]
 enum Uploader {
-    Agent { user_id: Uuid },
-    Portal { contact_id: Uuid },
+    Agent {
+        user_id: Uuid,
+    },
+    // Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
+    #[allow(dead_code)]
+    Portal {
+        contact_id: Uuid,
+    },
 }
 
 impl Uploader {
@@ -669,8 +710,19 @@ pub fn agent_attachment_routes(service: AttachmentService) -> Router {
         // PMS-941: ticket-scoped, note-free, image-only. The upload an author
         // makes while embedding a picture in a description or a note, before
         // there is necessarily a note row to hang it from.
+        //
+        // Merge note (PMS-936/PMS-941): the original PMS-941 URL was
+        // `POST /tickets/{id}/attachments`, but PMS-936 shipped a dual-plane
+        // general-attachment handler at that exact URL on the mokosh-contact-
+        // login track (JSON body, `tickets:attach_file` gated for contacts,
+        // `created_by_contact_id` stamping). Both routes are wanted; both
+        // panic axum at Router construction if they share a (method, path).
+        // Move the PMS-941 image-only inline upload to
+        // `/tickets/{id}/attachments/inline` so the generic attachment URL
+        // stays the shared plane and the inline-image contract lives at
+        // a URL that names its constraint.
         .route(
-            "/tickets/{ticket_id}/attachments",
+            "/tickets/{ticket_id}/attachments/inline",
             post(upload_inline_agent),
         )
         .route(
@@ -701,39 +753,9 @@ pub fn public_ticket_attachment_routes(service: AttachmentService) -> Router {
         .with_state(state)
 }
 
-pub fn portal_attachment_routes(
-    service: AttachmentService,
-    portal_auth_service: PortalAuthService,
-) -> Router {
-    let state = AttachmentsRouterState {
-        service: Arc::new(service),
-    };
-    // PMS-483 follow-up: the portal sub-router's `RequirePortalAuth`
-    // extractor relies on the `portal_auth_middleware` layer to decode
-    // the Bearer token and stash the resulting `CurrentContact` into
-    // request extensions. `portal_routes` applies that layer to its
-    // own routes; merging this router into the portal tree does NOT
-    // inherit it (layers are per-Router in axum), so without spelling
-    // it out here every portal upload / list / download / delete
-    // would 401 before reaching the handler. Build the same middleware
-    // off a separate `PortalAuthService` clone (cheap - the service is
-    // pool + jwt_secret) and layer it onto this sub-router.
-    let mw = PortalAuthMiddleware::new(portal_auth_service);
-    Router::new()
-        .route(
-            "/tickets/{ticket_id}/notes/{note_id}/attachments",
-            get(list_portal).post(upload_portal),
-        )
-        .route(
-            "/tickets/{ticket_id}/notes/{note_id}/attachments/{attachment_id}",
-            get(download_portal).delete(delete_portal),
-        )
-        .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(
-            mw,
-            portal_auth_middleware,
-        ))
-}
+// mokosh-contact-login: `portal_attachment_routes` retired with the
+// `/portal/*` customer-portal surface. A contact-plane replacement is folded
+// into the ticket contact routes in a later prompt.
 
 async fn list_agent(
     State(s): State<AttachmentsRouterState>,
@@ -828,98 +850,9 @@ async fn delete_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_portal(
-    State(s): State<AttachmentsRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
-    Path((ticket_id, note_id)): Path<(Uuid, Uuid)>,
-) -> AppResult<Json<Vec<AttachmentResponse>>> {
-    s.service
-        .assert_ticket_visible_to_company(contact.tenant_id, ticket_id, contact.company_id)
-        .await?;
-    s.service
-        .assert_note_in_ticket(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    let rows = s
-        .service
-        .list(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    Ok(Json(rows))
-}
-
-async fn upload_portal(
-    State(s): State<AttachmentsRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
-    Path((ticket_id, note_id)): Path<(Uuid, Uuid)>,
-    multipart: Multipart,
-) -> AppResult<Json<AttachmentResponse>> {
-    s.service
-        .assert_ticket_visible_to_company(contact.tenant_id, ticket_id, contact.company_id)
-        .await?;
-    s.service
-        .assert_note_in_ticket(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    let (file_name, mime_type, bytes) = read_multipart_file(multipart).await?;
-    let resp = s
-        .service
-        .create(
-            contact.tenant_id,
-            ticket_id,
-            note_id,
-            file_name,
-            mime_type,
-            bytes,
-            Uploader::Portal {
-                contact_id: contact.id,
-            },
-        )
-        .await?;
-    Ok(Json(resp))
-}
-
-async fn download_portal(
-    State(s): State<AttachmentsRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
-    Path((ticket_id, note_id, attachment_id)): Path<(Uuid, Uuid, Uuid)>,
-    headers: HeaderMap,
-) -> AppResult<Response> {
-    s.service
-        .assert_ticket_visible_to_company(contact.tenant_id, ticket_id, contact.company_id)
-        .await?;
-    s.service
-        .assert_note_in_ticket(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    let row = s.service.get_row(contact.tenant_id, attachment_id).await?;
-    if row.ticket_id != ticket_id || row.note_id != Some(note_id) {
-        return Err(AppError::NotFound("attachment not on this note".into()));
-    }
-    attachment_response(s.service.store.as_ref(), row, &headers).await
-}
-
-async fn delete_portal(
-    State(s): State<AttachmentsRouterState>,
-    RequirePortalAuth(contact): RequirePortalAuth,
-    Path((ticket_id, note_id, attachment_id)): Path<(Uuid, Uuid, Uuid)>,
-) -> AppResult<StatusCode> {
-    s.service
-        .assert_ticket_visible_to_company(contact.tenant_id, ticket_id, contact.company_id)
-        .await?;
-    s.service
-        .assert_note_in_ticket(contact.tenant_id, ticket_id, note_id)
-        .await?;
-    // Portal contacts can only delete their own uploads. Look up the
-    // row first to enforce the constraint before delete_one runs.
-    // PMS-783: the row only, so a delete no longer reads a blob it discards.
-    let row = s.service.get_row(contact.tenant_id, attachment_id).await?;
-    if row.created_by_contact_id != Some(contact.id) {
-        return Err(AppError::Forbidden(
-            "Portal contacts can only delete their own uploads".into(),
-        ));
-    }
-    s.service
-        .delete_one(contact.tenant_id, attachment_id)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
+// mokosh-contact-login: portal-plane attachment handlers (list_portal,
+// upload_portal, download_portal, delete_portal) retired with the /portal/*
+// customer-portal surface. A contact-plane replacement lands in a later prompt.
 
 /// UNAUTHENTICATED. The id in the path is the only identity; see the module
 /// header for why an `<img>` leaves no other option, and `read_public_inline`

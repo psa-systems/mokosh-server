@@ -998,6 +998,9 @@ impl QuotesService {
             "company_name": quote.company_name,
             "decision_notes": quote.decision_notes,
             "recipient_user_id": quote.requested_by_id,
+            // Per-entity deep-link metadata (migration 121).
+            "entity_type": "quote",
+            "entity_id": quote.id.to_string(),
         });
         if let Err(e) = notifications
             .dispatch(tenant_id, event_type, &context)

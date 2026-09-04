@@ -29,6 +29,86 @@ use mokosh_server::utils::error::AppError;
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
 
+/// PMS-791 / MAPPS-462: /auth/me carries `tenant_kind` from the tenants
+/// row so the SPA can gate org-only features without a second round-trip.
+/// Default tenant seeded by migration 002 is `kind='org'`; separately-seeded
+/// tenants with `kind='personal'` also round-trip correctly.
+#[sqlx::test]
+async fn current_user_carries_tenant_kind_org(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let me: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me")
+        .json()
+        .await
+        .expect("/me json");
+    assert_eq!(
+        me["tenant_kind"].as_str(),
+        Some("org"),
+        "seeded default tenant is kind='org'"
+    );
+}
+
+#[sqlx::test]
+async fn current_user_carries_tenant_kind_personal(pool: PgPool) {
+    // Seed a personal tenant + a user in it so /me returns "personal".
+    let personal_owner = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind, personal_owner_id) \
+         VALUES ($1, 'Personal', 'personal-mapps462', 'active', 'personal', $2)",
+    )
+    .bind(tenant_id)
+    .bind(personal_owner)
+    .execute(&pool)
+    .await
+    .expect("seed personal tenant");
+    let (_user_id, email, password) =
+        common::seed_user(&pool, tenant_id, "personal-user@example.com", "admin").await;
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "personal-mapps462",
+        }))
+        .send()
+        .await
+        .expect("send login");
+    assert!(resp.status().is_success(), "login should succeed");
+    let body: serde_json::Value = resp.json().await.expect("login json");
+    let token = body["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_string();
+
+    let me: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/auth/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /me")
+        .json()
+        .await
+        .expect("/me json");
+    assert_eq!(
+        me["tenant_kind"].as_str(),
+        Some("personal"),
+        "seeded personal tenant is kind='personal'"
+    );
+}
+
 #[sqlx::test]
 async fn login_then_me_happy_path(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -495,7 +575,9 @@ async fn mfa_challenge_happy_path(pool: PgPool) {
     let resp = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(
+            &serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }),
+        )
         .send()
         .await
         .expect("send login without mfa");
@@ -514,6 +596,7 @@ async fn mfa_challenge_happy_path(pool: PgPool) {
             "email": email,
             "password": password,
             "mfa_code": code_now,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -578,6 +661,7 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
             "email": email,
             "password": password,
             "recovery_code": first,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -598,6 +682,7 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
             "email": email,
             "password": password,
             "recovery_code": first,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -616,6 +701,7 @@ async fn mfa_recovery_code_login_single_use(pool: PgPool) {
             "email": email,
             "password": password,
             "recovery_code": second,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -870,6 +956,7 @@ async fn mfa_totp_code_cannot_be_replayed(pool: PgPool) {
             "email": email,
             "password": password,
             "mfa_code": code,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -889,6 +976,7 @@ async fn mfa_totp_code_cannot_be_replayed(pool: PgPool) {
             "email": email,
             "password": password,
             "mfa_code": code,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -928,6 +1016,7 @@ async fn mfa_failed_codes_lock_account(pool: PgPool) {
                 "email": email,
                 "password": password,
                 "mfa_code": bad,
+                "tenant_slug": "default",
             }))
             .send()
             .await
@@ -965,6 +1054,7 @@ async fn mfa_failed_codes_lock_account(pool: PgPool) {
             "email": email,
             "password": password,
             "mfa_code": fresh,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -1018,10 +1108,16 @@ async fn seed_mfa_enabled(pool: &PgPool, user_id: Uuid) -> Vec<u8> {
 }
 
 fn login_request(email: &str, password: &str, mfa_code: &str) -> LoginRequest {
+    // PMS-728 AC1: the local password path rejects a credential
+    // presented without an explicit tenant identifier. The seed admin
+    // used by this suite lives in the default tenant (slug `default`,
+    // seeded by migration 002), so tests thread that slug in unchanged
+    // rather than papering over the guard with `tenant_id`.
     serde_json::from_value(serde_json::json!({
         "email": email,
         "password": password,
         "mfa_code": mfa_code,
+        "tenant_slug": "default",
     }))
     .expect("build LoginRequest")
 }
@@ -1175,10 +1271,13 @@ async fn mfa_lock_seconds_sql_matches_rust_schedule(pool: PgPool) {
 // ============================================================================
 
 fn recovery_login_request(email: &str, password: &str, recovery_code: &str) -> LoginRequest {
+    // PMS-728 AC1: see `login_request` above; the seed admin lives in
+    // the default tenant so the local login path resolves via that slug.
     serde_json::from_value(serde_json::json!({
         "email": email,
         "password": password,
         "recovery_code": recovery_code,
+        "tenant_slug": "default",
     }))
     .expect("build recovery LoginRequest")
 }
@@ -1310,6 +1409,7 @@ async fn recovery_code_success_clears_mfa_counters(pool: PgPool) {
             "email": email,
             "password": password,
             "recovery_code": recovery,
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -1360,6 +1460,7 @@ async fn login_wrong_password_returns_401(pool: PgPool) {
         .json(&serde_json::json!({
             "email": email,
             "password": "definitely-not-the-password",
+            "tenant_slug": "default",
         }))
         .send()
         .await
@@ -1386,6 +1487,7 @@ async fn login_rate_limit_triggers_429(pool: PgPool) {
     let bad = serde_json::json!({
         "email": email,
         "password": "wrong-password",
+        "tenant_slug": "default",
     });
 
     // First 5 attempts: 401 (within quota).
@@ -1545,11 +1647,17 @@ async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
     );
 }
 
-/// PMS-138 backward compat: clients that omit `tenant_id` continue to
-/// land in the default tenant, so single-tenant deployments and any
-/// existing SPA that has not yet been updated keep working.
+/// PMS-728 AC1 (SUPERSEDED by MAPPS-492 phase 3): a credential
+/// presented with NO tenant identifier used to 401. Under phase 3, the
+/// server enters the identity-first branch: it resolves the identity
+/// by email + password, enumerates active memberships, and auto-scopes
+/// when the identity holds exactly one. This test now pins the new
+/// contract: a valid email/password with no tenant hint AND a single
+/// membership succeeds and returns a full scoped session. The
+/// zero-membership and multi-membership branches are covered in
+/// `tests/identity_login.rs`.
 #[sqlx::test]
-async fn login_omitting_tenant_id_falls_back_to_default(pool: PgPool) {
+async fn login_omitting_tenant_hint_autoscopes_when_identity_has_one_membership(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
 
@@ -1562,18 +1670,16 @@ async fn login_omitting_tenant_id_falls_back_to_default(pool: PgPool) {
         }))
         .send()
         .await
-        .expect("send login (no tenant_id)");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::OK,
-        "login must succeed when tenant_id is omitted (default-tenant fallback)"
+        .expect("send login (no tenant hint)");
+    assert!(
+        resp.status().is_success(),
+        "expected 2xx auto-scope; got {}",
+        resp.status()
     );
-    let body: serde_json::Value = resp.json().await.expect("login body");
-    assert_eq!(
-        body["user"]["tenant_id"].as_str(),
-        Some(common::DEFAULT_TENANT_ID.to_string().as_str()),
-        "omitted tenant_id must resolve to the default tenant"
-    );
+    let body: serde_json::Value = resp.json().await.expect("login json");
+    assert!(!body["access_token"].as_str().unwrap().is_empty());
+    assert_eq!(body["needs_selection"], false);
+    assert_eq!(body["needs_setup"], false);
 }
 
 /// PMS-138 wrong-hint pin: a hint that names a tenant where the email
@@ -1602,6 +1708,150 @@ async fn login_wrong_tenant_hint_returns_401(pool: PgPool) {
         resp.status(),
         reqwest::StatusCode::UNAUTHORIZED,
         "wrong tenant_id hint must 401, never cross-authenticate"
+    );
+}
+
+// ============================================================================
+// MAPPS-396: tenant_slug hint (standalone SPA login form)
+// ============================================================================
+
+/// MAPPS-396: the standalone login form types a slug rather than a UUID,
+/// so `tenant_slug: "acme"` on the login body must resolve to acme's
+/// tenant_id server-side and authenticate the acme-tenant user.
+#[sqlx::test]
+async fn login_with_tenant_slug_resolves_to_correct_tenant(pool: PgPool) {
+    let (tenant_id, user_id, email, password) =
+        common::seed_tenant_with_admin(&pool, "acme-mapps396").await;
+
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "acme-mapps396",
+        }))
+        .send()
+        .await
+        .expect("send login (tenant_slug hint)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "tenant_slug=acme-mapps396 must resolve to acme's tenant and authenticate"
+    );
+    let body: serde_json::Value = resp.json().await.expect("login body");
+    assert_eq!(
+        body["user"]["id"].as_str(),
+        Some(user_id.to_string().as_str()),
+        "tenant_slug hint must land on the acme-tenant user"
+    );
+    assert_eq!(
+        body["user"]["tenant_id"].as_str(),
+        Some(tenant_id.to_string().as_str()),
+        "tenant_slug hint must return acme's tenant_id"
+    );
+}
+
+/// MAPPS-396: `tenant_id` wins when both are set, so a host-derived
+/// UUID hint is not silently overridden by a mistyped slug field.
+#[sqlx::test]
+async fn login_with_both_tenant_id_and_slug_prefers_id(pool: PgPool) {
+    let (tenant_a_id, user_a_id, email_a, password_a) =
+        common::seed_tenant_with_admin(&pool, "acme-both-a").await;
+    let (_tenant_b_id, _user_b_id, _email_b, _password_b) =
+        common::seed_tenant_with_admin(&pool, "beta-both-b").await;
+
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email_a,
+            "password": password_a,
+            "tenant_id": tenant_a_id,
+            "tenant_slug": "beta-both-b",
+        }))
+        .send()
+        .await
+        .expect("send login (both hints)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "tenant_id must win over tenant_slug"
+    );
+    let body: serde_json::Value = resp.json().await.expect("login body");
+    assert_eq!(
+        body["user"]["id"].as_str(),
+        Some(user_a_id.to_string().as_str()),
+        "tenant_id must be the effective hint when both are set"
+    );
+}
+
+/// MAPPS-396: an unknown slug must 401 (fail-closed), never
+/// leak-through as "default tenant" and let the wrong user in.
+#[sqlx::test]
+async fn login_with_unknown_tenant_slug_401s(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "nope-does-not-exist",
+        }))
+        .send()
+        .await
+        .expect("send login (unknown slug)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "unknown slug must 401 (fail-closed), never leak-through as default tenant"
+    );
+}
+
+/// MAPPS-396: a slug that names a suspended tenant must 401 the same
+/// way an unknown slug does, so the endpoint cannot be walked to
+/// enumerate active-vs-suspended tenants.
+#[sqlx::test]
+async fn login_with_suspended_tenant_slug_401s(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+
+    // Insert a suspended tenant directly - the seed helper only makes
+    // active ones.
+    sqlx::query(
+        r#"
+        INSERT INTO tenants (id, name, slug, status, kind)
+        VALUES ($1, 'Suspended MSP', 'suspended-mapps396', 'suspended', 'org')
+        "#,
+    )
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("seed suspended tenant");
+
+    let app = common::boot(pool).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "suspended-mapps396",
+        }))
+        .send()
+        .await
+        .expect("send login (suspended slug)");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "suspended slug must 401 (matches unknown-slug shape so tenant status is not enumerable)"
     );
 }
 
@@ -2015,7 +2265,9 @@ async fn reset_password_changes_password_and_revokes_sessions(pool: PgPool) {
     let old_login = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(
+            &serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }),
+        )
         .send()
         .await
         .expect("send old-password login");
@@ -2363,7 +2615,9 @@ async fn change_password_logs_out_everywhere(pool: PgPool) {
     let old = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(
+            &serde_json::json!({ "email": email, "password": password, "tenant_slug": "default" }),
+        )
         .send()
         .await
         .expect("send old-password login");
@@ -2373,6 +2627,539 @@ async fn change_password_logs_out_everywhere(pool: PgPool) {
         "the old password no longer works after the change"
     );
     let _new_token = common::login(&app, &email, new_password).await;
+}
+
+/// MAPPS-501 (MAPPS-496 stage 2c): start_mfa_enrollment + enable_mfa
+/// write to `identities.mfa_secret` + `identities.mfa_enabled`; the
+/// MAPPS-498 back-mirror propagates both to `users`. Recovery-code
+/// hashes stay users-only (added by migration 029, never mirrored).
+#[sqlx::test]
+async fn mfa_enable_writes_to_identity_plane(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let setup: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/setup"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send mfa setup")
+        .json()
+        .await
+        .expect("mfa setup JSON");
+    let secret_b32 = setup["secret"].as_str().expect("secret").to_string();
+    let secret = mokosh_server::utils::totp::base32_decode(&secret_b32).expect("decode secret");
+    let code = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/enable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await
+        .expect("send mfa enable");
+    assert!(resp.status().is_success());
+
+    // Identity plane is authoritative for mfa_enabled + mfa_secret.
+    let (id_enabled, id_secret): (bool, Option<String>) =
+        sqlx::query_as("SELECT mfa_enabled, mfa_secret FROM identities WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read identity mfa");
+    assert!(id_enabled, "identity.mfa_enabled TRUE");
+    assert_eq!(
+        id_secret.as_deref(),
+        Some(secret_b32.as_str()),
+        "identity.mfa_secret matches setup"
+    );
+
+    // Users row mirrors via MAPPS-498.
+    let (u_enabled, u_secret): (bool, Option<String>) =
+        sqlx::query_as("SELECT mfa_enabled, mfa_secret FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read users mfa");
+    assert!(u_enabled);
+    assert_eq!(u_secret, id_secret);
+
+    // Recovery hashes are users-only.
+    let recovery_hashes: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(mfa_recovery_codes_hashes) FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_all(&app.pool)
+            .await
+            .expect("read recovery hashes");
+    assert_eq!(recovery_hashes.len(), 10, "10 recovery hashes stored");
+}
+
+/// MAPPS-501: disable_mfa clears mfa_enabled + mfa_secret + watermark
+/// on identities; clears recovery hashes on users. Bidir mirror
+/// keeps users.mfa_* in sync.
+#[sqlx::test]
+async fn mfa_disable_clears_identity_plane(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Enroll and enable first.
+    let setup: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/setup"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("setup")
+        .json()
+        .await
+        .expect("json");
+    let secret = mokosh_server::utils::totp::base32_decode(setup["secret"].as_str().unwrap())
+        .expect("decode");
+    let code = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    app.client
+        .post(app.url("/api/v1/auth/me/mfa/enable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "code": code }))
+        .send()
+        .await
+        .expect("enable");
+
+    // Disable requires current password.
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/disable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "password": password }))
+        .send()
+        .await
+        .expect("send disable");
+    assert!(resp.status().is_success());
+
+    let (id_enabled, id_secret, id_step): (bool, Option<String>, i64) = sqlx::query_as(
+        "SELECT mfa_enabled, mfa_secret, mfa_last_totp_step FROM identities WHERE id = $1",
+    )
+    .bind(admin_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("read identity");
+    assert!(!id_enabled, "identity.mfa_enabled cleared");
+    assert!(id_secret.is_none(), "identity.mfa_secret NULL");
+    assert_eq!(id_step, 0, "identity.mfa_last_totp_step reset");
+
+    let hashes: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(mfa_recovery_codes_hashes) FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_all(&app.pool)
+            .await
+            .expect("read hashes");
+    assert!(hashes.is_empty(), "recovery hashes cleared on users");
+}
+
+/// MAPPS-499 (MAPPS-496 stage 2a): change_password writes the new
+/// hash to `identities.password_hash`; the MAPPS-498 back-mirror
+/// propagates it to users.password_hash so the legacy read path in
+/// UserRow still sees the new value.
+#[sqlx::test]
+async fn change_password_writes_users_only_post_551(pool: PgPool) {
+    // MAPPS-551 (rewritten from the pre-551 mirror pin): identity's
+    // password_hash is no longer authoritative. `change_password`
+    // writes ONLY the caller's own users row; identity's hash stays
+    // at whatever value migration 128 seeded it with. The new
+    // password authenticates via the tenant-scoped login path.
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let identity_hash_before: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM identities WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read identity hash before");
+
+    let new_password = "changed-password-mapps551";
+    let resp = app
+        .client
+        .put(app.url("/api/v1/auth/me/password"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "current_password": password,
+            "new_password": new_password,
+            "confirm_password": new_password,
+        }))
+        .send()
+        .await
+        .expect("send change-password");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let identity_hash_after: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM identities WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read identity hash after");
+    let users_hash_after: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read users hash after");
+    assert_ne!(
+        users_hash_after, identity_hash_before,
+        "MAPPS-551: users password_hash changed"
+    );
+    assert_eq!(
+        identity_hash_before, identity_hash_after,
+        "MAPPS-551: identity's password_hash is NOT touched by change_password"
+    );
+    // The new password authenticates via the tenant-scoped login path.
+    let _new_token = common::login(&app, &email, new_password).await;
+}
+
+/// MAPPS-551 (rewritten from the pre-551 mirror pin): an identity with
+/// memberships in two tenants gets a change_password on tenant A; ONLY
+/// tenant A's users row gets the new hash. Tenant B's users row is
+/// untouched, so the original password still authenticates on tenant B.
+/// This is the operator-facing "two portals, two independent passwords"
+/// contract.
+#[sqlx::test]
+async fn change_password_isolates_per_tenant_on_shared_email(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    // Second tenant with the same identity as an additional membership.
+    let tenant_b = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, kind, status) \
+         VALUES ($1, 'Beta', 'beta-mapps551', 'org', 'active')",
+    )
+    .bind(tenant_b)
+    .execute(&pool)
+    .await
+    .expect("seed second tenant");
+    let hash_b = mokosh_server::utils::crypto::hash_password(&password).expect("hash pw");
+    let user_b_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'First', 'Last', 'admin', 'active', NOW())",
+    )
+    .bind(user_b_id)
+    .bind(tenant_b)
+    .bind(&email)
+    .bind(&hash_b)
+    .execute(&pool)
+    .await
+    .expect("seed second users row");
+
+    let app = common::boot(pool).await;
+    // Log in on tenant "default" via the tenant-hint path.
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "default",
+        }))
+        .send()
+        .await
+        .expect("send login");
+    let body: serde_json::Value = resp.json().await.expect("json");
+    let token = body["access_token"].as_str().unwrap().to_string();
+
+    let new_password = "isolated-password-mapps551";
+    let resp = app
+        .client
+        .put(app.url("/api/v1/auth/me/password"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "current_password": password,
+            "new_password": new_password,
+            "confirm_password": new_password,
+        }))
+        .send()
+        .await
+        .expect("send change-password");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Tenant A (default) users row has the new hash.
+    let a_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(admin_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read tenant-a hash");
+    let a_verify = mokosh_server::utils::crypto::verify_password(
+        new_password,
+        a_hash.as_deref().unwrap_or(""),
+    )
+    .expect("verify tenant-a hash");
+    assert!(
+        a_verify,
+        "MAPPS-551: tenant-a users row got the new password"
+    );
+
+    // Tenant B users row is UNTOUCHED. Verifying the ORIGINAL password
+    // still succeeds; verifying the new password fails.
+    let b_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+            .bind(user_b_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read tenant-b hash");
+    let b_verify_orig =
+        mokosh_server::utils::crypto::verify_password(&password, b_hash.as_deref().unwrap_or(""))
+            .expect("verify tenant-b hash with original pw");
+    let b_verify_new = mokosh_server::utils::crypto::verify_password(
+        new_password,
+        b_hash.as_deref().unwrap_or(""),
+    )
+    .expect("verify tenant-b hash with new pw");
+    assert!(
+        b_verify_orig,
+        "MAPPS-551: tenant-b users row keeps its ORIGINAL password"
+    );
+    assert!(
+        !b_verify_new,
+        "MAPPS-551: tenant-b users row does NOT pick up tenant-a's new password"
+    );
+}
+
+// MAPPS-495 (MAPPS-474 phase 6): the MAPPS-473 host-based agent-tenant
+// derivation was retired. The three tests that used to live here
+// (`login_derives_tenant_slug_from_agent_host`,
+// `login_body_slug_wins_over_agent_host`,
+// `login_without_hint_or_matching_host_falls_through_to_identity_first`)
+// are removed with the code; phase 3 (MAPPS-492) delivered identity-first
+// login which supersedes the whole host-derivation approach.
+
+// MAPPS-548: creating a new client (tenant) with an admin email that
+// collides with an existing account MUST NOT overwrite the existing
+// account's password when the new client admin redeems their
+// welcome-email setup token.
+//
+// Fixture: three accounts, all at the same email `collide@example.com`:
+//   1. mokosh platform super-admin (`platform_admins` row + a `users`
+//      row from migration 132's backfill), password "PLATFORM-A".
+//   2. a tenant admin in an unrelated tenant "tenant-b" with password
+//      "TENANT-B".
+//   3. a fresh client-admin `users` row (status='pending',
+//      password_hash NULL) in a new tenant "client-c" - the state the
+//      MAPPS-448 `send_admin_welcome` path leaves the admin row in
+//      immediately after `create_tenant`.
+//
+// Action: redeem a MAPPS-548 setup-flow reset token for account 3 with
+// a fresh password "CLIENT-C".
+//
+// Post-conditions:
+//   - account 1 still authenticates via `/api/v1/platform/login` with
+//     "PLATFORM-A" (platform_admins is isolated from users<->identities
+//     by table shape; this survived MAPPS-518 already, verified here
+//     as a regression guard against re-introducing a mirror).
+//   - account 2 still authenticates via `/api/v1/auth/login` with
+//     "TENANT-B" + tenant_slug="tenant-b" (the identity plane's
+//     password_hash is unchanged, and the tenant-scoped login path
+//     resolves via users.password_hash for the specific tenant users
+//     row).
+//   - account 3 authenticates via `/api/v1/auth/login` with
+//     "CLIENT-C" + tenant_slug="client-c" (the setup wrote to this
+//     specific users row only, so tenant-scoped login sees the fresh
+//     hash).
+#[sqlx::test]
+async fn client_admin_setup_isolates_credentials_when_email_collides(pool: PgPool) {
+    let email = "collide@example.com".to_string();
+    let platform_pw = "PLATFORM-A-12345".to_string();
+    let tenant_b_pw = "TENANT-B-12345".to_string();
+    let client_c_pw = "CLIENT-C-12345".to_string();
+    let platform_hash =
+        mokosh_server::utils::crypto::hash_password(&platform_pw).expect("hash platform pw");
+    let tenant_b_hash =
+        mokosh_server::utils::crypto::hash_password(&tenant_b_pw).expect("hash tenant-b pw");
+
+    // Account 1: mokosh platform super-admin row + matching users row in
+    // DEFAULT_TENANT. Post MAPPS-132 backfill this is exactly what a
+    // real operator has after upgrading.
+    let platform_admin_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO platform_admins (id, email, password_hash, first_name, last_name, status, email_verified_at) \
+         VALUES ($1, $2, $3, 'Yousif', 'Shkara', 'active', NOW())",
+    )
+    .bind(platform_admin_id)
+    .bind(&email)
+    .bind(&platform_hash)
+    .execute(&pool)
+    .await
+    .expect("insert platform admin");
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'Yousif', 'Shkara', 'admin', 'active', NOW())",
+    )
+    .bind(platform_admin_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(&email)
+    .bind(&platform_hash)
+    .execute(&pool)
+    .await
+    .expect("insert platform admin tenant users row");
+
+    // Account 2: unrelated tenant "tenant-b" with a tenant admin at
+    // the same email + password "TENANT-B".
+    let tenant_b_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) \
+         VALUES ($1, 'Tenant B', 'tenant-b', 'active', 'org')",
+    )
+    .bind(tenant_b_id)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b");
+    let tenant_b_admin_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'B', 'Admin', 'admin', 'active', NOW())",
+    )
+    .bind(tenant_b_admin_id)
+    .bind(tenant_b_id)
+    .bind(&email)
+    .bind(&tenant_b_hash)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b admin");
+
+    // Account 3: fresh client-admin users row (pending, password_hash
+    // NULL) in a new tenant "client-c". This mirrors the state
+    // `TenantService::create_tenant` -> `send_admin_welcome` leaves
+    // the row in right before the recipient clicks their setup link.
+    let client_c_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) \
+         VALUES ($1, 'Client C', 'client-c', 'active', 'org')",
+    )
+    .bind(client_c_id)
+    .execute(&pool)
+    .await
+    .expect("insert client-c");
+    let client_c_admin_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, NULL, 'C', 'Admin', 'admin', 'pending', NOW())",
+    )
+    .bind(client_c_admin_id)
+    .bind(client_c_id)
+    .bind(&email)
+    .execute(&pool)
+    .await
+    .expect("insert client-c admin (pending, no password)");
+
+    let app = common::boot(pool.clone()).await;
+
+    // Craft a setup token for account 3, redeem it with password
+    // "CLIENT-C".
+    let setup_token = craft_reset_token(
+        &app.pool,
+        client_c_id,
+        client_c_admin_id,
+        Utc::now() + Duration::hours(1),
+    )
+    .await;
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/reset-password"))
+        .json(&serde_json::json!({
+            "token": setup_token,
+            "new_password": client_c_pw,
+            "confirm_password": client_c_pw,
+        }))
+        .send()
+        .await
+        .expect("send setup reset-password");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "setup password redemption succeeds"
+    );
+
+    // Account 1: platform login with the ORIGINAL platform password
+    // must still succeed.
+    let platform_resp = app
+        .client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&serde_json::json!({ "email": email, "password": platform_pw }))
+        .send()
+        .await
+        .expect("send platform login");
+    assert_eq!(
+        platform_resp.status(),
+        reqwest::StatusCode::OK,
+        "MAPPS-548: platform super-admin password must survive a colliding client-admin setup"
+    );
+
+    // Account 2: tenant-scoped login for tenant-b with the ORIGINAL
+    // tenant-b password must still succeed.
+    let tenant_b_resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": tenant_b_pw,
+            "tenant_slug": "tenant-b",
+        }))
+        .send()
+        .await
+        .expect("send tenant-b login");
+    assert_eq!(
+        tenant_b_resp.status(),
+        reqwest::StatusCode::OK,
+        "MAPPS-548: an unrelated tenant admin at the same email must keep their password"
+    );
+
+    // Account 3: tenant-scoped login for client-c with the NEW
+    // password must succeed - the setup wrote to this users row.
+    let client_c_resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": client_c_pw,
+            "tenant_slug": "client-c",
+        }))
+        .send()
+        .await
+        .expect("send client-c login");
+    assert_eq!(
+        client_c_resp.status(),
+        reqwest::StatusCode::OK,
+        "MAPPS-548: the new client admin must be able to sign in with their newly-set password"
+    );
+
+    // The tenant users row for account 1 must NOT have been changed
+    // by the setup write (this is the sanity check that the
+    // migration-134 short-circuit actually fired).
+    let account1_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 AND tenant_id = $2")
+            .bind(platform_admin_id)
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read account 1 users hash");
+    assert_eq!(
+        account1_hash.as_deref(),
+        Some(platform_hash.as_str()),
+        "MAPPS-548: platform admin's tenant users row must keep its original hash"
+    );
+    let account2_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 AND tenant_id = $2")
+            .bind(tenant_b_admin_id)
+            .bind(tenant_b_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read account 2 users hash");
+    assert_eq!(
+        account2_hash.as_deref(),
+        Some(tenant_b_hash.as_str()),
+        "MAPPS-548: tenant-b admin's users row must keep its original hash"
+    );
 }
 
 /// MAPPS-531: signing out invalidates the access token, not only the refresh

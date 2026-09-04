@@ -25,8 +25,15 @@ struct ApprovalRow {
     ticket_id: Option<Uuid>,
     entity_reference: Option<String>,
     entity_label: Option<String>,
-    requested_by_id: Uuid,
+    requested_by_id: Option<Uuid>,
     requested_by_name: Option<String>,
+    /// PMS-937: portal-contact requester attribution. Populated when
+    /// the approval was filed via the contact plane's
+    /// `POST /tickets/{id}/approvals/request` surface; NULL on every
+    /// legacy staff-originated row (which populates `requested_by_id`
+    /// instead - see migration 152's XOR CHECK).
+    requested_by_contact_id: Option<Uuid>,
+    requested_by_contact_name: Option<String>,
     approver_user_id: Option<Uuid>,
     approver_user_name: Option<String>,
     approver_role: Option<String>,
@@ -50,6 +57,8 @@ impl From<ApprovalRow> for ApprovalResponse {
             entity_label: r.entity_label,
             requested_by_id: r.requested_by_id,
             requested_by_name: r.requested_by_name,
+            requested_by_contact_id: r.requested_by_contact_id,
+            requested_by_contact_name: r.requested_by_contact_name,
             approver_user_id: r.approver_user_id,
             approver_user_name: r.approver_user_name,
             approver_role: r.approver_role,
@@ -69,6 +78,8 @@ impl From<ApprovalRow> for ApprovalResponse {
 const SELECT_FIELDS: &str = "
     a.id, a.target, a.entity_id, a.ticket_id, a.requested_by_id,
     NULLIF(TRIM(CONCAT(rb.first_name, ' ', rb.last_name)), '') AS requested_by_name,
+    a.requested_by_contact_id,
+    NULLIF(TRIM(CONCAT(rbc.first_name, ' ', rbc.last_name)), '') AS requested_by_contact_name,
     a.approver_user_id,
     NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS approver_user_name,
     a.approver_role, a.status, a.notes, a.decision_notes,
@@ -101,6 +112,7 @@ const SELECT_FIELDS: &str = "
 /// resolved columns land NULL) instead of vanishing from the queue.
 const SELECT_JOINS: &str = "
     LEFT JOIN users rb ON rb.id = a.requested_by_id
+    LEFT JOIN contacts rbc ON rbc.id = a.requested_by_contact_id
     LEFT JOIN users au ON au.id = a.approver_user_id
     LEFT JOIN users db ON db.id = a.decided_by_id
     LEFT JOIN tickets t
@@ -184,6 +196,82 @@ impl ApprovalsService {
             .fetch_all(&mut *tx)
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// PMS-937: contact-initiated approval request against a ticket.
+    /// The route layer enforces cap gate + Company-scope before
+    /// calling in - this service trusts the ticket and writes the row.
+    /// `requested_by_id` is NULL and `requested_by_contact_id` carries
+    /// the portal contact who filed the request (see migration 152's
+    /// XOR CHECK on the requester columns). Approver defaults to the
+    /// tenant's `admin` role so any MSP admin can decide; a
+    /// requester-specified approver is intentionally not honoured on
+    /// the contact plane because the contact does not know the MSP's
+    /// user set.
+    pub async fn create_contact_request(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        contact_id: Uuid,
+        note: String,
+    ) -> AppResult<ApprovalResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let insert = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO ticket_approvals \
+                 (tenant_id, target, entity_id, ticket_id, \
+                  requested_by_id, requested_by_contact_id, \
+                  approver_user_id, approver_role, notes) \
+             VALUES ($1, 'ticket', $2, $2, NULL, $3, NULL, 'admin', $4) \
+             RETURNING id",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .bind(contact_id)
+        .bind(&note)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get(tenant_id, insert).await
+    }
+
+    /// PMS-937: staff-initiated approval-request shortcut. Same URL
+    /// as the contact-plane surface (`POST
+    /// /tickets/{id}/approvals/request`) so the SPA can drive both
+    /// planes through one call. Body carries only a `note`; the
+    /// approver defaults to the `admin` role so any MSP admin can
+    /// decide, matching the contact-plane default. Staff who need to
+    /// target a specific approver keep using the phase-1
+    /// `/approvals` endpoint with `CreateApprovalRequest`.
+    pub async fn create_staff_request(
+        &self,
+        tenant_id: Uuid,
+        ticket_id: Uuid,
+        requested_by_id: Uuid,
+        note: String,
+    ) -> AppResult<ApprovalResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let ticket_owned: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM tickets WHERE id = $1 AND tenant_id = $2")
+                .bind(ticket_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        drop(tx);
+        if ticket_owned.is_none() {
+            return Err(AppError::NotFound("Ticket not found".into()));
+        }
+        self.create_for_entity(
+            tenant_id,
+            ApprovalTarget::Ticket,
+            ticket_id,
+            requested_by_id,
+            CreateApprovalRequest {
+                approver_user_id: None,
+                approver_role: Some("admin".to_string()),
+                notes: Some(note),
+            },
+        )
+        .await
     }
 
     /// PMS-470: create an approval against any `(target, entity_id)`.

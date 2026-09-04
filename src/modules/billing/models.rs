@@ -183,6 +183,15 @@ pub struct InvoiceFilter {
     pub contract_id: Option<Uuid>,
     #[validate(length(max = 200))]
     pub q: Option<String>,
+    /// MAPPS-670 (mokosh-invoices P1e): server-side scope flag flipped
+    /// on by the route when the caller is a Contact. The client cannot
+    /// set it; `serde(skip_deserializing)` blocks a request-side
+    /// override. Draft invoices are internal artefacts the MSP is
+    /// still composing, so the portal must never see one - filtering
+    /// server-side keeps the count meta accurate (a client-side skip
+    /// would leave `total` inflated and pagination misleading).
+    #[serde(skip_deserializing, default)]
+    pub exclude_draft: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
@@ -443,6 +452,11 @@ pub struct PaymentGatewayConfigResponse {
     /// decryptable strictly server-side for actual gateway calls; to change it,
     /// send a new `config` on upsert.
     pub configured: bool,
+    /// MAPPS-671 (mokosh-invoices P2a): admin-set override for the Pay Now
+    /// button label a portal contact sees. `None` = the provider-default
+    /// label ("Pay with card" for Stripe, "Pay with PayPal" for PayPal).
+    #[serde(default)]
+    pub client_display_name: Option<String>,
 }
 
 /// PMS-711: response to the portal "Pay Now" action. The SPA redirects the
@@ -450,6 +464,57 @@ pub struct PaymentGatewayConfigResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct PayInvoiceResponse {
     pub checkout_url: String,
+}
+
+/// MAPPS-666 (mokosh-invoices P1a): what the SPA reads to decide whether
+/// to render the Pay Now button + what label to put on it. Fires once on
+/// invoice-detail mount alongside the existing invoice fetch so the
+/// button state is decided before the caller ever clicks it (a click
+/// that always 400s because no gateway is configured is a worse UX than
+/// a greyed button with a tooltip explaining why).
+///
+/// Contact-plane gate on `invoices:read` (not `invoices:pay`) - a
+/// Support Contact should see whether the button WOULD be enabled for
+/// a Billing Contact, so the empty state on their view is coherent
+/// with what a Billing Contact would see.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvoicePaymentReadinessResponse {
+    /// True iff the tenant has an `is_active = TRUE` row in
+    /// `payment_gateway_configs` whose provider adapter can resolve
+    /// credentials (via the secret store or an inline legacy config).
+    /// Not just "the row exists"; the credential has to be reachable
+    /// or the mint would 400 at click time.
+    pub gateway_ready: bool,
+    /// Provider-derived default ("Pay with card" for Stripe, "Pay with
+    /// PayPal" for PayPal). Phase 2 lets the tenant override via a
+    /// `payment_gateway_configs.client_display_name` column. `None`
+    /// when `gateway_ready = false`, since there is no gateway to
+    /// name.
+    pub button_label: Option<String>,
+    /// True iff `invoice.status` is `pending | sent | partially_paid`
+    /// AND `balance_due > 0`. Draft, void, written_off, and paid
+    /// invoices are not payable.
+    pub invoice_payable: bool,
+    /// Currency-formatted `balance_due` in the invoice's own currency,
+    /// so the SPA does not have to know how to format money.
+    /// Truth-in-copy (Q10 default): shown above the Pay button so the
+    /// contact is not surprised by the currency conversion on their
+    /// card statement.
+    pub balance_due_display: String,
+}
+
+/// PMS-914: body accepted by `POST /invoices/{invoice_id}/pay`. The SPA
+/// picks `success_url` / `cancel_url` because they are per-plane
+/// (contact portal lands back on the invoice detail; staff lands back
+/// on the CRM invoice row) and the server has no view onto which SPA
+/// is calling. Both are validated as URLs so a malformed value is
+/// refused before it reaches the payment provider.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct PayInvoiceRequest {
+    #[validate(url)]
+    pub success_url: String,
+    #[validate(url)]
+    pub cancel_url: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -465,6 +530,14 @@ pub struct UpsertPaymentGatewayConfigRequest {
     /// a gateway for the first time.
     #[serde(default)]
     pub config: Option<serde_json::Value>,
+    /// MAPPS-671 (mokosh-invoices P2a): admin-set override for the Pay Now
+    /// button label. Omit (or `null`) to keep the current value; send an
+    /// empty string to clear (falls back to the provider default); send a
+    /// non-empty string to set. Capped at 64 chars so the button stays
+    /// readable. Values from `sanitize_json_body` reach this trimmed.
+    #[serde(default)]
+    #[validate(length(max = 64, message = "Button label must be 64 characters or fewer."))]
+    pub client_display_name: Option<String>,
 }
 
 fn default_true() -> bool {

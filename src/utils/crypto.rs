@@ -126,6 +126,40 @@ pub fn generate_api_key() -> String {
     format!("psa_{}", generate_token(40))
 }
 
+/// mokosh-contact-login prompt 003: 16-char Crockford base32 slug used
+/// as `companies.portal_slug`. 80 bits of entropy so a targeted
+/// attacker cannot enumerate portals. Excludes visually confusable
+/// characters (I, L, O, U).
+///
+/// The contact portal URL shape is `msp.<apex>/portal/{slug}/*` (no
+/// per-tenant wildcard subdomain), so the slug is the ONLY thing
+/// standing between an attacker and the login page. All sensitive
+/// endpoints gate on capability + session; a leaked slug only reveals
+/// the login form.
+pub fn generate_portal_slug() -> String {
+    use rand::seq::IndexedRandom;
+    // 32 chars: Crockford base32 minus I / L / O / U.
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut rng = rand::rng();
+    (0..16)
+        .map(|_| *ALPHABET.choose(&mut rng).expect("non-empty alphabet") as char)
+        .collect()
+}
+
+/// mokosh-contact-login prompt 011 (PMS-928): random 9-digit numeric
+/// Portal ID used as `companies.portal_id`. Range `[100_000_000,
+/// 1_000_000_000)` (inclusive lower, exclusive upper) so the value is
+/// always renderable as exactly nine digits ("dictable over the phone")
+/// and never overflows into 10-digit territory.
+///
+/// 10^9 = 1B ids; at 10M Companies birthday-paradox collision is under
+/// 1%. `ContactService::grant_portal_access` retries UNIQUE-constraint
+/// bounces up to 5 times, so a collision is quietly recovered rather
+/// than surfacing as a create-Company failure.
+pub fn generate_portal_id() -> i64 {
+    rand::rng().random_range(100_000_000..1_000_000_000)
+}
+
 /// Generate a short numeric code (for MFA, etc.)
 pub fn generate_numeric_code(length: usize) -> String {
     let mut rng = rand::rng();
@@ -234,6 +268,62 @@ mod tests {
         let code = generate_numeric_code(6);
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn portal_slug_shape() {
+        // mokosh-contact-login prompt 003: pin the length, alphabet,
+        // and collision rate of the slug generator.
+        let slug = generate_portal_slug();
+        assert_eq!(slug.len(), 16, "portal slug must be 16 chars");
+        const ALLOWED: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        assert!(
+            slug.chars().all(|c| ALLOWED.contains(c)),
+            "portal slug must use Crockford base32 minus I/L/O/U, got {slug:?}"
+        );
+        // Collision smoke-test: 10_000 slugs should all be unique. 80
+        // bits of entropy makes an actual collision astronomically
+        // unlikely; a duplicate here would flag a broken RNG.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let s = generate_portal_slug();
+            assert!(seen.insert(s), "portal slug collision in 10k samples");
+        }
+    }
+
+    #[test]
+    fn portal_id_stays_in_9_digit_range() {
+        // mokosh-contact-login prompt 011 (PMS-928): every generated
+        // Portal ID sits inside the [100_000_000, 1_000_000_000)
+        // window so it always renders as exactly 9 digits. 10k
+        // samples is the same shape the slug generator's test uses;
+        // a stray value here flags a broken RNG or an off-by-one
+        // range change.
+        for _ in 0..10_000 {
+            let id = generate_portal_id();
+            assert!(
+                (100_000_000..1_000_000_000).contains(&id),
+                "portal_id out of range: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn portal_id_shows_reasonable_uniqueness() {
+        // mokosh-contact-login prompt 011 (PMS-928): birthday-paradox
+        // sanity check. 5k samples over a 900M-value space expect
+        // <=~14 collisions on average; assert we stay above 4990
+        // uniques so a collapsed RNG (constant, tiny range) trips
+        // the test but a healthy RNG never flakes.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..5_000 {
+            seen.insert(generate_portal_id());
+        }
+        assert!(
+            seen.len() >= 4990,
+            "portal_id uniqueness collapsed: only {} unique in 5k samples",
+            seen.len()
+        );
     }
 
     #[cfg(feature = "server")]

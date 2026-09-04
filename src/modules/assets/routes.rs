@@ -14,18 +14,30 @@ use serde::Deserialize;
 
 use super::models::*;
 use super::service::{AssetsService, ImpactDirection};
-use crate::modules::auth::{RequireAdmin, RequireAssets, TenantScoped};
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireAdmin, RequireAssets, RequireCallerContext, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
+use crate::modules::tickets::{TicketResponse, TicketService};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct AssetsRouterState {
     pub service: Arc<AssetsService>,
+    /// PMS-936: the `POST /assets/{id}/report-issue` endpoint creates a
+    /// ticket linked to the asset, so the router needs a
+    /// `TicketService` clone alongside the assets one. Optional to
+    /// keep call sites that only exercise the assets surface (unit
+    /// tests, seed) trivially constructible.
+    pub ticket_service: Option<Arc<TicketService>>,
 }
 
-pub fn assets_routes(service: AssetsService) -> Router {
+pub fn assets_routes(service: AssetsService, ticket_service: TicketService) -> Router {
     let state = AssetsRouterState {
         service: Arc::new(service),
+        ticket_service: Some(Arc::new(ticket_service)),
     };
     Router::new()
         // PMS-73 asset types
@@ -56,6 +68,14 @@ pub fn assets_routes(service: AssetsService) -> Router {
         // recursively to answer "if I retire this database, what
         // services break?" - the SPA's CI Map tab consumes it.
         .route("/assets/{id}/impact", get(get_asset_impact))
+        // PMS-936: contact-plane (or staff) opens a ticket linked to a
+        // specific asset. Gated on `assets:report_issue` for contacts;
+        // creates a `source = portal` ticket with `asset_id` set on
+        // the row so the report is discoverable from the asset detail.
+        .route(
+            "/assets/{id}/report-issue",
+            axum::routing::post(report_asset_issue),
+        )
         // PMS-76 configuration items
         .route(
             "/assets/{id}/configuration-items",
@@ -129,12 +149,28 @@ async fn delete_asset_type(
 
 async fn list_assets(
     State(s): State<AssetsRouterState>,
-    RequireAssets { user: u, .. }: RequireAssets,
-    Query(f): Query<AssetFilter>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Query(mut f): Query<AssetFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetResponse>>> {
     f.validate()?;
-    let (items, total) = s.service.list_assets(u.tenant(), &f, &pagination).await?;
+    // PMS-935: dual-plane sweep. Contact callers must hold
+    // `assets:read` (DB-loaded per request; JWT `caps` is UI-only)
+    // and get their listing scoped to their own Company so a spoofed
+    // `company_id` query param cannot widen visibility. Staff callers
+    // keep the pre-sweep RequireAssets module-gate + auth surface via
+    // `assert_staff_authenticated` (staff role beyond auth is not
+    // required for asset reads).
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::ASSETS_READ, &db).await?;
+            f.company_id = Some(session.company_id);
+        }
+    }
+    let (items, total) = s.service.list_assets(tenant, &f, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -156,10 +192,41 @@ async fn create_asset(
 
 async fn get_asset(
     State(s): State<AssetsRouterState>,
-    RequireAssets { user: u, .. }: RequireAssets,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<AssetResponse>> {
-    Ok(Json(s.service.get_asset(u.tenant(), id).await?))
+    // PMS-935: contact-plane callers 404 (not 403) on a foreign
+    // Company's asset so a probe cannot confirm existence.
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::ASSETS_READ, &db).await?;
+        }
+    }
+    let asset = s.service.get_asset(tenant, id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if asset.company_id != session.company_id {
+            return Err(AppError::NotFound("Asset".to_string()));
+        }
+    }
+    Ok(Json(asset))
+}
+
+/// PMS-935: baseline "must be authenticated staff" check inlined
+/// alongside the dual-plane read handlers. Reads used to sit behind
+/// `RequireAssets` (module gate + auth) with no additional role
+/// requirement; the sweep drops the module-gate piece so contact
+/// callers with `assets:read` reach the endpoint regardless of the
+/// tenant's staff-side module toggle. All child endpoints
+/// (relationships, configuration items, credentials, impact graph,
+/// audit log) stay behind `RequireAssets` and are therefore
+/// implicitly staff-only: a contact bearer never populates
+/// `AuthState`, so those extractors 401.
+fn assert_staff_authenticated(auth: &crate::modules::auth::AuthState) -> AppResult<()> {
+    auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+    Ok(())
 }
 
 async fn update_asset(
@@ -405,4 +472,149 @@ async fn list_asset_audit_log(
         &pagination,
         total,
     )))
+}
+
+/// PMS-936: body for `POST /assets/{id}/report-issue`. Kept minimal
+/// (summary + description) so the contact-plane form matches the SPA's
+/// smallest possible "raise a ticket about this asset" affordance;
+/// deeper fields (priority, category) live on the standard
+/// ticket-create form.
+#[derive(Debug, Deserialize)]
+struct ReportAssetIssueBody {
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// PMS-936: create a ticket linked to a specific asset.
+///
+/// Contact caller: gated on `assets:report_issue`, scoped to the
+/// caller's Company (a foreign-Company asset 404s). The created ticket
+/// carries `source = portal`, `contact_id = session.id`, and the
+/// asset's `company_id` + `asset_id` so the report is discoverable
+/// from the asset detail page.
+///
+/// Staff caller: shares the same create path; the ticket lands with
+/// `contact_id = None` and `source = internal` (the default when a
+/// staff caller opens a ticket without going through the contact
+/// plane).
+async fn report_asset_issue(
+    State(s): State<AssetsRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(asset_id): Path<Uuid>,
+    Json(body): Json<ReportAssetIssueBody>,
+) -> AppResult<Json<TicketResponse>> {
+    let tenant = caller.tenant();
+    let ticket_service = s
+        .ticket_service
+        .as_ref()
+        .ok_or_else(|| AppError::Configuration("Ticket service not configured".to_string()))?;
+
+    // Load the asset first so we know its Company + can fail leak-free.
+    let asset = s.service.get_asset(tenant, asset_id).await?;
+
+    let (contact_id, use_portal_path) = match &caller {
+        CallerContext::Staff(auth) => {
+            auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+            (None, false)
+        }
+        CallerContext::Contact(session) => {
+            caller
+                .require_capability(caps::ASSETS_REPORT_ISSUE, &db)
+                .await?;
+            if asset.company_id != session.company_id {
+                // Leak-free 404 - same posture as `get_asset`.
+                return Err(AppError::NotFound("Asset".to_string()));
+            }
+            (Some(session.id), true)
+        }
+    };
+
+    let summary_raw = body.summary.unwrap_or_default();
+    let summary = summary_raw.trim();
+    let title = if summary.is_empty() {
+        format!("Reported issue: {}", asset.name)
+    } else {
+        summary.to_string()
+    };
+    let description = body
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    if use_portal_path {
+        // Route through the shared portal-ticket path so the ticket
+        // lands with `source = portal`, the tenant's default status /
+        // priority / queue, and the `contact_id` stamped. The path
+        // does NOT yet support arbitrary extra fields (it wraps
+        // `create_ticket` with a fixed subset), so the `asset_id`
+        // linkage is applied as a follow-up UPDATE below; the whole
+        // report-issue flow tolerates the extra round-trip.
+        let contact = contact_id.unwrap_or_else(Uuid::nil);
+        let ticket = ticket_service
+            .create_portal_ticket(
+                tenant,
+                asset.company_id,
+                contact,
+                title,
+                description,
+                None,
+                None,
+            )
+            .await?;
+        // Stamp the asset link now; the row is already
+        // Company-scoped so this UPDATE cannot leak across tenants.
+        // Hold the tx in a local so the explicit commit lands (a
+        // dropped tx auto-rolls back and the update would silently
+        // disappear).
+        let mut tx = s.service.db().begin_with_tenant(tenant).await?;
+        sqlx::query(
+            "UPDATE tickets SET asset_id = $1, updated_at = NOW() \
+             WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(asset_id)
+        .bind(tenant.get())
+        .bind(ticket.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("stamp asset_id on report-issue ticket: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Internal(format!("commit asset_id stamp: {e}")))?;
+        // Re-fetch so the response reflects the freshly-stamped
+        // `asset_id`.
+        let refreshed = ticket_service
+            .get_ticket_response(tenant, ticket.id)
+            .await?;
+        Ok(Json(refreshed))
+    } else {
+        // Staff branch: go through the standard `create_ticket` path
+        // so the fully-populated request (with `asset_id` inline) lets
+        // us skip the follow-up UPDATE. Attribute the create to the
+        // caller's user id.
+        let user_id = match &caller {
+            CallerContext::Staff(auth) => auth.user.as_ref().map(|u| u.id).unwrap_or_default(),
+            CallerContext::Contact(_) => Uuid::nil(),
+        };
+        let req = mokosh_types::tickets::CreateTicketRequest {
+            title,
+            description,
+            asset_id: Some(asset_id),
+            company_id: asset.company_id,
+            source: mokosh_types::tickets::TicketSource::Internal,
+            ..Default::default()
+        };
+        let ticket = ticket_service
+            .create_ticket(tenant, user_id, &req, &ctx)
+            .await?;
+        let refreshed = ticket_service
+            .get_ticket_response(tenant, ticket.id)
+            .await?;
+        Ok(Json(refreshed))
+    }
 }

@@ -1,7 +1,7 @@
 //! API router configuration
 
 use axum::{
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, Method, StatusCode},
     middleware,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -13,6 +13,8 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
+
+use super::cors_origin::CorsOriginMatcher;
 
 use crate::db::Database;
 use crate::modules::approvals::{approval_routes, ApprovalsService};
@@ -37,7 +39,8 @@ use crate::modules::knowledge_base::attachments::{
 use crate::modules::knowledge_base::{kb_routes, KbService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
-use crate::modules::portal::{portal_routes, PortalAuthService};
+use crate::modules::platform::{platform_routes, PlatformAdminService};
+use crate::modules::portal_roles::{portal_role_routes, PortalRoleService};
 use crate::modules::projects::{projects_routes, ProjectsService};
 use crate::modules::quotes::{quotes_routes, QuotesService};
 use crate::modules::reports::{reports_routes, ReportsService};
@@ -47,12 +50,12 @@ use crate::modules::search::{search_routes, SearchService};
 use crate::modules::settings::{settings_routes, SettingsService};
 use crate::modules::sla::{sla_routes, SlaService};
 #[cfg(feature = "multi-tenant")]
+use crate::modules::teams::{me_teams_routes, teams_routes, TeamsService};
 use crate::modules::tenants::{public_tenant_routes, tenant_routes, TenantService};
 use crate::modules::ticket_templates::{ticket_template_routes, TicketTemplatesService};
 use crate::modules::tickets::{
-    agent_attachment_routes, contact_notes_routes, portal_attachment_routes,
-    public_ticket_attachment_routes, ticket_routes, AttachmentConfig, AttachmentService,
-    TicketService,
+    agent_attachment_routes, contact_notes_routes, public_ticket_attachment_routes, ticket_routes,
+    AttachmentConfig, AttachmentService, TicketService,
 };
 use crate::modules::time_tracking::{time_tracking_routes, TimeTrackingService};
 use crate::modules::workflows::{workflow_routes, WorkflowsService};
@@ -104,6 +107,10 @@ pub fn create_api_router(
     // main.rs. Only the emailed logo needs it (a mail client cannot resolve a
     // relative src); `None` omits the logo rather than emitting a broken image.
     public_api_base_url: Option<String>,
+    // MAPPS-457: instance-wide tenant creation cap, from MOKOSH_MAX_TENANTS.
+    // `None` = uncapped (production today); `Some(N)` = 409 on further creates
+    // once `SELECT COUNT(*) FROM tenants` reaches N.
+    max_tenants: Option<usize>,
     // PMS-904: self-hosted (mokosh owns platform identity) or saas (federated
     // to Bunyip SSO), from MOKOSH_DEPLOYMENT_MODE in main.rs. Decides whether
     // the mail that exists only to service a local password is sent at all.
@@ -115,14 +122,7 @@ pub fn create_api_router(
     // remembered to ask.
     secrets: Arc<dyn crate::secrets::SecretProvider>,
 ) -> Router {
-    let cors_origin_values: Vec<HeaderValue> = cors_origins
-        .iter()
-        .map(|o| {
-            o.parse::<HeaderValue>().unwrap_or_else(|e| {
-                panic!("CORS_ORIGIN entry {o:?} is not a valid header value: {e}")
-            })
-        })
-        .collect();
+    let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
 
     // PMS-905: `bunyip_verifier` is moved into the auth middleware below, so
@@ -174,7 +174,19 @@ pub fn create_api_router(
     // the payment-gateway configs use, so the auth service holds it too.
     .with_encryption_key(encryption_key);
     #[cfg(feature = "multi-tenant")]
-    let tenant_service = TenantService::new(db.clone());
+    // PMS-729 finalize: attach the dispatcher + SPA origin so a super-admin
+    // creating a tenant produces an emailed setup link for the fresh admin
+    // (mirrors `AuthService::create_user(send_welcome_email = true)`; same
+    // `client_origin`-based reset-password link the rest of the auth flow
+    // already builds against). The pre-session bunyip placement path
+    // (`auth_middleware.with_tenants(...)`) keeps its own bare
+    // `TenantService::new` because it does not create tenants that need an
+    // admin welcome.
+    let tenant_service = TenantService::new(db.clone())
+        .with_dispatcher(notifications_service.clone(), client_origin.clone())
+        // MAPPS-457: attach the instance-wide tenant cap. `None` (unset
+        // env) leaves the service uncapped, matching production today.
+        .with_max_tenants(max_tenants);
     // PMS-136: ContactService emails a `/portal/set-password` setup link when
     // an agent grants portal access, so it holds the SPA origin (the link
     // base). PMS-700: that mail is queued through the same `auth.welcome`
@@ -333,8 +345,25 @@ pub fn create_api_router(
         // latest published release and reports whether an upgrade is
         // available. Disabled (no outbound request) when the env var is unset.
         .route("/version/check", get(version_check))
-        // Auth routes
-        .nest("/auth", auth_routes(auth_service))
+        // Auth routes. MAPPS-493 (phase 4): share the AuthService Arc with
+        // tenant_routes so `/tenants/self-serve` can decode identity_tokens
+        // minted by /auth/login. AuthService derives Clone, so this is a
+        // cheap Arc bump. PMS-837 removed the Google OAuth popup routes and
+        // their `google_oauth` / `cookie_secure` parameters.
+        .nest("/auth", auth_routes(auth_service.clone()))
+        // MAPPS-513: platform super-admin routes. Distinct credential
+        // store (`platform_admins`) and distinct JWT typ so the
+        // super-admin persona is isolated from the tenant identity
+        // model. `RequirePlatformAdmin` extractor reads the platform
+        // service from request extensions; the extension layer that
+        // makes it reachable is attached at the very end of the
+        // api_v1 build (alongside `settings_service`) so every route
+        // (including the MAPPS-518 platform-admin-gated tenant
+        // endpoints) can resolve it.
+        .nest(
+            "/platform",
+            platform_routes(PlatformAdminService::new(db.clone(), jwt_secret.clone())),
+        )
         // Tenant management. Only mounted in multi-tenant builds: in a
         // single-tenant deployment there is exactly one tenant and the
         // CRUD endpoints would be a foot-gun. PMS-24.
@@ -342,8 +371,19 @@ pub fn create_api_router(
     #[cfg(feature = "multi-tenant")]
     let api_v1 = api_v1.nest(
         "/tenants",
-        tenant_routes(tenant_service, settings_service.clone()),
+        tenant_routes(
+            tenant_service,
+            settings_service.clone(),
+            std::sync::Arc::new(auth_service),
+        ),
     );
+    // PMS-791 / MAPPS-461: teams CRUD + membership. Two mounts so the
+    // "my teams" endpoint sits under /me alongside future me-scoped
+    // routes rather than crowding /teams.
+    #[cfg(feature = "multi-tenant")]
+    let api_v1 = api_v1
+        .nest("/teams", teams_routes(TeamsService::new(db.clone())))
+        .nest("/me", me_teams_routes(TeamsService::new(db.clone())));
     let api_v1 = api_v1
         // Contact management. The canonical company endpoints live
         // under `/api/v1/contacts/companies/...` (one router for
@@ -351,9 +391,47 @@ pub fn create_api_router(
         // Router::new())` here was dead - it matched nothing, so
         // `/api/v1/companies` returned a misleading 404 with no
         // explanation. Removed and documented (PMS-20).
-        .nest("/contacts", contact_routes(contact_service.clone()))
-        // Ticketing
-        .nest("/tickets", ticket_routes(ticket_service.clone()))
+        .nest(
+            "/contacts",
+            contact_routes(contact_service.clone(), PortalRoleService::new(db.clone())),
+        )
+        // MAPPS-618 phase B: Company-scoped branding asset uploads
+        // (logo / favicon / background). Staff-gated on
+        // `role.is_admin()`; the contact-plane siblings are wired
+        // separately below under `/api/v1/contact`.
+        .merge(crate::modules::branding::routes::staff_routes(db.clone()))
+        // mokosh-contact-login prompt 007: MSP-admin portal-role CRUD.
+        // Distinct top-level nest so the SPA hits `/api/v1/portal-roles`
+        // and the routes inside stay uncluttered by the double-nest
+        // `/contacts/portal-roles` shape the older read-only surface uses.
+        //
+        // PMS-929 (prompt 012): the nested Company-scoped role surface
+        // under `/api/v1/contacts/companies/{id}/portal-roles` also
+        // takes a `PortalRoleService`, built as a sibling instance
+        // above; both instances share the same `db` handle and are
+        // otherwise stateless.
+        .nest(
+            "/portal-roles",
+            portal_role_routes(PortalRoleService::new(db.clone())),
+        )
+        // Ticketing.
+        //
+        // PMS-936: the ticket router now also carries the shared
+        // `AttachmentService` so the portal `POST /tickets/{id}/attachments`
+        // route can reuse the on-disk blob pipeline (same env-driven
+        // dir + size cap as the agent surface).
+        .nest(
+            "/tickets",
+            ticket_routes(
+                ticket_service.clone(),
+                AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
+                // PMS-937: the tickets router now also owns
+                // `POST /tickets/{id}/approvals/request`, which needs
+                // the shared ApprovalsService instance (used for both
+                // contact-plane inserts and the staff-plane shortcut).
+                approvals_service.clone(),
+            ),
+        )
         // PMS-483: ticket-note attachment upload / download / delete.
         // Merged at the top level so its `/tickets/{id}/notes/...`
         // path nests cleanly under the existing ticket tree.
@@ -365,7 +443,7 @@ pub fn create_api_router(
         // route lives on the tickets module (TicketService owns the
         // notes surface) but mounts at the top level so its path
         // matches the SPA's `/contacts/{id}/notes` URL.
-        .merge(contact_notes_routes(ticket_service))
+        .merge(contact_notes_routes(ticket_service.clone()))
         // Time tracking: time-entries, timesheets, timers, rounding,
         // work-types. PMS-43.
         .merge(time_tracking_routes(time_tracking_service))
@@ -399,7 +477,11 @@ pub fn create_api_router(
         .merge(quotes_routes(quotes_service))
         // Assets / CMDB: types, assets, relationships, config items,
         // credential vault, audit log. PMS-72.
-        .merge(assets_routes(assets_service))
+        //
+        // PMS-936: also carries a `TicketService` clone so the
+        // `POST /assets/{id}/report-issue` endpoint can create the
+        // linked ticket through the shared portal-ticket path.
+        .merge(assets_routes(assets_service, ticket_service.clone()))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
         // PMS-923: images an article embeds. Upload / list / delete are
@@ -486,12 +568,44 @@ pub fn create_api_router(
             auth_middleware.clone(),
             crate::modules::auth::middleware::auth_middleware,
         ))
+        // mokosh-contact-login prompt 008: the contact-plane middleware runs
+        // on /api/v1/* too (not just /api/v1/contact/*) so a contact bearer
+        // reaching a dual-plane endpoint (tickets, invoices, quotes) lands
+        // in ContactAuthState. The `typ` claim isolation still holds - a
+        // staff bearer decodes only in the staff branch and vice versa - so
+        // this layer never overwrites an authenticated staff request; it
+        // simply attaches ContactAuthState (default when the bearer is not
+        // a contact token) so `RequireCallerContext` can fall back to it.
+        .layer(middleware::from_fn_with_state(
+            crate::modules::contact_portal::ContactAuthMiddleware::new(
+                crate::modules::contact_portal::ContactAuthService::new(
+                    db.clone(),
+                    jwt_secret.clone(),
+                ),
+            ),
+            crate::modules::contact_portal::middleware::portal_contact_middleware,
+        ))
+        // mokosh-contact-login prompt 008: `Extension<Database>` powers
+        // `CallerContext::require_capability`'s DB-load of the effective
+        // capability set. Attaching it once here lets every dual-plane
+        // handler pull the db without threading it through router state.
+        .layer(axum::Extension(db.clone()))
         // PMS-113 AC3: make SettingsService reachable from
         // `RequireModuleEnabled` extractors via the request's
         // extensions. The extractor reads
         // `parts.extensions.get::<Arc<SettingsService>>()` and short-
         // circuits with 404 when the gated module is disabled.
         .layer(axum::Extension(settings_service))
+        // MAPPS-513 / MAPPS-518: make `PlatformAdminService` reachable
+        // from the `RequirePlatformAdmin` extractor via request
+        // extensions. Attached at the outermost layer so every
+        // /api/v1 route (including the platform-admin-gated tenant
+        // endpoints from MAPPS-518) can resolve it, not just the
+        // /platform sub-tree.
+        .layer(axum::Extension(Arc::new(PlatformAdminService::new(
+            db.clone(),
+            jwt_secret.clone(),
+        ))))
         // PMS-298: outermost layer so every 4xx (including extractor
         // rejections such as a JSON body that fails to deserialize) is
         // returned as the standard `{error:{code,message}}` envelope instead
@@ -501,70 +615,27 @@ pub fn create_api_router(
             crate::utils::error::normalize_error_envelope,
         ));
 
-    // Build portal API routes. Portal identity is the contacts row,
-    // so this surface runs its own auth middleware (mounted inside
-    // `portal_routes`) and never sees `AuthMiddleware` / `AuthState`.
-    // PMS-820: the portal owns its own password reset, so the service holds
-    // the dispatcher the reset mail is queued through and the SPA origin the
-    // `/portal/reset-password` link is built from (a mokosh-apps route, so
-    // the SPA origin and not the apex - MAPPS-425).
-    let portal_service = PortalAuthService::with_delivery(
-        db.clone(),
-        jwt_secret.clone(),
-        spa_base_url.clone(),
-        notifications_service.clone(),
-    );
-    // PMS-483: `portal_attachment_routes` needs its own clone of the
-    // service so it can build the same `portal_auth_middleware` layer
-    // independently (the layer is per-Router in axum, not inherited
-    // from the merged-into parent).
-    let portal_attachment_auth_service = PortalAuthService::new(db.clone(), jwt_secret.clone());
-    let portal_ticket_service = TicketService::new(db.clone());
-    let portal_kb_service = KbService::new(db.clone());
-    let portal_billing_service =
-        BillingService::with_secrets(db.clone(), encryption_key, secrets.clone());
-    let portal_quotes_service = QuotesService::with_delivery(
-        db.clone(),
-        shared_mailer.clone(),
-        notifications_service.clone(),
-        spa_base_url.clone(),
-    );
-    let portal_api = Router::new()
-        .route("/health", get(health_check))
-        .merge(portal_routes(
-            portal_service,
-            portal_ticket_service,
-            portal_kb_service,
-            portal_billing_service,
-            portal_quotes_service,
-            // MAPPS-425: the Stripe checkout success/cancel URLs are
-            // `/portal/invoices/{id}`, mokosh-apps routes, so the portal
-            // origin is the SPA origin and not the apex.
-            spa_base_url.clone(),
-        ))
-        // PMS-483: portal-side ticket-note attachments. Same routes as
-        // the agent surface, but behind `RequirePortalAuth` and
-        // company-scoped via the contact's authenticated `company_id`.
-        // The portal auth middleware is layered inside this builder
-        // because `.merge` does NOT inherit the parent router's layers
-        // - without that, every portal upload would 401 before the
-        // handler.
-        .merge(portal_attachment_routes(
-            AttachmentService::new(db.clone(), AttachmentConfig::from_env()),
-            portal_attachment_auth_service,
-        ))
-        // PMS-298: same envelope normalization for the portal surface.
-        .layer(middleware::from_fn(
-            crate::utils::error::normalize_error_envelope,
-        ));
+    // mokosh-contact-login: the /portal/* customer-portal surface retires
+    // on this branch. The whole PortalAuthService + PortalRouter tree
+    // built here pre-pivot is gone; the contact plane replaces it under
+    // /api/v1/contact/* in a later prompt (004).
 
     // CORS: SPA at msp.<tld> talks to api.msp.<tld> from a different origin,
     // so credentialed CORS must be tight (specific origins, not wildcard).
     // The list comes from the CORS_ORIGIN env var (comma-separated). The
     // bunyip apex is included so the SaaS shell can call mokosh endpoints
     // in the future without losing credentials.
+    //
+    // PMS-729: entries starting with `https://*.` or `http://*.` are
+    // scheme-locked wildcard suffixes: they match any Origin whose scheme
+    // matches and whose host ends with the suffix (dot preserved). Used for
+    // the client-portal wildcard host `{slug}.client.<apex>` so per-tenant
+    // portal origins do not each need their own explicit CORS_ORIGIN entry.
+    // See `CorsOriginMatcher::from_entries` for the parse rules.
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(cors_origin_values))
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            cors_matcher.matches(origin.as_bytes())
+        }))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -573,7 +644,23 @@ pub fn create_api_router(
             Method::PATCH,
             Method::OPTIONS,
         ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            // PMS-729: the SPA attaches `X-Forwarded-Host` on every
+            // portal-side fetch so the server's host-to-tenant
+            // extractor sees the real `{slug}.client.<apex>` value
+            // even when a dev reverse proxy rewrites Host. Without it
+            // in the CORS preflight allow-list, the browser refuses
+            // the actual credentialed POST (magic-link redeem,
+            // set-password, etc.) with `Request header field
+            // x-forwarded-host is not allowed by
+            // Access-Control-Allow-Headers`, and the SPA reports the
+            // failure as "This link is invalid or has expired" even
+            // though the token never reached the server.
+            axum::http::HeaderName::from_static("x-forwarded-host"),
+        ])
         .allow_credentials(true)
         // Cache preflight for 10 minutes per docs/cors.md §5 so browsers do not
         // re-issue an OPTIONS before every credentialed request (PMS-389).
@@ -664,6 +751,9 @@ pub fn create_api_router(
         // mail client renders it straight out of the request-form email and
         // will never authenticate.
         .merge(public_tenant_routes(TenantService::new(db.clone())))
+        // MAPPS-618 phase B: same shape for the Company-scoped
+        // assets (logo / favicon / background).
+        .merge(crate::modules::branding::routes::public_routes(db.clone()))
         // PMS-923: an image embedded in a KB article. Unauthenticated by
         // necessity, not by preference: the browser fetches it as `<img src>`,
         // which carries no Authorization header, and the SPA holds a bearer
@@ -696,10 +786,32 @@ pub fn create_api_router(
             crate::utils::error::normalize_error_envelope,
         ));
 
+    // mokosh-contact-login prompt 004: contact-plane sub-router at
+    // /api/v1/contact/*. Distinct from /api/v1 (staff plane) - the
+    // portal_contact_middleware only decodes `typ: "contact"` tokens,
+    // so a staff bearer here is a 401 by construction.
+    let contact_service =
+        crate::modules::contact_portal::ContactAuthService::new(db.clone(), jwt_secret.clone())
+            .with_notifications(notifications_service.clone())
+            .with_spa_base_url(spa_base_url.clone());
+    // MAPPS-618 phase B: share the ContactAuthService with the
+    // branding router so it can `load_capabilities` for the
+    // `settings:manage_company_branding` gate without a duplicate
+    // instance.
+    let contact_service_arc = std::sync::Arc::new(contact_service.clone());
+    let contact_api = crate::modules::contact_portal::contact_routes(contact_service)
+        .merge(crate::modules::branding::routes::contact_routes(
+            db.clone(),
+            contact_service_arc,
+        ))
+        .layer(middleware::from_fn(
+            crate::utils::error::normalize_error_envelope,
+        ));
+
     Router::new()
         .nest("/api/v1", api_v1)
         .nest("/api/v1/public", public_api)
-        .nest("/api/v1/portal", portal_api)
+        .nest("/api/v1/contact", contact_api)
         .nest("/api/v1/bunyip", bunyip_webhooks)
         .nest("/api/v1/stripe", stripe_webhooks)
         .nest("/api/v1/paypal", paypal_webhooks)
@@ -1046,6 +1158,156 @@ mod tests {
             .expect("probe should be configured");
         assert_eq!(probe.url, "http://infisical:8080/api/status");
         assert_eq!(probe.display, "http://infisical:8080");
+    }
+
+    /// The mokosh-contact-login <- main merge (chore/merge-main-into-contact-
+    /// login) panicked axum at Router construction because two builders
+    /// registered the same `(method, path)` after nesting:
+    ///
+    ///   - PMS-936 `portal_attach_file` at `.route("/{ticket_id}/attachments", post(...))`
+    ///     in `src/modules/tickets/routes.rs`, mounted under `.nest("/tickets", ...)`
+    ///     -> `POST /tickets/{ticket_id}/attachments`.
+    ///   - PMS-941 `upload_inline_agent` at `.route("/tickets/{ticket_id}/attachments", post(...))`
+    ///     in `src/modules/tickets/attachments.rs`, mounted at the top level
+    ///     via `.merge(agent_attachment_routes(...))` -> same `POST /tickets/{ticket_id}/attachments`.
+    ///
+    /// axum panics at Router construction on that overlap, so the server
+    /// dies before the first request. `integration.yml` would catch it
+    /// (every integration test boots the router through `common::boot`),
+    /// but `check.yml` runs `cargo test --lib` alone. This scan reads the
+    /// two source files directly, so a future merge that reintroduces the
+    /// same `(method, effective path)` pair on the ticket-attachments
+    /// surface fails right here, before deploy.
+    ///
+    /// Narrow by construction: guards the tickets-attachment surface, not
+    /// every route pair in the router. The general case wants a router-
+    /// construction smoke test that boots against a stub Database; until
+    /// that lands, extending this test to a second surface is one
+    /// `(src, prefix)` entry away.
+    #[test]
+    fn tickets_attachments_surface_has_no_route_overlap() {
+        const TICKETS_ROUTES: &str = include_str!("../modules/tickets/routes.rs");
+        const TICKETS_ATTACHMENTS: &str = include_str!("../modules/tickets/attachments.rs");
+
+        // `(source, mount-prefix)` pairs. Every `.route("<path>", ...)` in
+        // `source` becomes an effective `<mount-prefix><path>` for the
+        // overlap check.
+        //
+        // `mount-prefix = ""` means "mounted at the top level via
+        // `.merge(...)`"; `mount-prefix = "/tickets"` means "nested under
+        // that prefix". These match `create_api_router` above.
+        let sources: &[(&str, &str, &str)] = &[
+            ("tickets/routes.rs", TICKETS_ROUTES, "/tickets"),
+            ("tickets/attachments.rs", TICKETS_ATTACHMENTS, ""),
+        ];
+
+        let mut seen: Vec<(String, String, &str)> = Vec::new();
+        let mut collisions: Vec<String> = Vec::new();
+
+        for (label, src, prefix) in sources {
+            for raw in extract_route_lines(src) {
+                let Some((path, methods)) = parse_route_line(&raw) else {
+                    continue;
+                };
+                let effective = format!("{prefix}{path}");
+                for method in methods {
+                    if let Some((_, _, other_label)) = seen
+                        .iter()
+                        .find(|(m, p, _)| m == &method && p == &effective)
+                    {
+                        collisions.push(format!(
+                            "{method} {effective}: {other_label} and {label} both register it"
+                        ));
+                    }
+                    seen.push((method, effective.clone(), label));
+                }
+            }
+        }
+
+        assert!(
+            seen.len() > 20,
+            "the scan found only {} routes across the two sources; it has \
+             stopped matching the file shape and is no longer proving \
+             anything",
+            seen.len()
+        );
+        assert!(
+            collisions.is_empty(),
+            "overlapping route registrations that will panic axum at Router \
+             construction:\n  {}\n\nGive each handler its own path (see PMS-\
+             936 vs PMS-941 in the tickets/attachments surface for the fix \
+             pattern) rather than overloading one URL.",
+            collisions.join("\n  ")
+        );
+    }
+
+    /// Pull every `.route(...)` invocation out of a file. Handles both the
+    /// one-line shape `.route("/foo", get(handler))` and the multi-line
+    /// shape ending in `)` on a later line. Returns the argument list of
+    /// each `.route(...)` call, comma-joined between path and methods, so
+    /// downstream parsing can see the full literal.
+    fn extract_route_lines(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        let bytes = src.as_bytes();
+        while let Some(start) = src[i..].find(".route(") {
+            let start = i + start + ".route(".len();
+            // Find the balanced closing paren.
+            let mut depth = 1usize;
+            let mut end = start;
+            let mut in_str = false;
+            let mut esc = false;
+            while end < bytes.len() && depth > 0 {
+                let c = bytes[end] as char;
+                if esc {
+                    esc = false;
+                } else if c == '\\' && in_str {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = !in_str;
+                } else if !in_str {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                if depth > 0 {
+                    end += 1;
+                }
+            }
+            if depth == 0 {
+                out.push(src[start..end].to_string());
+                i = end + 1;
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Parse the arg list of a single `.route(...)` call into its path
+    /// literal and the HTTP methods registered on it. Skips lines the
+    /// parser cannot recognise (macros, non-literal paths) so the scan
+    /// keeps going.
+    fn parse_route_line(raw: &str) -> Option<(String, Vec<String>)> {
+        let raw = raw.trim();
+        let first_quote = raw.find('"')?;
+        let after = &raw[first_quote + 1..];
+        let end_quote = after.find('"')?;
+        let path = &after[..end_quote];
+        let rest = &after[end_quote + 1..];
+        let mut methods = Vec::new();
+        for name in ["get", "post", "put", "patch", "delete", "head", "options"] {
+            let needle = format!("{name}(");
+            if rest.contains(&needle) {
+                methods.push(name.to_ascii_uppercase());
+            }
+        }
+        if methods.is_empty() {
+            return None;
+        }
+        Some((path.to_string(), methods))
     }
 
     /// Configured-but-unreachable stays an error (which /ready turns into

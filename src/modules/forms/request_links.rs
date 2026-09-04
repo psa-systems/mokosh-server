@@ -555,7 +555,7 @@ fn abuse_notice(abuse_contact_email: Option<&str>, form_name: &str) -> (String, 
 /// field in display order. Falls back to the company-agnostic form name alone
 /// when the form has no text field, which keeps the title deterministic rather
 /// than guessing at semantics the definition does not declare.
-fn summarise(
+pub(super) fn summarise(
     definition: &super::models::FormDefinitionResponse,
     answers: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
@@ -584,7 +584,11 @@ fn summarise(
 /// A textarea answer carries its own newlines. Those become hard breaks
 /// (two trailing spaces) and the continuation is indented into the list item,
 /// so the client's paragraphing survives instead of collapsing the same way.
-fn render_answers(
+///
+/// PMS-729 phase 2 §7 slice B / I8: `pub(super)` so the portal form-submit
+/// handler in `super::service::submit_from_portal` can call this too - the
+/// portal path renders the same description shape as the request-link path.
+pub(super) fn render_answers(
     definition: &super::models::FormDefinitionResponse,
     answers: &serde_json::Map<String, serde_json::Value>,
 ) -> String {

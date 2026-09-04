@@ -65,7 +65,10 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-br", "limit", "request-id"] }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "rust_decimal"] }
+# PMS-729 phase 2 H6: `ipnetwork` feature enables sqlx's IpNetwork
+# decode for the portal_refresh_tokens.ip_address column so
+# /portal/auth/me/sessions can surface the requesting IP.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate", "rust_decimal", "ipnetwork"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -97,6 +100,12 @@ jsonwebtoken = "9"
 
 # Validation
 validator = { version = "0.19", features = ["derive"] }
+
+# Password-strength scoring. PMS-729 phase 2 H5: portal password policy
+# rejects zxcvbn score < 3 (a fast-crack candidate) alongside the length
+# floor + common-password blocklist. Same primitive Dropbox uses in
+# production; pure-Rust port so no C dep.
+zxcvbn = "3"
 
 # Error handling
 thiserror = "2"
@@ -187,6 +196,10 @@ dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "ae62c
 # the four `utils::inline_image` already accepts for an uploaded logo: a
 # format the upload refuses can never reach the renderer, and a codec the
 # renderer lacks would make an accepted logo silently vanish from an invoice.
+# Merge note: kept main's 0.12.7 + image features. Contact-login's 0.7
+# with `default-features = false` was for RSS reasons under earlyoom;
+# 0.12.7 inherits `default-features = false` and the image codecs are
+# additive, so the RSS concern stays addressed here.
 printpdf = { version = "0.12.7", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [dev-dependencies]
@@ -225,6 +238,20 @@ strip = true
 
 [profile.dev]
 opt-level = 0
+# Memory-constrained dev containers (e.g. 15 GiB box with earlyoom at
+# the ~1.5 GB free threshold) SIGTERM the final mokosh_server lib
+# compile with default `debug = 2`. The linked rmeta unit for a crate
+# this large (~50 deps, ~130 modules, printpdf tree) needs to fit its
+# whole IR + DWARF in RAM at once. Dropping to `debug = 0` and
+# splitting into more codegen units keeps rustc peak RSS well under
+# the OOM ceiling; the client-side `[profile.wasm-dev]` uses the same
+# posture (see mokosh-apps Cargo.toml). Debuggers still work on
+# release builds; dev is for iteration speed, not stepping through.
+debug = 0
+codegen-units = 256
+# Stack unwinding is off in release (`panic = "abort"`) but stays on
+# in dev so a panic in a test prints the row. `overflow-checks` and
+# `debug-assertions` stay ON so a dev-time bug is loud.
 
 [profile.dev.package."*"]
 opt-level = 3

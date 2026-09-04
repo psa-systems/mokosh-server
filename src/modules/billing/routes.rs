@@ -13,8 +13,12 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::BillingService;
-use crate::modules::auth::{RequireBilling, RequireFinance, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireBilling, RequireCallerContext, RequireFinance, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -38,10 +42,41 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}",
             get(get_invoice).put(update_invoice),
         )
-        // PMS-911: the invoice as a client receives it. Rendered from the
-        // issuer snapshot frozen when it was sent, so a later rebrand cannot
-        // change a document somebody already holds.
-        .route("/invoices/{invoice_id}/pdf", get(get_invoice_pdf))
+        // PMS-911 / PMS-936: the invoice as a client receives it. Rendered
+        // from the issuer snapshot frozen when it was sent, so a later rebrand
+        // cannot change a document somebody already holds. Contact plane gates
+        // on `invoices:download_pdf`; staff plane keeps the standard
+        // RequireBilling + RequireFinance gates.
+        .route(
+            "/invoices/{invoice_id}/pdf",
+            axum::routing::get(get_invoice_pdf),
+        )
+        // PMS-914: dual-plane "Pay Now" surface. The PMS-711 service
+        // method (`create_invoice_checkout_session`) has been in
+        // place since the Stripe adapter landed but the retired
+        // `/portal/*` tree was the only mount site; this restores
+        // the route on the dual-plane billing router. Contact plane
+        // gates on `invoices:pay` (Billing-Contact role by default);
+        // staff plane keeps the RequireBilling + RequireFinance
+        // inline check the sibling handlers use.
+        .route(
+            "/invoices/{invoice_id}/pay",
+            axum::routing::post(pay_invoice),
+        )
+        // MAPPS-666 (mokosh-invoices P1a): a read the SPA fires on
+        // invoice-detail mount to decide whether the Pay Now button
+        // should render, and if so with what label. Fired alongside
+        // the invoice-detail fetch so the button state is decided
+        // before the caller ever clicks it: a click that always
+        // 400s because no gateway is configured is a worse UX than
+        // a greyed button with a tooltip explaining why. Contact
+        // plane gates on `invoices:read` (NOT `invoices:pay`) so a
+        // Support Contact sees the same coherent empty state a
+        // Billing Contact would.
+        .route(
+            "/invoices/{invoice_id}/payment-readiness",
+            axum::routing::get(get_invoice_payment_readiness),
+        )
         // PMS-955: the product catalog. A price list, not an inventory
         // system, and not a second home for labour pricing (`/rate-cards`).
         .route("/products", get(list_products).post(create_product))
@@ -388,31 +423,79 @@ async fn create_invoice_from_time_entries(
 
 async fn get_invoice(
     State(state): State<BillingRouterState>,
-    RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Json<InvoiceResponse>> {
-    let inv = state.service.get_invoice(user.tenant(), invoice_id).await?;
+    // mokosh-contact-login prompt 008: staff branch preserves the
+    // pre-sweep RequireBilling+RequireFinance gate via
+    // `assert_staff_billing_finance`; contact branch requires
+    // invoices:read + Company scope check, 404ing a foreign row.
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::INVOICES_READ, &db).await?;
+        }
+    }
+    let inv = state.service.get_invoice(tenant, invoice_id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if inv.company_id != session.company_id {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        }
+    }
     Ok(Json(inv))
 }
 
 async fn list_invoices(
     State(state): State<BillingRouterState>,
-    RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
-    Query(filter): Query<InvoiceFilter>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Query(mut filter): Query<InvoiceFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<InvoiceResponse>>> {
     filter.validate()?;
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::INVOICES_READ, &db).await?;
+            filter.company_id = Some(session.company_id);
+            // MAPPS-670 (mokosh-invoices P1e): the portal must never
+            // see a draft. Server-side so the count meta agrees with
+            // the rows (a client-side skip leaves `total` inflated
+            // and pagination misleading).
+            filter.exclude_draft = true;
+        }
+    }
     let (invoices, total) = state
         .service
-        .list_invoices(user.tenant(), &filter, &pagination)
+        .list_invoices(tenant, &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         invoices,
         &pagination,
         total,
     )))
+}
+
+/// mokosh-contact-login prompt 008: reproduce the RequireBilling +
+/// RequireFinance behaviour inline for a handler that now takes
+/// `RequireCallerContext` instead of the two dedicated extractors, so
+/// the staff branch still 404s a tenant with billing disabled and
+/// 403s a non-finance role. Kept as a small helper because two of the
+/// swept invoice handlers need it verbatim.
+fn assert_staff_billing_finance(auth: &crate::modules::auth::AuthState) -> AppResult<()> {
+    let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+    let role = user.role.as_str();
+    if !matches!(role, "super_admin" | "admin" | "finance") {
+        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -504,20 +587,35 @@ async fn get_statement(
     Ok(Json(statement))
 }
 
-/// PMS-911: `GET /invoices/{id}/pdf`.
+/// PMS-911 / PMS-936: dual-plane `GET /invoices/{id}/pdf`.
 ///
-/// Behind the same `RequireBilling` gate as the JSON it renders. A rendered
-/// invoice is the same financial data in another format, and a new output
-/// format must not become a side door around a permission (the PMS-350 lesson,
-/// applied again in PMS-876 for the report export).
+/// Contact plane gates on `invoices:download_pdf` plus a Company-scope check
+/// that 404s a foreign invoice; staff plane keeps the finance inline check.
+/// After the gate passes the handler renders (or serves the stored bytes) via
+/// the shared PMS-959 issuer path.
 async fn get_invoice_pdf(
     State(state): State<BillingRouterState>,
-    RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(invoice_id): Path<Uuid>,
 ) -> AppResult<Response> {
-    let tenant = user.tenant();
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(_) => {
+            caller
+                .require_capability(caps::INVOICES_DOWNLOAD_PDF, &db)
+                .await?;
+        }
+    }
     let invoice = state.service.get_invoice(tenant, invoice_id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if invoice.company_id != session.company_id {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        }
+    }
     // PMS-959: the bytes that were sent, when there are any. A live render is
     // the fallback for a draft, which has not been sent and has nothing to
     // preserve, and for an invoice sent before PMS-959, which is how those
@@ -551,6 +649,120 @@ async fn get_invoice_pdf(
         bytes,
         &format!("{}.pdf", invoice.invoice_number),
     ))
+}
+
+/// PMS-914 / PMS-711: mint a hosted checkout session for an invoice
+/// balance. Contact plane gates on `invoices:pay` plus a Company-scope
+/// check that 404s a foreign invoice (enumeration-resistant, matches
+/// the sibling `get_invoice` + `get_invoice_pdf` pattern); staff plane
+/// keeps the billing/finance inline gate. The 400s from the service
+/// (invoice in a non-payable status, zero balance, no active gateway)
+/// pass through unchanged.
+async fn pay_invoice(
+    State(state): State<BillingRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(invoice_id): Path<Uuid>,
+    Json(request): Json<PayInvoiceRequest>,
+) -> AppResult<Json<PayInvoiceResponse>> {
+    request.validate()?;
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::INVOICES_PAY, &db).await?;
+        }
+    }
+    if let CallerContext::Contact(session) = &caller {
+        let inv = state.service.get_invoice(tenant, invoice_id).await?;
+        if inv.company_id != session.company_id {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        }
+    }
+    let session = state
+        .service
+        .create_invoice_checkout_session(
+            tenant,
+            invoice_id,
+            &request.success_url,
+            &request.cancel_url,
+        )
+        .await?;
+    Ok(Json(PayInvoiceResponse {
+        checkout_url: session.url,
+    }))
+}
+
+/// MAPPS-666 (mokosh-invoices P1a): the SPA fires this once on invoice-
+/// detail mount to decide whether to render the Pay Now button + with
+/// what label. A click that always 400s because no gateway is
+/// configured is a worse UX than a greyed button with a tooltip
+/// explaining why, so surface the state up front.
+///
+/// Contact plane gates on `invoices:read` (NOT `invoices:pay`) - a
+/// Support Contact seeing the invoice should see the same coherent
+/// empty state a Billing Contact would, even though the button
+/// itself is hidden on the Support view (SPA-side `use_capability`).
+/// Staff plane keeps `assert_staff_billing_finance` for parity with
+/// every other billing read (PMS-962 in-source guard).
+async fn get_invoice_payment_readiness(
+    State(state): State<BillingRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Json<InvoicePaymentReadinessResponse>> {
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+        }
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::INVOICES_READ, &db).await?;
+        }
+    }
+    let invoice = state.service.get_invoice(tenant, invoice_id).await?;
+    if let CallerContext::Contact(session) = &caller {
+        if invoice.company_id != session.company_id {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        }
+    }
+    let active = state.service.active_provider_display(tenant).await?;
+    let gateway_ready = active.is_some();
+    let button_label = active.map(|(id, override_label)| {
+        // MAPPS-671 (mokosh-invoices P2a): the admin's override wins when
+        // set; otherwise fall back to a provider-derived default so a
+        // tenant that never touches the field still gets a coherent
+        // label. Empty-after-trim is treated as no override so a
+        // whitespace-only value cannot ship a blank button.
+        override_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| match id.as_str() {
+                "stripe" => "Pay with card".to_string(),
+                "paypal" => "Pay with PayPal".to_string(),
+                other => format!("Pay with {other}"),
+            })
+    });
+    let invoice_payable = matches!(
+        invoice.status,
+        InvoiceStatus::Pending | InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid
+    ) && invoice.balance_due > rust_decimal::Decimal::ZERO;
+    let currency = invoice.currency.as_deref().unwrap_or("USD");
+    let balance_due_display = if currency.eq_ignore_ascii_case("USD") {
+        format!("${:.2}", invoice.balance_due)
+    } else {
+        format!("{:.2} {}", invoice.balance_due, currency)
+    };
+    Ok(Json(InvoicePaymentReadinessResponse {
+        gateway_ready,
+        button_label,
+        invoice_payable,
+        balance_due_display,
+    }))
 }
 
 /// PMS-959: `GET /credit-notes/{id}/pdf`.

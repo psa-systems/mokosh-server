@@ -3,7 +3,7 @@
 use axum::{
     extract::{Request, State},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use std::sync::Arc;
 
@@ -93,6 +93,19 @@ impl From<AppError> for AuthRejection {
     }
 }
 
+impl From<AuthRejection> for AppError {
+    /// Reverse conversion so extractors whose own `Rejection` is
+    /// `AppError` can use `?` on a call that returns `AuthRejection`
+    /// (e.g. `RequireAuth::from_request_parts`). The RFC 6750
+    /// challenge is dropped, which is correct: an extractor whose
+    /// rejection is `AppError` never attaches a challenge anyway,
+    /// so the response shape is identical to the direct-`AppError`
+    /// path it was already using before the merge.
+    fn from(rejection: AuthRejection) -> Self {
+        rejection.error
+    }
+}
+
 impl axum::response::IntoResponse for AuthRejection {
     fn into_response(self) -> Response {
         let mut response = self.error.into_response();
@@ -170,6 +183,53 @@ impl AuthMiddleware {
     }
 }
 
+/// MAPPS-491 (MAPPS-474 phase 2): fill `identity_id`,
+/// `active_membership_id`, and `memberships` on an authenticated
+/// `AuthState`. Safe no-op when the state is unauthenticated or the
+/// tenant is missing. `mid_hint` comes from the JWT (`JwtClaims.mid`);
+/// when absent, the membership id is resolved from
+/// `(email, tenant_id)`. Runs on the migrator pool because both
+/// identity-plane tables are RLS-exempt.
+async fn enrich_auth_state_with_identity(
+    auth_service: &AuthService,
+    state: AuthState,
+    mid_hint: Option<uuid::Uuid>,
+) -> AuthState {
+    let (Some(user), Some(tenant_id)) = (state.user.as_ref(), state.tenant_id) else {
+        return state;
+    };
+    let pool = auth_service.db().migrator_pool();
+    let identity_id = crate::db::identity::IdentityRepo::find_id_by_email(pool, &user.email)
+        .await
+        .ok()
+        .flatten();
+    let active_membership_id = match mid_hint {
+        Some(mid) => Some(mid),
+        None => crate::db::identity::MembershipRepo::find_id_by_email_and_tenant(
+            pool,
+            &user.email,
+            tenant_id,
+        )
+        .await
+        .ok()
+        .flatten(),
+    };
+    let memberships = match identity_id {
+        Some(id) => {
+            crate::db::identity::MembershipRepo::list_views_for_identity(pool, id, Some(tenant_id))
+                .await
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    AuthState {
+        identity_id,
+        active_membership_id,
+        memberships,
+        ..state
+    }
+}
+
 /// Extract auth state from request
 pub async fn auth_middleware(
     State(auth_middleware): State<AuthMiddleware>,
@@ -188,6 +248,18 @@ pub async fn auth_middleware(
     // instead of the generic 401. Distinguishes "your bunyip account was
     // deleted" from "your session expired / please refresh" at the SPA.
     let mut candidate_sub: Option<uuid::Uuid> = None;
+    // MAPPS-491: hint the enrich pass with `mid` from the legacy JWT when
+    // present. Bunyip tokens never carry it (bunyip does not know about
+    // memberships) so the hint stays None on that path and the enrich
+    // pass falls back to an (email, tenant_id) lookup.
+    let mut mid_hint: Option<uuid::Uuid> = None;
+    // Captures a "principal was definitively rejected" AppError (suspended
+    // tenant, deactivated user) from either the bunyip path or the legacy
+    // path. When set AND no auth path succeeded, short-circuit with the
+    // AppError's own response after the block, so the SPA sees the real
+    // 403 + copy instead of a generic 401 the AuthGuard reads as
+    // "session expired" and loops on.
+    let mut principal_rejection: Option<AppError> = None;
     // PMS-769: which bearer outcome the extractors should challenge on.
     let mut outcome = BearerOutcome::Absent;
     let auth_state = match bearer(&request) {
@@ -201,7 +273,7 @@ pub async fn auth_middleware(
                 Some(v) => match v.verify_at_jwt(token).await {
                     Ok(claims) => {
                         candidate_sub = uuid::Uuid::parse_str(&claims.sub).ok();
-                        ensure_user_from_bunyip(
+                        let (state, rejection) = ensure_user_from_bunyip(
                             &auth_middleware.auth_service,
                             auth_middleware.tenants.as_ref(),
                             auth_middleware.invitations.as_ref(),
@@ -209,7 +281,11 @@ pub async fn auth_middleware(
                             token,
                             &claims,
                         )
-                        .await
+                        .await;
+                        if principal_rejection.is_none() {
+                            principal_rejection = rejection;
+                        }
+                        state
                     }
                     // PMS-769: this error used to be dropped on the floor, so
                     // an expired token, a wrong-audience token, a forged
@@ -257,6 +333,10 @@ pub async fn auth_middleware(
                         if candidate_sub.is_none() {
                             candidate_sub = Some(claims.sub);
                         }
+                        // MAPPS-491: pull `mid` off the JWT for the enrich
+                        // pass below. `None` (legacy token) triggers the
+                        // fallback lookup by (email, tenant_id).
+                        mid_hint = claims.mid;
                         match auth_middleware
                             .auth_service
                             .ensure_user_and_tenant_active(
@@ -271,13 +351,21 @@ pub async fn auth_middleware(
                             }
                             // PMS-769: the cause (deactivated user, suspended
                             // tenant, post-password-change `iat`, MAPPS-531
-                            // signed-out session) is logged
-                            // rather than discarded, so a support report of
-                            // "it just 401s" has server-side evidence. `debug`,
-                            // not `warn`: every one of these is an expected
-                            // revocation, and the 401 itself is the loud part.
+                            // signed-out session) is logged rather than
+                            // discarded, so a support report of "it just 401s"
+                            // has server-side evidence. `debug`, not `warn`:
+                            // every one of these is an expected revocation,
+                            // and the 401 itself is the loud part. The reason
+                            // is ALSO captured so the outer function can
+                            // return the AppError's own response (e.g. 403
+                            // "This organization is not active") instead of
+                            // dropping to a generic 401 the SPA reads as
+                            // "session expired" and loops on.
                             Err(e) => {
                                 tracing::debug!(error = %e, user = %claims.sub, "legacy bearer principal rejected");
+                                if principal_rejection.is_none() {
+                                    principal_rejection = Some(e);
+                                }
                                 AuthState::default()
                             }
                         }
@@ -319,6 +407,26 @@ pub async fn auth_middleware(
     } else {
         auth_state
     };
+
+    // When neither auth path succeeded AND we captured a definitive principal
+    // rejection (suspended tenant, deactivated user - PMS-698 semantics), return
+    // the AppError's own response NOW instead of running the request through
+    // `next` with an empty AuthState (which downstream extractors turn into a
+    // generic 401 the SPA reads as "session expired" and prompts the user to
+    // sign in again). The MAPPS-348 tombstone upgrade above takes precedence
+    // over principal_rejection - a deleted-account 410 is more specific than a
+    // suspended-tenant 403.
+    if !auth_state.is_authenticated && !auth_state.deleted {
+        if let Some(err) = principal_rejection {
+            return err.into_response();
+        }
+    }
+
+    // MAPPS-491 (MAPPS-474 phase 2): backfill identity + membership fields
+    // on the authenticated state so extractors and `GET /auth/memberships`
+    // can read them without a second round-trip. No-op when unauthenticated.
+    let auth_state =
+        enrich_auth_state_with_identity(&auth_middleware.auth_service, auth_state, mid_hint).await;
 
     // Insert auth state into request extensions
     if auth_state.is_authenticated {
@@ -389,6 +497,36 @@ where
             &auth_state,
             bearer_outcome(parts),
         )?))
+    }
+}
+
+/// MAPPS-491 (MAPPS-474 phase 2): extractor that surfaces the FULL
+/// authenticated `AuthState` (identity_id, active_membership_id,
+/// memberships, plus the user + tenant). Handlers that need the
+/// membership set — currently `GET /auth/memberships` — reach for this
+/// instead of `RequireAuth`, which only exposes `CurrentUser`.
+#[derive(Clone)]
+pub struct RequireAuthState(pub AuthState);
+
+impl<S> axum::extract::FromRequestParts<S> for RequireAuthState
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_state = parts
+            .extensions
+            .get::<AuthState>()
+            .cloned()
+            .unwrap_or_default();
+        // Reuse the RequireAuth gate: if the state isn't authenticated
+        // (or is tombstoned), map to the same 401 / 410.
+        user_or_auth_error(&auth_state, bearer_outcome(parts))?;
+        Ok(RequireAuthState(auth_state))
     }
 }
 
@@ -704,8 +842,10 @@ async fn ensure_user_from_bunyip(
     verifier: &BunyipVerifier,
     bearer: &str,
     claims: &super::oidc_rs::AtClaims,
-) -> Option<AuthState> {
-    let sub = uuid::Uuid::parse_str(&claims.sub).ok()?;
+) -> (Option<AuthState>, Option<AppError>) {
+    let Some(sub) = uuid::Uuid::parse_str(&claims.sub).ok() else {
+        return (None, None);
+    };
 
     // PMS-244: orgs live in Mokosh (Bunyip is a personal-subscription IdP with
     // no org concept), so the tenant is resolved from Mokosh's own membership
@@ -734,7 +874,7 @@ async fn ensure_user_from_bunyip(
         match place_bunyip_user_from_local_state(auth_service, tenants, invitations, sub, claims)
             .await
         {
-            LocalPlacement::Placed(state) => return *state,
+            LocalPlacement::Placed(state) => return (*state, None),
             LocalPlacement::UserinfoNeeded => {
                 let info = verifier.userinfo(bearer).await;
                 // MAPPS-335: bind the userinfo response to the verified at+jwt by
@@ -779,7 +919,7 @@ async fn ensure_user_from_bunyip(
             }
         };
 
-    place_bunyip_user(
+    place_bunyip_user_with_rejection(
         auth_service,
         tenants,
         invitations,
@@ -844,7 +984,8 @@ pub async fn place_bunyip_user_from_local_state(
             claims,
             Some(principal),
         )
-        .await,
+        .await
+        .0,
     ))
 }
 
@@ -944,6 +1085,9 @@ async fn resolve_bunyip_caller(
 // integration tests) to construct that struct from the same fields. Suppress
 // here rather than refactor; the surface is internal to the auth module.
 #[allow(clippy::too_many_arguments)]
+/// Backward-compatible wrapper: discards any principal-rejection reason and
+/// returns only the resolved `AuthState`. The bunyip_login integration test
+/// suite calls this directly and does not need the rejection detail.
 pub async fn place_bunyip_user(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -955,6 +1099,38 @@ pub async fn place_bunyip_user(
     family_name: Option<String>,
     claims: &super::oidc_rs::AtClaims,
 ) -> Option<AuthState> {
+    place_bunyip_user_with_rejection(
+        auth_service,
+        tenants,
+        invitations,
+        sub,
+        email,
+        email_verified,
+        given_name,
+        family_name,
+        claims,
+    )
+    .await
+    .0
+}
+
+/// Variant that returns both the resolved `AuthState` AND any principal
+/// rejection reason (deactivated user / suspended tenant). The middleware
+/// uses this so it can short-circuit the request with the AppError's own
+/// 403 response instead of dropping to a generic 401 the SPA reads as
+/// "session expired" and loops on.
+#[allow(clippy::too_many_arguments)]
+pub async fn place_bunyip_user_with_rejection(
+    auth_service: &Arc<AuthService>,
+    tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
+    invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
+    sub: uuid::Uuid,
+    email: Option<String>,
+    email_verified: bool,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    claims: &super::oidc_rs::AtClaims,
+) -> (Option<AuthState>, Option<AppError>) {
     place_bunyip_caller(
         auth_service,
         tenants,
@@ -988,7 +1164,7 @@ async fn place_bunyip_caller(
     family_name: Option<String>,
     claims: &super::oidc_rs::AtClaims,
     resolved: Option<BunyipPrincipal>,
-) -> Option<AuthState> {
+) -> (Option<AuthState>, Option<AppError>) {
     let placement = match resolved.as_ref() {
         Some(principal) => Some(principal.placement.clone()),
         None => auth_service.find_user_placement(sub).await.ok().flatten(),
@@ -1002,6 +1178,32 @@ async fn place_bunyip_caller(
         }
         _ => None,
     };
+
+    // MAPPS-458 (PMS-728 slice 2): Bunyip is no longer an onboarding
+    // surface. A `sub` that has no existing `users` row AND no pending
+    // invitation for the presented email is rejected here; the request
+    // returns 401 upstream when `place_bunyip_user` yields `None`.
+    // Users arrive via the explicit invitations flow, not silent JIT
+    // creation. `placement.is_some()` covers every already-provisioned
+    // user (including the stuck-in-default backfill, which is a tenant
+    // rehome, not a fresh user creation).
+    //
+    // Carve-out for the platform admin (`bunyip_role = "admin"`): this
+    // is the root/owner of the Mokosh instance in the bunyip model
+    // (PMS-728 proposed approach: "the root/owner user keeps a
+    // Bunyip-backed login"). They bootstrap the first tenant, so they
+    // must be able to sign in on a fresh instance without a
+    // pre-existing invitation - matches the `bootstrap_admin_*`
+    // regression pins in `tests/bunyip_login.rs`.
+    let is_platform_admin = claims.bunyip_role.as_deref() == Some("admin");
+    if placement.is_none() && invite.is_none() && !is_platform_admin {
+        tracing::info!(
+            sub = %sub,
+            email = email.as_deref().unwrap_or("<absent>"),
+            "bunyip-authenticated identity has no local placement and no pending invitation; rejecting per MAPPS-458"
+        );
+        return (None, None);
+    }
 
     // PMS-245: a non-admin user still parked in the shared default tenant (dumped
     // there by the pre-PMS-244 funnel) is treated like a fresh user - moved to
@@ -1028,7 +1230,7 @@ async fn place_bunyip_caller(
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(error = %e, sub = %sub, "personal tenant provisioning failed");
-                    return None;
+                    return (None, None);
                 }
             },
             None => default_bunyip_tenant_id(),
@@ -1103,7 +1305,7 @@ async fn place_bunyip_caller(
                 // so a bunyip-provisioned user lands with their real name on
                 // first sight. Both are Option<String>; None falls back to
                 // `synthetic_name_from_email` inside the service.
-                auth_service
+                match auth_service
                     .upsert_user_from_oidc(
                         sub,
                         target,
@@ -1114,8 +1316,13 @@ async fn place_bunyip_caller(
                         email_verified,
                     )
                     .await
-                    .map_err(|e| tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed"))
-                    .ok()?
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::warn!(error = %e, sub = %sub, "JIT user upsert failed");
+                        return (None, None);
+                    }
+                }
             }
         },
     };
@@ -1185,7 +1392,11 @@ async fn place_bunyip_caller(
     // a revocation signal for a bunyip token.
     if let Err(e) = auth_service.ensure_principal_usable(&user).await {
         tracing::info!(error = %e, user = %user.id, tenant_id = %user.tenant_id, "rejecting bunyip principal");
-        return None;
+        // Propagate the rejection so the middleware can short-circuit with the
+        // AppError's 403 "This organization is not active" response instead of
+        // falling through to legacy + landing on a generic 401 the SPA reads
+        // as "session expired" and loops on.
+        return (None, Some(e));
     }
 
     // Mark the invite accepted now the user is placed (best-effort).
@@ -1241,17 +1452,36 @@ async fn place_bunyip_caller(
     }
 
     let tenant_id = user.tenant_id;
-    Some(AuthState::authenticated(user.to_current_user(), tenant_id))
+    (
+        Some(AuthState::authenticated(user.to_current_user(), tenant_id)),
+        None,
+    )
 }
 
 /// Translate Bunyip's system role (the `bunyip_role` claim) into mokosh's
 /// effective role on the Bunyip RS path (PMS-172, revised for the
-/// single-tenancy posture in PMS-447).
+/// single-tenancy posture in PMS-447 and again for the MAPPS-513 /
+/// MAPPS-518 auth-plane split).
 ///
 /// After PMS-447 each Mokosh tenant has exactly one user (the owner), so a
-/// signed-in Bunyip user IS the admin of their own world by construction:
-/// - `admin`      -> mokosh `super_admin` (platform-level, cross-tenant; the
-///   only role that is genuinely Bunyip-exclusive).
+/// signed-in Bunyip user IS the admin of their own world by construction.
+///
+/// MAPPS-519 (MAPPS-518 stage B follow-up): the mokosh platform
+/// super-admin persona lives in `platform_admins`, not in a `users` row.
+/// Migration 133 deletes every existing `users.role='super_admin'` row,
+/// and every previously-`RequireSuperAdmin` handler is now gated on
+/// `RequirePlatformAdmin` (a `/platform/login` bearer). This mapping
+/// used to promote a bunyip `admin` to `UserRole::SuperAdmin` on the
+/// tenant plane, which would silently re-create a super_admin `users`
+/// row on the next bunyip JIT — reopening the shared-identity data
+/// surface that migration 133 just closed if that bunyip admin shared
+/// an email with an existing tenant admin. The mapping now flattens to
+/// `Admin`: being a bunyip admin still owns the tenant, but no longer
+/// implicitly carries mokosh-platform privilege. Platform-plane
+/// privilege comes only from a `platform_admins` row.
+///
+/// - `admin`      -> mokosh `admin` (single-tenancy floor; owner of the
+///   caller's own tenant, nothing more). See the MAPPS-519 note above.
 /// - `subscriber` -> mokosh `admin` (single-tenancy floor). A stale local
 ///   `super_admin` clamps down to `admin`; anything lower than `admin`
 ///   (Technician, Manager, etc.) upgrades up to `admin`.
@@ -1264,11 +1494,16 @@ async fn place_bunyip_caller(
 fn effective_role_from_bunyip(bunyip_role: Option<&str>, local: UserRole) -> UserRole {
     match bunyip_role {
         None => local,
-        Some("admin") => UserRole::SuperAdmin,
+        // MAPPS-519: `admin` no longer promotes to `SuperAdmin`.
+        // Every branch below returns `UserRole::Admin`; the regression
+        // test at the bottom of this module pins that invariant so a
+        // future accidental flip fails a unit test rather than
+        // silently reopening the identity-share surface.
         Some(_) => {
-            // PMS-447: subscriber (or unknown future role) -> tenant admin.
-            // super_admin is Bunyip-exclusive, so a stale local super_admin
-            // clamps down to admin; anything else rises to admin.
+            // PMS-447: bunyip `admin` / `subscriber` / any unknown role
+            // -> tenant admin. A stale local `super_admin` clamps down
+            // to `admin`; anything lower than `admin` (Technician,
+            // Manager, etc.) upgrades up to `admin`.
             UserRole::Admin
         }
     }
@@ -1285,6 +1520,14 @@ fn default_bunyip_tenant_id() -> uuid::Uuid {
 /// default landing tenant into their own personal tenant. True only for a user
 /// currently in `default_tenant`, with no pending invite, who is not a platform
 /// `super_admin` (those legitimately belong to the infra/default tenant).
+///
+/// MAPPS-518: post stage B the platform super-admin persona lives in
+/// `platform_admins`, not `users`, so no `users.role = 'super_admin'`
+/// row is produced by any production code path (bootstrap + Google
+/// auto-provision both switched away). The check is retained for the
+/// integration-test fixtures that still seed a role='super_admin' row
+/// in the default tenant (`common::seed_admin`) to keep those tests
+/// stable; it is a no-op in production.
 fn is_stuck_in_default(
     current: Option<uuid::Uuid>,
     default_tenant: uuid::Uuid,
@@ -1339,6 +1582,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: String::new(),
         }
     }
 
@@ -1553,8 +1797,17 @@ mod tests {
     }
 
     #[test]
-    fn bunyip_admin_maps_to_super_admin() {
-        // A Bunyip admin is the top mokosh role regardless of the local row.
+    fn bunyip_admin_maps_to_tenant_admin() {
+        // MAPPS-519 (MAPPS-518 stage B follow-up): a Bunyip `admin` used
+        // to promote to `UserRole::SuperAdmin`, which - combined with
+        // the MAPPS-498 users<->identities mirror - re-created a
+        // super_admin `users` row on every bunyip JIT and reopened the
+        // shared-identity data surface migration 133 closed. The
+        // mapping now flattens to tenant `Admin`: the bunyip admin
+        // still owns their tenant (PMS-447 single-tenancy floor), but
+        // no longer implicitly carries mokosh-platform privilege.
+        // Platform-plane privilege comes only from a `platform_admins`
+        // row + `/platform/login`.
         for local in [
             UserRole::Technician,
             UserRole::Manager,
@@ -1563,8 +1816,47 @@ mod tests {
         ] {
             assert_eq!(
                 effective_role_from_bunyip(Some("admin"), local),
-                UserRole::SuperAdmin
+                UserRole::Admin,
+                "bunyip admin must not mint a super_admin users row \
+                 (regression from MAPPS-519)"
             );
+        }
+    }
+
+    #[test]
+    fn no_bunyip_role_ever_mints_super_admin() {
+        // MAPPS-519 belt-and-braces regression: for the full cross of
+        // known bunyip claims x known local roles, no branch of
+        // `effective_role_from_bunyip` may return `SuperAdmin`. A
+        // future accidental flip (a new bunyip role, a copy-paste of
+        // the old mapping) is caught by this test rather than
+        // silently reopening the shared-identity data surface in
+        // production.
+        //
+        // The `None` branch is deliberately excluded here because it
+        // preserves the local row verbatim for back-compat with the
+        // legacy HS256 / standalone paths; a caller with an existing
+        // `local = SuperAdmin` still needs to see it come back
+        // unchanged there. Migration 133 already deletes those rows
+        // in prod, so no live caller exercises that combination.
+        for claim in ["admin", "subscriber", "owner", "member", "guest", ""] {
+            for local in [
+                UserRole::Technician,
+                UserRole::Dispatcher,
+                UserRole::Sales,
+                UserRole::Finance,
+                UserRole::Manager,
+                UserRole::Admin,
+                UserRole::SuperAdmin,
+            ] {
+                let effective = effective_role_from_bunyip(Some(claim), local);
+                assert_ne!(
+                    effective,
+                    UserRole::SuperAdmin,
+                    "bunyip_role={claim:?} local={local:?} must not \
+                     promote to SuperAdmin (regression from MAPPS-519)"
+                );
+            }
         }
     }
 

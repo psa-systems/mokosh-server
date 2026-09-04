@@ -57,8 +57,14 @@ pub struct Tenant {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Tenant branding configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Tenant branding configuration.
+///
+/// The full set of brand-controllable fields for a tenant. Consumed by the
+/// contact portal, painted by `AuthLayout` + the CSS-custom-property pipeline
+/// on the SPA (MAPPS-621). Per-Company overrides live in
+/// [`crate::contacts::CompanyBranding`] with EXACTLY the same shape so
+/// [`EffectiveBranding`] can merge the two field-by-field.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TenantBranding {
     pub logo_url: Option<String>,
     /// MAPPS-429: content type of the stored logo, so the public serving route
@@ -66,8 +72,21 @@ pub struct TenantBranding {
     /// encoding the format into the filename.
     pub logo_mime: Option<String>,
     pub favicon_url: Option<String>,
+    /// MAPPS-617: mime alongside `favicon_url`, same reason as `logo_mime`.
+    pub favicon_mime: Option<String>,
     pub primary_color: Option<String>,
     pub secondary_color: Option<String>,
+    /// MAPPS-617: solid-color background for the portal (`#RRGGBB` or
+    /// `#RRGGBBAA`). Set alongside `background_url` at most one at a time; the
+    /// SPA prefers `background_url` when both are present.
+    pub background_color: Option<String>,
+    /// MAPPS-617: server-served path to a background image (analogous to
+    /// `logo_url`). Uploaded via the multipart route prompt 002 introduces.
+    pub background_url: Option<String>,
+    pub background_mime: Option<String>,
+    /// MAPPS-617: portal wordmark (replaces the hardcoded "Mokosh Platform"
+    /// string in `AuthLayout`). Painters prefer this over `company_name`.
+    pub display_name: Option<String>,
     pub company_name: Option<String>,
     pub support_email: Option<String>,
     pub support_phone: Option<String>,
@@ -126,6 +145,33 @@ pub struct OrganizationProfileRequest {
     pub website: Option<String>,
 }
 
+/// The merged brand a caller sees. Field-by-field
+/// `company.field.or(tenant.field)` (see
+/// [`crate::branding::effective_branding`]), so every non-`None` Company
+/// override wins over the tenant default. Missing on both sides stays
+/// `None`; the SPA supplies the coded fallback.
+///
+/// Same shape as [`TenantBranding`] on purpose: the wire boundary is a keys
+/// union, not a differently-shaped type.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct EffectiveBranding {
+    pub logo_url: Option<String>,
+    pub logo_mime: Option<String>,
+    pub favicon_url: Option<String>,
+    pub favicon_mime: Option<String>,
+    pub primary_color: Option<String>,
+    pub secondary_color: Option<String>,
+    pub background_color: Option<String>,
+    pub background_url: Option<String>,
+    pub background_mime: Option<String>,
+    pub display_name: Option<String>,
+    pub company_name: Option<String>,
+    pub support_email: Option<String>,
+    pub support_phone: Option<String>,
+    pub support_contact_name: Option<String>,
+    pub portal_domain: Option<String>,
+}
+
 /// Create tenant request
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateTenantRequest {
@@ -142,6 +188,14 @@ pub struct CreateTenantRequest {
     pub admin_email: String,
     pub admin_first_name: String,
     pub admin_last_name: String,
+    /// MAPPS-396: optional branding at creation time so the SPA can
+    /// set the logo, primary color, and support email in a single
+    /// round-trip rather than a create-then-update pair. When omitted
+    /// (`None`) the tenant lands with the empty-object default and the
+    /// portal renders the generic wordmark, matching pre-MAPPS-396
+    /// behavior.
+    #[serde(default)]
+    pub branding: Option<TenantBranding>,
 }
 
 /// Update tenant request
@@ -149,6 +203,15 @@ pub struct CreateTenantRequest {
 pub struct UpdateTenantRequest {
     #[validate(length(min = 1, max = 255))]
     pub name: Option<String>,
+    /// MAPPS-449: renames the tenant's portal subdomain.
+    /// [`crate::modules::tenants::TenantService::update_tenant`] runs the
+    /// same `slugify()` normalisation `create_tenant` uses and re-checks
+    /// uniqueness against every OTHER tenant. Immediate-404 policy on the
+    /// old slug: no aliasing, no redirect. Pending contact-portal invites
+    /// carrying the old slug in their setup link break loudly; the SPA
+    /// surfaces a warning banner so the super-admin knows to re-send them.
+    #[validate(length(min = 1, max = 100))]
+    pub slug: Option<String>,
     #[validate(email)]
     pub billing_email: Option<String>,
     pub billing_contact_name: Option<String>,
@@ -165,6 +228,39 @@ pub struct UpdateTenantRequest {
     /// the service merges them (`branding || $n`). A key set to null still
     /// clears, which is how a contact field is emptied.
     pub branding: Option<serde_json::Value>,
+}
+
+/// MAPPS-450: request body for `PUT /api/v1/tenants/{id}/admin`.
+///
+/// Every field is optional so the caller sends only what changed; the
+/// server rejects an empty PATCH so a stray click cannot audit-write a
+/// no-op update. `resend_welcome` piggybacks on the same call so the
+/// email-changed common case is a single round-trip; the server ignores
+/// it when the admin has already redeemed (status != 'pending').
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateTenantAdminRequest {
+    #[validate(email)]
+    pub email: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    #[serde(default)]
+    pub resend_welcome: bool,
+}
+
+/// MAPPS-450: view of the tenant's admin `users` row that the tenant
+/// management modal renders. Returned from `GET /tenants/{id}/admin` and
+/// from the PUT above. `status` is the raw column so the SPA can gate
+/// the email-editable UI on `pending` vs `active`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantAdminInfo {
+    pub user_id: Uuid,
+    pub email: String,
+    pub first_name: String,
+    pub last_name: String,
+    /// Raw `users.status` column value: `pending`, `active`, `suspended`,
+    /// etc. Only `pending` allows super-admin email edits and welcome
+    /// re-sends.
+    pub status: String,
 }
 
 /// Tenant response for API

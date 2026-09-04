@@ -156,6 +156,23 @@ impl std::fmt::Display for AuthRequired {
 
 impl std::error::Error for AuthRequired {}
 
+/// MAPPS-491 (MAPPS-474 phase 2): one active seat an identity holds in a tenant.
+///
+/// Returned by `GET /api/v1/auth/memberships` and populated on `AuthState`
+/// so extractors can inspect the caller's full membership set without a
+/// second round-trip. Client redefines the same shape locally in
+/// `mokosh-apps/src/hooks/auth.rs` until phase 3 consolidates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MembershipView {
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+    pub tenant_slug: String,
+    pub tenant_kind: String,
+    pub role: String,
+    pub status: String,
+    pub is_active: bool,
+}
+
 /// Current authenticated user state
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuthState {
@@ -173,6 +190,23 @@ pub struct AuthState {
     /// still deserializes a pre-348 payload.
     #[serde(default)]
     pub deleted: bool,
+    /// MAPPS-491 (phase 2): identities.id for the authenticated caller,
+    /// resolved from the loaded user's email at middleware time. Distinct
+    /// from `user.id` (per-tenant projection) when an email is shared
+    /// across tenants (backfill collapsed both users rows to one identity).
+    /// `#[serde(default)]` keeps legacy wire shape compatible.
+    #[serde(default)]
+    pub identity_id: Option<Uuid>,
+    /// MAPPS-491 (phase 2): tenant_memberships.id the current session
+    /// is scoped to. Sourced from `JwtClaims.mid` when present, otherwise
+    /// resolved from `(identity_id, tenant_id)`. Phase 5 uses this to
+    /// power the switcher; phase 3 does not depend on it.
+    #[serde(default)]
+    pub active_membership_id: Option<Uuid>,
+    /// MAPPS-491 (phase 2): every active membership the identity holds.
+    /// Powers `GET /api/v1/auth/memberships` and phase 3's tenant picker.
+    #[serde(default)]
+    pub memberships: Vec<MembershipView>,
 }
 
 impl AuthState {
@@ -183,6 +217,9 @@ impl AuthState {
             user: Some(user),
             tenant_id: Some(tenant_id),
             deleted: false,
+            identity_id: None,
+            active_membership_id: None,
+            memberships: Vec::new(),
         }
     }
 
@@ -197,6 +234,9 @@ impl AuthState {
             user: None,
             tenant_id: None,
             deleted: true,
+            identity_id: None,
+            active_membership_id: None,
+            memberships: Vec::new(),
         }
     }
 
@@ -263,6 +303,16 @@ pub struct CurrentUser {
     /// `None` keeps old responses / fixtures deserialising cleanly.
     #[serde(default)]
     pub own_company_id: Option<Uuid>,
+    /// PMS-791 / MAPPS-462: the owning tenant's `kind` column, one of
+    /// `"org"` or `"personal"`. Threaded onto the session bootstrap so
+    /// the SPA can gate org-only features (Teams nav, invitation flows)
+    /// without a second round-trip. `#[serde(default)]` keeps the wire
+    /// backward-compatible: an older server that omits the field
+    /// deserialises to `""`, and the SPA's `is_org_tenant()` helper
+    /// defaults to `true` on empty (safe: the server-side authorization
+    /// still gates the actual endpoints).
+    #[serde(default)]
+    pub tenant_kind: String,
 }
 
 impl CurrentUser {
@@ -342,6 +392,11 @@ pub struct User {
     /// user-load queries. See [`CurrentUser::own_company_id`].
     #[serde(default)]
     pub own_company_id: Option<Uuid>,
+    /// PMS-791 / MAPPS-462: the owning tenant's `kind` column, populated by
+    /// the same correlated-subquery pattern as `own_company_id` above. See
+    /// [`CurrentUser::tenant_kind`].
+    #[serde(default)]
+    pub tenant_kind: String,
 }
 
 impl User {
@@ -361,6 +416,7 @@ impl User {
             theme_base_mode: self.theme_base_mode.clone(),
             theme_accent_id: self.theme_accent_id.clone(),
             own_company_id: self.own_company_id,
+            tenant_kind: self.tenant_kind.clone(),
         }
     }
 }
@@ -401,6 +457,15 @@ pub struct LoginRequest {
     /// `00000000-0000-0000-0000-000000000001`. PMS-138.
     #[serde(default)]
     pub tenant_id: Option<Uuid>,
+    /// MAPPS-396: alternative to `tenant_id` for the standalone SPA
+    /// login form, where the operator types the tenant slug (e.g.
+    /// `acme`) rather than a UUID. The server resolves the slug against
+    /// `tenants.slug WHERE status = 'active'` before running the
+    /// email/password lookup; when both are supplied `tenant_id` wins
+    /// so a host-derived hint is not silently overridden by a
+    /// mistyped slug field.
+    #[serde(default)]
+    pub tenant_slug: Option<String>,
 }
 
 /// Login response
@@ -422,6 +487,83 @@ pub struct LoginResponse {
     /// login with `approval_code` to complete it.
     #[serde(default)]
     pub approval_required: bool,
+    /// MAPPS-492 (MAPPS-474 phase 3): the identity authenticated but
+    /// holds MORE THAN ONE active membership. Client renders the tenant
+    /// picker, then POSTs `/auth/select-tenant` with `identity_token` +
+    /// the chosen `tenant_id` to complete the login. Tokens are empty
+    /// and `user` is None on this branch, mirroring the mfa/approval
+    /// shape. Emitted on every response so the client sees an explicit
+    /// boolean rather than `undefined`; the field is new but adding a
+    /// key with a `false` default is backward-compatible.
+    #[serde(default)]
+    pub needs_selection: bool,
+    /// MAPPS-492 (phase 3): the identity authenticated but holds ZERO
+    /// active memberships. Client routes to the "create your
+    /// organization" landing (phase 4 wires the self-serve create-org
+    /// form). Tokens are empty and `user` is None on this branch too.
+    #[serde(default)]
+    pub needs_setup: bool,
+    /// MAPPS-492 (phase 3): short-lived JWT (typ="identity", 5 min TTL)
+    /// scoped to the identity only. Present ONLY on `needs_selection`
+    /// and `needs_setup` branches. Unusable as a bearer for the
+    /// general API; `auth_middleware` accepts only `typ="access"`.
+    /// Client stores it in-memory, submits it to
+    /// `/auth/select-tenant` or `/tenants` (phase 4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_token: Option<String>,
+    /// MAPPS-492 (phase 3): the identity's active memberships when
+    /// `needs_selection` is true. Empty on every other branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memberships: Option<Vec<MembershipView>>,
+}
+
+/// MAPPS-492 (MAPPS-474 phase 3): request body for
+/// `POST /api/v1/auth/select-tenant`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct SelectTenantRequest {
+    /// The short-lived JWT returned in `LoginResponse.identity_token`
+    /// when the identity-first login branch resolved to
+    /// `needs_selection`.
+    #[validate(length(min = 1, message = "identity_token is required"))]
+    pub identity_token: String,
+    /// The tenant the caller picked from their membership list.
+    pub tenant_id: Uuid,
+}
+
+/// MAPPS-493 (MAPPS-474 phase 4): request body for
+/// `POST /api/v1/tenants/self-serve`. Called by the SPA `needs_setup`
+/// panel to trade an identity_token for a new organization + a full
+/// session scoped to it.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct SelfServeTenantRequest {
+    /// The short-lived JWT returned in `LoginResponse.identity_token`
+    /// when the identity-first login branch resolved to `needs_setup`.
+    #[validate(length(min = 1, message = "identity_token is required"))]
+    pub identity_token: String,
+    /// Display name for the new organization.
+    #[validate(length(min = 1, max = 100, message = "Name must be 1-100 characters"))]
+    pub tenant_name: String,
+    /// URL-safe slug for the tenant's client portal. Optional: server
+    /// derives one from the name when omitted.
+    #[serde(default)]
+    #[validate(length(max = 64, message = "Slug must be 64 characters or fewer"))]
+    pub tenant_slug: Option<String>,
+}
+
+/// MAPPS-494 (MAPPS-474 phase 5): request body for
+/// `POST /api/v1/tenants/additional`. Called by the in-app "Create new
+/// organization" switcher item when the caller is already authenticated;
+/// no identity_token needed because a bearer session is required.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct AdditionalTenantRequest {
+    /// Display name for the new organization.
+    #[validate(length(min = 1, max = 100, message = "Name must be 1-100 characters"))]
+    pub tenant_name: String,
+    /// URL-safe slug for the tenant's client portal. Optional: server
+    /// derives one from the name when omitted.
+    #[serde(default)]
+    #[validate(length(max = 64, message = "Slug must be 64 characters or fewer"))]
+    pub tenant_slug: Option<String>,
 }
 
 /// Refresh token request
@@ -615,6 +757,28 @@ pub struct UpdateUserRequest {
     pub login_location_alerts: Option<bool>,
 }
 
+/// Request body for `POST /api/v1/auth/me/complete-onboarding`.
+///
+/// The forced-onboarding screen collects `first_name` + `last_name` for a
+/// user whose bunyip claims did not carry them (the JIT insert stamps
+/// synthetic names derived from the email local-part when the claims are
+/// absent). Both fields are optional here so a caller that only needs to
+/// flip `profile_completed_at` (e.g. a user whose names were already set
+/// on a subsequent bunyip login) can POST an empty body.
+///
+/// Names are written ONLY on first completion (server guards with a
+/// `WHERE profile_completed_at IS NULL` clause): a replay after the row
+/// already carries a real bunyip-refreshed name must not overwrite it.
+/// PMS-512 keeps bunyip as the identity source of truth for names on
+/// the OIDC path; this endpoint is the standalone bootstrap fallback.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct CompleteOnboardingRequest {
+    #[validate(length(min = 1, max = 100, message = "First name must be 1-100 characters"))]
+    pub first_name: Option<String>,
+    #[validate(length(min = 1, max = 100, message = "Last name must be 1-100 characters"))]
+    pub last_name: Option<String>,
+}
+
 /// User list filter parameters. Parsed from the query string on
 /// `GET /api/v1/auth/users`. `q` matches `email`, `first_name`,
 /// and `last_name` via case-insensitive substring; capped at 200
@@ -688,6 +852,14 @@ pub struct UserResponse {
     /// See [`CurrentUser::own_company_id`].
     #[serde(default)]
     pub own_company_id: Option<Uuid>,
+    /// MAPPS-495 (MAPPS-476 fix): the owning tenant's `kind` ('org' or
+    /// 'personal'). Serialised on `/auth/me` so the SPA can gate
+    /// org-only features (Teams nav, invitation-to-team flow) without a
+    /// second round-trip. Was added to [`CurrentUser`] in PMS-791 phase
+    /// 1.5 (MAPPS-462) but never propagated onto `UserResponse`, which
+    /// is what `/auth/me` actually returns; that oversight was MAPPS-476.
+    #[serde(default)]
+    pub tenant_kind: String,
 }
 
 impl From<User> for UserResponse {
@@ -713,6 +885,7 @@ impl From<User> for UserResponse {
             created_at: user.created_at,
             profile_completed: user.profile_completed_at.is_some(),
             own_company_id: user.own_company_id,
+            tenant_kind: user.tenant_kind,
         }
     }
 }
@@ -813,6 +986,13 @@ pub struct JwtClaims {
     pub typ: String,
     /// Session ID
     pub sid: Uuid,
+    /// MAPPS-491 (MAPPS-474 phase 2): active `tenant_memberships.id`
+    /// for the session's tenant scope. Optional so legacy tokens
+    /// minted before phase 2 still decode (`serde(default)` returns
+    /// `None`); on verify the middleware falls back to a repo lookup
+    /// by `(identity_id, tenant_id)` when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -929,6 +1109,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
         let tenant_id = user.tenant_id;
 
@@ -954,6 +1135,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
         let tenant_id = user.tenant_id;
         let state = AuthState::authenticated(user, tenant_id);
@@ -979,6 +1161,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
 
         assert_eq!(user.full_name(), "John Doe");
@@ -1000,6 +1183,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
 
         assert_eq!(user.initials(), "JD");
@@ -1024,6 +1208,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);
@@ -1049,6 +1234,7 @@ mod tests {
             theme_base_mode: None,
             theme_accent_id: None,
             own_company_id: None,
+            tenant_kind: "org".to_string(),
         };
         let tenant_id = user.tenant_id;
         let auth_state = AuthState::authenticated(user, tenant_id);

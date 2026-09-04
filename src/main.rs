@@ -92,6 +92,16 @@ pub struct AppConfig {
     /// PMS-658: opt-in switch for the suspicious-login notify-and-approve gate
     /// (`LOGIN_APPROVAL_ENABLED`). Off by default.
     pub login_approval_enabled: bool,
+    /// MAPPS-457: instance-wide hard cap on how many tenants a super-admin can
+    /// create. Unset (or `<=0`) leaves creation uncapped, matching production
+    /// today. Positive integer rejects further `create_tenant` calls with 409
+    /// once `SELECT COUNT(*) FROM tenants` reaches the value.
+    ///
+    /// Set via `MOKOSH_MAX_TENANTS`. Bumped without a code change so an
+    /// operator can raise the ceiling on the running instance and see the
+    /// effect on the next create call (no restart needed for lowering /
+    /// raising - re-read at each create request).
+    pub max_tenants: Option<usize>,
     /// PMS-902 / PMS-904: whether this instance owns its platform identities
     /// (`self-hosted`, the default) or federates them to Bunyip SSO (`saas`).
     /// Read from `MOKOSH_DEPLOYMENT_MODE`; see [`DeploymentMode`].
@@ -301,6 +311,15 @@ impl AppConfig {
             login_approval_enabled: std::env::var("LOGIN_APPROVAL_ENABLED")
                 .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
+            // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS. Empty,
+            // unset, unparseable, or non-positive -> None (uncapped). Positive
+            // usize -> Some(N). The value is threaded into `TenantService` via
+            // its builder so the service layer probes `COUNT(*)` before
+            // insert.
+            max_tenants: std::env::var("MOKOSH_MAX_TENANTS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0),
             // PMS-902: self-hosted (default) or saas. Unset and unrecognised
             // both resolve to self-hosted, so a typo cannot silently stop a
             // self-hosted deployment's account email.
@@ -649,6 +668,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduled_dashboards_worker,
         std::time::Duration::from_secs(60),
     );
+    // mokosh-contact-login: portal_export_worker retired with the
+    // /portal/* customer-portal surface. The contact plane replaces
+    // it in prompt 004+; export gets rebuilt if the operator still
+    // needs it on the contact side.
 
     // PMS-960: one-shot in effect. A KB attachment used to be stored at a
     // flat `kb-articles/{id}` with no tenant in the path; it is now under
@@ -738,6 +761,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.login_approval_enabled,
         config.abuse_contact_email,
         config.public_api_base_url,
+        config.max_tenants,
         config.deployment_mode,
         secrets.clone(),
     );

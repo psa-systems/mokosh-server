@@ -13,15 +13,17 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest, CreateApiKeyRequest,
-    CreateApiKeyResponse, CreateUserRequest, ForgotPasswordRequest, ListUsersFilter, LoginRequest,
-    MfaDisableRequest, MfaEnableRequest, MfaEnableResponse, MfaSetupResponse, RefreshTokenRequest,
-    RefreshTokenResponse, ResetPasswordRequest, SessionInfo, UpdateUserRequest, UserResponse,
+    rate_limit, ApiKeyResponse, AuthService, ChangePasswordRequest, CompleteOnboardingRequest,
+    CreateApiKeyRequest, CreateApiKeyResponse, CreateUserRequest, ForgotPasswordRequest,
+    ListUsersFilter, LoginRequest, MfaDisableRequest, MfaEnableRequest, MfaEnableResponse,
+    MfaSetupResponse, RefreshTokenRequest, RefreshTokenResponse, ResetPasswordRequest, SessionInfo,
+    UpdateUserRequest, UserResponse,
 };
-use crate::modules::auth::middleware::{RequireAuth, RequireManager};
+use crate::modules::auth::middleware::{RequireAuth, RequireAuthState, RequireManager};
 use crate::modules::auth::TenantScoped;
 use crate::utils::error::{rate_limited_response, AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
+use mokosh_types::auth::MembershipView;
 
 /// Application state for auth routes
 #[derive(Clone)]
@@ -69,6 +71,15 @@ pub fn auth_routes(auth_service: AuthService) -> Router {
         // of the handler (see `login` below) so the limiter can key on
         // `(ip, email)` not just `ip`.
         .route("/login", post(login))
+        // MAPPS-492 (MAPPS-474 phase 3): completes a `needs_selection`
+        // login by trading the short-lived identity_token + a chosen
+        // tenant_id for a full scoped session.
+        .route("/select-tenant", post(select_tenant))
+        // MAPPS-494 (MAPPS-474 phase 5): switch the current session to
+        // another tenant the identity holds a membership in. Bearer
+        // required; the switch re-mints access + refresh tokens with the
+        // new tid + mid so subsequent requests scope to the picked tenant.
+        .route("/switch-tenant/{tenant_id}", post(switch_tenant))
         .route("/logout", post(logout))
         // PMS-880: sign out everywhere. Authenticated like the protected
         // routes below (it needs the caller's identity), grouped here with its
@@ -77,11 +88,24 @@ pub fn auth_routes(auth_service: AuthService) -> Router {
         .route("/refresh", post(refresh_token))
         .route("/forgot-password", post(forgot_password))
         .route("/reset-password", post(reset_password))
+        // MAPPS-552: SetPasswordPage reads this on mount to render
+        // "Set your password for [Client Name]" instead of a generic
+        // heading. Public (token IS the credential). 404 on unknown /
+        // expired token so an attacker cannot enumerate valid tokens
+        // via this surface.
+        .route(
+            "/set-password/context/{token}",
+            axum::routing::get(set_password_context),
+        )
         // PMS-837: no `/google` mounts. The popup sign-in flow was retired as
         // unconsumed; see the module doc in `mod.rs`.
         // Protected routes
         .route("/me", get(get_current_user))
         .route("/me", put(update_current_user))
+        // MAPPS-491 (MAPPS-474 phase 2): every active membership the
+        // authenticated identity holds. Populated by the middleware so
+        // the handler is a projection over `AuthState.memberships`.
+        .route("/memberships", get(list_my_memberships))
         // PMS-752: let the onboarding screen finish. See the handler.
         .route("/me/complete-onboarding", post(complete_onboarding))
         .route("/me/password", put(change_password))
@@ -143,26 +167,134 @@ async fn login(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let response = match state
-        .auth_service
-        .login(&request, ip_address, user_agent)
-        .await
-    {
-        Ok(response) => response,
-        // PMS-773: the persistent second-factor lockout knows exactly when it
-        // lifts, so it answers with the same Retry-After contract as the
-        // limiter above instead of a bare 429.
-        Err(AppError::RateLimited {
-            retry_after_seconds: Some(retry_after),
-        }) => {
-            return Ok(rate_limited_response(
-                retry_after,
-                "Too many failed verification codes, please try again later",
-            ))
+    // MAPPS-492 (MAPPS-474 phase 3): identity-first branch. When the
+    // caller still has NO tenant hint after the MAPPS-473 host
+    // derivation ran, drop into the email-only login flow: the server
+    // resolves the identity by email + password, then either
+    // auto-scopes (single membership), returns a picker
+    // (`needs_selection`), or returns setup (`needs_setup`). Callers
+    // that DO supply a tenant hint (existing tests, MAPPS-473
+    // auto-resolved hosts, dev slug typing) keep taking the
+    // tenant-scoped `AuthService::login` path unchanged.
+    let has_tenant_hint = request.tenant_id.is_some()
+        || !request
+            .tenant_slug
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty();
+    let response = if has_tenant_hint {
+        match state
+            .auth_service
+            .login(&request, ip_address, user_agent)
+            .await
+        {
+            Ok(response) => response,
+            // PMS-773: the persistent second-factor lockout knows exactly when it
+            // lifts, so it answers with the same Retry-After contract as the
+            // limiter above instead of a bare 429.
+            Err(AppError::RateLimited {
+                retry_after_seconds: Some(retry_after),
+            }) => {
+                return Ok(rate_limited_response(
+                    retry_after,
+                    "Too many failed verification codes, please try again later",
+                ))
+            }
+            Err(other) => return Err(other),
         }
-        Err(other) => return Err(other),
+    } else {
+        state
+            .auth_service
+            .authenticate_identity_first(&request, ip_address, user_agent)
+            .await?
     };
 
+    Ok(Json(response).into_response())
+}
+
+/// MAPPS-492 (MAPPS-474 phase 3): finish a `needs_selection` login.
+/// Consumes an identity token minted by the login handler above and
+/// returns a full scoped session for the caller-chosen tenant.
+async fn select_tenant(
+    State(state): State<AuthRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<mokosh_types::auth::SelectTenantRequest>,
+) -> Result<Response, AppError> {
+    request.validate()?;
+
+    let ip_address = Some(
+        crate::utils::client_ip::extract_client_ip(
+            addr.ip(),
+            &headers,
+            crate::utils::client_ip::trusted_proxies(),
+        )
+        .to_string(),
+    );
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let response = state
+        .auth_service
+        .select_tenant_for_identity(
+            &request.identity_token,
+            request.tenant_id,
+            ip_address,
+            user_agent,
+        )
+        .await?;
+    Ok(Json(response).into_response())
+}
+
+/// MAPPS-494 (MAPPS-474 phase 5): switch the caller's active session to
+/// a different tenant they hold a membership in. Verifies membership
+/// from the pre-populated `AuthState.memberships` (phase-2 enrich pass),
+/// then delegates to the shared `mint_session_for_membership` primitive.
+///
+/// Returns the same `LoginResponse` shape as the login handler so the
+/// client's install_session path handles the response unchanged.
+async fn switch_tenant(
+    State(state): State<AuthRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    RequireAuthState(auth_state): RequireAuthState,
+    axum::extract::Path(target_tenant_id): axum::extract::Path<Uuid>,
+) -> Result<Response, AppError> {
+    // Verify the caller holds an ACTIVE membership in the target tenant.
+    // Reading from AuthState instead of re-querying the DB: the enrich
+    // pass in `auth_middleware` already populated `memberships` for us.
+    let has_membership = auth_state
+        .memberships
+        .iter()
+        .any(|m| m.tenant_id == target_tenant_id && m.status == "active");
+    if !has_membership {
+        return Err(AppError::NotFound(
+            "No active membership in the requested tenant".to_string(),
+        ));
+    }
+
+    let caller = auth_state.user.as_ref().ok_or(AppError::Unauthorized)?;
+
+    let ip_address = Some(
+        crate::utils::client_ip::extract_client_ip(
+            addr.ip(),
+            &headers,
+            crate::utils::client_ip::trusted_proxies(),
+        )
+        .to_string(),
+    );
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let response = state
+        .auth_service
+        .mint_session_for_membership(target_tenant_id, &caller.email, ip_address, user_agent)
+        .await?;
     Ok(Json(response).into_response())
 }
 
@@ -338,6 +470,28 @@ async fn reset_password(
     Ok(())
 }
 
+/// MAPPS-552: return the tenant name + slug for the client-admin
+/// welcome flow so the SPA's `SetPasswordPage` can render a heading
+/// like "Set your password for Acme Co". Token IS the credential -
+/// no auth extractor. 404 for any invalid / expired / redeemed token
+/// so the shape does not enumerate valid tokens to an attacker.
+#[derive(serde::Serialize)]
+struct SetPasswordContext {
+    tenant_name: String,
+    tenant_slug: String,
+}
+
+async fn set_password_context(
+    State(state): State<AuthRouterState>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> AppResult<Json<SetPasswordContext>> {
+    let (tenant_name, tenant_slug) = state.auth_service.set_password_context(&token).await?;
+    Ok(Json(SetPasswordContext {
+        tenant_name,
+        tenant_slug,
+    }))
+}
+
 /// Get current user endpoint
 async fn get_current_user(
     State(state): State<AuthRouterState>,
@@ -348,6 +502,17 @@ async fn get_current_user(
         .get_user_by_id(user.tenant_id, user.id)
         .await?;
     Ok(Json(full_user.into()))
+}
+
+/// MAPPS-491 (MAPPS-474 phase 2): every active membership the caller
+/// holds. Populated by the middleware, so this is a projection over
+/// `AuthState.memberships`; no query runs in the handler. Client's
+/// `use_memberships_loader` (mokosh-apps/src/hooks/auth.rs:299)
+/// calls this endpoint on login and on switcher open.
+async fn list_my_memberships(
+    RequireAuthState(state): RequireAuthState,
+) -> AppResult<Json<Vec<MembershipView>>> {
+    Ok(Json(state.memberships))
 }
 
 /// Update current user endpoint
@@ -388,10 +553,27 @@ async fn update_current_user(
 async fn complete_onboarding(
     State(state): State<AuthRouterState>,
     RequireAuth(user): RequireAuth,
+    body: Option<Json<CompleteOnboardingRequest>>,
 ) -> AppResult<Json<UserResponse>> {
+    // Body is optional so a client that only needs to stamp the
+    // timestamp can POST with no body (empty payload rejected by
+    // Axum's Json extractor would 415 the caller; falling through to
+    // an Option lets the empty case be graceful).
+    let (first_name, last_name) = match body {
+        Some(Json(req)) => {
+            req.validate()?;
+            (req.first_name, req.last_name)
+        }
+        None => (None, None),
+    };
     let updated = state
         .auth_service
-        .mark_profile_completed(user.tenant_id, user.id)
+        .mark_profile_completed(
+            user.tenant_id,
+            user.id,
+            first_name.as_deref(),
+            last_name.as_deref(),
+        )
         .await?;
     Ok(Json(updated.into()))
 }

@@ -542,8 +542,48 @@ pub struct Company {
     pub notes: Option<String>,
     pub logo_url: Option<String>,
     pub portal_enabled: bool,
+    /// MAPPS-635 B: the 9-digit numeric Portal ID (`companies.portal_id`,
+    /// MAPPS-589 / PMS-928) if one has been assigned. `None` until a
+    /// portal-access grant lands.
+    pub portal_id: Option<i64>,
+    /// MAPPS-635 B: the legacy 16-char Crockford portal slug. Kept
+    /// during the Portal-ID transition (see prompt 011). `None` until
+    /// a grant assigns one.
+    pub portal_slug: Option<String>,
+    /// MAPPS-617: per-Company branding overrides. See
+    /// [`crate::tenants::TenantBranding`] and
+    /// [`crate::tenants::EffectiveBranding`]: the resolver merges the
+    /// tenant's brand with these overrides field-by-field, Company keys
+    /// winning where set. Empty on rows created before the branding
+    /// feature landed (migration ships `NOT NULL DEFAULT '{}'`).
+    #[serde(default)]
+    pub branding: CompanyBranding,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Per-Company branding overrides. Same field shape as
+/// [`crate::tenants::TenantBranding`] so the two merge cleanly through
+/// [`crate::tenants::EffectiveBranding`]; every non-`None` field on the
+/// Company wins over the tenant default. Missing on both sides stays
+/// `None`; the SPA supplies the coded fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CompanyBranding {
+    pub logo_url: Option<String>,
+    pub logo_mime: Option<String>,
+    pub favicon_url: Option<String>,
+    pub favicon_mime: Option<String>,
+    pub primary_color: Option<String>,
+    pub secondary_color: Option<String>,
+    pub background_color: Option<String>,
+    pub background_url: Option<String>,
+    pub background_mime: Option<String>,
+    pub display_name: Option<String>,
+    pub company_name: Option<String>,
+    pub support_email: Option<String>,
+    pub support_phone: Option<String>,
+    pub support_contact_name: Option<String>,
+    pub portal_domain: Option<String>,
 }
 
 /// Create company request
@@ -633,6 +673,15 @@ pub struct UpdateCompanyRequest {
     #[validate(custom(function = "validate_text_no_nul"))]
     pub notes: Option<String>,
     pub portal_enabled: Option<bool>,
+    /// MAPPS-618: per-Company branding overrides. Same wire shape as
+    /// `UpdateTenantRequest.branding` (PMS-758): a JSONB object of the
+    /// subset the caller owns. `None` leaves the row's branding
+    /// untouched; a present object is JSONB-merged into the existing
+    /// row via `||`, so a caller clears a specific key by sending it
+    /// as an explicit `null` and leaves other keys alone by omitting
+    /// them. Type-checked at the read side by
+    /// [`CompanyBranding`]'s serde derives.
+    pub branding: Option<serde_json::Value>,
 }
 
 /// Company response for API
@@ -665,6 +714,25 @@ pub struct CompanyResponse {
     /// a value could be stored and never read back.
     pub notes: Option<String>,
     pub portal_enabled: bool,
+    /// MAPPS-635 B: the Company's 9-digit numeric Portal ID (PMS-928)
+    /// and its legacy Crockford slug. Both sit on the `companies` row
+    /// but were dropped from this DTO, so staff had no way to look up
+    /// a Company's portal URL after the original grant email was
+    /// filed away. Surfacing them here lets the Portal Access card
+    /// render "Portal ID: X" + a "Copy portal link" affordance in
+    /// every state (not only in the response to a fresh grant).
+    /// `None` when portal access has never been enabled for the
+    /// Company: the CHECK constraint on `portal_id` fires when we
+    /// write it and the slug is written from the same code path.
+    pub portal_id: Option<i64>,
+    pub portal_slug: Option<String>,
+    /// MAPPS-618 read-side fix: the per-Company branding overrides
+    /// need to round-trip on both GET and the PUT-response so the
+    /// SPA's editor initialises with the current values (instead of
+    /// re-showing an empty form after every save). Previously the DB
+    /// persisted the block but the wire response dropped it,
+    /// leaving the editor looking like nothing had saved.
+    pub branding: CompanyBranding,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -692,6 +760,9 @@ impl From<Company> for CompanyResponse {
             tags: c.tags,
             notes: c.notes,
             portal_enabled: c.portal_enabled,
+            portal_id: c.portal_id,
+            portal_slug: c.portal_slug,
+            branding: c.branding,
             created_at: c.created_at,
             updated_at: c.updated_at,
         }

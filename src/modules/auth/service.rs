@@ -698,12 +698,45 @@ impl AuthService {
         let audit_ip = ip_address.clone();
         let audit_ua = user_agent.clone();
 
-        // PMS-138: bind the lookup to (tenant_id, email), falling
-        // back to the default tenant when the SPA didn't supply a
-        // hint. Replaces the prior email-only lookup with
-        // `ORDER BY created_at ASC LIMIT 1` tiebreaker that silently
-        // routed multi-tenant collisions to the wrong account.
-        let tenant_id = Self::resolve_tenant_for_login(request.tenant_id);
+        // PMS-138: bind the lookup to (tenant_id, email). Replaces
+        // the prior email-only lookup with `ORDER BY created_at ASC
+        // LIMIT 1` tiebreaker that silently routed multi-tenant
+        // collisions to the wrong account.
+        //
+        // MAPPS-396: the standalone login form types a tenant slug
+        // (e.g. `acme`) rather than a UUID, so the request may carry
+        // `tenant_slug` instead of `tenant_id`. Resolve the slug here
+        // to the same `tenant_id` shape the downstream lookup already
+        // expects. When both are set `tenant_id` wins so a
+        // host-derived hint is not silently overridden by a mistyped
+        // slug. Falls closed (401) on an unknown or suspended slug so
+        // the endpoint cannot enumerate valid tenants.
+        //
+        // PMS-728 AC1: the local password path now REJECTS a
+        // credential presented without an explicit tenant identifier.
+        // The historical fallback to the default tenant
+        // (`00000000-0000-0000-0000-000000000001`) let a bare
+        // email/password reach the default tenant's admin bootstrap
+        // by accident; making the identifier mandatory closes that
+        // seam and matches how `PortalAuthService::login` already
+        // resolves its tenant. Google OAuth (`login_with_google`) is
+        // unaffected: its JIT path still uses
+        // `resolve_tenant_for_login(None)` deliberately, so that
+        // helper is left untouched and only this local-password
+        // branch takes the stricter posture.
+        let tenant_hint = match request.tenant_id {
+            Some(id) => Some(id),
+            None => match request.tenant_slug.as_deref().map(str::trim) {
+                Some(slug) if !slug.is_empty() => Some(self.resolve_tenant_slug(slug).await?),
+                _ => None,
+            },
+        };
+        let Some(tenant_id) = tenant_hint else {
+            // Fail-closed with the same 401 shape as a bad-password
+            // outcome so the endpoint does not distinguish "no tenant
+            // identifier" from "wrong credentials" to an unauth caller.
+            return Err(AppError::Unauthorized);
+        };
         let user = self
             .find_user_by_email_for_tenant(tenant_id, &request.email)
             .await?;
@@ -878,6 +911,10 @@ impl AuthService {
                     user: None,
                     mfa_required: true,
                     approval_required: false,
+                    needs_selection: false,
+                    needs_setup: false,
+                    identity_token: None,
+                    memberships: None,
                 });
             }
         }
@@ -912,6 +949,10 @@ impl AuthService {
                             user: None,
                             mfa_required: false,
                             approval_required: true,
+                            needs_selection: false,
+                            needs_setup: false,
+                            identity_token: None,
+                            memberships: None,
                         });
                     }
                 }
@@ -933,7 +974,8 @@ impl AuthService {
             .await?;
 
         // Generate tokens
-        let (access_token, refresh_token, expires_at) = self.generate_tokens(&user, session_id)?;
+        let (access_token, refresh_token, expires_at) =
+            self.generate_tokens(&user, session_id).await?;
 
         // Update last login
         self.update_last_login(user.tenant_id, user.id).await?;
@@ -972,6 +1014,10 @@ impl AuthService {
             user: Some(user.to_current_user()),
             mfa_required: false,
             approval_required: false,
+            needs_selection: false,
+            needs_setup: false,
+            identity_token: None,
+            memberships: None,
         })
     }
 
@@ -1035,12 +1081,64 @@ impl AuthService {
         // is not a revocation signal for a bunyip token.
         if let Some(changed_at) = user.password_changed_at {
             if token_iat < changed_at.timestamp() {
-                return Err(AppError::Forbidden(
-                    "Access token predates a password change".to_string(),
-                ));
+                // Return Unauthorized (401), not Forbidden (403), so the SPA's
+                // 401-refresh-and-retry flow kicks in and mints a fresh token
+                // instead of surfacing a permanent 403. Distinct from the
+                // suspended-tenant / deactivated-user case above, which stays
+                // 403 and short-circuits the middleware so the SPA can render
+                // the "This organization is not active" splash. The prior 403
+                // shape here was defensible but conflated a stale-token
+                // condition (recoverable via refresh) with a policy denial
+                // (not recoverable).
+                return Err(AppError::Unauthorized);
             }
         }
         Ok(user)
+    }
+
+    /// MAPPS-459 (PMS-728 slice 3): upsert the per-tenant Bunyip
+    /// entitlement row consulted by [`ensure_tenant_active`]. Called
+    /// from the webhook path (or any future integration surface) with
+    /// the Bunyip-supplied membership status. `unknown` is legal here
+    /// so a "we lost contact, do not know" event can explicitly clear
+    /// a prior state without inventing a new value.
+    ///
+    /// Runs on the migrator pool because the write is a cross-tenant
+    /// integration write with no session GUC; the table is RLS-exempt
+    /// for the same reason (auth reads on the pre-session path).
+    pub async fn set_tenant_entitlement(
+        &self,
+        tenant_id: Uuid,
+        status: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        reason: Option<&str>,
+    ) -> AppResult<()> {
+        if !matches!(status, "active" | "suspended" | "unknown") {
+            return Err(AppError::validation_field(
+                "status",
+                "must be one of: active, suspended, unknown",
+            ));
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO tenant_membership_entitlements
+                (tenant_id, status, checked_at, expires_at, reason, created_at, updated_at)
+            VALUES ($1, $2, NOW(), $3, $4, NOW(), NOW())
+            ON CONFLICT (tenant_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                checked_at = NOW(),
+                expires_at = EXCLUDED.expires_at,
+                reason = EXCLUDED.reason,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(status)
+        .bind(expires_at)
+        .bind(reason)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
     }
 
     /// MAPPS-531: is the session behind an access token still live?
@@ -1088,11 +1186,44 @@ impl AuthService {
             .fetch_optional(self.db.pool())
             .await?;
         match status.as_deref() {
-            Some("active") => Ok(()),
-            _ => Err(AppError::Forbidden(
-                "This organization is not active".to_string(),
-            )),
+            Some("active") => {}
+            _ => {
+                return Err(AppError::Forbidden(
+                    "This organization is not active".to_string(),
+                ));
+            }
         }
+
+        // MAPPS-459 (PMS-728 slice 3): consult the per-tenant Bunyip
+        // entitlement. `unknown` (the seed state, or a tenant with no
+        // integration wired yet) passes through so a fresh instance is
+        // never locked out. `suspended` OR an expired entitlement
+        // rejects with the same "not active" copy so the endpoint does
+        // not distinguish billing vs. operator lifecycle to a caller.
+        // `tenant_membership_entitlements` (migration 154) is intentionally
+        // RLS-exempt: see the migration header for the "pre-auth / cross-
+        // tenant entitlement lookup path" reason, and 038's ENABLE-RLS loop
+        // runs at migration time only, so nothing enables RLS on 154's
+        // table after the fact.
+        let entitlement: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+            "SELECT status, expires_at FROM tenant_membership_entitlements WHERE tenant_id = $1",
+        )
+        .bind(tenant_id)
+        // SAFETY (PMS-285 / PMS-692): RLS-exempt table, see the note
+        // right above; NOBYPASSRLS app pool without a GUC is fine here.
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some((entitlement_status, expires_at)) = entitlement {
+            let now = chrono::Utc::now();
+            let expired = expires_at.is_some_and(|t| t < now);
+            if entitlement_status == "suspended" || expired {
+                return Err(AppError::Forbidden(
+                    "This organization is not active".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Refresh access token
@@ -1126,7 +1257,7 @@ impl AuthService {
 
         // Generate new tokens
         let (access_token, new_refresh_token, expires_at) =
-            self.generate_tokens(&user, claims.sid)?;
+            self.generate_tokens(&user, claims.sid).await?;
 
         // Update session activity
         self.update_session_activity(claims.tid, claims.sid).await?;
@@ -1296,6 +1427,54 @@ impl AuthService {
 
     /// Reset password with token
     #[tracing::instrument(skip_all)]
+    /// MAPPS-552: pre-render metadata for the SPA's SetPasswordPage.
+    /// Consumes the same `{user_id}.{secret}` token shape the
+    /// welcome email carries, verifies it against
+    /// `password_reset_tokens`, and returns the tenant's
+    /// human-readable name + slug so the SPA can render
+    /// "Set your password for [Client Name]". No side effect: does
+    /// NOT mark the token used - the actual password write happens
+    /// on the subsequent `POST /reset-password`.
+    ///
+    /// Fail-closed: returns `NotFound` for any invalid, unknown,
+    /// expired, or already-redeemed token. Same error shape for
+    /// every failure mode so an attacker cannot enumerate valid
+    /// tokens through this surface.
+    pub async fn set_password_context(&self, token: &str) -> AppResult<(String, String)> {
+        let (user_id, secret) =
+            parse_user_bound_token(token).ok_or_else(|| AppError::NotFound("token".to_string()))?;
+        let candidates = sqlx::query_as::<_, (Uuid, String)>(
+            r#"
+            SELECT tenant_id, token_hash
+            FROM password_reset_tokens
+            WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(self.db.migrator_pool())
+        .await
+        .map_err(|_| AppError::NotFound("token".to_string()))?;
+
+        let mut matched_tenant: Option<Uuid> = None;
+        for (tenant_id, token_hash) in &candidates {
+            if verify_password(secret, token_hash).unwrap_or(false) {
+                matched_tenant = Some(*tenant_id);
+                break;
+            }
+        }
+        let tenant_id = matched_tenant.ok_or_else(|| AppError::NotFound("token".to_string()))?;
+
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT name, slug FROM tenants WHERE id = $1")
+                .bind(tenant_id)
+                .fetch_optional(self.db.migrator_pool())
+                .await
+                .map_err(|_| AppError::NotFound("token".to_string()))?;
+        let (name, slug) = row.ok_or_else(|| AppError::NotFound("token".to_string()))?;
+        Ok((name, slug))
+    }
+
     pub async fn reset_password(&self, request: &ResetPasswordRequest) -> AppResult<()> {
         // PMS-905: refuse to redeem, ahead of every other check.
         //
@@ -1370,16 +1549,38 @@ impl AuthService {
         // Hash new password
         let new_hash = hash_password(&request.new_password)?;
 
-        // Update password. PMS-681: stamp `password_changed_at` so the auth
-        // middleware rejects every access token issued before now. Since
-        // MAPPS-531 the session DELETE below independently kills them too (the
-        // access path checks the token's `sid`); the two cutoffs stay separate
-        // because one is keyed on the credential changing and the other on the
-        // session ending.
+        // MAPPS-551: password_hash lives per-tenant on `users`. The
+        // MAPPS-498 mirror no longer touches password (see migration
+        // 135), and the MAPPS-548 setup/reset distinction is retired
+        // here - every redemption of a reset token, whether it is a
+        // first-time client-admin setup or a forgot-password by an
+        // existing tenant user, writes ONLY the users row the token
+        // resolves to. Two portals sharing an email keep independent
+        // passwords, forever.
+        //
+        // `status = 'active'` promotes a pending users row (fresh
+        // client-admin from `TenantService::create_tenant`) so the
+        // newly-set password is usable at login. Idempotent for a
+        // user already 'active' - the SET is a no-op write.
+        //
+        // The MAPPS-548 `app.skip_users_identity_mirror` flag is
+        // kept as belt-and-braces: post-135 the trigger no longer
+        // touches password, but a future column addition to the
+        // mirror should not silently escape this write. Cheap.
+        //
+        // PMS-681: stamp `password_changed_at` so the auth middleware rejects
+        // every access token issued before now. Since MAPPS-531 the session
+        // DELETE below independently kills them too (the access path checks
+        // the token's `sid`); the two cutoffs stay separate because one is
+        // keyed on the credential changing and the other on the session
+        // ending.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query("SELECT set_config('app.skip_users_identity_mirror', 'on', true)")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
-            "UPDATE users SET password_hash = $1, updated_at = NOW(), \
-             password_changed_at = NOW() \
+            "UPDATE users SET password_hash = $1, status = 'active', \
+             password_changed_at = NOW(), updated_at = NOW() \
              WHERE id = $2 AND tenant_id = $3",
         )
         .bind(&new_hash)
@@ -1428,15 +1629,17 @@ impl AuthService {
             ));
         }
 
-        // Get current password hash
+        // Get current password hash + email (need the email to
+        // resolve the identity row for the MAPPS-499 write).
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let current_hash: String =
-            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 AND tenant_id = $2")
-                .bind(user_id)
-                .bind(tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| AppError::NotFound("User".to_string()))?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT password_hash, email FROM users WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (current_hash, email) = row.ok_or_else(|| AppError::NotFound("User".to_string()))?;
 
         // Verify current password
         if !verify_password(&request.current_password, &current_hash)? {
@@ -1449,10 +1652,26 @@ impl AuthService {
         // Hash and update new password
         let new_hash = hash_password(&request.new_password)?;
 
+        // MAPPS-551: retire the identity write. Password lives on the
+        // per-tenant users row only; migration 135's mirror no longer
+        // touches password_hash in either direction. Two portals
+        // sharing an email hold independent passwords, and this
+        // signed-in change writes ONLY the caller's own (user_id,
+        // tenant_id) row. `email` is still bound above for the
+        // pre-551 identity write path and is now unused; leaving the
+        // binding in place is a tiny inefficiency, kept for the
+        // audit trail hooks below that reference `current_hash`.
+        //
+        // MAPPS-548 belt-and-braces flag stays set on the tx: the
+        // trigger is already toothless for password_hash post-135,
+        // but a future mirror addition should not silently escape.
+        let _ = &email;
+        sqlx::query("SELECT set_config('app.skip_users_identity_mirror', 'on', true)")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
-            "UPDATE users SET password_hash = $1, updated_at = NOW(), \
-             password_changed_at = NOW() \
-             WHERE id = $2 AND tenant_id = $3",
+            "UPDATE users SET password_hash = $1, password_changed_at = NOW(), \
+             updated_at = NOW() WHERE id = $2 AND tenant_id = $3",
         )
         .bind(&new_hash)
         .bind(user_id)
@@ -1937,16 +2156,23 @@ impl AuthService {
             .map(|c| recovery_code_hex_hash(c))
             .collect();
 
+        // MAPPS-501 (MAPPS-496 stage 2c): flip mfa_enabled + reset
+        // watermark on identities (source of truth); recovery-code
+        // hashes remain a users-only column (added by migration 029,
+        // not mirrored to identities).
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            r#"
-            UPDATE users
-               SET mfa_enabled = TRUE,
-                   mfa_recovery_codes_hashes = $1,
-                   updated_at = NOW()
-             WHERE id = $2
-               AND tenant_id = $3
-            "#,
+            "UPDATE identities SET mfa_enabled = TRUE, \
+                                   mfa_last_totp_step = 0, \
+                                   updated_at = NOW() \
+             WHERE lower(email) = lower($1)",
+        )
+        .bind(&user.email)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE users SET mfa_recovery_codes_hashes = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
         )
         .bind(&hashes)
         .bind(user_id)
@@ -1977,17 +2203,24 @@ impl AuthService {
             return Err(AppError::Unauthorized);
         }
 
+        // MAPPS-501 (MAPPS-496 stage 2c): clear mfa_enabled + mfa_secret
+        // + watermark on identities (source of truth); clear recovery
+        // hashes on users (users-only column). Both writes share the
+        // same tx.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            r#"
-            UPDATE users
-               SET mfa_enabled = FALSE,
-                   mfa_secret = NULL,
-                   mfa_recovery_codes_hashes = '{}',
-                   updated_at = NOW()
-             WHERE id = $1
-               AND tenant_id = $2
-            "#,
+            "UPDATE identities SET mfa_enabled = FALSE, \
+                                   mfa_secret = NULL, \
+                                   mfa_last_totp_step = 0, \
+                                   updated_at = NOW() \
+             WHERE lower(email) = lower($1)",
+        )
+        .bind(&user.email)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE users SET mfa_recovery_codes_hashes = '{}', updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
         )
         .bind(user_id)
         .bind(tenant_id)
@@ -2227,8 +2460,21 @@ impl AuthService {
         let offset = pagination.offset() as i64;
         let limit = pagination.limit() as i64;
 
-        let mut data_conds: Vec<String> = vec!["tenant_id = $1".to_string()];
-        let mut count_conds: Vec<String> = vec!["tenant_id = $1".to_string()];
+        // MAPPS-562: the auto-provisioned system attribution users row
+        // (email = 'system+<slug>@mokosh.local', password_hash NULL,
+        // unloginable) exists only to satisfy the tickets.created_by_id
+        // FK on client-plane tenants. It's not a human user and must
+        // not appear in the operator-facing users list. Hide by the
+        // reserved email suffix so a future rename of the row shape
+        // doesn't quietly leak.
+        let mut data_conds: Vec<String> = vec![
+            "tenant_id = $1".to_string(),
+            "email NOT LIKE 'system+%@mokosh.local'".to_string(),
+        ];
+        let mut count_conds: Vec<String> = vec![
+            "tenant_id = $1".to_string(),
+            "email NOT LIKE 'system+%@mokosh.local'".to_string(),
+        ];
         let mut data_idx: i32 = 4;
         let mut count_idx: i32 = 2;
 
@@ -2269,7 +2515,8 @@ impl AuthService {
                    login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at,
-                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id,
+                   (SELECT kind FROM tenants WHERE id = users.tenant_id) AS tenant_kind
             FROM users
             WHERE {data_where}
             ORDER BY {order_by}
@@ -2452,9 +2699,48 @@ impl AuthService {
     /// `COALESCE` keeps the first timestamp, so this is idempotent: a double
     /// submit records when onboarding was actually finished, not when it was
     /// last re-submitted.
+    ///
+    /// The optional `first_name` / `last_name` args are the standalone
+    /// bootstrap fallback: the onboarding screen collects them for users whose
+    /// bunyip claims did not carry names. Names are written ONLY on first
+    /// completion (guarded by `WHERE profile_completed_at IS NULL` on the
+    /// name UPDATE) so a replay after a subsequent bunyip login refreshed the
+    /// row cannot overwrite the authoritative name from the IdP. Bunyip
+    /// remains the identity source of truth on the OIDC path (PMS-512); this
+    /// path fills the gap only when it is genuinely empty.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn mark_profile_completed(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<User> {
+    pub async fn mark_profile_completed(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        first_name: Option<&str>,
+        last_name: Option<&str>,
+    ) -> AppResult<User> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Names first (under the write-once guard) so the timestamp
+        // stamp below decides idempotency, not the name write. The
+        // UPDATE's `WHERE profile_completed_at IS NULL` clause is
+        // what turns a replay into a no-op even if a different name
+        // shows up in the body: an already-onboarded user cannot
+        // rewrite their name through this endpoint.
+        let first_trim = first_name.map(str::trim).filter(|s| !s.is_empty());
+        let last_trim = last_name.map(str::trim).filter(|s| !s.is_empty());
+        if first_trim.is_some() || last_trim.is_some() {
+            sqlx::query(
+                "UPDATE users \
+                 SET first_name = COALESCE($1, first_name), \
+                     last_name  = COALESCE($2, last_name), \
+                     updated_at = NOW() \
+                 WHERE id = $3 AND tenant_id = $4 \
+                   AND profile_completed_at IS NULL",
+            )
+            .bind(first_trim)
+            .bind(last_trim)
+            .bind(user_id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "UPDATE users SET profile_completed_at = COALESCE(profile_completed_at, NOW()), \
                               updated_at = NOW() \
@@ -2480,7 +2766,8 @@ impl AuthService {
                    login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, password_changed_at, profile_completed_at,
-                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id,
+                   (SELECT kind FROM tenants WHERE id = users.tenant_id) AS tenant_kind
             FROM users
             -- PMS-591: a tombstoned user (deleted via the Bunyip
             -- account_deleted webhook) reads as NotFound so every
@@ -2764,7 +3051,8 @@ impl AuthService {
                    login_location_alerts, mfa_enabled,
                    mfa_secret, notification_preferences, settings,
                    created_at, updated_at, profile_completed_at,
-                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id
+                   (SELECT own_company_id FROM tenants WHERE id = users.tenant_id) AS own_company_id,
+                   (SELECT kind FROM tenants WHERE id = users.tenant_id) AS tenant_kind
             FROM users
             WHERE tenant_id = $1 AND email = $2
             "#,
@@ -2891,6 +3179,33 @@ impl AuthService {
         hint.unwrap_or_else(|| Uuid::from_u128(1))
     }
 
+    /// MAPPS-396: resolve a tenant slug (e.g. `acme`) to its `tenant_id`
+    /// for the standalone login form. Only `status = 'active'` rows
+    /// match so a suspended tenant reads as "not a tenant" from the
+    /// login endpoint's point of view, matching the fail-closed posture
+    /// the portal side already uses for its host-to-tenant mapping
+    /// (`src/modules/portal/host_tenant.rs`). Runs on the migrator pool
+    /// because the request is pre-auth (no session GUC to set).
+    ///
+    /// Returns `AppError::Unauthorized` on an unknown or suspended
+    /// slug so the response is indistinguishable from a wrong password
+    /// (same status the downstream password-verify path returns), so
+    /// the endpoint cannot be walked to enumerate tenant slugs.
+    async fn resolve_tenant_slug(&self, slug: &str) -> AppResult<Uuid> {
+        // Deliberately does NOT filter on `status = 'active'`: a filtered lookup
+        // collapses a suspended tenant into "unknown slug" and returns 401, which
+        // the SPA then reads as a session-expired prompt and asks the user to
+        // sign in again (into a tenant they cannot access). Return the id
+        // regardless of status; `ensure_tenant_active` runs downstream and turns
+        // the non-active case into a 403 with the "This organization is not
+        // active" copy the SPA renders instead of the sign-in prompt.
+        let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM tenants WHERE slug = $1")
+            .bind(slug)
+            .fetch_optional(self.db.migrator_pool())
+            .await?;
+        row.map(|(id,)| id).ok_or(AppError::Unauthorized)
+    }
+
     /// Validate token and return claims.
     ///
     /// MAPPS-334: explicit `Validation::new(Algorithm::HS256)` instead of
@@ -3000,13 +3315,33 @@ impl AuthService {
     }
 
     /// Update user's last login timestamp. PMS-4 AC6.
+    ///
+    /// MAPPS-500 (MAPPS-496 stage 2b): identities is now the source of
+    /// truth for `last_login_at`; the MAPPS-498 back-mirror propagates
+    /// the timestamp to every users row this identity backs across all
+    /// tenants they hold a membership in. `tenant_id + user_id` is
+    /// still consulted first to resolve the email, so a stray
+    /// cross-tenant `user_id` returns no email and the write is
+    /// silently a no-op (matches the pre-500 shape which was a
+    /// 0-rows-affected users UPDATE for the same case).
     async fn update_last_login(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query("UPDATE users SET last_login_at = NOW() WHERE id = $1 AND tenant_id = $2")
-            .bind(user_id)
-            .bind(tenant_id)
-            .execute(&mut *tx)
-            .await?;
+        let email: Option<String> =
+            sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND tenant_id = $2")
+                .bind(user_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(email) = email else {
+            return Ok(());
+        };
+        sqlx::query(
+            "UPDATE identities SET last_login_at = NOW(), updated_at = NOW() \
+             WHERE lower(email) = lower($1)",
+        )
+        .bind(&email)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
 
         Ok(())
@@ -3038,7 +3373,7 @@ impl AuthService {
     }
 
     /// Generate access and refresh tokens
-    fn generate_tokens(
+    async fn generate_tokens(
         &self,
         user: &User,
         session_id: Uuid,
@@ -3052,6 +3387,20 @@ impl AuthService {
         // refresh-TTL window has rotated every live legacy token.
         let iss = MOKOSH_JWT_ISSUER.to_string();
         let aud = MOKOSH_JWT_AUDIENCE.to_string();
+
+        // MAPPS-491 (phase 2): mint carries the active `tenant_memberships.id`.
+        // `None` is tolerated (bootstrap paths may run before the identity
+        // plane is populated); verify falls back to a repo lookup so a
+        // missing `mid` never fails a request.
+        let mid = crate::db::identity::MembershipRepo::find_id_by_email_and_tenant(
+            self.db.migrator_pool(),
+            &user.email,
+            user.tenant_id,
+        )
+        .await
+        .ok()
+        .flatten();
+
         let access_claims = JwtClaims {
             sub: user.id,
             tid: user.tenant_id,
@@ -3064,6 +3413,7 @@ impl AuthService {
             aud: aud.clone(),
             typ: "access".to_string(),
             sid: session_id,
+            mid,
         };
 
         let refresh_claims = JwtClaims {
@@ -3078,6 +3428,7 @@ impl AuthService {
             aud,
             typ: "refresh".to_string(),
             sid: session_id,
+            mid,
         };
 
         let encoding_key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
@@ -3086,6 +3437,442 @@ impl AuthService {
         let refresh_token = encode(&Header::default(), &refresh_claims, &encoding_key)?;
 
         Ok((access_token, refresh_token, access_expires))
+    }
+
+    // ========================================================================
+    // MAPPS-492 (MAPPS-474 phase 3): identity-first login primitives.
+    // ========================================================================
+
+    /// Mint a short-lived (5 min) identity token used to bridge the login
+    /// picker step. `typ="identity"` so `auth_middleware` (which only
+    /// accepts `typ="access"`) never treats it as a general-purpose
+    /// bearer. Carries `sub=identity_id` and `email` only; `tid` is
+    /// `Uuid::nil()` (no tenant is scoped yet); `role`/`sid`/`mid`
+    /// are placeholders.
+    pub fn mint_identity_token(&self, identity_id: Uuid, email: &str) -> AppResult<String> {
+        let now = Utc::now();
+        let claims = JwtClaims {
+            sub: identity_id,
+            tid: Uuid::nil(),
+            email: email.to_string(),
+            role: UserRole::Technician,
+            iat: now.timestamp(),
+            nbf: now.timestamp(),
+            exp: (now + Duration::minutes(5)).timestamp(),
+            iss: MOKOSH_JWT_ISSUER.to_string(),
+            aud: MOKOSH_JWT_AUDIENCE.to_string(),
+            typ: "identity".to_string(),
+            sid: Uuid::nil(),
+            mid: None,
+        };
+        let encoding_key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
+        Ok(encode(&Header::default(), &claims, &encoding_key)?)
+    }
+
+    /// Verify an identity token and return `(identity_id, email)`.
+    /// Enforces `typ == "identity"` and standard exp validation. Wrong
+    /// type or expired -> `AppError::Unauthorized`. Mirrors the
+    /// `decode_token` validation shape: audience pinning is deferred
+    /// (MAPPS-334 follow-up), 30s leeway matches the bunyip RS verifier.
+    pub fn decode_identity_token(&self, token: &str) -> AppResult<(Uuid, String)> {
+        let decoding_key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = true;
+        validation.validate_aud = false;
+        validation.leeway = 30;
+        let claims = decode::<JwtClaims>(token, &decoding_key, &validation)
+            .map_err(|_| AppError::Unauthorized)?
+            .claims;
+        if claims.typ != "identity" {
+            return Err(AppError::Unauthorized);
+        }
+        Ok((claims.sub, claims.email))
+    }
+
+    /// Identity-first login (MAPPS-492 phase 3). Called when the login
+    /// request has no tenant hint. Verifies (email, password) against
+    /// `identities`, runs the identity-level MFA gate, enumerates active
+    /// memberships, and branches:
+    ///
+    /// - 1 membership: mints a full session for that tenant and returns
+    ///   a scoped `LoginResponse` (single membership auto-scope).
+    /// - N > 1: returns a `needs_selection` response with the
+    ///   `identity_token` + membership list. Client re-POSTs to
+    ///   `/auth/select-tenant` to finish.
+    /// - 0: returns a `needs_setup` response with the `identity_token`.
+    ///   Phase 4 wires the "create your organization" flow that
+    ///   redeems it.
+    ///
+    /// Login-approval (PMS-658) is intentionally NOT applied on this
+    /// branch in phase 3; the follow-up plan tracks integration. The
+    /// tenant-hint `login()` path keeps its existing approval gate.
+    pub async fn authenticate_identity_first(
+        &self,
+        request: &LoginRequest,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> AppResult<LoginResponse> {
+        // 1. Resolve identity by email. Unauthorized rather than 404 so
+        //    email enumeration is no easier than the tenant-hint path.
+        let pool = self.db.migrator_pool();
+        let identity = crate::db::identity::IdentityRepo::find_by_email(pool, &request.email)
+            .await
+            .map_err(|_| AppError::Unauthorized)?
+            .ok_or(AppError::Unauthorized)?;
+
+        // 2. MAPPS-551: password is authoritative per-tenant on
+        //    `users`, not on identities. Verify the supplied password
+        //    against each active membership's users row and collect
+        //    the memberships that verified. Empty match set ->
+        //    Unauthorized (same 401 an unknown identity yields, so
+        //    timing does not leak "identity exists but password wrong"
+        //    vs "identity does not exist").
+        //
+        //    Pre-551 this branch verified against
+        //    `identities.password_hash`; that value is no longer
+        //    authoritative post-135 (the mirror no longer writes it
+        //    on UPDATE, so it stales the moment any per-tenant
+        //    password changes). Walking memberships is O(N) verifies;
+        //    Argon2 is ~50ms so a caller with 5 memberships pays
+        //    ~250ms on identity-first login. Acceptable - the caller
+        //    typed a password and expects to wait, and MAPPS-549
+        //    auto-picks so the picker case is rare.
+        let all_memberships =
+            crate::db::identity::MembershipRepo::list_views_for_identity(pool, identity.id, None)
+                .await
+                .map_err(|_| AppError::Unauthorized)?;
+        let mut matched_memberships = Vec::with_capacity(all_memberships.len());
+        let mut any_verified_user: Option<User> = None;
+        if all_memberships.is_empty() {
+            // MAPPS-551: orphan identity (no memberships) is the
+            // needs_setup case. Post-551 the identity's
+            // password_hash is not authoritative for
+            // per-membership login, but it IS authoritative for
+            // this specific "no memberships yet" state - the
+            // MAPPS-498 INSERT branch of the mirror seeded it from
+            // the first users row, and until a membership exists
+            // there is no per-tenant users row to verify against.
+            // Preserves the MAPPS-492 phase-3 self-serve flow
+            // (identity signs up, verifies password, lands on
+            // /create-org to mint their first tenant).
+            let identity_hash = identity
+                .password_hash
+                .as_deref()
+                .ok_or(AppError::Unauthorized)?;
+            if !verify_password(&request.password, identity_hash)? {
+                return Err(AppError::Unauthorized);
+            }
+        } else {
+            for m in &all_memberships {
+                let user = match self
+                    .find_user_by_email_for_tenant(m.tenant_id, &identity.email)
+                    .await
+                {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let Some(hash) = user.password_hash.as_deref() else {
+                    continue;
+                };
+                match verify_password(&request.password, hash) {
+                    Ok(true) => {
+                        matched_memberships.push(m.clone());
+                        if any_verified_user.is_none() {
+                            any_verified_user = Some(user);
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            if matched_memberships.is_empty() {
+                return Err(AppError::Unauthorized);
+            }
+        }
+
+        // 3. MFA at the identity level. Mirrors the tenant-hint branch's
+        //    contract: no code -> `mfa_required` shape (empty tokens,
+        //    user=None). Verification uses the identity's mfa_secret,
+        //    which the phase-1 trigger keeps in sync with users.mfa_secret.
+        if identity.mfa_enabled {
+            let code = request
+                .mfa_code
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match code {
+                None => {
+                    return Ok(LoginResponse {
+                        access_token: String::new(),
+                        refresh_token: String::new(),
+                        expires_at: Utc::now(),
+                        user: None,
+                        mfa_required: true,
+                        approval_required: false,
+                        needs_selection: false,
+                        needs_setup: false,
+                        identity_token: None,
+                        memberships: None,
+                    });
+                }
+                Some(code) => {
+                    // Same base32-decode + +/-1 step tolerance the
+                    // tenant-hint path uses (see MFA branch above).
+                    // MAPPS-497 item 4 (PMS-502 identity extension):
+                    // burn the accepted step on the identity plane so
+                    // a captured code cannot be replayed against this
+                    // path within its ~60s window. Compare-and-set on
+                    // `identities.mfa_last_totp_step`; 0 rows
+                    // affected == replay.
+                    let secret_b32 = identity.mfa_secret.as_deref().ok_or_else(|| {
+                        AppError::Internal("MFA enabled without secret".to_string())
+                    })?;
+                    let secret = crate::utils::totp::base32_decode(secret_b32).map_err(|_| {
+                        AppError::Internal("stored MFA secret is corrupt".to_string())
+                    })?;
+                    let step = match crate::utils::totp::verify(&secret, code, Utc::now(), 1) {
+                        Some(step) => step,
+                        None => return Err(AppError::Unauthorized),
+                    };
+                    let advanced = crate::db::identity::IdentityRepo::record_identity_mfa_success(
+                        pool,
+                        identity.id,
+                        step,
+                    )
+                    .await
+                    .map_err(|_| AppError::Unauthorized)?;
+                    if !advanced {
+                        // Replay of an already-spent step. Fail closed;
+                        // the caller sees the same 401 a wrong code
+                        // yields, so timing does not leak "replay vs
+                        // wrong code" to an attacker.
+                        return Err(AppError::Unauthorized);
+                    }
+                }
+            }
+        }
+
+        // 4. MAPPS-551: the "how many places does this identity live"
+        //    branch operates over the memberships whose users row
+        //    password actually verified in step 2 above. A caller
+        //    with memberships whose passwords do not match is
+        //    treated as if those memberships did not exist for this
+        //    request; only matching memberships count toward
+        //    auto-scope vs picker.
+        //
+        //    `needs_setup` (zero memberships branch) is preserved
+        //    for the orphan-identity case: an identity with no
+        //    memberships whose password verified against
+        //    `identities.password_hash` in step 2's "no memberships"
+        //    branch. `all_memberships` empty AND we did not 401
+        //    above means the caller is a self-serve signup landing
+        //    on the create-org flow (MAPPS-492 phase 3 /
+        //    MAPPS-493 phase 4).
+        if all_memberships.is_empty() {
+            let identity_token = self.mint_identity_token(identity.id, &identity.email)?;
+            return Ok(LoginResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: Utc::now(),
+                user: None,
+                mfa_required: false,
+                approval_required: false,
+                needs_selection: false,
+                needs_setup: true,
+                identity_token: Some(identity_token),
+                memberships: None,
+            });
+        }
+        match matched_memberships.len() {
+            1 => {
+                // MAPPS-497 item 5 (PMS-658 identity-first extension):
+                // resolve the user + run the approval gate BEFORE
+                // session mint. The tenant-hint `login` path runs the
+                // same gate at the same spot; identity-first now
+                // matches for the single-membership (auto-scope) case.
+                //
+                // MAPPS-551: reuse the users row already loaded +
+                // password-verified in step 2 rather than fetching it
+                // again. `any_verified_user` is `Some` whenever
+                // `matched_memberships` is non-empty (both are
+                // populated in the same loop).
+                let user = any_verified_user.expect(
+                    "MAPPS-551: any_verified_user set when matched_memberships is non-empty",
+                );
+                self.ensure_principal_usable(&user).await?;
+                if let Some(response) = self
+                    .check_login_approval(
+                        &user,
+                        request.device_id.as_deref(),
+                        request.approval_code.as_deref(),
+                        ip_address.as_deref(),
+                        user_agent.as_deref(),
+                    )
+                    .await?
+                {
+                    return Ok(response);
+                }
+                self.mint_session_for_user(&user, ip_address, user_agent)
+                    .await
+            }
+            _ => {
+                let identity_token = self.mint_identity_token(identity.id, &identity.email)?;
+                Ok(LoginResponse {
+                    access_token: String::new(),
+                    refresh_token: String::new(),
+                    expires_at: Utc::now(),
+                    user: None,
+                    mfa_required: false,
+                    approval_required: false,
+                    needs_selection: true,
+                    needs_setup: false,
+                    identity_token: Some(identity_token),
+                    memberships: Some(matched_memberships),
+                })
+            }
+        }
+    }
+
+    /// MAPPS-492: helper. Given an identity/email that has just
+    /// authenticated and a specific tenant_id it holds a membership in,
+    /// resolve the users row, run the principal gate, create a session,
+    /// mint tokens, and return the scoped `LoginResponse`. Shared by the
+    /// auto-scope branch of `authenticate_identity_first`, by
+    /// `select_tenant_for_identity`, and (phase 4, MAPPS-493) by the
+    /// `/tenants/self-serve` handler which needs to mint a session for
+    /// the freshly-created admin of a self-serve tenant.
+    pub(crate) async fn mint_session_for_membership(
+        &self,
+        tenant_id: Uuid,
+        email: &str,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> AppResult<LoginResponse> {
+        let user = self.find_user_by_email_for_tenant(tenant_id, email).await?;
+        self.ensure_principal_usable(&user).await?;
+        self.mint_session_for_user(&user, ip_address, user_agent)
+            .await
+    }
+
+    /// MAPPS-497 item 5: session-mint tail extracted from
+    /// `mint_session_for_membership` so the PMS-658 approval gate can
+    /// run BETWEEN principal-check and session-mint on the identity-
+    /// first branch. Callers that have already resolved a user and run
+    /// `ensure_principal_usable` invoke this directly.
+    pub(crate) async fn mint_session_for_user(
+        &self,
+        user: &User,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> AppResult<LoginResponse> {
+        let session_id = self
+            .create_session(user.tenant_id, user.id, ip_address, user_agent, false)
+            .await?;
+        let (access_token, refresh_token, expires_at) =
+            self.generate_tokens(user, session_id).await?;
+        self.update_last_login(user.tenant_id, user.id).await?;
+
+        Ok(LoginResponse {
+            access_token,
+            refresh_token,
+            expires_at,
+            user: Some(user.to_current_user()),
+            mfa_required: false,
+            approval_required: false,
+            needs_selection: false,
+            needs_setup: false,
+            identity_token: None,
+            memberships: None,
+        })
+    }
+
+    /// MAPPS-497 item 5 (PMS-658 identity-first extension): apply the
+    /// suspicious-login approval gate on any code path that has already
+    /// resolved a `User`. Returns:
+    /// - `Ok(None)` when the gate is disabled, the login is not
+    ///   suspicious, OR the emailed approval code was supplied and
+    ///   verified. Caller continues with session mint.
+    /// - `Ok(Some(response))` when suspicious + no code was supplied.
+    ///   The response carries `approval_required: true` + empty tokens
+    ///   (same shape the tenant-hint `login` path emits); the caller
+    ///   propagates it up so the SPA prompts for the code.
+    ///
+    /// Wired into `authenticate_identity_first` for the auto-scope
+    /// branch (single-membership case). The multi-membership picker
+    /// branch defers the gate to a follow-up ticket (would require
+    /// adding `approval_code` + `device_id` to `SelectTenantRequest`).
+    async fn check_login_approval(
+        &self,
+        user: &User,
+        device_id: Option<&str>,
+        approval_code: Option<&str>,
+        ip: Option<&str>,
+        ua: Option<&str>,
+    ) -> AppResult<Option<LoginResponse>> {
+        if !self.login_approval_enabled {
+            return Ok(None);
+        }
+        let assessment = self.assess_login(user, ip, device_id).await?;
+        if !assessment.suspicious {
+            return Ok(None);
+        }
+        match approval_code.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(code) => {
+                self.verify_login_approval(user.tenant_id, user.id, code)
+                    .await?;
+                Ok(None)
+            }
+            None => {
+                self.issue_login_approval(user, &assessment, ip, ua).await?;
+                Ok(Some(LoginResponse {
+                    access_token: String::new(),
+                    refresh_token: String::new(),
+                    expires_at: Utc::now(),
+                    user: None,
+                    mfa_required: false,
+                    approval_required: true,
+                    needs_selection: false,
+                    needs_setup: false,
+                    identity_token: None,
+                    memberships: None,
+                }))
+            }
+        }
+    }
+
+    /// MAPPS-492: complete a `needs_selection` login. Consumes an
+    /// identity token minted by `authenticate_identity_first`, verifies
+    /// the caller has a membership in the chosen tenant, and returns a
+    /// full scoped session.
+    ///
+    /// Errors:
+    /// - `Unauthorized` on token decode failure, wrong `typ`, or expiry.
+    /// - `NotFound` when the identity holds no active membership in
+    ///   `tenant_id`.
+    pub async fn select_tenant_for_identity(
+        &self,
+        identity_token: &str,
+        tenant_id: Uuid,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> AppResult<LoginResponse> {
+        let (identity_id, email) = self.decode_identity_token(identity_token)?;
+        // Reject when the identity holds no active membership in the
+        // requested tenant. Consulted via the shared repo helper so the
+        // (identity, tenant) status filter stays in one place.
+        let membership = crate::db::identity::MembershipRepo::find(
+            self.db.migrator_pool(),
+            identity_id,
+            tenant_id,
+        )
+        .await
+        .map_err(|_| AppError::Unauthorized)?
+        .ok_or_else(|| AppError::NotFound("Membership not found for this tenant".to_string()))?;
+        if membership.status != "active" {
+            return Err(AppError::NotFound("Membership is not active".to_string()));
+        }
+
+        self.mint_session_for_membership(tenant_id, &email, ip_address, user_agent)
+            .await
     }
 
     /// Get all active sessions for a user. PMS-260: scoped to the caller's
@@ -3225,6 +4012,12 @@ struct UserRow {
     // subquery against `tenants` in each user-load query (tenant-scoped, not a
     // `users` column).
     own_company_id: Option<Uuid>,
+    // PMS-791 / MAPPS-462: the owning tenant's `kind` column, pulled in by
+    // the same correlated-subquery pattern. `#[sqlx(default)]` so the JIT
+    // placement path in middleware (which constructs a UserRow from claims,
+    // not a live SELECT) does not have to know about this column.
+    #[sqlx(default)]
+    tenant_kind: Option<String>,
 }
 
 #[cfg(feature = "server")]
@@ -3261,6 +4054,7 @@ impl From<UserRow> for User {
             password_changed_at: row.password_changed_at,
             profile_completed_at: row.profile_completed_at,
             own_company_id: row.own_company_id,
+            tenant_kind: row.tenant_kind.unwrap_or_default(),
         }
     }
 }
@@ -3507,29 +4301,12 @@ pub(crate) fn synthetic_name_from_email(email: &str) -> (String, String) {
     }
 }
 
-/// PMS-657: the action to take for a resolved login country, given the country
-/// recorded at the user's previous login. Kept pure (no DB, no mailer) so the
-/// branch logic is unit-testable in isolation.
+// Post-code-review finding #10: agent-side login-location types moved
+// to `crate::utils::login_location`. Both the enum and the branch
+// function are aliased through so existing call sites at auth/service.rs
+// keep resolving.
 #[cfg(feature = "server")]
-#[derive(Debug, PartialEq, Eq)]
-enum LoginLocationDecision {
-    /// No prior country on record: store this one silently, no alert.
-    Record,
-    /// Same country as last time: do nothing.
-    Unchanged,
-    /// Country differs from last time: alert the user, then store the new one.
-    Alert,
-}
-
-/// Decide what to do for the `current` login country given the `previous` one.
-#[cfg(feature = "server")]
-fn login_location_decision(previous: Option<&str>, current: &str) -> LoginLocationDecision {
-    match previous {
-        None => LoginLocationDecision::Record,
-        Some(prev) if prev == current => LoginLocationDecision::Unchanged,
-        Some(_) => LoginLocationDecision::Alert,
-    }
-}
+use crate::utils::login_location::{login_location_decision, LoginLocationDecision};
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
@@ -3699,10 +4476,10 @@ mod tests {
     #[test]
     fn attempt_counters_are_incremented_in_sql() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let sources = [
-            root.join("src/modules/auth/service.rs"),
-            root.join("src/modules/portal/service.rs"),
-        ];
+        // mokosh-contact-login prompt 001: portal/service.rs retired.
+        // Contact-plane replacement lands in prompt 004; extend this
+        // list to include it once that lands.
+        let sources = [root.join("src/modules/auth/service.rs")];
         let banned = [
             concat!("SET mfa_failed_attempts", " = $"),
             concat!("SET portal_failed_login_count", " = $"),

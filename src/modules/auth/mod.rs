@@ -21,6 +21,11 @@
 
 #[cfg(feature = "server")]
 pub mod bootstrap;
+// mokosh-contact-login prompt 008: `CallerContext` + `RequireCallerContext`.
+// Dual-plane extractor for routes a staff user OR a portal contact may
+// reach; contact branches gate on `require_capability` (DB-loaded).
+#[cfg(feature = "server")]
+pub mod caller_context;
 // PMS-591: receiver for Bunyip's `account_deleted` webhook. Wired outside
 // the JWT auth chain in `create_api_router`.
 #[cfg(feature = "server")]
@@ -45,12 +50,15 @@ mod service;
 pub mod tenant;
 
 #[cfg(feature = "server")]
+pub use caller_context::{load_contact_capabilities, CallerContext, RequireCallerContext};
+#[cfg(feature = "server")]
 pub use middleware::{
     AdminRoles, AuthMiddleware, FinanceRoles, ManagerRoles, ModuleGate, RequireAdmin,
-    RequireAdminUser, RequireAssets, RequireAuth, RequireBilling, RequireCalendar,
-    RequireContracts, RequireFinance, RequireKnowledgeBase, RequireManager, RequireModuleEnabled,
-    RequireProjects, RequireReports, RequireRmm, RequireRole, RequireSuperAdmin,
-    RequireTimeTracking, RequireTimesheets, RoleRequirement, SuperAdminRoles, TenantScope,
+    RequireAdminUser, RequireAssets, RequireAuth, RequireAuthState, RequireBilling,
+    RequireCalendar, RequireContracts, RequireFinance, RequireKnowledgeBase, RequireManager,
+    RequireModuleEnabled, RequireProjects, RequireReports, RequireRmm, RequireRole,
+    RequireSuperAdmin, RequireTimeTracking, RequireTimesheets, RoleRequirement, SuperAdminRoles,
+    TenantScope,
 };
 pub use models::*;
 #[cfg(feature = "server")]
@@ -61,6 +69,9 @@ pub use service::AuthService;
 // against the Rust one.
 #[cfg(feature = "server")]
 pub use service::{mfa_lock_seconds_sql, mfa_lockout_until};
+// PMS-729 finalize (MAPPS-334 parity): re-exported so the portal-side
+// JWT mint stamps the same `iss` / `aud` values as the agent side does.
+pub use service::{MOKOSH_JWT_AUDIENCE, MOKOSH_JWT_ISSUER};
 // PMS-743: tenant naming derives a personal tenant's display name from the
 // same email-to-name logic the JIT user insert uses, rather than growing a
 // second copy of the UUID / placeholder rejection rules.
