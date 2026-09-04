@@ -843,17 +843,8 @@ async fn existing_tickets_with_null_team_id_read_back_ok(pool: PgPool) {
     // Seed a company + insert a ticket with team_id NULL. Minimal shape;
     // just proving the row can round-trip.
     let company_id = common::seed_company(&pool).await;
-    let ticket_id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO tickets (id, tenant_id, ticket_number, title, company_id, status, priority, team_id)
-        VALUES ($1, $2, 'REG-35', 'null team test', $3, 'open', 'medium', NULL)
-        "#,
-    )
-    .bind(ticket_id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .bind(company_id)
-    .execute(&pool).await.expect("insert null-team ticket");
+    let (admin_id, _, _) = common::seed_admin(&pool).await;
+    let ticket_id = common::seed_ticket_for_team(&pool, company_id, admin_id, "REG-35", None).await;
 
     let team_col: Option<Uuid> = sqlx::query_scalar("SELECT team_id FROM tickets WHERE id = $1")
         .bind(ticket_id)
@@ -873,15 +864,9 @@ async fn team_delete_of_team_with_tickets_soft_deletes_not_hard(pool: PgPool) {
         .unwrap();
     // Seed a ticket pointing at this team.
     let company_id = common::seed_company(&pool).await;
-    let ticket_id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO tickets (id, tenant_id, ticket_number, title, company_id, status, priority, team_id)
-        VALUES ($1, $2, 'REG-36', 'ticket with team', $3, 'open', 'medium', $4)
-        "#,
-    )
-    .bind(ticket_id).bind(common::DEFAULT_TENANT_ID).bind(company_id).bind(team.id)
-    .execute(&pool).await.expect("insert ticket with team");
+    let (admin_id, _, _) = common::seed_admin(&pool).await;
+    let ticket_id =
+        common::seed_ticket_for_team(&pool, company_id, admin_id, "REG-36", Some(team.id)).await;
 
     // Service DELETE = soft. Would FK-violate if we tried hard delete
     // (tickets.team_id NO ACTION); confirm the ticket still resolves.
