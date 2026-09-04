@@ -644,7 +644,23 @@ pub fn create_api_router(
             Method::PATCH,
             Method::OPTIONS,
         ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            // PMS-729: the SPA attaches `X-Forwarded-Host` on every
+            // portal-side fetch so the server's host-to-tenant
+            // extractor sees the real `{slug}.client.<apex>` value
+            // even when a dev reverse proxy rewrites Host. Without it
+            // in the CORS preflight allow-list, the browser refuses
+            // the actual credentialed POST (magic-link redeem,
+            // set-password, etc.) with `Request header field
+            // x-forwarded-host is not allowed by
+            // Access-Control-Allow-Headers`, and the SPA reports the
+            // failure as "This link is invalid or has expired" even
+            // though the token never reached the server.
+            axum::http::HeaderName::from_static("x-forwarded-host"),
+        ])
         .allow_credentials(true)
         // Cache preflight for 10 minutes per docs/cors.md §5 so browsers do not
         // re-issue an OPTIONS before every credentialed request (PMS-389).
