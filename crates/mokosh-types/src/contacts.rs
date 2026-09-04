@@ -649,6 +649,11 @@ pub struct CompanyResponse {
     pub address: Address,
     pub account_manager_id: Option<Uuid>,
     pub account_manager_name: Option<String>,
+    /// PMS-993: who this company's invoices are addressed to. `Company` has
+    /// carried it since the table was created and no response exposed it, so a
+    /// client could not tell a company that has no billing contact (and so
+    /// cannot have an invoice sent) from one it simply had not read.
+    pub default_billing_contact_id: Option<Uuid>,
     pub sla_id: Option<Uuid>,
     pub default_contract_id: Option<Uuid>,
     pub contact_count: Option<i64>,
@@ -678,6 +683,7 @@ impl From<Company> for CompanyResponse {
             address: c.address,
             account_manager_id: c.account_manager_id,
             account_manager_name: None,
+            default_billing_contact_id: c.default_billing_contact_id,
             sla_id: c.sla_id,
             default_contract_id: c.default_contract_id,
             contact_count: None,

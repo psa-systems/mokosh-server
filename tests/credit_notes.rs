@@ -25,6 +25,8 @@ async fn sent_invoice(
     amount: &str,
 ) -> (uuid::Uuid, String) {
     let company_id = common::seed_company(pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(pool, company_id).await;
     let invoice_id = draft_invoice(app, token, company_id, amount).await;
     send_invoice(app, token, &invoice_id).await;
     (company_id, invoice_id)
@@ -342,6 +344,8 @@ async fn a_draft_invoice_is_refused_because_it_can_still_be_edited(pool: PgPool)
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let invoice_id = draft_invoice(&app, &token, company_id, "1000").await;
 
     let resp = credit(&app, &token, &invoice_id, "100").await;

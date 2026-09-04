@@ -140,6 +140,8 @@ async fn an_invoice_renders_with_the_issuing_msp(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
     set_branding(&app, &token, acme()).await;
@@ -185,6 +187,8 @@ async fn an_msp_with_no_branding_still_gets_a_valid_invoice(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
 
@@ -204,6 +208,8 @@ async fn a_rebrand_after_sending_leaves_the_invoice_byte_identical(pool: PgPool)
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
     set_branding(&app, &token, acme()).await;
@@ -241,6 +247,8 @@ async fn replacing_the_logo_after_sending_leaves_the_invoice_byte_identical(pool
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
     set_branding(&app, &token, acme()).await;
@@ -268,6 +276,8 @@ async fn a_draft_follows_current_branding(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
     set_branding(&app, &token, acme()).await;
@@ -298,6 +308,8 @@ async fn a_statement_renders_from_current_branding(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
     set_branding(&app, &token, acme()).await;
@@ -363,6 +375,8 @@ async fn the_pdf_routes_are_behind_the_billing_gate(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let (_tid, tech_email, tech_pw) = common::seed_user(
         &pool,
         common::DEFAULT_TENANT_ID,

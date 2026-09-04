@@ -53,6 +53,17 @@ async fn seed_portal_contact(pool: &PgPool, company_id: Uuid, email: &str) -> Uu
     id
 }
 
+/// PMS-993: make `contact_id` the billing contact of `company_id`, which is
+/// what grants the billing role and with it the portal invoice surface.
+async fn grant_billing_role(pool: &PgPool, company_id: Uuid, contact_id: Uuid) {
+    sqlx::query("UPDATE companies SET default_billing_contact_id = $1 WHERE id = $2")
+        .bind(contact_id)
+        .bind(company_id)
+        .execute(pool)
+        .await
+        .expect("grant billing role");
+}
+
 /// Seed a portal-enabled contact with NO password hash (the state right
 /// after an agent grants access but before the customer redeems their
 /// setup link). Returns its contact id.
@@ -391,7 +402,10 @@ async fn portal_tickets_are_company_scoped(pool: PgPool) {
 async fn portal_invoices_are_company_scoped(pool: PgPool) {
     let company_a = seed_company(&pool, "Company A").await;
     let company_b = seed_company(&pool, "Company B").await;
-    seed_portal_contact(&pool, company_a, "a@a.example").await;
+    let contact_a = seed_portal_contact(&pool, company_a, "a@a.example").await;
+    // PMS-993: the invoice routes require the billing role, so the contact
+    // that is meant to read them has to hold it.
+    grant_billing_role(&pool, company_a, contact_a).await;
     let invoice_a = seed_invoice(&pool, company_a, "INV-A-0001").await;
     let invoice_b = seed_invoice(&pool, company_b, "INV-B-0001").await;
     let app = common::boot(pool).await;
@@ -436,6 +450,64 @@ async fn portal_invoices_are_company_scoped(pool: PgPool) {
         reqwest::StatusCode::NOT_FOUND,
         "cross-company invoice read returns 404"
     );
+}
+
+// PMS-993: the invoice surface is the billing contact's. A portal contact of
+// the same company without the role is refused every invoice route, and the
+// refusal is a uniform 403 for a real same-company id and an unknown one
+// alike, so it never doubles as an existence oracle.
+#[sqlx::test]
+async fn portal_invoices_require_the_billing_role(pool: PgPool) {
+    let company = seed_company(&pool, "Company A").await;
+    let billing = seed_portal_contact(&pool, company, "billing@a.example").await;
+    seed_portal_contact(&pool, company, "plain@a.example").await;
+    grant_billing_role(&pool, company, billing).await;
+    let invoice = seed_invoice(&pool, company, "INV-A-0001").await;
+    let unknown = Uuid::new_v4();
+    let app = common::boot(pool).await;
+
+    let plain = portal_token(&app, "plain@a.example").await;
+    for path in [
+        "/api/v1/portal/invoices".to_string(),
+        format!("/api/v1/portal/invoices/{invoice}"),
+        format!("/api/v1/portal/invoices/{unknown}"),
+    ] {
+        let resp = app
+            .client
+            .get(app.url(&path))
+            .bearer_auth(&plain)
+            .send()
+            .await
+            .expect("no-role invoice read");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "{path} without the billing role is 403"
+        );
+    }
+    let pay = app
+        .client
+        .post(app.url(&format!("/api/v1/portal/invoices/{invoice}/pay")))
+        .bearer_auth(&plain)
+        .send()
+        .await
+        .expect("no-role pay");
+    assert_eq!(
+        pay.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "pay without the billing role is 403"
+    );
+
+    // The billing contact still reads it.
+    let holder = portal_token(&app, "billing@a.example").await;
+    let ok = app
+        .client
+        .get(app.url(&format!("/api/v1/portal/invoices/{invoice}")))
+        .bearer_auth(&holder)
+        .send()
+        .await
+        .expect("billing contact reads invoice");
+    assert!(ok.status().is_success(), "the billing contact reads it");
 }
 
 // AC4: the KB feed returns only articles visible to the contact's

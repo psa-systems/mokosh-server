@@ -332,6 +332,43 @@ impl BillingService {
         Ok(())
     }
 
+    /// Validate that `contact_id` is a contact of `company_id` in the caller's
+    /// tenant (PMS-993). `invoices.billing_contact_id` was bound straight from
+    /// the request at every write with no check at all, and FK checks bypass
+    /// RLS, so a caller could address an invoice to another tenant's contact:
+    /// the PMS-333 hole that `assert_payment_term_in_tenant` closes next door.
+    ///
+    /// Membership accepts either carrier, because both are live: the legacy
+    /// `contacts.company_id` scalar (which PMS-806 keeps as the mirror of the
+    /// primary link) and a `contact_companies` row for a contact who works at
+    /// several companies.
+    async fn assert_billing_contact_for_company(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<()> {
+        let found: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM contacts c \
+             WHERE c.tenant_id = $1 AND c.id = $3 \
+               AND (c.company_id = $2 \
+                    OR EXISTS(SELECT 1 FROM contact_companies l \
+                              WHERE l.tenant_id = $1 AND l.contact_id = c.id \
+                                AND l.company_id = $2)))",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(contact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !found {
+            return Err(AppError::BadRequest(
+                "billing_contact_id does not reference a contact of this company".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// PMS-990: the due date, and the term it came from.
     ///
     /// A given `due_date` wins, stored as given with whatever term the caller
@@ -644,6 +681,20 @@ impl BillingService {
         )
         .await?;
 
+        // PMS-993: FK checks bypass RLS, so an unvalidated `billing_contact_id`
+        // could address an invoice to another tenant's contact. Resolving an
+        // ABSENT one from the company is PMS-1016's scope, not this issue's.
+        let billing_contact_id = request.billing_contact_id;
+        if let Some(contact_id) = billing_contact_id {
+            Self::assert_billing_contact_for_company(
+                &mut tx,
+                tenant_id,
+                request.company_id,
+                contact_id,
+            )
+            .await?;
+        }
+
         let invoice_id = Uuid::new_v4();
         sqlx::query(
             r#"
@@ -662,7 +713,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(&invoice_number)
         .bind(request.company_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(request.invoice_date)
         .bind(due_date)
@@ -930,6 +981,18 @@ impl BillingService {
             Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, request.due_date)
                 .await?;
 
+        // PMS-993: same recipient rule as `create_invoice`.
+        let billing_contact_id = request.billing_contact_id;
+        if let Some(contact_id) = billing_contact_id {
+            Self::assert_billing_contact_for_company(
+                &mut tx,
+                tenant_id,
+                request.company_id,
+                contact_id,
+            )
+            .await?;
+        }
+
         // 4. Insert the invoice header. `balance_due` starts at `total`.
         let invoice_id = Uuid::new_v4();
         sqlx::query(
@@ -948,7 +1011,7 @@ impl BillingService {
         .bind(tenant_id)
         .bind(&invoice_number)
         .bind(request.company_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(request.contract_id)
         .bind(invoice_date)
         .bind(due_date)
@@ -1309,6 +1372,9 @@ impl BillingService {
         // so numbers stay gapless.
         let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
 
+        // Recipient stays unset at create; PMS-1016 owns resolving it.
+        let billing_contact_id: Option<Uuid> = None;
+
         sqlx::query(
             r#"
             INSERT INTO invoices (
@@ -1317,8 +1383,8 @@ impl BillingService {
                 subtotal, tax_amount, discount_amount, total, amount_paid,
                 balance_due, currency, notes, po_number, payment_term_id
             )
-            VALUES ($1, $2, $3, $4, NULL, $5, 'draft', $6, $7, 'net30', $8, $9,
-                    $10, $11, 0, $11, 'USD', $12, NULL, $13)
+            VALUES ($1, $2, $3, $4, $13, $5, 'draft', $6, $7, 'net30', $8, $9,
+                    $10, $11, 0, $11, 'USD', $12, NULL, $14)
             "#,
         )
         .bind(invoice_id)
@@ -1335,6 +1401,7 @@ impl BillingService {
         .bind(format!(
             "Recurring billing for {period_start} to {period_end}"
         ))
+        .bind(billing_contact_id)
         .bind(payment_term_id)
         .execute(&mut *tx)
         .await?;
@@ -2756,9 +2823,13 @@ impl BillingService {
         let total = subtotal + tax - discount;
         let balance_due = total - amount_paid;
 
-        // `sent_at` is stamped when the status first moves to `sent`.
+        // `sent_at` is stamped when the status first moves to `sent`. PMS-993:
+        // that transition is now named once and reused, because the recipient
+        // guard, the issuer freeze and the pay-now hook all key off it and a
+        // fourth copy of the condition is a fourth chance to drift.
         let status = request.status.unwrap_or(locked_status);
-        let sent_at = if matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none() {
+        let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
+        let sent_at = if just_sent {
             Some(Utc::now())
         } else {
             current.sent_at
@@ -2767,6 +2838,19 @@ impl BillingService {
         if let Some(pt) = request.payment_term_id {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
+        // PMS-993: FK checks bypass RLS, so an unvalidated `billing_contact_id`
+        // could address an invoice to another tenant's contact. Same hole
+        // `assert_payment_term_in_tenant` closes next door (PMS-333).
+        if let Some(contact_id) = request.billing_contact_id {
+            Self::assert_billing_contact_for_company(
+                &mut tx,
+                tenant_id,
+                current.company_id,
+                contact_id,
+            )
+            .await?;
+        }
+
         // PMS-990: a term change with no due date re-derives the due date
         // from the (possibly updated) invoice date, because an invoice moved
         // from Net 30 to Net 15 that kept its old due date would carry a term
@@ -2784,7 +2868,6 @@ impl BillingService {
             (_, given) => given,
         };
 
-        let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
         // PMS-992: the recipient is resolved BEFORE the transition, and a send
         // with nobody to email is refused rather than recorded. `sent` used to
         // mean "the operator pressed Send"; it now means the invoice was

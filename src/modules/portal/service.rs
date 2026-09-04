@@ -88,11 +88,22 @@ impl PortalAuthService {
             bool,
             Option<String>,
             Option<DateTime<Utc>>,
+            bool,
         )> = sqlx::query_as(
             r#"
                 SELECT c.id, c.tenant_id, c.company_id, c.email, c.first_name,
                        c.last_name, c.is_portal_user, c.portal_password_hash,
-                       c.portal_locked_until
+                       c.portal_locked_until,
+                       -- PMS-993: the billing role for the company this session
+                       -- scopes to, so the login response says up front whether
+                       -- the invoice surface is reachable. A correlated EXISTS,
+                       -- not a join: `company_id` is nullable, and a join would
+                       -- drop the row and turn a company-less contact's login
+                       -- into "unknown credential".
+                       EXISTS(SELECT 1 FROM companies co
+                              WHERE co.tenant_id = c.tenant_id
+                                AND co.id = c.company_id
+                                AND co.default_billing_contact_id = c.id)
                 FROM contacts c
                 INNER JOIN tenants t ON c.tenant_id = t.id
                 WHERE t.slug = $1 AND c.email = $2 AND t.status = 'active'
@@ -121,6 +132,7 @@ impl PortalAuthService {
             is_portal_user,
             hash,
             locked_until,
+            is_billing_contact,
         )) = row
         else {
             return Err(AppError::Unauthorized);
@@ -211,6 +223,7 @@ impl PortalAuthService {
                 email,
                 first_name,
                 last_name,
+                is_billing_contact,
             },
         })
     }
@@ -252,26 +265,41 @@ impl PortalAuthService {
     /// hydrates `first_name` / `last_name` for `/me`-style handlers after
     /// decoding the token (PMS-195). The cutoff comes back in the same read
     /// because the row is already being loaded. Scoped by `(tenant_id, id)`.
+    ///
+    /// PMS-993: `company_id` is the token's `cid` claim, and the billing role
+    /// rides along as a correlated EXISTS rather than a join. A join to
+    /// `companies` would drop the `contacts` row for a contact whose company is
+    /// missing, and this read IS MAPPS-532's revocation check: no row means the
+    /// middleware degrades to empty names instead of rejecting the token, so a
+    /// query that can lose the row turns sign-out-everywhere into a no-op.
     pub async fn contact_snapshot(
         &self,
         tenant_id: Uuid,
         contact_id: Uuid,
+        company_id: Uuid,
     ) -> AppResult<Option<PortalContactSnapshot>> {
-        let row: Option<(String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT first_name, last_name, portal_tokens_valid_from \
-             FROM contacts WHERE tenant_id = $1 AND id = $2",
+        let row: Option<(String, String, Option<DateTime<Utc>>, bool)> = sqlx::query_as(
+            "SELECT c.first_name, c.last_name, c.portal_tokens_valid_from, \
+                    EXISTS(SELECT 1 FROM companies co \
+                           WHERE co.tenant_id = c.tenant_id AND co.id = $3 \
+                             AND co.default_billing_contact_id = c.id) \
+             FROM contacts c WHERE c.tenant_id = $1 AND c.id = $2",
         )
         .bind(tenant_id)
         .bind(contact_id)
+        .bind(company_id)
         // PMS-692: `contacts` is RLS-covered; scope the read with the tenant GUC
         // so it does not fail closed on the NOBYPASSRLS serving connection.
         .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         Ok(row.map(
-            |(first_name, last_name, tokens_valid_from)| PortalContactSnapshot {
-                first_name,
-                last_name,
-                tokens_valid_from,
+            |(first_name, last_name, tokens_valid_from, is_billing_contact)| {
+                PortalContactSnapshot {
+                    first_name,
+                    last_name,
+                    tokens_valid_from,
+                    is_billing_contact,
+                }
             },
         ))
     }

@@ -133,6 +133,8 @@ async fn changing_a_catalog_price_does_not_reprice_a_document(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let product_id = a_product(&app, &token, "Licence", "100").await;
     let resp = invoice_with_product(&app, &token, company_id, &product_id, "100").await;
@@ -195,6 +197,8 @@ async fn a_sold_product_is_retired_rather_than_deleted(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let unsold = a_product(&app, &token, "Never sold", "10").await;
     let sold = a_product(&app, &token, "Sold once", "10").await;
@@ -384,6 +388,8 @@ async fn a_foreign_product_is_refused_and_no_line_is_written(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     // A product belonging to nobody this caller can see.
     let other_tenant = uuid::Uuid::new_v4();
@@ -443,6 +449,8 @@ async fn a_line_with_no_product_is_unaffected(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let resp = app
         .client
@@ -480,6 +488,8 @@ async fn replacing_the_lines_keeps_the_product_link(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let first = a_product(&app, &token, "First", "10").await;
     let second = a_product(&app, &token, "Second", "20").await;
