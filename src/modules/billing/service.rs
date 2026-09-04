@@ -1597,10 +1597,6 @@ impl BillingService {
         .execute(&mut *tx)
         .await?;
 
-        // PMS-1029: a recurring invoice names no rate, so the tenant's default
-        // applies over the lines just written.
-        Self::apply_tax(&mut tx, tenant_id, invoice_id, None, None, Decimal::ZERO).await?;
-
         // --- 2. Reserve the period in the ledger. If the period was
         // already billed, ON CONFLICT DO NOTHING returns no row: roll
         // back the whole transaction (invoice header + sequence bump
@@ -1676,6 +1672,10 @@ impl BillingService {
             .execute(&mut *tx)
             .await?;
         }
+
+        // PMS-1029: a recurring invoice names no rate, so the tenant's default
+        // applies over the lines just written.
+        Self::apply_tax(&mut tx, tenant_id, invoice_id, None, None, Decimal::ZERO).await?;
 
         // --- 4. Audit row in the same transaction. CREATE: old = None. ---
         let after: Option<serde_json::Value> = sqlx::query_scalar(
