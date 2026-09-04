@@ -450,3 +450,63 @@ async fn readiness_no_invoices_read_cap_403(pool: PgPool) {
         "MAPPS-666: contact without invoices:read must 403"
     );
 }
+
+// MAPPS-705: `dashboard/summary` must not leak counts / recent-activity
+// rows past the caller's read caps.
+
+#[sqlx::test]
+async fn dashboard_summary_hides_invoices_from_no_invoices_read_cap(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    // Support Contact holds tickets:* but NOT invoices:read.
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "dash-nocap", &["Support Contact"]).await;
+    let _invoice_id = seed_sent_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/contact/dashboard/summary"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["unpaid_invoices"].as_i64(),
+        Some(0),
+        "MAPPS-705: contact without invoices:read must see zero on the unpaid_invoices tile, got {body}"
+    );
+    let activity = body["recent_activity"].as_array().expect("recent_activity");
+    assert!(
+        activity.iter().all(|r| r["kind"].as_str() != Some("invoice")),
+        "MAPPS-705: no invoice row may appear in recent_activity for a contact without invoices:read, got {body}"
+    );
+}
+
+#[sqlx::test]
+async fn dashboard_summary_surfaces_invoices_when_caller_holds_invoices_read(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "dash-billing", &["Billing Contact"]).await;
+    let _invoice_id = seed_sent_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/contact/dashboard/summary"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["unpaid_invoices"].as_i64(),
+        Some(1),
+        "MAPPS-705: contact with invoices:read must see the seeded sent invoice"
+    );
+    let activity = body["recent_activity"].as_array().expect("recent_activity");
+    assert!(
+        activity.iter().any(|r| r["kind"].as_str() == Some("invoice")),
+        "MAPPS-705: invoice row must appear in recent_activity for a contact holding invoices:read, got {body}"
+    );
+}

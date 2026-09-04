@@ -402,9 +402,11 @@ async fn dashboard_summary(
     RequireContactAuth(session): RequireContactAuth,
 ) -> AppResult<Json<ContactDashboardSummary>> {
     let tenant = TenantId::from_trusted(session.tenant_id);
+    // MAPPS-705: pass the caller's capabilities so the aggregator can
+    // skip the tiles + activity rows the caller cannot open.
     let summary = state
         .service
-        .dashboard_summary(tenant, session.company_id)
+        .dashboard_summary(tenant, session.company_id, &session.caps)
         .await?;
     Ok(Json(summary))
 }

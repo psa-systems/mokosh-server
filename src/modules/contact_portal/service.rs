@@ -1608,47 +1608,82 @@ impl ContactAuthService {
         &self,
         tenant_id: TenantId,
         company_id: Uuid,
+        caps: &[String],
     ) -> AppResult<super::models::ContactDashboardSummary> {
+        // MAPPS-705: gate each aggregate + activity section on the
+        // caller's capabilities. A tile whose underlying list the
+        // caller cannot open must not surface its count, and the
+        // recent-activity feed must not leak the existence of rows the
+        // caller could not click into. A contact holding zero caps
+        // sees zero rows across the board, which is what the
+        // empty-state SPA landing renders.
+        let has = |cap: &str| caps.iter().any(|c| c == cap);
+        let can_read_tickets = has(super::capabilities::TICKETS_READ);
+        let can_read_invoices = has(super::capabilities::INVOICES_READ);
+        let can_read_quotes = has(super::capabilities::QUOTES_READ);
+        let can_read_contracts = has(super::capabilities::CONTRACTS_READ);
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let open_tickets: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::BIGINT FROM tickets t \
-             INNER JOIN ticket_statuses s ON s.id = t.status_id \
-             WHERE t.tenant_id = $1 AND t.company_id = $2 AND s.is_closed = FALSE",
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let unpaid_invoices: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::BIGINT FROM invoices \
-             WHERE tenant_id = $1 AND company_id = $2 \
-               AND balance_due > 0 \
-               AND status NOT IN ('paid', 'void', 'written_off')",
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let active_quotes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::BIGINT FROM quotes \
-             WHERE tenant_id = $1 AND company_id = $2 AND status = 'sent'",
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let active_contracts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::BIGINT FROM contracts \
-             WHERE tenant_id = $1 AND company_id = $2 AND status = 'active'",
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let open_tickets: i64 = if can_read_tickets {
+            sqlx::query_scalar(
+                "SELECT COUNT(*)::BIGINT FROM tickets t \
+                 INNER JOIN ticket_statuses s ON s.id = t.status_id \
+                 WHERE t.tenant_id = $1 AND t.company_id = $2 AND s.is_closed = FALSE",
+            )
+            .bind(tenant_id)
+            .bind(company_id)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            0
+        };
+        let unpaid_invoices: i64 = if can_read_invoices {
+            sqlx::query_scalar(
+                "SELECT COUNT(*)::BIGINT FROM invoices \
+                 WHERE tenant_id = $1 AND company_id = $2 \
+                   AND balance_due > 0 \
+                   AND status NOT IN ('paid', 'void', 'written_off')",
+            )
+            .bind(tenant_id)
+            .bind(company_id)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            0
+        };
+        let active_quotes: i64 = if can_read_quotes {
+            sqlx::query_scalar(
+                "SELECT COUNT(*)::BIGINT FROM quotes \
+                 WHERE tenant_id = $1 AND company_id = $2 AND status = 'sent'",
+            )
+            .bind(tenant_id)
+            .bind(company_id)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            0
+        };
+        let active_contracts: i64 = if can_read_contracts {
+            sqlx::query_scalar(
+                "SELECT COUNT(*)::BIGINT FROM contracts \
+                 WHERE tenant_id = $1 AND company_id = $2 AND status = 'active'",
+            )
+            .bind(tenant_id)
+            .bind(company_id)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            0
+        };
         // Recent-activity feed: one UNION ALL across the four
         // Company-scoped entities so the top-10 slice is a single
         // round-trip. The `kind` column doubles as the SPA's routing
         // discriminator (ticket vs invoice vs quote vs contract).
+        // MAPPS-705: each arm is gated by its capability so a
+        // contact without `invoices:read` never sees an invoice row
+        // in this list. A `SELECT ... WHERE FALSE` collapses to
+        // zero rows, which the query planner drops entirely, so the
+        // shape stays a single statement.
         let activity_rows: Vec<(String, Uuid, String, chrono::DateTime<chrono::Utc>)> =
             sqlx::query_as(
                 r#"
@@ -1656,22 +1691,22 @@ impl ContactAuthService {
                     SELECT 'ticket'::TEXT AS kind, t.id AS id, t.title AS summary,
                            GREATEST(t.updated_at, t.created_at) AS occurred_at
                     FROM tickets t
-                    WHERE t.tenant_id = $1 AND t.company_id = $2
+                    WHERE t.tenant_id = $1 AND t.company_id = $2 AND $3
                     UNION ALL
                     SELECT 'invoice'::TEXT, i.id, i.invoice_number,
                            GREATEST(i.updated_at, i.created_at)
                     FROM invoices i
-                    WHERE i.tenant_id = $1 AND i.company_id = $2
+                    WHERE i.tenant_id = $1 AND i.company_id = $2 AND $4
                     UNION ALL
                     SELECT 'quote'::TEXT, q.id, COALESCE(q.title, q.quote_number),
                            GREATEST(q.updated_at, q.created_at)
                     FROM quotes q
-                    WHERE q.tenant_id = $1 AND q.company_id = $2
+                    WHERE q.tenant_id = $1 AND q.company_id = $2 AND $5
                     UNION ALL
                     SELECT 'contract'::TEXT, c.id, c.name,
                            GREATEST(c.updated_at, c.created_at)
                     FROM contracts c
-                    WHERE c.tenant_id = $1 AND c.company_id = $2
+                    WHERE c.tenant_id = $1 AND c.company_id = $2 AND $6
                 ) feed
                 ORDER BY occurred_at DESC
                 LIMIT 10
@@ -1679,6 +1714,10 @@ impl ContactAuthService {
             )
             .bind(tenant_id)
             .bind(company_id)
+            .bind(can_read_tickets)
+            .bind(can_read_invoices)
+            .bind(can_read_quotes)
+            .bind(can_read_contracts)
             .fetch_all(&mut *tx)
             .await?;
         drop(tx);
