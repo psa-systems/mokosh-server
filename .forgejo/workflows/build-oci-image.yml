@@ -7,12 +7,7 @@ name: Build OCI container
 on:
   push:
     branches:
-      # TEMPORARY: `main` disabled while mokosh-contact-login is the only
-      # staging build. Uncomment to restore `:latest` from main. The
-      # matching `main` half of the job's `if:` ref-guard below and the
-      # `["main"] ++` in scripts/check-oci-publish-tags.nu are commented
-      # out for the same reason; flip all three together.
-      #- "main"
+      - "main"
       # Allow-listed feature branches publish their own branch tag and never
       # :latest, so staging can run a branch (PMS-733). Keep this list in sync
       # with BRANCH_ALLOW_LIST in oci-build/get-tags.nu; scripts/check-oci-publish-tags.nu
