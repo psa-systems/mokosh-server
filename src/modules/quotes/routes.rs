@@ -72,6 +72,12 @@ pub fn quotes_routes(service: QuotesService) -> Router {
         .with_state(state)
 }
 
+/// Today where a staff caller is (PMS-1027). The caller-context handlers
+/// use `CallerContext::today`, which also answers for a contact.
+fn today_for(user_tz: &str) -> chrono::NaiveDate {
+    mokosh_types::datetime::user_today(chrono::Utc::now(), user_tz)
+}
+
 async fn list_quotes(
     State(state): State<QuotesRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -90,7 +96,7 @@ async fn list_quotes(
     }
     let (quotes, total) = state
         .service
-        .list_quotes(tenant, &filter, &pagination)
+        .list_quotes(tenant, caller.today(&db).await?, &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         quotes,
@@ -111,7 +117,10 @@ async fn get_quote(
             caller.require_capability(caps::QUOTES_READ, &db).await?;
         }
     }
-    let quote = state.service.get_quote(caller.tenant(), quote_id).await?;
+    let quote = state
+        .service
+        .get_quote(caller.tenant(), quote_id, caller.today(&db).await?)
+        .await?;
     if let CallerContext::Contact(session) = &caller {
         // mokosh-contact-login prompt 008: 404 (not 403) on a foreign
         // Company so a contact cannot probe for another Company's
@@ -159,7 +168,10 @@ async fn get_quote_pdf(
                 .await?;
         }
     }
-    let quote = state.service.get_quote(caller.tenant(), quote_id).await?;
+    let quote = state
+        .service
+        .get_quote(caller.tenant(), quote_id, caller.today(&db).await?)
+        .await?;
     if let CallerContext::Contact(session) = &caller {
         if quote.company_id != session.company_id {
             return Err(AppError::NotFound("Quote".to_string()));
@@ -235,7 +247,13 @@ async fn contact_decide(
     };
     let quote = state
         .service
-        .decide_quote(caller.tenant(), quote_id, &decision, ctx)
+        .decide_quote(
+            caller.tenant(),
+            caller.today(db).await?,
+            quote_id,
+            &decision,
+            ctx,
+        )
         .await?;
     Ok(Json(quote))
 }
@@ -250,7 +268,13 @@ async fn create_quote(
     request.validate()?;
     let quote = state
         .service
-        .create_quote(user.tenant(), user.id, &request, &ctx)
+        .create_quote(
+            user.tenant(),
+            today_for(&user.timezone),
+            user.id,
+            &request,
+            &ctx,
+        )
         .await?;
     Ok(Json(quote))
 }
@@ -266,7 +290,13 @@ async fn update_quote(
     request.validate()?;
     let quote = state
         .service
-        .update_quote(user.tenant(), quote_id, &request, &ctx)
+        .update_quote(
+            user.tenant(),
+            today_for(&user.timezone),
+            quote_id,
+            &request,
+            &ctx,
+        )
         .await?;
     Ok(Json(quote))
 }
@@ -297,7 +327,7 @@ async fn add_line(
     request.validate()?;
     let quote = state
         .service
-        .add_line(user.tenant(), quote_id, &request)
+        .add_line(user.tenant(), today_for(&user.timezone), quote_id, &request)
         .await?;
     Ok(Json(quote))
 }
@@ -312,7 +342,13 @@ async fn update_line(
     request.validate()?;
     let quote = state
         .service
-        .update_line(user.tenant(), quote_id, line_id, &request)
+        .update_line(
+            user.tenant(),
+            today_for(&user.timezone),
+            quote_id,
+            line_id,
+            &request,
+        )
         .await?;
     Ok(Json(quote))
 }
@@ -325,7 +361,7 @@ async fn delete_line(
 ) -> AppResult<Json<QuoteResponse>> {
     let quote = state
         .service
-        .delete_line(user.tenant(), quote_id, line_id)
+        .delete_line(user.tenant(), today_for(&user.timezone), quote_id, line_id)
         .await?;
     Ok(Json(quote))
 }
@@ -341,7 +377,7 @@ async fn send_quote(
 ) -> AppResult<Json<QuoteResponse>> {
     let quote = state
         .service
-        .send_quote(user.tenant(), quote_id, &ctx)
+        .send_quote(user.tenant(), today_for(&user.timezone), quote_id, &ctx)
         .await?;
     Ok(Json(quote))
 }
@@ -364,7 +400,13 @@ async fn convert_quote(
     request.validate()?;
     let quote = state
         .service
-        .convert_quote(user.tenant(), quote_id, &request, &ctx)
+        .convert_quote(
+            user.tenant(),
+            today_for(&user.timezone),
+            quote_id,
+            &request,
+            &ctx,
+        )
         .await?;
     Ok(Json(quote))
 }

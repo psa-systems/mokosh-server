@@ -416,7 +416,7 @@ async fn create_invoice_from_time_entries(
     request.validate()?;
     let inv = state
         .service
-        .create_invoice_from_time_entries(user.tenant(), &request, &ctx)
+        .create_invoice_from_time_entries(user.tenant(), &user.timezone, &request, &ctx)
         .await?;
     Ok(Json(inv))
 }
@@ -546,7 +546,7 @@ async fn create_credit_note(
     request.validate()?;
     let note = state
         .service
-        .create_credit_note(user.tenant(), &request, &ctx)
+        .create_credit_note(user.tenant(), &user.timezone, &request, &ctx)
         .await?;
     Ok(Json(note))
 }

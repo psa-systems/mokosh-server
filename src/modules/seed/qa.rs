@@ -360,7 +360,7 @@ impl QaSeeder {
 
                 for task_spec in qa_task_specs(pi, phase.id, task_status_id, user_id) {
                     self.projects
-                        .create_task(tenant, project.id, &task_spec, &ctx)
+                        .create_task(tenant, "UTC", project.id, &task_spec, &ctx)
                         .await?;
                     report.tasks += 1;
                 }
@@ -466,7 +466,7 @@ impl QaSeeder {
             )
             .await?;
         self.billing
-            .create_credit_note(tenant, &qa_credit_note_spec(credited.id), &ctx)
+            .create_credit_note(tenant, "UTC", &qa_credit_note_spec(credited.id), &ctx)
             .await?;
         report.credit_notes += 1;
 

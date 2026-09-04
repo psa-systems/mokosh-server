@@ -373,6 +373,30 @@ pub async fn read_track_breaks(db: &Database, tenant_id: TenantId) -> AppResult<
     Ok(value.and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
+/// PMS-1028: the currency an invoice is issued in when nothing names one
+/// (`billing_prefs/currency`, a 3-letter ISO 4217 code the settings route
+/// validates). Unset means `USD`, which is what every writer hardcoded
+/// before, so nothing moves for a tenant that configured nothing.
+///
+/// Takes the caller's tenant-GUC connection rather than the pool: the three
+/// invoice writers and the credit note read it inside the transaction that
+/// inserts the row, and `tenant_settings` is RLS-covered.
+pub async fn read_default_currency(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+) -> AppResult<String> {
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'billing_prefs' AND key = 'currency'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(value
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "USD".to_string()))
+}
+
 /// PMS-469: read the fallback `companies.id` that the email-intake
 /// service should use when auto-creating contacts for unknown
 /// senders. `Ok(None)` when unset (or malformed) - the caller treats

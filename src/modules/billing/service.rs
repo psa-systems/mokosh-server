@@ -1,7 +1,9 @@
 //! Billing service. Endpoints land incrementally across PMS-33.
 
 use crate::modules::auth::TenantId;
+use crate::modules::settings::read_default_currency;
 use chrono::{DateTime, NaiveDate, Utc};
+use mokosh_types::datetime::user_today;
 
 use crate::modules::contracts::service::CycleStep;
 use rust_decimal::Decimal;
@@ -735,6 +737,11 @@ impl BillingService {
         .await?;
 
         let invoice_id = Uuid::new_v4();
+        // PMS-1028: the tenant's default currency unless the caller names one.
+        let currency = match request.currency.as_deref() {
+            Some(c) => c.to_string(),
+            None => read_default_currency(&mut tx, tenant_id).await?,
+        };
         sqlx::query(
             r#"
             INSERT INTO invoices (
@@ -761,7 +768,7 @@ impl BillingService {
         .bind(tax)
         .bind(discount)
         .bind(total)
-        .bind(request.currency.as_deref().unwrap_or("USD"))
+        .bind(&currency)
         .bind(&request.notes)
         .bind(&request.po_number)
         .bind(payment_term_id)
@@ -860,6 +867,7 @@ impl BillingService {
     pub async fn create_invoice_from_time_entries(
         &self,
         tenant_id: TenantId,
+        user_tz: &str,
         request: &CreateInvoiceFromTimeEntriesRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
@@ -1011,11 +1019,13 @@ impl BillingService {
         let discount = Decimal::ZERO;
         let total = subtotal + tax - discount;
 
-        // Default the invoice date to today when the caller omits it, and
-        // the due date to what the tenant's default term implies (PMS-990).
+        // Default the invoice date to today IN THE CALLER'S ZONE when the
+        // caller omits it (PMS-1027: the UTC day put an evening invoice in
+        // the Americas on tomorrow), and the due date to what the tenant's
+        // default term implies (PMS-990), counted from that date.
         let invoice_date = request
             .invoice_date
-            .unwrap_or_else(|| Utc::now().date_naive());
+            .unwrap_or_else(|| user_today(Utc::now(), user_tz));
         let (due_date, payment_term_id) =
             Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, request.due_date)
                 .await?;
@@ -1031,6 +1041,11 @@ impl BillingService {
 
         // 4. Insert the invoice header. `balance_due` starts at `total`.
         let invoice_id = Uuid::new_v4();
+        // PMS-1028: the tenant's default currency unless the caller names one.
+        let currency = match request.currency.as_deref() {
+            Some(c) => c.to_string(),
+            None => read_default_currency(&mut tx, tenant_id).await?,
+        };
         sqlx::query(
             r#"
             INSERT INTO invoices (
@@ -1056,7 +1071,7 @@ impl BillingService {
         .bind(tax)
         .bind(discount)
         .bind(total)
-        .bind(request.currency.as_deref().unwrap_or("USD"))
+        .bind(&currency)
         .bind(&request.notes)
         .bind(&request.po_number)
         .bind(payment_term_id)
@@ -1423,7 +1438,7 @@ impl BillingService {
                 balance_due, currency, notes, po_number, payment_term_id
             )
             VALUES ($1, $2, $3, $4, $13, $5, 'draft', $6, $7, 'net30', $8, $9,
-                    $10, $11, 0, $11, 'USD', $12, NULL, $14)
+                    $10, $11, 0, $11, $15, $12, NULL, $14)
             "#,
         )
         .bind(invoice_id)
@@ -1442,6 +1457,9 @@ impl BillingService {
         ))
         .bind(billing_contact_id)
         .bind(payment_term_id)
+        // PMS-1028: a recurring invoice names nothing, so it is issued in
+        // the tenant's default currency.
+        .bind(read_default_currency(&mut tx, tenant_id).await?)
         .execute(&mut *tx)
         .await?;
 
@@ -2385,6 +2403,8 @@ impl BillingService {
             None => None,
         };
 
+        // `invoices.currency` is set by every writer (PMS-1028); the fallback
+        // covers rows older than the column's population only.
         let currency = invoice.currency.as_deref().unwrap_or("USD");
         let params = CheckoutParams {
             tenant_id: tenant_id.get(),
@@ -3513,6 +3533,7 @@ impl BillingService {
             }
             _ => None,
         };
+        // Same fallback as the checkout: rows older than the column only.
         let currency = invoice.currency.as_deref().unwrap_or("USD");
         let amount_due = format!("{} {}", invoice.balance_due, currency);
         let due_date = invoice.due_date.to_string();
@@ -3850,6 +3871,7 @@ impl BillingService {
     pub async fn create_credit_note(
         &self,
         tenant_id: TenantId,
+        user_tz: &str,
         request: &CreateCreditNoteRequest,
         ctx: &AuditCtx,
     ) -> AppResult<CreditNoteResponse> {
@@ -3928,16 +3950,20 @@ impl BillingService {
 
         let credit_note_id = Uuid::new_v4();
         let number = Self::next_credit_note_number(&mut tx, tenant_id).await?;
+        // PMS-1027: today in the caller's zone. The note is issued the instant
+        // it exists (PMS-953) and its document is stored in this transaction
+        // (PMS-959), so a wrong day here is on paper the customer keeps.
         let issue_date = request
             .issue_date
-            .unwrap_or_else(|| chrono::Utc::now().date_naive());
+            .unwrap_or_else(|| user_today(chrono::Utc::now(), user_tz));
         // The invoice's currency unless the caller names one, so the two
         // documents cannot silently disagree about what is being credited.
-        let currency = request
-            .currency
-            .clone()
-            .or(invoice_currency)
-            .unwrap_or_else(|| "USD".to_string());
+        let currency = match request.currency.clone().or(invoice_currency) {
+            Some(c) => c,
+            // PMS-1028: an invoice older than the currency column's population
+            // has none to inherit; the tenant's default is the next best answer.
+            None => read_default_currency(&mut tx, tenant_id).await?,
+        };
 
         sqlx::query(
             r#"
