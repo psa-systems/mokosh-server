@@ -15,7 +15,8 @@ use mokosh_types::tickets::BillingStatus;
 
 #[derive(Clone)]
 pub struct TimeTrackingService {
-    db: Database,
+    /// Shared with `work_day.rs`, the PMS-950 half of this service.
+    pub(super) db: Database,
 }
 
 impl TimeTrackingService {

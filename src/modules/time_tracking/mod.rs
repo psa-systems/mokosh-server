@@ -12,6 +12,8 @@ mod models;
 mod routes;
 #[cfg(feature = "server")]
 mod service;
+#[cfg(feature = "server")]
+mod work_day;
 
 pub use models::*;
 #[cfg(feature = "server")]
