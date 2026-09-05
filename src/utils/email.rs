@@ -72,6 +72,18 @@ pub struct InvoiceSent<'a> {
     pub pdf: Option<&'a [u8]>,
 }
 
+/// PMS-1037: what a reminder about an overdue invoice says. The same fields
+/// as [`InvoiceSent`] plus how far past due it is.
+#[derive(Debug, Clone, Copy)]
+pub struct InvoiceReminder<'a> {
+    pub invoice_number: &'a str,
+    pub amount_due: &'a str,
+    pub due_date: &'a str,
+    pub days_overdue: i64,
+    pub portal_link: Option<&'a str>,
+    pub pdf: Option<&'a [u8]>,
+}
+
 /// A file carried by a message (PMS-991).
 #[derive(Debug, Clone, Copy)]
 pub struct EmailAttachment<'a> {
@@ -215,6 +227,35 @@ pub trait Mailer: Send + Sync {
         );
         let filename = format!("{invoice_number}.pdf");
         let attachments: Vec<EmailAttachment<'_>> = pdf
+            .map(|bytes| EmailAttachment {
+                filename: &filename,
+                mime: "application/pdf",
+                bytes,
+            })
+            .into_iter()
+            .collect();
+        self.send_with_attachments(to, &subject, &body, &attachments)
+            .await
+    }
+
+    /// PMS-1037: a reminder that an invoice is past due. Composed by
+    /// [`compose_invoice_reminder`] and routed through
+    /// [`Mailer::send_with_attachments`] like the invoice itself, so every
+    /// mailer inherits it and a test mailer records it the same way.
+    async fn send_invoice_reminder(
+        &self,
+        to: &str,
+        from: SenderIdentity<'_>,
+        reminder: InvoiceReminder<'_>,
+    ) -> AppResult<()> {
+        let SenderIdentity {
+            org_name,
+            contact_line,
+        } = from;
+        let (subject, body) = compose_invoice_reminder(org_name, contact_line, reminder);
+        let filename = format!("{}.pdf", reminder.invoice_number);
+        let attachments: Vec<EmailAttachment<'_>> = reminder
+            .pdf
             .map(|bytes| EmailAttachment {
                 filename: &filename,
                 mime: "application/pdf",
@@ -501,6 +542,50 @@ pub fn compose_invoice_sent(
     (subject, body)
 }
 
+/// The reminder email's subject and body (PMS-1037). Names the amount, the
+/// due date and how many days past it the invoice is; the pay link and the
+/// attachment are mentioned only when present, as in [`compose_invoice_sent`].
+pub fn compose_invoice_reminder(
+    org_name: &str,
+    contact_line: &str,
+    reminder: InvoiceReminder<'_>,
+) -> (String, String) {
+    let InvoiceReminder {
+        invoice_number,
+        amount_due,
+        due_date,
+        days_overdue,
+        portal_link,
+        pdf,
+    } = reminder;
+    let days = if days_overdue == 1 {
+        "1 day".to_string()
+    } else {
+        format!("{days_overdue} days")
+    };
+    let attached = if pdf.is_some() {
+        format!("The invoice is attached as {invoice_number}.pdf.\n\n")
+    } else {
+        String::new()
+    };
+    let pay = match portal_link {
+        Some(link) => format!("Review the invoice and pay online here:\n\n{link}\n\n"),
+        None => String::new(),
+    };
+    let body = format!(
+        "This is a reminder from {org_name} that an invoice is past due.\n\n\
+         Invoice: {invoice_number}\n\
+         Amount due: {amount_due}\n\
+         Due: {due_date} ({days} ago)\n\n\
+         {attached}\
+         {pay}\
+         If you have already paid, please disregard this message.\n\n\
+         {contact_line}"
+    );
+    let subject = format!("Reminder: invoice {invoice_number} from {org_name} is {days} overdue");
+    (subject, body)
+}
+
 /// Assemble a plain-text message carrying files (PMS-991): `multipart/mixed`
 /// with the text first and each attachment after it. Free, like
 /// [`build_message`], so a unit test can inspect the bytes.
@@ -722,6 +807,49 @@ impl Mailer for SharedMailer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PMS-1037: the reminder names the amount, the due date and how far
+    /// past it the invoice is, and mentions the link and the attachment only
+    /// when they are there.
+    #[test]
+    fn the_reminder_says_how_overdue_and_only_what_is_there() {
+        let (subject, body) = compose_invoice_reminder(
+            "Acme MSP",
+            "Reply to ap@acme.example",
+            InvoiceReminder {
+                invoice_number: "INV-000042",
+                amount_due: "150.00 USD",
+                due_date: "2026-08-01",
+                days_overdue: 7,
+                portal_link: None,
+                pdf: Some(b"%PDF"),
+            },
+        );
+        assert_eq!(
+            subject,
+            "Reminder: invoice INV-000042 from Acme MSP is 7 days overdue"
+        );
+        assert!(body.contains("Due: 2026-08-01 (7 days ago)"), "{body}");
+        assert!(body.contains("attached as INV-000042.pdf"), "{body}");
+        assert!(!body.contains("pay online"), "{body}");
+        assert!(body.ends_with("Reply to ap@acme.example"), "{body}");
+
+        let (subject, body) = compose_invoice_reminder(
+            "Acme MSP",
+            "",
+            InvoiceReminder {
+                invoice_number: "INV-1",
+                amount_due: "1.00 USD",
+                due_date: "2026-08-01",
+                days_overdue: 1,
+                portal_link: Some("https://portal.example/portal/invoices/x"),
+                pdf: None,
+            },
+        );
+        assert!(subject.ends_with("is 1 day overdue"), "{subject}");
+        assert!(body.contains("https://portal.example/portal/invoices/x"));
+        assert!(!body.contains("attached"), "{body}");
+    }
 
     fn test_from() -> Mailbox {
         "Mokosh <noreply@mokosh.example>".parse().unwrap()
