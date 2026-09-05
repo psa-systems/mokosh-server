@@ -33,6 +33,47 @@ pub struct ContractResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+/// PMS-1061: what a contact receives for a contract, on the dual-plane
+/// reads. The MSP's `notes` are agent scratch and never reach the customer;
+/// `sla_id`, `signed_by_contact_id`, `auto_renew` and the timestamps are
+/// the MSP's own bookkeeping. The billing cycle and amount stay: the
+/// customer signed them. This is the shape the retired portal router
+/// served (`PortalContract`), which PMS-1025's sweep replaced with the
+/// staff type by accident. Every key is always present (`null` when
+/// unset) so the customer-facing shape is stable.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactContractResponse {
+    pub id: Uuid,
+    /// The caller's own company: what the session already says, never a
+    /// foreign one, since the scope check runs before the projection.
+    pub company_id: Uuid,
+    pub contract_number: Option<String>,
+    pub name: String,
+    pub contract_type: String,
+    pub status: String,
+    pub start_date: NaiveDate,
+    pub end_date: Option<NaiveDate>,
+    pub billing_cycle: String,
+    pub billing_amount: Option<Decimal>,
+}
+
+impl From<ContractResponse> for ContactContractResponse {
+    fn from(c: ContractResponse) -> Self {
+        Self {
+            id: c.id,
+            company_id: c.company_id,
+            contract_number: c.contract_number,
+            name: c.name,
+            contract_type: c.contract_type,
+            status: c.status,
+            start_date: c.start_date,
+            end_date: c.end_date,
+            billing_cycle: c.billing_cycle,
+            billing_amount: c.billing_amount,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct ContractFilter {
     pub company_id: Option<Uuid>,

@@ -24,6 +24,15 @@ endpoint, extend one of these files.
   on the list path, OR refuses (404 - stay enumeration-resistant) when
   the returned row's `company_id != session.company_id` on the detail
   path, OR the endpoint only ever returns the caller's own data.
+- **SCOPED** says which ROWS a contact may read. Which FIELDS is a
+  second question with its own answer (PMS-1061): a dual-plane read
+  handler's contact arm answers with the entity's contact projection
+  (`ContactContractResponse`, `ContactAssetResponse`,
+  `ContactProjectResponse`), never the staff type, because the staff
+  type carries the MSP's notes, rates, budgets, purchase prices, network
+  identity and assignees. A new dual-plane read of an entity with any
+  such field needs a projection and a case in
+  `tests/contact_dto_projection.rs`.
 - **N/A**: auth / session lifecycle (login, refresh, logout, set +
   reset + forgot password), the public `/host` and
   `/resolve-to-portal-id` hooks, and any endpoint that never returns
@@ -61,16 +70,16 @@ endpoint, extend one of these files.
 
 | method path | handler | verdict |
 |---|---|---|
-| GET  /assets | `list_assets` | SCOPED (force-set `filter.company_id`) |
-| GET  /assets/{id} | `get_asset` | SCOPED (404 on foreign) |
+| GET  /assets | `list_assets` | SCOPED (force-set `filter.company_id`; rows are `ContactAssetResponse`, PMS-1061) |
+| GET  /assets/{id} | `get_asset` | SCOPED (404 on foreign; `ContactAssetResponse`, PMS-1061) |
 | POST /assets/{id}/report-issue | `report_asset_issue` | SCOPED (portal uses `asset.company_id`) |
-| GET  /contracts | `list_contracts` | SCOPED |
-| GET  /contracts/{id} | `get_contract` | SCOPED |
+| GET  /contracts | `list_contracts` | SCOPED (rows are `ContactContractResponse`, PMS-1061) |
+| GET  /contracts/{id} | `get_contract` | SCOPED (`ContactContractResponse`, PMS-1061) |
 | GET  /invoices | `list_invoices` | SCOPED |
 | GET  /invoices/{id} | `get_invoice` | SCOPED |
 | GET  /invoices/{id}/pdf | `get_invoice_pdf` | SCOPED (501 body, gates first) |
-| GET  /projects | `list_projects` | SCOPED (NULL house projects implicitly excluded) |
-| GET  /projects/{id} | `get_project` | SCOPED |
+| GET  /projects | `list_projects` | SCOPED (NULL house projects implicitly excluded; rows are `ContactProjectResponse`, PMS-1061) |
+| GET  /projects/{id} | `get_project` | SCOPED (`ContactProjectResponse`, PMS-1061) |
 | GET  /quotes | `list_quotes` | SCOPED (`list_quotes_for_company`: own company AND issued statuses only, PMS-1060) |
 | GET  /quotes/{id} | `get_quote` | SCOPED (`get_quote_for_company`: 404 on foreign OR un-issued, PMS-1060) |
 | GET  /quotes/{id}/pdf | `get_quote_pdf` | SCOPED (same read as `get_quote`, PMS-1060; 501 body, gates first) |

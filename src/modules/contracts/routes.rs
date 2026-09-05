@@ -70,7 +70,8 @@ async fn list_contracts(
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Query(mut f): Query<ContractFilter>,
     Query(pagination): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<ContractResponse>>> {
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     f.validate()?;
     // PMS-935: dual-plane sweep. Staff branch keeps the pre-sweep
     // RequireContracts + RequireFinance role gate via
@@ -78,6 +79,8 @@ async fn list_contracts(
     // effective `contracts:read` capability from `portal_roles` per
     // request and forces the filter's `company_id` to the session's
     // Company so a spoofed query param cannot widen visibility.
+    // PMS-1061: the contact arm answers with `ContactContractResponse`,
+    // the customer's projection, never the staff type.
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => assert_staff_contracts_finance(auth)?,
@@ -87,11 +90,20 @@ async fn list_contracts(
         }
     }
     let (items, total) = s.service.list_contracts(tenant, &f, &pagination).await?;
-    Ok(Json(PaginatedResponse::from_params(
-        items,
-        &pagination,
-        total,
-    )))
+    Ok(match &caller {
+        CallerContext::Staff(_) => {
+            Json(PaginatedResponse::from_params(items, &pagination, total)).into_response()
+        }
+        CallerContext::Contact(_) => Json(PaginatedResponse::from_params(
+            items
+                .into_iter()
+                .map(ContactContractResponse::from)
+                .collect::<Vec<_>>(),
+            &pagination,
+            total,
+        ))
+        .into_response(),
+    })
 }
 
 async fn create_contract(
@@ -112,11 +124,13 @@ async fn get_contract(
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<ContractResponse>> {
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     // PMS-935: contact-plane callers 404 (not 403) on a foreign
     // Company's contract so a probe cannot confirm existence. Staff
     // callers keep the pre-sweep RequireContracts + RequireFinance
-    // role gate via `assert_staff_contracts_finance`.
+    // role gate via `assert_staff_contracts_finance`. PMS-1061: a
+    // contact gets `ContactContractResponse`, never the staff type.
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => assert_staff_contracts_finance(auth)?,
@@ -125,12 +139,15 @@ async fn get_contract(
         }
     }
     let contract = s.service.get_contract(tenant, id).await?;
-    if let CallerContext::Contact(session) = &caller {
-        if contract.company_id != session.company_id {
-            return Err(AppError::NotFound("Contract".to_string()));
+    Ok(match &caller {
+        CallerContext::Staff(_) => Json(contract).into_response(),
+        CallerContext::Contact(session) => {
+            if contract.company_id != session.company_id {
+                return Err(AppError::NotFound("Contract".to_string()));
+            }
+            Json(ContactContractResponse::from(contract)).into_response()
         }
-    }
-    Ok(Json(contract))
+    })
 }
 
 /// PMS-935: reproduce the RequireContracts + RequireFinance staff
