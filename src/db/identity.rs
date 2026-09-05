@@ -6,9 +6,17 @@
 //! from the new `GET /api/v1/auth/memberships` endpoint, and phase 3 will
 //! call it from the refactored login handler.
 //!
-//! Both tables are cross-tenant lookup tables (no RLS, see
-//! `migrations/128_identities_and_memberships.sql`), so every read here
-//! runs on the migrator pool with no `app.current_tenant` GUC required.
+//! Both tables are cross-tenant lookup tables, so every read here runs on
+//! the BYPASSRLS migrator pool with no `app.current_tenant` GUC. That is a
+//! requirement, not a convenience: PMS-1040 audited every call site below,
+//! confirmed all of them pass `db().migrator_pool()`, and on that basis
+//! migration 191 gave `tenant_memberships` the fail-closed
+//! `tenant_isolation` policy as a backstop. A caller that hands one of
+//! these functions the bare NOBYPASSRLS `db().pool()` now reads zero
+//! membership rows. `identities` has no `tenant_id` to scope to and stays
+//! exempt, named in `TENANTLESS_WITHOUT_RLS` (`tests/rls_coverage.rs`).
+//! Migration `157_identities_and_memberships.sql` created both tables; its
+//! header's "neither table is RLS-enabled" predates 191.
 
 use sqlx::PgPool;
 use uuid::Uuid;

@@ -7,14 +7,16 @@
 //! missing that coverage, so a newly added tenant table cannot silently skip RLS
 //! the way the PMS-683 thirteen did.
 //!
-//! `ALLOWED_WITHOUT_RLS` is the set of tenant tables whose feature services still
-//! query the raw NOBYPASSRLS `mokosh_app` pool without setting the
-//! `app.current_tenant` GUC (see `094_rls_quotes_backstop.sql`). Enabling RLS on
-//! them before those services move to `begin_with_tenant` would fail-close their
-//! reads, so they are deferred to the `begin_with_tenant` read-path migration
-//! (PMS-256 / PMS-285 lineage). When a service is migrated and its table gains
-//! RLS, delete it from this list; the assertions below keep the list honest in
-//! both directions. The invariant is fully restored once the list is empty.
+//! `ALLOWED_WITHOUT_RLS` is the set of tenant tables read on the raw NOBYPASSRLS
+//! `mokosh_app` pool without setting the `app.current_tenant` GUC (see
+//! `094_rls_quotes_backstop.sql`). Enabling RLS on one of them fail-closes that
+//! read to zero rows, so each entry states why its read cannot carry a tenant
+//! GUC. Historically the list also held tables merely WAITING for their service
+//! to move to `begin_with_tenant`; those were all migrated and the list emptied
+//! (migration 095). PMS-1040 reopened it for the opposite case: a read that is
+//! cross-tenant by construction and must stay exempt permanently. When a table
+//! does gain RLS, delete it from this list; the assertions below keep the list
+//! honest in both directions.
 //!
 //! PMS-874 adds the other half of the universe. A table with NO `tenant_id`
 //! column was outside this file's sweep entirely, so a child table isolated only
@@ -31,22 +33,47 @@
 
 use sqlx::PgPool;
 
-/// Tenant-scoped tables intentionally NOT yet under RLS, pending their services'
-/// migration to `begin_with_tenant`. Keep sorted.
+/// Tenant-scoped tables intentionally NOT under RLS, because the read that
+/// reaches them cannot carry an `app.current_tenant` GUC. Keep sorted.
 ///
-/// PMS-683 (tail): now EMPTY. The 11 tables previously deferred here had their
-/// services migrated onto `begin_with_tenant` and gained the fail-closed
-/// `tenant_isolation` policy in migration 095, so the invariant is fully
-/// restored: every tenant-scoped `public` table has RLS enabled, forced, and a
-/// `tenant_isolation` policy. A newly added tenant table that skips RLS will now
-/// fail this test outright rather than being silently allowlisted.
-const ALLOWED_WITHOUT_RLS: &[&str] = &[];
+/// PMS-683 (tail) emptied this list: the 11 tables previously deferred here had
+/// their services migrated onto `begin_with_tenant` and gained the fail-closed
+/// `tenant_isolation` policy in migration 095. PMS-1040 reopened it with exactly
+/// one entry, for a table that must NEVER gain the policy rather than one
+/// waiting for its service to move.
+///
+/// * `tenant_membership_entitlements` - the pre-auth, cross-tenant entitlement
+///   lookup. `AuthService::ensure_principal_usable`
+///   (`src/modules/auth/service.rs`, the read carrying the
+///   `SAFETY (PMS-285 / PMS-692)` note) reads it on the bare NOBYPASSRLS
+///   `.pool()` with no `app.current_tenant` GUC, because the caller is not yet
+///   authenticated into a tenant. RLS would fail-close that read to `None`, and
+///   a missing entitlement row means "fresh instance, never lock anybody out",
+///   so the gate would silently pass every tenant including suspended ones.
+///   Decided in migration `154_tenant_membership_entitlements.sql`'s header
+///   (MAPPS-459 / PMS-728) and restated at the call site; PMS-1040 moved it here
+///   because a rule recorded only in prose is not a rule.
+const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
 
 /// Tables with NO `tenant_id` column that legitimately carry no
 /// `tenant_isolation` policy. Keep sorted; every entry states its reason.
 ///
 /// * `_sqlx_migrations` - sqlx's own ledger. Global schema state, written only
 ///   by the BYPASSRLS migrator role, holding no tenant data.
+/// * `identities` - the cross-tenant identity plane (MAPPS-475, migration
+///   `157_identities_and_memberships.sql`). One human is one row that exists
+///   across every tenant they hold a seat in, so there is no tenant to scope to
+///   and no parent to join through; login-by-email resolves it before any GUC
+///   can be set. Every reader takes the BYPASSRLS migrator pool
+///   (`IdentityRepo::*` call sites in `src/modules/auth/middleware.rs`,
+///   `src/modules/auth/service.rs`, `src/modules/tenants/routes.rs`). Its seat
+///   table, `tenant_memberships`, DOES carry a `tenant_id` and gained the policy
+///   in migration 191. PMS-1040.
+/// * `platform_admins` - the platform super-admin registry (MAPPS-513,
+///   migration `160_platform_admins.sql`), deliberately outside tenancy so the
+///   persona's credential lifecycle never intersects a tenant admin's identity.
+///   Read on the pre-auth login path; every `PlatformAdminRepo::*` call site in
+///   `src/modules/platform/service.rs` uses the migrator pool. PMS-1040.
 /// * `tenants` - the isolation root. It is the table every policy's `tenant_id`
 ///   points at, so it cannot itself be scoped by one; `TenantService` reaches it
 ///   on the migrator pool behind a `super_admin` route.
@@ -54,7 +81,12 @@ const ALLOWED_WITHOUT_RLS: &[&str] = &[];
 /// Anything else in this shape is a child table isolated through a parent
 /// foreign key, and gets the fail-closed parent-join policy (migrations `041`
 /// and `128`). PMS-874.
-const TENANTLESS_WITHOUT_RLS: &[&str] = &["_sqlx_migrations", "tenants"];
+const TENANTLESS_WITHOUT_RLS: &[&str] = &[
+    "_sqlx_migrations",
+    "identities",
+    "platform_admins",
+    "tenants",
+];
 
 /// `public` tables missing full fail-closed RLS (enabled AND forced AND a
 /// `tenant_isolation` policy), restricted to the half of the schema that does
