@@ -92,6 +92,49 @@ pub struct AssetResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+/// PMS-1061: what a contact receives for an asset, on the dual-plane
+/// reads. The purchase price, the network identity (`ip_address`,
+/// `hostname`, `mac_address`), the assignee, the licence terms, the RMM
+/// lifecycle and the transit ticket are the MSP's operating data; what
+/// the customer verifies is the device (tag, name, type, make, model,
+/// serial) and its dates. The shape the retired portal router served
+/// (`PortalAsset`), which PMS-1025's sweep replaced with the staff type.
+/// Every key is always present (`null` when unset) so the shape is stable.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactAssetResponse {
+    pub id: Uuid,
+    /// The caller's own company: what the session already says, never a
+    /// foreign one, since the scope check runs before the projection.
+    pub company_id: Uuid,
+    pub asset_tag: Option<String>,
+    pub name: String,
+    pub asset_type_id: Uuid,
+    pub status: String,
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub serial_number: Option<String>,
+    pub warranty_expiry: Option<NaiveDate>,
+    pub end_of_life: Option<NaiveDate>,
+}
+
+impl From<AssetResponse> for ContactAssetResponse {
+    fn from(a: AssetResponse) -> Self {
+        Self {
+            id: a.id,
+            company_id: a.company_id,
+            asset_tag: a.asset_tag,
+            name: a.name,
+            asset_type_id: a.asset_type_id,
+            status: a.status,
+            manufacturer: a.manufacturer,
+            model: a.model,
+            serial_number: a.serial_number,
+            warranty_expiry: a.warranty_expiry,
+            end_of_life: a.end_of_life,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct AssetFilter {
     pub company_id: Option<Uuid>,
