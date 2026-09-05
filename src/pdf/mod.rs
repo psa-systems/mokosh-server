@@ -1141,12 +1141,7 @@ impl Layout {
             );
             self.rule_between(x, x + width);
             for line in lines {
-                self.text_at(
-                    x,
-                    &truncate_to(line, width, body),
-                    Weight::Regular,
-                    body,
-                );
+                self.text_at(x, &truncate_to(line, width, body), Weight::Regular, body);
                 self.y_mm -= row;
             }
             lowest = lowest.min(self.y_mm);
@@ -1198,12 +1193,7 @@ impl Layout {
         for (label, value) in pairs {
             self.keep_together(row);
             self.text_at(MARGIN_MM, label, Weight::Regular, body);
-            self.text_at(
-                MARGIN_MM + LABEL_WIDTH_MM,
-                value,
-                Weight::Bold,
-                body,
-            );
+            self.text_at(MARGIN_MM + LABEL_WIDTH_MM, value, Weight::Bold, body);
             self.advance(row);
         }
     }
