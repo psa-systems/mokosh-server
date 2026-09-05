@@ -113,6 +113,14 @@ pub struct TenantBranding {
     /// PMS-911: the postal address an invoice is issued from. The one branding
     /// value that is deliberately multi-line, because an address is.
     pub postal_address: Option<String>,
+    /// PMS-1006: which document template this tenant's invoices, credit notes
+    /// and statements are laid out with: `classic`, `modern` or `compact`.
+    /// Absent or null is `classic`, which is the output every document had
+    /// before templates existed, so a tenant that never chooses sees nothing
+    /// change. Tenant-wide rather than per invoice: an MSP's documents should
+    /// look alike, and the bytes of an issued document are kept (PMS-959) so a
+    /// later change cannot rewrite one a customer already holds.
+    pub invoice_template: Option<String>,
 }
 
 /// PMS-896: the organisation record, as the onboarding flow submits it.

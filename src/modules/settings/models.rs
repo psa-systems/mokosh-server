@@ -220,6 +220,8 @@ mod tests {
             ("website", json!("https://acme.example")),
             ("website", json!("javascript:alert(1)")),
             ("portal_domain", json!("portal.acme.example")),
+            ("invoice_template", json!("modern")),
+            ("invoice_template", json!("fancy")),
             ("supprt_email", json!("help@acme.example")),
         ];
         for (key, value) in cases {

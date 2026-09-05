@@ -80,9 +80,9 @@ endpoint, extend one of these files.
 | GET  /invoices/{id}/pdf | `get_invoice_pdf` | SCOPED (501 body, gates first) |
 | GET  /projects | `list_projects` | SCOPED (NULL house projects implicitly excluded; rows are `ContactProjectResponse`, PMS-1061) |
 | GET  /projects/{id} | `get_project` | SCOPED (`ContactProjectResponse`, PMS-1061) |
-| GET  /quotes | `list_quotes` | SCOPED |
-| GET  /quotes/{id} | `get_quote` | SCOPED |
-| GET  /quotes/{id}/pdf | `get_quote_pdf` | SCOPED |
+| GET  /quotes | `list_quotes` | SCOPED (`list_quotes_for_company`: own company AND issued statuses only, PMS-1060) |
+| GET  /quotes/{id} | `get_quote` | SCOPED (`get_quote_for_company`: 404 on foreign OR un-issued, PMS-1060) |
+| GET  /quotes/{id}/pdf | `get_quote_pdf` | SCOPED (same read as `get_quote`, PMS-1060; 501 body, gates first) |
 | POST /quotes/{id}/accept | `accept_quote` | SCOPED |
 | POST /quotes/{id}/decline | `decline_quote` | SCOPED |
 | GET  /tickets | `list_tickets` | SCOPED |

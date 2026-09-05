@@ -65,6 +65,23 @@ Where the contact comes from differs by document, and the difference is the poin
 
 Documents issued before this landed are not re-rendered. PMS-959 stores an invoice's PDF inside the transaction that first sends it and a credit note's inside the transaction that creates it, and `GET /invoices/{id}/pdf` and `GET /credit-notes/{id}/pdf` serve those bytes whenever there are any. Only invoices sent and credit notes created after this change carry the contact; an older document keeps the bytes its customer already holds. A live render (a draft preview, or anything issued before PMS-959) does pick the contact up.
 
+## The document template
+
+PMS-1006. `tenants.branding.invoice_template` chooses how a document is laid out: `classic`, `modern` or `compact`. The keys are validated in `src/modules/tenants/branding.rs` against `pdf::Template`, and anything else is refused with a message naming the three. Absent or null is `classic`, which is the output every document had before templates existed, so a tenant that never chooses sees nothing change.
+
+The choice is tenant-wide, not per invoice. An MSP's documents should look alike, and there is no per-invoice override: the bytes of an issued document are what the record is, so a per-invoice field would store a value nothing could read back off the document.
+
+Which documents follow it:
+
+- The invoice, at the moment it is rendered. A draft renders live, so it follows the tenant's current choice; `GET /invoices/{id}/pdf?template=<key>` previews another one on the MSP's own data while the invoice is still editable. The parameter is a staff affordance: PMS-936 opened that route to the contact plane too, and a contact passing it is refused rather than served a layout nobody picked.
+- The credit note, at creation, which is when it is issued and when its document is stored (PMS-953, PMS-959).
+- The statement, every time, because PMS-954 made it a read model that stores nothing.
+- NOT the report export (`GET /reports/{key}/export?format=pdf`). An internal report is not a document a client receives and carries no branding at all; it stays Classic.
+
+An already-sent invoice keeps its stored bytes. PMS-959 writes the rendered PDF inside the transaction that first moves the invoice to `sent`, and `GET /invoices/{id}/pdf` serves those bytes for any frozen invoice, so changing `invoice_template` (or the accent colour, or the legal name) afterwards cannot alter a document a customer already holds. For the same reason `?template=` is a 400 on a frozen invoice rather than a re-render: that path serves what was sent, and there is only one answer to give.
+
+`primary_color` is the accent the Modern template draws its head band in; a tenant that set none gets `pdf::DEFAULT_ACCENT`. The band's own text is dark or light according to the band colour's relative luminance, so a pale brand colour does not produce white on white.
+
 ## UI
 
 The invoice detail page (`mokosh-apps`, `src/pages/billing.rs`) mirrors this model: Edit / Send / Void render only while editable (`draft` / `pending`), Record Payment renders only while collectible, and a frozen invoice shows an inline note explaining that it is a finalized record and cannot be edited, cancelled, or voided.
