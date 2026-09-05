@@ -1,25 +1,30 @@
-//! PMS-729 phase 2 §5 H1+H2: portal refresh + logout HTTP wire tests.
+//! PMS-729 phase 2 §5 H1+H2: contact refresh + logout HTTP wire tests,
+//! on the contact plane since PMS-1025 (ported in PMS-1031).
 //!
-//! The service-level rotation, replay detection, and chain revocation
-//! logic lives in `src/modules/portal/service.rs`; this suite pins the
-//! HTTP shape of `POST /portal/auth/login` (now returning both tokens),
-//! `POST /portal/auth/refresh` (rotation + replay + expiry), and
-//! `POST /portal/auth/logout` (idempotent chain revocation) end-to-end.
+//! The service-level rotation and revocation logic lives in
+//! `src/modules/contact_portal/service.rs`; this suite pins the HTTP shape
+//! of `POST /contact/auth/login` (returning both tokens),
+//! `POST /contact/auth/refresh` (rotation + replay + expiry), and
+//! `POST /contact/auth/logout` (idempotent revocation) end-to-end.
 //!
 //! All 401 paths share the enumeration-resistant `UNAUTHORIZED` envelope
 //! so a caller cannot tell "unknown token" from "expired" from "replay
 //! detected" without another side channel.
+//!
+//! Two cases the retired portal pinned are gone with it: a replayed
+//! refresh token revoked every live token in its rotation chain, and a
+//! logout did the same. A contact session (`contact_sessions`) is
+//! revoked one row at a time and carries no chain, so a replay is a
+//! 401 for the replayed token only; that gap is PMS-1062 rather than
+//! pinned here as if it were the design.
 
 mod common;
 
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const PORTAL_PASSWORD: &str = "portal-password-12345";
-
 /// Seed a company + a portal-enabled contact under the default tenant.
-/// Returns the contact's email so tests can log in as it.
-async fn seed_portal_contact(pool: &PgPool, email: &str) -> String {
+async fn seed_portal_contact(pool: &PgPool, email: &str) -> common::PortalContact {
     let company = Uuid::new_v4();
     sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme Co')")
         .bind(company)
@@ -27,53 +32,18 @@ async fn seed_portal_contact(pool: &PgPool, email: &str) -> String {
         .execute(pool)
         .await
         .expect("seed company");
-    let hash =
-        mokosh_server::utils::crypto::hash_password(PORTAL_PASSWORD).expect("hash portal password");
-    sqlx::query(
-        r#"
-        INSERT INTO contacts (
-            id, tenant_id, company_id, first_name, last_name, email,
-            is_portal_user, portal_password_hash
-        )
-        VALUES ($1, $2, $3, 'Portal', 'Contact', $4, TRUE, $5)
-        "#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(common::DEFAULT_TENANT_ID)
-    .bind(company)
-    .bind(email)
-    .bind(&hash)
-    .execute(pool)
-    .await
-    .expect("seed portal contact");
-    email.to_string()
+    common::seed_portal_contact(pool, company, email, &[]).await
 }
 
 /// Log the seeded contact in and return the full login body so tests can
 /// grab both tokens.
-async fn login(app: &common::TestApp, email: &str) -> serde_json::Value {
-    let resp = app
-        .client
-        .post(app.url("/api/v1/portal/auth/login"))
-        .json(&serde_json::json!({
-            "tenant_slug": "default",
-            "email": email,
-            "password": PORTAL_PASSWORD,
-        }))
-        .send()
-        .await
-        .expect("send login");
-    assert!(
-        resp.status().is_success(),
-        "login should 2xx, got {}",
-        resp.status()
-    );
-    resp.json().await.expect("login body JSON")
+async fn login(app: &common::TestApp, contact: &common::PortalContact) -> serde_json::Value {
+    common::contact_login(app, contact).await
 }
 
 async fn refresh(app: &common::TestApp, refresh_token: &str) -> reqwest::Response {
     app.client
-        .post(app.url("/api/v1/portal/auth/refresh"))
+        .post(app.url("/api/v1/contact/auth/refresh"))
         .json(&serde_json::json!({ "refresh_token": refresh_token }))
         .send()
         .await
@@ -82,7 +52,7 @@ async fn refresh(app: &common::TestApp, refresh_token: &str) -> reqwest::Respons
 
 async fn logout(app: &common::TestApp, refresh_token: &str) -> reqwest::Response {
     app.client
-        .post(app.url("/api/v1/portal/auth/logout"))
+        .post(app.url("/api/v1/contact/auth/logout"))
         .json(&serde_json::json!({ "refresh_token": refresh_token }))
         .send()
         .await
@@ -104,22 +74,18 @@ async fn assert_unauthorized_envelope(resp: reqwest::Response, ctx: &str) {
     );
 }
 
-// AC (H1+H2): login now returns access_token + refresh_token, both
-// strings, plus expires_at + refresh_expires_at timestamps and the
-// contact snapshot the SPA already consumed.
+// AC (H1+H2): login returns access_token + refresh_token, both strings,
+// plus the access expiry and the contact snapshot the SPA consumes.
 #[sqlx::test]
 async fn login_returns_access_and_refresh_tokens(pool: PgPool) {
-    seed_portal_contact(&pool, "user@example.com").await;
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
-    let body = login(&app, "user@example.com").await;
+    let body = login(&app, &contact).await;
 
     assert!(body["access_token"].is_string(), "access_token present");
     assert!(body["refresh_token"].is_string(), "refresh_token present");
     assert!(body["expires_at"].is_string(), "expires_at present");
-    assert!(
-        body["refresh_expires_at"].is_string(),
-        "refresh_expires_at present"
-    );
+    assert!(body["contact"].is_object(), "contact snapshot present");
     // Refresh token format is `{uuid}.{secret}`; the setup-token helper
     // uses the same shape so verifying the split proves the wire matches.
     let rt = body["refresh_token"].as_str().unwrap();
@@ -132,9 +98,9 @@ async fn login_returns_access_and_refresh_tokens(pool: PgPool) {
 // pair, and the new tokens work as credentials.
 #[sqlx::test]
 async fn refresh_rotates_both_tokens(pool: PgPool) {
-    seed_portal_contact(&pool, "user@example.com").await;
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
-    let login_body = login(&app, "user@example.com").await;
+    let login_body = login(&app, &contact).await;
     let initial_refresh = login_body["refresh_token"].as_str().unwrap().to_string();
 
     let resp = refresh(&app, &initial_refresh).await;
@@ -165,7 +131,7 @@ async fn refresh_rotates_both_tokens(pool: PgPool) {
     // The new access token authenticates the /me endpoint.
     let me = app
         .client
-        .get(app.url("/api/v1/portal/auth/me"))
+        .get(app.url("/api/v1/contact/auth/me"))
         .bearer_auth(&new_access)
         .send()
         .await
@@ -178,15 +144,14 @@ async fn refresh_rotates_both_tokens(pool: PgPool) {
 }
 
 // AC (H2 replay detection): presenting the SAME refresh token twice
-// after it has already been rotated once fails closed AND revokes every
-// live token in the rotation chain. The "current" token (the successor
-// of the replayed one) becomes unusable, so the honest customer + the
-// attacker both get logged out.
+// after it has already been rotated once fails closed. (The retired
+// portal also revoked the successor; the contact plane does not, see the
+// module comment.)
 #[sqlx::test]
-async fn replayed_refresh_kills_the_entire_rotation_chain(pool: PgPool) {
-    seed_portal_contact(&pool, "user@example.com").await;
+async fn replayed_refresh_is_refused(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
-    let login_body = login(&app, "user@example.com").await;
+    let login_body = login(&app, &contact).await;
     let rt_1 = login_body["refresh_token"].as_str().unwrap().to_string();
 
     // Honest customer rotates once and gets rt_2.
@@ -197,23 +162,27 @@ async fn replayed_refresh_kills_the_entire_rotation_chain(pool: PgPool) {
         .expect("rt_2")
         .to_string();
 
-    // Attacker replays rt_1 (already rotated) -> 401 + revokes chain.
+    // Attacker replays rt_1 (already rotated) -> 401.
     let replay = refresh(&app, &rt_1).await;
     assert_unauthorized_envelope(replay, "replayed rt_1").await;
 
-    // rt_2 is now dead too.
-    let dead = refresh(&app, &rt_2).await;
-    assert_unauthorized_envelope(dead, "rt_2 after chain-kill").await;
+    // The honest customer's rt_2 still rotates.
+    let round_two = refresh(&app, &rt_2).await;
+    assert!(
+        round_two.status().is_success(),
+        "rt_2 rotates after the rt_1 replay, got {}",
+        round_two.status()
+    );
 }
 
-// AC (H1): logout revokes the presented refresh token AND the entire
-// chain, so a stolen access token cannot be renewed once the customer
-// signs out.
+// AC (H1): logout revokes the presented refresh token, so a stolen
+// access token cannot be renewed once the customer signs out; the token
+// it was rotated from was already revoked by the rotation.
 #[sqlx::test]
-async fn logout_revokes_refresh_token_chain(pool: PgPool) {
-    seed_portal_contact(&pool, "user@example.com").await;
+async fn logout_revokes_the_refresh_token(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
-    let login_body = login(&app, "user@example.com").await;
+    let login_body = login(&app, &contact).await;
     let rt = login_body["refresh_token"].as_str().unwrap().to_string();
 
     // Rotate once so the chain has 2 members.
@@ -231,11 +200,11 @@ async fn logout_revokes_refresh_token_chain(pool: PgPool) {
         "logout returns 204"
     );
 
-    // Every member of the chain is now dead: rt and rt_2 both 401.
+    // Both are dead: rt_2 by the logout, rt by the rotation before it.
     let dead_new = refresh(&app, &rt_2).await;
     assert_unauthorized_envelope(dead_new, "rt_2 after logout").await;
     let dead_old = refresh(&app, &rt).await;
-    assert_unauthorized_envelope(dead_old, "rt (already rotated + chain-killed)").await;
+    assert_unauthorized_envelope(dead_old, "rt (already rotated)").await;
 }
 
 // AC (H1 idempotent + enumeration-resistant): logout with an unknown
@@ -262,7 +231,7 @@ async fn logout_with_unknown_token_still_returns_204(pool: PgPool) {
 // UNAUTHORIZED envelope. Cannot enumerate live tokens by response.
 #[sqlx::test]
 async fn refresh_fails_closed_on_every_negative_path(pool: PgPool) {
-    seed_portal_contact(&pool, "user@example.com").await;
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
 
     // Unknown UUID + random secret.
@@ -273,7 +242,7 @@ async fn refresh_fails_closed_on_every_negative_path(pool: PgPool) {
     assert_unauthorized_envelope(refresh(&app, "no-dot-in-here").await, "no dot").await;
 
     // Right UUID (a real, live one) but wrong secret.
-    let login_body = login(&app, "user@example.com").await;
+    let login_body = login(&app, &contact).await;
     let good = login_body["refresh_token"].as_str().unwrap();
     let (id, _real) = good.split_once('.').unwrap();
     let fake = format!("{id}.wrong-secret-that-does-not-verify");
@@ -288,7 +257,7 @@ async fn refresh_with_empty_body_is_validation_error(pool: PgPool) {
     let app = common::boot(pool).await;
     let resp = app
         .client
-        .post(app.url("/api/v1/portal/auth/refresh"))
+        .post(app.url("/api/v1/contact/auth/refresh"))
         .json(&serde_json::json!({ "refresh_token": "" }))
         .send()
         .await
@@ -300,12 +269,14 @@ async fn refresh_with_empty_body_is_validation_error(pool: PgPool) {
 // AC (H1+H2 access token independence): after logout, the ACCESS token
 // stays valid until its own expiry (15 min). Only the ability to REFRESH
 // is revoked. Documents the intentional trade-off: access-token
-// revocation would require a server-side lookup per request.
+// revocation would require a server-side lookup per request. (MAPPS-532
+// chose the same for the retired portal, and the contact middleware
+// likewise reads no session row.)
 #[sqlx::test]
 async fn access_token_survives_logout_until_expiry(pool: PgPool) {
-    seed_portal_contact(&pool, "user@example.com").await;
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
-    let login_body = login(&app, "user@example.com").await;
+    let login_body = login(&app, &contact).await;
     let access = login_body["access_token"].as_str().unwrap();
     let rt = login_body["refresh_token"].as_str().unwrap();
 
@@ -315,7 +286,7 @@ async fn access_token_survives_logout_until_expiry(pool: PgPool) {
     // Access token is still valid.
     let me = app
         .client
-        .get(app.url("/api/v1/portal/auth/me"))
+        .get(app.url("/api/v1/contact/auth/me"))
         .bearer_auth(access)
         .send()
         .await

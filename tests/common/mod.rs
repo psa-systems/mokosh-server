@@ -746,3 +746,149 @@ pub async fn seed_admin_and_team(pool: &PgPool, team_name: &str) -> (Uuid, Strin
     seed_team_member(pool, DEFAULT_TENANT_ID, team_id, admin_id, "leader").await;
     (admin_id, email, password, team_id)
 }
+
+/// PMS-1031: a portal identity on the contact plane (PMS-1025). The plane
+/// replaced `/api/v1/portal`: a contact signs in at
+/// `POST /api/v1/contact/auth/login` addressing its company by
+/// `companies.portal_slug` (or `portal_id`), and what it may then do on the
+/// dual-plane `/api/v1/*` routes is the union of its portal roles'
+/// capabilities (migration 171 seeds `Billing Contact`, `Support Contact`
+/// and `Read-Only`; `tests/contact_scope.rs` walks the matrix).
+#[allow(dead_code)]
+pub const CONTACT_PASSWORD: &str = "Kq7$mZ2n#PxR9wLf";
+
+/// A seeded portal contact: what a suite needs to sign it in.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct PortalContact {
+    pub id: Uuid,
+    pub company_id: Uuid,
+    pub email: String,
+    /// The company's `portal_slug`, minted here when the company had none.
+    pub slug: String,
+}
+
+/// Seed a portal contact under `DEFAULT_TENANT_ID` with the named built-in
+/// roles. Password is [`CONTACT_PASSWORD`].
+#[allow(dead_code)]
+pub async fn seed_portal_contact(
+    pool: &PgPool,
+    company_id: Uuid,
+    email: &str,
+    role_names: &[&str],
+) -> PortalContact {
+    seed_portal_contact_in_tenant(pool, DEFAULT_TENANT_ID, company_id, email, role_names).await
+}
+
+/// [`seed_portal_contact`] under a caller-picked tenant, for the
+/// cross-tenant cases. The contact row is written the way
+/// `ContactService::grant_portal_access` leaves it (`is_portal_user`, a
+/// password hash, a role assignment per role), without the setup mail.
+#[allow(dead_code)]
+pub async fn seed_portal_contact_in_tenant(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    email: &str,
+    role_names: &[&str],
+) -> PortalContact {
+    let minted = format!("co-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let slug: String = sqlx::query_scalar(
+        "UPDATE companies SET portal_slug = COALESCE(portal_slug, $2) \
+         WHERE id = $1 AND tenant_id = $3 RETURNING portal_slug",
+    )
+    .bind(company_id)
+    .bind(&minted)
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await
+    .expect("stamp portal_slug on the company");
+
+    let id = Uuid::new_v4();
+    let hash = mokosh_server::utils::crypto::hash_password(CONTACT_PASSWORD)
+        .expect("hash the contact password");
+    sqlx::query(
+        "INSERT INTO contacts \
+            (id, tenant_id, company_id, first_name, last_name, email, \
+             is_portal_user, portal_password_hash) \
+         VALUES ($1, $2, $3, 'Portal', 'Contact', $4, TRUE, $5)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(company_id)
+    .bind(email)
+    .bind(&hash)
+    .execute(pool)
+    .await
+    .expect("seed portal contact");
+
+    for name in role_names {
+        let role_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM portal_roles WHERE tenant_id = $1 AND name = $2")
+                .bind(tenant_id)
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|e| panic!("read portal role {name}: {e}"));
+        sqlx::query(
+            "INSERT INTO contact_role_assignments (contact_id, role_id, tenant_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(id)
+        .bind(role_id)
+        .bind(tenant_id)
+        .execute(pool)
+        .await
+        .expect("assign portal role");
+    }
+
+    PortalContact {
+        id,
+        company_id,
+        email: email.to_string(),
+        slug,
+    }
+}
+
+/// `POST /api/v1/contact/auth/login` for the contact, with the given
+/// password, returning the raw response so a suite can assert a refusal.
+#[allow(dead_code)]
+pub async fn contact_login_response(
+    app: &TestApp,
+    contact: &PortalContact,
+    password: &str,
+) -> reqwest::Response {
+    app.client
+        .post(app.url("/api/v1/contact/auth/login"))
+        .json(&serde_json::json!({
+            "slug": contact.slug,
+            "email": contact.email,
+            "password": password,
+        }))
+        .send()
+        .await
+        .expect("send contact login")
+}
+
+/// Sign the contact in and return the login body (`access_token`,
+/// `refresh_token`, `expires_at`, `contact`).
+#[allow(dead_code)]
+pub async fn contact_login(app: &TestApp, contact: &PortalContact) -> serde_json::Value {
+    let resp = contact_login_response(app, contact, CONTACT_PASSWORD).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "contact login must 200 for {}",
+        contact.email
+    );
+    resp.json().await.expect("contact login JSON")
+}
+
+/// Sign the contact in and return the bearer for the dual-plane routes.
+#[allow(dead_code)]
+pub async fn contact_token(app: &TestApp, contact: &PortalContact) -> String {
+    contact_login(app, contact).await["access_token"]
+        .as_str()
+        .expect("access_token in contact login")
+        .to_string()
+}
