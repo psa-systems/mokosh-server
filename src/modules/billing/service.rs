@@ -147,18 +147,23 @@ impl BillingService {
         tenant_id: TenantId,
         company_id: Uuid,
     ) -> AppResult<UninvoiceableTime> {
-        let row: Option<(i64, i64, i64, i64, i64)> = sqlx::query_as(
+        let row: Option<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
             r#"
             SELECT
                 COUNT(*) FILTER (
                     WHERE is_billable IS TRUE AND invoice_id IS NULL
-                      AND billing_status IS DISTINCT FROM 'ready_to_bill'),
+                      AND billing_status IS DISTINCT FROM 'ready_to_bill'
+                      AND billing_status IS DISTINCT FROM 'prepaid'),
                 COALESCE(SUM(duration_minutes) FILTER (
                     WHERE is_billable IS TRUE AND invoice_id IS NULL
-                      AND billing_status IS DISTINCT FROM 'ready_to_bill'), 0),
+                      AND billing_status IS DISTINCT FROM 'ready_to_bill'
+                      AND billing_status IS DISTINCT FROM 'prepaid'), 0),
                 COUNT(*) FILTER (WHERE is_billable IS NOT TRUE),
                 COALESCE(SUM(duration_minutes) FILTER (WHERE is_billable IS NOT TRUE), 0),
-                COUNT(*) FILTER (WHERE is_billable IS TRUE AND invoice_id IS NOT NULL)
+                COUNT(*) FILTER (WHERE is_billable IS TRUE AND invoice_id IS NOT NULL),
+                -- PMS-1035: covered by a block-hours allotment; not a fault.
+                COUNT(*) FILTER (WHERE billing_status = 'prepaid'),
+                COALESCE(SUM(duration_minutes) FILTER (WHERE billing_status = 'prepaid'), 0)
             FROM time_entries
             WHERE tenant_id = $1
               AND company_id = $2
@@ -174,14 +179,23 @@ impl BillingService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let (not_ready, not_ready_minutes, non_billable, non_billable_minutes, already_invoiced) =
-            row.unwrap_or((0, 0, 0, 0, 0));
+        let (
+            not_ready,
+            not_ready_minutes,
+            non_billable,
+            non_billable_minutes,
+            already_invoiced,
+            prepaid,
+            prepaid_minutes,
+        ) = row.unwrap_or((0, 0, 0, 0, 0, 0, 0));
         Ok(UninvoiceableTime {
             not_ready,
             not_ready_minutes,
             non_billable,
             non_billable_minutes,
             already_invoiced,
+            prepaid,
+            prepaid_minutes,
         })
     }
 
@@ -1014,6 +1028,11 @@ impl BillingService {
             r#"
             SELECT te.id, te.duration_minutes, te.hourly_rate, te.total_amount,
                    te.ticket_id, te.date, te.notes,
+                   -- PMS-1035: the block-hours draw. An entry fully inside the
+                   -- block is `prepaid` and not selected at all; one with
+                   -- overage is billed for the overage alone, at the rate the
+                   -- draw recorded, else its own.
+                   te.hours_consumed, te.overage_hours, te.overage_rate,
                    -- PMS-1004: what the line says. The work type is NOT NULL
                    -- on the entry, so the join cannot drop a row; the ticket
                    -- is optional and its two columns are NULL without one.
@@ -1096,10 +1115,6 @@ impl BillingService {
             Vec::with_capacity(entries.len());
         let mut subtotal = Decimal::ZERO;
         for entry in &entries {
-            let quantity = Decimal::from(entry.duration_minutes) / sixty;
-            let unit_price = entry.hourly_rate.unwrap_or(Decimal::ZERO);
-            let total = entry.total_amount.unwrap_or(quantity * unit_price);
-            subtotal += total;
             // PMS-1004: the line describes the work, not the row.
             let ticket =
                 entry
@@ -1109,12 +1124,41 @@ impl BillingService {
                         number,
                         title: entry.ticket_title.as_deref().unwrap_or(""),
                     });
-            let description = super::descriptions::time_entry_line(
-                entry.date,
-                &entry.work_type_name,
-                ticket,
-                entry.notes.as_deref(),
-            );
+            // PMS-1035: an entry that ran past its block bills the overage
+            // hours only, at the contract's overage rate when the draw recorded
+            // one and at the entry's own rate otherwise, and the line says so.
+            // The prepaid part is the customer's already; `total_amount` is the
+            // full entry's figure and is not used for such a line.
+            let (quantity, unit_price, total, description) = match entry.overage_hours {
+                Some(over) if over > Decimal::ZERO => {
+                    let unit_price = entry
+                        .overage_rate
+                        .or(entry.hourly_rate)
+                        .unwrap_or(Decimal::ZERO);
+                    let description = super::descriptions::time_entry_overage_line(
+                        entry.date,
+                        &entry.work_type_name,
+                        ticket,
+                        entry.notes.as_deref(),
+                        over,
+                        entry.hours_consumed.unwrap_or(Decimal::ZERO),
+                    );
+                    (over, unit_price, over * unit_price, description)
+                }
+                _ => {
+                    let quantity = Decimal::from(entry.duration_minutes) / sixty;
+                    let unit_price = entry.hourly_rate.unwrap_or(Decimal::ZERO);
+                    let total = entry.total_amount.unwrap_or(quantity * unit_price);
+                    let description = super::descriptions::time_entry_line(
+                        entry.date,
+                        &entry.work_type_name,
+                        ticket,
+                        entry.notes.as_deref(),
+                    );
+                    (quantity, unit_price, total, description)
+                }
+            };
+            subtotal += total;
             lines.push((
                 entry.id,
                 description,
@@ -5160,6 +5204,11 @@ pub(crate) struct UninvoiceableTime {
     pub non_billable_minutes: i64,
     /// Client entries that were billable and are already on an invoice.
     pub already_invoiced: i64,
+    /// PMS-1035: client entries fully covered by a block-hours allotment the
+    /// customer already paid for. Nothing to charge, and nothing to fix.
+    pub prepaid: i64,
+    /// Minutes across those.
+    pub prepaid_minutes: i64,
 }
 
 impl UninvoiceableTime {
@@ -5228,6 +5277,13 @@ impl UninvoiceableTime {
                 )
             ));
         }
+        if self.prepaid > 0 {
+            let hours = Self::hours(self.prepaid_minutes);
+            parts.push(format!(
+                "{} ({hours}) covered by the block-hours contract",
+                Self::count_of(self.prepaid, "time entry", "time entries")
+            ));
+        }
 
         let Some(next) = self.next_step() else {
             return "No billable time or mileage entries found for this company".to_string();
@@ -5259,6 +5315,9 @@ impl UninvoiceableTime {
         if self.already_invoiced > 0 {
             return Some("There is nothing new to bill for this company.");
         }
+        if self.prepaid > 0 {
+            return Some("Those hours were prepaid, so there is nothing to charge for them.");
+        }
         None
     }
 }
@@ -5273,6 +5332,10 @@ struct TimeEntryBillingRow {
     hourly_rate: Option<Decimal>,
     total_amount: Option<Decimal>,
     ticket_id: Option<Uuid>,
+    /// PMS-1035: the block-hours draw, when the entry made one.
+    hours_consumed: Option<Decimal>,
+    overage_hours: Option<Decimal>,
+    overage_rate: Option<Decimal>,
     /// PMS-1004: what the generated line says.
     date: chrono::NaiveDate,
     notes: Option<String>,
@@ -5532,7 +5595,31 @@ mod pms944_uninvoiceable_time_tests {
             non_billable,
             non_billable_minutes,
             already_invoiced,
+            ..UninvoiceableTime::default()
         }
+    }
+
+    fn prepaid(count: i64, minutes: i64) -> UninvoiceableTime {
+        UninvoiceableTime {
+            prepaid: count,
+            prepaid_minutes: minutes,
+            ..UninvoiceableTime::default()
+        }
+    }
+
+    /// PMS-1035: time covered by a block is named as such, is not reported as
+    /// "not ready", and the next step says there is nothing to charge.
+    #[test]
+    fn prepaid_time_is_named_and_is_not_a_fault() {
+        let msg = prepaid(2, 150).into_message();
+        assert_eq!(
+            msg,
+            "This company has no time to invoice right now. It has 2 time entries \
+             (2.5 hours) covered by the block-hours contract. Those hours were prepaid, \
+             so there is nothing to charge for them."
+        );
+        assert!(!msg.contains("not marked ready"), "{msg}");
+        assert!(!msg.contains("No billable time"), "{msg}");
     }
 
     fn not_ready(count: i64, minutes: i64) -> UninvoiceableTime {
@@ -5666,6 +5753,7 @@ mod pms944_uninvoiceable_time_tests {
             non_billable: 2,
             non_billable_minutes: 120,
             already_invoiced: 3,
+            ..UninvoiceableTime::default()
         }
         .into_message();
         assert!(msg.contains("1 billable time entry (1 hour) that is not marked ready to bill, 2 time entries (2 hours) logged as non-billable and 3 billable time entries already on an invoice"), "{msg}");

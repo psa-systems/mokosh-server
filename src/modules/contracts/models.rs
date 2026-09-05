@@ -430,6 +430,11 @@ pub struct ConsumeOutcome {
     pub overage_hours: Decimal,
     /// `overage_hours * overage_rate` (zero when no overage / no rate).
     pub overage_amount: Decimal,
+    /// PMS-1035: the contract item's `overage_rate` at the moment of the
+    /// draw, `None` when the item names none. Carried separately from the
+    /// amount because a missing rate is "bill the overage at the entry's
+    /// own hourly rate", not "bill it at zero".
+    pub overage_rate: Option<Decimal>,
     /// The balance row id that was debited (current period).
     pub balance_id: Uuid,
 }
