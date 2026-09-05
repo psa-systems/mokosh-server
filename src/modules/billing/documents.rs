@@ -533,13 +533,47 @@ pub fn statement(
         );
     }
 
-    document.totals(vec![
+    // PMS-1036: its own table, the way credits have theirs; the books treat
+    // the two differently and so does the reader.
+    if !statement.write_offs.is_empty() {
+        document = document.table_aligned(
+            "Written off",
+            vec![
+                "Invoice".into(),
+                "Date".into(),
+                "Reason".into(),
+                "Amount".into(),
+            ],
+            statement
+                .write_offs
+                .iter()
+                .map(|w| {
+                    vec![
+                        w.invoice_number.clone(),
+                        w.write_off_date.to_string(),
+                        w.reason.clone(),
+                        amount(w.amount),
+                    ]
+                })
+                .collect(),
+            last_right(4),
+        );
+    }
+
+    let mut totals = vec![
         ("Invoiced".to_string(), amount(statement.total_invoiced)),
         ("Paid".to_string(), amount(statement.total_paid)),
         ("Refunded".to_string(), amount(statement.total_refunded)),
         ("Credited".to_string(), amount(statement.total_credited)),
-        ("Balance due".to_string(), amount(statement.closing_balance)),
-    ])
+    ];
+    if !statement.total_written_off.is_zero() {
+        totals.push((
+            "Written off".to_string(),
+            amount(statement.total_written_off),
+        ));
+    }
+    totals.push(("Balance due".to_string(), amount(statement.closing_balance)));
+    document.totals(totals)
 }
 
 /// A statement table's alignment: everything left but the amount, which is
