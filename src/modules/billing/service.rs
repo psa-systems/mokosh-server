@@ -282,7 +282,14 @@ impl BillingService {
                 amount_paid     = p.paid,
                 amount_credited = p.credited,
                 balance_due     = i.total - p.paid - p.credited,
-                status      = CASE WHEN p.credited > 0
+                -- PMS-1036: a write-off is an input to this CASE, not a value
+                -- it derives. Every payment or credit event runs it, so
+                -- without the first arm the next partial payment on a
+                -- written-off invoice would flip it back to partially_paid;
+                -- a late payment is a recovery, recorded and kept, with the
+                -- status standing.
+                status      = CASE WHEN i.written_off_at IS NOT NULL THEN 'written_off'
+                                   WHEN p.credited > 0
                                     AND p.credited >= i.total - p.paid THEN 'void'
                                    WHEN i.total - p.paid - p.credited <= 0 THEN 'paid'
                                    WHEN p.paid > 0 THEN 'partially_paid'
@@ -755,6 +762,7 @@ impl BillingService {
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
                    created_at, updated_at, emailed_at, emailed_to,
+                   written_off_at, written_off_by_id, write_off_reason, write_off_amount,
                    tax_rate_id, tax_rate
             FROM invoices
             WHERE {data_where}
@@ -3748,6 +3756,103 @@ impl BillingService {
         Self::load_invoice(&mut tx, tenant_id, invoice_id).await
     }
 
+    /// PMS-1036: write an invoice off. The customer owes it and will not pay.
+    ///
+    /// Not a credit note: a credit says the customer did not owe this and
+    /// reduces revenue; a write-off says they did and will not pay, a bad-debt
+    /// expense, and the books and the statement keep the two apart. So
+    /// `balance_due` is left exactly as it was (the debt was not forgiven) and
+    /// the balance at this moment is frozen in `write_off_amount`, because
+    /// `balance_due` keeps moving if a late payment lands afterwards. That
+    /// payment is a recovery: recorded, kept, and the status stands, which is
+    /// the first arm of `recompute_invoice_balance`'s status CASE.
+    ///
+    /// Allowed from `sent` and `partially_paid` (an overdue invoice is one of
+    /// those past its date); refused with a 409 naming the status from `draft`
+    /// (delete it), `paid`, `void` and `written_off`. No reversal in v1: if one
+    /// is needed it is its own decision with its own audit shape.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn write_off_invoice(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        user_id: Uuid,
+        request: &WriteOffInvoiceRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<InvoiceResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String, String, Decimal)> = sqlx::query_as(
+            "SELECT invoice_number, status, balance_due FROM invoices \
+             WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((invoice_number, status, balance_due)) = row else {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        };
+        let status = InvoiceStatus::from_str(&status).unwrap_or(InvoiceStatus::Draft);
+        if !matches!(status, InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid) {
+            return Err(AppError::Conflict(format!(
+                "Invoice {invoice_number} cannot be written off in status '{}'",
+                status.as_str()
+            )));
+        }
+        if balance_due <= Decimal::ZERO {
+            return Err(AppError::Conflict(format!(
+                "Invoice {invoice_number} has nothing outstanding to write off"
+            )));
+        }
+
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE invoices
+            SET status            = 'written_off',
+                written_off_at    = NOW(),
+                written_off_by_id = $3,
+                write_off_reason  = $4,
+                write_off_amount  = balance_due,
+                updated_at        = NOW()
+            WHERE id = $1 AND tenant_id = $2
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(request.reason.trim())
+        .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "invoices",
+            Some(invoice_id),
+            before,
+            after,
+        )
+        .await?;
+        let invoice = Self::load_invoice(&mut tx, tenant_id, invoice_id).await?;
+        tx.commit().await?;
+        Ok(invoice)
+    }
+
     /// Assemble one invoice, in a transaction the caller owns (PMS-959).
     ///
     /// The whole of what an invoice response is, in one place with two entry
@@ -3775,6 +3880,7 @@ impl BillingService {
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
                    created_at, updated_at, emailed_at, emailed_to,
+                   written_off_at, written_off_by_id, write_off_reason, write_off_amount,
                    tax_rate_id, tax_rate
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
@@ -4483,7 +4589,7 @@ impl BillingService {
         // computed here rather than carried on the company, because a stored
         // running total is a third home for a number that already has one and
         // the only one that can be silently wrong.
-        let opening: (Decimal, Decimal, Decimal, Decimal) = sqlx::query_as(&format!(
+        let opening: (Decimal, Decimal, Decimal, Decimal, Decimal) = sqlx::query_as(&format!(
             r#"
             SELECT
                 COALESCE((SELECT SUM(total) FROM invoices
@@ -4498,7 +4604,11 @@ impl BillingService {
                             AND r.created_at::date < $3), 0),
                 COALESCE((SELECT SUM(total) FROM credit_notes
                           WHERE tenant_id = $1 AND company_id = $2
-                            AND status = 'issued' AND issue_date < $3), 0)
+                            AND status = 'issued' AND issue_date < $3), 0),
+                COALESCE((SELECT SUM(write_off_amount) FROM invoices
+                          WHERE tenant_id = $1 AND company_id = $2
+                            AND written_off_at IS NOT NULL
+                            AND written_off_at::date < $3), 0)
             "#,
             issued = Self::STATEMENT_ISSUED_INVOICE,
         ))
@@ -4507,8 +4617,9 @@ impl BillingService {
         .bind(query.period_start)
         .fetch_one(&mut *tx)
         .await?;
-        let (open_invoiced, open_paid, open_refunded, open_credited) = opening;
-        let opening_balance = open_invoiced + open_refunded - open_paid - open_credited;
+        let (open_invoiced, open_paid, open_refunded, open_credited, open_written_off) = opening;
+        let opening_balance =
+            open_invoiced + open_refunded - open_paid - open_credited - open_written_off;
 
         let invoices: Vec<StatementInvoiceRow> = sqlx::query_as(&format!(
             r#"
@@ -4586,10 +4697,35 @@ impl BillingService {
         .fetch_all(&mut *tx)
         .await?;
 
+        // PMS-1036: dated by the write-off, not the invoice, so an invoice
+        // charged in one period and written off in a later one appears on
+        // both statements as what happened in each.
+        let write_offs: Vec<StatementWriteOffRow> = sqlx::query_as(
+            r#"
+            SELECT id, invoice_number, written_off_at::date AS write_off_date,
+                   write_off_amount, write_off_reason
+            FROM invoices
+            WHERE tenant_id = $1 AND company_id = $2
+              AND written_off_at IS NOT NULL
+              AND written_off_at::date BETWEEN $3 AND $4
+            ORDER BY written_off_at, invoice_number
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query.company_id)
+        .bind(query.period_start)
+        .bind(query.period_end)
+        .fetch_all(&mut *tx)
+        .await?;
+
         let total_invoiced: Decimal = invoices.iter().map(|i| i.total).sum();
         let total_paid: Decimal = payments.iter().map(|p| p.amount).sum();
         let total_refunded: Decimal = refunds.iter().map(|r| r.amount).sum();
         let total_credited: Decimal = credit_notes.iter().map(|c| c.total).sum();
+        let total_written_off: Decimal = write_offs
+            .iter()
+            .map(|w| w.write_off_amount.unwrap_or(Decimal::ZERO))
+            .sum();
 
         Ok(StatementResponse {
             company_id: query.company_id,
@@ -4601,13 +4737,16 @@ impl BillingService {
             payments: payments.into_iter().map(Into::into).collect(),
             refunds: refunds.into_iter().map(Into::into).collect(),
             credit_notes: credit_notes.into_iter().map(Into::into).collect(),
+            write_offs: write_offs.into_iter().map(Into::into).collect(),
             total_invoiced,
             total_paid,
             total_refunded,
             total_credited,
+            total_written_off,
             closing_balance: opening_balance + total_invoiced + total_refunded
                 - total_paid
-                - total_credited,
+                - total_credited
+                - total_written_off,
         })
     }
 
@@ -5304,6 +5443,10 @@ struct InvoiceRow {
     paid_at: Option<chrono::DateTime<Utc>>,
     emailed_at: Option<chrono::DateTime<Utc>>,
     emailed_to: Option<String>,
+    written_off_at: Option<chrono::DateTime<Utc>>,
+    written_off_by_id: Option<Uuid>,
+    write_off_reason: Option<String>,
+    write_off_amount: Option<Decimal>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -5340,6 +5483,10 @@ impl From<InvoiceRow> for InvoiceResponse {
             paid_at: r.paid_at,
             emailed_at: r.emailed_at,
             emailed_to: r.emailed_to,
+            written_off_at: r.written_off_at,
+            written_off_by_id: r.written_off_by_id,
+            write_off_reason: r.write_off_reason,
+            write_off_amount: r.write_off_amount,
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,
@@ -5689,6 +5836,28 @@ impl From<StatementRefundRow> for StatementRefundLine {
             refund_date: r.refund_date,
             amount: r.amount,
             invoice_number: r.invoice_number,
+        }
+    }
+}
+
+/// PMS-1036: an invoice written off in the period.
+#[derive(sqlx::FromRow)]
+struct StatementWriteOffRow {
+    id: Uuid,
+    invoice_number: String,
+    write_off_date: chrono::NaiveDate,
+    write_off_amount: Option<Decimal>,
+    write_off_reason: Option<String>,
+}
+
+impl From<StatementWriteOffRow> for StatementWriteOffLine {
+    fn from(r: StatementWriteOffRow) -> Self {
+        Self {
+            invoice_id: r.id,
+            invoice_number: r.invoice_number,
+            write_off_date: r.write_off_date,
+            amount: r.write_off_amount.unwrap_or(Decimal::ZERO),
+            reason: r.write_off_reason.unwrap_or_default(),
         }
     }
 }

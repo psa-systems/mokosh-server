@@ -142,7 +142,8 @@ fn assert_reconciles(s: &Value) {
     let expected =
         dec(&s["opening_balance"]) + dec(&s["total_invoiced"]) + dec(&s["total_refunded"])
             - dec(&s["total_paid"])
-            - dec(&s["total_credited"]);
+            - dec(&s["total_credited"])
+            - dec(&s["total_written_off"]);
     assert_eq!(
         dec(&s["closing_balance"]),
         expected,
@@ -160,6 +161,7 @@ fn assert_reconciles(s: &Value) {
     assert_eq!(dec(&s["total_paid"]), sum("payments", "amount"));
     assert_eq!(dec(&s["total_credited"]), sum("credit_notes", "total"));
     assert_eq!(dec(&s["total_refunded"]), sum("refunds", "amount"));
+    assert_eq!(dec(&s["total_written_off"]), sum("write_offs", "amount"));
 }
 
 /// One period, one of everything, and the arithmetic holds.

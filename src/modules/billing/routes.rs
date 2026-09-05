@@ -42,6 +42,13 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}",
             get(get_invoice).put(update_invoice),
         )
+        // PMS-1036: the bad-debt record. POST rather than a status on PUT
+        // because a sent invoice is frozen to `update_invoice` and this is
+        // a decision with its own reason and audit row, not an edit.
+        .route(
+            "/invoices/{invoice_id}/write-off",
+            axum::routing::post(write_off_invoice),
+        )
         // PMS-911 / PMS-936: the invoice as a client receives it. Rendered
         // from the issuer snapshot frozen when it was sent, so a later rebrand
         // cannot change a document somebody already holds. Contact plane gates
@@ -536,6 +543,25 @@ async fn get_credit_note(
 
 /// Finance-gated, like every other write that moves money: raising a credit
 /// note reduces what a client owes.
+/// PMS-1036: write an invoice off. Finance only, like every other write to
+/// an issued document. 409 names the status when the invoice is not one that
+/// can be written off; the reason is required.
+async fn write_off_invoice(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(invoice_id): Path<Uuid>,
+    Json(request): Json<WriteOffInvoiceRequest>,
+) -> AppResult<Json<InvoiceResponse>> {
+    request.validate()?;
+    let invoice = state
+        .service
+        .write_off_invoice(user.tenant(), invoice_id, user.id, &request, &ctx)
+        .await?;
+    Ok(Json(invoice))
+}
+
 async fn create_credit_note(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
