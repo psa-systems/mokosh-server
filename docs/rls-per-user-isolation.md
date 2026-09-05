@@ -327,16 +327,19 @@ strict per-user isolation for everything editable.
   verification query is `docs/dev-docs/pms-263-verify-no-comingled-business-rows.sql`. This also
   sidesteps the unsafe one-shot path: personal tenants are provisioned lazily on login
   (PMS-243/245), so a bulk SQL backfill would have no tenant to resolve most owners to.
-- **Portal identity (PMS-255.6).** Portal runs on a `contacts`-row identity (`CurrentContact`,
-  company-scoped), a separate plane from `users`, with its own `portal_auth_middleware` and
-  `RequirePortalAuth` extractor (`src/modules/portal/middleware.rs`, joined by
-  `RequirePortalBillingContact` in PMS-993, which adds the billing-contact role check on top of
-  it for the invoice routes) and its own credential
-  lifecycle under `/api/v1/portal/auth/*` (PMS-820). Per-user isolation is deliberately NOT
-  applied to portal contacts: the plane stays company-scoped and is revisited with the orgs
-  work. `PortalService::login` is a pre-auth `(tenant_slug, email)` resolve on the migrator
-  pool with the `// SAFETY (PMS-285` note pointing back at this section; keep the two in step
-  if the decision changes.
+- **Portal identity (PMS-255.6).** The customer plane runs on a `contacts`-row identity,
+  company-scoped, separate from `users`, with its own middleware and its own credential
+  lifecycle (PMS-820). Per-user isolation is deliberately NOT applied to those contacts: the
+  plane stays company-scoped and is revisited with the orgs work. That decision stands as
+  written; the names in it do not, because PMS-1025 replaced the plane it was recorded against.
+  Today it is `portal_contact_middleware` plus the `RequireContactAuth` extractor
+  (`src/modules/contact_portal/middleware.rs`), the endpoints are `/api/v1/contact/auth/*`, and
+  what a contact may do is the `portal_roles` capability set checked per request by
+  `CallerContext::require_capability`, not PMS-993's single billing-contact role. The company
+  scope comes from the session's `cid` claim, and `ContactAuthService::login` resolves
+  `(portal_id | portal_slug, email)` to one company row on the migrator pool before any
+  credential check, because there is no tenant GUC to set until the identity resolves. Keep this
+  entry in step with `src/modules/contact_portal/` if the decision changes.
 - ~~**Lookup classification.**~~ Resolved by PMS-259: see "Borderline tables (confirmed
   classification)" above. `business_hours` is editable-lookup; `payment_gateway_configs` and
   `email_mailboxes` are business.
