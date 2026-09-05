@@ -153,7 +153,8 @@ async fn list_assets(
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Query(mut f): Query<AssetFilter>,
     Query(pagination): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<AssetResponse>>> {
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     f.validate()?;
     // PMS-935: dual-plane sweep. Contact callers must hold
     // `assets:read` (DB-loaded per request; JWT `caps` is UI-only)
@@ -161,7 +162,9 @@ async fn list_assets(
     // `company_id` query param cannot widen visibility. Staff callers
     // keep the pre-sweep RequireAssets module-gate + auth surface via
     // `assert_staff_authenticated` (staff role beyond auth is not
-    // required for asset reads).
+    // required for asset reads). PMS-1061: the contact arm answers with
+    // `ContactAssetResponse`, the customer's projection, never the staff
+    // type.
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
@@ -171,11 +174,20 @@ async fn list_assets(
         }
     }
     let (items, total) = s.service.list_assets(tenant, &f, &pagination).await?;
-    Ok(Json(PaginatedResponse::from_params(
-        items,
-        &pagination,
-        total,
-    )))
+    Ok(match &caller {
+        CallerContext::Staff(_) => {
+            Json(PaginatedResponse::from_params(items, &pagination, total)).into_response()
+        }
+        CallerContext::Contact(_) => Json(PaginatedResponse::from_params(
+            items
+                .into_iter()
+                .map(ContactAssetResponse::from)
+                .collect::<Vec<_>>(),
+            &pagination,
+            total,
+        ))
+        .into_response(),
+    })
 }
 
 async fn create_asset(
@@ -195,9 +207,11 @@ async fn get_asset(
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<AssetResponse>> {
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     // PMS-935: contact-plane callers 404 (not 403) on a foreign
-    // Company's asset so a probe cannot confirm existence.
+    // Company's asset so a probe cannot confirm existence. PMS-1061: a
+    // contact gets `ContactAssetResponse`, never the staff type.
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
@@ -206,12 +220,15 @@ async fn get_asset(
         }
     }
     let asset = s.service.get_asset(tenant, id).await?;
-    if let CallerContext::Contact(session) = &caller {
-        if asset.company_id != session.company_id {
-            return Err(AppError::NotFound("Asset".to_string()));
+    Ok(match &caller {
+        CallerContext::Staff(_) => Json(asset).into_response(),
+        CallerContext::Contact(session) => {
+            if asset.company_id != session.company_id {
+                return Err(AppError::NotFound("Asset".to_string()));
+            }
+            Json(ContactAssetResponse::from(asset)).into_response()
         }
-    }
-    Ok(Json(asset))
+    })
 }
 
 /// PMS-935: baseline "must be authenticated staff" check inlined
