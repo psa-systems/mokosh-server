@@ -18,9 +18,10 @@ The abstraction was not what was missing; Bunyip had one. What was missing was a
 path that could not be bypassed, a recorded answer to "which provider served this", and a purge that refuses to
 delete a value that is not safely somewhere else.
 
-Mokosh has the same exposure. `src/secrets/` and `src/storage/` are the right shape already, but configuration,
-application secrets, authentication and email each reach their dependencies a different way, and 76 `env::var`
-reads go around every seam that exists.
+Mokosh had the same exposure. `src/secrets/` and `src/storage/` were the right shape already, but configuration,
+application secrets, authentication and email each reached their dependencies a different way, and every
+environment read went around whatever seam existed. Phase 3 closed the configuration half of that; application
+secrets, authentication and email are still open.
 
 ### Sequencing
 
@@ -34,10 +35,13 @@ comes first because the vocabulary and the tier rule are what every later phase 
 or adds to the confusion. Bunyip's matching rename is
 [BUNYIP-642](https://youtrack.a8n.run/issue/BUNYIP-642).
 
-**3. The configuration seam.** [PMS-982](https://youtrack.a8n.run/issue/PMS-982) adds `ConfigProvider`, the
-declared key registry with a tier on each key, and the build-time guard that fails on an `env::var` read outside
-the provider. This is the phase that actually prevents the incident, because it is the one that makes bypassing
-impossible. Everything after it depends on the seam existing.
+**3. The configuration seam.** [PMS-982](https://youtrack.a8n.run/issue/PMS-982) adds `ConfigProvider`
+(`src/config/`), the declared key registry with a tier on each key, and the build-time guard that fails on an
+environment read outside the provider and its named entry points. This is the phase that actually prevents the
+incident, because it is the one that makes bypassing impossible. Everything after it depends on the seam
+existing. It landed with every read moved and no allowlist of exceptions, which is why
+[PMS-1024](https://youtrack.a8n.run/issue/PMS-1024) was folded into it rather than sequenced after it: a
+follow-up whose every criterion named an artefact this phase creates could not run on its own.
 
 **4. More configuration providers.** [PMS-987](https://youtrack.a8n.run/issue/PMS-987) adds file, database and
 Bunyip implementations with declared priority and several enabled at once. Multiple providers of one kind is a

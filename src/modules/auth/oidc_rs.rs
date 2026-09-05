@@ -20,6 +20,8 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::config::{self, registry as keys};
+
 // ── Token claim types ─────────────────────────────────────────────────────────
 
 /// Subset of the RFC 9068 `at+jwt` claims mokosh-server reads on the RS side.
@@ -127,22 +129,39 @@ pub struct VerifierConfig {
 impl VerifierConfig {
     /// `OIDC_ISSUER` + `OIDC_AUDIENCE` are required; both fail-loud so a
     /// misconfigured RS never silently accepts tokens from the wrong issuer.
+    ///
+    /// PMS-982: the four values come from the configuration provider. The rule
+    /// itself lives in [`from_values`](Self::from_values) so it is testable
+    /// against a held generation without mutating process-global environment.
     pub fn from_env() -> Result<Self, String> {
-        let issuer = std::env::var("OIDC_ISSUER")
-            .map_err(|_| "OIDC_ISSUER must be set (e.g. https://api.a8n.systems)".to_string())?
+        Self::from_values(
+            config::get(&keys::OIDC_ISSUER),
+            config::get(&keys::OIDC_AUDIENCE),
+            config::get(&keys::OIDC_JWKS_CACHE_TTL_SECS),
+            config::get(&keys::OIDC_LEEWAY_SECONDS),
+        )
+    }
+
+    /// The pure rule, unchanged from what `from_env` did before the values
+    /// moved: issuer and audience required, the two knobs optional with their
+    /// built-in defaults.
+    pub fn from_values(
+        issuer: Option<String>,
+        audience: Option<String>,
+        jwks_cache_ttl_secs: Option<String>,
+        leeway_seconds: Option<String>,
+    ) -> Result<Self, String> {
+        let issuer = issuer
+            .ok_or_else(|| "OIDC_ISSUER must be set (e.g. https://api.a8n.systems)".to_string())?
             .trim_end_matches('/')
             .to_string();
-        let audience = std::env::var("OIDC_AUDIENCE").map_err(|_| {
+        let audience = audience.ok_or_else(|| {
             "OIDC_AUDIENCE must be set (e.g. https://api.msp.a8n.systems)".to_string()
         })?;
-        let jwks_cache_ttl_secs = std::env::var("OIDC_JWKS_CACHE_TTL_SECS")
-            .ok()
+        let jwks_cache_ttl_secs = jwks_cache_ttl_secs
             .and_then(|v| v.parse().ok())
             .unwrap_or(600);
-        let leeway_seconds = std::env::var("OIDC_LEEWAY_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
+        let leeway_seconds = leeway_seconds.and_then(|v| v.parse().ok()).unwrap_or(30);
         Ok(Self {
             issuer,
             audience,
@@ -563,12 +582,45 @@ mod tests {
         assert_eq!(missing.email_verified, None);
     }
 
+    /// PMS-982: the rule is tested against values rather than by mutating the
+    /// process environment, which under a held configuration generation would
+    /// not have been seen and under a concurrent runner raced its siblings.
     #[test]
     fn config_requires_issuer_and_audience() {
-        // Run sequentially via a mutex elsewhere if env tests get flaky; for
-        // now this just verifies the error path is wired.
-        std::env::remove_var("OIDC_ISSUER");
-        std::env::remove_var("OIDC_AUDIENCE");
-        assert!(VerifierConfig::from_env().is_err());
+        assert!(VerifierConfig::from_values(None, None, None, None).is_err());
+        assert!(
+            VerifierConfig::from_values(Some("https://issuer".into()), None, None, None).is_err(),
+            "an audience is required too"
+        );
+        assert!(
+            VerifierConfig::from_values(None, Some("https://rs".into()), None, None).is_err(),
+            "an issuer is required too"
+        );
+
+        let config = VerifierConfig::from_values(
+            Some("https://issuer/".into()),
+            Some("https://rs".into()),
+            None,
+            None,
+        )
+        .expect("issuer plus audience is enough");
+        assert_eq!(
+            config.issuer, "https://issuer",
+            "the trailing slash is trimmed"
+        );
+        assert_eq!(config.jwks_cache_ttl_secs, 600);
+        assert_eq!(config.leeway_seconds, 30);
+
+        // An unparseable knob keeps the built-in default rather than failing
+        // the whole verifier, exactly as it did before.
+        let tuned = VerifierConfig::from_values(
+            Some("https://issuer".into()),
+            Some("https://rs".into()),
+            Some("120".into()),
+            Some("not-a-number".into()),
+        )
+        .expect("the knobs are optional");
+        assert_eq!(tuned.jwks_cache_ttl_secs, 120);
+        assert_eq!(tuned.leeway_seconds, 30);
     }
 }

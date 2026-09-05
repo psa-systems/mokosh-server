@@ -18,6 +18,7 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
+use crate::config::{self, registry as keys};
 use crate::utils::error::{AppError, AppResult};
 
 /// PMS-761: who a client-facing message is from, as the client reads it.
@@ -604,22 +605,21 @@ pub struct MailerConfig {
 }
 
 impl MailerConfig {
+    /// PMS-982: the six `SMTP_*` values come from the configuration provider.
+    /// Every emptiness and default rule below is unchanged; only where the
+    /// string comes from moved.
     pub fn from_env() -> AppResult<Self> {
-        let host = std::env::var("SMTP_HOST").ok().filter(|s| !s.is_empty());
-        let port = std::env::var("SMTP_PORT")
-            .ok()
+        let host = config::get(&keys::SMTP_HOST).filter(|s| !s.is_empty());
+        let port = config::get(&keys::SMTP_PORT)
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(587);
-        let username = std::env::var("SMTP_USERNAME")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let password = std::env::var("SMTP_PASSWORD")
-            .ok()
+        let username = config::get(&keys::SMTP_USERNAME).filter(|s| !s.is_empty());
+        let password = config::get(&keys::SMTP_PASSWORD)
             .filter(|s| !s.is_empty())
             .map(SecretString::from);
-        let from = std::env::var("SMTP_FROM")
-            .unwrap_or_else(|_| "Mokosh <noreply@example.com>".to_string());
-        let tls = SmtpTls::parse(&std::env::var("SMTP_TLS").unwrap_or_default())?;
+        let from = config::get(&keys::SMTP_FROM)
+            .unwrap_or_else(|| "Mokosh <noreply@example.com>".to_string());
+        let tls = SmtpTls::parse(&config::get(&keys::SMTP_TLS).unwrap_or_default())?;
 
         if username.is_some() && password.is_none() {
             return Err(AppError::Configuration(

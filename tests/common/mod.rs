@@ -347,6 +347,13 @@ async fn boot_with_db(
     // here as well means a suite that never touches storage cannot pin the
     // compiled-in `./attachments` root for a neighbour that does.
     storage_root();
+    // PMS-982: configuration resolves into a generation that is held, so a
+    // suite's `set_var` (ATTACHMENT_DIR above, ATTACHMENT_MAX_BYTES and
+    // INFISICAL_ADDRESS in the suites that set them before booting) is not
+    // visible until the generation is rebuilt. Refreshing here rather than in
+    // each suite means a suite only has to set the variable before it boots,
+    // which is what every one of them already does.
+    mokosh_server::config::refresh();
     // Route the server's tracing events to libtest's per-thread capture so
     // a failing test surfaces the real cause in its panic output (e.g. the
     // sqlx error swallowed by `AppError::Database("Database operation

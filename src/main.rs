@@ -1,5 +1,6 @@
 //! Mokosh Server - API server entrypoint
 
+use mokosh_server::config::{self, registry as keys, ConfigKey};
 use mokosh_server::utils::deployment::{
     DeploymentMode, EnablementSource, ProviderKind, ProviderOverrides,
 };
@@ -155,18 +156,33 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Resolve a secret env var, refusing the dev fallback outside dev/test.
-/// In dev/test an unset var falls back to `dev_value`. In every other
-/// environment an unset var - or one explicitly set to `dev_value` - is a
+/// Resolve a secret, refusing the dev fallback outside dev/test.
+/// In dev/test an unset value falls back to `dev_value`. In every other
+/// environment an unset value - or one explicitly set to `dev_value` - is a
 /// fatal boot error, consistent with the other fail-loud startup checks
 /// (SMTP/migrations) (PMS-499).
+///
+/// PMS-982: the value comes from the configuration provider. The rule is
+/// [`resolve_secret_value`], which takes the string, so the cases below are
+/// tested without mutating process-global environment behind a held
+/// generation.
 fn resolve_secret(
-    var_name: &str,
+    key: &ConfigKey,
     environment: &str,
     dev_value: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    match std::env::var(var_name) {
-        Ok(value) if !value.is_empty() => {
+    resolve_secret_value(key.name(), config::get(key), environment, dev_value)
+}
+
+/// The rule itself, over a value the caller already has.
+fn resolve_secret_value(
+    var_name: &str,
+    value: Option<String>,
+    environment: &str,
+    dev_value: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match value {
+        Some(value) if !value.is_empty() => {
             if value == dev_value && !env_allows_dev_secrets(environment) {
                 return Err(format!(
                     "{var_name} is set to the known dev fallback value, which is refused in the \
@@ -192,38 +208,37 @@ fn resolve_secret(
 }
 
 impl AppConfig {
+    /// PMS-982: every value below comes from the configuration provider, which
+    /// `main` has already initialised. Each field's own emptiness, trimming and
+    /// default rule is unchanged; only where the string comes from moved.
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
-        dotenvy::dotenv().ok();
-
         let environment =
-            std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
+            config::get(&keys::ENVIRONMENT).unwrap_or_else(|| "development".to_string());
 
         // PMS-499: refuse the hardcoded dev fallbacks for the auth/crypto
         // secrets outside dev/test. Resolved before the struct is built so a
         // production/staging/unknown environment fails loud at boot rather than
         // silently serving with a publicly-known JWT_SECRET / ENCRYPTION_KEY.
-        let jwt_secret = resolve_secret("JWT_SECRET", &environment, DEV_JWT_SECRET)?;
+        let jwt_secret = resolve_secret(&keys::JWT_SECRET, &environment, DEV_JWT_SECRET)?;
         check_jwt_secret_len(&jwt_secret, &environment)?;
-        let encryption_key = resolve_secret("ENCRYPTION_KEY", &environment, DEV_ENCRYPTION_KEY)?;
-        let client_origin =
-            std::env::var("CLIENT_ORIGIN").unwrap_or_else(|_| "http://localhost:4301".to_string());
+        let encryption_key =
+            resolve_secret(&keys::ENCRYPTION_KEY, &environment, DEV_ENCRYPTION_KEY)?;
+        let client_origin = config::get(&keys::CLIENT_ORIGIN)
+            .unwrap_or_else(|| "http://localhost:4301".to_string());
         // MAPPS-425: falls back to `client_origin` so a single-origin dev
         // stack is unaffected. Deployed environments MUST set it, because
         // there `CLIENT_ORIGIN` is the apex and the SPA is a subdomain.
-        let spa_base_url = std::env::var("SPA_BASE_URL")
-            .ok()
+        let spa_base_url = config::get(&keys::SPA_BASE_URL)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| client_origin.clone());
         // PMS-748: optional on purpose. An unset value removes the line rather
         // than defaulting to the SMTP from-address, which is a noreply on every
         // deployed environment and would send abuse reports into a black hole.
-        let abuse_contact_email = std::env::var("ABUSE_CONTACT_EMAIL")
-            .ok()
+        let abuse_contact_email = config::get(&keys::ABUSE_CONTACT_EMAIL)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let public_api_base_url = std::env::var("PUBLIC_API_BASE_URL")
-            .ok()
+        let public_api_base_url = config::get(&keys::PUBLIC_API_BASE_URL)
             .map(|v| v.trim().trim_end_matches('/').to_string())
             .filter(|v| !v.is_empty());
         // PMS-591: shared secret for the BUNYIP-211 `account_deleted` webhook.
@@ -233,7 +248,7 @@ impl AppConfig {
         // (BUNYIP-332); bunyip signs every outbound webhook with a single
         // service-wide secret, not a per-Application value.
         let bunyip_webhook_secret = resolve_secret(
-            "BUNYIP_WEBHOOK_SECRET",
+            &keys::BUNYIP_WEBHOOK_SECRET,
             &environment,
             DEV_BUNYIP_WEBHOOK_SECRET,
         )?;
@@ -252,28 +267,28 @@ impl AppConfig {
         }
 
         Ok(Self {
-            database_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            database_url: config::get(&keys::DATABASE_URL).unwrap_or_else(|| {
                 "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
             }),
             // PMS-285: the request-serving role. Default to DATABASE_URL so a
             // dev box without the split still boots (RLS stays inert until the
             // app role is a NOBYPASSRLS one).
-            app_database_url: std::env::var("MOKOSH_APP_DATABASE_URL")
-                .or_else(|_| std::env::var("DATABASE_URL"))
-                .unwrap_or_else(|_| {
+            app_database_url: config::get(&keys::MOKOSH_APP_DATABASE_URL)
+                .or_else(|| config::get(&keys::DATABASE_URL))
+                .unwrap_or_else(|| {
                     "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
                 }),
             jwt_secret,
-            host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
-            port: std::env::var("PORT")
-                .unwrap_or_else(|_| "8080".to_string())
+            host: config::get(&keys::HOST).unwrap_or_else(|| "0.0.0.0".to_string()),
+            port: config::get(&keys::PORT)
+                .unwrap_or_else(|| "8080".to_string())
                 .parse()
                 .unwrap_or(8080),
             environment,
-            base_url: std::env::var("BASE_URL")
-                .unwrap_or_else(|_| "http://localhost:8080".to_string()),
-            run_migrations: std::env::var("RUN_MIGRATIONS")
-                .unwrap_or_else(|_| "true".to_string())
+            base_url: config::get(&keys::BASE_URL)
+                .unwrap_or_else(|| "http://localhost:8080".to_string()),
+            run_migrations: config::get(&keys::RUN_MIGRATIONS)
+                .unwrap_or_else(|| "true".to_string())
                 .parse()
                 .unwrap_or(true),
             encryption_key,
@@ -281,8 +296,7 @@ impl AppConfig {
             spa_base_url,
             abuse_contact_email,
             public_api_base_url,
-            cors_origins: std::env::var("CORS_ORIGIN")
-                .ok()
+            cors_origins: config::get(&keys::CORS_ORIGIN)
                 .map(|raw| {
                     raw.split(',')
                         .map(|s| s.trim().to_string())
@@ -290,25 +304,20 @@ impl AppConfig {
                         .collect::<Vec<_>>()
                 })
                 .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| {
-                    vec![std::env::var("CLIENT_ORIGIN")
-                        .unwrap_or_else(|_| "http://localhost:4301".to_string())]
-                }),
+                .unwrap_or_else(|| vec![client_origin.clone()]),
             bunyip_webhook_secret,
             // PMS-657: optional IP2Location DB path for login-location alerts.
-            ip2location_db_path: std::env::var("IP2LOCATION_DB_PATH")
-                .ok()
+            ip2location_db_path: config::get(&keys::IP2LOCATION_DB_PATH)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             // BUNYIP-475: optional IP2Proxy PX DB path for ASN / VPN enrichment.
-            ip2proxy_db_path: std::env::var("IP2PROXY_DB_PATH")
-                .ok()
+            ip2proxy_db_path: config::get(&keys::IP2PROXY_DB_PATH)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             // PMS-658: opt-in switch for the suspicious-login notify-and-approve
             // gate. Default false because it can withhold a login; enable per
             // deployment for a staged rollout.
-            login_approval_enabled: std::env::var("LOGIN_APPROVAL_ENABLED")
+            login_approval_enabled: config::get(&keys::LOGIN_APPROVAL_ENABLED)
                 .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
             // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS. Empty,
@@ -316,8 +325,7 @@ impl AppConfig {
             // usize -> Some(N). The value is threaded into `TenantService` via
             // its builder so the service layer probes `COUNT(*)` before
             // insert.
-            max_tenants: std::env::var("MOKOSH_MAX_TENANTS")
-                .ok()
+            max_tenants: config::get(&keys::MOKOSH_MAX_TENANTS)
                 .and_then(|raw| raw.trim().parse::<usize>().ok())
                 .filter(|n| *n > 0),
             // PMS-902: self-hosted (default) or saas. Unset and unrecognised
@@ -376,7 +384,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Running in multi-tenant mode");
 
-    let config = AppConfig::from_env().expect("Failed to load configuration");
+    // The env file has to land before ANYTHING reads a variable: the hosting
+    // profile below chooses the configuration provider, and that provider then
+    // resolves every declared key out of this process's environment.
+    dotenvy::dotenv().ok();
 
     // PMS-1011: the same variable, read strictly, because this answer chooses
     // providers rather than gating mail. Read here so an unrecognised mode
@@ -384,6 +395,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // legal values, instead of surfacing from whichever provider resolved
     // first. `config.deployment_mode` keeps the lenient reading for mail.
     let hosting_profile = DeploymentMode::from_env_for_providers()?;
+
+    // PMS-982: pick the configuration provider and resolve the first
+    // generation, before `AppConfig` or any feature asks for a value. An
+    // unrecognised CONFIG_BACKEND ends startup here naming the legal values,
+    // rather than silently serving from the default.
+    let config_selection =
+        config::init_from_env(hosting_profile.default_provider_for(ProviderKind::Configuration)?)?;
+
+    let config = AppConfig::from_env().expect("Failed to load configuration");
 
     // PMS-489: self-provision the split DB roles (mokosh_migrator / mokosh_app)
     // from MOKOSH_ADMIN_DATABASE_URL on first boot, before connecting the
@@ -585,6 +605,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // disagree about what is serving a capability.
     let provider_selection = hosting_profile.resolve_providers(
         &ProviderOverrides::new()
+            .with_opt(
+                ProviderKind::Configuration,
+                config_selection.explicit_providers(),
+            )
             .with_opt(ProviderKind::Secrets, secrets_config.explicit_providers())
             .with_opt(
                 ProviderKind::Storage,
@@ -843,44 +867,52 @@ mod tests {
         );
     }
 
-    // Use a per-test unique var name so the env mutation cannot collide with
-    // sibling tests running in the same process.
+    // PMS-982: the rule is driven with values rather than by mutating
+    // process-global environment. `resolve_secret` reads through the held
+    // configuration generation now, so a `set_var` here would not have been
+    // seen; taking the value also removes the per-test unique var names these
+    // needed to avoid racing each other.
     #[test]
     fn resolve_secret_dev_env_falls_back() {
-        let var = "PMS499_TEST_DEV_FALLBACK";
-        std::env::remove_var(var);
-        let got = resolve_secret(var, "development", "the-dev-value").unwrap();
+        let got = resolve_secret_value("A_SECRET", None, "development", "the-dev-value").unwrap();
         assert_eq!(got, "the-dev-value");
+        // A forwarded-but-unset variable arrives blank (PMS-836) and means the
+        // same thing as absent.
+        let blank =
+            resolve_secret_value("A_SECRET", Some(String::new()), "dev", "the-dev-value").unwrap();
+        assert_eq!(blank, "the-dev-value");
     }
 
     #[test]
     fn resolve_secret_prod_unset_is_fatal() {
-        let var = "PMS499_TEST_PROD_UNSET";
-        std::env::remove_var(var);
         assert!(
-            resolve_secret(var, "production", "the-dev-value").is_err(),
+            resolve_secret_value("A_SECRET", None, "production", "the-dev-value").is_err(),
             "unset secret in production must error"
         );
     }
 
     #[test]
     fn resolve_secret_prod_dev_value_is_fatal() {
-        let var = "PMS499_TEST_PROD_DEVVAL";
-        std::env::set_var(var, "the-dev-value");
-        let result = resolve_secret(var, "production", "the-dev-value");
-        std::env::remove_var(var);
         assert!(
-            result.is_err(),
+            resolve_secret_value(
+                "A_SECRET",
+                Some("the-dev-value".to_string()),
+                "production",
+                "the-dev-value"
+            )
+            .is_err(),
             "explicit dev fallback in production must error"
         );
     }
 
     #[test]
     fn resolve_secret_prod_real_value_ok() {
-        let var = "PMS499_TEST_PROD_REAL";
-        std::env::set_var(var, "a-real-production-secret");
-        let result = resolve_secret(var, "production", "the-dev-value");
-        std::env::remove_var(var);
+        let result = resolve_secret_value(
+            "A_SECRET",
+            Some("a-real-production-secret".to_string()),
+            "production",
+            "the-dev-value",
+        );
         assert_eq!(result.unwrap(), "a-real-production-secret");
     }
 

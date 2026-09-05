@@ -80,7 +80,7 @@ static UPDATE_CHECK_PROBE: std::sync::OnceLock<Option<UpdateCheckProbe>> =
 fn update_check_probe() -> Option<&'static UpdateCheckProbe> {
     UPDATE_CHECK_PROBE
         .get_or_init(|| {
-            let configured = std::env::var("MOKOSH_UPDATE_CHECK_URL").ok()?;
+            let configured = crate::config::get(&crate::config::registry::MOKOSH_UPDATE_CHECK_URL)?;
             let trimmed = configured.trim().trim_end_matches('/').to_string();
             if trimmed.is_empty() {
                 return None;
