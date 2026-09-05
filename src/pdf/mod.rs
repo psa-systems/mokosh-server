@@ -68,10 +68,12 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use printpdf::{
-    Color, FontId, Line, LinePoint, Mm, Op, ParsedFont, PdfDocument, PdfFont, PdfFontHandle,
-    PdfPage, PdfSaveOptions, Point, Pt, RawImage, Rgb, TextItem, XObjectId, XObjectTransform,
+    Color, FontId, Line, LinePoint, Mm, Op, PaintMode, ParsedFont, PdfDocument, PdfFont,
+    PdfFontHandle, PdfPage, PdfSaveOptions, Point, Polygon, PolygonRing, Pt, RawImage, Rgb,
+    TextItem, WindingOrder, XObjectId, XObjectTransform,
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::utils::error::{AppError, AppResult};
@@ -122,6 +124,242 @@ const MIN_COLUMN_MM: f32 = 16.0;
 /// overflows (PMS-1004): dates, quantities and amounts are never cut to make
 /// room for a description.
 const NARROW_COLUMN_MM: f32 = 34.0;
+
+/// PMS-1006: the band across the head of a Modern page, and where its parts
+/// sit inside it, measured DOWN from the top of the sheet.
+const BAND_HEIGHT_MM: f32 = 34.0;
+const BAND_TITLE_MM: f32 = 15.0;
+const BAND_SUBTITLE_MM: f32 = 25.0;
+const BAND_LOGO_TOP_MM: f32 = 7.0;
+
+/// PMS-1006: the accent a Modern document uses when the tenant set no
+/// `primary_color`. A dark blue, so the band reads as a document rather than as
+/// a placeholder, and so the contrast rule picks light text for the default
+/// case.
+pub const DEFAULT_ACCENT: &str = "#0F4C81";
+
+/// PMS-1006: how a document is laid out.
+///
+/// The tenant picks one and it applies to every document rendered for them from
+/// then on. It is a key on the document rather than a set of layout arguments
+/// because the choice is made once, in `tenants.branding`, and travels with the
+/// thing being rendered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Template {
+    /// The output every document had before PMS-1006, unchanged. The default,
+    /// so shipping templates never means every existing tenant's invoices
+    /// changed shape without anybody asking.
+    #[default]
+    Classic,
+    /// A coloured band across the head of the page, a tinted and zebra-striped
+    /// items table, a bordered totals block and a footer.
+    Modern,
+    /// Monochrome, 8 pt, tighter leading and rules instead of fills, so a long
+    /// invoice still fits one page and prints without swallowing ink.
+    Compact,
+}
+
+impl Template {
+    /// The keys a tenant may store, in the order an error message lists them.
+    pub const KEYS: [&'static str; 3] = ["classic", "modern", "compact"];
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "classic" => Some(Self::Classic),
+            "modern" => Some(Self::Modern),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Modern => "modern",
+            Self::Compact => "compact",
+        }
+    }
+}
+
+/// An RGB triple in the 0..=1 range printpdf wants.
+type Ink = [f32; 3];
+
+const BLACK: Ink = [0.0, 0.0, 0.0];
+/// Not pure white: a band's text at 0.08 grey reads as ink rather than as a
+/// hole punched in the colour.
+const NEAR_BLACK: Ink = [0.08, 0.08, 0.08];
+const WHITE: Ink = [1.0, 1.0, 1.0];
+
+/// PMS-1006: what a [`Template`] means in millimetres and ink.
+///
+/// Resolved by the renderer, never by a caller: a document says which template
+/// it is and what accent colour the tenant chose, and every measurement below
+/// follows from that. Classic's values are the constants the renderer used
+/// before this existed, which is what keeps its output byte-identical.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Theme {
+    pub template: Template,
+    accent: Ink,
+    title_pt: f32,
+    heading_pt: f32,
+    body_pt: f32,
+    /// Line height as a multiple of the font size.
+    leading: f32,
+    /// Space opened before each section.
+    gap_mm: f32,
+    rule_above_mm: f32,
+    rule_below_mm: f32,
+    band: bool,
+    zebra: bool,
+    column_rules: bool,
+    totals_border: bool,
+    footer: bool,
+}
+
+impl Theme {
+    /// `accent` is the tenant's `primary_color` as `#rrggbb`; an absent or
+    /// unparseable value falls back to [`DEFAULT_ACCENT`] rather than to no
+    /// colour, because a Modern document with no band is not Modern.
+    pub fn resolve(template: Template, accent: Option<&str>) -> Self {
+        let chosen = accent.and_then(parse_hex);
+        if chosen.is_none() {
+            // Unset is the ordinary case and says nothing. A value that is set
+            // and will not parse is not: the branding validator refuses one on
+            // the way in, so it came from before the key was validated or from
+            // a hand-edited row, and the operator wondering why their colour
+            // never appears has to be able to find out why.
+            if let Some(value) = accent {
+                tracing::warn!(
+                    accent = %value,
+                    "pdf: the accent colour is not `#rrggbb`; falling back to the default"
+                );
+            }
+        }
+        // `DEFAULT_ACCENT` is a literal this module owns and
+        // `the_band_is_drawn_in_the_tenants_colour_or_the_stated_default` pins
+        // that it parses, so the last arm is unreachable rather than a silent
+        // substitution; it is black rather than a panic because a renderer must
+        // not withhold a document over a constant.
+        let accent = chosen
+            .or_else(|| parse_hex(DEFAULT_ACCENT))
+            .unwrap_or(BLACK);
+        match template {
+            Template::Classic => Self {
+                template,
+                accent,
+                title_pt: TITLE_PT,
+                heading_pt: HEADING_PT,
+                body_pt: BODY_PT,
+                leading: 1.45,
+                gap_mm: 4.0,
+                rule_above_mm: 2.0,
+                rule_below_mm: 4.5,
+                band: false,
+                zebra: false,
+                column_rules: false,
+                totals_border: false,
+                footer: false,
+            },
+            Template::Modern => Self {
+                band: true,
+                zebra: true,
+                totals_border: true,
+                footer: true,
+                ..Self::resolve(Template::Classic, None).with_accent(accent)
+            },
+            Template::Compact => Self {
+                title_pt: 13.0,
+                heading_pt: 9.5,
+                body_pt: 8.0,
+                leading: 1.24,
+                gap_mm: 2.0,
+                rule_above_mm: 1.5,
+                rule_below_mm: 3.4,
+                column_rules: true,
+                ..Self::resolve(Template::Classic, None).with_accent(accent)
+            },
+        }
+    }
+
+    fn with_accent(mut self, accent: Ink) -> Self {
+        self.accent = accent;
+        self
+    }
+
+    fn row(&self, size_pt: f32) -> f32 {
+        size_pt * MM_PER_PT * self.leading
+    }
+
+    fn body_row(&self) -> f32 {
+        self.row(self.body_pt)
+    }
+
+    /// A heading with its rule: the text, then what [`Layout::rule`] advances.
+    fn heading_height(&self) -> f32 {
+        self.row(self.heading_pt) + self.rule_above_mm + self.rule_below_mm
+    }
+
+    /// The ink a band's own text is set in.
+    ///
+    /// NOT hardcoded white. An MSP whose brand is pale yellow would otherwise
+    /// get white on white, which is a document with no title on it.
+    pub fn band_text(&self) -> Ink {
+        if relative_luminance(self.accent) > 0.45 {
+            NEAR_BLACK
+        } else {
+            WHITE
+        }
+    }
+}
+
+/// `#rrggbb` into a triple. `None` for anything else, so a colour the branding
+/// validator never saw cannot reach the page as an unrelated one.
+fn parse_hex(value: &str) -> Option<Ink> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok().map(f32::from);
+    Some([
+        channel(0)? / 255.0,
+        channel(2)? / 255.0,
+        channel(4)? / 255.0,
+    ])
+}
+
+/// WCAG relative luminance, which is what decides whether text on a colour is
+/// dark or light. The sRGB channels are linearised first, because a plain
+/// average of the raw channels calls a saturated yellow dark.
+fn relative_luminance(ink: Ink) -> f32 {
+    let linear = |c: f32| {
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(ink[0]) + 0.7152 * linear(ink[1]) + 0.0722 * linear(ink[2])
+}
+
+/// A colour mixed towards white, for a header fill or a zebra stripe: at 4 per
+/// cent a row reads as shaded rather than as coloured, whatever the accent is.
+fn tint(ink: Ink, strength: f32) -> Ink {
+    [
+        1.0 - (1.0 - ink[0]) * strength,
+        1.0 - (1.0 - ink[1]) * strength,
+        1.0 - (1.0 - ink[2]) * strength,
+    ]
+}
+
+fn color(ink: Ink) -> Color {
+    Color::Rgb(Rgb {
+        r: ink[0],
+        g: ink[1],
+        b: ink[2],
+        icc_profile: None,
+    })
+}
 
 /// What a section holds.
 pub enum Body {
@@ -185,6 +423,17 @@ pub struct Document {
     /// PMS-911: the issuer's mark, top right of the first page.
     pub logo: Option<Logo>,
     pub sections: Vec<Section>,
+    /// PMS-1006: closing lines, printed under a rule at the end of the
+    /// document. Carried by every document and drawn only by the templates
+    /// whose theme asks for one, so a caller never says "if Modern".
+    pub footer: Vec<String>,
+    /// PMS-1006: which layout to render in. [`Template::Classic`] unless a
+    /// caller says otherwise, so every existing construction site keeps the
+    /// output it had.
+    pub template: Template,
+    /// PMS-1006: the tenant's `primary_color` as `#rrggbb`, for the templates
+    /// that draw in it. Absent means [`DEFAULT_ACCENT`].
+    pub accent: Option<String>,
 }
 
 impl Document {
@@ -194,7 +443,29 @@ impl Document {
             subtitle: None,
             logo: None,
             sections: Vec::new(),
+            footer: Vec::new(),
+            template: Template::Classic,
+            accent: None,
         }
+    }
+
+    /// PMS-1006: lay this document out with a template other than Classic.
+    pub fn template(mut self, template: Template) -> Self {
+        self.template = template;
+        self
+    }
+
+    /// PMS-1006: the accent colour the template draws in, `#rrggbb`.
+    pub fn accent(mut self, accent: Option<String>) -> Self {
+        self.accent = accent;
+        self
+    }
+
+    /// PMS-1006: the closing lines. Whether they are drawn is the template's
+    /// decision, not the caller's.
+    pub fn footer(mut self, lines: Vec<String>) -> Self {
+        self.footer = lines;
+        self
     }
 
     /// PMS-911: an optional mark. `None` is the ordinary case, not a fallback:
@@ -389,6 +660,7 @@ fn for_font(s: &str, face: &ParsedFont, missing: &mut BTreeSet<char>) -> String 
 /// rather than a bad document: see [`faces`].
 pub fn render(document: &Document) -> AppResult<Vec<u8>> {
     let faces = faces()?;
+    let theme = Theme::resolve(document.template, document.accent.as_deref());
     // The title also goes in the document information dictionary, which
     // printpdf writes as UTF-16BE, so that copy carries any character at all
     // and is passed through unfolded.
@@ -399,37 +671,39 @@ pub fn render(document: &Document) -> AppResult<Vec<u8>> {
             .map
             .insert(weight.id(), PdfFont::new(faces.get(weight).clone()));
     }
-    let mut layout = Layout::new(faces);
+    let mut layout = Layout::new(faces, theme);
 
-    // The logo is placed before the title so the title block can start below
-    // it if it is the taller of the two. A logo that will not decode is
-    // dropped rather than fatal: an invoice with no mark is a valid invoice,
-    // and refusing to render one because an image is corrupt would withhold
-    // the document over its decoration.
-    let logo_height = match &document.logo {
-        Some(logo) => match place_logo(&mut doc, &mut layout, logo) {
-            Ok(height) => height,
-            Err(reason) => {
-                tracing::warn!(reason = %reason, "pdf: could not place the logo; rendering without it");
-                0.0
-            }
-        },
-        None => 0.0,
-    };
+    if theme.band {
+        // PMS-1006: the band is filled first so the title and the mark sit on
+        // top of it rather than under it.
+        layout.band(&document.title, document.subtitle.as_deref());
+        if let Some(logo) = &document.logo {
+            layout.y_mm = PAGE_HEIGHT_MM - BAND_LOGO_TOP_MM;
+            place_or_warn(&mut doc, &mut layout, logo);
+        }
+        layout.y_mm = PAGE_HEIGHT_MM - BAND_HEIGHT_MM - theme.gap_mm;
+    } else {
+        // The logo is placed before the title so the title block can start
+        // below it if it is the taller of the two.
+        let logo_height = match &document.logo {
+            Some(logo) => place_or_warn(&mut doc, &mut layout, logo),
+            None => 0.0,
+        };
 
-    let title_top = layout.y_mm;
-    layout.line(&document.title, Weight::Bold, TITLE_PT);
-    if let Some(subtitle) = &document.subtitle {
-        layout.line(subtitle, Weight::Regular, HEADING_PT);
+        let title_top = layout.y_mm;
+        layout.line(&document.title, Weight::Bold, theme.title_pt);
+        if let Some(subtitle) = &document.subtitle {
+            layout.line(subtitle, Weight::Regular, theme.heading_pt);
+        }
+        // Whichever of the two blocks is taller decides where the body starts.
+        layout.y_mm = layout.y_mm.min(title_top - logo_height);
     }
-    // Whichever of the two blocks is taller decides where the body starts.
-    layout.y_mm = layout.y_mm.min(title_top - logo_height);
-    layout.gap(4.0);
+    layout.gap(theme.gap_mm);
 
     for section in &document.sections {
-        layout.gap(4.0);
+        layout.gap(theme.gap_mm);
         if let Some(heading) = &section.heading {
-            layout.keep_together(heading_height() + row_height(BODY_PT) * 2.0);
+            layout.keep_together(theme.heading_height() + theme.body_row() * 2.0);
             layout.heading(heading);
         }
         match &section.body {
@@ -443,6 +717,10 @@ pub fn render(document: &Document) -> AppResult<Vec<u8>> {
             Body::Columns(blocks) => layout.columns(blocks),
             Body::Totals(pairs) => layout.totals(pairs),
         }
+    }
+
+    if theme.footer && !document.footer.is_empty() {
+        layout.footer(&document.footer);
     }
 
     // One line per document, not per character: a 400-row report of an
@@ -579,23 +857,22 @@ fn place_logo(doc: &mut PdfDocument, layout: &mut Layout, logo: &Logo) -> Result
     Ok(height_mm)
 }
 
-fn row_height(size_pt: f32) -> f32 {
-    size_pt * MM_PER_PT * 1.45
+/// Place the mark, or say why it could not be placed and carry on.
+///
+/// A logo that will not decode is dropped rather than fatal: an invoice with no
+/// mark is a valid invoice, and refusing to render one because an image is
+/// corrupt would withhold the document over its decoration. The refusal is
+/// logged rather than swallowed, so an MSP whose logo never appears can be told
+/// why.
+fn place_or_warn(doc: &mut PdfDocument, layout: &mut Layout, logo: &Logo) -> f32 {
+    match place_logo(doc, layout, logo) {
+        Ok(height) => height,
+        Err(reason) => {
+            tracing::warn!(reason = %reason, "pdf: could not place the logo; rendering without it");
+            0.0
+        }
+    }
 }
-
-/// A heading with its rule: the text, then what [`Layout::rule`] advances.
-fn heading_height() -> f32 {
-    row_height(HEADING_PT) + RULE_ABOVE_MM + RULE_BELOW_MM
-}
-
-/// Where a rule sits relative to the text either side of it (PMS-1004). The
-/// text cursor is a BASELINE, so the rule needs only descender clearance
-/// above it and a full ascent plus breathing room below, where the next
-/// baseline lands. Before this the rule was set a full row below the
-/// heading and the next baseline a hair below the rule, so every heading
-/// floated above its rule and every body sat on it.
-const RULE_ABOVE_MM: f32 = 2.0;
-const RULE_BELOW_MM: f32 = 4.5;
 
 /// A pen walking down a page, spilling onto the next when it runs out.
 struct Layout {
@@ -608,16 +885,19 @@ struct Layout {
     /// Every character the faces could not draw, gathered as the page is drawn
     /// so [`render`] can report them once.
     missing: BTreeSet<char>,
+    /// PMS-1006: every measurement and every colour this pen uses.
+    theme: Theme,
 }
 
 impl Layout {
-    fn new(faces: &'static Faces) -> Self {
+    fn new(faces: &'static Faces, theme: Theme) -> Self {
         Self {
             pages: Vec::new(),
             ops: Vec::new(),
             y_mm: PAGE_HEIGHT_MM - MARGIN_MM,
             faces,
             missing: BTreeSet::new(),
+            theme,
         }
     }
 
@@ -653,6 +933,11 @@ impl Layout {
     }
 
     fn text_at(&mut self, x_mm: f32, text: &str, font: Weight, size_pt: f32) {
+        self.text_in(x_mm, text, font, size_pt, BLACK);
+    }
+
+    /// PMS-1006: the same, in an ink the caller chooses, for a band's own text.
+    fn text_in(&mut self, x_mm: f32, text: &str, font: Weight, size_pt: f32, ink: Ink) {
         let text = for_font(text, self.faces.get(font), &mut self.missing);
         self.ops.extend([
             Op::StartTextSection,
@@ -663,14 +948,7 @@ impl Layout {
                 font: PdfFontHandle::External(font.id()),
                 size: Pt(size_pt),
             },
-            Op::SetFillColor {
-                col: Color::Rgb(Rgb {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    icc_profile: None,
-                }),
-            },
+            Op::SetFillColor { col: color(ink) },
             Op::ShowText {
                 items: vec![TextItem::Text(text)],
             },
@@ -681,13 +959,95 @@ impl Layout {
     /// One line at the left margin, and down.
     fn line(&mut self, text: &str, font: Weight, size_pt: f32) {
         self.text_at(MARGIN_MM, text, font, size_pt);
-        self.advance(row_height(size_pt));
+        self.advance(self.theme.row(size_pt));
     }
 
     /// A section heading with its rule beneath.
     fn heading(&mut self, text: &str) {
-        self.text_at(MARGIN_MM, text, Weight::Bold, HEADING_PT);
+        let size = self.theme.heading_pt;
+        self.text_at(MARGIN_MM, text, Weight::Bold, size);
         self.rule();
+    }
+
+    /// PMS-1006: the Modern band, filled in the tenant's accent, carrying the
+    /// document's name and number in whichever ink reads on it.
+    fn band(&mut self, title: &str, subtitle: Option<&str>) {
+        let accent = self.theme.accent;
+        self.fill_rect(
+            0.0,
+            PAGE_HEIGHT_MM - BAND_HEIGHT_MM,
+            PAGE_WIDTH_MM,
+            PAGE_HEIGHT_MM,
+            accent,
+        );
+        let ink = self.theme.band_text();
+        let title_pt = self.theme.title_pt;
+        let heading_pt = self.theme.heading_pt;
+        self.y_mm = PAGE_HEIGHT_MM - BAND_TITLE_MM;
+        self.text_in(
+            MARGIN_MM,
+            &title.to_uppercase(),
+            Weight::Bold,
+            title_pt,
+            ink,
+        );
+        if let Some(subtitle) = subtitle {
+            self.y_mm = PAGE_HEIGHT_MM - BAND_SUBTITLE_MM;
+            self.text_in(MARGIN_MM, subtitle, Weight::Regular, heading_pt, ink);
+        }
+    }
+
+    /// PMS-1006: the closing block, under a rule. Drawn only when the theme
+    /// asks for one, so a document carries its footer lines whatever template
+    /// renders it.
+    fn footer(&mut self, lines: &[String]) {
+        let gap = self.theme.gap_mm;
+        let size = self.theme.body_pt;
+        self.keep_together(
+            gap + self.theme.heading_height() + self.theme.body_row() * lines.len() as f32,
+        );
+        self.gap(gap);
+        self.rule();
+        for line in lines {
+            self.text_at(MARGIN_MM, line, Weight::Regular, size);
+            self.advance(self.theme.row(size));
+        }
+    }
+
+    /// A filled rectangle, for a band, a header fill or a zebra stripe.
+    fn fill_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, ink: Ink) {
+        let corner = |x: f32, y: f32| LinePoint {
+            p: Point {
+                x: Mm(x).into(),
+                y: Mm(y).into(),
+            },
+            bezier: false,
+        };
+        self.ops.extend([
+            Op::SetFillColor { col: color(ink) },
+            Op::DrawPolygon {
+                polygon: Polygon {
+                    rings: vec![PolygonRing {
+                        points: vec![
+                            corner(x0, y0),
+                            corner(x1, y0),
+                            corner(x1, y1),
+                            corner(x0, y1),
+                        ],
+                    }],
+                    mode: PaintMode::Fill,
+                    winding_order: WindingOrder::NonZero,
+                },
+            },
+        ]);
+    }
+
+    /// A stroked rectangle, for the Modern totals block.
+    fn stroke_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        self.segment(x0, y0, x1, y0);
+        self.segment(x1, y0, x1, y1);
+        self.segment(x1, y1, x0, y1);
+        self.segment(x0, y1, x0, y0);
     }
 
     /// A hairline the width of the content area, used under a heading and under
@@ -697,15 +1057,27 @@ impl Layout {
     }
 
     /// A hairline from `x0` to `x1`, spaced for text above and below it.
+    ///
+    /// The text cursor is a BASELINE, so the rule needs only descender
+    /// clearance above it and a full ascent plus breathing room below, where
+    /// the next baseline lands (PMS-1004). Before that the rule was set a full
+    /// row below the heading and the next baseline a hair below the rule, so
+    /// every heading floated above its rule and every body sat on it.
     fn rule_between(&mut self, x0: f32, x1: f32) {
-        self.advance(RULE_ABOVE_MM);
+        self.advance(self.theme.rule_above_mm);
         self.hairline(x0, x1);
-        self.advance(RULE_BELOW_MM);
+        self.advance(self.theme.rule_below_mm);
     }
 
     /// The line itself at the current cursor, with no spacing of its own.
     fn hairline(&mut self, x0: f32, x1: f32) {
-        let y = Mm(self.y_mm).into();
+        let y = self.y_mm;
+        self.segment(x0, y, x1, y);
+    }
+
+    /// A hairline between two points, which a rule, a column rule and a
+    /// stroked border all are.
+    fn segment(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
         self.ops.extend([
             Op::SetOutlineThickness { pt: Pt(0.4) },
             Op::SetOutlineColor {
@@ -722,14 +1094,14 @@ impl Layout {
                         LinePoint {
                             p: Point {
                                 x: Mm(x0).into(),
-                                y,
+                                y: Mm(y0).into(),
                             },
                             bezier: false,
                         },
                         LinePoint {
                             p: Point {
                                 x: Mm(x1).into(),
-                                y,
+                                y: Mm(y1).into(),
                             },
                             bezier: false,
                         },
@@ -748,64 +1120,102 @@ impl Layout {
         if blocks.is_empty() {
             return;
         }
+        let body = self.theme.body_pt;
+        let heading_pt = self.theme.heading_pt;
+        let row = self.theme.body_row();
         let count = blocks.len() as f32;
         let width = (self.content_width() - COLUMN_GUTTER_MM * (count - 1.0)) / count;
         let tallest = blocks.iter().map(|(_, l)| l.len()).max().unwrap_or(0);
-        let needed = heading_height() + row_height(BODY_PT) * tallest as f32;
+        let needed = self.theme.heading_height() + row * tallest as f32;
         self.keep_together(needed);
         let top = self.y_mm;
         let mut lowest = top;
         for (i, (heading, lines)) in blocks.iter().enumerate() {
             let x = MARGIN_MM + i as f32 * (width + COLUMN_GUTTER_MM);
             self.y_mm = top;
-            self.text_at(x, &truncate_to(heading, width), Weight::Bold, HEADING_PT);
+            self.text_at(
+                x,
+                &truncate_to(heading, width, body),
+                Weight::Bold,
+                heading_pt,
+            );
             self.rule_between(x, x + width);
             for line in lines {
-                self.text_at(x, &truncate_to(line, width), Weight::Regular, BODY_PT);
-                self.y_mm -= row_height(BODY_PT);
+                self.text_at(
+                    x,
+                    &truncate_to(line, width, body),
+                    Weight::Regular,
+                    body,
+                );
+                self.y_mm -= row;
             }
             lowest = lowest.min(self.y_mm);
         }
         self.y_mm = lowest;
     }
 
-    /// PMS-1004: a totals block against the right margin.
+    /// PMS-1004: a totals block against the right margin. PMS-1006 gave the
+    /// templates that ask for it a border around the block and the closing
+    /// pair at heading size, so "Balance due" is the line the eye lands on.
     fn totals(&mut self, pairs: &[(String, String)]) {
+        let body = self.theme.body_pt;
+        let row = self.theme.body_row();
+        let last_pt = if self.theme.totals_border {
+            self.theme.heading_pt
+        } else {
+            body
+        };
         let x0 = PAGE_WIDTH_MM - MARGIN_MM - TOTALS_WIDTH_MM;
         let right = PAGE_WIDTH_MM - MARGIN_MM;
-        self.keep_together(row_height(BODY_PT) * (pairs.len() as f32 + 1.0) + RULE_BELOW_MM);
+        let height = row * (pairs.len() as f32 + 1.0) + self.theme.rule_below_mm;
+        self.keep_together(height);
+        if self.theme.totals_border {
+            let top = self.y_mm + row * 0.75;
+            self.stroke_rect(x0 - CELL_PAD_MM, top - height, right + CELL_PAD_MM, top);
+        }
         for (i, (label, value)) in pairs.iter().enumerate() {
-            if i + 1 == pairs.len() && pairs.len() > 1 {
+            let last = i + 1 == pairs.len();
+            if last && pairs.len() > 1 {
                 // The rule that says "this one is the answer".
                 self.rule_between(x0, right);
             }
-            self.text_at(x0, label, Weight::Regular, BODY_PT);
-            let value = truncate_to(value, TOTALS_WIDTH_MM - LABEL_WIDTH_MM / 2.0);
+            let size = if last { last_pt } else { body };
+            self.text_at(x0, label, Weight::Regular, size);
+            let value = truncate_to(value, TOTALS_WIDTH_MM - LABEL_WIDTH_MM / 2.0, body);
             self.text_at(
-                right_aligned_x(right, &value),
+                right_aligned_x(right, &value, size),
                 &value,
                 Weight::Bold,
-                BODY_PT,
+                size,
             );
-            self.advance(row_height(BODY_PT));
+            self.advance(self.theme.row(size));
         }
     }
 
     fn fields(&mut self, pairs: &[(String, String)]) {
+        let body = self.theme.body_pt;
+        let row = self.theme.body_row();
         for (label, value) in pairs {
-            self.keep_together(row_height(BODY_PT));
-            self.text_at(MARGIN_MM, label, Weight::Regular, BODY_PT);
-            self.text_at(MARGIN_MM + LABEL_WIDTH_MM, value, Weight::Bold, BODY_PT);
-            self.advance(row_height(BODY_PT));
+            self.keep_together(row);
+            self.text_at(MARGIN_MM, label, Weight::Regular, body);
+            self.text_at(
+                MARGIN_MM + LABEL_WIDTH_MM,
+                value,
+                Weight::Bold,
+                body,
+            );
+            self.advance(row);
         }
     }
 
     /// PMS-911: plain lines at the left margin, for an address block.
     fn text_block(&mut self, lines: &[String]) {
+        let body = self.theme.body_pt;
+        let row = self.theme.body_row();
         for line in lines {
-            self.keep_together(row_height(BODY_PT));
-            self.text_at(MARGIN_MM, line, Weight::Regular, BODY_PT);
-            self.advance(row_height(BODY_PT));
+            self.keep_together(row);
+            self.text_at(MARGIN_MM, line, Weight::Regular, body);
+            self.advance(row);
         }
     }
 
@@ -813,42 +1223,82 @@ impl Layout {
         if headers.is_empty() {
             return;
         }
-        let widths = column_widths(headers, rows, self.content_width());
+        let body = self.theme.body_pt;
+        let row_mm = self.theme.body_row();
+        let widths = column_widths(headers, rows, self.content_width(), body);
         self.header_row(headers, &widths, align);
-        for row in rows {
+        for (index, row) in rows.iter().enumerate() {
             // A row that would land in the bottom margin starts the next page,
             // and the header comes with it: a table whose columns are unlabelled
             // from page two is not a table any more.
-            if self.y_mm - row_height(BODY_PT) < MARGIN_MM {
+            if self.y_mm - row_mm < MARGIN_MM {
                 self.page_break();
                 self.header_row(headers, &widths, align);
             }
+            // PMS-1006: the shading and the rules go down BEFORE the text, so
+            // the text sits on top of them rather than under them.
+            if self.theme.zebra && index % 2 == 1 {
+                let stripe = tint(self.theme.accent, 0.04);
+                self.row_fill(MARGIN_MM, PAGE_WIDTH_MM - MARGIN_MM, stripe);
+            }
+            if self.theme.column_rules {
+                self.column_rules(&widths);
+            }
             self.cells(row, &widths, align, Weight::Regular);
-            self.advance(row_height(BODY_PT));
+            self.advance(row_mm);
         }
         // PMS-1004: a closing rule, so the table has a bottom as well as a
         // top and what follows it (a totals block, the next section) reads as
         // separate from the last row.
-        self.advance(RULE_ABOVE_MM - row_height(BODY_PT) * 0.4);
+        self.advance(self.theme.rule_above_mm - row_mm * 0.4);
         self.hairline(MARGIN_MM, PAGE_WIDTH_MM - MARGIN_MM);
-        self.advance(RULE_BELOW_MM);
+        self.advance(self.theme.rule_below_mm);
     }
 
     fn header_row(&mut self, headers: &[String], widths: &[f32], align: &[Align]) {
+        if self.theme.zebra {
+            let fill = tint(self.theme.accent, 0.16);
+            self.row_fill(MARGIN_MM, PAGE_WIDTH_MM - MARGIN_MM, fill);
+        }
+        if self.theme.column_rules {
+            self.column_rules(widths);
+        }
         self.cells(headers, widths, align, Weight::Bold);
         self.rule();
     }
 
+    /// The rectangle one table row occupies, measured from its baseline: a
+    /// descender below, an ascender and its leading above.
+    fn row_fill(&mut self, x0: f32, x1: f32, ink: Ink) {
+        let row = self.theme.body_row();
+        let (bottom, top) = (self.y_mm - row * 0.26, self.y_mm + row * 0.72);
+        self.fill_rect(x0, bottom, x1, top, ink);
+    }
+
+    /// PMS-1006: Compact separates its columns with rules instead of fills.
+    /// One segment per boundary per row, so a table that breaks across pages
+    /// needs no bookkeeping about where it started.
+    fn column_rules(&mut self, widths: &[f32]) {
+        let row = self.theme.body_row();
+        let (bottom, top) = (self.y_mm - row * 0.26, self.y_mm + row * 0.72);
+        let mut x = MARGIN_MM;
+        for width in widths.iter().take(widths.len().saturating_sub(1)) {
+            x += width;
+            self.segment(x - CELL_PAD_MM / 2.0, bottom, x - CELL_PAD_MM / 2.0, top);
+        }
+    }
+
     fn cells(&mut self, cells: &[String], widths: &[f32], align: &[Align], font: Weight) {
+        let body = self.theme.body_pt;
         let mut x = MARGIN_MM;
         for (i, width) in widths.iter().enumerate() {
             if let Some(cell) = cells.get(i) {
-                let text = truncate_to(cell, *width);
+                let text = truncate_to(cell, *width, body);
                 let at = match align.get(i).copied().unwrap_or_default() {
                     Align::Left => x,
-                    Align::Right => right_aligned_x(x + width - CELL_PAD_MM, &text),
+                    Align::Right => right_aligned_x(x + width - CELL_PAD_MM, &text, body),
                 };
-                self.text_at(at, &text, font, BODY_PT);
+                self.text_at(at, &text, font, body);
             }
             x += width;
         }
@@ -866,9 +1316,11 @@ impl Layout {
     }
 }
 
-/// How many millimetres a string of `n` characters occupies at the body size.
-fn text_width_mm(chars: usize) -> f32 {
-    chars as f32 * AVERAGE_CHAR_EM * BODY_PT * MM_PER_PT
+/// How many millimetres a string of `n` characters occupies at a given size.
+/// PMS-1006 made the size a parameter, because Compact sets its body at 8 pt
+/// and a width estimated at 9 pt would truncate cells that fit.
+fn text_width_mm(chars: usize, size_pt: f32) -> f32 {
+    chars as f32 * AVERAGE_CHAR_EM * size_pt * MM_PER_PT
 }
 
 /// Where text has to START so that it ENDS at `right_mm` (PMS-1004).
@@ -878,23 +1330,28 @@ fn text_width_mm(chars: usize) -> f32 {
 /// short of the edge rather than past it. Digits are 0.556 em in Helvetica,
 /// close enough to the 0.52 that a column of amounts lines up to within a
 /// character.
-fn right_aligned_x(right_mm: f32, text: &str) -> f32 {
-    (right_mm - text_width_mm(text.chars().count())).max(MARGIN_MM)
+fn right_aligned_x(right_mm: f32, text: &str, size_pt: f32) -> f32 {
+    (right_mm - text_width_mm(text.chars().count(), size_pt)).max(MARGIN_MM)
 }
 
 /// Share the content width between columns in proportion to what they hold.
 ///
 /// A column is never narrower than [`MIN_COLUMN_MM`], so one long free-text
 /// column cannot squeeze a column of dates down to nothing.
-fn column_widths(headers: &[String], rows: &[Vec<String>], available: f32) -> Vec<f32> {
+fn column_widths(
+    headers: &[String],
+    rows: &[Vec<String>],
+    available: f32,
+    size_pt: f32,
+) -> Vec<f32> {
     let mut wanted: Vec<f32> = headers
         .iter()
-        .map(|h| text_width_mm(h.chars().count()) + 4.0)
+        .map(|h| text_width_mm(h.chars().count(), size_pt) + 4.0)
         .collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if let Some(w) = wanted.get_mut(i) {
-                *w = w.max(text_width_mm(cell.chars().count()) + 4.0);
+                *w = w.max(text_width_mm(cell.chars().count(), size_pt) + 4.0);
             }
         }
     }
@@ -951,9 +1408,9 @@ fn column_widths(headers: &[String], rows: &[Vec<String>], available: f32) -> Ve
 
 /// Cut a cell to what its column can show, with an ellipsis so a reader can
 /// see that something was cut.
-fn truncate_to(text: &str, width_mm: f32) -> String {
+fn truncate_to(text: &str, width_mm: f32, size_pt: f32) -> String {
     let usable = (width_mm - CELL_PAD_MM).max(0.0);
-    let fits = (usable / (AVERAGE_CHAR_EM * BODY_PT * MM_PER_PT)).floor() as usize;
+    let fits = (usable / (AVERAGE_CHAR_EM * size_pt * MM_PER_PT)).floor() as usize;
     let len = text.chars().count();
     if len <= fits {
         return text.to_string();
@@ -1186,7 +1643,7 @@ mod tests {
         ];
         let rows = vec![vec!["x".to_string(), "a".repeat(400), "1".to_string()]];
         let available = PAGE_WIDTH_MM - 2.0 * MARGIN_MM;
-        let widths = column_widths(&headers, &rows, available);
+        let widths = column_widths(&headers, &rows, available, BODY_PT);
         assert_eq!(widths.len(), 3);
         for w in &widths {
             assert!(*w >= MIN_COLUMN_MM - 0.01, "a column collapsed: {widths:?}");
@@ -1251,14 +1708,14 @@ mod tests {
     fn right_aligned_text_ends_at_the_edge_it_was_given() {
         let right = 120.0;
         let text = "300.00 USD";
-        let x = right_aligned_x(right, text);
+        let x = right_aligned_x(right, text, BODY_PT);
         assert!(x < right);
         assert!(
-            (x + text_width_mm(text.chars().count()) - right).abs() < 0.01,
+            (x + text_width_mm(text.chars().count(), BODY_PT) - right).abs() < 0.01,
             "start plus width is the edge: {x}"
         );
         assert_eq!(
-            right_aligned_x(20.0, &"9".repeat(500)),
+            right_aligned_x(20.0, &"9".repeat(500), BODY_PT),
             MARGIN_MM,
             "an impossible fit is pinned to the margin rather than off the page"
         );
@@ -1283,10 +1740,10 @@ mod tests {
             "1300.00 USD".to_string(),
         ]];
         let available = PAGE_WIDTH_MM - 2.0 * MARGIN_MM;
-        let widths = column_widths(&headers, &rows, available);
+        let widths = column_widths(&headers, &rows, available, BODY_PT);
         for (i, cell) in rows[0].iter().enumerate().skip(1) {
             assert_eq!(
-                truncate_to(cell, widths[i]),
+                truncate_to(cell, widths[i], BODY_PT),
                 *cell,
                 "column {i} was cut: {widths:?}"
             );
@@ -1298,6 +1755,293 @@ mod tests {
         assert!(
             widths[0] > widths[3],
             "the description still gets the most room: {widths:?}"
+        );
+    }
+
+    // ========================================================================
+    // PMS-1006: three templates, chosen per tenant.
+    // ========================================================================
+
+    /// An invoice-shaped document, long enough that Compact's tighter setting
+    /// has something to save.
+    fn invoice_of(lines: usize) -> Document {
+        Document::new("Invoice")
+            .subtitle("INV-000001")
+            .footer(vec![
+                "Payment terms: Net 30".to_string(),
+                "Acme IT Services Pty Ltd - billing@acme.example".to_string(),
+            ])
+            .columns(vec![
+                (
+                    "From".to_string(),
+                    vec![
+                        "Acme IT Services Pty Ltd".to_string(),
+                        "trading as Acme IT".to_string(),
+                        "12 Example St".to_string(),
+                        "Sydney NSW 2000".to_string(),
+                        "ABN 12 345 678 901".to_string(),
+                        "billing@acme.example".to_string(),
+                    ],
+                ),
+                (
+                    "Bill to".to_string(),
+                    vec![
+                        "NiceGuy IT".to_string(),
+                        "1 Customer Way".to_string(),
+                        "Springfield, OR 97477".to_string(),
+                        "Attn: Bill Payer".to_string(),
+                        "ap@client.example".to_string(),
+                    ],
+                ),
+            ])
+            .fields(
+                "Details",
+                vec![
+                    ("Invoice number".into(), "INV-000001".into()),
+                    ("Invoice date".into(), "2026-08-01".into()),
+                    ("Due date".into(), "2026-08-31".into()),
+                    ("Payment terms".into(), "Net 30".into()),
+                    ("PO number".into(), "PO-4471".into()),
+                ],
+            )
+            .table_aligned(
+                "Items",
+                vec![
+                    "Description".into(),
+                    "Qty".into(),
+                    "Unit price".into(),
+                    "Amount".into(),
+                ],
+                (0..lines)
+                    .map(|i| {
+                        vec![
+                            format!(
+                                "2026-08-{:02} Remote support: T{i:06} Printer offline",
+                                i + 1
+                            ),
+                            "2".into(),
+                            "150.00 USD".into(),
+                            "300.00 USD".into(),
+                        ]
+                    })
+                    .collect(),
+                items_align(),
+            )
+            .totals(vec![
+                ("Subtotal".into(), "9000.00 USD".into()),
+                ("Tax".into(), "900.00 USD".into()),
+                ("Total".into(), "9900.00 USD".into()),
+                ("Paid".into(), "0.00 USD".into()),
+                ("Credited".into(), "0.00 USD".into()),
+                ("Balance due".into(), "9900.00 USD".into()),
+            ])
+    }
+
+    fn items_align() -> Vec<Align> {
+        vec![Align::Left, Align::Right, Align::Right, Align::Right]
+    }
+
+    /// Read the rendered bytes back as operations.
+    ///
+    /// The content streams are deflated, so an assertion about what colour
+    /// something was drawn in cannot be made by searching the file. Parsing it
+    /// with the same library that wrote it says what a reader will see.
+    fn drawn(bytes: &[u8]) -> Vec<Op> {
+        let mut warnings = Vec::new();
+        let doc = PdfDocument::parse(bytes, &printpdf::PdfParseOptions::default(), &mut warnings)
+            .expect("the renderer's own output has to parse");
+        doc.pages.into_iter().flat_map(|page| page.ops).collect()
+    }
+
+    /// The ink of the first text drawn, which on a Modern document is the word
+    /// in the band.
+    fn first_text_ink(bytes: &[u8]) -> Option<Ink> {
+        let mut fill = None;
+        for op in drawn(bytes) {
+            match op {
+                Op::SetFillColor {
+                    col: Color::Rgb(rgb),
+                } => fill = Some([rgb.r, rgb.g, rgb.b]),
+                Op::ShowText { .. } => return fill,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Three keys, and the round trip a tenant setting depends on.
+    #[test]
+    fn a_template_is_named_by_one_of_three_keys() {
+        for key in Template::KEYS {
+            let template = Template::from_key(key).expect("an advertised key must parse");
+            assert_eq!(template.as_key(), key);
+        }
+        assert_eq!(Template::from_key("fancy"), None);
+        assert_eq!(Template::from_key("Modern"), None, "the key is lowercase");
+        assert_eq!(Template::default(), Template::Classic);
+        assert_eq!(Document::new("x").template, Template::Classic);
+    }
+
+    /// Each template renders, each is deterministic, and no two agree: a
+    /// picker with three entries that produce one document is not a picker.
+    #[test]
+    fn every_template_renders_deterministically_and_differs_from_the_others() {
+        let rendered: Vec<Vec<u8>> = Template::KEYS
+            .iter()
+            .map(|key| {
+                let template = Template::from_key(key).expect("key");
+                let doc = invoice_of(6).template(template);
+                let first = render(&doc).expect("render");
+                let second = render(&invoice_of(6).template(template)).expect("render");
+                assert_eq!(first, second, "{key} must render the same bytes twice");
+                assert!(first.starts_with(b"%PDF-"), "{key} must be a PDF");
+                first
+            })
+            .collect();
+        assert_ne!(rendered[0], rendered[1], "classic and modern must differ");
+        assert_ne!(rendered[0], rendered[2], "classic and compact must differ");
+        assert_ne!(rendered[1], rendered[2], "modern and compact must differ");
+    }
+
+    /// PMS-1006: the band takes the tenant's own colour, and a tenant that set
+    /// none gets the stated default rather than no band.
+    #[test]
+    fn the_band_is_drawn_in_the_tenants_colour_or_the_stated_default() {
+        assert_eq!(
+            Theme::resolve(Template::Modern, Some("#0066cc")).accent,
+            parse_hex("#0066cc").expect("hex"),
+        );
+        assert_eq!(
+            Theme::resolve(Template::Modern, None).accent,
+            parse_hex(DEFAULT_ACCENT).expect("the default has to parse"),
+        );
+        assert_eq!(
+            Theme::resolve(Template::Modern, Some("not a colour")).accent,
+            parse_hex(DEFAULT_ACCENT).expect("hex"),
+            "a value the validator never saw falls back rather than reaching the page"
+        );
+        let doc = |accent: Option<&str>| {
+            render(
+                &invoice_of(3)
+                    .template(Template::Modern)
+                    .accent(accent.map(str::to_string)),
+            )
+            .expect("render")
+        };
+        assert_ne!(
+            doc(Some("#0066cc")),
+            doc(None),
+            "the accent has to reach the document"
+        );
+        assert_eq!(
+            doc(Some(DEFAULT_ACCENT)),
+            doc(None),
+            "and an unset colour is exactly the default one"
+        );
+    }
+
+    /// PMS-1006: an MSP whose brand is pale yellow must not get white on
+    /// white. Asserted on the ink actually drawn, read back out of the file.
+    #[test]
+    fn band_text_is_dark_on_a_pale_accent_and_light_on_a_dark_one() {
+        let render_with = |accent: &str| {
+            render(
+                &invoice_of(3)
+                    .template(Template::Modern)
+                    .accent(Some(accent.to_string())),
+            )
+            .expect("render")
+        };
+        let pale = first_text_ink(&render_with("#FFFFCC")).expect("the band draws text");
+        let dark = first_text_ink(&render_with("#0F4C81")).expect("the band draws text");
+        assert_ne!(pale, dark, "the same word cannot be one ink on both");
+        assert_eq!(pale, NEAR_BLACK, "dark text on a pale band");
+        assert_eq!(dark, WHITE, "light text on a dark band");
+        assert_eq!(
+            Theme::resolve(Template::Modern, Some("#FFFFCC")).band_text(),
+            NEAR_BLACK
+        );
+        assert_eq!(
+            Theme::resolve(Template::Modern, Some("#0F4C81")).band_text(),
+            WHITE
+        );
+        assert_eq!(
+            Theme::resolve(Template::Modern, Some("#FFFF00")).band_text(),
+            NEAR_BLACK,
+            "a saturated yellow is pale, which a plain channel average gets wrong"
+        );
+    }
+
+    /// PMS-1006: the point of Compact. Counted in pages, because "tighter" is
+    /// only worth anything if it saves a sheet.
+    #[test]
+    fn a_thirty_line_invoice_takes_fewer_pages_in_compact() {
+        let pages = |template: Template| {
+            page_count(&render(&invoice_of(30).template(template)).expect("render"))
+        };
+        let classic = pages(Template::Classic);
+        let compact = pages(Template::Compact);
+        assert!(classic > 1, "the fixed invoice has to spill in Classic");
+        assert!(
+            compact < classic,
+            "Compact took {compact} pages against Classic's {classic}"
+        );
+    }
+
+    /// The money columns line up under each other in every template, and the
+    /// totals block sits against the right margin with its last pair set
+    /// larger where the theme asks for it.
+    #[test]
+    fn money_is_right_aligned_and_the_totals_block_closes_on_the_balance() {
+        for template in [Template::Modern, Template::Compact] {
+            let theme = Theme::resolve(template, None);
+            let widths = column_widths(
+                &["Description".into(), "Qty".into(), "Amount".into()],
+                &[vec![
+                    "Remote support".into(),
+                    "2".into(),
+                    "300.00 USD".into(),
+                ]],
+                PAGE_WIDTH_MM - 2.0 * MARGIN_MM,
+                theme.body_pt,
+            );
+            let right_edge = MARGIN_MM + widths[0] + widths[1] + widths[2] - CELL_PAD_MM;
+            let text = "300.00 USD";
+            let x = right_aligned_x(right_edge, text, theme.body_pt);
+            assert!(
+                (x + text_width_mm(text.chars().count(), theme.body_pt) - right_edge).abs() < 0.01,
+                "{template:?}: an amount must end at its column's right edge"
+            );
+        }
+        assert!(
+            Theme::resolve(Template::Modern, None).totals_border,
+            "Modern boxes its totals"
+        );
+        assert!(
+            Theme::resolve(Template::Modern, None).heading_pt
+                > Theme::resolve(Template::Modern, None).body_pt,
+            "and sets Balance due at heading size"
+        );
+    }
+
+    /// A footer is a property of the template, not of the caller: every
+    /// document carries its closing lines and Classic draws none of them,
+    /// which is what keeps Classic's output what it was.
+    #[test]
+    fn only_a_template_that_asks_for_a_footer_draws_one() {
+        let with = invoice_of(3).footer(vec!["Payment terms: Net 30".to_string()]);
+        let without = invoice_of(3).footer(Vec::new());
+        assert_eq!(
+            render(&with.template(Template::Classic)).expect("render"),
+            render(&without.template(Template::Classic)).expect("render"),
+            "Classic prints no footer, so carrying the lines changes nothing"
+        );
+        let with = invoice_of(3).footer(vec!["Payment terms: Net 30".to_string()]);
+        let without = invoice_of(3).footer(Vec::new());
+        assert_ne!(
+            render(&with.template(Template::Modern)).expect("render"),
+            render(&without.template(Template::Modern)).expect("render"),
+            "Modern prints one"
         );
     }
 
@@ -1476,11 +2220,11 @@ mod tests {
     /// neighbour.
     #[test]
     fn an_oversized_cell_is_cut_with_an_ellipsis() {
-        let cut = truncate_to(&"a".repeat(200), MIN_COLUMN_MM);
+        let cut = truncate_to(&"a".repeat(200), MIN_COLUMN_MM, BODY_PT);
         assert!(cut.ends_with("..."), "{cut:?}");
         assert!(cut.chars().count() < 200);
         assert_eq!(
-            truncate_to("short", 60.0),
+            truncate_to("short", 60.0, BODY_PT),
             "short",
             "and a cell that fits is untouched"
         );

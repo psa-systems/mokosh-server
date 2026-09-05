@@ -141,6 +141,39 @@ fn logo(bytes: Option<Vec<u8>>) -> Option<Logo> {
     })
 }
 
+/// PMS-1006: the layout the issuer resolved, applied to a document.
+///
+/// One function, so the invoice, the credit note and the statement cannot come
+/// to disagree about where the template comes from. What the template MEANS is
+/// the renderer's business; this only hands it over.
+fn styled(document: Document, issuer: &Issuer) -> Document {
+    document
+        .template(issuer.template)
+        .accent(issuer.accent_color.clone())
+}
+
+/// PMS-1006: the closing lines a template with a footer prints.
+///
+/// The payment terms and how to reach the issuer, which is what a reader
+/// looking at the bottom of an invoice wants. Carried by the document whatever
+/// template renders it; Classic draws no footer, so its output is unchanged.
+fn footer_lines(issuer: &Issuer, terms: Option<&str>) -> Vec<String> {
+    let mut lines = Vec::with_capacity(2);
+    if let Some(terms) = terms.map(str::trim).filter(|t| !t.is_empty()) {
+        lines.push(format!("Payment terms: {terms}"));
+    }
+    let contact = [&issuer.email, &issuer.phone, &issuer.website]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("  |  ");
+    if !contact.is_empty() {
+        lines.push(format!("{} - {contact}", issuer.name));
+    }
+    lines
+}
+
 /// The issuer's block: who is billing, and everything a client needs to
 /// identify them.
 ///
@@ -177,9 +210,14 @@ pub fn invoice(
     logo_bytes: Option<Vec<u8>>,
 ) -> Document {
     let currency = invoice.currency.as_deref();
-    let mut document = Document::new("Invoice")
+    let terms = invoice
+        .payment_term_name
+        .clone()
+        .or_else(|| invoice.payment_terms.clone());
+    let mut document = styled(Document::new("Invoice"), issuer)
         .subtitle(invoice.invoice_number.clone())
         .logo(logo(logo_bytes))
+        .footer(footer_lines(issuer, terms.as_deref()))
         .columns(vec![
             ("From".to_string(), issuer_lines(issuer)),
             ("Bill to".to_string(), bill_to.lines()),
@@ -197,11 +235,7 @@ pub fn invoice(
     ];
     // The lookup name if there is one, the legacy free-text terms otherwise
     // (PMS-333), and no line at all when there is neither.
-    if let Some(terms) = invoice
-        .payment_term_name
-        .clone()
-        .or_else(|| invoice.payment_terms.clone())
-    {
+    if let Some(terms) = terms {
         details.push(("Payment terms".to_string(), terms));
     }
     if let Some(po) = &invoice.po_number {
@@ -296,9 +330,10 @@ pub fn credit_note(
         details.push(("Against invoice".to_string(), number.clone()));
     }
 
-    let mut document = Document::new("Credit Note")
+    let mut document = styled(Document::new("Credit Note"), issuer)
         .subtitle(note.credit_note_number.clone())
         .logo(logo(logo_bytes))
+        .footer(footer_lines(issuer, None))
         .columns(vec![
             ("From".to_string(), issuer_lines(issuer)),
             ("Credit to".to_string(), credit_to.lines()),
@@ -418,12 +453,13 @@ pub fn statement(
     // A statement carries no currency of its own: it spans documents that each
     // carry one, so the code is left off rather than guessed at.
     let amount = |value: Decimal| format!("{value:.2}");
-    let mut document = Document::new("Statement of Account")
+    let mut document = styled(Document::new("Statement of Account"), issuer)
         .subtitle(format!(
             "{} to {}",
             statement.period_start, statement.period_end
         ))
         .logo(logo(logo_bytes))
+        .footer(footer_lines(issuer, None))
         .columns(vec![
             ("From".to_string(), issuer_lines(issuer)),
             ("Account".to_string(), account.lines()),

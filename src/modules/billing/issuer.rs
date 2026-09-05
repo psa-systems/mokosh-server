@@ -47,14 +47,21 @@ use uuid::Uuid;
 use mokosh_types::tenants::TenantBranding;
 
 use crate::modules::tenants::logo::TenantLogoStore;
+use crate::pdf::Template;
 use crate::storage::ObjectKey;
 use crate::utils::error::AppResult;
 
-/// The issuing MSP, as a document shows it.
+/// The issuing MSP, as a document shows it, and how that document is laid out.
 ///
 /// Every field optional: an MSP that has filled nothing in still gets a valid
 /// invoice with its tenant name on it, which is an explicit acceptance
 /// criterion rather than a convenience.
+///
+/// PMS-1006 added the template and the accent colour. They are presentation
+/// rather than identity, but they come out of the same `tenants.branding`
+/// document through the same fallbacks, and they freeze on the same event for
+/// the same reason, so resolving them anywhere else would be a second reader of
+/// that JSONB with its own answers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issuer {
     /// The registered entity, falling back to the trading name and then to the
@@ -72,6 +79,24 @@ pub struct Issuer {
     /// only on a snapshot: [`resolve`] does not copy anything.
     pub logo_digest: Option<String>,
     pub logo_mime: Option<String>,
+    /// PMS-1006: the template the tenant's documents are laid out with.
+    ///
+    /// Resolved here rather than read at the render site for the same reason
+    /// every other value is: this is the one place that turns a tenant's
+    /// `branding` document into what a document shows, fallbacks included, and
+    /// a second reader of that JSONB would be a second set of fallbacks. It
+    /// rides the snapshot too, so an invoice sent before PMS-959 and re-rendered
+    /// live still reproduces the layout it was sent in.
+    ///
+    /// `serde(default)` because every snapshot written before PMS-1006 lacks
+    /// the key, and the default is Classic, which is exactly what those
+    /// invoices were rendered with.
+    #[serde(default)]
+    pub template: Template,
+    /// PMS-1006: the accent the template draws in, the tenant's
+    /// `primary_color`. `None` means the renderer's own default.
+    #[serde(default)]
+    pub accent_color: Option<String>,
 }
 
 /// Compose the identity a document should show for this tenant, right now.
@@ -79,6 +104,7 @@ pub struct Issuer {
 /// The fallback chain is the acceptance criterion about an MSP with nothing
 /// filled in: `legal_name`, then `company_name`, then the tenant's own name.
 pub fn resolve(tenant_name: &str, branding: &TenantBranding) -> Issuer {
+    let template = resolve_template(clean(branding.invoice_template.as_deref()).as_deref());
     let legal = clean(branding.legal_name.as_deref());
     let trading = clean(branding.company_name.as_deref());
     let name = legal
@@ -96,6 +122,31 @@ pub fn resolve(tenant_name: &str, branding: &TenantBranding) -> Issuer {
         website: clean(branding.website.as_deref()),
         logo_digest: None,
         logo_mime: clean(branding.logo_mime.as_deref()),
+        template,
+        accent_color: clean(branding.primary_color.as_deref()),
+    }
+}
+
+/// PMS-1006: the stored key, or Classic.
+///
+/// An unset key is the ordinary case and says nothing. A key that is SET and
+/// unrecognised is not: the branding validator refuses anything outside the
+/// three on the way in, so it came from before the key existed or from a
+/// hand-edited row. That is logged rather than swallowed, because an MSP whose
+/// chosen template never appears has to be able to find out why. Falling back
+/// rather than failing, because refusing to render an invoice over its layout
+/// would withhold the document.
+fn resolve_template(key: Option<&str>) -> Template {
+    match key {
+        None => Template::Classic,
+        Some(key) => Template::from_key(key).unwrap_or_else(|| {
+            tracing::warn!(
+                invoice_template = %key,
+                known = ?Template::KEYS,
+                "PMS-1006: unknown invoice_template; the document renders as classic"
+            );
+            Template::Classic
+        }),
     }
 }
 
@@ -240,6 +291,41 @@ mod tests {
             issuer.name, "Acme IT",
             "a blank legal name falls through to the trading name"
         );
+    }
+
+    /// PMS-1006: the template is a resolved value like every other, and a
+    /// tenant that never chose one gets Classic.
+    #[test]
+    fn the_template_resolves_from_branding_and_defaults_to_classic() {
+        assert_eq!(resolve("acme", &branding()).template, Template::Classic);
+        let mut b = branding();
+        b.invoice_template = Some("modern".into());
+        b.primary_color = Some("#0066cc".into());
+        let issuer = resolve("acme", &b);
+        assert_eq!(issuer.template, Template::Modern);
+        assert_eq!(issuer.accent_color.as_deref(), Some("#0066cc"));
+    }
+
+    /// A key the validator would refuse is Classic rather than a failed
+    /// render: withholding an invoice over its layout is worse than printing
+    /// it in the default one.
+    #[test]
+    fn an_unrecognised_template_falls_back_rather_than_failing() {
+        let mut b = branding();
+        b.invoice_template = Some("fancy".into());
+        assert_eq!(resolve("acme", &b).template, Template::Classic);
+        b.invoice_template = Some("   ".into());
+        assert_eq!(resolve("acme", &b).template, Template::Classic);
+    }
+
+    /// Every snapshot written before PMS-1006 lacks both keys, and Classic is
+    /// what those invoices were rendered with.
+    #[test]
+    fn a_snapshot_from_before_templates_reads_back_as_classic() {
+        let stored = serde_json::json!({ "name": "Acme IT Services Pty Ltd" });
+        let issuer: Issuer = serde_json::from_value(stored).expect("older snapshot");
+        assert_eq!(issuer.template, Template::Classic);
+        assert_eq!(issuer.accent_color, None);
     }
 
     /// `resolve` copies nothing. Only `freeze` touches storage, which is what
