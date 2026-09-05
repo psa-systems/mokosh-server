@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
-use crate::modules::settings::read_tenant_zone;
+use crate::modules::settings::{read_invoice_reminder_settings, read_tenant_zone};
 use crate::utils::email::Mailer;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -733,6 +733,8 @@ impl BillingService {
             count_conds.push(format!(
                 "(invoice_number ILIKE ${count_idx} OR po_number ILIKE ${count_idx})"
             ));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.exclude_draft {
             // MAPPS-670 (mokosh-invoices P1e): no placeholder; the value
@@ -740,6 +742,26 @@ impl BillingService {
             // a Contact.
             data_conds.push("status <> 'draft'".to_string());
             count_conds.push("status <> 'draft'".to_string());
+        }
+        // PMS-1037: overdue is the predicate `overdue_days` applies on the
+        // read, in SQL, against the tenant's day, which is read on the tenant
+        // connection before the binds below.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let zone = read_tenant_zone(&mut tx, tenant_id).await?;
+        let today = mokosh_types::datetime::user_local_date(Utc::now(), &zone);
+        if let Some(overdue) = filter.overdue {
+            let predicate = |idx: usize| {
+                let core = format!(
+                    "(status IN ('sent', 'partially_paid') AND balance_due > 0 AND due_date < ${idx})"
+                );
+                if overdue {
+                    core
+                } else {
+                    format!("NOT {core}")
+                }
+            };
+            data_conds.push(predicate(data_idx));
+            count_conds.push(predicate(count_idx));
         }
 
         let data_where = data_conds.join(" AND ");
@@ -786,12 +808,18 @@ impl BillingService {
             q = q.bind(pattern.clone());
             cq = cq.bind(pattern);
         }
+        if filter.overdue.is_some() {
+            q = q.bind(today);
+            cq = cq.bind(today);
+        }
 
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q.fetch_all(&mut *tx).await?;
         let total = cq.fetch_one(&mut *tx).await?;
         drop(tx);
         let mut resp: Vec<InvoiceResponse> = rows.into_iter().map(Into::into).collect();
+        for invoice in &mut resp {
+            invoice.mark_overdue(today);
+        }
         self.enrich_invoices(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
     }
@@ -1498,6 +1526,188 @@ impl BillingService {
     /// Split out of [`generate_due_recurring_invoices`] so each contract
     /// gets its own transaction: one contract's conflict / empty-items
     /// skip never rolls back another contract's invoice.
+    /// PMS-1037: every tenant's overdue reminders, once an hour.
+    pub async fn send_due_reminders_all_tenants(&self, now: DateTime<Utc>) -> AppResult<u64> {
+        let tenant_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tenants")
+            .fetch_all(self.db.migrator_pool())
+            .await?;
+        let mut total = 0u64;
+        for tenant_id in tenant_ids {
+            match self
+                .send_due_reminders(TenantId::from_trusted(tenant_id), now)
+                .await
+            {
+                Ok(sent) => total += sent.len() as u64,
+                Err(e) => {
+                    tracing::warn!(
+                        %tenant_id,
+                        error = ?e,
+                        "invoice reminders failed for tenant; skipping"
+                    );
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// PMS-1037: mail the customer about every overdue invoice whose days
+    /// past due hit a step of the tenant's reminder schedule, at the tenant's
+    /// local sending hour, once per invoice per step.
+    ///
+    /// The schedule lives in `billing_reminders` (`enabled`, `schedule` as
+    /// day offsets such as `[3, 7, 14, 30]`, `send_hour`), read on the
+    /// tenant connection. The day is the tenant's (`read_tenant_zone`,
+    /// PMS-1030), because "past due" is a date comparison that has to be made
+    /// in the day the invoice was dated in. The recipient is who the invoice
+    /// was emailed to (PMS-992), else the resolved billing contact (PMS-993);
+    /// an invoice with neither is skipped and logged, not guessed at. The
+    /// stored document (PMS-959) travels with the mail when there is one, and
+    /// the pay link when a gateway is connected, the PMS-991 shape.
+    ///
+    /// `invoice_reminders` is the idempotency guard: the row is claimed with
+    /// `ON CONFLICT DO NOTHING` before the send, inside the transaction, so a
+    /// worker that fires twice in the hour sends once, and a relay that
+    /// refuses the message releases the claim so the next run tries again.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn send_due_reminders(
+        &self,
+        tenant_id: TenantId,
+        now: DateTime<Utc>,
+    ) -> AppResult<Vec<Uuid>> {
+        let Some(mailer) = self.mailer.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let settings = read_invoice_reminder_settings(&mut tx, tenant_id).await?;
+        if !settings.enabled || settings.schedule.is_empty() {
+            return Ok(Vec::new());
+        }
+        let zone = read_tenant_zone(&mut tx, tenant_id).await?;
+        let local = now.with_timezone(&mokosh_types::datetime::resolve_tz(&zone));
+        if chrono::Timelike::hour(&local) != settings.send_hour {
+            return Ok(Vec::new());
+        }
+        let today = local.date_naive();
+
+        let candidates: Vec<ReminderCandidateRow> = sqlx::query_as(
+            r#"
+            SELECT id, invoice_number, company_id, billing_contact_id, due_date,
+                   balance_due, currency, emailed_to
+            FROM invoices
+            WHERE tenant_id = $1
+              AND status IN ('sent', 'partially_paid')
+              AND balance_due > 0
+              AND due_date < $2
+            ORDER BY due_date, invoice_number
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(today)
+        .fetch_all(&mut *tx)
+        .await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
+        let contact_line = org.contact_line("Questions about this invoice?", None);
+        let gateway = matches!(self.has_active_gateway(tenant_id).await, Ok(true));
+
+        let mut sent = Vec::new();
+        for invoice in candidates {
+            let days = (today - invoice.due_date).num_days();
+            if !settings.schedule.contains(&days) {
+                continue;
+            }
+            let recipient = match invoice.emailed_to.clone() {
+                Some(to) if !to.trim().is_empty() => to,
+                _ => match Self::resolve_invoice_recipient(
+                    &mut tx,
+                    tenant_id,
+                    invoice.company_id,
+                    invoice.billing_contact_id,
+                )
+                .await?
+                {
+                    Ok((_, email)) => email,
+                    Err(why) => {
+                        tracing::warn!(
+                            target: "mokosh_server.billing",
+                            invoice_id = %invoice.id,
+                            "invoice reminder skipped: {why}"
+                        );
+                        continue;
+                    }
+                },
+            };
+            let claimed: Option<Uuid> = sqlx::query_scalar(
+                r#"
+                INSERT INTO invoice_reminders (tenant_id, invoice_id, offset_days, sent_to)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (tenant_id, invoice_id, offset_days) DO NOTHING
+                RETURNING id
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(invoice.id)
+            .bind(days as i32)
+            .bind(&recipient)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(claim) = claimed else {
+                continue;
+            };
+
+            let pdf = super::documents::read_issued(tenant_id.get(), invoice.id).await;
+            let portal_link = match (self.portal_origin.as_ref(), gateway) {
+                (Some(origin), true) => Some(format!(
+                    "{}/portal/invoices/{}",
+                    origin.trim_end_matches('/'),
+                    invoice.id
+                )),
+                _ => None,
+            };
+            let currency = invoice.currency.as_deref().unwrap_or("USD");
+            let amount_due = format!("{} {}", invoice.balance_due, currency);
+            let due_date = invoice.due_date.to_string();
+            let from = crate::utils::email::SenderIdentity {
+                org_name: org.name(),
+                contact_line: &contact_line,
+            };
+            let outcome = mailer
+                .send_invoice_reminder(
+                    &recipient,
+                    from,
+                    crate::utils::email::InvoiceReminder {
+                        invoice_number: &invoice.invoice_number,
+                        amount_due: &amount_due,
+                        due_date: &due_date,
+                        days_overdue: days,
+                        portal_link: portal_link.as_deref(),
+                        pdf: pdf.as_deref(),
+                    },
+                )
+                .await;
+            match outcome {
+                Ok(()) => sent.push(invoice.id),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mokosh_server.billing",
+                        invoice_id = %invoice.id,
+                        error = %e,
+                        "invoice reminder: send refused, the claim is released"
+                    );
+                    sqlx::query("DELETE FROM invoice_reminders WHERE id = $1")
+                        .bind(claim)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(sent)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn generate_one_recurring_invoice(
         &self,
@@ -3800,6 +4010,9 @@ impl BillingService {
         .await?;
 
         let mut resp: InvoiceResponse = row.into();
+        // PMS-1037: overdue is the tenant's day, not the reader's clock.
+        let zone = read_tenant_zone(tx, tenant_id).await?;
+        resp.mark_overdue(mokosh_types::datetime::user_local_date(Utc::now(), &zone));
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
         resp.company_name =
             sqlx::query_scalar("SELECT name FROM companies WHERE tenant_id = $1 AND id = $2")
@@ -5127,6 +5340,19 @@ impl UninvoiceableTime {
 /// Row shape for the billable-time-entry select in
 /// [`BillingService::create_invoice_from_time_entries`]. Only the
 /// columns the invoice line needs are pulled.
+/// PMS-1037: an overdue invoice as the reminder worker reads it.
+#[derive(sqlx::FromRow)]
+struct ReminderCandidateRow {
+    id: Uuid,
+    invoice_number: String,
+    company_id: Uuid,
+    billing_contact_id: Option<Uuid>,
+    due_date: chrono::NaiveDate,
+    balance_due: Decimal,
+    currency: Option<String>,
+    emailed_to: Option<String>,
+}
+
 #[derive(sqlx::FromRow)]
 struct TimeEntryBillingRow {
     id: Uuid,
@@ -5340,6 +5566,8 @@ impl From<InvoiceRow> for InvoiceResponse {
             paid_at: r.paid_at,
             emailed_at: r.emailed_at,
             emailed_to: r.emailed_to,
+            is_overdue: false,
+            days_overdue: 0,
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,
