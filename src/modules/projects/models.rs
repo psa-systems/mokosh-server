@@ -110,6 +110,46 @@ pub struct ProjectResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+/// PMS-1061: what a contact receives for a project, on the dual-plane
+/// reads. The rate, the money budget, the actuals, the billing method and
+/// the manager are the MSP's margin and staffing; the customer sees the
+/// project, its dates and the hours it was scoped for. The shape the
+/// retired portal router served (`PortalProject`), which PMS-1025's sweep
+/// replaced with the staff type. Every key is always present (`null`
+/// when unset) so the shape is stable.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactProjectResponse {
+    pub id: Uuid,
+    /// The caller's own company: what the session already says, never a
+    /// foreign one, since the scope check runs before the projection.
+    pub company_id: Option<Uuid>,
+    pub project_number: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub start_date: Option<NaiveDate>,
+    pub target_end_date: Option<NaiveDate>,
+    pub actual_end_date: Option<NaiveDate>,
+    pub budget_hours: Option<Decimal>,
+}
+
+impl From<ProjectResponse> for ContactProjectResponse {
+    fn from(p: ProjectResponse) -> Self {
+        Self {
+            id: p.id,
+            company_id: p.company_id,
+            project_number: p.project_number,
+            name: p.name,
+            description: p.description,
+            status: p.status,
+            start_date: p.start_date,
+            target_end_date: p.target_end_date,
+            actual_end_date: p.actual_end_date,
+            budget_hours: p.budget_hours,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateProjectRequest {
     #[validate(length(min = 1, max = 80))]

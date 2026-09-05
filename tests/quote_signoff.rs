@@ -9,9 +9,8 @@
 //!   - A contact sees only quotes for their own company AND their own
 //!     tenant.
 //!   - An un-issued quote is 404 (not 403) to a contact who guesses its
-//!     id, so the portal never confirms it exists. The dual-plane routes
-//!     do not hold this yet (a contact sees its company's drafts); the
-//!     case is kept, ignored, under the ticket that owns the fix.
+//!     id, so the portal never confirms it exists (PMS-1060 restored this
+//!     on the dual-plane routes).
 //!   - Accept / decline record the deciding contact, timestamp, and
 //!     notes, and 409 from any state other than `sent`.
 //!   - A quote past `valid_until` reads as expired and cannot be
@@ -486,10 +485,9 @@ async fn staff_token_cannot_drive_the_portal_signoff(pool: PgPool) {
 
 /// An un-issued quote is the MSP's own: invisible to the contact in the
 /// list and 404 (not 403) by direct id, so the portal never confirms it
-/// exists. The retired portal router held this; the dual-plane
-/// `list_quotes` and `get_quote` scope to the company only and hand a
-/// contact its company's drafts. Kept under the ticket that owns the fix.
-#[ignore = "PMS-1060: a contact sees its company's un-issued quotes on the dual-plane quote routes"]
+/// exists. PMS-1060: the dual-plane `list_quotes` and `get_quote` scoped
+/// to the company only and handed a contact its company's drafts; the
+/// contact arms now go through the issued-only company reads.
 #[sqlx::test]
 async fn a_contact_never_sees_an_unissued_quote(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
