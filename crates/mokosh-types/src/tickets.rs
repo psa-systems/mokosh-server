@@ -66,6 +66,11 @@ pub enum BillingStatus {
     NotBilled,
     ReadyToBill,
     Billed,
+    /// PMS-1035: a time entry fully covered by a block-hours allotment the
+    /// customer already paid for. Not `billed` (that means "on an invoice")
+    /// and never picked up by the time-entry invoice; releasing the draw
+    /// puts the entry back to `ready_to_bill`. Time entries only.
+    Prepaid,
 }
 
 impl BillingStatus {
@@ -74,6 +79,7 @@ impl BillingStatus {
             "not_billed" => Some(Self::NotBilled),
             "ready_to_bill" => Some(Self::ReadyToBill),
             "billed" => Some(Self::Billed),
+            "prepaid" => Some(Self::Prepaid),
             _ => None,
         }
     }
@@ -83,6 +89,7 @@ impl BillingStatus {
             Self::NotBilled => "not_billed",
             Self::ReadyToBill => "ready_to_bill",
             Self::Billed => "billed",
+            Self::Prepaid => "prepaid",
         }
     }
 }
