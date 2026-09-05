@@ -131,6 +131,21 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
         // being one printable line: a rule that accepted a VAT number and
         // refused an ABN would be worse than no rule.
         "tax_id" => text(label, value, MAX_TAX_ID).map(|_| ()),
+        // PMS-1006: which document template the tenant's invoices, credit
+        // notes and statements are laid out with. An enumerated key rather
+        // than free text, and the message names the three, because a typo
+        // here silently reverts every document to Classic.
+        "invoice_template" => {
+            let s = text(label, value, 20)?;
+            if crate::pdf::Template::from_key(s.trim()).is_some() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "`{label}` must be one of {}",
+                    crate::pdf::Template::KEYS.join(", ")
+                ))
+            }
+        }
         // PMS-911: the one branding value that is legitimately multi-line,
         // because an address is. Held to a line count as well as a length, so
         // it stays an address block on an invoice rather than a paragraph.
@@ -188,6 +203,7 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
 const KNOWN_KEYS: &[&str] = &[
     "company_name",
     "favicon_url",
+    "invoice_template",
     "legal_name",
     "logo_mime",
     "logo_url",
@@ -333,6 +349,7 @@ mod tests {
             "legal_name": "Acme IT Services Pty Ltd",
             "tax_id": "ABN 12 345 678 901",
             "postal_address": "12 Example Street\nSuite 4\nSydney NSW 2000",
+            "invoice_template": "modern",
         });
         assert!(patch(full.clone()).is_ok());
         let fields: Vec<String> = full
@@ -448,6 +465,28 @@ mod tests {
         assert!(
             patch(json!({ "support_contact_name": "Dana\nX" })).is_err(),
             "and no other key gained a newline"
+        );
+    }
+
+    /// PMS-1006: exactly three keys, and a refusal that names them, because a
+    /// typo would otherwise silently leave every document on Classic.
+    #[test]
+    fn an_invoice_template_is_one_of_three_keys() {
+        for key in crate::pdf::Template::KEYS {
+            assert!(
+                patch(json!({ "invoice_template": key })).is_ok(),
+                "`{key}` must be settable"
+            );
+        }
+        let err = validate_branding_value("invoice_template", &json!("fancy")).unwrap_err();
+        for key in crate::pdf::Template::KEYS {
+            assert!(err.contains(key), "the message must name `{key}`: {err}");
+        }
+        assert!(patch(json!({ "invoice_template": "Modern" })).is_err());
+        assert!(patch(json!({ "invoice_template": 1 })).is_err());
+        assert!(
+            patch(json!({ "invoice_template": null })).is_ok(),
+            "an explicit null clears the choice back to Classic"
         );
     }
 
