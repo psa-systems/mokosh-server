@@ -182,6 +182,13 @@ pub struct InvoiceResponse {
     pub emailed_at: Option<DateTime<Utc>>,
     pub emailed_to: Option<String>,
     pub paid_at: Option<DateTime<Utc>>,
+    /// PMS-1036: the write-off, when there was one. `write_off_amount` is
+    /// the balance at that moment, frozen; `balance_due` keeps moving if a
+    /// late payment lands afterwards.
+    pub written_off_at: Option<DateTime<Utc>>,
+    pub written_off_by_id: Option<Uuid>,
+    pub write_off_reason: Option<String>,
+    pub write_off_amount: Option<Decimal>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
@@ -832,6 +839,15 @@ pub struct CreateCreditNoteLineRequest {
     pub sort_order: i32,
 }
 
+/// PMS-1036: write an invoice off. The customer owes it and will not pay;
+/// this is the bad-debt record, not a correction (that is a credit note).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct WriteOffInvoiceRequest {
+    /// Required: the audit trail, and the first thing an auditor reads.
+    #[validate(length(min = 1, max = 2000))]
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateCreditNoteRequest {
     /// The invoice being corrected. Required: see the column comment in
@@ -926,6 +942,21 @@ pub struct StatementCreditLine {
     pub invoice_number: Option<String>,
 }
 
+/// PMS-1036: an invoice written off in the period. Its own line kind, the
+/// way credits have theirs, because the books treat the two differently: a
+/// credit says the customer did not owe it, a write-off says they did and
+/// will not pay. Dated by `written_off_at`, and the amount is the balance
+/// frozen at that moment, so a closed period is not rewritten by a late
+/// recovery.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatementWriteOffLine {
+    pub invoice_id: Uuid,
+    pub invoice_number: String,
+    pub write_off_date: NaiveDate,
+    pub amount: Decimal,
+    pub reason: String,
+}
+
 /// PMS-954: a client's account over a period.
 ///
 /// Derived at read time and stored nowhere. A stored statement row would be a
@@ -950,6 +981,8 @@ pub struct StatementResponse {
     pub payments: Vec<StatementPaymentLine>,
     pub refunds: Vec<StatementRefundLine>,
     pub credit_notes: Vec<StatementCreditLine>,
+    /// PMS-1036: invoices written off in the period.
+    pub write_offs: Vec<StatementWriteOffLine>,
     /// Sum of `invoices` above.
     pub total_invoiced: Decimal,
     /// Sum of `payments` above.
@@ -958,9 +991,13 @@ pub struct StatementResponse {
     pub total_refunded: Decimal,
     /// Sum of `credit_notes` above.
     pub total_credited: Decimal,
+    /// Sum of `write_offs` above (PMS-1036).
+    pub total_written_off: Decimal,
     /// `opening_balance + total_invoiced + total_refunded - total_paid -
-    /// total_credited`, and the tests assert exactly that rather than trusting
-    /// the sentence.
+    /// total_credited - total_written_off`, and the tests assert exactly that
+    /// rather than trusting the sentence. A written-off amount leaves the
+    /// account the customer is asked to settle; it is the MSP's loss, not a
+    /// sum still being collected.
     pub closing_balance: Decimal,
 }
 
