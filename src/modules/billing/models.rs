@@ -182,6 +182,12 @@ pub struct InvoiceResponse {
     pub emailed_at: Option<DateTime<Utc>>,
     pub emailed_to: Option<String>,
     pub paid_at: Option<DateTime<Utc>>,
+    /// PMS-1037: derived on every read in the tenant's day, never stored.
+    /// `true` when the invoice is `sent` or `partially_paid`, has a balance,
+    /// and `due_date` is before today; `days_overdue` is then the count of
+    /// days past the due date, else 0.
+    pub is_overdue: bool,
+    pub days_overdue: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
@@ -204,6 +210,9 @@ pub struct InvoiceFilter {
     /// would leave `total` inflated and pagination misleading).
     #[serde(skip_deserializing, default)]
     pub exclude_draft: bool,
+    /// PMS-1037: `true` keeps only overdue invoices (collectible, with a
+    /// balance, past due in the tenant's day); `false` keeps the rest.
+    pub overdue: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
@@ -832,6 +841,35 @@ pub struct CreateCreditNoteLineRequest {
     pub sort_order: i32,
 }
 
+/// PMS-1037: the one rule for "overdue", for every read and for the reminder
+/// worker. `Some(days)` when the invoice is still being collected (`sent` or
+/// `partially_paid`), still has a balance, and its due date is before `today`;
+/// a paid, void, written-off or draft invoice is never overdue, and neither
+/// is one due today. Derived, not stored: `due_date` and `balance_due`
+/// already hold the fact.
+pub fn overdue_days(
+    status: InvoiceStatus,
+    balance_due: Decimal,
+    due_date: NaiveDate,
+    today: NaiveDate,
+) -> Option<i64> {
+    let collectible = matches!(status, InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid);
+    if collectible && balance_due > Decimal::ZERO && due_date < today {
+        Some((today - due_date).num_days())
+    } else {
+        None
+    }
+}
+
+impl InvoiceResponse {
+    /// Stamp `is_overdue` and `days_overdue` for a reader whose day is `today`.
+    pub fn mark_overdue(&mut self, today: NaiveDate) {
+        let days = overdue_days(self.status, self.balance_due, self.due_date, today);
+        self.is_overdue = days.is_some();
+        self.days_overdue = days.unwrap_or(0);
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateCreditNoteRequest {
     /// The invoice being corrected. Required: see the column comment in
@@ -1031,4 +1069,46 @@ pub struct ProductFilter {
     pub is_active: Option<bool>,
     #[validate(length(max = 200))]
     pub q: Option<String>,
+}
+
+#[cfg(test)]
+mod overdue_tests {
+    use super::*;
+
+    fn day(d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, d).expect("date")
+    }
+
+    /// PMS-1037: only a collectible invoice with a balance, past its date.
+    #[test]
+    fn overdue_is_collectible_with_a_balance_and_past_due() {
+        let ten = Decimal::from(10);
+        assert_eq!(
+            overdue_days(InvoiceStatus::Sent, ten, day(1), day(6)),
+            Some(5)
+        );
+        assert_eq!(
+            overdue_days(InvoiceStatus::PartiallyPaid, ten, day(5), day(6)),
+            Some(1)
+        );
+        assert_eq!(overdue_days(InvoiceStatus::Sent, ten, day(6), day(6)), None);
+        assert_eq!(overdue_days(InvoiceStatus::Sent, ten, day(9), day(6)), None);
+        assert_eq!(
+            overdue_days(InvoiceStatus::Sent, Decimal::ZERO, day(1), day(6)),
+            None
+        );
+        for status in [
+            InvoiceStatus::Draft,
+            InvoiceStatus::Pending,
+            InvoiceStatus::Paid,
+            InvoiceStatus::Void,
+            InvoiceStatus::WrittenOff,
+        ] {
+            assert_eq!(
+                overdue_days(status, ten, day(1), day(6)),
+                None,
+                "{status:?}"
+            );
+        }
+    }
 }

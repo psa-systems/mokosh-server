@@ -379,6 +379,55 @@ pub async fn read_tenant_zone(
     Ok(zone.unwrap_or_else(|| "UTC".to_string()))
 }
 
+/// PMS-1037: the tenant's overdue-invoice reminder schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvoiceReminderSettings {
+    pub enabled: bool,
+    /// Days past due a reminder goes out on, ascending.
+    pub schedule: Vec<i64>,
+    /// The tenant's local hour the sweep sends at. Unset means 8.
+    pub send_hour: u32,
+}
+
+/// PMS-1037: `billing_reminders/{enabled,schedule,send_hour}` on the caller's
+/// tenant-GUC connection. Unset is off: a tenant that never turned reminders
+/// on is not mailing anybody.
+pub async fn read_invoice_reminder_settings(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+) -> AppResult<InvoiceReminderSettings> {
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        r#"SELECT key, value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'billing_reminders'"#,
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut settings = InvoiceReminderSettings {
+        enabled: false,
+        schedule: Vec::new(),
+        send_hour: 8,
+    };
+    for (key, value) in rows {
+        match key.as_str() {
+            "enabled" => settings.enabled = value.as_bool().unwrap_or(false),
+            "schedule" => {
+                settings.schedule = value
+                    .as_array()
+                    .map(|days| days.iter().filter_map(|d| d.as_i64()).collect())
+                    .unwrap_or_default();
+            }
+            "send_hour" => {
+                if let Some(hour) = value.as_u64().filter(|h| *h <= 23) {
+                    settings.send_hour = hour as u32;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(settings)
+}
+
 /// PMS-943: does this employer track breaks (`timesheets/track_breaks`)?
 ///
 /// Tenant-level rather than per company: the employee taking the break is the
