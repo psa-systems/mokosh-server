@@ -55,6 +55,9 @@ endpoint, extend one of these files.
 | POST /auth/logout | `logout` | N/A |
 | GET  /auth/me | `me` | SCOPED (own profile) |
 | PUT  /auth/me | `update_me` | SCOPED (own profile, DB cap re-check) |
+| POST /auth/me/mfa/setup | `mfa_setup` | SCOPED (own row, password re-verified; PMS-1063) |
+| POST /auth/me/mfa/enable | `mfa_enable` | SCOPED (own row, password re-verified; PMS-1063) |
+| POST /auth/me/mfa/disable | `mfa_disable` | SCOPED (own row, password + code re-verified; PMS-1063) |
 | POST /auth/refresh | `refresh` | N/A |
 | POST /auth/reset-password | `reset_password` | N/A |
 | POST /auth/set-password | `set_password` | N/A |

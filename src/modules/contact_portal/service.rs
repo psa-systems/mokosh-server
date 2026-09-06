@@ -18,6 +18,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::auth::mfa_secret;
 use crate::modules::auth::TenantId;
 use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
@@ -76,6 +77,10 @@ pub struct ContactAuthService {
     /// Base URL of the SPA (e.g. `http://localhost:4301`) so the
     /// reset-password email carries a full-URL link.
     spa_base_url: String,
+    /// PMS-1063: the `ENCRYPTION_KEY` that seals `contacts.portal_mfa_secret`
+    /// at rest, the PMS-871 rule the staff plane already follows for
+    /// `users.mfa_secret`. Zero in fixtures that never enrol.
+    encryption_key: [u8; 32],
 }
 
 impl ContactAuthService {
@@ -85,7 +90,15 @@ impl ContactAuthService {
             jwt_secret,
             notifications: None,
             spa_base_url: String::new(),
+            encryption_key: [0u8; 32],
         }
+    }
+
+    /// PMS-1063: attach the key that protects the TOTP secret at rest.
+    #[must_use]
+    pub fn with_encryption_key(mut self, encryption_key: [u8; 32]) -> Self {
+        self.encryption_key = encryption_key;
+        self
     }
 
     pub fn with_notifications(mut self, notifications: NotificationsService) -> Self {
@@ -124,7 +137,8 @@ impl ContactAuthService {
         slug: Option<&str>,
         email: &str,
         password: &str,
-        _mfa_code: Option<&str>,
+        mfa_code: Option<&str>,
+        recovery_code: Option<&str>,
         user_agent: Option<&str>,
         ip: Option<IpAddr>,
     ) -> AppResult<ContactLoginResponse> {
@@ -160,11 +174,13 @@ impl ContactAuthService {
         let contact_row: Option<(
             Uuid,
             Option<String>,
+            bool,
             Option<String>,
             Option<DateTime<Utc>>,
         )> = sqlx::query_as(
             r#"
-                SELECT id, portal_password_hash, portal_mfa_secret, portal_locked_until
+                SELECT id, portal_password_hash, portal_mfa_enabled, portal_mfa_secret,
+                       portal_locked_until
                 FROM contacts
                 WHERE tenant_id = $1
                   AND company_id = $2
@@ -178,7 +194,8 @@ impl ContactAuthService {
         .fetch_optional(self.db.migrator_pool())
         .await?;
 
-        let Some((contact_id, password_hash, _mfa_secret, locked_until)) = contact_row else {
+        let Some((contact_id, password_hash, mfa_enabled, mfa_secret, locked_until)) = contact_row
+        else {
             return Err(AppError::Unauthorized);
         };
 
@@ -199,6 +216,41 @@ impl ContactAuthService {
             // response - they just skip the lockout write.
             let _ = self.register_failed_login(tenant_id, contact_id).await;
             return Err(AppError::Unauthorized);
+        }
+
+        // PMS-1063: second factor. Password verified; a contact with
+        // MFA on gets no session until a TOTP code or a recovery code
+        // verifies. No code at all is the `mfa_required` pre-signal
+        // (empty tokens, the SPA re-POSTs with `mfa_code`); a wrong
+        // one is a 401 that ticks the PMS-501 lockout counter exactly
+        // as a wrong password does, so a second-factor grinder is
+        // throttled by the same persistent count.
+        if mfa_enabled {
+            let supplied_totp = mfa_code.map(str::trim).filter(|s| !s.is_empty());
+            let supplied_recovery = recovery_code.map(str::trim).filter(|s| !s.is_empty());
+            if supplied_totp.is_none() && supplied_recovery.is_none() {
+                return Ok(ContactLoginResponse {
+                    access_token: String::new(),
+                    refresh_token: String::new(),
+                    expires_at: Utc::now(),
+                    contact: None,
+                    mfa_required: true,
+                    password_setup_url: None,
+                });
+            }
+            let second_factor_ok = self
+                .verify_second_factor(
+                    tenant_id,
+                    contact_id,
+                    mfa_secret.as_deref(),
+                    supplied_totp,
+                    supplied_recovery,
+                )
+                .await?;
+            if !second_factor_ok {
+                let _ = self.register_failed_login(tenant_id, contact_id).await;
+                return Err(AppError::Unauthorized);
+            }
         }
 
         // Success: reset counters + stamp last-login. Best-effort.
@@ -1222,13 +1274,13 @@ impl ContactAuthService {
             String,
             String,
             String,
-            Option<String>,
+            bool,
             Option<String>,
         )> = sqlx::query_as(
             r#"
                 SELECT c.id, c.tenant_id, c.company_id, c.email,
                        co.name AS company_name, co.portal_slug,
-                       c.portal_mfa_secret, c.portal_password_hash
+                       c.portal_mfa_enabled, c.portal_password_hash
                 FROM contacts c
                 INNER JOIN companies co ON co.id = c.company_id
                 INNER JOIN tenants t ON t.id = c.tenant_id
@@ -1263,9 +1315,21 @@ impl ContactAuthService {
         // the code (out of scope for this ticket; contact MFA is
         // off by default).
         if candidates.len() == 1 {
-            let (contact_id, tid, company_id, email_row, _company_name, slug, mfa_secret, pwd_hash) =
-                candidates.into_iter().next().unwrap();
-            if mfa_secret.is_some() {
+            let (
+                contact_id,
+                tid,
+                company_id,
+                email_row,
+                _company_name,
+                slug,
+                mfa_enabled,
+                pwd_hash,
+            ) = candidates.into_iter().next().unwrap();
+            // PMS-1063: the gate is `portal_mfa_enabled`, the same
+            // flag the password login reads, not whether a secret
+            // happens to be staged: an enrolment that was started and
+            // abandoned must not lock the magic link.
+            if mfa_enabled {
                 return Ok(LoginLinkRedeemOutcome {
                     auto: Some(ContactLoginResponse {
                         access_token: String::new(),
@@ -1559,6 +1623,279 @@ impl ContactAuthService {
         .execute(self.db.migrator_pool())
         .await?;
         Ok(format!("{session_id}.{secret}"))
+    }
+
+    /// PMS-1063: verify the second factor on a login. A recovery code
+    /// wins when both are supplied (the customer who lost their
+    /// authenticator must get in even if the SPA still sends an empty
+    /// `mfa_code`); otherwise the TOTP code is checked against the
+    /// stored secret with one step of skew, and a secret still stored
+    /// in the pre-PMS-871 plaintext shape is rewritten sealed once the
+    /// code it produced has verified.
+    async fn verify_second_factor(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        stored_secret: Option<&str>,
+        totp: Option<&str>,
+        recovery: Option<&str>,
+    ) -> AppResult<bool> {
+        if let Some(code) = recovery {
+            return self
+                .consume_recovery_code(tenant_id, contact_id, code)
+                .await;
+        }
+        let Some(code) = totp else {
+            return Ok(false);
+        };
+        let stored = stored_secret
+            .ok_or_else(|| AppError::Internal("MFA enabled but no secret stored".to_string()))?;
+        let opened = mfa_secret::open(stored, &self.encryption_key)?;
+        let secret = crate::utils::totp::base32_decode(opened.secret_b32())
+            .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
+        if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+            return Ok(false);
+        }
+        if opened.needs_upgrade() {
+            self.upgrade_legacy_portal_mfa_secret(
+                tenant_id,
+                contact_id,
+                stored,
+                opened.secret_b32(),
+            )
+            .await?;
+        }
+        Ok(true)
+    }
+
+    /// PMS-1063: burn one recovery code. `array_remove` is a no-op when
+    /// the hash is absent, and the `ANY` predicate keeps the UPDATE from
+    /// matching then, so `rows_affected` says whether a code was spent.
+    async fn consume_recovery_code(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        code: &str,
+    ) -> AppResult<bool> {
+        let candidate = crate::utils::recovery::hash_code_hex(code);
+        let rows = sqlx::query(
+            r#"
+            UPDATE contacts
+               SET portal_mfa_recovery_codes_hashes =
+                     array_remove(portal_mfa_recovery_codes_hashes, $1),
+                   updated_at = NOW()
+             WHERE id = $2
+               AND tenant_id = $3
+               AND $1 = ANY(portal_mfa_recovery_codes_hashes)
+            "#,
+        )
+        .bind(&candidate)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?
+        .rows_affected();
+        Ok(rows > 0)
+    }
+
+    /// PMS-1063 (the PMS-871 shape): rewrite a plaintext
+    /// `portal_mfa_secret` sealed. Guarded on the old value so a
+    /// concurrent re-enrolment is never overwritten.
+    async fn upgrade_legacy_portal_mfa_secret(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        stored: &str,
+        secret_b32: &str,
+    ) -> AppResult<()> {
+        let sealed = mfa_secret::seal(secret_b32, &self.encryption_key)?;
+        sqlx::query(
+            "UPDATE contacts SET portal_mfa_secret = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3 AND portal_mfa_secret = $4",
+        )
+        .bind(&sealed)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(stored)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
+    }
+
+    /// PMS-1063: re-verify the contact's password before a change to
+    /// its second factor. A stolen access token cannot cross this.
+    /// Returns the row's `portal_mfa_enabled` and `portal_mfa_secret`
+    /// for the caller's next step.
+    async fn reauthenticate(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_password: &str,
+    ) -> AppResult<(bool, Option<String>, String)> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(bool, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT portal_mfa_enabled, portal_mfa_secret, portal_password_hash, email \
+             FROM contacts WHERE id = $1 AND tenant_id = $2 AND is_portal_user = TRUE",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((enabled, secret, password_hash, email)) = row else {
+            return Err(AppError::Unauthorized);
+        };
+        let hash = password_hash.ok_or(AppError::Unauthorized)?;
+        if !verify_password(current_password, &hash)? {
+            return Err(AppError::Unauthorized);
+        }
+        Ok((enabled, secret, email.unwrap_or_default()))
+    }
+
+    /// PMS-1063: start MFA enrolment. Stages a fresh TOTP secret on the
+    /// contact row, sealed at rest, WITHOUT flipping
+    /// `portal_mfa_enabled`: only `enable_mfa`, after a live code has
+    /// verified, turns it on, so a mis-set authenticator cannot lock
+    /// the customer out. Calling this again before enable replaces the
+    /// staged secret. 409 when MFA is already on: disable first.
+    #[tracing::instrument(skip_all)]
+    pub async fn start_mfa_enrollment(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_password: &str,
+    ) -> AppResult<ContactMfaSetupResponse> {
+        let (enabled, _, email) = self
+            .reauthenticate(tenant_id, contact_id, current_password)
+            .await?;
+        if enabled {
+            return Err(AppError::Conflict("MFA is already enabled".to_string()));
+        }
+        let secret = crate::utils::totp::generate_secret();
+        let secret_b32 = crate::utils::totp::base32_encode(&secret);
+        let sealed = mfa_secret::seal(&secret_b32, &self.encryption_key)?;
+        sqlx::query(
+            "UPDATE contacts SET portal_mfa_secret = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(&sealed)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        // The issuer the authenticator shows beside the code, the way
+        // the staff plane labels it (PMS-789): a colon inside the name
+        // would split the otpauth label once the app decodes it.
+        let app = crate::utils::app_name::app_name().replace(':', " ");
+        let label = format!("{app}:{email}");
+        let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, &app);
+        Ok(ContactMfaSetupResponse {
+            secret: secret_b32,
+            provisioning_uri,
+        })
+    }
+
+    /// PMS-1063: finish MFA enrolment. Re-verifies the password, checks
+    /// one live code against the staged secret, flips
+    /// `portal_mfa_enabled`, and mints the single-use recovery codes,
+    /// returned once and stored as hashes.
+    #[tracing::instrument(skip_all)]
+    pub async fn enable_mfa(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        code: &str,
+        current_password: &str,
+    ) -> AppResult<ContactMfaEnableResponse> {
+        let (enabled, stored, _) = self
+            .reauthenticate(tenant_id, contact_id, current_password)
+            .await?;
+        if enabled {
+            return Err(AppError::Conflict("MFA is already enabled".to_string()));
+        }
+        let stored = stored.ok_or_else(|| {
+            AppError::BadRequest("MFA enrollment has not been started".to_string())
+        })?;
+        let opened = mfa_secret::open(&stored, &self.encryption_key)?;
+        let secret = crate::utils::totp::base32_decode(opened.secret_b32())
+            .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
+        if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+            return Err(AppError::BadRequest("Invalid MFA code".to_string()));
+        }
+        let recovery_codes = crate::utils::recovery::generate_set();
+        let hashes: Vec<String> = recovery_codes
+            .iter()
+            .map(|c| crate::utils::recovery::hash_code_hex(c))
+            .collect();
+        // Seal on the way in too, so a secret staged before the key
+        // was wired (or by a seed) does not stay plaintext past this.
+        let sealed = mfa_secret::seal(opened.secret_b32(), &self.encryption_key)?;
+        sqlx::query(
+            r#"
+            UPDATE contacts
+               SET portal_mfa_enabled = TRUE,
+                   portal_mfa_secret = $1,
+                   portal_mfa_enrolled_at = NOW(),
+                   portal_mfa_recovery_codes_hashes = $2,
+                   updated_at = NOW()
+             WHERE id = $3 AND tenant_id = $4
+            "#,
+        )
+        .bind(&sealed)
+        .bind(&hashes)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(ContactMfaEnableResponse { recovery_codes })
+    }
+
+    /// PMS-1063: remove MFA. Needs the current password AND a live code
+    /// or an unspent recovery code, so a stolen access token cannot
+    /// quietly weaken the account. Not enabled is the same 401 as a
+    /// wrong password, so the response does not say which.
+    #[tracing::instrument(skip_all)]
+    pub async fn disable_mfa(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_password: &str,
+        code: &str,
+    ) -> AppResult<()> {
+        let (enabled, stored, _) = self
+            .reauthenticate(tenant_id, contact_id, current_password)
+            .await?;
+        if !enabled {
+            return Err(AppError::Unauthorized);
+        }
+        let code = code.trim();
+        let looks_like_totp = code.chars().all(|c| c.is_ascii_digit());
+        let (totp, recovery) = if looks_like_totp {
+            (Some(code), None)
+        } else {
+            (None, Some(code))
+        };
+        if !self
+            .verify_second_factor(tenant_id, contact_id, stored.as_deref(), totp, recovery)
+            .await?
+        {
+            return Err(AppError::Unauthorized);
+        }
+        sqlx::query(
+            r#"
+            UPDATE contacts
+               SET portal_mfa_enabled = FALSE,
+                   portal_mfa_secret = NULL,
+                   portal_mfa_enrolled_at = NULL,
+                   portal_mfa_recovery_codes_hashes = '{}',
+                   updated_at = NOW()
+             WHERE id = $1 AND tenant_id = $2
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
     }
 
     /// Best-effort: increment `portal_failed_login_count` and arm

@@ -568,16 +568,21 @@ async fn redeem_revoked_between_mint_and_click_returns_400(pool: PgPool) {
 }
 
 /// mokosh-contact-login prompt 010: single-match auto-mint gated on
-/// MFA. When the target contact has `portal_mfa_secret` set, the
-/// redeem returns `mfa_required = true` with empty tokens.
+/// MFA. When the target contact has `portal_mfa_enabled` set, the
+/// redeem returns `mfa_required = true` with empty tokens. PMS-1063:
+/// the gate is the flag, the same one the password login reads, not
+/// whether a secret happens to be staged.
 #[sqlx::test]
 async fn mfa_gates_single_match_auto_mint(pool: PgPool) {
     let (contact_id, _co_id, _slug) = seed_portal_contact(&pool, "mfa@mcl.example").await;
-    sqlx::query("UPDATE contacts SET portal_mfa_secret = 'JBSWY3DPEHPK3PXP' WHERE id = $1")
-        .bind(contact_id)
-        .execute(&pool)
-        .await
-        .expect("set mfa secret");
+    sqlx::query(
+        "UPDATE contacts SET portal_mfa_enabled = TRUE, portal_mfa_secret = 'JBSWY3DPEHPK3PXP' \
+         WHERE id = $1",
+    )
+    .bind(contact_id)
+    .execute(&pool)
+    .await
+    .expect("set mfa secret");
     let token = mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "mfa@mcl.example", None).await;
     let app = common::boot(pool.clone()).await;
 
