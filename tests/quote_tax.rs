@@ -105,9 +105,12 @@ async fn tax_follows_the_rate_over_the_taxable_lines_and_every_line_change(pool:
         line("Extra", "100", true),
     )
     .await;
-    // 250.05 * 13% = 32.5065 -> 32.51
+    // Subtotal 280.05 keeps the exempt line; the tax base is the taxable
+    // 250.05, and 250.05 * 13% = 32.5065 -> 32.51 (PMS-1078: the total was
+    // asserted as 282.56, which dropped the exempt line from the subtotal).
+    assert_eq!(dec(&with_line["subtotal"]), Decimal::new(28005, 2));
     assert_eq!(dec(&with_line["tax_amount"]), Decimal::new(3251, 2));
-    assert_eq!(dec(&with_line["total"]), Decimal::new(28256, 2));
+    assert_eq!(dec(&with_line["total"]), Decimal::new(31256, 2));
 }
 
 /// A given amount is kept through line changes and records no rate; naming a
