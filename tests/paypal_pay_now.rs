@@ -105,6 +105,12 @@ fn stub_base() -> &'static str {
         });
         let base = rx.recv().expect("stub base");
         std::env::set_var("PAYPAL_API_BASE", &base);
+        // PMS-982: the provider asks the configuration seam for the base, and
+        // the generation is resolved and held, so the `set_var` above is not
+        // seen until it is rebuilt. Refreshed here rather than left to
+        // `common::boot`, because the stub's port is only known now and a case
+        // may boot before it starts one.
+        mokosh_server::config::refresh();
         base
     })
 }

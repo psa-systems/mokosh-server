@@ -68,8 +68,7 @@ pub struct KbAttachmentConfig {
 
 impl KbAttachmentConfig {
     pub fn from_env() -> Self {
-        let max_bytes = std::env::var("KB_ATTACHMENT_MAX_BYTES")
-            .ok()
+        let max_bytes = crate::config::get(&crate::config::registry::KB_ATTACHMENT_MAX_BYTES)
             .filter(|v| !v.trim().is_empty())
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MAX_BYTES);

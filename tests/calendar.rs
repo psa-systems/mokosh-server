@@ -704,3 +704,82 @@ async fn list_appointments_filtered_by_team_id(pool: PgPool) {
         "null-team appointment must NOT appear when a specific team is filtered: {data:?}"
     );
 }
+
+/// PMS-1066: the bounded-range path (`from` + `to`, which delegates to
+/// `appointments_in_range` and expands recurrence) must apply `team_id`
+/// too. It took no team at all, so a dispatcher filtering the board to
+/// their own team was served every team's work with a 200. Both halves
+/// of that read are covered: a one-off row and a recurring series
+/// belonging to the other team must both stay out.
+#[sqlx::test]
+async fn range_query_filtered_by_team_id(pool: PgPool) {
+    let (admin_id, email, password) = seed_admin(&pool).await;
+    let team_a = seed_team(&pool, common::DEFAULT_TENANT_ID, "Range A", None).await;
+    let team_b = seed_team(&pool, common::DEFAULT_TENANT_ID, "Range B", None).await;
+    let app = boot(pool).await;
+    let token = login(&app, &email, &password).await;
+
+    for (title, team, rule) in [
+        ("A-onsite", Some(team_a), None),
+        ("B-onsite", Some(team_b), None),
+        ("no-team-onsite", None, None),
+        ("A-standup", Some(team_a), Some("FREQ=DAILY;COUNT=3")),
+        ("B-standup", Some(team_b), Some("FREQ=DAILY;COUNT=3")),
+    ] {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/appointments"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "title": title,
+                "assigned_to_id": admin_id,
+                "start_time": "2026-05-04T09:00:00Z",
+                "end_time": "2026-05-04T10:00:00Z",
+                "team_id": team,
+                "recurrence_rule": rule,
+            }))
+            .send()
+            .await
+            .expect("create");
+        assert!(resp.status().is_success(), "seed {title}");
+    }
+
+    let list: serde_json::Value = app
+        .client
+        .get(app.url(&format!(
+            "/api/v1/appointments?from=2026-05-01T00:00:00Z&to=2026-05-31T23:59:59Z&team_id={team_a}"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send range query")
+        .json()
+        .await
+        .expect("range query JSON");
+    let data = list["data"].as_array().expect("data array");
+
+    let titles: Vec<&str> = data
+        .iter()
+        .map(|a| a["title"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        titles.contains(&"A-onsite"),
+        "team A appointment must appear: {data:?}"
+    );
+    assert_eq!(
+        titles.iter().filter(|t| **t == "A-standup").count(),
+        3,
+        "team A series must still expand to its 3 occurrences: {data:?}"
+    );
+    for excluded in ["B-onsite", "B-standup", "no-team-onsite"] {
+        assert!(
+            !titles.contains(&excluded),
+            "{excluded} must NOT appear when team A is filtered: {data:?}"
+        );
+    }
+    assert_eq!(
+        list["meta"]["total"].as_u64(),
+        Some(4),
+        "total counts only the filtered team's rows (1 one-off + 3 occurrences): {list}"
+    );
+}

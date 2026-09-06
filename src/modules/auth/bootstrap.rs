@@ -19,8 +19,8 @@ use crate::utils::error::AppResult;
 
 pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
     let (email, password) = match (
-        std::env::var("ADMIN_EMAIL").ok(),
-        std::env::var("ADMIN_PASSWORD").ok(),
+        crate::config::get(&crate::config::registry::ADMIN_EMAIL),
+        crate::config::get(&crate::config::registry::ADMIN_PASSWORD),
     ) {
         (Some(e), Some(p)) if !e.trim().is_empty() && !p.is_empty() => (e, p),
         _ => return Ok(()),
