@@ -201,6 +201,12 @@ dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "ae62c
 # 0.12.7 inherits `default-features = false` and the image codecs are
 # additive, so the RSS concern stays addressed here.
 printpdf = { version = "0.12.7", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# PMS-1008 subsets the embedded faces per document. printpdf's own subsetter is
+# behind its `text_layout` feature, which is what we are declining, but the
+# subsetter it calls is this crate - already in the build graph as printpdf's own
+# non-optional dependency, so naming it here adds no compile. Same version and
+# same feature set as printpdf pins, so both see one build of it.
+allsorts = { package = "allsorts-azul", version = "0.17.1", default-features = false, features = ["flate2_rust"] }
 
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for

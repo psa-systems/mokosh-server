@@ -2151,6 +2151,7 @@ name = "mokosh-server"
 version = "0.13.0"
 dependencies = [
  "aes-gcm",
+ "allsorts-azul",
  "anyhow",
  "argon2",
  "async-trait",

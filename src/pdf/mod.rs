@@ -49,14 +49,20 @@
 //!
 //! ## The cost of that, stated rather than discovered
 //!
-//! Two weights of a whole font are about 850 KB in the binary, and printpdf
-//! embeds the full font program (subsetting is behind its `text_layout`
-//! feature, which pulls a layout engine and a system font-discovery crate in
-//! for glyphs we already know how to name), so a rendered document carries the
-//! deflated faces it used: a one-line invoice went from about 8.5 KB to about
-//! 460 KB. That is the trade for a name that is spelled right, and it is a
-//! per-document cost on documents PMS-959 keeps for seven years, so shrinking
-//! it is PMS-1008 rather than something this module quietly lives with.
+//! Two weights of a whole font are about 850 KB in the binary. That is a
+//! one-off; what was not is the rendered document, which carried both deflated
+//! faces whole and took a one-line invoice from about 8.5 KB to about 460 KB -
+//! a per-document cost on documents PMS-959 keeps for seven years and sums into
+//! `TenantUsage.storage_bytes`.
+//!
+//! PMS-1008 cut it back to about 11 KB by embedding only the glyphs a document
+//! draws: [`subset_face`] runs after layout, over the characters [`Layout::used`]
+//! collected, and the subset face is what goes into `resources.fonts`. printpdf
+//! subsets by itself only behind its `text_layout` feature, which pulls a layout
+//! engine and a system font-discovery crate in for glyphs we already know how to
+//! name, so this calls the subsetter that feature reaches for - `allsorts`,
+//! already in the build graph as printpdf's own dependency - directly.
+//! `a_document_carries_only_the_glyphs_it_draws` is what holds it there.
 //!
 //! What still cannot be drawn is Noto Sans's own coverage limit, chiefly CJK,
 //! whose face is roughly twenty times the size for a case no tenant has hit.
@@ -579,6 +585,23 @@ impl Weight {
             .to_string(),
         )
     }
+
+    /// The vendored sfnt bytes the face was parsed from, which is also what
+    /// [`subset_face`] reads its tables back out of.
+    fn source(self) -> &'static [u8] {
+        match self {
+            Weight::Regular => NOTO_SANS_REGULAR,
+            Weight::Bold => NOTO_SANS_BOLD,
+        }
+    }
+
+    /// Position in [`Layout::used`].
+    fn index(self) -> usize {
+        match self {
+            Weight::Regular => 0,
+            Weight::Bold => 1,
+        }
+    }
 }
 
 /// The two faces, parsed once for the life of the process.
@@ -654,6 +677,76 @@ fn for_font(s: &str, face: &ParsedFont, missing: &mut BTreeSet<char>) -> String 
         .collect()
 }
 
+/// Cut a face down to the glyphs one document actually draws (PMS-1008).
+///
+/// The face that goes into `resources.fonts` is the face printpdf embeds AND
+/// the face it looks glyph ids up in, so handing it the subset is the whole
+/// mechanism: the content stream, `/W` and `/ToUnicode` all come out keyed by
+/// the subset's own ids, and `/FontFile2` is the subset program. printpdf will
+/// do this itself only behind `text_layout`, which pulls a layout engine and
+/// system font discovery in; the subsetter that feature reaches for is
+/// `allsorts`, which is already in the build graph, so this calls it directly.
+///
+/// Deterministic, which PMS-911 and PMS-990 both rest on: the glyph set is a
+/// `BTreeSet` so the id list is ordered by construction, and allsorts writes the
+/// tables from that list with nothing dated or random in them.
+///
+/// Returns `None` rather than failing the render, and says why at `error`. A
+/// document set in the whole face is the correct document at the wrong size,
+/// so a subsetter that refuses one glyph set must not withhold an invoice;
+/// nothing downstream reads the outcome, because either face renders the same
+/// page.
+fn subset_face(weight: Weight, face: &ParsedFont, used: &BTreeSet<char>) -> Option<ParsedFont> {
+    use allsorts::binary::read::ReadScope;
+    use allsorts::font_data::FontData;
+    use allsorts::subset::{subset, CmapTarget, SubsetProfile};
+
+    // Glyph 0 (.notdef) first and no duplicates: allsorts documents both as
+    // requirements, and omitting .notdef renumbers the first real glyph onto 0,
+    // where every reader draws it as the missing-glyph box.
+    let mut ids: Vec<u16> = vec![0];
+    ids.extend(
+        used.iter()
+            .filter_map(|c| face.lookup_glyph_index(*c as u32))
+            .filter(|gid| *gid != 0)
+            .collect::<BTreeSet<u16>>(),
+    );
+
+    let bytes = ReadScope::new(weight.source())
+        .read::<FontData<'_>>()
+        .map_err(|e| e.to_string())
+        .and_then(|font| font.table_provider(0).map_err(|e| e.to_string()))
+        .and_then(|provider| {
+            subset(&provider, &ids, &SubsetProfile::Pdf, CmapTarget::Unicode)
+                .map_err(|e| e.to_string())
+        });
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::error!(
+                font = %weight.id().0,
+                glyphs = ids.len(),
+                reason = %reason,
+                "pdf: could not subset the embedded font; embedding the whole face"
+            );
+            return None;
+        }
+    };
+
+    let mut warnings = Vec::new();
+    let subset = ParsedFont::from_bytes(&bytes, 0, &mut warnings);
+    for warning in &warnings {
+        tracing::warn!(font = %weight.id().0, message = %warning.message, "pdf: subset font parse warning");
+    }
+    if subset.is_none() {
+        tracing::error!(
+            font = %weight.id().0,
+            "pdf: the subset font did not parse; embedding the whole face"
+        );
+    }
+    subset
+}
+
 /// Render a document to PDF bytes.
 ///
 /// Fails only when the vendored faces will not parse, which is a broken build
@@ -665,12 +758,6 @@ pub fn render(document: &Document) -> AppResult<Vec<u8>> {
     // printpdf writes as UTF-16BE, so that copy carries any character at all
     // and is passed through unfolded.
     let mut doc = PdfDocument::new(&document.title);
-    for weight in [Weight::Regular, Weight::Bold] {
-        doc.resources
-            .fonts
-            .map
-            .insert(weight.id(), PdfFont::new(faces.get(weight).clone()));
-    }
     let mut layout = Layout::new(faces, theme);
 
     if theme.band {
@@ -737,6 +824,19 @@ pub fn render(document: &Document) -> AppResult<Vec<u8>> {
             characters = %characters.join(", "),
             "pdf: the embedded font has no glyph for these characters; they were printed as '?'"
         );
+    }
+
+    // The faces go in AFTER the page is laid out, because what goes in is the
+    // subset of each face this document draws (PMS-1008) and that is not known
+    // until every string has been folded through `for_font`.
+    let used = std::mem::take(&mut layout.used);
+    for weight in [Weight::Regular, Weight::Bold] {
+        let face = subset_face(weight, faces.get(weight), &used[weight.index()])
+            .unwrap_or_else(|| faces.get(weight).clone());
+        doc.resources
+            .fonts
+            .map
+            .insert(weight.id(), PdfFont::new(face));
     }
 
     let mut bytes = doc
@@ -885,6 +985,11 @@ struct Layout {
     /// Every character the faces could not draw, gathered as the page is drawn
     /// so [`render`] can report them once.
     missing: BTreeSet<char>,
+    /// Every character each face actually draws, indexed by [`Weight::index`].
+    /// This is what the face is subset to (PMS-1008), so it records the text
+    /// AFTER [`for_font`] has folded it: the `?` a missing character becomes
+    /// needs a glyph of its own.
+    used: [BTreeSet<char>; 2],
     /// PMS-1006: every measurement and every colour this pen uses.
     theme: Theme,
 }
@@ -897,6 +1002,7 @@ impl Layout {
             y_mm: PAGE_HEIGHT_MM - MARGIN_MM,
             faces,
             missing: BTreeSet::new(),
+            used: Default::default(),
             theme,
         }
     }
@@ -939,6 +1045,7 @@ impl Layout {
     /// PMS-1006: the same, in an ink the caller chooses, for a band's own text.
     fn text_in(&mut self, x_mm: f32, text: &str, font: Weight, size_pt: f32, ink: Ink) {
         let text = for_font(text, self.faces.get(font), &mut self.missing);
+        self.used[font.index()].extend(text.chars());
         self.ops.extend([
             Op::StartTextSection,
             Op::SetTextCursor {
@@ -2087,6 +2194,74 @@ mod tests {
             );
         }
         assert!(!text.contains('?'), "nothing was substituted: {text:?}");
+    }
+
+    /// An invoice shaped like the ones PMS-959 stores for seven years.
+    fn one_line_invoice(bill_to: Vec<String>) -> Document {
+        Document::new("Invoice")
+            .subtitle("INV-000001")
+            .columns(vec![
+                (
+                    "From".to_string(),
+                    vec!["Acme IT Services".to_string(), "12 Example St".to_string()],
+                ),
+                ("Bill to".to_string(), bill_to),
+            ])
+            .table_aligned(
+                "Items",
+                vec!["Description".into(), "Qty".into(), "Amount".into()],
+                vec![vec![
+                    "2026-08-27 Remote support: T000042 Printer offline".into(),
+                    "2".into(),
+                    "300.00 USD".into(),
+                ]],
+                vec![Align::Left, Align::Right, Align::Right],
+            )
+            .totals(vec![("Balance due".into(), "300.00 USD".into())])
+    }
+
+    /// PMS-1008: the document carries the glyphs it drew, not the whole face.
+    ///
+    /// The size is asserted here rather than quoted in a pull request, because
+    /// this is a per-document cost on documents kept for seven years and the
+    /// way it comes back is a change that stops the subset being reached (a
+    /// face handed to `resources.fonts` unsubset, a subsetter that starts
+    /// failing) - none of which any other test in this module would notice.
+    ///
+    /// The second assertion is what says SUBSET rather than merely "small":
+    /// two documents differing only in the scripts they draw must differ in
+    /// size, which is only true if each carries its own glyphs.
+    #[test]
+    fn a_document_carries_only_the_glyphs_it_draws() {
+        let latin = render(&one_line_invoice(vec![
+            "NiceGuy IT".to_string(),
+            "1 Customer Way".to_string(),
+        ]))
+        .expect("render");
+        assert!(
+            latin.len() < 100 * 1024,
+            "a one-line invoice is {} bytes; the whole face is back in it",
+            latin.len()
+        );
+
+        let mixed = render(&one_line_invoice(vec![
+            "\u{141}ukasiewicz Sp. z o.o.".to_string(),
+            "\u{418}\u{432}\u{430}\u{43d}\u{43e}\u{432}".to_string(),
+            "\u{3a0}\u{3b1}\u{3c0}\u{3b1}\u{3b4}\u{3cc}\u{3c0}\u{3bf}\u{3c5}".to_string(),
+        ]))
+        .expect("render");
+        assert!(
+            mixed.len() > latin.len(),
+            "Greek and Cyrillic cost nothing extra ({} vs {} bytes), so the \
+             embedded program is not the glyph set of this document",
+            mixed.len(),
+            latin.len()
+        );
+        assert!(
+            mixed.len() < 100 * 1024,
+            "a three-script invoice is {} bytes",
+            mixed.len()
+        );
     }
 
     /// Records every event a render emits, so "exactly one warning" is a count
