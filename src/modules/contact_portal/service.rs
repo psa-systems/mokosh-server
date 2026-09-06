@@ -1249,24 +1249,38 @@ impl ContactAuthService {
     /// mokosh-contact-login prompt 010 (PMS-918): redeem a magic link
     /// minted by `request_login_link` (or by
     /// `ContactService::grant_portal_access`). Parses `{intent_id}.{secret}`,
-    /// verifies the hash, marks the intent used (same tx, so a race
-    /// loses cleanly), then loads matching portal contacts.
+    /// verifies the hash, loads the matching portal contact, and marks
+    /// the intent used in the same transaction that decides to sign
+    /// the contact in, so a race between two clicks lands one winner.
     ///
     /// - 0 matches (revoked between mint + click) -> generic
     ///   `AppError::BadRequest("This link is invalid or has expired")`.
-    /// - 1 match -> auto-mint access + refresh (or `mfa_required = true`
-    ///   if the contact has TOTP enrolled) and return in
+    /// - 1 match -> auto-mint access + refresh in
     ///   `LoginLinkRedeemOutcome.auto`.
-    /// - >=2 matches -> mint a short-lived selection JWT and return
-    ///   the picker payload in `LoginLinkRedeemOutcome.candidates`.
+    /// - >=2 matches -> the same generic 400 (MAPPS-637 retired the
+    ///   picker); the intent is consumed.
     ///
-    /// Every failure path folds to the same generic 400 copy so the
+    /// PMS-1077: a contact with MFA on is answered `mfa_required: true`
+    /// with empty tokens on a POST that carries no code, and the intent
+    /// is NOT consumed, so the second POST with `{ token, mfa_code }`
+    /// (or `recovery_code`) finds the link still live. The code goes
+    /// through the same `verify_second_factor` as the password login:
+    /// a wrong one is a 401 that ticks `portal_failed_login_count` and
+    /// leaves the link live (bounded by its expiry and by the PMS-501
+    /// lockout, which this path honours too); a right one consumes the
+    /// link and mints. Before this the intent was consumed before the
+    /// gate, so the second POST was refused as a replay and a contact
+    /// with MFA on could never finish a magic-link login.
+    ///
+    /// Every link failure folds to the same generic 400 copy so the
     /// caller cannot tell WHY the token was rejected (expired vs.
     /// already-used vs. revoked vs. malformed).
     #[tracing::instrument(skip_all)]
     pub async fn redeem_login_link(
         &self,
         token: &str,
+        mfa_code: Option<&str>,
+        recovery_code: Option<&str>,
         user_agent: Option<&str>,
         ip: Option<IpAddr>,
     ) -> AppResult<LoginLinkRedeemOutcome> {
@@ -1349,17 +1363,15 @@ impl ContactAuthService {
             );
             return Err(invalid());
         }
-        sqlx::query("UPDATE portal_login_intents SET used_at = NOW() WHERE id = $1")
-            .bind(intent_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
 
-        // Candidate lookup. Rows where the tenant is suspended or the
-        // Company has no portal_slug never appear (a suspended tenant
-        // is not a valid destination and a slug-less Company cannot
-        // render its `/portal/{slug}/*` URLs anyway). Zero rows =
-        // same generic invalid error above; do NOT leak revocation.
+        // Candidate lookup, on the same connection while the intent
+        // row stays locked: the intent is consumed further down, only
+        // once this call has decided to sign the contact in (PMS-1077).
+        // Rows where the tenant is suspended or the Company has no
+        // portal_slug never appear (a suspended tenant is not a valid
+        // destination and a slug-less Company cannot render its
+        // `/portal/{slug}/*` URLs anyway). Zero rows = same generic
+        // invalid error above; do NOT leak revocation.
         #[allow(clippy::type_complexity)]
         let candidates: Vec<(
             Uuid,
@@ -1370,11 +1382,14 @@ impl ContactAuthService {
             String,
             bool,
             Option<String>,
+            Option<String>,
+            Option<DateTime<Utc>>,
         )> = sqlx::query_as(
             r#"
                 SELECT c.id, c.tenant_id, c.company_id, c.email,
                        co.name AS company_name, co.portal_slug,
-                       c.portal_mfa_enabled, c.portal_password_hash
+                       c.portal_mfa_enabled, c.portal_password_hash,
+                       c.portal_mfa_secret, c.portal_locked_until
                 FROM contacts c
                 INNER JOIN companies co ON co.id = c.company_id
                 INNER JOIN tenants t ON t.id = c.tenant_id
@@ -1390,7 +1405,7 @@ impl ContactAuthService {
         .bind(tenant_id)
         .bind(&intent_email)
         .bind(scope_company_id)
-        .fetch_all(self.db.migrator_pool())
+        .fetch_all(&mut *tx)
         .await?;
         if candidates.is_empty() {
             tracing::warn!(
@@ -1404,10 +1419,8 @@ impl ContactAuthService {
         }
 
         // Single-match: auto-mint. MFA gate mirrors the shape prompt
-        // 004 login already returns (empty tokens + mfa_required =
-        // true). The SPA re-POSTs to a follow-up MFA endpoint with
-        // the code (out of scope for this ticket; contact MFA is
-        // off by default).
+        // 004 login returns (empty tokens + mfa_required = true); the
+        // SPA re-POSTs here with the code (PMS-1077).
         if candidates.len() == 1 {
             let (
                 contact_id,
@@ -1418,24 +1431,67 @@ impl ContactAuthService {
                 slug,
                 mfa_enabled,
                 pwd_hash,
+                mfa_secret,
+                locked_until,
             ) = candidates.into_iter().next().unwrap();
             // PMS-1063: the gate is `portal_mfa_enabled`, the same
             // flag the password login reads, not whether a secret
             // happens to be staged: an enrolment that was started and
             // abandoned must not lock the magic link.
             if mfa_enabled {
-                return Ok(LoginLinkRedeemOutcome {
-                    auto: Some(ContactLoginResponse {
-                        access_token: String::new(),
-                        refresh_token: String::new(),
-                        expires_at: Utc::now(),
-                        contact: None,
-                        mfa_required: true,
-                        password_setup_url: None,
-                    }),
-                    candidates: None,
-                });
+                let supplied_totp = mfa_code.map(str::trim).filter(|s| !s.is_empty());
+                let supplied_recovery = recovery_code.map(str::trim).filter(|s| !s.is_empty());
+                if supplied_totp.is_none() && supplied_recovery.is_none() {
+                    // Pre-signal. `tx` drops here unconsumed, so the
+                    // link is still live for the second POST.
+                    return Ok(LoginLinkRedeemOutcome {
+                        auto: Some(ContactLoginResponse {
+                            access_token: String::new(),
+                            refresh_token: String::new(),
+                            expires_at: Utc::now(),
+                            contact: None,
+                            mfa_required: true,
+                            password_setup_url: None,
+                        }),
+                        candidates: None,
+                    });
+                }
+                // The PMS-501 lockout the password login honours: a
+                // second-factor grinder on this path meets the same
+                // wall.
+                if let Some(until) = locked_until {
+                    if until > Utc::now() {
+                        return Err(AppError::RateLimited {
+                            retry_after_seconds: None,
+                        });
+                    }
+                }
+                let second_factor_ok = self
+                    .verify_second_factor(
+                        tid,
+                        contact_id,
+                        mfa_secret.as_deref(),
+                        supplied_totp,
+                        supplied_recovery,
+                    )
+                    .await?;
+                if !second_factor_ok {
+                    // Wrong code: tick the counter, leave the link
+                    // live (its expiry and the lockout bound the
+                    // retries), and say so with the login's 401
+                    // rather than the link's 400.
+                    let _ = self.register_failed_login(tid, contact_id).await;
+                    return Err(AppError::Unauthorized);
+                }
             }
+            // Decided: consume the link before anything is minted, so
+            // the concurrent click waiting on the row lock sees it
+            // used.
+            sqlx::query("UPDATE portal_login_intents SET used_at = NOW() WHERE id = $1")
+                .bind(intent_id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
             // Option-1 first-login gate: contact without a password
             // must set one before landing on /dashboard. Do NOT mint
             // the session yet; hand the SPA the set-password URL so
@@ -1467,11 +1523,17 @@ impl ContactAuthService {
         // MAPPS-637: multi-match is now an invalid-link outcome. The
         // aggregate-by-email picker retired; a token that would have
         // fed the picker is treated the same as an expired / unknown
-        // one. The caller must reach for their Portal ID and use the
+        // one, and is consumed the way it was before PMS-1077. The
+        // caller must reach for their Portal ID and use the
         // Portal-ID + password login path instead. Enum-resistant:
         // returns the SAME "invalid" AppError the empty-candidates
         // branch above produces, so a probe cannot distinguish
         // "multi-match" from "expired".
+        sqlx::query("UPDATE portal_login_intents SET used_at = NOW() WHERE id = $1")
+            .bind(intent_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Err(invalid())
     }
 
@@ -1551,10 +1613,13 @@ impl ContactAuthService {
                 tenant_id, contact_id, session_id, session_id, user_agent, ip,
             )
             .await?;
-        // Stamp last-login. Best-effort.
+        // Stamp last-login and, as the password login does, clear the
+        // PMS-501 failure count a second factor may have ticked
+        // (PMS-1077). Best-effort.
         let _ = sqlx::query(
             "UPDATE contacts \
-             SET portal_last_login_at = NOW(), updated_at = NOW() \
+             SET portal_last_login_at = NOW(), portal_failed_login_count = 0, \
+                 portal_locked_until = NULL, updated_at = NOW() \
              WHERE id = $1 AND tenant_id = $2",
         )
         .bind(contact_id)
