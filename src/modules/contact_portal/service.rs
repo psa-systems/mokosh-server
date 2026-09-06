@@ -1921,6 +1921,120 @@ impl ContactAuthService {
         Ok(())
     }
 
+    /// PMS-1085: the family the caller's access token belongs to, from
+    /// its `sid`. `None` when the row is gone (a revoked-and-purged
+    /// session), which the callers treat as "matches nothing".
+    async fn family_of_session(
+        &self,
+        tenant_id: Uuid,
+        session_id: Uuid,
+    ) -> AppResult<Option<Uuid>> {
+        let family: Option<Uuid> = sqlx::query_scalar(
+            "SELECT family_id FROM contact_sessions WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(session_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        Ok(family)
+    }
+
+    /// PMS-1085: the contact's live sessions, one per rotation family
+    /// (the newest unrevoked, unexpired row of each), newest login
+    /// first. `current` marks the family the caller's `sid` is in.
+    ///
+    /// SAFETY (PMS-285): both filters are the caller's own tenant and
+    /// contact ids from the verified JWT; the migrator pool is what
+    /// every `contact_sessions` read here uses.
+    #[tracing::instrument(skip_all)]
+    pub async fn list_sessions(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_sid: Uuid,
+    ) -> AppResult<Vec<ContactSessionResponse>> {
+        let current_family = self.family_of_session(tenant_id, current_sid).await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<String>,
+            Option<ipnetwork::IpNetwork>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT ON (s.family_id)
+                   s.family_id,
+                   (SELECT MIN(f.created_at) FROM contact_sessions f
+                     WHERE f.family_id = s.family_id) AS issued_at,
+                   s.created_at AS last_seen_at,
+                   s.expires_at, s.user_agent, s.ip_address
+            FROM contact_sessions s
+            WHERE s.contact_id = $1
+              AND s.tenant_id = $2
+              AND s.revoked_at IS NULL
+              AND s.expires_at > NOW()
+            ORDER BY s.family_id, s.created_at DESC
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_all(self.db.migrator_pool())
+        .await?;
+        let mut sessions: Vec<ContactSessionResponse> = rows
+            .into_iter()
+            .map(
+                |(family_id, issued_at, last_seen_at, expires_at, user_agent, ip)| {
+                    ContactSessionResponse {
+                        id: family_id,
+                        issued_at,
+                        last_seen_at,
+                        expires_at,
+                        user_agent,
+                        ip_address: ip.map(|ip| ip.ip().to_string()),
+                        current: current_family == Some(family_id),
+                    }
+                },
+            )
+            .collect();
+        sessions.sort_by(|a, b| b.issued_at.cmp(&a.issued_at));
+        Ok(sessions)
+    }
+
+    /// PMS-1085: end one of the caller's OTHER sessions by family id.
+    /// The caller's own family is refused with a 400 pointing at
+    /// `/auth/logout`, which also clears the SPA's in-memory token; a
+    /// family that is not the caller's (unknown, or another contact's)
+    /// is a silent 204, the enumeration-resistant shape logout has.
+    #[tracing::instrument(skip_all)]
+    pub async fn revoke_session(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_sid: Uuid,
+        family_id: Uuid,
+    ) -> AppResult<()> {
+        if self.family_of_session(tenant_id, current_sid).await? == Some(family_id) {
+            return Err(AppError::BadRequest(
+                "Use /auth/logout to sign out of the current session".to_string(),
+            ));
+        }
+        let owns: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM contact_sessions \
+             WHERE family_id = $1 AND contact_id = $2 AND tenant_id = $3)",
+        )
+        .bind(family_id)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        if !owns {
+            return Ok(());
+        }
+        self.revoke_session_family(family_id).await
+    }
+
     /// PMS-1063: start MFA enrolment. Stages a fresh TOTP secret on the
     /// contact row, sealed at rest, WITHOUT flipping
     /// `portal_mfa_enabled`: only `enable_mfa`, after a live code has

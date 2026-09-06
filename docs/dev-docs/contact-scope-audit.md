@@ -56,6 +56,8 @@ endpoint, extend one of these files.
 | GET  /auth/me | `me` | SCOPED (own profile) |
 | PUT  /auth/me | `update_me` | SCOPED (own profile, DB cap re-check) |
 | PUT  /auth/me/password | `change_password` | SCOPED (own row, password re-verified, re-auth budget; PMS-1086) |
+| GET  /auth/me/sessions | `list_sessions` | SCOPED (own `contact_sessions` families; PMS-1085) |
+| DELETE /auth/me/sessions/{id} | `revoke_session` | SCOPED (own family only; foreign id is a silent 204; PMS-1085) |
 | POST /auth/me/mfa/setup | `mfa_setup` | SCOPED (own row, password re-verified; PMS-1063) |
 | POST /auth/me/mfa/enable | `mfa_enable` | SCOPED (own row, password re-verified; PMS-1063) |
 | POST /auth/me/mfa/disable | `mfa_disable` | SCOPED (own row, password + code re-verified; PMS-1063) |
