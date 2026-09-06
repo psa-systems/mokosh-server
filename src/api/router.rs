@@ -793,7 +793,8 @@ pub fn create_api_router(
     let contact_service =
         crate::modules::contact_portal::ContactAuthService::new(db.clone(), jwt_secret.clone())
             .with_notifications(notifications_service.clone())
-            .with_spa_base_url(spa_base_url.clone());
+            .with_spa_base_url(spa_base_url.clone())
+            .with_encryption_key(encryption_key);
     // MAPPS-618 phase B: share the ContactAuthService with the
     // branding router so it can `load_capabilities` for the
     // `settings:manage_company_branding` gate without a duplicate
