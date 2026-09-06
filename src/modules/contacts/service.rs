@@ -4638,8 +4638,8 @@ mod mirror_writers {
     /// today: PMS-1107.
     #[test]
     fn every_contacts_insert_writes_the_child_rows_its_mirrors_derive_from() {
-        // Assembled rather than written out, so this test's own source is not a
-        // hit when the scan reaches this file.
+        // Assembled so the needle is not its own hit. Prose in this file still
+        // names the statement, so a backticked mention is skipped below.
         let needle = format!("INSERT INTO {}", "contacts");
         // The company link and the phone list have one writer each. Either name
         // in the window counts: `write_contact_companies` is the CRUD path's
@@ -4669,6 +4669,12 @@ mod mirror_writers {
                 }
                 let text = std::fs::read_to_string(&path).expect("read source file");
                 for (offset, _) in text.match_indices(&needle) {
+                    // A backticked mention is prose (this module's own doc
+                    // comment and assertion message), never a statement, and
+                    // counting one would soften the tripwire below.
+                    if text[..offset].ends_with('`') {
+                        continue;
+                    }
                     seen += 1;
                     let rest = &text[offset..];
                     let window = &rest[..rest.len().min(WINDOW)];
