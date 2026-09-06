@@ -144,6 +144,11 @@ pub const PROJECTS_READ: &str = "projects:read";
 pub const KB_READ: &str = "kb:read";
 /// Read notifications addressed to the contact.
 pub const NOTIFICATIONS_READ: &str = "notifications:read";
+/// PMS-1084: list the approvals the MSP addressed to the contact
+/// (`ticket_approvals.approver_contact_id`) and approve or reject
+/// each once. The other side of [`TICKETS_REQUEST_APPROVAL`], which
+/// is the contact asking; this is the contact answering.
+pub const APPROVALS_DECIDE: &str = "approvals:decide";
 /// Edit own profile + password + MFA + own sessions.
 pub const SETTINGS_MANAGE_OWN: &str = "settings:manage_own";
 /// MAPPS-618 (mokosh-branding prompt 002): edit the caller's own
@@ -195,6 +200,7 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     PROJECTS_READ,
     KB_READ,
     NOTIFICATIONS_READ,
+    APPROVALS_DECIDE,
     SETTINGS_MANAGE_OWN,
     SETTINGS_MANAGE_COMPANY_BRANDING,
     CONTACTS_INVITE_SUB_USER,
@@ -239,6 +245,7 @@ mod tests {
             PROJECTS_READ,
             KB_READ,
             NOTIFICATIONS_READ,
+            APPROVALS_DECIDE,
             SETTINGS_MANAGE_OWN,
             CONTACTS_INVITE_SUB_USER,
             CONTACTS_MANAGE_SUB_USER,
@@ -330,6 +337,9 @@ mod tests {
         // shape as 150. Read-Only + Billing Contact are unchanged (both
         // caps mutate state and are irrelevant to the billing surface).
         let seed_support_151_add = &["tickets:edit_own", "tickets:request_approval"];
+        // Migration 197 (PMS-1084) APPENDs the decide cap to the
+        // Support Contact row, the other side of `tickets:request_approval`.
+        let seed_support_197_add = &["approvals:decide"];
         let all_seeds: &[&[&str]] = &[
             seed_billing_142,
             seed_support_142,
@@ -337,6 +347,7 @@ mod tests {
             seed_billing_150_add,
             seed_support_150_add,
             seed_support_151_add,
+            seed_support_197_add,
         ];
         for seed in all_seeds {
             for cap in *seed {
