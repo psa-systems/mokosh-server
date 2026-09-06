@@ -1788,11 +1788,14 @@ async fn revoke_portal_access_wipes_assignments_and_sessions(pool: PgPool) {
 
     // Seed a live contact_sessions row so we can assert it gets
     // revoked. Uses a bogus hash - we only care about `revoked_at`.
+    // `family_id` is its own id, the head-of-chain shape a login
+    // writes (PMS-1062); the column is NOT NULL since migration 194.
     sqlx::query(
         "INSERT INTO contact_sessions \
-         (tenant_id, contact_id, refresh_token_hash, expires_at) \
-         VALUES ($1, $2, 'bogus', NOW() + INTERVAL '30 days')",
+         (id, tenant_id, contact_id, refresh_token_hash, expires_at, family_id) \
+         VALUES ($1, $2, $3, 'bogus', NOW() + INTERVAL '30 days', $1)",
     )
+    .bind(uuid::Uuid::new_v4())
     .bind(common::DEFAULT_TENANT_ID)
     .bind(contact_id)
     .execute(&pool)
