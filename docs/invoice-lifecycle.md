@@ -36,6 +36,12 @@ Because the status transition to `void` also flows through `update_invoice`, thi
 
 A credit note says the customer did not owe this and reduces revenue. A write-off says the customer owes it and will not pay: a bad-debt expense. The books treat them differently, so `balance_due` is left exactly as it was (the debt was not forgiven), the online payment path refuses the invoice the way it refuses `void`, and `recompute_invoice_balance` keeps the status standing through any later payment or credit (its status CASE reads `written_off_at` first). The statement (PMS-954) lists a written-off invoice under its own `write_offs` line kind, dated by the write-off and carrying the frozen amount, and takes `total_written_off` out of the closing balance: the customer is no longer asked to settle it, and a period that closed before the write-off is not rewritten by it.
 
+## Overdue and reminders (PMS-1037)
+
+Overdue is derived on every read, never stored: `is_overdue` and `days_overdue` on `InvoiceResponse` are `status IN ('sent', 'partially_paid') AND balance_due > 0 AND due_date < today`, computed in the tenant's day (`read_tenant_zone`, PMS-1030), and `GET /invoices?overdue=true` filters on the same predicate. A stored flag would be a second home for a fact `due_date` and `balance_due` already hold, and the only one that could be stale.
+
+Reminders are a worker. `InvoiceReminderWorker` runs hourly; for each tenant with `billing_reminders/enabled` and a `schedule` (day offsets such as `[3, 7, 14, 30]`), at the tenant's local `send_hour` (default 8), it mails every overdue invoice whose `days_overdue` equals a step, to the address the invoice was emailed to (PMS-992) else the resolved billing contact (PMS-993), with the stored document attached (PMS-959) and the pay link when a gateway is connected. `invoice_reminders` records each send per invoice per step and is the idempotency guard, so a run that fires twice in the hour sends once; a refused send releases the claim so the next run tries again. Late fees are deliberately not here: a fee is a new line on a new document, and its own ticket.
+
 ## Sending requires a recipient
 
 PMS-993. An invoice cannot reach `sent` without a `billing_contact_id`, because an issued invoice with no recipient is a document nobody was ever asked to pay. The recipient is the company's billing contact, `companies.default_billing_contact_id`: per-company and single-valued, so reassigning it replaces the previous holder.

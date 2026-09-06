@@ -119,6 +119,33 @@ pub fn validate_setting_value(
                 "expected a 3-letter uppercase ISO 4217 currency code",
             )),
         },
+        // PMS-1037: overdue invoice reminders. `schedule` is the list of days
+        // past due a reminder goes out on, ascending and distinct so each
+        // step is one send; `send_hour` is the tenant's local hour.
+        ("billing_reminders", "enabled") => match value {
+            Value::Bool(_) => Ok(()),
+            _ => Err(bad("value", "expected a boolean")),
+        },
+        ("billing_reminders", "schedule") => match value.as_array() {
+            Some(days)
+                if !days.is_empty()
+                    && days.len() <= 10
+                    && days
+                        .iter()
+                        .all(|d| matches!(d.as_u64(), Some(n) if (1..=365).contains(&n)))
+                    && days.windows(2).all(|w| w[0].as_u64() < w[1].as_u64()) =>
+            {
+                Ok(())
+            }
+            _ => Err(bad(
+                "value",
+                "expected an ascending list of 1 to 10 day offsets, each in 1..=365",
+            )),
+        },
+        ("billing_reminders", "send_hour") => match value.as_u64() {
+            Some(n) if n <= 23 => Ok(()),
+            _ => Err(bad("value", "expected an hour in 0..=23")),
+        },
         ("ticketing", "auto_close_resolved_after_days") => match value.as_u64() {
             Some(n) if (1..=90).contains(&n) => Ok(()),
             _ => Err(bad("value", "expected an integer in 1..=90")),
