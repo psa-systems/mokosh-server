@@ -93,6 +93,18 @@ pub struct ContactLoginRequest {
     pub recovery_code: Option<String>,
 }
 
+/// PMS-1086: `PUT /api/v1/contact/auth/me/password` body. The current
+/// password is re-verified so a stolen access token cannot rotate the
+/// credential out from under the customer; the new one goes through
+/// the shared password policy.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactChangePasswordRequest {
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+    #[validate(length(min = 1, message = "new_password is required"))]
+    pub new_password: String,
+}
+
 /// PMS-1063: `POST /api/v1/contact/auth/me/mfa/setup` body. The
 /// current password is required so a stolen access token cannot
 /// enrol an attacker's authenticator on the customer's account.
