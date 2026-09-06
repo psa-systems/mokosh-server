@@ -14,6 +14,8 @@ use std::sync::OnceLock;
 use axum::http::HeaderMap;
 use ipnetwork::IpNetwork;
 
+use crate::config::{self, registry as keys};
+
 /// Trusted-proxy CIDRs used when `TRUSTED_PROXY_CIDR` is unset: loopback plus
 /// the RFC1918 / RFC4193 (ULA) / link-local private ranges. Mokosh sits behind
 /// Traefik on a private Docker/LAN network, so the proxy's peer address always
@@ -39,8 +41,10 @@ static TRUSTED_PROXIES: OnceLock<Vec<IpNetwork>> = OnceLock::new();
 /// take the server down; if every configured entry is invalid the list is
 /// empty and the forwarded header is trusted from no one (peer address wins).
 pub fn trusted_proxies() -> &'static [IpNetwork] {
-    TRUSTED_PROXIES.get_or_init(|| match std::env::var("TRUSTED_PROXY_CIDR") {
-        Ok(raw) if !raw.trim().is_empty() => raw
+    // PMS-982: the value comes from the configuration provider; the `OnceLock`
+    // stays, so when it is read is unchanged.
+    TRUSTED_PROXIES.get_or_init(|| match config::get(&keys::TRUSTED_PROXY_CIDR) {
+        Some(raw) if !raw.trim().is_empty() => raw
             .split(',')
             .filter_map(|entry| {
                 let entry = entry.trim();

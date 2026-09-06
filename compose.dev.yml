@@ -296,6 +296,10 @@ services:
       # reproduces the code's own fallback in SecretsConfig::from_env, so an
       # unset variable behaves the same here as it does in production.
       SECRET_BACKEND: ${SECRET_BACKEND:-database}
+      # PMS-982: `environment`, the only configuration provider today. The `:-`
+      # default reproduces the code's own fallback in ConfigSelection::from_env,
+      # so an unset variable behaves the same here as it does in production.
+      CONFIG_BACKEND: ${CONFIG_BACKEND:-environment}
       INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
       INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:-}
@@ -396,6 +400,18 @@ services:
       # PMS-923: KB article images. Default reproduces the code's own 5 MiB.
       KB_ATTACHMENT_MAX_BYTES: ${KB_ATTACHMENT_MAX_BYTES:-}
       TENANT_LOGO_MAX_BYTES: ${TENANT_LOGO_MAX_BYTES:-}
+      # MAPPS-618/622: the other five branding caps, declared in
+      # src/config/registry.rs by PMS-982. Like their siblings above the `:-`
+      # default is empty, which IS the code's own fallback: max_bytes discards
+      # an unparseable or non-positive value and takes
+      # BrandAssetKind::default_max_bytes (1 MiB logo, 512 KiB favicon, 2 MiB
+      # background). Repeating those numbers here would be a second home for
+      # them, and .env.example carries them as the operator-facing default.
+      BRANDING_TENANT_FAVICON_MAX_BYTES: ${BRANDING_TENANT_FAVICON_MAX_BYTES:-}
+      BRANDING_TENANT_BACKGROUND_MAX_BYTES: ${BRANDING_TENANT_BACKGROUND_MAX_BYTES:-}
+      BRANDING_COMPANY_LOGO_MAX_BYTES: ${BRANDING_COMPANY_LOGO_MAX_BYTES:-}
+      BRANDING_COMPANY_FAVICON_MAX_BYTES: ${BRANDING_COMPANY_FAVICON_MAX_BYTES:-}
+      BRANDING_COMPANY_BACKGROUND_MAX_BYTES: ${BRANDING_COMPANY_BACKGROUND_MAX_BYTES:-}
       # PMS-958: storage backend. Empty resolves to local, so the dev stack
       # keeps writing to the `attachments` volume unless an operator opts in
       # to the `s3` profile's MinIO (`just dev-s3`) and sets these.

@@ -27,6 +27,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
+use crate::config::{self, registry as keys, ConfigKey};
 use crate::utils::error::{AppError, AppResult};
 
 const ALLOWED_MIME: &[(&str, &str)] = &[
@@ -86,14 +87,23 @@ impl BrandAssetKind {
         }
     }
 
-    fn env_var(self, scope: AssetScope) -> &'static str {
+    /// The cap's configuration key. A closed match over the six
+    /// `(scope, kind)` pairs, so all six are declarable in the registry
+    /// (PMS-982) even though the read site names none of them: this is exactly
+    /// the computed-key read that a literal-only scan of `.env.example`
+    /// parity could not see, and five of the six were reachable from nowhere.
+    fn config_key(self, scope: AssetScope) -> &'static ConfigKey {
         match (scope, self) {
-            (AssetScope::Tenant(_), Self::Logo) => "TENANT_LOGO_MAX_BYTES",
-            (AssetScope::Tenant(_), Self::Favicon) => "BRANDING_TENANT_FAVICON_MAX_BYTES",
-            (AssetScope::Tenant(_), Self::Background) => "BRANDING_TENANT_BACKGROUND_MAX_BYTES",
-            (AssetScope::Company(_), Self::Logo) => "BRANDING_COMPANY_LOGO_MAX_BYTES",
-            (AssetScope::Company(_), Self::Favicon) => "BRANDING_COMPANY_FAVICON_MAX_BYTES",
-            (AssetScope::Company(_), Self::Background) => "BRANDING_COMPANY_BACKGROUND_MAX_BYTES",
+            (AssetScope::Tenant(_), Self::Logo) => &keys::TENANT_LOGO_MAX_BYTES,
+            (AssetScope::Tenant(_), Self::Favicon) => &keys::BRANDING_TENANT_FAVICON_MAX_BYTES,
+            (AssetScope::Tenant(_), Self::Background) => {
+                &keys::BRANDING_TENANT_BACKGROUND_MAX_BYTES
+            }
+            (AssetScope::Company(_), Self::Logo) => &keys::BRANDING_COMPANY_LOGO_MAX_BYTES,
+            (AssetScope::Company(_), Self::Favicon) => &keys::BRANDING_COMPANY_FAVICON_MAX_BYTES,
+            (AssetScope::Company(_), Self::Background) => {
+                &keys::BRANDING_COMPANY_BACKGROUND_MAX_BYTES
+            }
         }
     }
 
@@ -177,8 +187,7 @@ pub type CompanyAssetStore = BrandingAssetStore;
 
 impl BrandingAssetStore {
     pub fn from_env() -> Self {
-        let root = std::env::var("ATTACHMENT_DIR")
-            .ok()
+        let root = config::get(&keys::ATTACHMENT_DIR)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./attachments"));
@@ -186,8 +195,7 @@ impl BrandingAssetStore {
     }
 
     pub fn max_bytes(&self, kind: BrandAssetKind, scope: AssetScope) -> u64 {
-        std::env::var(kind.env_var(scope))
-            .ok()
+        config::get(kind.config_key(scope))
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or_else(|| kind.default_max_bytes())
