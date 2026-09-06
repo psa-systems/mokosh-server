@@ -209,7 +209,7 @@ pub const ALL_CAPABILITIES: &[&str] = &[
 
 /// PMS-1118: the capability set each built-in portal role holds, the
 /// union every seed migration has produced (171 inserted, 179, 180 and
-/// 197 appended, 198 backfilled). `TenantService::seed_builtin_portal_roles`
+/// 197 appended, 199 backfilled). `TenantService::seed_builtin_portal_roles`
 /// binds these for a new tenant, so a tenant created today holds what
 /// one that predates the migrations holds; `builtin_roles_match_the_seed_migrations`
 /// fails the build when a migration appends a capability without adding
@@ -383,7 +383,7 @@ mod tests {
         let support_180 = &["tickets:edit_own", "tickets:request_approval"];
         // Migration 197 (PMS-1084): appends.
         let support_197 = &["approvals:decide"];
-        // Migration 198 (PMS-1118) re-appends the unions above and adds
+        // Migration 199 (PMS-1118) re-appends the unions above and adds
         // nothing, so it has no entry of its own.
 
         fn union(parts: &[&[&'static str]]) -> BTreeSet<&'static str> {

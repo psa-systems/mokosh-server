@@ -2336,7 +2336,7 @@ async fn create_tenant_seeds_three_builtin_portal_roles(pool: PgPool) {
 
     // PMS-1118: a tenant created today holds exactly what the default
     // tenant holds after every seed migration (171 inserted it, 179, 180,
-    // 197 appended, 198 backfilled), and exactly what the code seed's
+    // 197 appended, 199 backfilled), and exactly what the code seed's
     // constants say. Compared as sets, per role, in both directions.
     for (name, _, _) in &rows {
         let fresh: std::collections::BTreeSet<String> = rows
