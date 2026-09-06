@@ -12,7 +12,7 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use validator::Validate;
 
@@ -29,6 +29,12 @@ const REFRESH_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
 #[derive(Clone)]
 pub struct ContactRouterState {
     pub service: Arc<ContactAuthService>,
+    /// PMS-1086 (the PMS-881 shape): failure-counted budget for the
+    /// password re-auth on `PUT /auth/me/password` and
+    /// `POST /auth/me/mfa/disable`, one instance for both so grinding
+    /// the password through one does not reset the other. Only a
+    /// rejected re-auth spends it.
+    pub reauth_limiter: Arc<crate::modules::auth::rate_limit::ReauthRateLimiter>,
 }
 
 /// Build the `/api/v1/contact/*` sub-router. Layered with
@@ -42,6 +48,7 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
     };
     let state = ContactRouterState {
         service: service_arc,
+        reauth_limiter: crate::modules::auth::rate_limit::ReauthRateLimiter::new(10, 5),
     };
     Router::new()
         .route("/auth/login", post(login))
@@ -58,6 +65,10 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         // MAPPS-636 removed the picker for. A caller who hits this
         // URL now 404s.
         .route("/auth/me", get(me).put(update_me))
+        // PMS-1086: change the password while signed in, behind the
+        // session AND the current password; revokes every other
+        // session family.
+        .route("/auth/me/password", put(change_password))
         // PMS-1063: MFA enrolment and removal, behind the session AND
         // the current password (setup, enable, disable all re-verify
         // it), the shape the retired portal had at /portal/auth/me/mfa/*.
@@ -336,10 +347,14 @@ async fn mfa_enable(
 async fn mfa_disable(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ContactMfaDisableRequest>,
 ) -> AppResult<StatusCode> {
     request.validate()?;
-    state
+    let ip = reauth_client_ip(addr, &headers);
+    check_reauth_budget(&state, ip, session.id)?;
+    let result = state
         .service
         .disable_mfa(
             session.tenant_id,
@@ -347,8 +362,77 @@ async fn mfa_disable(
             &request.current_password,
             &request.code,
         )
-        .await?;
+        .await;
+    spend_reauth_budget_on_refusal(&state, ip, session.id, &result);
+    result?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-1086: change the password while signed in. The current-password
+/// re-auth shares the failure budget with `mfa_disable` (PMS-881), so a
+/// stolen access token cannot grind the password at full rate through
+/// either route; a correct password never spends any.
+async fn change_password(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<ContactChangePasswordRequest>,
+) -> AppResult<StatusCode> {
+    request.validate()?;
+    let ip = reauth_client_ip(addr, &headers);
+    check_reauth_budget(&state, ip, session.id)?;
+    let result = state
+        .service
+        .change_password(
+            session.tenant_id,
+            session.id,
+            session.sid,
+            &request.current_password,
+            &request.new_password,
+        )
+        .await;
+    spend_reauth_budget_on_refusal(&state, ip, session.id, &result);
+    result?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Source IP for the re-auth buckets: the forwarded chain behind
+/// Traefik, else the peer (PMS-587), the way the staff route keys it.
+fn reauth_client_ip(addr: SocketAddr, headers: &HeaderMap) -> std::net::IpAddr {
+    crate::utils::client_ip::extract_client_ip(
+        addr.ip(),
+        headers,
+        crate::utils::client_ip::trusted_proxies(),
+    )
+}
+
+/// 429 with the wait when either re-auth bucket is spent, BEFORE the
+/// credential is compared.
+fn check_reauth_budget(
+    state: &ContactRouterState,
+    ip: std::net::IpAddr,
+    contact_id: uuid::Uuid,
+) -> AppResult<()> {
+    match state.reauth_limiter.check(ip, contact_id) {
+        Ok(()) => Ok(()),
+        Err(retry_after) => Err(AppError::RateLimited {
+            retry_after_seconds: Some(retry_after),
+        }),
+    }
+}
+
+/// Only a rejected re-auth (the service's 401) spends budget: a weak
+/// new password or a database error is not a credential guess.
+fn spend_reauth_budget_on_refusal<T>(
+    state: &ContactRouterState,
+    ip: std::net::IpAddr,
+    contact_id: uuid::Uuid,
+    result: &AppResult<T>,
+) {
+    if matches!(result, Err(AppError::Unauthorized)) {
+        state.reauth_limiter.record_failure(ip, contact_id);
+    }
 }
 
 /// PMS-935: contact profile self-edit. Gated on
