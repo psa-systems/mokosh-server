@@ -82,6 +82,10 @@ pub fn billing_routes(service: BillingService) -> Router {
         // Support Contact sees the same coherent empty state a
         // Billing Contact would.
         .route(
+            "/invoices/{invoice_id}/payments",
+            get(list_invoice_payments),
+        )
+        .route(
             "/invoices/{invoice_id}/payment-readiness",
             axum::routing::get(get_invoice_payment_readiness),
         )
@@ -1050,6 +1054,40 @@ async fn delete_product(
     Ok(())
 }
 
+/// PMS-1088: the payments and refunds behind an invoice, dual-plane.
+/// The staff branch carries the billing module gate and the finance
+/// role inline (`assert_staff_billing_finance`, listed in
+/// `INLINE_STAFF_GATE`); the contact branch requires `invoices:read`
+/// and folds the session's Company into the invoice lookup, so a
+/// foreign invoice is the unknown-id 404 and its payments never
+/// surface. Both arms answer the customer-safe subset: no agent
+/// notes, no gateway ids, no provider payloads.
+async fn list_invoice_payments(
+    State(state): State<BillingRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Json<InvoiceLedgerResponse>> {
+    let tenant = caller.tenant();
+    let company_scope = match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth, &settings).await?;
+            None
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::INVOICES_READ, &db).await?;
+            Some(session.company_id)
+        }
+    };
+    Ok(Json(
+        state
+            .service
+            .invoice_ledger(tenant, invoice_id, company_scope)
+            .await?,
+    ))
+}
+
 #[cfg(test)]
 mod finance_gate {
     /// Every handler in this file that takes the module gate takes the role
@@ -1110,8 +1148,9 @@ mod finance_gate {
         );
     }
 
-    /// The five dual-plane handlers whose staff branch carries the gate in the
-    /// body rather than in the argument list (PMS-1041). They take
+    /// The dual-plane handlers whose staff branch carries the gate in the
+    /// body rather than in the argument list (PMS-1041; PMS-1088 added the
+    /// sixth). They take
     /// `RequireCallerContext` because they serve the contact plane too, and
     /// stacking `RequireBilling` on top would resolve the caller twice.
     ///
@@ -1124,6 +1163,8 @@ mod finance_gate {
         "get_invoice_pdf",
         "pay_invoice",
         "get_invoice_payment_readiness",
+        // PMS-1088: the invoice ledger, the sixth dual-plane read.
+        "list_invoice_payments",
     ];
 
     /// And every handler carries the MODULE gate, one way or the other

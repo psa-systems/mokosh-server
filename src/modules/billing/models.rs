@@ -1149,3 +1149,45 @@ mod overdue_tests {
         }
     }
 }
+
+/// PMS-1088: one payment on an invoice as a customer may see it. The
+/// safe subset of `payments`: the internal `notes` an agent leaves
+/// ("bounced, retry Friday"), the `gateway_transaction_id` and the raw
+/// `gateway_response` stay with the staff. `reference_number` is kept
+/// because on a check or a wire it is the customer's own reference.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvoiceLedgerPayment {
+    pub id: Uuid,
+    pub payment_date: NaiveDate,
+    pub amount: Decimal,
+    pub payment_method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_number: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// PMS-1088: one refund against a payment on the invoice. The
+/// provider's own reference and its raw response stay with the staff.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvoiceLedgerRefund {
+    pub id: Uuid,
+    pub payment_id: Uuid,
+    pub amount: Decimal,
+    pub created_at: DateTime<Utc>,
+}
+
+/// PMS-1088: `GET /invoices/{id}/payments`, the payments and refunds
+/// behind an invoice's `amount_paid` and `balance_due`, newest first,
+/// with the sums so a page can print them without adding. A wrapping
+/// object rather than a bare array so pagination can arrive later
+/// without a shape change; per-invoice payment counts are bounded by
+/// human behaviour, so the whole ledger is one response today.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvoiceLedgerResponse {
+    pub invoice_id: Uuid,
+    pub currency: String,
+    pub payments: Vec<InvoiceLedgerPayment>,
+    pub refunds: Vec<InvoiceLedgerRefund>,
+    pub total_paid: Decimal,
+    pub total_refunded: Decimal,
+}
