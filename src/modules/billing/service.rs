@@ -4001,6 +4001,70 @@ impl BillingService {
     /// PMS-36: read a single invoice with `lines` populated. 404 when
     /// the id is outside the tenant.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// PMS-1088: the payments and refunds behind an invoice's balance,
+    /// newest first. `company_scope` is the contact plane's Company,
+    /// folded into the invoice lookup so a foreign invoice is the
+    /// unknown-id 404 and its payments never surface; staff pass
+    /// `None`. The rows are the customer-safe subset (see
+    /// [`InvoiceLedgerPayment`]); the staff `/payments` list keeps the
+    /// notes and gateway columns.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, invoice_id = %invoice_id))]
+    pub async fn invoice_ledger(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        company_scope: Option<Uuid>,
+    ) -> AppResult<InvoiceLedgerResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let currency: Option<String> = sqlx::query_scalar(
+            "SELECT COALESCE(currency, 'USD') FROM invoices \
+             WHERE tenant_id = $1 AND id = $2 \
+               AND ($3::uuid IS NULL OR company_id = $3)",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .bind(company_scope)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let currency = currency.ok_or_else(|| AppError::NotFound("Invoice".to_string()))?;
+        let payments: Vec<InvoiceLedgerPayment> = sqlx::query_as::<_, LedgerPaymentRow>(
+            "SELECT id, payment_date, amount, payment_method, reference_number, created_at \
+             FROM payments \
+             WHERE tenant_id = $1 AND invoice_id = $2 \
+             ORDER BY payment_date DESC, created_at DESC",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let refunds: Vec<InvoiceLedgerRefund> = sqlx::query_as::<_, LedgerRefundRow>(
+            "SELECT id, payment_id, amount, created_at \
+             FROM payment_refunds \
+             WHERE tenant_id = $1 AND invoice_id = $2 \
+             ORDER BY created_at DESC",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let total_paid = payments.iter().map(|p| p.amount).sum();
+        let total_refunded = refunds.iter().map(|r| r.amount).sum();
+        Ok(InvoiceLedgerResponse {
+            invoice_id,
+            currency,
+            payments,
+            refunds,
+            total_paid,
+            total_refunded,
+        })
+    }
+
     pub async fn get_invoice(
         &self,
         tenant_id: TenantId,
@@ -6315,6 +6379,50 @@ mod gateway_resolution {
             }
             Err(other) => panic!("expected a Configuration error, got {other:?}"),
             Ok(_) => panic!("two serveable gateways must not resolve to one"),
+        }
+    }
+}
+
+/// PMS-1088: the columns `invoice_ledger` reads off `payments`.
+#[derive(sqlx::FromRow)]
+struct LedgerPaymentRow {
+    id: Uuid,
+    payment_date: chrono::NaiveDate,
+    amount: rust_decimal::Decimal,
+    payment_method: String,
+    reference_number: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<LedgerPaymentRow> for InvoiceLedgerPayment {
+    fn from(r: LedgerPaymentRow) -> Self {
+        Self {
+            id: r.id,
+            payment_date: r.payment_date,
+            amount: r.amount,
+            payment_method: r.payment_method,
+            reference_number: r.reference_number,
+            created_at: r.created_at,
+        }
+    }
+}
+
+/// PMS-1088: the columns `invoice_ledger` reads off `payment_refunds`.
+#[derive(sqlx::FromRow)]
+struct LedgerRefundRow {
+    id: Uuid,
+    payment_id: Uuid,
+    amount: rust_decimal::Decimal,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<LedgerRefundRow> for InvoiceLedgerRefund {
+    fn from(r: LedgerRefundRow) -> Self {
+        Self {
+            id: r.id,
+            payment_id: r.payment_id,
+            amount: r.amount,
+            created_at: r.created_at,
         }
     }
 }
