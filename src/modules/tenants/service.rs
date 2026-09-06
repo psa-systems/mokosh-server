@@ -1689,33 +1689,29 @@ impl TenantService {
     /// plain `UNIQUE (tenant_id, name)` migration 139 carried to this
     /// partial-index shape so a Company-scoped role can share a name
     /// with a tenant-wide one; the ON CONFLICT clause now targets the
-    /// partial index explicitly. Mirrors the capability sets in
-    /// migration 142 exactly; the `all_capabilities_match_seed_migration`
-    /// test in `contact_portal::capabilities` guards drift.
+    /// partial index explicitly. PMS-1118: the capability sets are
+    /// `contact_portal::capabilities::BUILTIN_ROLES`, bound rather than
+    /// written as SQL literals, so a new tenant holds what the seed
+    /// migrations gave an old one; `builtin_roles_match_the_seed_migrations`
+    /// pins the constants against the migrations.
     ///
     /// SAFETY (PMS-285): runs under the new tenant's GUC tx so the
     /// `portal_roles` RLS WITH CHECK policy sees `app.current_tenant`.
     pub async fn seed_builtin_portal_roles(&self, tenant_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
-            r#"
-            INSERT INTO portal_roles (tenant_id, name, capabilities, is_builtin)
-            VALUES
-                ($1, 'Billing Contact',
-                 ARRAY['invoices:read', 'invoices:pay', 'quotes:read', 'quotes:accept',
-                       'notifications:read', 'settings:manage_own'], TRUE),
-                ($1, 'Support Contact',
-                 ARRAY['tickets:read', 'tickets:write', 'tickets:comment', 'kb:read',
-                       'notifications:read', 'settings:manage_own', 'approvals:decide'], TRUE),
-                ($1, 'Read-Only',
-                 ARRAY['tickets:read', 'invoices:read', 'quotes:read', 'contracts:read',
-                       'assets:read', 'projects:read', 'kb:read', 'notifications:read'], TRUE)
-            ON CONFLICT (tenant_id, LOWER(name)) WHERE company_id IS NULL DO NOTHING
-            "#,
-        )
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await?;
+        for (name, capabilities) in crate::modules::contact_portal::capabilities::BUILTIN_ROLES {
+            let capabilities: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
+            sqlx::query(
+                "INSERT INTO portal_roles (tenant_id, name, capabilities, is_builtin) \
+                 VALUES ($1, $2, $3, TRUE) \
+                 ON CONFLICT (tenant_id, LOWER(name)) WHERE company_id IS NULL DO NOTHING",
+            )
+            .bind(tenant_id)
+            .bind(name)
+            .bind(&capabilities)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
