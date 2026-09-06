@@ -115,6 +115,11 @@ pub struct InvoiceLineResponse {
     /// price is NOT read through this: `unit_price` below is what was charged,
     /// and it stays what was charged when the catalog changes.
     pub product_id: Option<Uuid>,
+    /// PMS-1029: whether this line counts toward the taxable subtotal. Stored
+    /// per line (a product line copies `products.is_taxable` at write time),
+    /// never read through to the product, so a catalog edit cannot re-tax an
+    /// issued document.
+    pub is_taxable: bool,
     pub description: String,
     pub quantity: Decimal,
     pub unit_price: Decimal,
@@ -150,6 +155,13 @@ pub struct InvoiceResponse {
     pub payment_term_name: Option<String>,
     pub subtotal: Decimal,
     pub tax_amount: Decimal,
+    /// PMS-1029: the rate `tax_amount` was derived from, frozen on the invoice
+    /// so the document prints it and a later edit to `tax_rates` does not
+    /// re-price an issued document. `None` means the amount was supplied by
+    /// the caller rather than derived, which is what every pre-PMS-1029 row is.
+    pub tax_rate_id: Option<Uuid>,
+    /// The percent, e.g. `13.0000`, frozen alongside `tax_rate_id`.
+    pub tax_rate: Option<Decimal>,
     pub discount_amount: Decimal,
     pub total: Decimal,
     pub amount_paid: Decimal,
@@ -170,6 +182,19 @@ pub struct InvoiceResponse {
     pub emailed_at: Option<DateTime<Utc>>,
     pub emailed_to: Option<String>,
     pub paid_at: Option<DateTime<Utc>>,
+    /// PMS-1037: derived on every read in the tenant's day, never stored.
+    /// `true` when the invoice is `sent` or `partially_paid`, has a balance,
+    /// and `due_date` is before today; `days_overdue` is then the count of
+    /// days past the due date, else 0.
+    pub is_overdue: bool,
+    pub days_overdue: i64,
+    /// PMS-1036: the write-off, when there was one. `write_off_amount` is
+    /// the balance at that moment, frozen; `balance_due` keeps moving if a
+    /// late payment lands afterwards.
+    pub written_off_at: Option<DateTime<Utc>>,
+    pub written_off_by_id: Option<Uuid>,
+    pub write_off_reason: Option<String>,
+    pub write_off_amount: Option<Decimal>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
@@ -192,6 +217,9 @@ pub struct InvoiceFilter {
     /// would leave `total` inflated and pagination misleading).
     #[serde(skip_deserializing, default)]
     pub exclude_draft: bool,
+    /// PMS-1037: `true` keeps only overdue invoices (collectible, with a
+    /// balance, past due in the tenant's day); `false` keeps the rest.
+    pub overdue: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
@@ -203,6 +231,10 @@ pub struct CreateInvoiceLineRequest {
     /// actually charged.
     #[serde(default)]
     pub product_id: Option<Uuid>,
+    /// PMS-1029: default taxable. Ignored when `product_id` is set, because
+    /// the product's own `is_taxable` is copied onto the line instead.
+    #[serde(default = "default_true")]
+    pub is_taxable: bool,
     #[validate(length(min = 1, max = 1000))]
     pub description: String,
     /// `quantity` and `unit_price` are intentionally signed (PMS-306): a
@@ -234,7 +266,10 @@ pub struct CreateInvoiceRequest {
     /// Optional FK into the tenant's `payment_terms` lookup (PMS-333). The
     /// service validates it belongs to the caller's tenant.
     pub payment_term_id: Option<Uuid>,
+    /// PMS-1029: given, it is stored as given and records no rate; absent,
+    /// the tax is derived from `tax_rate_id`, else the tenant's default rate.
     pub tax_amount: Option<Decimal>,
+    pub tax_rate_id: Option<Uuid>,
     pub discount_amount: Option<Decimal>,
     #[validate(length(max = 3))]
     pub currency: Option<String>,
@@ -283,6 +318,8 @@ pub struct CreateInvoiceFromTimeEntriesRequest {
     pub po_number: Option<String>,
     /// Restrict to these entries. `None` bills every eligible entry.
     pub time_entry_ids: Option<Vec<Uuid>>,
+    /// PMS-1029: absent, the tenant's default rate applies.
+    pub tax_rate_id: Option<Uuid>,
 }
 
 /// Header-only update. To replace line items, send `lines = Some(...)`.
@@ -297,7 +334,10 @@ pub struct UpdateInvoiceRequest {
     /// Optional FK into the tenant's `payment_terms` lookup (PMS-333),
     /// preserved on omit; an explicit value re-links and is tenant-validated.
     pub payment_term_id: Option<Uuid>,
+    /// PMS-1029: replacing the lines or naming a rate re-derives the tax; a
+    /// given `tax_amount` still wins; an update touching neither leaves it.
     pub tax_amount: Option<Decimal>,
+    pub tax_rate_id: Option<Uuid>,
     pub discount_amount: Option<Decimal>,
     pub notes: Option<String>,
     pub po_number: Option<String>,
@@ -611,6 +651,7 @@ mod tests {
 
     fn one_line() -> CreateInvoiceLineRequest {
         CreateInvoiceLineRequest {
+            is_taxable: true,
             line_type: InvoiceLineType::Service,
             product_id: None,
             description: "Work".into(),
@@ -624,6 +665,7 @@ mod tests {
 
     fn invoice(invoice_date: NaiveDate, due_date: NaiveDate) -> CreateInvoiceRequest {
         CreateInvoiceRequest {
+            tax_rate_id: None,
             company_id: Uuid::new_v4(),
             billing_contact_id: None,
             contract_id: None,
@@ -806,6 +848,44 @@ pub struct CreateCreditNoteLineRequest {
     pub sort_order: i32,
 }
 
+/// PMS-1037: the one rule for "overdue", for every read and for the reminder
+/// worker. `Some(days)` when the invoice is still being collected (`sent` or
+/// `partially_paid`), still has a balance, and its due date is before `today`;
+/// a paid, void, written-off or draft invoice is never overdue, and neither
+/// is one due today. Derived, not stored: `due_date` and `balance_due`
+/// already hold the fact.
+pub fn overdue_days(
+    status: InvoiceStatus,
+    balance_due: Decimal,
+    due_date: NaiveDate,
+    today: NaiveDate,
+) -> Option<i64> {
+    let collectible = matches!(status, InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid);
+    if collectible && balance_due > Decimal::ZERO && due_date < today {
+        Some((today - due_date).num_days())
+    } else {
+        None
+    }
+}
+
+impl InvoiceResponse {
+    /// Stamp `is_overdue` and `days_overdue` for a reader whose day is `today`.
+    pub fn mark_overdue(&mut self, today: NaiveDate) {
+        let days = overdue_days(self.status, self.balance_due, self.due_date, today);
+        self.is_overdue = days.is_some();
+        self.days_overdue = days.unwrap_or(0);
+    }
+}
+
+/// PMS-1036: write an invoice off. The customer owes it and will not pay;
+/// this is the bad-debt record, not a correction (that is a credit note).
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct WriteOffInvoiceRequest {
+    /// Required: the audit trail, and the first thing an auditor reads.
+    #[validate(length(min = 1, max = 2000))]
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateCreditNoteRequest {
     /// The invoice being corrected. Required: see the column comment in
@@ -900,6 +980,21 @@ pub struct StatementCreditLine {
     pub invoice_number: Option<String>,
 }
 
+/// PMS-1036: an invoice written off in the period. Its own line kind, the
+/// way credits have theirs, because the books treat the two differently: a
+/// credit says the customer did not owe it, a write-off says they did and
+/// will not pay. Dated by `written_off_at`, and the amount is the balance
+/// frozen at that moment, so a closed period is not rewritten by a late
+/// recovery.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatementWriteOffLine {
+    pub invoice_id: Uuid,
+    pub invoice_number: String,
+    pub write_off_date: NaiveDate,
+    pub amount: Decimal,
+    pub reason: String,
+}
+
 /// PMS-954: a client's account over a period.
 ///
 /// Derived at read time and stored nowhere. A stored statement row would be a
@@ -924,6 +1019,8 @@ pub struct StatementResponse {
     pub payments: Vec<StatementPaymentLine>,
     pub refunds: Vec<StatementRefundLine>,
     pub credit_notes: Vec<StatementCreditLine>,
+    /// PMS-1036: invoices written off in the period.
+    pub write_offs: Vec<StatementWriteOffLine>,
     /// Sum of `invoices` above.
     pub total_invoiced: Decimal,
     /// Sum of `payments` above.
@@ -932,9 +1029,13 @@ pub struct StatementResponse {
     pub total_refunded: Decimal,
     /// Sum of `credit_notes` above.
     pub total_credited: Decimal,
+    /// Sum of `write_offs` above (PMS-1036).
+    pub total_written_off: Decimal,
     /// `opening_balance + total_invoiced + total_refunded - total_paid -
-    /// total_credited`, and the tests assert exactly that rather than trusting
-    /// the sentence.
+    /// total_credited - total_written_off`, and the tests assert exactly that
+    /// rather than trusting the sentence. A written-off amount leaves the
+    /// account the customer is asked to settle; it is the MSP's loss, not a
+    /// sum still being collected.
     pub closing_balance: Decimal,
 }
 
@@ -1005,4 +1106,46 @@ pub struct ProductFilter {
     pub is_active: Option<bool>,
     #[validate(length(max = 200))]
     pub q: Option<String>,
+}
+
+#[cfg(test)]
+mod overdue_tests {
+    use super::*;
+
+    fn day(d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, d).expect("date")
+    }
+
+    /// PMS-1037: only a collectible invoice with a balance, past its date.
+    #[test]
+    fn overdue_is_collectible_with_a_balance_and_past_due() {
+        let ten = Decimal::from(10);
+        assert_eq!(
+            overdue_days(InvoiceStatus::Sent, ten, day(1), day(6)),
+            Some(5)
+        );
+        assert_eq!(
+            overdue_days(InvoiceStatus::PartiallyPaid, ten, day(5), day(6)),
+            Some(1)
+        );
+        assert_eq!(overdue_days(InvoiceStatus::Sent, ten, day(6), day(6)), None);
+        assert_eq!(overdue_days(InvoiceStatus::Sent, ten, day(9), day(6)), None);
+        assert_eq!(
+            overdue_days(InvoiceStatus::Sent, Decimal::ZERO, day(1), day(6)),
+            None
+        );
+        for status in [
+            InvoiceStatus::Draft,
+            InvoiceStatus::Pending,
+            InvoiceStatus::Paid,
+            InvoiceStatus::Void,
+            InvoiceStatus::WrittenOff,
+        ] {
+            assert_eq!(
+                overdue_days(status, ten, day(1), day(6)),
+                None,
+                "{status:?}"
+            );
+        }
+    }
 }

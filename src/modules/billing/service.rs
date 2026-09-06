@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
-use crate::modules::settings::read_tenant_zone;
+use crate::modules::settings::{read_invoice_reminder_settings, read_tenant_zone};
 use crate::utils::email::Mailer;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -147,18 +147,23 @@ impl BillingService {
         tenant_id: TenantId,
         company_id: Uuid,
     ) -> AppResult<UninvoiceableTime> {
-        let row: Option<(i64, i64, i64, i64, i64)> = sqlx::query_as(
+        let row: Option<(i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
             r#"
             SELECT
                 COUNT(*) FILTER (
                     WHERE is_billable IS TRUE AND invoice_id IS NULL
-                      AND billing_status IS DISTINCT FROM 'ready_to_bill'),
+                      AND billing_status IS DISTINCT FROM 'ready_to_bill'
+                      AND billing_status IS DISTINCT FROM 'prepaid'),
                 COALESCE(SUM(duration_minutes) FILTER (
                     WHERE is_billable IS TRUE AND invoice_id IS NULL
-                      AND billing_status IS DISTINCT FROM 'ready_to_bill'), 0),
+                      AND billing_status IS DISTINCT FROM 'ready_to_bill'
+                      AND billing_status IS DISTINCT FROM 'prepaid'), 0),
                 COUNT(*) FILTER (WHERE is_billable IS NOT TRUE),
                 COALESCE(SUM(duration_minutes) FILTER (WHERE is_billable IS NOT TRUE), 0),
-                COUNT(*) FILTER (WHERE is_billable IS TRUE AND invoice_id IS NOT NULL)
+                COUNT(*) FILTER (WHERE is_billable IS TRUE AND invoice_id IS NOT NULL),
+                -- PMS-1035: covered by a block-hours allotment; not a fault.
+                COUNT(*) FILTER (WHERE billing_status = 'prepaid'),
+                COALESCE(SUM(duration_minutes) FILTER (WHERE billing_status = 'prepaid'), 0)
             FROM time_entries
             WHERE tenant_id = $1
               AND company_id = $2
@@ -174,14 +179,23 @@ impl BillingService {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let (not_ready, not_ready_minutes, non_billable, non_billable_minutes, already_invoiced) =
-            row.unwrap_or((0, 0, 0, 0, 0));
+        let (
+            not_ready,
+            not_ready_minutes,
+            non_billable,
+            non_billable_minutes,
+            already_invoiced,
+            prepaid,
+            prepaid_minutes,
+        ) = row.unwrap_or((0, 0, 0, 0, 0, 0, 0));
         Ok(UninvoiceableTime {
             not_ready,
             not_ready_minutes,
             non_billable,
             non_billable_minutes,
             already_invoiced,
+            prepaid,
+            prepaid_minutes,
         })
     }
 
@@ -282,7 +296,14 @@ impl BillingService {
                 amount_paid     = p.paid,
                 amount_credited = p.credited,
                 balance_due     = i.total - p.paid - p.credited,
-                status      = CASE WHEN p.credited > 0
+                -- PMS-1036: a write-off is an input to this CASE, not a value
+                -- it derives. Every payment or credit event runs it, so
+                -- without the first arm the next partial payment on a
+                -- written-off invoice would flip it back to partially_paid;
+                -- a late payment is a recovery, recorded and kept, with the
+                -- status standing.
+                status      = CASE WHEN i.written_off_at IS NOT NULL THEN 'written_off'
+                                   WHEN p.credited > 0
                                     AND p.credited >= i.total - p.paid THEN 'void'
                                    WHEN i.total - p.paid - p.credited <= 0 THEN 'paid'
                                    WHEN p.paid > 0 THEN 'partially_paid'
@@ -316,6 +337,117 @@ impl BillingService {
     /// caller's tenant (PMS-333). RLS scopes the lookup, so a foreign-tenant id
     /// (whose FK would otherwise pass, since FK checks bypass RLS) is rejected
     /// with a 400 instead of silently linking across tenants.
+    /// PMS-1029: the one rule for an invoice's tax, run after its lines are
+    /// written and in the same transaction.
+    ///
+    /// The rate is the request's `tax_rate_id` (validated in the tenant and
+    /// active), else the tenant's active default, else none; the amount is
+    /// `round(taxable line total * rate / 100, 2)`, half away from zero as
+    /// money is. A given `explicit_amount` is stored as given and records no
+    /// rate: a jurisdiction this rule cannot express exists, and the SPA sends
+    /// one today. The rate applied is frozen on the invoice (`tax_rate_id`,
+    /// `tax_rate`) so the document can print it and a later edit to
+    /// `tax_rates` does not re-price an issued document.
+    ///
+    /// Writes `subtotal`, `tax_amount`, `total` and `balance_due` the way
+    /// `update_invoice` does, and deliberately NOT through
+    /// `recompute_invoice_balance`: that derives `status` for a payment event
+    /// and its fallback arm is `sent`, which would flip a draft.
+    async fn apply_tax(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        requested_rate: Option<Uuid>,
+        explicit_amount: Option<Decimal>,
+        discount: Decimal,
+    ) -> AppResult<()> {
+        let (subtotal, taxable): (Decimal, Decimal) = sqlx::query_as(
+            "SELECT COALESCE(SUM(total), 0), COALESCE(SUM(total) FILTER (WHERE is_taxable), 0) \
+             FROM invoice_lines WHERE invoice_id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let rate: Option<(Uuid, Decimal)> = match requested_rate {
+            Some(id) => Some(Self::assert_tax_rate_in_tenant(tx, tenant_id, id).await?),
+            None => Self::default_tax_rate(tx, tenant_id).await?,
+        };
+        let (tax, rate_id, rate_pct) = match (explicit_amount, rate) {
+            (Some(amount), _) => (amount, None, None),
+            (None, Some((id, pct))) => (
+                (taxable * pct / Decimal::from(100)).round_dp_with_strategy(
+                    2,
+                    rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                ),
+                Some(id),
+                Some(pct),
+            ),
+            (None, None) => (Decimal::ZERO, None, None),
+        };
+        sqlx::query(
+            r#"
+            UPDATE invoices SET
+                subtotal    = $2,
+                tax_amount  = $3,
+                tax_rate_id = $4,
+                tax_rate    = $5,
+                total       = $2 + $3 - $6,
+                balance_due = $2 + $3 - $6 - amount_paid - amount_credited,
+                updated_at  = NOW()
+            WHERE id = $1 AND tenant_id = $7
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(subtotal)
+        .bind(tax)
+        .bind(rate_id)
+        .bind(rate_pct)
+        .bind(discount)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    /// PMS-1029: the tenant's active default rate, if it has one. Shared with
+    /// quotes (PMS-1038).
+    pub(crate) async fn default_tax_rate(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+    ) -> AppResult<Option<(Uuid, Decimal)>> {
+        Ok(sqlx::query_as(
+            "SELECT id, rate FROM tax_rates \
+             WHERE tenant_id = $1 AND is_default = TRUE AND is_active = TRUE \
+             ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?)
+    }
+
+    /// PMS-1029: a `tax_rate_id` must name an active rate in the caller's
+    /// tenant. An FK check bypasses RLS, so a foreign id would satisfy the
+    /// constraint and link silently (the PMS-333 reason for payment terms).
+    pub(crate) async fn assert_tax_rate_in_tenant(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        tax_rate_id: Uuid,
+    ) -> AppResult<(Uuid, Decimal)> {
+        sqlx::query_as(
+            "SELECT id, rate FROM tax_rates \
+             WHERE tenant_id = $1 AND id = $2 AND is_active = TRUE",
+        )
+        .bind(tenant_id)
+        .bind(tax_rate_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "tax_rate_id does not name an active tax rate in this tenant".to_string(),
+            )
+        })
+    }
+
     async fn assert_payment_term_in_tenant(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -622,6 +754,8 @@ impl BillingService {
             count_conds.push(format!(
                 "(invoice_number ILIKE ${count_idx} OR po_number ILIKE ${count_idx})"
             ));
+            data_idx += 1;
+            count_idx += 1;
         }
         if filter.exclude_draft {
             // MAPPS-670 (mokosh-invoices P1e): no placeholder; the value
@@ -629,6 +763,26 @@ impl BillingService {
             // a Contact.
             data_conds.push("status <> 'draft'".to_string());
             count_conds.push("status <> 'draft'".to_string());
+        }
+        // PMS-1037: overdue is the predicate `overdue_days` applies on the
+        // read, in SQL, against the tenant's day, which is read on the tenant
+        // connection before the binds below.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let zone = read_tenant_zone(&mut tx, tenant_id).await?;
+        let today = mokosh_types::datetime::user_local_date(Utc::now(), &zone);
+        if let Some(overdue) = filter.overdue {
+            let predicate = |idx: usize| {
+                let core = format!(
+                    "(status IN ('sent', 'partially_paid') AND balance_due > 0 AND due_date < ${idx})"
+                );
+                if overdue {
+                    core
+                } else {
+                    format!("NOT {core}")
+                }
+            };
+            data_conds.push(predicate(data_idx));
+            count_conds.push(predicate(count_idx));
         }
 
         let data_where = data_conds.join(" AND ");
@@ -643,7 +797,9 @@ impl BillingService {
                    payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
-                   created_at, updated_at, emailed_at, emailed_to
+                   created_at, updated_at, emailed_at, emailed_to,
+                   written_off_at, written_off_by_id, write_off_reason, write_off_amount,
+                   tax_rate_id, tax_rate
             FROM invoices
             WHERE {data_where}
             ORDER BY {order_by}
@@ -674,12 +830,18 @@ impl BillingService {
             q = q.bind(pattern.clone());
             cq = cq.bind(pattern);
         }
+        if filter.overdue.is_some() {
+            q = q.bind(today);
+            cq = cq.bind(today);
+        }
 
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q.fetch_all(&mut *tx).await?;
         let total = cq.fetch_one(&mut *tx).await?;
         drop(tx);
         let mut resp: Vec<InvoiceResponse> = rows.into_iter().map(Into::into).collect();
+        for invoice in &mut resp {
+            invoice.mark_overdue(today);
+        }
         self.enrich_invoices(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
     }
@@ -791,9 +953,10 @@ impl BillingService {
                 r#"
                 INSERT INTO invoice_lines (
                     id, invoice_id, line_type, description, quantity, unit_price,
-                    total, ticket_id, project_id, sort_order, product_id
+                    total, ticket_id, project_id, sort_order, product_id, is_taxable
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = $11), $12))
                 "#,
             )
             .bind(Uuid::new_v4())
@@ -807,9 +970,20 @@ impl BillingService {
             .bind(line.project_id)
             .bind(line.sort_order)
             .bind(line.product_id)
+            .bind(line.is_taxable)
             .execute(&mut *tx)
             .await?;
         }
+        // PMS-1029: tax from the lines just written, in this transaction.
+        Self::apply_tax(
+            &mut tx,
+            tenant_id,
+            invoice_id,
+            request.tax_rate_id,
+            request.tax_amount,
+            discount,
+        )
+        .await?;
 
         // Audit row in the same transaction. CREATE: old = None, after
         // captured by the new invoice id. PMS-117.
@@ -882,6 +1056,11 @@ impl BillingService {
             r#"
             SELECT te.id, te.duration_minutes, te.hourly_rate, te.total_amount,
                    te.ticket_id, te.date, te.notes,
+                   -- PMS-1035: the block-hours draw. An entry fully inside the
+                   -- block is `prepaid` and not selected at all; one with
+                   -- overage is billed for the overage alone, at the rate the
+                   -- draw recorded, else its own.
+                   te.hours_consumed, te.overage_hours, te.overage_rate,
                    -- PMS-1004: what the line says. The work type is NOT NULL
                    -- on the entry, so the join cannot drop a row; the ticket
                    -- is optional and its two columns are NULL without one.
@@ -964,10 +1143,6 @@ impl BillingService {
             Vec::with_capacity(entries.len());
         let mut subtotal = Decimal::ZERO;
         for entry in &entries {
-            let quantity = Decimal::from(entry.duration_minutes) / sixty;
-            let unit_price = entry.hourly_rate.unwrap_or(Decimal::ZERO);
-            let total = entry.total_amount.unwrap_or(quantity * unit_price);
-            subtotal += total;
             // PMS-1004: the line describes the work, not the row.
             let ticket =
                 entry
@@ -977,12 +1152,41 @@ impl BillingService {
                         number,
                         title: entry.ticket_title.as_deref().unwrap_or(""),
                     });
-            let description = super::descriptions::time_entry_line(
-                entry.date,
-                &entry.work_type_name,
-                ticket,
-                entry.notes.as_deref(),
-            );
+            // PMS-1035: an entry that ran past its block bills the overage
+            // hours only, at the contract's overage rate when the draw recorded
+            // one and at the entry's own rate otherwise, and the line says so.
+            // The prepaid part is the customer's already; `total_amount` is the
+            // full entry's figure and is not used for such a line.
+            let (quantity, unit_price, total, description) = match entry.overage_hours {
+                Some(over) if over > Decimal::ZERO => {
+                    let unit_price = entry
+                        .overage_rate
+                        .or(entry.hourly_rate)
+                        .unwrap_or(Decimal::ZERO);
+                    let description = super::descriptions::time_entry_overage_line(
+                        entry.date,
+                        &entry.work_type_name,
+                        ticket,
+                        entry.notes.as_deref(),
+                        over,
+                        entry.hours_consumed.unwrap_or(Decimal::ZERO),
+                    );
+                    (over, unit_price, over * unit_price, description)
+                }
+                _ => {
+                    let quantity = Decimal::from(entry.duration_minutes) / sixty;
+                    let unit_price = entry.hourly_rate.unwrap_or(Decimal::ZERO);
+                    let total = entry.total_amount.unwrap_or(quantity * unit_price);
+                    let description = super::descriptions::time_entry_line(
+                        entry.date,
+                        &entry.work_type_name,
+                        ticket,
+                        entry.notes.as_deref(),
+                    );
+                    (quantity, unit_price, total, description)
+                }
+            };
+            subtotal += total;
             lines.push((
                 entry.id,
                 description,
@@ -1139,6 +1343,17 @@ impl BillingService {
         // 6. Mark the source entries billed and link them to the invoice,
         //    within the same transaction. Scoped to the locked id set so
         //    a concurrently-inserted eligible entry is not swept in.
+        // PMS-1029: the named rate, else the tenant's default, over every line
+        // (time and mileage lines are taxable).
+        Self::apply_tax(
+            &mut tx,
+            tenant_id,
+            invoice_id,
+            request.tax_rate_id,
+            None,
+            Decimal::ZERO,
+        )
+        .await?;
         let billed_ids: Vec<Uuid> = entries.iter().map(|e| e.id).collect();
         sqlx::query(
             r#"
@@ -1363,6 +1578,188 @@ impl BillingService {
     /// Split out of [`generate_due_recurring_invoices`] so each contract
     /// gets its own transaction: one contract's conflict / empty-items
     /// skip never rolls back another contract's invoice.
+    /// PMS-1037: every tenant's overdue reminders, once an hour.
+    pub async fn send_due_reminders_all_tenants(&self, now: DateTime<Utc>) -> AppResult<u64> {
+        let tenant_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM tenants")
+            .fetch_all(self.db.migrator_pool())
+            .await?;
+        let mut total = 0u64;
+        for tenant_id in tenant_ids {
+            match self
+                .send_due_reminders(TenantId::from_trusted(tenant_id), now)
+                .await
+            {
+                Ok(sent) => total += sent.len() as u64,
+                Err(e) => {
+                    tracing::warn!(
+                        %tenant_id,
+                        error = ?e,
+                        "invoice reminders failed for tenant; skipping"
+                    );
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// PMS-1037: mail the customer about every overdue invoice whose days
+    /// past due hit a step of the tenant's reminder schedule, at the tenant's
+    /// local sending hour, once per invoice per step.
+    ///
+    /// The schedule lives in `billing_reminders` (`enabled`, `schedule` as
+    /// day offsets such as `[3, 7, 14, 30]`, `send_hour`), read on the
+    /// tenant connection. The day is the tenant's (`read_tenant_zone`,
+    /// PMS-1030), because "past due" is a date comparison that has to be made
+    /// in the day the invoice was dated in. The recipient is who the invoice
+    /// was emailed to (PMS-992), else the resolved billing contact (PMS-993);
+    /// an invoice with neither is skipped and logged, not guessed at. The
+    /// stored document (PMS-959) travels with the mail when there is one, and
+    /// the pay link when a gateway is connected, the PMS-991 shape.
+    ///
+    /// `invoice_reminders` is the idempotency guard: the row is claimed with
+    /// `ON CONFLICT DO NOTHING` before the send, inside the transaction, so a
+    /// worker that fires twice in the hour sends once, and a relay that
+    /// refuses the message releases the claim so the next run tries again.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn send_due_reminders(
+        &self,
+        tenant_id: TenantId,
+        now: DateTime<Utc>,
+    ) -> AppResult<Vec<Uuid>> {
+        let Some(mailer) = self.mailer.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let settings = read_invoice_reminder_settings(&mut tx, tenant_id).await?;
+        if !settings.enabled || settings.schedule.is_empty() {
+            return Ok(Vec::new());
+        }
+        let zone = read_tenant_zone(&mut tx, tenant_id).await?;
+        let local = now.with_timezone(&mokosh_types::datetime::resolve_tz(&zone));
+        if chrono::Timelike::hour(&local) != settings.send_hour {
+            return Ok(Vec::new());
+        }
+        let today = local.date_naive();
+
+        let candidates: Vec<ReminderCandidateRow> = sqlx::query_as(
+            r#"
+            SELECT id, invoice_number, company_id, billing_contact_id, due_date,
+                   balance_due, currency, emailed_to
+            FROM invoices
+            WHERE tenant_id = $1
+              AND status IN ('sent', 'partially_paid')
+              AND balance_due > 0
+              AND due_date < $2
+            ORDER BY due_date, invoice_number
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(today)
+        .fetch_all(&mut *tx)
+        .await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
+        let contact_line = org.contact_line("Questions about this invoice?", None);
+        let gateway = matches!(self.has_active_gateway(tenant_id).await, Ok(true));
+
+        let mut sent = Vec::new();
+        for invoice in candidates {
+            let days = (today - invoice.due_date).num_days();
+            if !settings.schedule.contains(&days) {
+                continue;
+            }
+            let recipient = match invoice.emailed_to.clone() {
+                Some(to) if !to.trim().is_empty() => to,
+                _ => match Self::resolve_invoice_recipient(
+                    &mut tx,
+                    tenant_id,
+                    invoice.company_id,
+                    invoice.billing_contact_id,
+                )
+                .await?
+                {
+                    Ok((_, email)) => email,
+                    Err(why) => {
+                        tracing::warn!(
+                            target: "mokosh_server.billing",
+                            invoice_id = %invoice.id,
+                            "invoice reminder skipped: {why}"
+                        );
+                        continue;
+                    }
+                },
+            };
+            let claimed: Option<Uuid> = sqlx::query_scalar(
+                r#"
+                INSERT INTO invoice_reminders (tenant_id, invoice_id, offset_days, sent_to)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (tenant_id, invoice_id, offset_days) DO NOTHING
+                RETURNING id
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(invoice.id)
+            .bind(days as i32)
+            .bind(&recipient)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(claim) = claimed else {
+                continue;
+            };
+
+            let pdf = super::documents::read_issued(tenant_id.get(), invoice.id).await;
+            let portal_link = match (self.portal_origin.as_ref(), gateway) {
+                (Some(origin), true) => Some(format!(
+                    "{}/portal/invoices/{}",
+                    origin.trim_end_matches('/'),
+                    invoice.id
+                )),
+                _ => None,
+            };
+            let currency = invoice.currency.as_deref().unwrap_or("USD");
+            let amount_due = format!("{} {}", invoice.balance_due, currency);
+            let due_date = invoice.due_date.to_string();
+            let from = crate::utils::email::SenderIdentity {
+                org_name: org.name(),
+                contact_line: &contact_line,
+            };
+            let outcome = mailer
+                .send_invoice_reminder(
+                    &recipient,
+                    from,
+                    crate::utils::email::InvoiceReminder {
+                        invoice_number: &invoice.invoice_number,
+                        amount_due: &amount_due,
+                        due_date: &due_date,
+                        days_overdue: days,
+                        portal_link: portal_link.as_deref(),
+                        pdf: pdf.as_deref(),
+                    },
+                )
+                .await;
+            match outcome {
+                Ok(()) => sent.push(invoice.id),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mokosh_server.billing",
+                        invoice_id = %invoice.id,
+                        error = %e,
+                        "invoice reminder: send refused, the claim is released"
+                    );
+                    sqlx::query("DELETE FROM invoice_reminders WHERE id = $1")
+                        .bind(claim)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(sent)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn generate_one_recurring_invoice(
         &self,
@@ -1523,9 +1920,10 @@ impl BillingService {
                 r#"
                 INSERT INTO invoice_lines (
                     id, invoice_id, line_type, description, quantity, unit_price,
-                    total, sort_order, product_id
+                    total, sort_order, product_id, is_taxable
                 )
-                VALUES ($1, $2, 'service', $3, $4, $5, $6, $7, $8)
+                VALUES ($1, $2, 'service', $3, $4, $5, $6, $7, $8,
+                        COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = $8), TRUE))
                 "#,
             )
             .bind(Uuid::new_v4())
@@ -1543,6 +1941,10 @@ impl BillingService {
             .execute(&mut *tx)
             .await?;
         }
+
+        // PMS-1029: a recurring invoice names no rate, so the tenant's default
+        // applies over the lines just written.
+        Self::apply_tax(&mut tx, tenant_id, invoice_id, None, None, Decimal::ZERO).await?;
 
         // --- 4. Audit row in the same transaction. CREATE: old = None. ---
         let after: Option<serde_json::Value> = sqlx::query_scalar(
@@ -2930,9 +3332,10 @@ impl BillingService {
                     INSERT INTO invoice_lines (
                         id, invoice_id, line_type, description, quantity,
                         unit_price, total, ticket_id, project_id, sort_order,
-                        product_id
+                        product_id, is_taxable
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                            COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = $11), $12))
                     "#,
                 )
                 .bind(Uuid::new_v4())
@@ -2946,6 +3349,7 @@ impl BillingService {
                 .bind(line.project_id)
                 .bind(line.sort_order)
                 .bind(line.product_id)
+                .bind(line.is_taxable)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -3092,6 +3496,21 @@ impl BillingService {
         )
         .execute(&mut *tx)
         .await?;
+        // PMS-1029: replacing the lines or naming a rate re-derives the tax
+        // over the lines now on the invoice; a given amount is stored as
+        // given; an update touching none of the three leaves the tax alone.
+        if request.lines.is_some() || request.tax_rate_id.is_some() || request.tax_amount.is_some()
+        {
+            Self::apply_tax(
+                &mut tx,
+                tenant_id,
+                invoice_id,
+                request.tax_rate_id.or(current.tax_rate_id),
+                request.tax_amount,
+                discount,
+            )
+            .await?;
+        }
 
         // PMS-959: the document the client receives, kept as it was sent.
         //
@@ -3591,6 +4010,103 @@ impl BillingService {
         Self::load_invoice(&mut tx, tenant_id, invoice_id).await
     }
 
+    /// PMS-1036: write an invoice off. The customer owes it and will not pay.
+    ///
+    /// Not a credit note: a credit says the customer did not owe this and
+    /// reduces revenue; a write-off says they did and will not pay, a bad-debt
+    /// expense, and the books and the statement keep the two apart. So
+    /// `balance_due` is left exactly as it was (the debt was not forgiven) and
+    /// the balance at this moment is frozen in `write_off_amount`, because
+    /// `balance_due` keeps moving if a late payment lands afterwards. That
+    /// payment is a recovery: recorded, kept, and the status stands, which is
+    /// the first arm of `recompute_invoice_balance`'s status CASE.
+    ///
+    /// Allowed from `sent` and `partially_paid` (an overdue invoice is one of
+    /// those past its date); refused with a 409 naming the status from `draft`
+    /// (delete it), `paid`, `void` and `written_off`. No reversal in v1: if one
+    /// is needed it is its own decision with its own audit shape.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn write_off_invoice(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        user_id: Uuid,
+        request: &WriteOffInvoiceRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<InvoiceResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String, String, Decimal)> = sqlx::query_as(
+            "SELECT invoice_number, status, balance_due FROM invoices \
+             WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((invoice_number, status, balance_due)) = row else {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        };
+        let status = InvoiceStatus::from_str(&status).unwrap_or(InvoiceStatus::Draft);
+        if !matches!(status, InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid) {
+            return Err(AppError::Conflict(format!(
+                "Invoice {invoice_number} cannot be written off in status '{}'",
+                status.as_str()
+            )));
+        }
+        if balance_due <= Decimal::ZERO {
+            return Err(AppError::Conflict(format!(
+                "Invoice {invoice_number} has nothing outstanding to write off"
+            )));
+        }
+
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE invoices
+            SET status            = 'written_off',
+                written_off_at    = NOW(),
+                written_off_by_id = $3,
+                write_off_reason  = $4,
+                write_off_amount  = balance_due,
+                updated_at        = NOW()
+            WHERE id = $1 AND tenant_id = $2
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(request.reason.trim())
+        .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "invoices",
+            Some(invoice_id),
+            before,
+            after,
+        )
+        .await?;
+        let invoice = Self::load_invoice(&mut tx, tenant_id, invoice_id).await?;
+        tx.commit().await?;
+        Ok(invoice)
+    }
+
     /// Assemble one invoice, in a transaction the caller owns (PMS-959).
     ///
     /// The whole of what an invoice response is, in one place with two entry
@@ -3617,7 +4133,9 @@ impl BillingService {
                    payment_term_id,
                    subtotal, tax_amount, discount_amount, total, amount_paid, amount_credited,
                    balance_due, currency, notes, po_number, sent_at, paid_at,
-                   created_at, updated_at, emailed_at, emailed_to
+                   created_at, updated_at, emailed_at, emailed_to,
+                   written_off_at, written_off_by_id, write_off_reason, write_off_amount,
+                   tax_rate_id, tax_rate
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -3631,7 +4149,7 @@ impl BillingService {
         let line_rows = sqlx::query_as::<_, InvoiceLineRow>(
             r#"
             SELECT id, line_type, description, quantity, unit_price, total,
-                   ticket_id, project_id, sort_order, product_id
+                   ticket_id, project_id, sort_order, product_id, is_taxable
             FROM invoice_lines
             WHERE invoice_id = $1
             ORDER BY sort_order, created_at
@@ -3642,6 +4160,9 @@ impl BillingService {
         .await?;
 
         let mut resp: InvoiceResponse = row.into();
+        // PMS-1037: overdue is the tenant's day, not the reader's clock.
+        let zone = read_tenant_zone(tx, tenant_id).await?;
+        resp.mark_overdue(mokosh_types::datetime::user_local_date(Utc::now(), &zone));
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
         resp.company_name =
             sqlx::query_scalar("SELECT name FROM companies WHERE tenant_id = $1 AND id = $2")
@@ -4325,7 +4846,7 @@ impl BillingService {
         // computed here rather than carried on the company, because a stored
         // running total is a third home for a number that already has one and
         // the only one that can be silently wrong.
-        let opening: (Decimal, Decimal, Decimal, Decimal) = sqlx::query_as(&format!(
+        let opening: (Decimal, Decimal, Decimal, Decimal, Decimal) = sqlx::query_as(&format!(
             r#"
             SELECT
                 COALESCE((SELECT SUM(total) FROM invoices
@@ -4340,7 +4861,11 @@ impl BillingService {
                             AND r.created_at::date < $3), 0),
                 COALESCE((SELECT SUM(total) FROM credit_notes
                           WHERE tenant_id = $1 AND company_id = $2
-                            AND status = 'issued' AND issue_date < $3), 0)
+                            AND status = 'issued' AND issue_date < $3), 0),
+                COALESCE((SELECT SUM(write_off_amount) FROM invoices
+                          WHERE tenant_id = $1 AND company_id = $2
+                            AND written_off_at IS NOT NULL
+                            AND written_off_at::date < $3), 0)
             "#,
             issued = Self::STATEMENT_ISSUED_INVOICE,
         ))
@@ -4349,8 +4874,9 @@ impl BillingService {
         .bind(query.period_start)
         .fetch_one(&mut *tx)
         .await?;
-        let (open_invoiced, open_paid, open_refunded, open_credited) = opening;
-        let opening_balance = open_invoiced + open_refunded - open_paid - open_credited;
+        let (open_invoiced, open_paid, open_refunded, open_credited, open_written_off) = opening;
+        let opening_balance =
+            open_invoiced + open_refunded - open_paid - open_credited - open_written_off;
 
         let invoices: Vec<StatementInvoiceRow> = sqlx::query_as(&format!(
             r#"
@@ -4428,10 +4954,35 @@ impl BillingService {
         .fetch_all(&mut *tx)
         .await?;
 
+        // PMS-1036: dated by the write-off, not the invoice, so an invoice
+        // charged in one period and written off in a later one appears on
+        // both statements as what happened in each.
+        let write_offs: Vec<StatementWriteOffRow> = sqlx::query_as(
+            r#"
+            SELECT id, invoice_number, written_off_at::date AS write_off_date,
+                   write_off_amount, write_off_reason
+            FROM invoices
+            WHERE tenant_id = $1 AND company_id = $2
+              AND written_off_at IS NOT NULL
+              AND written_off_at::date BETWEEN $3 AND $4
+            ORDER BY written_off_at, invoice_number
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query.company_id)
+        .bind(query.period_start)
+        .bind(query.period_end)
+        .fetch_all(&mut *tx)
+        .await?;
+
         let total_invoiced: Decimal = invoices.iter().map(|i| i.total).sum();
         let total_paid: Decimal = payments.iter().map(|p| p.amount).sum();
         let total_refunded: Decimal = refunds.iter().map(|r| r.amount).sum();
         let total_credited: Decimal = credit_notes.iter().map(|c| c.total).sum();
+        let total_written_off: Decimal = write_offs
+            .iter()
+            .map(|w| w.write_off_amount.unwrap_or(Decimal::ZERO))
+            .sum();
 
         Ok(StatementResponse {
             company_id: query.company_id,
@@ -4443,13 +4994,16 @@ impl BillingService {
             payments: payments.into_iter().map(Into::into).collect(),
             refunds: refunds.into_iter().map(Into::into).collect(),
             credit_notes: credit_notes.into_iter().map(Into::into).collect(),
+            write_offs: write_offs.into_iter().map(Into::into).collect(),
             total_invoiced,
             total_paid,
             total_refunded,
             total_credited,
+            total_written_off,
             closing_balance: opening_balance + total_invoiced + total_refunded
                 - total_paid
-                - total_credited,
+                - total_credited
+                - total_written_off,
         })
     }
 
@@ -4863,6 +5417,11 @@ pub(crate) struct UninvoiceableTime {
     pub non_billable_minutes: i64,
     /// Client entries that were billable and are already on an invoice.
     pub already_invoiced: i64,
+    /// PMS-1035: client entries fully covered by a block-hours allotment the
+    /// customer already paid for. Nothing to charge, and nothing to fix.
+    pub prepaid: i64,
+    /// Minutes across those.
+    pub prepaid_minutes: i64,
 }
 
 impl UninvoiceableTime {
@@ -4931,6 +5490,13 @@ impl UninvoiceableTime {
                 )
             ));
         }
+        if self.prepaid > 0 {
+            let hours = Self::hours(self.prepaid_minutes);
+            parts.push(format!(
+                "{} ({hours}) covered by the block-hours contract",
+                Self::count_of(self.prepaid, "time entry", "time entries")
+            ));
+        }
 
         let Some(next) = self.next_step() else {
             return "No billable time or mileage entries found for this company".to_string();
@@ -4962,6 +5528,9 @@ impl UninvoiceableTime {
         if self.already_invoiced > 0 {
             return Some("There is nothing new to bill for this company.");
         }
+        if self.prepaid > 0 {
+            return Some("Those hours were prepaid, so there is nothing to charge for them.");
+        }
         None
     }
 }
@@ -4969,6 +5538,19 @@ impl UninvoiceableTime {
 /// Row shape for the billable-time-entry select in
 /// [`BillingService::create_invoice_from_time_entries`]. Only the
 /// columns the invoice line needs are pulled.
+/// PMS-1037: an overdue invoice as the reminder worker reads it.
+#[derive(sqlx::FromRow)]
+struct ReminderCandidateRow {
+    id: Uuid,
+    invoice_number: String,
+    company_id: Uuid,
+    billing_contact_id: Option<Uuid>,
+    due_date: chrono::NaiveDate,
+    balance_due: Decimal,
+    currency: Option<String>,
+    emailed_to: Option<String>,
+}
+
 #[derive(sqlx::FromRow)]
 struct TimeEntryBillingRow {
     id: Uuid,
@@ -4976,6 +5558,10 @@ struct TimeEntryBillingRow {
     hourly_rate: Option<Decimal>,
     total_amount: Option<Decimal>,
     ticket_id: Option<Uuid>,
+    /// PMS-1035: the block-hours draw, when the entry made one.
+    hours_consumed: Option<Decimal>,
+    overage_hours: Option<Decimal>,
+    overage_rate: Option<Decimal>,
     /// PMS-1004: what the generated line says.
     date: chrono::NaiveDate,
     notes: Option<String>,
@@ -5096,11 +5682,13 @@ struct InvoiceLineRow {
     project_id: Option<Uuid>,
     sort_order: i32,
     product_id: Option<Uuid>,
+    is_taxable: bool,
 }
 
 impl From<InvoiceLineRow> for InvoiceLineResponse {
     fn from(r: InvoiceLineRow) -> Self {
         Self {
+            is_taxable: r.is_taxable,
             id: r.id,
             line_type: InvoiceLineType::from_str(&r.line_type).unwrap_or(InvoiceLineType::Service),
             description: r.description,
@@ -5130,6 +5718,8 @@ struct InvoiceRow {
     payment_term_id: Option<Uuid>,
     subtotal: Decimal,
     tax_amount: Decimal,
+    tax_rate_id: Option<Uuid>,
+    tax_rate: Option<Decimal>,
     discount_amount: Decimal,
     total: Decimal,
     amount_paid: Decimal,
@@ -5142,6 +5732,10 @@ struct InvoiceRow {
     paid_at: Option<chrono::DateTime<Utc>>,
     emailed_at: Option<chrono::DateTime<Utc>>,
     emailed_to: Option<String>,
+    written_off_at: Option<chrono::DateTime<Utc>>,
+    written_off_by_id: Option<Uuid>,
+    write_off_reason: Option<String>,
+    write_off_amount: Option<Decimal>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -5164,6 +5758,8 @@ impl From<InvoiceRow> for InvoiceResponse {
             payment_term_name: None,
             subtotal: r.subtotal,
             tax_amount: r.tax_amount,
+            tax_rate_id: r.tax_rate_id,
+            tax_rate: r.tax_rate,
             discount_amount: r.discount_amount,
             total: r.total,
             amount_paid: r.amount_paid,
@@ -5176,6 +5772,12 @@ impl From<InvoiceRow> for InvoiceResponse {
             paid_at: r.paid_at,
             emailed_at: r.emailed_at,
             emailed_to: r.emailed_to,
+            is_overdue: false,
+            days_overdue: 0,
+            written_off_at: r.written_off_at,
+            written_off_by_id: r.written_off_by_id,
+            write_off_reason: r.write_off_reason,
+            write_off_amount: r.write_off_amount,
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,
@@ -5221,7 +5823,31 @@ mod pms944_uninvoiceable_time_tests {
             non_billable,
             non_billable_minutes,
             already_invoiced,
+            ..UninvoiceableTime::default()
         }
+    }
+
+    fn prepaid(count: i64, minutes: i64) -> UninvoiceableTime {
+        UninvoiceableTime {
+            prepaid: count,
+            prepaid_minutes: minutes,
+            ..UninvoiceableTime::default()
+        }
+    }
+
+    /// PMS-1035: time covered by a block is named as such, is not reported as
+    /// "not ready", and the next step says there is nothing to charge.
+    #[test]
+    fn prepaid_time_is_named_and_is_not_a_fault() {
+        let msg = prepaid(2, 150).into_message();
+        assert_eq!(
+            msg,
+            "This company has no time to invoice right now. It has 2 time entries \
+             (2.5 hours) covered by the block-hours contract. Those hours were prepaid, \
+             so there is nothing to charge for them."
+        );
+        assert!(!msg.contains("not marked ready"), "{msg}");
+        assert!(!msg.contains("No billable time"), "{msg}");
     }
 
     fn not_ready(count: i64, minutes: i64) -> UninvoiceableTime {
@@ -5355,6 +5981,7 @@ mod pms944_uninvoiceable_time_tests {
             non_billable: 2,
             non_billable_minutes: 120,
             already_invoiced: 3,
+            ..UninvoiceableTime::default()
         }
         .into_message();
         assert!(msg.contains("1 billable time entry (1 hour) that is not marked ready to bill, 2 time entries (2 hours) logged as non-billable and 3 billable time entries already on an invoice"), "{msg}");
@@ -5525,6 +6152,28 @@ impl From<StatementRefundRow> for StatementRefundLine {
             refund_date: r.refund_date,
             amount: r.amount,
             invoice_number: r.invoice_number,
+        }
+    }
+}
+
+/// PMS-1036: an invoice written off in the period.
+#[derive(sqlx::FromRow)]
+struct StatementWriteOffRow {
+    id: Uuid,
+    invoice_number: String,
+    write_off_date: chrono::NaiveDate,
+    write_off_amount: Option<Decimal>,
+    write_off_reason: Option<String>,
+}
+
+impl From<StatementWriteOffRow> for StatementWriteOffLine {
+    fn from(r: StatementWriteOffRow) -> Self {
+        Self {
+            invoice_id: r.id,
+            invoice_number: r.invoice_number,
+            write_off_date: r.write_off_date,
+            amount: r.write_off_amount.unwrap_or(Decimal::ZERO),
+            reason: r.write_off_reason.unwrap_or_default(),
         }
     }
 }
