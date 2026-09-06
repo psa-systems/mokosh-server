@@ -38,6 +38,13 @@ impl TicketService {
         Self::with_mailer(db, Arc::new(LogMailer))
     }
 
+    /// Handle to the wrapped [`Database`] for callers (e.g. the portal
+    /// invoice-PDF route) that need to reuse the same pool without
+    /// having to thread a second Database clone through router state.
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+
     /// Build a TicketService wired to a specific mailer. Used from
     /// `create_api_router` so add-note notifications and the
     /// automation-rule send_notification action share the SMTP path as
@@ -1154,6 +1161,12 @@ impl TicketService {
                     // template might reference has to always have a value.
                     "org_name": org.name(),
                     "contact_line": contact_line,
+                    // Per-entity deep-link metadata (migration 121). The
+                    // dispatcher persists these onto every notification
+                    // row so the portal inbox can click through straight
+                    // to the ticket detail page.
+                    "entity_type": "ticket",
+                    "entity_id": ticket_id.to_string(),
                 });
                 notify
                     .dispatch(tenant_id, "ticket.note_added", &context)
@@ -2371,19 +2384,23 @@ impl TicketService {
     ) -> AppResult<TicketNote> {
         self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
             .await?;
+        let note_id = Uuid::new_v4();
+        // Single tx for the fallback-creator lookup + note INSERT +
+        // ticket first_response_at bump. Previously the fallback
+        // lookup opened its own throwaway tx (extra GUC round-trip)
+        // before the write tx below.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let fallback_creator: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
              AND role IN ('super_admin', 'admin', 'manager') \
              ORDER BY created_at LIMIT 1",
         )
         .bind(tenant_id)
-        .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
+        .fetch_optional(&mut *tx)
         .await?;
         let fallback_creator = fallback_creator.ok_or(AppError::Configuration(
             "Cannot accept portal note: tenant has no admin/manager user to attribute it to".into(),
         ))?;
-        let note_id = Uuid::new_v4();
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
             INSERT INTO ticket_notes
@@ -2414,20 +2431,215 @@ impl TicketService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        // Fetch the inserted row through the list path so the
-        // returned DTO carries the resolved `created_by_name`.
-        let pagination = PaginationParams {
-            page: 1,
-            per_page: 200,
-            sort: None,
-            sort_dir: "asc".to_string(),
-        };
-        let (rows, _) = self
-            .list_portal_ticket_notes(tenant_id, company_id, ticket_id, &pagination)
-            .await?;
-        rows.into_iter()
-            .find(|n| n.id == note_id)
+        // Fetch just the row we inserted (by id) with the same
+        // author-name resolution the list path uses. Previously this
+        // routed through `list_portal_ticket_notes` with a per_page=200
+        // sweep and filtered in-memory for a single row; on a busy
+        // ticket that meant loading 200 notes to return 1.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as::<_, TicketNoteRow>(
+            r#"
+            SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
+                   n.is_email_sent, n.email_sent_at, n.created_by_id,
+                   n.created_by_contact_id,
+                   n.created_at, n.updated_at,
+                   COALESCE(
+                       NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''),
+                       NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                   ) AS created_by_name
+            FROM ticket_notes n
+            LEFT JOIN users u ON n.created_by_id = u.id
+            LEFT JOIN contacts c ON n.created_by_contact_id = c.id
+            WHERE n.tenant_id = $1 AND n.id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(note_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        row.map(TicketNote::from)
             .ok_or(AppError::NotFound("Ticket note".to_string()))
+    }
+
+    /// Portal contact reopens one of their own company's tickets. Only
+    /// legal when the ticket is currently in a `is_closed = TRUE`
+    /// status (resolved / closed / declined-etc.); flips it back to
+    /// the tenant's `is_default` (open) status, clears
+    /// `closed_at` / `resolved_at`, and appends a public
+    /// `note_type = 'public'` audit trail so the agent sees WHY the
+    /// ticket came back. A ticket already in an open status stays
+    /// unchanged (idempotent) so a double-click does not thrash.
+    ///
+    /// PMS-936: `contact_id` is now `Option<Uuid>` so the same reopen
+    /// implementation covers both the portal contact plane and the
+    /// staff plane. `Some(id)` stamps the audit note's
+    /// `created_by_contact_id` (portal); `None` leaves it NULL and the
+    /// note's authorship falls back to the caller-supplied
+    /// `staff_created_by_id`, matching how staff-authored public
+    /// notes attribute in the ticket_notes table.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, ticket_id = %ticket_id, contact_id = ?contact_id))]
+    pub async fn reopen_portal_ticket(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        contact_id: Option<Uuid>,
+        ticket_id: Uuid,
+        reason: Option<&str>,
+    ) -> AppResult<TicketResponse> {
+        self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
+            .await?;
+
+        // Single transaction covers: is-closed probe, default-status
+        // lookup, UPDATE, and audit-note INSERT. Previously each of
+        // the first three ran in its own tx (three round-trips + two
+        // GUC set-plus-commits) with no correctness benefit; the
+        // consolidated tx also gives the whole reopen atomicity so a
+        // mid-flow crash cannot leave the status flipped without the
+        // audit note (or vice versa).
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let currently_closed: Option<bool> = sqlx::query_scalar(
+            "SELECT s.is_closed
+             FROM tickets t
+             JOIN ticket_statuses s ON s.id = t.status_id
+             WHERE t.tenant_id = $1 AND t.id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(is_closed) = currently_closed else {
+            return Err(AppError::NotFound("Ticket".to_string()));
+        };
+        if !is_closed {
+            // Already open (or a status the customer would not call
+            // "closed"). Nothing to do; return the current state.
+            drop(tx);
+            return self.get_ticket_response(tenant_id, ticket_id).await;
+        }
+
+        let default_status_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(default_status_id) = default_status_id else {
+            return Err(AppError::Configuration(
+                "No default ticket status configured for this tenant".to_string(),
+            ));
+        };
+
+        sqlx::query(
+            "UPDATE tickets SET status_id = $1,
+                                closed_at = NULL,
+                                resolved_at = NULL,
+                                updated_at = NOW()
+             WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(default_status_id)
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Append a public audit-trail note so the agent side sees the
+        // reopen (and any reason) in the same thread the SPA renders.
+        let fallback_creator: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
+             AND role IN ('super_admin', 'admin', 'manager') \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let creator_id = fallback_creator.unwrap_or_else(Uuid::nil);
+        let content = match reason {
+            Some(r) if !r.trim().is_empty() => {
+                format!("Ticket reopened by customer. Reason: {}", r.trim())
+            }
+            _ => "Ticket reopened by customer.".to_string(),
+        };
+        let _ = sqlx::query(
+            "INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type,
+                                       content, created_by_id, created_by_contact_id)
+             VALUES ($1, $2, $3, 'public', $4, $5, $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .bind(&content)
+        .bind(creator_id)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await;
+
+        tx.commit().await?;
+
+        self.get_ticket_response(tenant_id, ticket_id).await
+    }
+
+    /// PMS-937: contact-owned ticket edit. The route layer has
+    /// already gated on `tickets:edit_own`, verified the ticket's
+    /// Company scope + reporter contact id, and stripped every field
+    /// but title / description from the request body. This method
+    /// runs the same `update_ticket` pipeline the staff PUT uses so
+    /// the audit-log trail is identical; `last_updated_by_id` is
+    /// attributed to the tenant's fallback admin user because the
+    /// portal plane has no `users` identity of its own.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_portal_ticket(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        _contact_id: Uuid,
+        ticket_id: Uuid,
+        request: UpdateTicketRequest,
+    ) -> AppResult<Ticket> {
+        // Belt-and-braces Company-scope check even though the route
+        // layer already ran one; a future caller wiring update_portal_ticket
+        // directly must not be able to bypass the scope check.
+        self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
+            .await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let fallback_creator: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
+             AND role IN ('super_admin', 'admin', 'manager') \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        drop(tx);
+        let creator = fallback_creator.ok_or_else(|| {
+            AppError::Configuration(
+                "Cannot edit portal ticket: tenant has no admin/manager user to attribute the change to"
+                    .to_string(),
+            )
+        })?;
+        self.update_ticket(
+            tenant_id,
+            ticket_id,
+            creator,
+            &request,
+            &AuditCtx::system(tenant_id.get()),
+        )
+        .await
+    }
+
+    /// PMS-937: public wrapper around
+    /// [`Self::assert_portal_ticket_visible`] so route handlers in
+    /// other modules (e.g. the ticket approvals-request surface) can
+    /// enforce Company-scope + 404-leak-free existence without
+    /// duplicating the SQL.
+    pub async fn assert_ticket_visible_to_company(
+        &self,
+        tenant_id: TenantId,
+        ticket_id: Uuid,
+        company_id: Uuid,
+    ) -> AppResult<()> {
+        self.assert_portal_ticket_visible(tenant_id, company_id, ticket_id)
+            .await
     }
 
     /// Verify the ticket belongs to the portal contact's company within the

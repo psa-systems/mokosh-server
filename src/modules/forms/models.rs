@@ -25,3 +25,14 @@ pub struct ResolvedRequestToken {
     /// and that column is NOT NULL.
     pub created_by_id: Uuid,
 }
+
+/// PMS-729 phase 2 §7 slice B / I8: one row on `GET /portal/forms`. Just
+/// the picker-visible metadata; the caller GETs `/portal/forms/{id}` to
+/// render the field set.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortalFormListItem {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub slug: String,
+    pub description: Option<String>,
+}

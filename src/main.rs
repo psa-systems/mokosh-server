@@ -1,6 +1,8 @@
 //! Mokosh Server - API server entrypoint
 
-use mokosh_server::utils::deployment::DeploymentMode;
+use mokosh_server::utils::deployment::{
+    DeploymentMode, EnablementSource, ProviderKind, ProviderOverrides,
+};
 use mokosh_server::{api::create_api_router, version::VersionInfo, Database};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -90,6 +92,16 @@ pub struct AppConfig {
     /// PMS-658: opt-in switch for the suspicious-login notify-and-approve gate
     /// (`LOGIN_APPROVAL_ENABLED`). Off by default.
     pub login_approval_enabled: bool,
+    /// MAPPS-457: instance-wide hard cap on how many tenants a super-admin can
+    /// create. Unset (or `<=0`) leaves creation uncapped, matching production
+    /// today. Positive integer rejects further `create_tenant` calls with 409
+    /// once `SELECT COUNT(*) FROM tenants` reaches the value.
+    ///
+    /// Set via `MOKOSH_MAX_TENANTS`. Bumped without a code change so an
+    /// operator can raise the ceiling on the running instance and see the
+    /// effect on the next create call (no restart needed for lowering /
+    /// raising - re-read at each create request).
+    pub max_tenants: Option<usize>,
     /// PMS-902 / PMS-904: whether this instance owns its platform identities
     /// (`self-hosted`, the default) or federates them to Bunyip SSO (`saas`).
     /// Read from `MOKOSH_DEPLOYMENT_MODE`; see [`DeploymentMode`].
@@ -299,6 +311,15 @@ impl AppConfig {
             login_approval_enabled: std::env::var("LOGIN_APPROVAL_ENABLED")
                 .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
                 .unwrap_or(false),
+            // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS. Empty,
+            // unset, unparseable, or non-positive -> None (uncapped). Positive
+            // usize -> Some(N). The value is threaded into `TenantService` via
+            // its builder so the service layer probes `COUNT(*)` before
+            // insert.
+            max_tenants: std::env::var("MOKOSH_MAX_TENANTS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0),
             // PMS-902: self-hosted (default) or saas. Unset and unrecognised
             // both resolve to self-hosted, so a typo cannot silently stop a
             // self-hosted deployment's account email.
@@ -356,6 +377,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Running in multi-tenant mode");
 
     let config = AppConfig::from_env().expect("Failed to load configuration");
+
+    // PMS-1011: the same variable, read strictly, because this answer chooses
+    // providers rather than gating mail. Read here so an unrecognised mode
+    // ends startup before the database is touched, with a message naming the
+    // legal values, instead of surfacing from whichever provider resolved
+    // first. `config.deployment_mode` keeps the lenient reading for mail.
+    let hosting_profile = DeploymentMode::from_env_for_providers()?;
 
     // PMS-489: self-provision the split DB roles (mokosh_migrator / mokosh_app)
     // from MOKOSH_ADMIN_DATABASE_URL on first boot, before connecting the
@@ -415,11 +443,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // email-settings endpoint can rebuild and swap it live. Hard-fail on
     // misconfiguration so an operator does not learn at 3am that a bad config
     // silently degraded to LogMailer.
-    let initial_mailer =
+    let mailer_config =
         mokosh_server::modules::settings::email::resolve_mailer_config(&db, &encryption_key)
             .await
-            .and_then(|c| c.build())
-            .expect("Failed to build Mailer from DB settings / SMTP_* env (see .env.example)");
+            .expect(
+                "Failed to load Mailer config from DB settings / SMTP_* env (see .env.example)",
+            );
+    // PMS-1011: the mail provider for the boot record, read before `build`
+    // consumes the config. A relay host means `SmtpMailer`; no host means
+    // `LogMailer`, which is the hosting profile's default in both modes.
+    let mail_provider_explicit = mailer_config
+        .host
+        .is_some()
+        .then(|| vec![mokosh_server::utils::deployment::provider::SMTP]);
+    let initial_mailer = mailer_config
+        .build()
+        .expect("Failed to build Mailer from DB settings / SMTP_* env (see .env.example)");
     let shared_mailer = std::sync::Arc::new(mokosh_server::utils::email::SharedMailer::new(
         initial_mailer,
     ));
@@ -505,22 +544,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
 
-    // PMS-968: the secret store, built once for the whole process. A
-    // misconfigured backend ends startup here rather than surfacing when a
+    // PMS-968: the secret provider, built once for the whole process. A
+    // misconfigured provider ends startup here rather than surfacing when a
     // customer tries to pay. Built before the scheduler because the credential
     // mover needs it, and shared with the router below so every reader of a
     // gateway credential is looking in the same place.
-    let secrets = mokosh_server::secrets::store_from_env(db.clone(), encryption_key)
-        .expect("secret store configuration");
+    // The hosting profile's default is resolved HERE and handed in as a name
+    // (PMS-1011). `secrets` never holds the deployment shape, which is what
+    // keeps PMS-904's boundary intact.
+    let (secrets, secrets_config) = mokosh_server::secrets::provider_from_env(
+        db.clone(),
+        encryption_key,
+        hosting_profile
+            .default_provider_for(ProviderKind::Secrets)
+            .expect("secrets profile default"),
+    )
+    .expect("secret provider configuration");
 
-    // PMS-958: the object store, built once for the whole process for the
+    // PMS-958: the object provider, built once for the whole process for the
     // same reason. Every service that keeps bytes reaches it through
     // `storage::shared()` rather than a constructor argument (there are
     // thirteen of those constructions across the router, the tenants routes,
     // billing and the seeders), so this first touch is what turns a
-    // misconfigured backend into a boot failure instead of a 500 on the first
+    // misconfigured provider into a boot failure instead of a 500 on the first
     // upload.
-    mokosh_server::storage::init_from_env().expect("storage backend configuration");
+    let storage_default = hosting_profile
+        .default_provider_for(ProviderKind::Storage)
+        .expect("storage profile default");
+    let (storage_provider, storage_source) = mokosh_server::storage::init_from_env(storage_default)
+        .expect("storage provider configuration");
+
+    // PMS-1011: the boot record. Every provider kind, what serves it, and
+    // whether the hosting profile's default stands or the operator overrode
+    // it, so a provider left on by a default is in the log rather than
+    // assumed; PMS-989 reports the deviations from here.
+    //
+    // The overrides are what the capabilities above already resolved, not a
+    // re-read of their variables: each owns the one reader of its own setting,
+    // and a second reader here is how two parts of one process come to
+    // disagree about what is serving a capability.
+    let provider_selection = hosting_profile.resolve_providers(
+        &ProviderOverrides::new()
+            .with_opt(ProviderKind::Secrets, secrets_config.explicit_providers())
+            .with_opt(
+                ProviderKind::Storage,
+                (storage_source == EnablementSource::Explicit)
+                    .then(|| vec![storage_provider.as_str()]),
+            )
+            // A mounted verifier is what makes bunyip the platform
+            // authenticator, in either mode; the legacy path stays enabled
+            // behind it until PMS-981 deprecates it.
+            .with_opt(
+                ProviderKind::Authentication,
+                bunyip_verifier.is_some().then(|| {
+                    vec![
+                        mokosh_server::utils::deployment::provider::BUNYIP,
+                        mokosh_server::utils::deployment::provider::LOCAL,
+                    ]
+                }),
+            )
+            .with_opt(ProviderKind::Email, mail_provider_explicit),
+    );
+    provider_selection.record();
 
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
@@ -583,6 +668,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scheduled_dashboards_worker,
         std::time::Duration::from_secs(60),
     );
+    // mokosh-contact-login: portal_export_worker retired with the
+    // /portal/* customer-portal surface. The contact plane replaces
+    // it in prompt 004+; export gets rebuilt if the operator still
+    // needs it on the contact side.
 
     // PMS-960: one-shot in effect. A KB attachment used to be stored at a
     // flat `kb-articles/{id}` with no tenant in the path; it is now under
@@ -597,7 +686,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     scheduler.register(kb_attachment_mover, std::time::Duration::from_secs(3600));
 
     // PMS-968: one-shot move of pre-existing gateway credentials into the
-    // configured secret store. The scheduler fires every job once at startup,
+    // configured secret provider. The scheduler fires every job once at startup,
     // so an hour gives the one-shot behaviour plus a retry if the store was
     // briefly unreachable, and once the move is done the tick is one query
     // returning no rows.
@@ -608,6 +697,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     scheduler.register(
         gateway_credential_mover,
+        std::time::Duration::from_secs(3600),
+    );
+    // PMS-1037: overdue invoice reminders, hourly so each tenant's local
+    // sending hour is hit once a day. Built with delivery (the mailer and the
+    // portal origin) because it mails, unlike the recurring generator above.
+    let invoice_reminder_worker = mokosh_server::modules::billing::InvoiceReminderWorker::new(
+        mokosh_server::modules::billing::BillingService::with_delivery(
+            db.clone(),
+            encryption_key,
+            mailer.clone(),
+            config.spa_base_url.clone(),
+            secrets.clone(),
+        ),
+    );
+    scheduler.register(
+        invoice_reminder_worker,
         std::time::Duration::from_secs(3600),
     );
 
@@ -672,6 +777,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.login_approval_enabled,
         config.abuse_contact_email,
         config.public_api_base_url,
+        config.max_tenants,
         config.deployment_mode,
         secrets.clone(),
     );

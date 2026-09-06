@@ -355,6 +355,79 @@ pub async fn read_max_minutes_per_day(db: &Database, tenant_id: TenantId) -> App
     Ok((hours as i32) * 60)
 }
 
+/// PMS-1030: the zone a tenant's day happens in, for the jobs that have no
+/// user to ask: the default `business_hours` row's `timezone`, else `UTC`.
+///
+/// Not a new `tenants.timezone` column: the SLA's business hours already
+/// hold the zone this MSP's day happens in, and a second home for it is how
+/// the two would come to disagree. Migration 049 keeps the default to one
+/// row per tenant. Takes a connection rather than the pool because the
+/// contract sweep reads it on the migrator pool, across tenants.
+pub async fn read_tenant_zone(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+) -> AppResult<String> {
+    let zone: Option<String> = sqlx::query_scalar(
+        r#"SELECT timezone FROM business_hours
+           WHERE tenant_id = $1 AND is_default = TRUE
+           ORDER BY created_at, id
+           LIMIT 1"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(zone.unwrap_or_else(|| "UTC".to_string()))
+}
+
+/// PMS-1037: the tenant's overdue-invoice reminder schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvoiceReminderSettings {
+    pub enabled: bool,
+    /// Days past due a reminder goes out on, ascending.
+    pub schedule: Vec<i64>,
+    /// The tenant's local hour the sweep sends at. Unset means 8.
+    pub send_hour: u32,
+}
+
+/// PMS-1037: `billing_reminders/{enabled,schedule,send_hour}` on the caller's
+/// tenant-GUC connection. Unset is off: a tenant that never turned reminders
+/// on is not mailing anybody.
+pub async fn read_invoice_reminder_settings(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+) -> AppResult<InvoiceReminderSettings> {
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        r#"SELECT key, value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'billing_reminders'"#,
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut settings = InvoiceReminderSettings {
+        enabled: false,
+        schedule: Vec::new(),
+        send_hour: 8,
+    };
+    for (key, value) in rows {
+        match key.as_str() {
+            "enabled" => settings.enabled = value.as_bool().unwrap_or(false),
+            "schedule" => {
+                settings.schedule = value
+                    .as_array()
+                    .map(|days| days.iter().filter_map(|d| d.as_i64()).collect())
+                    .unwrap_or_default();
+            }
+            "send_hour" => {
+                if let Some(hour) = value.as_u64().filter(|h| *h <= 23) {
+                    settings.send_hour = hour as u32;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(settings)
+}
+
 /// PMS-943: does this employer track breaks (`timesheets/track_breaks`)?
 ///
 /// Tenant-level rather than per company: the employee taking the break is the
@@ -371,6 +444,30 @@ pub async fn read_track_breaks(db: &Database, tenant_id: TenantId) -> AppResult<
     .fetch_optional(&mut *tx)
     .await?;
     Ok(value.and_then(|v| v.as_bool()).unwrap_or(false))
+}
+
+/// PMS-1028: the currency an invoice is issued in when nothing names one
+/// (`billing_prefs/currency`, a 3-letter ISO 4217 code the settings route
+/// validates). Unset means `USD`, which is what every writer hardcoded
+/// before, so nothing moves for a tenant that configured nothing.
+///
+/// Takes the caller's tenant-GUC connection rather than the pool: the three
+/// invoice writers and the credit note read it inside the transaction that
+/// inserts the row, and `tenant_settings` is RLS-covered.
+pub async fn read_default_currency(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+) -> AppResult<String> {
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'billing_prefs' AND key = 'currency'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(value
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "USD".to_string()))
 }
 
 /// PMS-469: read the fallback `companies.id` that the email-intake

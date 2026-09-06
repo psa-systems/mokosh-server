@@ -1,4 +1,4 @@
-//! The default backend: the `secrets` table, AES-256-GCM at rest.
+//! The default provider: the `secrets` table, AES-256-GCM at rest.
 //!
 //! This is today's behaviour with the location factored out. The crypto is the
 //! same `crate::utils::crypto` pair every per-feature column already used, and
@@ -7,26 +7,26 @@
 
 use async_trait::async_trait;
 
-use super::{SecretKey, SecretStore};
+use super::{SecretKey, SecretProvider};
 use crate::db::Database;
 use crate::utils::error::AppResult;
 
 #[derive(Clone)]
-pub struct DatabaseSecretStore {
+pub struct DatabaseSecretProvider {
     db: Database,
     /// The host `ENCRYPTION_KEY`, as parsed by
     /// [`crate::utils::crypto::parse_encryption_key`].
     encryption_key: [u8; 32],
 }
 
-impl DatabaseSecretStore {
+impl DatabaseSecretProvider {
     pub fn new(db: Database, encryption_key: [u8; 32]) -> Self {
         Self { db, encryption_key }
     }
 }
 
 #[async_trait]
-impl SecretStore for DatabaseSecretStore {
+impl SecretProvider for DatabaseSecretProvider {
     async fn get(&self, key: &SecretKey) -> AppResult<Option<String>> {
         let name = key.name()?;
         // `begin_with_tenant` and not the migrator pool, even though the row is
@@ -78,7 +78,7 @@ impl SecretStore for DatabaseSecretStore {
     async fn delete(&self, key: &SecretKey) -> AppResult<()> {
         let name = key.name()?;
         let mut tx = self.db.begin_with_tenant(key.tenant_id()).await?;
-        // No row affected is success: see `SecretStore::delete`.
+        // No row affected is success: see `SecretProvider::delete`.
         sqlx::query("DELETE FROM secrets WHERE tenant_id = $1 AND name = $2")
             .bind(key.tenant_id())
             .bind(&name)

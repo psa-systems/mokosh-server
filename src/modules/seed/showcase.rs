@@ -276,7 +276,7 @@ impl ShowcaseSeeder {
 
                 for task_spec in showcase_task_specs(pi, phase.id, task_status_id, user_id) {
                     self.projects
-                        .create_task(tenant, project.id, &task_spec, &ctx)
+                        .create_task(tenant, "UTC", project.id, &task_spec, &ctx)
                         .await?;
                     report.tasks += 1;
                 }

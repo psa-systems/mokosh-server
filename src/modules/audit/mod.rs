@@ -28,7 +28,7 @@ pub mod models;
 pub mod routes;
 pub mod service;
 
-pub use context::{audit_auth_event, audit_write, AuditAction, AuditCtx};
+pub use context::{audit_auth_event, audit_portal_event, audit_write, AuditAction, AuditCtx};
 pub use models::*;
 pub use routes::audit_routes;
 pub use service::{field_changes, is_task_marker_only_change, AuditService};

@@ -1,4 +1,4 @@
-//! PMS-968: gateway credentials move into the secret store, and a move that
+//! PMS-968: gateway credentials move into the secret provider, and a move that
 //! cannot finish changes nothing.
 //!
 //! The interesting cases are all about partial failure. A credential that moves
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use mokosh_server::db::Database;
 use mokosh_server::modules::billing::GatewayCredentialMover;
-use mokosh_server::secrets::{DatabaseSecretStore, SecretKey, SecretStore};
+use mokosh_server::secrets::{DatabaseSecretProvider, SecretKey, SecretProvider};
 use mokosh_server::utils::error::{AppError, AppResult};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -26,7 +26,7 @@ const TEST_KEY: [u8; 32] = [0u8; 32];
 struct ForgetfulStore;
 
 #[async_trait]
-impl SecretStore for ForgetfulStore {
+impl SecretProvider for ForgetfulStore {
     async fn get(&self, _key: &SecretKey) -> AppResult<Option<String>> {
         Ok(None)
     }
@@ -42,7 +42,7 @@ impl SecretStore for ForgetfulStore {
 struct UnreachableStore;
 
 #[async_trait]
-impl SecretStore for UnreachableStore {
+impl SecretProvider for UnreachableStore {
     async fn get(&self, _key: &SecretKey) -> AppResult<Option<String>> {
         Err(AppError::external_service("Infisical", "unreachable"))
     }
@@ -87,12 +87,12 @@ async fn column_for(pool: &PgPool, tenant_id: Uuid, provider: &str) -> Option<St
     .expect("read column")
 }
 
-fn mover(pool: &PgPool, store: Arc<dyn SecretStore>) -> GatewayCredentialMover {
+fn mover(pool: &PgPool, store: Arc<dyn SecretProvider>) -> GatewayCredentialMover {
     GatewayCredentialMover::new(Database::from_pool(pool.clone()), store, TEST_KEY)
 }
 
-fn working_store(pool: &PgPool) -> Arc<dyn SecretStore> {
-    Arc::new(DatabaseSecretStore::new(
+fn working_store(pool: &PgPool) -> Arc<dyn SecretProvider> {
+    Arc::new(DatabaseSecretProvider::new(
         Database::from_pool(pool.clone()),
         TEST_KEY,
     ))

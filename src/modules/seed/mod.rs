@@ -7,6 +7,8 @@ mod data;
 #[cfg(feature = "server")]
 mod middleware;
 #[cfg(feature = "server")]
+pub mod portal_dev;
+#[cfg(feature = "server")]
 pub mod qa;
 #[cfg(feature = "server")]
 mod service;
@@ -15,6 +17,8 @@ pub mod showcase;
 
 #[cfg(feature = "server")]
 pub use middleware::{seed_middleware, SeedMiddlewareState};
+#[cfg(feature = "server")]
+pub use portal_dev::{portal_dev_seed, PortalDevSeedReport, PORTAL_DEV_PASSWORD};
 #[cfg(feature = "server")]
 pub use qa::{confirm_qa_tenant, qa_seed, qa_teardown, QaReport};
 #[cfg(feature = "server")]

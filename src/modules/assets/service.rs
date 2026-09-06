@@ -25,6 +25,15 @@ impl AssetsService {
         Self { db, encryption_key }
     }
 
+    /// PMS-936: expose the shared `Database` handle so the routes layer
+    /// can run a small follow-up UPDATE (stamp `tickets.asset_id`
+    /// after `create_portal_ticket`) without duplicating the pool
+    /// wiring. Prefer the service's typed methods for anything
+    /// non-trivial.
+    pub fn db(&self) -> &Database {
+        &self.db
+    }
+
     // PMS-73 asset types ------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_asset_types(

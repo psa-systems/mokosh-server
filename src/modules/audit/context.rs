@@ -211,3 +211,49 @@ where
     )
     .await
 }
+
+/// PMS-729 phase 2 H10: portal-side analogue of [`audit_auth_event`].
+///
+/// Records portal login / logout / password reset / password change
+/// against the `portal_contact` entity_type so audit queries can tell
+/// staff (agent) auth events from client (portal) auth events. The
+/// acting principal is a `contacts` row, NOT a `users` row, so the
+/// existing `audit_auth_event` helper (which puts the actor in
+/// `user_id`) would silently drop the actor entirely. This helper
+/// leaves `user_id` NULL and puts the contact id in `entity_id`
+/// instead, and includes a small `new_values` bag with the reason /
+/// event subtype so admin queries can distinguish "portal.login" from
+/// "portal.login_failed" without adding a new AuditAction variant.
+pub async fn audit_portal_event<'e, E>(
+    exec: E,
+    tenant_id: Uuid,
+    contact_id: Option<Uuid>,
+    action: AuditAction,
+    subtype: &str,
+    ip: Option<String>,
+    user_agent: Option<String>,
+) -> AppResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let ctx = AuditCtx {
+        tenant_id: Some(tenant_id),
+        user_id: None,
+        ip,
+        user_agent,
+    };
+    audit_write(
+        exec,
+        // SAFETY (PMS-285): `tenant_id` is the row the portal service
+        // resolved from the login credential / refresh token; the audit
+        // row is written under the same scope so bridging is sound.
+        TenantId::from_trusted(tenant_id),
+        &ctx,
+        action,
+        "portal_contact",
+        contact_id,
+        None,
+        Some(serde_json::json!({ "event": subtype })),
+    )
+    .await
+}

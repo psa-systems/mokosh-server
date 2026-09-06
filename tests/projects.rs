@@ -868,6 +868,7 @@ async fn create_task_audit_failure_rolls_back_the_task(pool: PgPool) {
     let result = service
         .create_task(
             TenantId::from_trusted(common::DEFAULT_TENANT_ID),
+            "UTC",
             project_id,
             &req,
             &ctx,

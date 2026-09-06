@@ -198,7 +198,11 @@ async fn tickets_report(
     RequireReports { user: u, .. }: RequireReports,
     Query(q): Query<DateRange>,
 ) -> AppResult<Json<TicketsReportResponse>> {
-    Ok(Json(s.service.tickets(u.tenant(), q.from, q.to).await?))
+    Ok(Json(
+        s.service
+            .tickets(u.tenant(), &u.timezone, q.from, q.to)
+            .await?,
+    ))
 }
 
 async fn time_report(
@@ -206,7 +210,11 @@ async fn time_report(
     RequireReports { user: u, .. }: RequireReports,
     Query(q): Query<DateRange>,
 ) -> AppResult<Json<TimeReportResponse>> {
-    Ok(Json(s.service.time(u.tenant(), q.from, q.to).await?))
+    Ok(Json(
+        s.service
+            .time(u.tenant(), &u.timezone, q.from, q.to)
+            .await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -318,14 +326,14 @@ async fn export_report(
         ReportKind::Tickets => emit(
             format,
             descriptor,
-            &s.service.tickets(u.tenant(), q.from, q.to).await?,
+            &s.service.tickets(u.tenant(), &u.timezone, q.from, q.to).await?,
             csv_for_tickets,
             pdf_for_tickets,
         ),
         ReportKind::Time => emit(
             format,
             descriptor,
-            &s.service.time(u.tenant(), q.from, q.to).await?,
+            &s.service.time(u.tenant(), &u.timezone, q.from, q.to).await?,
             csv_for_time,
             pdf_for_time,
         ),
@@ -333,7 +341,7 @@ async fn export_report(
             format,
             descriptor,
             &s.service
-                .request_type_durations(u.tenant(), q.from, q.to)
+                .request_type_durations(u.tenant(), &u.timezone, q.from, q.to)
                 .await?,
             csv_for_request_types,
             pdf_for_request_types,
@@ -795,7 +803,7 @@ async fn request_types_report(
 ) -> AppResult<Json<crate::modules::reports::service::RequestTypeDurationsResponse>> {
     Ok(Json(
         s.service
-            .request_type_durations(u.tenant(), q.from, q.to)
+            .request_type_durations(u.tenant(), &u.timezone, q.from, q.to)
             .await?,
     ))
 }

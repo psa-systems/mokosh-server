@@ -14,5 +14,6 @@ mod models;
 mod routes;
 mod service;
 
+pub use models::ApprovalResponse;
 pub use routes::{approval_routes, ApprovalsRouterState};
 pub use service::ApprovalsService;

@@ -38,11 +38,7 @@ def check-workflow [] {
     mut errors = []
 
     let trigger_branches = ($workflow | get on.push.branches)
-    # TEMPORARY: `main` is commented out of `on.push.branches` in
-    # build-oci-image.yml while mokosh-contact-login is the only staging
-    # build. Drop the `["main"] ++` here for the same window; re-add both
-    # together to restore `:latest` from main.
-    let expected_branches = $allowed
+    let expected_branches = (["main"] ++ $allowed)
     if ($trigger_branches | sort) != ($expected_branches | sort) {
         $errors = ($errors | append $"($WORKFLOW): push trigger builds ($trigger_branches | str join ', '); the allow-list says ($expected_branches | str join ', ')")
     }

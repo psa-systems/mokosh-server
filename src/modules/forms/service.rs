@@ -15,6 +15,7 @@ use super::models::{
     CreateFormDefinitionRequest, CreateFormFieldRequest, FieldType, FormDefinitionResponse,
     FormFieldResponse, FormRule, FormSubmissionResponse, UpdateFormDefinitionRequest,
 };
+use super::validation::validate_submission;
 use crate::db::{Database, TenantTransaction};
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult, FieldError};
@@ -390,6 +391,218 @@ impl FormsService {
     // retired as unconsumed, `is_active` is how an operator stops collecting,
     // and `submit_via_request_link` is now the only writer of
     // `form_submissions`.
+
+    /// PMS-729 phase 2 §7 slice B / I8: list every portal-visible active
+    /// form for a tenant. `portal_visible = TRUE AND is_active = TRUE`;
+    /// a retired form or one flagged internal-only stays out of the
+    /// picker.
+    pub async fn list_portal_forms(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<Vec<super::models::PortalFormListItem>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, name, slug, description
+            FROM form_definitions
+            WHERE tenant_id = $1
+              AND is_active = TRUE
+              AND portal_visible = TRUE
+            ORDER BY name ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, name, slug, description)| super::models::PortalFormListItem {
+                    id,
+                    name,
+                    slug,
+                    description,
+                },
+            )
+            .collect())
+    }
+
+    /// PMS-729 phase 2 §7 slice B / I8: fetch the client-facing view of
+    /// one portal-visible form. Retired / non-portal forms surface as
+    /// 404 so the endpoint cannot be used to enumerate internal forms.
+    pub async fn get_portal_form(
+        &self,
+        tenant_id: TenantId,
+        form_id: Uuid,
+    ) -> AppResult<super::models::PublicFormResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM form_definitions
+                WHERE tenant_id = $1 AND id = $2
+                  AND is_active = TRUE AND portal_visible = TRUE
+            )
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(form_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if !exists {
+            return Err(AppError::NotFound("Form".to_string()));
+        }
+        // The full definition is already scoped by tenant on `get`, and
+        // the portal shape drops ids / timestamps via the same
+        // `public_form_from_definition` helper the public magic-link
+        // path uses in `super::service::public_form_for_token` (which is
+        // just `get(...)` re-wrapped for the token flow, so we reuse
+        // `get` directly here).
+        let def = self.get(tenant_id, form_id).await?;
+        // MAPPS-429 + PMS-748: the wire shape needs tenant name / contact /
+        // logo. The portal SPA already carries branding from `/portal/host`
+        // so it never renders these three fields, but the shared type
+        // requires them; load the org identity the same way the magic-link
+        // path does so the payload stays a superset that a future portal
+        // surface (or SDK consumer) can render if it wants.
+        let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
+        let contact_info = def.contact_info.clone().or_else(|| org.phrase());
+        Ok(super::models::PublicFormResponse {
+            name: def.name,
+            description: def.description,
+            tenant_name: org.name().to_string(),
+            contact_info,
+            logo_url: org.logo_path().map(str::to_string),
+            rules: def.rules,
+            fields: def
+                .fields
+                .into_iter()
+                .map(|f| super::models::PublicFormField {
+                    name: f.name,
+                    label: f.label,
+                    help_text: f.help_text,
+                    field_type: f.field_type,
+                    is_required: f.is_required,
+                    min_length: f.min_length,
+                    max_length: f.max_length,
+                    options: f.options,
+                    date_not_in_past: f.date_not_in_past,
+                })
+                .collect(),
+        })
+    }
+
+    /// PMS-729 phase 2 §7 slice B / I8: submit a portal-visible form on
+    /// behalf of a portal contact. Same validation as the public
+    /// magic-link path, but the submitter identity comes from the
+    /// authenticated portal session (`contact_id`, `company_id`), not a
+    /// resolved token, and there is no rate limiter here because the
+    /// portal auth middleware already gates access.
+    ///
+    /// Opens a ticket via `TicketService::create_portal_ticket`, which
+    /// picks a fallback admin as `created_by_id` so the ticket's
+    /// NOT-NULL FK to `users` is satisfied even though the caller is a
+    /// contact. Returns the ticket number the customer can quote.
+    pub async fn submit_portal_form(
+        &self,
+        tenant_id: TenantId,
+        form_id: Uuid,
+        company_id: Uuid,
+        contact_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> AppResult<super::models::PublicSubmissionReceipt> {
+        // Preflight: form must exist AND be portal-visible AND active.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM form_definitions
+                WHERE tenant_id = $1 AND id = $2
+                  AND is_active = TRUE AND portal_visible = TRUE
+            )
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(form_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if !exists {
+            return Err(AppError::NotFound("Form".to_string()));
+        }
+
+        let definition = self.get(tenant_id, form_id).await?;
+        let normalised = validate_submission(
+            &definition.fields,
+            &definition.rules,
+            payload,
+            Utc::now().date_naive(),
+        )?;
+
+        // Persist the submission first so we can link a ticket to it.
+        let submission_id = Uuid::new_v4();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "INSERT INTO form_submissions \
+               (id, tenant_id, form_definition_id, payload, submitted_by_contact_id) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(submission_id)
+        .bind(tenant_id)
+        .bind(form_id)
+        .bind(serde_json::Value::Object(normalised.clone()))
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let Some(tickets) = self.tickets.as_ref() else {
+            return Err(AppError::Internal(
+                "no ticket service wired into the forms service".to_string(),
+            ));
+        };
+
+        // Ticket title / body come out of the same helpers PMS-730 uses
+        // for the magic-link path so an agent picking up a portal-form
+        // ticket sees the same shape.
+        let title = format!(
+            "{}: {}",
+            definition.name,
+            super::request_links::summarise(&definition, &normalised)
+        );
+        let description = Some(super::request_links::render_answers(
+            &definition,
+            &normalised,
+        ));
+        let ticket = tickets
+            .create_portal_ticket(
+                tenant_id,
+                company_id,
+                contact_id,
+                title,
+                description,
+                None,
+                None,
+            )
+            .await?;
+
+        // Link the submission to the ticket so the portal ticket
+        // detail can show "from form X" later.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query("UPDATE form_submissions SET ticket_id = $3 WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(submission_id)
+            .bind(ticket.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        Ok(super::models::PublicSubmissionReceipt {
+            ticket_number: ticket.ticket_number,
+        })
+    }
 
     pub async fn list_submissions(
         &self,

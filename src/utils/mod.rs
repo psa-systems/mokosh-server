@@ -14,6 +14,7 @@ pub mod email;
 pub mod error;
 pub mod geoip;
 pub mod html;
+pub mod login_location;
 // PMS-941: the one image allowlist every publicly-readable image route shares
 // (tenant logo, KB article image, ticket inline image). SVG is refused there.
 pub mod inline_image;
@@ -21,6 +22,10 @@ pub mod inline_image;
 // login-location check and by the website probe's SSRF guard.
 pub mod net;
 pub mod pagination;
+// PMS-729 phase 2 H5: shared password-strength policy consumed by every
+// portal password write site (setup, reset, change). Agent surface will
+// migrate onto this in a follow-up.
+pub mod password_policy;
 #[cfg(feature = "server")]
 pub mod security_headers;
 // TOTP (RFC 6238) + MFA recovery codes for the legacy HS256 auth flow.

@@ -80,18 +80,59 @@ impl TestApp {
 /// `common::` and not every one seeds a company.
 #[allow(dead_code)]
 pub async fn seed_company(pool: &PgPool) -> Uuid {
+    seed_company_named(pool, "Acme Co").await
+}
+
+/// `idx_companies_tenant_name_unique` is on `(tenant_id, lower(btrim(name)))`,
+/// so a test needing a second company has to name it.
+#[allow(dead_code)]
+pub async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
         INSERT INTO companies (id, tenant_id, name)
-        VALUES ($1, $2, 'Acme Co')
+        VALUES ($1, $2, $3)
         "#,
     )
     .bind(id)
     .bind(DEFAULT_TENANT_ID)
+    .bind(name)
     .execute(pool)
     .await
     .expect("seed test company");
+    id
+}
+
+/// PMS-993: seed a contact of `company_id` and make it the company's billing
+/// contact. An invoice cannot reach `sent` without one, so every fixture that
+/// sends has to point its company at somebody. Returns the contact id.
+///
+/// Deliberately NOT folded into `seed_company`: that helper has call sites in
+/// most test binaries and several of them assert a company's contact count.
+#[allow(dead_code)]
+pub async fn seed_billing_contact(pool: &PgPool, company_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO contacts (
+            id, tenant_id, company_id, first_name, last_name, email, contact_type
+        )
+        VALUES ($1, $2, $3, 'Billing', 'Contact', $4, 'billing')
+        "#,
+    )
+    .bind(id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(format!("billing.{id}@example.com"))
+    .execute(pool)
+    .await
+    .expect("seed billing contact");
+    sqlx::query("UPDATE companies SET default_billing_contact_id = $1 WHERE id = $2")
+        .bind(id)
+        .bind(company_id)
+        .execute(pool)
+        .await
+        .expect("point company at its billing contact");
     id
 }
 
@@ -169,7 +210,7 @@ pub fn dec(s: &str) -> Decimal {
 ///
 /// Nine suites used to name a fixed path under `/tmp` (`/tmp/mokosh-pms923-test`
 /// and friends). `/tmp` is world-writable with the sticky bit, so whichever OS
-/// user ran the suite FIRST on a host owned that directory, and `LocalStore`
+/// user ran the suite FIRST on a host owned that directory, and `LocalProvider`
 /// created it with that process's umask. A second user on the same host then
 /// could not write into it, `StorageConfig` failed with `Permission denied`,
 /// and the API surfaced a 500 - which reads as a defect in the storage seam and
@@ -300,7 +341,7 @@ async fn boot_with_db(
     app_pool: Option<PgPool>,
     bunyip: Option<mokosh_server::modules::auth::oidc_rs::Verifier>,
 ) -> TestApp {
-    // PMS-958: the object store is process-wide and built on first use, so
+    // PMS-958: the object provider is process-wide and built on first use, so
     // the root has to be chosen before anything in this binary can ask for
     // it. Every suite that stores bytes already calls this itself; doing it
     // here as well means a suite that never touches storage cannot pin the
@@ -324,12 +365,12 @@ async fn boot_with_db(
     let mailer = Arc::new(SharedMailer::new(Arc::new(LogMailer)));
     let mailer_handle = mailer.clone();
     let encryption_key = [0u8; 32];
-    // PMS-968: the database backend under the same zero key the router is
+    // PMS-968: the database provider under the same zero key the router is
     // given, so a suite that stores a gateway credential can read it back.
-    // Deliberately not `store_from_env`: process env is shared across the cases
+    // Deliberately not `provider_from_env`: process env is shared across the cases
     // in a binary, so reading SECRET_BACKEND here would let one suite's
     // configuration decide another's.
-    let secrets = std::sync::Arc::new(mokosh_server::secrets::DatabaseSecretStore::new(
+    let secrets = std::sync::Arc::new(mokosh_server::secrets::DatabaseSecretProvider::new(
         db.clone(),
         encryption_key,
     ));
@@ -360,6 +401,10 @@ async fn boot_with_db(
         // MAPPS-429: a public API base IS configured here, so the request-form
         // suite can assert an emailed logo resolves absolutely.
         Some("http://api.localhost".to_string()),
+        // MAPPS-457: default test router has no tenant cap so integration
+        // suites that spin up dozens of tenants stay unblocked. Cap-behavior
+        // specs override this by building their own router.
+        None,
         // PMS-904: self-hosted, so the integration suite exercises the mode
         // that sends everything. The suppression is a unit test on
         // `AuthService`, which can hold both modes in one binary; flipping the
@@ -428,6 +473,23 @@ pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     .execute(pool)
     .await
     .expect("insert seeded admin");
+
+    // MAPPS-518 (MAPPS-513 stage B): also seed a `platform_admins` row
+    // for the same email + password so tests that hit endpoints gated
+    // by `RequirePlatformAdmin` (post stage B: list/create/suspend/
+    // activate/resend_welcome tenants, get/update tenant admin) can
+    // call `common::platform_login` to get a platform bearer. Older
+    // tests that just use `common::login` still work; the users row
+    // is unchanged.
+    sqlx::query(
+        "INSERT INTO platform_admins (email, password_hash, first_name, last_name, status) \
+         VALUES ($1, $2, 'Test', 'Admin', 'active') ON CONFLICT DO NOTHING",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(pool)
+    .await
+    .expect("insert seeded platform admin");
 
     (user_id, email, password)
 }
@@ -564,10 +626,20 @@ pub async fn seed_tenant_with_admin(
 /// [`seed_admin`]: not every integration-test binary authenticates.
 #[allow(dead_code)]
 pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
+    // PMS-728 AC1: the local password path rejects a credential presented
+    // without an explicit tenant identifier. This helper backs the whole
+    // suite's default-admin login path (which uses `seed_admin`, populating
+    // the default tenant, slug `default`, seeded by migration 002), so
+    // threading the slug in here keeps the change localised: the callers
+    // don't need to know the tenant lookup semantics.
     let resp = app
         .client
         .post(app.url("/api/v1/auth/login"))
-        .json(&serde_json::json!({ "email": email, "password": password }))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": "default",
+        }))
         .send()
         .await
         .expect("send /login request");
@@ -580,5 +652,243 @@ pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
     body["access_token"]
         .as_str()
         .expect("login response has access_token")
+        .to_string()
+}
+
+/// MAPPS-518 (MAPPS-513 stage B): drive `POST /api/v1/platform/login`
+/// and return the platform bearer. `seed_admin` seeds a matching
+/// `platform_admins` row so this works with the same email/password
+/// pair. Use this for tests that hit endpoints gated by
+/// `RequirePlatformAdmin` (list_tenants, create_tenant,
+/// suspend_tenant, activate_tenant, resend_admin_welcome,
+/// get_tenant_admin, update_tenant_admin).
+#[allow(dead_code)]
+pub async fn platform_login(app: &TestApp, email: &str, password: &str) -> String {
+    let resp = app
+        .client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&serde_json::json!({ "email": email, "password": password }))
+        .send()
+        .await
+        .expect("send /platform/login request");
+    assert!(
+        resp.status().is_success(),
+        "platform login expected 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("/platform/login JSON body");
+    body["access_token"]
+        .as_str()
+        .expect("platform login response has access_token")
+        .to_string()
+}
+
+/// PMS-791 / MAPPS-461: seed a team owned by the given tenant. Returns the
+/// team id. `manager_id` is optional; when set, the caller has typically
+/// just `seed_user`-ed that user in the same tenant.
+#[allow(dead_code)]
+pub async fn seed_team(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    name: &str,
+    manager_id: Option<Uuid>,
+) -> Uuid {
+    let team_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO teams (id, tenant_id, name, manager_id, color, is_active)
+        VALUES ($1, $2, $3, $4, '#6366F1', TRUE)
+        "#,
+    )
+    .bind(team_id)
+    .bind(tenant_id)
+    .bind(name)
+    .bind(manager_id)
+    .execute(pool)
+    .await
+    .expect("seed_team");
+    team_id
+}
+
+/// PMS-791 / MAPPS-461: add a user to a team with the given role
+/// (`"leader"` or `"member"`). Bypass the production service so tests
+/// can set up invalid states on purpose (e.g. wrong-tenant user_id).
+#[allow(dead_code)]
+pub async fn seed_team_member(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    team_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+) {
+    sqlx::query(
+        r#"
+        INSERT INTO team_members (tenant_id, team_id, user_id, role, joined_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(team_id)
+    .bind(user_id)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("seed_team_member");
+}
+
+/// PMS-791 / MAPPS-461: shorthand for the common test setup — an admin
+/// (via `seed_admin`) + a team + the admin as leader. Returns
+/// `(admin_id, admin_email, admin_password, team_id)`.
+#[allow(dead_code)]
+pub async fn seed_admin_and_team(pool: &PgPool, team_name: &str) -> (Uuid, String, String, Uuid) {
+    let (admin_id, email, password) = seed_admin(pool).await;
+    let team_id = seed_team(pool, DEFAULT_TENANT_ID, team_name, Some(admin_id)).await;
+    seed_team_member(pool, DEFAULT_TENANT_ID, team_id, admin_id, "leader").await;
+    (admin_id, email, password, team_id)
+}
+
+/// PMS-1031: a portal identity on the contact plane (PMS-1025). The plane
+/// replaced `/api/v1/portal`: a contact signs in at
+/// `POST /api/v1/contact/auth/login` addressing its company by
+/// `companies.portal_slug` (or `portal_id`), and what it may then do on the
+/// dual-plane `/api/v1/*` routes is the union of its portal roles'
+/// capabilities (migration 171 seeds `Billing Contact`, `Support Contact`
+/// and `Read-Only`; `tests/contact_scope.rs` walks the matrix).
+#[allow(dead_code)]
+pub const CONTACT_PASSWORD: &str = "Kq7$mZ2n#PxR9wLf";
+
+/// A seeded portal contact: what a suite needs to sign it in.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct PortalContact {
+    pub id: Uuid,
+    pub company_id: Uuid,
+    pub email: String,
+    /// The company's `portal_slug`, minted here when the company had none.
+    pub slug: String,
+}
+
+/// Seed a portal contact under `DEFAULT_TENANT_ID` with the named built-in
+/// roles. Password is [`CONTACT_PASSWORD`].
+#[allow(dead_code)]
+pub async fn seed_portal_contact(
+    pool: &PgPool,
+    company_id: Uuid,
+    email: &str,
+    role_names: &[&str],
+) -> PortalContact {
+    seed_portal_contact_in_tenant(pool, DEFAULT_TENANT_ID, company_id, email, role_names).await
+}
+
+/// [`seed_portal_contact`] under a caller-picked tenant, for the
+/// cross-tenant cases. The contact row is written the way
+/// `ContactService::grant_portal_access` leaves it (`is_portal_user`, a
+/// password hash, a role assignment per role), without the setup mail.
+#[allow(dead_code)]
+pub async fn seed_portal_contact_in_tenant(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    email: &str,
+    role_names: &[&str],
+) -> PortalContact {
+    let minted = format!("co-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let slug: String = sqlx::query_scalar(
+        "UPDATE companies SET portal_slug = COALESCE(portal_slug, $2) \
+         WHERE id = $1 AND tenant_id = $3 RETURNING portal_slug",
+    )
+    .bind(company_id)
+    .bind(&minted)
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await
+    .expect("stamp portal_slug on the company");
+
+    let id = Uuid::new_v4();
+    let hash = mokosh_server::utils::crypto::hash_password(CONTACT_PASSWORD)
+        .expect("hash the contact password");
+    sqlx::query(
+        "INSERT INTO contacts \
+            (id, tenant_id, company_id, first_name, last_name, email, \
+             is_portal_user, portal_password_hash) \
+         VALUES ($1, $2, $3, 'Portal', 'Contact', $4, TRUE, $5)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(company_id)
+    .bind(email)
+    .bind(&hash)
+    .execute(pool)
+    .await
+    .expect("seed portal contact");
+
+    for name in role_names {
+        let role_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM portal_roles WHERE tenant_id = $1 AND name = $2")
+                .bind(tenant_id)
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|e| panic!("read portal role {name}: {e}"));
+        sqlx::query(
+            "INSERT INTO contact_role_assignments (contact_id, role_id, tenant_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(id)
+        .bind(role_id)
+        .bind(tenant_id)
+        .execute(pool)
+        .await
+        .expect("assign portal role");
+    }
+
+    PortalContact {
+        id,
+        company_id,
+        email: email.to_string(),
+        slug,
+    }
+}
+
+/// `POST /api/v1/contact/auth/login` for the contact, with the given
+/// password, returning the raw response so a suite can assert a refusal.
+#[allow(dead_code)]
+pub async fn contact_login_response(
+    app: &TestApp,
+    contact: &PortalContact,
+    password: &str,
+) -> reqwest::Response {
+    app.client
+        .post(app.url("/api/v1/contact/auth/login"))
+        .json(&serde_json::json!({
+            "slug": contact.slug,
+            "email": contact.email,
+            "password": password,
+        }))
+        .send()
+        .await
+        .expect("send contact login")
+}
+
+/// Sign the contact in and return the login body (`access_token`,
+/// `refresh_token`, `expires_at`, `contact`).
+#[allow(dead_code)]
+pub async fn contact_login(app: &TestApp, contact: &PortalContact) -> serde_json::Value {
+    let resp = contact_login_response(app, contact, CONTACT_PASSWORD).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "contact login must 200 for {}",
+        contact.email
+    );
+    resp.json().await.expect("contact login JSON")
+}
+
+/// Sign the contact in and return the bearer for the dual-plane routes.
+#[allow(dead_code)]
+pub async fn contact_token(app: &TestApp, contact: &PortalContact) -> String {
+    contact_login(app, contact).await["access_token"]
+        .as_str()
+        .expect("access_token in contact login")
         .to_string()
 }

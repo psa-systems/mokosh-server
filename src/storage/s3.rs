@@ -1,4 +1,4 @@
-//! PMS-958: the S3-compatible backend behind [`ObjectStore`].
+//! PMS-958: the S3-compatible provider behind [`ObjectProvider`].
 //!
 //! No client crate. The trait needs five operations (`PUT`, `GET`, `HEAD`,
 //! `DELETE`, and a `PUT` with `x-amz-copy-source` for the atomic `rename`), no
@@ -23,7 +23,7 @@
 //! Credentials are operator env, per the rule PMS-912 settled: a credential
 //! that belongs to the deployment lives beside `INFISICAL_CLIENT_SECRET` and
 //! `SMTP_PASSWORD`, and only a credential that belongs to a tenant goes in the
-//! `SecretStore`. Storage is per deployment. A per-tenant bucket later is a
+//! `SecretProvider`. Storage is per deployment. A per-tenant bucket later is a
 //! lookup of `(bucket, credentials)` by tenant in front of these same five
 //! requests, because the key already carries the tenant.
 //!
@@ -42,7 +42,7 @@ use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
 use url::Url;
 
-use super::{ObjectKey, ObjectReader, ObjectStore};
+use super::{ObjectKey, ObjectProvider, ObjectReader};
 use crate::utils::error::{AppError, AppResult};
 
 /// The hash of an empty body, which every request without one carries as
@@ -164,21 +164,21 @@ fn validate_bucket_name(bucket: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// The S3-compatible backend.
-pub struct S3Store {
+/// The S3-compatible provider.
+pub struct S3Provider {
     config: S3Config,
     http: Client,
 }
 
-impl fmt::Debug for S3Store {
+impl fmt::Debug for S3Provider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("S3Store")
+        f.debug_struct("S3Provider")
             .field("config", &self.config)
             .finish()
     }
 }
 
-impl S3Store {
+impl S3Provider {
     pub fn new(config: S3Config) -> AppResult<Self> {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -200,7 +200,7 @@ impl S3Store {
         &self.config
     }
 
-    /// The key on the wire: the same relative path the local backend uses and
+    /// The key on the wire: the same relative path the local provider uses and
     /// the ledger records, with `/` between the segments whatever the host OS.
     pub fn object_key(key: &ObjectKey) -> AppResult<String> {
         let path = key.relative_path()?;
@@ -325,7 +325,7 @@ async fn unexpected(op: &str, status: StatusCode, response: Response) -> AppErro
 }
 
 #[async_trait]
-impl ObjectStore for S3Store {
+impl ObjectProvider for S3Provider {
     async fn put(&self, key: &ObjectKey, bytes: &[u8]) -> AppResult<()> {
         let object_key = Self::object_key(key)?;
         let response = self
@@ -348,7 +348,7 @@ impl ObjectStore for S3Store {
                 .await
                 .map(|b| b.to_vec())
                 .map_err(|e| AppError::Internal(format!("S3 read failed: {e}"))),
-            // The local backend answers a missing file with `NotFound`, and
+            // The local provider answers a missing file with `NotFound`, and
             // two callers lean on that to fall back to the legacy KB path.
             StatusCode::NOT_FOUND => Err(AppError::NotFound("object not found".to_string())),
             status => Err(unexpected("get", status, response).await),
@@ -378,7 +378,7 @@ impl ObjectStore for S3Store {
             .request(Method::DELETE, Some(&object_key), &[], Vec::new())
             .await?;
         match response.status() {
-            // Best-effort, like the local backend: a missing object says the
+            // Best-effort, like the local provider: a missing object says the
             // same thing as a deleted one.
             StatusCode::NO_CONTENT | StatusCode::OK | StatusCode::NOT_FOUND => Ok(()),
             status => Err(unexpected("delete", status, response).await),
@@ -698,8 +698,8 @@ mod tests {
         ("S3_SECRET_ACCESS_KEY", "secret"),
     ];
 
-    fn store(pairs: &[(&str, &str)]) -> S3Store {
-        S3Store::new(S3Config::parse(vars(pairs)).expect("config")).expect("client")
+    fn provider(pairs: &[(&str, &str)]) -> S3Provider {
+        S3Provider::new(S3Config::parse(vars(pairs)).expect("config")).expect("client")
     }
 
     /// The key on the wire is the pinned local layout with `/` between the
@@ -707,27 +707,27 @@ mod tests {
     #[test]
     fn the_key_is_the_local_layout_with_slashes() {
         assert_eq!(
-            S3Store::object_key(&ObjectKey::ticket_attachment(TENANT, OBJECT)).unwrap(),
+            S3Provider::object_key(&ObjectKey::ticket_attachment(TENANT, OBJECT)).unwrap(),
             format!("{TENANT}/{OBJECT}")
         );
         assert_eq!(
-            S3Store::object_key(&ObjectKey::tenant_logo(TENANT, "png")).unwrap(),
+            S3Provider::object_key(&ObjectKey::tenant_logo(TENANT, "png")).unwrap(),
             format!("tenant-logos/{TENANT}.png")
         );
         assert_eq!(
-            S3Store::object_key(&ObjectKey::kb_attachment(TENANT, OBJECT)).unwrap(),
+            S3Provider::object_key(&ObjectKey::kb_attachment(TENANT, OBJECT)).unwrap(),
             format!("{TENANT}/kb-articles/{OBJECT}")
         );
         assert_eq!(
-            S3Store::object_key(&ObjectKey::legacy_kb_attachment(TENANT, OBJECT)).unwrap(),
+            S3Provider::object_key(&ObjectKey::legacy_kb_attachment(TENANT, OBJECT)).unwrap(),
             format!("kb-articles/{OBJECT}")
         );
         assert_eq!(
-            S3Store::object_key(&ObjectKey::financial_document(TENANT, OBJECT)).unwrap(),
+            S3Provider::object_key(&ObjectKey::financial_document(TENANT, OBJECT)).unwrap(),
             format!("{TENANT}/documents/{OBJECT}")
         );
         assert_eq!(
-            S3Store::object_key(&ObjectKey::branding_logo(TENANT, DIGEST)).unwrap(),
+            S3Provider::object_key(&ObjectKey::branding_logo(TENANT, DIGEST)).unwrap(),
             format!("{TENANT}/branding/{DIGEST}")
         );
     }
@@ -757,8 +757,8 @@ mod tests {
             ),
         ] {
             assert_ne!(
-                S3Store::object_key(&mine).unwrap(),
-                S3Store::object_key(&theirs).unwrap()
+                S3Provider::object_key(&mine).unwrap(),
+                S3Provider::object_key(&theirs).unwrap()
             );
         }
     }
@@ -769,7 +769,7 @@ mod tests {
     fn a_hostile_extension_is_refused_before_it_becomes_a_key() {
         for hostile in ["../x", "a/b", "", &"a".repeat(17)] {
             assert!(
-                S3Store::object_key(&ObjectKey::tenant_logo(TENANT, hostile)).is_err(),
+                S3Provider::object_key(&ObjectKey::tenant_logo(TENANT, hostile)).is_err(),
                 "{hostile:?} must be refused"
             );
         }
@@ -777,7 +777,7 @@ mod tests {
 
     #[test]
     fn path_style_puts_the_bucket_in_the_path() {
-        let s = store(FULL);
+        let s = provider(FULL);
         let (url, host) = s.url_for(Some("tenant-logos/x.png")).unwrap();
         assert_eq!(url.as_str(), "http://minio:9000/mokosh/tenant-logos/x.png");
         assert_eq!(host, "minio:9000");
@@ -790,7 +790,7 @@ mod tests {
         let mut pairs = FULL.to_vec();
         pairs.push(("S3_PATH_STYLE", "false"));
         pairs[0] = ("S3_ENDPOINT", "https://s3.us-west-2.amazonaws.com");
-        let s = store(&pairs);
+        let s = provider(&pairs);
         let (url, host) = s.url_for(Some("a/b")).unwrap();
         assert_eq!(
             url.as_str(),
@@ -808,7 +808,7 @@ mod tests {
     fn an_endpoint_with_a_path_prefix_keeps_it() {
         let mut pairs = FULL.to_vec();
         pairs[0] = ("S3_ENDPOINT", "https://storage.example/s3/");
-        let s = store(&pairs);
+        let s = provider(&pairs);
         let (url, _) = s.url_for(Some("a/b")).unwrap();
         assert_eq!(url.as_str(), "https://storage.example/s3/mokosh/a/b");
     }
@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn the_secret_does_not_reach_a_debug_line() {
-        let s = store(FULL);
+        let s = provider(FULL);
         let debug = format!("{s:?}");
         assert!(!debug.contains("secret\""), "{debug}");
         assert!(debug.contains("<redacted>"));
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn the_location_names_the_bucket_and_the_key() {
-        let s = store(FULL);
+        let s = provider(FULL);
         assert_eq!(
             s.location(&ObjectKey::ticket_attachment(TENANT, OBJECT))
                 .unwrap(),

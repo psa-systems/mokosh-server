@@ -308,6 +308,15 @@ impl QaSeeder {
             primary_contact.push(first.expect("each company seeds >=1 contact"));
         }
 
+        // PMS-993: every seeded company gets a billing contact, because an
+        // invoice can no longer be sent without one and this dataset sends one.
+        // `CreateCompanyRequest` has never carried the pointer, so it is set
+        // here rather than folded into `qa_company_specs`.
+        for (&company_id, &contact_id) in company_ids.iter().zip(primary_contact.iter()) {
+            self.set_billing_contact(tid, company_id, contact_id)
+                .await?;
+        }
+
         // --- Tickets (paginating primary list, every status/priority/date) ---
         let now = Utc::now();
         for i in 0..QA_TICKET_COUNT {
@@ -351,7 +360,7 @@ impl QaSeeder {
 
                 for task_spec in qa_task_specs(pi, phase.id, task_status_id, user_id) {
                     self.projects
-                        .create_task(tenant, project.id, &task_spec, &ctx)
+                        .create_task(tenant, "UTC", project.id, &task_spec, &ctx)
                         .await?;
                     report.tasks += 1;
                 }
@@ -438,6 +447,7 @@ impl QaSeeder {
                 tenant,
                 credited.id,
                 &UpdateInvoiceRequest {
+                    tax_rate_id: None,
                     billing_contact_id: None,
                     contract_id: None,
                     invoice_date: None,
@@ -457,7 +467,7 @@ impl QaSeeder {
             )
             .await?;
         self.billing
-            .create_credit_note(tenant, &qa_credit_note_spec(credited.id), &ctx)
+            .create_credit_note(tenant, "UTC", &qa_credit_note_spec(credited.id), &ctx)
             .await?;
         report.credit_notes += 1;
 
@@ -621,6 +631,29 @@ impl QaSeeder {
                 .fetch_all(&mut *tx)
                 .await?;
         Ok(ids)
+    }
+
+    /// PMS-993: point a seeded company at its billing contact. Written
+    /// directly because `CreateCompanyRequest` does not carry the pointer and
+    /// `update_company` would need the whole request struct restated.
+    async fn set_billing_contact(
+        &self,
+        tid: Uuid,
+        company_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tid).await?;
+        sqlx::query(
+            "UPDATE companies SET default_billing_contact_id = $1, updated_at = NOW() \
+             WHERE tenant_id = $2 AND id = $3",
+        )
+        .bind(contact_id)
+        .bind(tid)
+        .bind(company_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Spread a freshly-created ticket across a non-default status and a past
@@ -1151,6 +1184,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
     vec![
         (
             CreateInvoiceRequest {
+                tax_rate_id: None,
                 company_id: company_a,
                 billing_contact_id: None,
                 contract_id: None,
@@ -1165,6 +1199,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                 po_number: Some("QA-PO-1".to_string()),
                 lines: vec![
                     CreateInvoiceLineRequest {
+                        is_taxable: true,
                         product_id: None,
                         line_type: InvoiceLineType::Service,
                         description: "QA-Managed services - June".to_string(),
@@ -1175,6 +1210,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                         sort_order: 1,
                     },
                     CreateInvoiceLineRequest {
+                        is_taxable: true,
                         product_id: None,
                         line_type: InvoiceLineType::TimeEntry,
                         description: "QA-Onsite support hours".to_string(),
@@ -1190,6 +1226,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
         ),
         (
             CreateInvoiceRequest {
+                tax_rate_id: None,
                 company_id: company_b,
                 billing_contact_id: None,
                 contract_id: None,
@@ -1204,6 +1241,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                 po_number: Some("QA-PO-2".to_string()),
                 lines: vec![
                     CreateInvoiceLineRequest {
+                        is_taxable: true,
                         product_id: None,
                         line_type: InvoiceLineType::Product,
                         description: "QA-Firewall appliance".to_string(),
@@ -1214,6 +1252,7 @@ fn qa_invoice_specs(company_ids: &[Uuid]) -> Vec<(CreateInvoiceRequest, Option<D
                         sort_order: 1,
                     },
                     CreateInvoiceLineRequest {
+                        is_taxable: true,
                         product_id: None,
                         line_type: InvoiceLineType::Service,
                         description: "QA-Installation".to_string(),
@@ -1355,6 +1394,9 @@ fn qa_appointment_specs(
                 timezone: "UTC".to_string(),
                 location: Some("Client site".to_string()),
                 recurrence_rule: None,
+                // PMS-791 phase 3: QA seed leaves team_id empty; QA
+                // tenants have no teams provisioned yet.
+                team_id: None,
             }
         })
         .collect()
@@ -1406,6 +1448,7 @@ fn qa_credited_invoice_spec(
 ) -> CreateInvoiceRequest {
     let company = company_ids.first().copied().unwrap_or_default();
     CreateInvoiceRequest {
+        tax_rate_id: None,
         company_id: company,
         billing_contact_id: None,
         contract_id: None,
@@ -1419,6 +1462,7 @@ fn qa_credited_invoice_spec(
         notes: Some("QA seed invoice (sent, then partly credited).".to_string()),
         po_number: Some("QA-PO-3".to_string()),
         lines: vec![CreateInvoiceLineRequest {
+            is_taxable: true,
             // PMS-955: the one seeded line that names a catalog row, so the
             // dataset carries a sold product and not only free-text lines.
             product_id,

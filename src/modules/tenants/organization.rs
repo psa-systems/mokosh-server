@@ -53,6 +53,10 @@ pub fn organization_update(request: &OrganizationProfileRequest) -> AppResult<Up
 
     Ok(UpdateTenantRequest {
         name: Some(name),
+        // The organisation submission never renames the tenant's portal
+        // slug (MAPPS-449 owns that surface); pass `None` so the update
+        // is a no-op for the slug column.
+        slug: None,
         billing_email: None,
         billing_contact_name: None,
         settings: None,

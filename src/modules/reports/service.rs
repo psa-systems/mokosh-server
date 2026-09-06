@@ -145,12 +145,17 @@ impl ReportsService {
     pub async fn tickets(
         &self,
         tenant_id: TenantId,
+        user_tz: &str,
         from: Option<NaiveDate>,
         to: Option<NaiveDate>,
     ) -> AppResult<TicketsReportResponse> {
+        // PMS-1027: the default window ends on the caller's today, the day
+        // `dashboard` above already uses, so two reports on one screen agree
+        // about whether today's tickets are in.
+        let today = mokosh_types::datetime::user_today(chrono::Utc::now(), user_tz);
         let (from, to) = (
-            from.unwrap_or_else(|| chrono::Utc::now().date_naive() - chrono::Duration::days(30)),
-            to.unwrap_or_else(|| chrono::Utc::now().date_naive()),
+            from.unwrap_or_else(|| today - chrono::Duration::days(30)),
+            to.unwrap_or(today),
         );
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let opened: Vec<(String, i64)> = sqlx::query_as(
@@ -209,12 +214,15 @@ impl ReportsService {
     pub async fn time(
         &self,
         tenant_id: TenantId,
+        user_tz: &str,
         from: Option<NaiveDate>,
         to: Option<NaiveDate>,
     ) -> AppResult<TimeReportResponse> {
+        // PMS-1027: same rule as `tickets`.
+        let today = mokosh_types::datetime::user_today(chrono::Utc::now(), user_tz);
         let (from, to) = (
-            from.unwrap_or_else(|| chrono::Utc::now().date_naive() - chrono::Duration::days(30)),
-            to.unwrap_or_else(|| chrono::Utc::now().date_naive()),
+            from.unwrap_or_else(|| today - chrono::Duration::days(30)),
+            to.unwrap_or(today),
         );
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let by_user: Vec<(Uuid, i64)> = sqlx::query_as(
@@ -667,10 +675,12 @@ impl ReportsService {
     pub async fn request_type_durations(
         &self,
         tenant_id: TenantId,
+        user_tz: &str,
         from: Option<NaiveDate>,
         to: Option<NaiveDate>,
     ) -> AppResult<RequestTypeDurationsResponse> {
-        let today = chrono::Utc::now().date_naive();
+        // PMS-1027: same rule as `tickets`.
+        let today = mokosh_types::datetime::user_today(chrono::Utc::now(), user_tz);
         let (from, to) = (
             from.unwrap_or_else(|| month_start(today)),
             to.unwrap_or(today),

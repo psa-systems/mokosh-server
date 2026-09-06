@@ -65,6 +65,7 @@ fn login_request(
         approval_code: approval_code.map(str::to_string),
         device_id: Some(device_id.to_string()),
         tenant_id: Some(common::DEFAULT_TENANT_ID),
+        tenant_slug: None,
     }
 }
 

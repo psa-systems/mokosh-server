@@ -188,6 +188,41 @@ impl QuotesService {
     /// The single place totals are derived. Every mutating path funnels
     /// through here rather than trusting a caller-supplied figure, so a
     /// quote's stored total always equals the sum of its lines plus tax.
+    /// PMS-1038: settle which rate a quote derives its tax from. A given
+    /// amount (`amount_given`) clears the rate so `recompute_totals` keeps
+    /// the amount; a named rate is validated in the tenant and set; with
+    /// neither, `default_when_unset` (create) takes the tenant's default and
+    /// an update leaves the quote as it is.
+    async fn settle_tax_rate(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        quote_id: Uuid,
+        requested_rate: Option<Uuid>,
+        amount_given: bool,
+        default_when_unset: bool,
+    ) -> AppResult<()> {
+        use crate::modules::billing::BillingService;
+        let rate: Option<(Uuid, Decimal)> = if amount_given {
+            None
+        } else if let Some(id) = requested_rate {
+            Some(BillingService::assert_tax_rate_in_tenant(tx, tenant_id, id).await?)
+        } else if default_when_unset {
+            BillingService::default_tax_rate(tx, tenant_id).await?
+        } else {
+            return Ok(());
+        };
+        sqlx::query(
+            "UPDATE quotes SET tax_rate_id = $3, tax_rate = $4 WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
+        .bind(rate.map(|(id, _)| id))
+        .bind(rate.map(|(_, pct)| pct))
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
     async fn recompute_totals(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -203,13 +238,27 @@ impl QuotesService {
         sqlx::query(
             r#"
             UPDATE quotes
-            SET subtotal = $3, total = $3 + tax_amount
+            SET subtotal   = $3,
+                -- PMS-1038: a quote with a rate re-derives its tax on every
+                -- line change; one with none keeps the amount it was given.
+                tax_amount = CASE
+                    WHEN tax_rate IS NOT NULL THEN ROUND(
+                        (SELECT COALESCE(SUM(total) FILTER (WHERE is_taxable), 0)
+                         FROM quote_lines WHERE quote_id = $2) * tax_rate / 100, 2)
+                    ELSE tax_amount END
             WHERE tenant_id = $1 AND id = $2
             "#,
         )
         .bind(tenant_id)
         .bind(quote_id)
         .bind(subtotal)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE quotes SET total = subtotal + tax_amount WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
         .execute(&mut *tx)
         .await?;
         Ok(())
@@ -248,6 +297,7 @@ impl QuotesService {
     pub async fn list_quotes(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         filter: &QuoteFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<QuoteResponse>, u64)> {
@@ -321,13 +371,21 @@ impl QuotesService {
         let rows = q.fetch_all(&mut *tx).await?;
         let total = cq.fetch_one(&mut *tx).await?;
         drop(tx);
-        let mut resp: Vec<QuoteResponse> = rows.into_iter().map(Into::into).collect();
+        let mut resp: Vec<QuoteResponse> =
+            rows.into_iter().map(|r| r.into_response(today)).collect();
         self.enrich_quotes(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn get_quote(&self, tenant_id: TenantId, quote_id: Uuid) -> AppResult<QuoteResponse> {
+    /// `today` is the caller's day (PMS-1027, `CallerContext::today`), the
+    /// date read-time expiry compares `valid_until` against.
+    pub async fn get_quote(
+        &self,
+        tenant_id: TenantId,
+        quote_id: Uuid,
+        today: NaiveDate,
+    ) -> AppResult<QuoteResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, QuoteRow>(&format!(
             "SELECT {QUOTE_COLUMNS} FROM quotes WHERE tenant_id = $1 AND id = $2"
@@ -340,7 +398,8 @@ impl QuotesService {
 
         let line_rows = sqlx::query_as::<_, QuoteLineRow>(
             r#"
-            SELECT id, line_type, description, quantity, unit_price, total, sort_order
+            SELECT id, line_type, description, quantity, unit_price, total, sort_order,
+                   is_taxable
             FROM quote_lines
             WHERE quote_id = $1
             ORDER BY sort_order, created_at
@@ -351,7 +410,7 @@ impl QuotesService {
         .await?;
         drop(tx);
 
-        let mut resp: QuoteResponse = row.into();
+        let mut resp = row.into_response(today);
         resp.lines = Some(line_rows.into_iter().map(Into::into).collect());
         self.enrich_quotes(tenant_id, std::slice::from_mut(&mut resp))
             .await?;
@@ -368,6 +427,7 @@ impl QuotesService {
     pub async fn create_quote(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         requested_by_id: Uuid,
         request: &CreateQuoteRequest,
         ctx: &AuditCtx,
@@ -420,6 +480,18 @@ impl QuotesService {
         for line in &request.lines {
             Self::insert_line(&mut tx, quote_id, line).await?;
         }
+        // PMS-1038: a given amount is kept with no rate; else the named rate,
+        // else the tenant's default, and the tax is derived from it.
+        Self::settle_tax_rate(
+            &mut tx,
+            tenant_id,
+            quote_id,
+            request.tax_rate_id,
+            request.tax_amount.is_some(),
+            true,
+        )
+        .await?;
+        Self::recompute_totals(&mut tx, tenant_id, quote_id).await?;
 
         let after: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT to_jsonb(t) FROM quotes t WHERE tenant_id = $1 AND id = $2")
@@ -440,7 +512,7 @@ impl QuotesService {
         .await?;
 
         tx.commit().await?;
-        self.get_quote(tenant_id, quote_id).await
+        self.get_quote(tenant_id, quote_id, today).await
     }
 
     async fn insert_line(
@@ -452,9 +524,10 @@ impl QuotesService {
         sqlx::query(
             r#"
             INSERT INTO quote_lines (
-                id, quote_id, line_type, description, quantity, unit_price, total, sort_order
+                id, quote_id, line_type, description, quantity, unit_price, total, sort_order,
+                is_taxable
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             "#,
         )
         .bind(id)
@@ -465,6 +538,7 @@ impl QuotesService {
         .bind(line.unit_price)
         .bind(line.quantity * line.unit_price)
         .bind(line.sort_order)
+        .bind(line.is_taxable)
         .execute(&mut *tx)
         .await?;
         Ok(id)
@@ -479,6 +553,7 @@ impl QuotesService {
     pub async fn update_quote(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         quote_id: Uuid,
         request: &UpdateQuoteRequest,
         ctx: &AuditCtx,
@@ -500,6 +575,7 @@ impl QuotesService {
             || request.valid_until.is_some()
             || request.currency.is_some()
             || request.tax_amount.is_some()
+            || request.tax_rate_id.is_some()
             || request.lines.is_some();
         if changes_content {
             Self::assert_content_editable(current)?;
@@ -565,6 +641,16 @@ impl QuotesService {
                 Self::insert_line(&mut tx, quote_id, line).await?;
             }
         }
+        // PMS-1038: a given amount clears the rate; a named rate sets it.
+        Self::settle_tax_rate(
+            &mut tx,
+            tenant_id,
+            quote_id,
+            request.tax_rate_id,
+            request.tax_amount.is_some(),
+            false,
+        )
+        .await?;
         // Always recompute: `tax_amount` alone changes `total` even when
         // the lines are untouched.
         Self::recompute_totals(&mut tx, tenant_id, quote_id).await?;
@@ -588,7 +674,7 @@ impl QuotesService {
         .await?;
 
         tx.commit().await?;
-        self.get_quote(tenant_id, quote_id).await
+        self.get_quote(tenant_id, quote_id, today).await
     }
 
     /// Cancel a quote.
@@ -671,6 +757,7 @@ impl QuotesService {
     pub async fn send_quote(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         quote_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<QuoteResponse> {
@@ -717,7 +804,7 @@ impl QuotesService {
         .await?;
         tx.commit().await?;
 
-        let quote = self.get_quote(tenant_id, quote_id).await?;
+        let quote = self.get_quote(tenant_id, quote_id, today).await?;
         self.mail_quote_to_client(tenant_id, &quote).await;
         Ok(quote)
     }
@@ -820,6 +907,7 @@ impl QuotesService {
     pub async fn list_quotes_for_company(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<QuoteResponse>, u64)> {
@@ -854,7 +942,8 @@ impl QuotesService {
         .await?;
         drop(tx);
 
-        let mut resp: Vec<QuoteResponse> = rows.into_iter().map(Into::into).collect();
+        let mut resp: Vec<QuoteResponse> =
+            rows.into_iter().map(|r| r.into_response(today)).collect();
         self.enrich_quotes(tenant_id, &mut resp).await?;
         Ok((resp, total as u64))
     }
@@ -869,10 +958,11 @@ impl QuotesService {
     pub async fn get_quote_for_company(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         company_id: Uuid,
         quote_id: Uuid,
     ) -> AppResult<QuoteResponse> {
-        let quote = self.get_quote(tenant_id, quote_id).await?;
+        let quote = self.get_quote(tenant_id, quote_id, today).await?;
         if quote.company_id != company_id || !quote.status.is_client_visible() {
             return Err(AppError::NotFound("Quote".to_string()));
         }
@@ -888,6 +978,7 @@ impl QuotesService {
     pub async fn decide_quote(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         quote_id: Uuid,
         decision: &ClientDecision,
         ctx: &AuditCtx,
@@ -913,7 +1004,8 @@ impl QuotesService {
 
         // Read-time expiry: a quote past `valid_until` is treated as
         // expired without a sweeper having to have run.
-        let effective = effective_status(stored, valid_until, Utc::now().date_naive());
+        // PMS-1027: `today` is the customer's day, not UTC's.
+        let effective = effective_status(stored, valid_until, today);
         if effective != QuoteStatus::Sent {
             return Err(AppError::Conflict(format!(
                 "Quote in status '{}' can no longer be decided",
@@ -968,7 +1060,7 @@ impl QuotesService {
         .await?;
         tx.commit().await?;
 
-        let quote = self.get_quote(tenant_id, quote_id).await?;
+        let quote = self.get_quote(tenant_id, quote_id, today).await?;
         self.notify_owner_of_decision(tenant_id, &quote, next).await;
         Ok(quote)
     }
@@ -998,6 +1090,9 @@ impl QuotesService {
             "company_name": quote.company_name,
             "decision_notes": quote.decision_notes,
             "recipient_user_id": quote.requested_by_id,
+            // Per-entity deep-link metadata (migration 121).
+            "entity_type": "quote",
+            "entity_id": quote.id.to_string(),
         });
         if let Err(e) = notifications
             .dispatch(tenant_id, event_type, &context)
@@ -1040,6 +1135,7 @@ impl QuotesService {
     pub async fn convert_quote(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         quote_id: Uuid,
         request: &ConvertQuoteRequest,
         ctx: &AuditCtx,
@@ -1068,7 +1164,7 @@ impl QuotesService {
         // gets the same `converted_project_id` either way.
         if status == QuoteStatus::Converted && row.converted_project_id.is_some() {
             drop(tx);
-            return self.get_quote(tenant_id, quote_id).await;
+            return self.get_quote(tenant_id, quote_id, today).await;
         }
 
         if status != QuoteStatus::Accepted {
@@ -1171,13 +1267,14 @@ impl QuotesService {
         .await?;
 
         tx.commit().await?;
-        self.get_quote(tenant_id, quote_id).await
+        self.get_quote(tenant_id, quote_id, today).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn add_line(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         quote_id: Uuid,
         line: &QuoteLineRequest,
     ) -> AppResult<QuoteResponse> {
@@ -1188,13 +1285,14 @@ impl QuotesService {
         Self::insert_line(&mut tx, quote_id, line).await?;
         Self::recompute_totals(&mut tx, tenant_id, quote_id).await?;
         tx.commit().await?;
-        self.get_quote(tenant_id, quote_id).await
+        self.get_quote(tenant_id, quote_id, today).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn update_line(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         quote_id: Uuid,
         line_id: Uuid,
         line: &QuoteLineRequest,
@@ -1230,13 +1328,14 @@ impl QuotesService {
 
         Self::recompute_totals(&mut tx, tenant_id, quote_id).await?;
         tx.commit().await?;
-        self.get_quote(tenant_id, quote_id).await
+        self.get_quote(tenant_id, quote_id, today).await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn delete_line(
         &self,
         tenant_id: TenantId,
+        today: NaiveDate,
         quote_id: Uuid,
         line_id: Uuid,
     ) -> AppResult<QuoteResponse> {
@@ -1256,7 +1355,7 @@ impl QuotesService {
 
         Self::recompute_totals(&mut tx, tenant_id, quote_id).await?;
         tx.commit().await?;
-        self.get_quote(tenant_id, quote_id).await
+        self.get_quote(tenant_id, quote_id, today).await
     }
 }
 
@@ -1291,7 +1390,7 @@ const QUOTE_COLUMNS: &str = r#"id, tenant_id, quote_number, company_id, billing_
        title, summary, description, status, valid_until,
        subtotal, tax_amount, total, currency, requested_by_id,
        sent_at, decided_at, decided_by_contact_id, decision_notes,
-       converted_project_id, created_at, updated_at"#;
+       converted_project_id, created_at, updated_at, tax_rate_id, tax_rate"#;
 
 /// The fields `convert_quote` reads off the `FOR UPDATE`-locked quote
 /// row. A named struct rather than a tuple so the field meanings survive
@@ -1315,6 +1414,7 @@ struct QuoteLineRow {
     unit_price: Decimal,
     total: Decimal,
     sort_order: Option<i32>,
+    is_taxable: bool,
 }
 
 impl From<QuoteLineRow> for QuoteLineResponse {
@@ -1327,6 +1427,7 @@ impl From<QuoteLineRow> for QuoteLineResponse {
             unit_price: r.unit_price,
             total: r.total,
             sort_order: r.sort_order.unwrap_or(0),
+            is_taxable: r.is_taxable,
         }
     }
 }
@@ -1345,6 +1446,8 @@ struct QuoteRow {
     valid_until: Option<chrono::NaiveDate>,
     subtotal: Decimal,
     tax_amount: Decimal,
+    tax_rate_id: Option<Uuid>,
+    tax_rate: Option<Decimal>,
     total: Decimal,
     currency: Option<String>,
     requested_by_id: Option<Uuid>,
@@ -1357,9 +1460,13 @@ struct QuoteRow {
     updated_at: chrono::DateTime<Utc>,
 }
 
-impl From<QuoteRow> for QuoteResponse {
-    fn from(r: QuoteRow) -> Self {
-        Self {
+impl QuoteRow {
+    /// `today` is the caller's day (PMS-1027): read-time expiry has to compare
+    /// `valid_until` with the day it is where the reader is, so this is not a
+    /// `From` impl, which could only ask the UTC clock.
+    fn into_response(self, today: NaiveDate) -> QuoteResponse {
+        let r = self;
+        QuoteResponse {
             id: r.id,
             tenant_id: r.tenant_id,
             quote_number: r.quote_number,
@@ -1375,11 +1482,13 @@ impl From<QuoteRow> for QuoteResponse {
             status: effective_status(
                 QuoteStatus::from_str(&r.status).unwrap_or(QuoteStatus::Draft),
                 r.valid_until,
-                Utc::now().date_naive(),
+                today,
             ),
             valid_until: r.valid_until,
             subtotal: r.subtotal,
             tax_amount: r.tax_amount,
+            tax_rate_id: r.tax_rate_id,
+            tax_rate: r.tax_rate,
             total: r.total,
             currency: r.currency,
             requested_by_id: r.requested_by_id,

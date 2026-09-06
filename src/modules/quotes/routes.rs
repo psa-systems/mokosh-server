@@ -24,8 +24,12 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::QuotesService;
-use crate::modules::auth::{RequireBilling, RequireFinance, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireBilling, RequireCallerContext, RequireFinance, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -49,6 +53,17 @@ pub fn quotes_routes(service: QuotesService) -> Router {
         .route("/quotes/{quote_id}/send", post(send_quote))
         // PMS-674: the accepted quote becomes the Project the MSP works.
         .route("/quotes/{quote_id}/convert", post(convert_quote))
+        // mokosh-contact-login prompt 008: contact-plane accept /
+        // decline endpoints. Gates on quotes:accept; scopes to the
+        // caller's Company (foreign quote 404s, not 403s).
+        .route("/quotes/{quote_id}/accept", post(accept_quote))
+        .route("/quotes/{quote_id}/decline", post(decline_quote))
+        // PMS-936: contact- and staff-callable quote PDF surface.
+        // Contact plane gates on `quotes:download_pdf`; server-side
+        // PDF generation is deferred to a follow-up ticket so the
+        // handler currently returns 501 with a helpful message. The
+        // capability gate is the load-bearing piece of the ticket.
+        .route("/quotes/{quote_id}/pdf", get(get_quote_pdf))
         .route("/quotes/{quote_id}/lines", post(add_line))
         .route(
             "/quotes/{quote_id}/lines/{line_id}",
@@ -57,18 +72,43 @@ pub fn quotes_routes(service: QuotesService) -> Router {
         .with_state(state)
 }
 
+/// Today where a staff caller is (PMS-1027). The caller-context handlers
+/// use `CallerContext::today`, which also answers for a contact.
+fn today_for(user_tz: &str) -> chrono::NaiveDate {
+    mokosh_types::datetime::user_today(chrono::Utc::now(), user_tz)
+}
+
 async fn list_quotes(
     State(state): State<QuotesRouterState>,
-    RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Query(filter): Query<QuoteFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<QuoteResponse>>> {
     filter.validate()?;
-    let (quotes, total) = state
-        .service
-        .list_quotes(user.tenant(), &filter, &pagination)
-        .await?;
+    let tenant = caller.tenant();
+    let today = caller.today(&db).await?;
+    let (quotes, total) = match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+            state
+                .service
+                .list_quotes(tenant, today, &filter, &pagination)
+                .await?
+        }
+        // PMS-1060: the company scope alone handed a contact its company's
+        // drafts. `list_quotes_for_company` is the read the retired portal
+        // router used: the caller's company AND only the issued statuses
+        // (`CLIENT_VISIBLE_STATUSES`), so working state never reaches a
+        // customer.
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::QUOTES_READ, &db).await?;
+            state
+                .service
+                .list_quotes_for_company(tenant, today, session.company_id, &pagination)
+                .await?
+        }
+    };
     Ok(Json(PaginatedResponse::from_params(
         quotes,
         &pagination,
@@ -78,11 +118,162 @@ async fn list_quotes(
 
 async fn get_quote(
     State(state): State<QuotesRouterState>,
-    RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(quote_id): Path<Uuid>,
 ) -> AppResult<Json<QuoteResponse>> {
-    let quote = state.service.get_quote(user.tenant(), quote_id).await?;
+    let today = caller.today(&db).await?;
+    let quote = match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+            state
+                .service
+                .get_quote(caller.tenant(), quote_id, today)
+                .await?
+        }
+        // mokosh-contact-login prompt 008: 404 (not 403) on a foreign
+        // Company so a contact cannot probe for another Company's quote
+        // ids. PMS-1060: the same 404 for the caller's own un-issued
+        // quote, so the portal never confirms an internal quote exists;
+        // `get_quote_for_company` is the one place both checks live.
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::QUOTES_READ, &db).await?;
+            state
+                .service
+                .get_quote_for_company(caller.tenant(), today, session.company_id, quote_id)
+                .await?
+        }
+    };
+    Ok(Json(quote))
+}
+
+/// mokosh-contact-login prompt 008: reproduce the RequireBilling +
+/// RequireFinance staff gate inline for a handler that now takes
+/// `RequireCallerContext`. Mirrors the same helper on the billing
+/// routes; the intentional duplication keeps each module's failure
+/// mode locally auditable.
+fn assert_staff_billing_finance(auth: &crate::modules::auth::AuthState) -> AppResult<()> {
+    let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+    let role = user.role.as_str();
+    if !matches!(role, "super_admin" | "admin" | "finance") {
+        return Err(AppError::Forbidden("Insufficient permissions".to_string()));
+    }
+    Ok(())
+}
+
+/// PMS-936: dual-plane quote PDF endpoint. Contact caller gates on
+/// `quotes:download_pdf` + Company scope; staff caller keeps the
+/// RequireBilling + RequireFinance inline check. Actual PDF rendering
+/// is deferred to a follow-up ticket - the response is 501 with a
+/// helpful message once every authz gate passes. The cap gate is what
+/// matters for this ticket.
+async fn get_quote_pdf(
+    State(state): State<QuotesRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(quote_id): Path<Uuid>,
+) -> AppResult<axum::response::Response> {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let today = caller.today(&db).await?;
+    // PMS-1060: the contact read is the issued-only, own-company one, so a
+    // draft's document is a 404 for a customer the way the quote itself is.
+    let _quote = match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+            state
+                .service
+                .get_quote(caller.tenant(), quote_id, today)
+                .await?
+        }
+        CallerContext::Contact(session) => {
+            caller
+                .require_capability(caps::QUOTES_DOWNLOAD_PDF, &db)
+                .await?;
+            state
+                .service
+                .get_quote_for_company(caller.tenant(), today, session.company_id, quote_id)
+                .await?
+        }
+    };
+    Ok((
+        StatusCode::NOT_IMPLEMENTED,
+        "quote PDF download is not yet wired; see PMS-936 follow-up",
+    )
+        .into_response())
+}
+
+/// mokosh-contact-login prompt 008: contact-plane accept endpoint.
+/// Gates on quotes:accept, then delegates to the shared decision
+/// path so the state-machine invariants (valid_until check, single-
+/// decision guard) live in one place.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct QuoteDecisionBody {
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+async fn accept_quote(
+    State(state): State<QuotesRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(quote_id): Path<Uuid>,
+    body: Option<Json<QuoteDecisionBody>>,
+) -> AppResult<Json<QuoteResponse>> {
+    contact_decide(&state, &caller, &db, quote_id, true, body, &ctx).await
+}
+
+async fn decline_quote(
+    State(state): State<QuotesRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(quote_id): Path<Uuid>,
+    body: Option<Json<QuoteDecisionBody>>,
+) -> AppResult<Json<QuoteResponse>> {
+    contact_decide(&state, &caller, &db, quote_id, false, body, &ctx).await
+}
+
+async fn contact_decide(
+    state: &QuotesRouterState,
+    caller: &CallerContext,
+    db: &Database,
+    quote_id: Uuid,
+    accept: bool,
+    body: Option<Json<QuoteDecisionBody>>,
+    ctx: &crate::modules::audit::AuditCtx,
+) -> AppResult<Json<QuoteResponse>> {
+    // Contact-plane only for now: staff sign-off happens via the
+    // existing `/quotes/{id}/approvals` surface which this sweep does
+    // not touch. A staff bearer hitting accept / decline gets 403 so
+    // the semantics stay explicit.
+    let session = match caller {
+        CallerContext::Contact(session) => session,
+        CallerContext::Staff(_) => {
+            return Err(AppError::Forbidden(
+                "Staff use the approvals endpoint, not accept/decline.".to_string(),
+            ));
+        }
+    };
+    caller.require_capability(caps::QUOTES_ACCEPT, db).await?;
+    let notes = body.and_then(|Json(b)| b.notes);
+    let decision = ClientDecision {
+        company_id: session.company_id,
+        accept,
+        contact_id: session.id,
+        notes,
+    };
+    let quote = state
+        .service
+        .decide_quote(
+            caller.tenant(),
+            caller.today(db).await?,
+            quote_id,
+            &decision,
+            ctx,
+        )
+        .await?;
     Ok(Json(quote))
 }
 
@@ -96,7 +287,13 @@ async fn create_quote(
     request.validate()?;
     let quote = state
         .service
-        .create_quote(user.tenant(), user.id, &request, &ctx)
+        .create_quote(
+            user.tenant(),
+            today_for(&user.timezone),
+            user.id,
+            &request,
+            &ctx,
+        )
         .await?;
     Ok(Json(quote))
 }
@@ -112,7 +309,13 @@ async fn update_quote(
     request.validate()?;
     let quote = state
         .service
-        .update_quote(user.tenant(), quote_id, &request, &ctx)
+        .update_quote(
+            user.tenant(),
+            today_for(&user.timezone),
+            quote_id,
+            &request,
+            &ctx,
+        )
         .await?;
     Ok(Json(quote))
 }
@@ -143,7 +346,7 @@ async fn add_line(
     request.validate()?;
     let quote = state
         .service
-        .add_line(user.tenant(), quote_id, &request)
+        .add_line(user.tenant(), today_for(&user.timezone), quote_id, &request)
         .await?;
     Ok(Json(quote))
 }
@@ -158,7 +361,13 @@ async fn update_line(
     request.validate()?;
     let quote = state
         .service
-        .update_line(user.tenant(), quote_id, line_id, &request)
+        .update_line(
+            user.tenant(),
+            today_for(&user.timezone),
+            quote_id,
+            line_id,
+            &request,
+        )
         .await?;
     Ok(Json(quote))
 }
@@ -171,7 +380,7 @@ async fn delete_line(
 ) -> AppResult<Json<QuoteResponse>> {
     let quote = state
         .service
-        .delete_line(user.tenant(), quote_id, line_id)
+        .delete_line(user.tenant(), today_for(&user.timezone), quote_id, line_id)
         .await?;
     Ok(Json(quote))
 }
@@ -187,7 +396,7 @@ async fn send_quote(
 ) -> AppResult<Json<QuoteResponse>> {
     let quote = state
         .service
-        .send_quote(user.tenant(), quote_id, &ctx)
+        .send_quote(user.tenant(), today_for(&user.timezone), quote_id, &ctx)
         .await?;
     Ok(Json(quote))
 }
@@ -210,7 +419,13 @@ async fn convert_quote(
     request.validate()?;
     let quote = state
         .service
-        .convert_quote(user.tenant(), quote_id, &request, &ctx)
+        .convert_quote(
+            user.tenant(),
+            today_for(&user.timezone),
+            quote_id,
+            &request,
+            &ctx,
+        )
         .await?;
     Ok(Json(quote))
 }

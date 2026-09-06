@@ -965,6 +965,49 @@ impl KbService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// Portal single-article read for a specific customer contact. Enforces
+    /// the same publish + visibility rules as
+    /// [`Self::list_portal_articles_for_company`]: `status = 'published'` AND
+    /// (`visibility = 'public'` OR `visibility = 'client_specific'` with the
+    /// caller's `company_id` in `company_ids`). A stored-but-not-visible
+    /// article returns 404 rather than 403 so the portal never confirms an
+    /// article exists outside the contact's scope.
+    ///
+    /// Does NOT bump `view_count`: the agent-side `get_article` counts staff
+    /// reads, and folding portal reads into the same counter would let a
+    /// customer inflate a "popular article" signal the operator does not
+    /// want the caller to influence. Add a separate portal-read counter if
+    /// that signal ever ships.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, id = %id))]
+    pub async fn get_portal_article(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        id: Uuid,
+    ) -> AppResult<KbArticleResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as::<_, ArticleRow>(
+            r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
+                      author_id, view_count, helpful_count, not_helpful_count,
+                      published_at, tags, company_ids, created_at, updated_at
+               FROM kb_articles
+               WHERE tenant_id = $1
+                 AND id = $2
+                 AND status = 'published'
+                 AND (
+                       visibility = 'public'
+                    OR (visibility = 'client_specific' AND $3 = ANY(company_ids))
+                 )"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(company_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("KB article".to_string()))?;
+        Ok(row.into())
+    }
+
     /// Portal feed for a specific customer contact (PMS-84 / PMS-32).
     ///
     /// This is the contact-facing query and the only portal-visible feed:

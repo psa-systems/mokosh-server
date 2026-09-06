@@ -72,9 +72,10 @@ check: check-compile check-clippy check-fmt check-migrations check-migration-imm
 check-doc-links:
     nu scripts/check-doc-links.nu
 
-# Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if
-# README.md or docs/quickstart.md names a recipe the justfile does not define.
-[doc("Fail if README.md or docs/quickstart.md names a recipe the justfile lacks (PMS-843).")]
+# Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if one of
+# the docs in `const DOCS` (scripts/check-doc-recipes.nu) names a recipe the
+# justfile does not define; a new page carrying commands belongs in that list.
+[doc("Fail if a guarded doc names a recipe the justfile lacks (scope: scripts/check-doc-recipes.nu, PMS-843).")]
 [group: 'check']
 check-doc-recipes:
     nu scripts/check-doc-recipes.nu
@@ -258,7 +259,7 @@ test:
 # Run the Postgres-backed integration suite in the dev compose `server` container.
 [group: 'test']
 test-integration: ensure-env
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --tests -- --test-threads=4'
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --tests --no-fail-fast -- --test-threads=4'
 
 # Verify the demo-critical path only: demo-data seeding (seed_demo) and the
 # tenant import/export round-trip (data_transfer). A fast, targeted subset of
@@ -492,6 +493,16 @@ infisical-bootstrap: ensure-env
     with-env $envs {
         cargo run --quiet --bin mokosh-server -- bootstrap-infisical
     }
+
+# PMS-729: seed the client-portal login fixture set into the running dev
+# database (three tenants + one portal contact each, sharing a fixed dev
+# password). Idempotent. Refuses if ENVIRONMENT is not development/dev/test.
+# Run once after `just dev` boots to exercise the host-derived portal login
+# at http://{slug}.client.localhost:4301/portal/login.
+[doc("Seed the PMS-729 client-portal fixture tenants + contacts into the running dev DB (idempotent, dev-only).")]
+[group: 'dev']
+dev-seed-portal: ensure-env
+    docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo run --quiet --bin mokosh-bootstrap -- dev-seed-portal'
 
 # Build OCI image
 [group: 'build']

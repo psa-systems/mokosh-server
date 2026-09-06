@@ -689,6 +689,89 @@ impl NotificationsService {
         Ok(())
     }
 
+    // PMS-729 phase 2 §6 slice 5: branding-context injection ---------------
+
+    /// Fold `{{msp_name}}` / `{{msp_logo_url}}` / `{{msp_primary_color}}`
+    /// / `{{msp_support_email}}` into the render context so every
+    /// template gets tenant-branded output without the dispatch caller
+    /// having to thread the fields in by hand.
+    ///
+    /// Missing branding fields degrade to empty strings so a template
+    /// that references `{{msp_support_email}}` on a tenant that never
+    /// set one renders `""` (empty) rather than a literal placeholder;
+    /// this matches what `render_template` already does for absent
+    /// keys but is more graceful for user-visible copy.
+    /// `{{msp_name}}` defaults to "Mokosh Platform" so subject lines
+    /// like "{{msp_name}} - Reset your password" stay readable even for
+    /// the default/system tenant.
+    ///
+    /// Caller-supplied keys ALWAYS win: a test that passes an explicit
+    /// `msp_name` in context sees that value, not the DB one.
+    async fn enrich_with_branding(
+        &self,
+        tenant_id: TenantId,
+        mut context: serde_json::Value,
+    ) -> AppResult<serde_json::Value> {
+        // The template context must be a JSON object to merge into. If
+        // a caller passed a non-object (empty array, null, primitive),
+        // wrap it in an object so the branding keys can be attached
+        // rather than silently dropped.
+        if !context.is_object() {
+            context = serde_json::json!({});
+        }
+
+        let row: Option<(String, serde_json::Value)> = {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query_as(r#"SELECT name, branding FROM tenants WHERE id = $1"#)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        };
+
+        let (name, branding) = match row {
+            Some(r) => r,
+            None => (String::new(), serde_json::json!({})),
+        };
+
+        let obj = context.as_object_mut().expect("guarded above");
+
+        // helper: only set the key if the caller did not.
+        let mut ensure_key = |k: &str, v: serde_json::Value| {
+            if !obj.contains_key(k) {
+                obj.insert(k.to_string(), v);
+            }
+        };
+
+        let msp_name = if name.is_empty() {
+            "Mokosh Platform".to_string()
+        } else {
+            name
+        };
+        ensure_key("msp_name", serde_json::Value::String(msp_name));
+
+        let branding_str = |field: &str| -> String {
+            branding
+                .get(field)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        };
+        ensure_key(
+            "msp_logo_url",
+            serde_json::Value::String(branding_str("logo_url")),
+        );
+        ensure_key(
+            "msp_primary_color",
+            serde_json::Value::String(branding_str("primary_color")),
+        );
+        ensure_key(
+            "msp_support_email",
+            serde_json::Value::String(branding_str("support_email")),
+        );
+
+        Ok(context)
+    }
+
     // PMS-92 dispatcher -------------------------------------------------------
     /// Look up active rules matching `event_type`, expand recipients
     /// (rule-defined + caller-supplied via context), render the template
@@ -873,10 +956,21 @@ impl NotificationsService {
         event_type: &str,
         context: &serde_json::Value,
     ) -> AppResult<Vec<RenderedNotification>> {
+        // PMS-729 phase 2 §6 slice 5: enrich the render context with the
+        // MSP's identity (name + branding) so every template can reference
+        // `{{msp_name}}` / `{{msp_logo_url}}` / `{{msp_primary_color}}` /
+        // `{{msp_support_email}}` without the caller having to thread those
+        // values through by hand. Caller-supplied context keys always win
+        // over the branding defaults so a specific dispatch site can
+        // override. Applied here (not in dispatch) so `preview` renders the
+        // same context and neither can drift.
+        let enriched_context = self
+            .enrich_with_branding(tenant_id, context.clone())
+            .await?;
         // PMS-789: the deployment's name is supplied here rather than by each
         // of the dispatch call sites, so no template can name the product and
         // find `{{app_name}}` unresolved because one caller forgot it.
-        let merged = with_app_name(context);
+        let merged = with_app_name(&enriched_context);
         let context = &merged;
         let rules = sqlx::query_as::<_, RuleRow>(
             r#"SELECT id, name, event_type, conditions, channels, recipients, template_id, is_active
@@ -896,29 +990,69 @@ impl NotificationsService {
             .get("recipient_email")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        // PMS-729 phase 2 §7 slice B / I12: portal-inbox recipient. When a
+        // caller stamps `recipient_contact_id` into the context, the
+        // dispatcher writes an in_app row against `notifications.contact_id`
+        // so the portal inbox picks it up. Rule-level contact recipients
+        // (a `contacts` array under `notification_rules.recipients` JSONB)
+        // are supported alongside the ctx key.
+        let ctx_contact_id: Option<Uuid> = context
+            .get("recipient_contact_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+
+        // Per-entity deep-link metadata. When the caller stamps
+        // `entity_type` (`ticket` / `invoice` / `quote` / ...) and
+        // `entity_id` into the context, the dispatcher persists both
+        // onto every notification row so the portal inbox can render
+        // a click-through link straight to the entity's detail page.
+        // Absent / malformed values simply skip the columns and leave
+        // NULL (matches the auth.* / system-event case, where there
+        // is no single entity to deep-link).
+        // MAPPS-656: dead until the contact-plane fanout is re-threaded through RenderedNotification
+        let _ctx_entity_type: Option<String> = context
+            .get("entity_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty() && s.chars().count() <= 50);
+        // MAPPS-656: dead until the contact-plane fanout is re-threaded through RenderedNotification
+        let _ctx_entity_id: Option<Uuid> = context
+            .get("entity_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+
+        // Batch-load every distinct template id off the rules in one
+        // round-trip. Previously the loop below opened one
+        // `begin_with_tenant` tx PER rule to fetch the template by id
+        // (N+1 against `notification_templates`); a busy dispatch with
+        // 4-5 rules on the same event would spend most of its wall-
+        // clock on template lookups. One IN() call keyed by tenant
+        // still passes the RLS policy (same GUC posture per PMS-261).
+        let template_ids: Vec<Uuid> = rules.iter().filter_map(|r| r.template_id).collect();
+        let template_index: HashMap<Uuid, TemplateRow> = if template_ids.is_empty() {
+            HashMap::new()
+        } else {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            let rows: Vec<TemplateRow> = sqlx::query_as(
+                "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
+                 FROM notification_templates WHERE id = ANY($1)",
+            )
+            .bind(&template_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            rows.into_iter().map(|t| (t.id, t)).collect()
+        };
 
         let mut messages: Vec<RenderedNotification> = Vec::new();
         for rule in rules {
-            // PMS-261: scope the template lookup through `begin_with_tenant`
-            // so the RLS GUC is set. `notification_templates` carries a
-            // `tenant_id` and is covered by the fail-closed policy (migration
-            // 038); the previous bare `self.db.pool()` read ran with NO GUC,
-            // which under an unprivileged (NOBYPASSRLS) connection matches zero
-            // rows and would silently drop the template, falling back to the
-            // default subject/body. The `template_id` came off this tenant's
-            // own rule, so the row lives under this same tenant.
-            let template = match rule.template_id {
-                Some(tid) => {
-                    sqlx::query_as::<_, TemplateRow>(
-                        "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
-                         FROM notification_templates WHERE id = $1",
-                    )
-                    .bind(tid)
-                    .fetch_optional(&mut *conn)
-                    .await?
-                }
-                None => None,
-            };
+            // PMS-782 batch: templates were loaded up front by tenant-scoped tx
+            // (see `template_index` above), so the per-rule lookup is one hash
+            // hit rather than a round-trip. Main's per-rule fetch was PMS-261's
+            // RLS-safe read; the batch retains the same tenant-scoped tx and
+            // therefore keeps the RLS GUC set for the read.
+            let template = rule
+                .template_id
+                .and_then(|tid| template_index.get(&tid).cloned());
 
             // PMS-701: no template means nothing renderable. The old
             // fallback body was the whole dispatch JSON (recipient
@@ -967,11 +1101,40 @@ impl NotificationsService {
                 }
             }
 
+            // PMS-729 phase 2 §7 slice B / I12: contact recipients. Same
+            // shape as user_ids / emails; a rule can enumerate
+            // `contacts: [uuid, ...]` in its recipients JSONB, and the
+            // dispatch caller can add one more via
+            // `recipient_contact_id`. Deduplicated so a caller stamping
+            // the same contact twice does not double the fanout.
+            let mut contact_ids: Vec<Uuid> = rule
+                .recipients
+                .get("contacts")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                .collect();
+            if let Some(cid) = ctx_contact_id {
+                if !contact_ids.contains(&cid) {
+                    contact_ids.push(cid);
+                }
+            }
+
             // PMS-195: batch-load every recipient's preference row up front
             // instead of querying once per (channel, user) pair inside the
             // nested loop below (was N+1).
             let prefs = self
                 .load_user_preferences(&mut *conn, tenant_id, &user_ids, event_type)
+                .await?;
+            // Portal notification-preferences: same shape as user prefs
+            // but keyed on contact_id (see contact_notification_preferences,
+            // migration 120). A contact who opted out sees no fanout on
+            // in_app or email for this event.
+            // MAPPS-656: dead until the contact-plane fanout is re-threaded through RenderedNotification
+            let _contact_prefs = self
+                .load_contact_preferences(tenant_id, &contact_ids, event_type)
                 .await?;
 
             // PMS-782: rendered once per rule, not once per channel. The
@@ -1057,6 +1220,36 @@ impl NotificationsService {
                 .fetch_all(&mut *conn)
                 .await?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// Portal parallel of [`Self::load_user_preferences`]: batch-load
+    /// every recipient contact's `contact_notification_preferences`
+    /// row for the current event_type, keyed by `contact_id`. A
+    /// contact with no row is absent from the map (accept-all).
+    async fn load_contact_preferences(
+        &self,
+        tenant_id: TenantId,
+        contact_ids: &[Uuid],
+        event_type: &str,
+    ) -> AppResult<HashMap<Uuid, (Option<bool>, Vec<String>)>> {
+        if contact_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, Option<bool>, Vec<String>)> = sqlx::query_as(
+            r#"SELECT contact_id, is_enabled, channel_types
+               FROM contact_notification_preferences
+               WHERE tenant_id = $1 AND contact_id = ANY($2) AND event_type = $3"#,
+        )
+        .bind(tenant_id)
+        .bind(contact_ids)
+        .bind(event_type)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(cid, enabled, channels)| (cid, (enabled, channels)))
+            .collect())
     }
 
     /// Batch-load the `user_notification_preferences` rows for every
@@ -1337,7 +1530,7 @@ struct ChannelRow {
     is_default: Option<bool>,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 struct TemplateRow {
     id: Uuid,
     name: String,

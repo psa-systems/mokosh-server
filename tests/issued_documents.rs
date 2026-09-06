@@ -98,6 +98,8 @@ async fn sending_an_invoice_stores_its_document(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &pw).await;
 
@@ -138,6 +140,8 @@ async fn the_route_serves_the_stored_bytes_not_a_fresh_render(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
     let invoice_id = draft_invoice(&app, &token, company_id).await;
@@ -166,6 +170,8 @@ async fn a_rebrand_cannot_reach_a_stored_document(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
     let invoice_id = draft_invoice(&app, &token, company_id).await;
@@ -193,6 +199,8 @@ async fn a_draft_renders_live_and_stores_nothing(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &pw).await;
     let invoice_id = draft_invoice(&app, &token, company_id).await;
@@ -217,6 +225,8 @@ async fn a_credit_note_gets_its_document_at_creation(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &pw).await;
     let invoice_id = draft_invoice(&app, &token, company_id).await;
@@ -273,6 +283,8 @@ async fn voiding_a_credit_note_leaves_its_document_alone(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
     let invoice_id = draft_invoice(&app, &token, company_id).await;

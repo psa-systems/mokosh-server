@@ -11,6 +11,11 @@ Nothing here is the source of truth for what the server currently
 does. The code is, and the repo [`CLAUDE.md`](../../CLAUDE.md) is the
 maintained prose summary of it.
 
+The user-facing pages (quickstart, architecture, binaries,
+configuration, recipes and the rest) are indexed one directory up in
+[`docs/README.md`](../README.md). The table below covers this
+directory, plus the quickstart that developers reach from here.
+
 ## Contents
 
 | Document | Kind | Purpose |
@@ -19,6 +24,7 @@ maintained prose summary of it.
 | [`local-vs-ci-checks.md`](local-vs-ci-checks.md) | maintained, updated with every check change (PMS-851) | Step-by-step mapping of `.forgejo/workflows/check.yml` onto `just check` and `just pre-commit`, plus the local-only gates (`check-docker`, `test-integration`, `verify-demo`, `test-e2e`) and why each is not in the umbrella recipe. Read before adding a check to either side. |
 | [`architecture-seams.md`](architecture-seams.md) | maintained, a section dies when its seam is collapsed | Subsystems that could plausibly own the same job, and which side is canonical: the three identity planes, the dual billing surfaces, the subscription-state and dual-users schema divergences (PMS-198), and what became of the seams PMS-295 retired. Read before touching auth, the portal, billing, or the `tenants` / `users` tables. |
 | [`request-body-entry-points.md`](request-body-entry-points.md) | maintained, a row per body extractor (PMS-924) | Every way a request body enters the server, and whether the invisible-character sanitizer covers it, exempts it, or does not apply. Carries the greps that regenerate the set. Read before adding a route that reads a body, especially one that verifies a signature over the raw bytes. |
+| [`readme-template.md`](readme-template.md) | maintained convention, applies to every repo in the estate | The eight-section README structure, the rule that detail belongs in `docs/`, and the three mechanical constraints that bite when applying it: the GIF stays commented until its asset is committed, a page that gains a `just` command joins the doc-recipe guard, and the security section invents no disclosure address. |
 | [`sla-jsonb-vs-normalized.md`](sla-jsonb-vs-normalized.md) | decision record, PMS-585 | Why `business_hours.schedule` and `holiday_calendars.holidays` stay JSONB instead of being normalized into child tables. |
 | [`qa-test-plan.md`](qa-test-plan.md) | reusable prompt | The no-shortcuts QA agent prompt for driving the app end to end through a browser plus the API, and the rules that exist because an earlier pass took each of those shortcuts. |
 | [`security/`](security/) | point-in-time records, each named for its issue | One-off audits and sweeps kept for their reasoning, not for their status: the auth / login / 2FA / session review (PMS-625) and the map of where a portal request path touches `users` (PMS-820). Findings were dispositioned on those issues; the tracker, not the file, says what is still open. |

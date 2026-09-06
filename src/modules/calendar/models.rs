@@ -38,6 +38,11 @@ pub struct AppointmentResponse {
     /// client tell a virtual instance apart from a persisted row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recurrence_parent_id: Option<Uuid>,
+    /// PMS-791 phase 3 / MAPPS-464: team the appointment is routed to.
+    /// Nullable; personal tenants leave empty. Skipped serialization on
+    /// null so pre-phase-3 API consumers do not see the extra key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -68,6 +73,11 @@ pub struct CreateAppointmentRequest {
     /// materialised as rows. A `DTSTART` line is NOT expected here - the
     /// series is anchored on this appointment's `start_time`.
     pub recurrence_rule: Option<String>,
+    /// PMS-791 phase 3 / MAPPS-464: optional team routing. `appointments.team_id`
+    /// column has existed since migration 008 but was unused until this ticket.
+    /// Nullable; personal tenants leave it empty.
+    #[serde(default)]
+    pub team_id: Option<Uuid>,
 }
 
 fn default_other() -> String {
@@ -99,6 +109,13 @@ pub struct UpdateAppointmentRequest {
     pub timezone: Option<String>,
     pub status: Option<String>,
     pub location: Option<String>,
+    /// PMS-791 phase 3 / MAPPS-464: team reassign; `None` = unchanged.
+    /// Explicit null on the wire (`Option<Option<Uuid>>` shape via
+    /// `#[serde(default, deserialize_with = ...)]`) would let a caller
+    /// clear the team; not offered in phase 3 to keep the shape simple.
+    /// Follow-up if a customer asks.
+    #[serde(default)]
+    pub team_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
@@ -108,6 +125,17 @@ pub struct AppointmentFilter {
     pub appointment_type: Option<String>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
+    /// PMS-791 phase 4 / MAPPS-465: filter by team. Mirrors the ticket
+    /// list's team_id filter shape. Cross-tenant team_id would still
+    /// pass RLS at the appointments table (both live in the same
+    /// tenant); the calendar service does not enforce a membership
+    /// check on the caller side — teams are a routing concept, not
+    /// an isolation boundary (docs/mokosh-orgs/00-blueprint.md §5).
+    pub team_id: Option<Uuid>,
+    /// PMS-791 phase 4: `true` restricts the list to appointments
+    /// whose `team_id` is one of the caller's `team_members` rows.
+    /// Server-resolved from the authenticated caller.
+    pub my_teams: Option<bool>,
 }
 
 // ============================================================================

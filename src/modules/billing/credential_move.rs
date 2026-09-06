@@ -1,4 +1,4 @@
-//! PMS-968: move every gateway credential into the secret store, once.
+//! PMS-968: move every gateway credential into the secret provider, once.
 //!
 //! Before this, a tenant's payment-provider credential was AES-256-GCM
 //! ciphertext in `payment_gateway_configs.config_encrypted`. PMS-967 built
@@ -10,7 +10,7 @@
 //! ## Why a job and not a migration
 //!
 //! Migrations here are plain SQL embedded by `sqlx::migrate!` and run at
-//! startup. Writing to the secret store is a network call when the backend is
+//! startup. Writing to the secret provider is a network call when the provider is
 //! Infisical, which no SQL file can make. [`Scheduler`](crate::scheduler::Scheduler)
 //! fires every registered job once immediately at startup and then on its
 //! interval, which gives the one-shot behaviour with no maintenance window and
@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::scheduler::Job;
-use crate::secrets::{SecretKey, SecretStore};
+use crate::secrets::{SecretKey, SecretProvider};
 use crate::utils::error::AppResult;
 
 /// What one tick did, for the log line and for tests.
@@ -60,18 +60,18 @@ impl CredentialMoveOutcome {
     }
 }
 
-/// Walks pre-PMS-968 gateway credentials into the configured secret store.
+/// Walks pre-PMS-968 gateway credentials into the configured secret provider.
 #[derive(Clone)]
 pub struct GatewayCredentialMover {
     db: Database,
-    secrets: std::sync::Arc<dyn SecretStore>,
+    secrets: std::sync::Arc<dyn SecretProvider>,
     encryption_key: [u8; 32],
 }
 
 impl GatewayCredentialMover {
     pub fn new(
         db: Database,
-        secrets: std::sync::Arc<dyn SecretStore>,
+        secrets: std::sync::Arc<dyn SecretProvider>,
         encryption_key: [u8; 32],
     ) -> Self {
         Self {
@@ -151,7 +151,7 @@ impl GatewayCredentialMover {
         let stored = self.secrets.get(&key).await?;
         if stored.as_deref() != Some(plaintext.as_str()) {
             return Err(crate::utils::error::AppError::Configuration(format!(
-                "secret store did not return the credential just written for provider {provider:?}"
+                "secret provider did not return the credential just written for gateway {provider:?}"
             )));
         }
 

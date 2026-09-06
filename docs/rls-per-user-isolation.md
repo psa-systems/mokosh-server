@@ -329,7 +329,9 @@ strict per-user isolation for everything editable.
   (PMS-243/245), so a bulk SQL backfill would have no tenant to resolve most owners to.
 - **Portal identity (PMS-255.6).** Portal runs on a `contacts`-row identity (`CurrentContact`,
   company-scoped), a separate plane from `users`, with its own `portal_auth_middleware` and
-  `RequirePortalAuth` extractor (`src/modules/portal/middleware.rs`) and its own credential
+  `RequirePortalAuth` extractor (`src/modules/portal/middleware.rs`, joined by
+  `RequirePortalBillingContact` in PMS-993, which adds the billing-contact role check on top of
+  it for the invoice routes) and its own credential
   lifecycle under `/api/v1/portal/auth/*` (PMS-820). Per-user isolation is deliberately NOT
   applied to portal contacts: the plane stays company-scoped and is revisited with the orgs
   work. `PortalService::login` is a pre-auth `(tenant_slug, email)` resolve on the migrator

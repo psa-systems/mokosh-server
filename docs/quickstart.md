@@ -11,7 +11,7 @@ You need:
 - Linux host with Docker Engine running and your user in the `docker` group.
 - `just` (task runner).
 - Nushell `0.112.2` (several `just` recipes are written in nu, and every snippet below is nu).
-- Rust stable (`cargo`, `rustc`). The server itself compiles inside the `server` container, but the host toolchain runs `just check`, `just infisical-bootstrap` and any `cargo` command you run directly.
+- Rust `1.94.1` (`cargo`, `rustc`), the exact patch `rust-toolchain.toml` pins so rustfmt and clippy match CI; rustup reads that file and fetches it for you. The server itself compiles inside the `server` container, but the host toolchain runs `just check`, `just infisical-bootstrap` and any `cargo` command you run directly.
 - `sqlx-cli`, only for host-side `just migrate-run`. The server applies migrations itself on start (`RUN_MIGRATIONS=true`).
 - `docker compose` v2 (the `compose` subcommand, not legacy `docker-compose`).
 - The shared Traefik ingress network `network-traefik-public`. `compose.dev.yml` attaches to it as an `external` network, so `just dev` fails immediately if it does not exist.

@@ -12,8 +12,12 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::ProjectsService;
-use crate::modules::auth::{RequireAdmin, RequireProjects, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireAdmin, RequireCallerContext, RequireProjects, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -82,13 +86,43 @@ pub fn projects_routes(service: ProjectsService) -> Router {
 
 async fn list_projects(
     State(s): State<ProjectsRouterState>,
-    RequireProjects { user: u, .. }: RequireProjects,
-    Query(f): Query<ProjectFilter>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Query(mut f): Query<ProjectFilter>,
     Query(p): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<ProjectResponse>>> {
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     f.validate()?;
-    let (items, total) = s.service.list_projects(u.tenant(), &f, &p).await?;
-    Ok(Json(PaginatedResponse::from_params(items, &p, total)))
+    // PMS-935: dual-plane sweep. Contact callers must hold
+    // `projects:read`; server stamps `company_id` from the session
+    // so a spoofed query param cannot widen visibility. Projects
+    // with a NULL `company_id` (staff-side house projects) are
+    // implicitly excluded from the contact view. PMS-1061: the contact
+    // arm answers with `ContactProjectResponse`, the customer's
+    // projection, never the staff type.
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::PROJECTS_READ, &db).await?;
+            f.company_id = Some(session.company_id);
+        }
+    }
+    let (items, total) = s.service.list_projects(tenant, &f, &p).await?;
+    Ok(match &caller {
+        CallerContext::Staff(_) => {
+            Json(PaginatedResponse::from_params(items, &p, total)).into_response()
+        }
+        CallerContext::Contact(_) => Json(PaginatedResponse::from_params(
+            items
+                .into_iter()
+                .map(ContactProjectResponse::from)
+                .collect::<Vec<_>>(),
+            &p,
+            total,
+        ))
+        .into_response(),
+    })
 }
 
 /// PMS-894: tenant-wide project totals, so the SPA's list page can render its
@@ -114,10 +148,46 @@ async fn create_project(
 
 async fn get_project(
     State(s): State<ProjectsRouterState>,
-    RequireProjects { user: u, .. }: RequireProjects,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<ProjectResponse>> {
-    Ok(Json(s.service.get_project(u.tenant(), id).await?))
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    // PMS-935: contact-plane callers 404 on a foreign Company's
+    // project (or a house project with a NULL company_id) so a probe
+    // cannot confirm existence. PMS-1061: a contact gets
+    // `ContactProjectResponse`, never the staff type.
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::PROJECTS_READ, &db).await?;
+        }
+    }
+    let project = s.service.get_project(tenant, id).await?;
+    Ok(match &caller {
+        CallerContext::Staff(_) => Json(project).into_response(),
+        CallerContext::Contact(session) => {
+            if project.company_id != Some(session.company_id) {
+                return Err(AppError::NotFound("Project".to_string()));
+            }
+            Json(ContactProjectResponse::from(project)).into_response()
+        }
+    })
+}
+
+/// PMS-935: baseline "must be authenticated staff" check inlined
+/// alongside the dual-plane read handlers. Reads used to sit behind
+/// `RequireProjects` (module gate + auth); the sweep drops the
+/// module-gate piece so contact callers with `projects:read` reach
+/// the endpoint regardless of the tenant's staff-side module toggle.
+/// Every child endpoint (phases, tasks, task statuses, project
+/// types, task dependencies) stays behind `RequireProjects` and is
+/// therefore implicitly staff-only: a contact bearer never
+/// populates `AuthState`, so those extractors 401.
+fn assert_staff_authenticated(auth: &crate::modules::auth::AuthState) -> AppResult<()> {
+    auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+    Ok(())
 }
 
 async fn update_project(
@@ -328,7 +398,9 @@ async fn create_task(
 ) -> AppResult<Json<TaskResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.create_task(u.tenant(), id, &req, &ctx).await?,
+        s.service
+            .create_task(u.tenant(), &u.timezone, id, &req, &ctx)
+            .await?,
     ))
 }
 

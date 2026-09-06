@@ -133,6 +133,8 @@ async fn changing_a_catalog_price_does_not_reprice_a_document(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let product_id = a_product(&app, &token, "Licence", "100").await;
     let resp = invoice_with_product(&app, &token, company_id, &product_id, "100").await;
@@ -195,6 +197,8 @@ async fn a_sold_product_is_retired_rather_than_deleted(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let unsold = a_product(&app, &token, "Never sold", "10").await;
     let sold = a_product(&app, &token, "Sold once", "10").await;
@@ -262,6 +266,118 @@ async fn a_sold_product_is_retired_rather_than_deleted(pool: PgPool) {
     assert_eq!(refused_line.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
+/// PMS-1002: the response says whether anything has sold the product, so a
+/// client can show it and withhold Delete where the FK would refuse it. The
+/// flag is advisory and the FK stays the guard, which the test above pins.
+#[sqlx::test]
+async fn the_response_says_whether_anything_has_sold_the_product(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = common::seed_company(&pool).await;
+
+    let fresh = a_product(&app, &token, "Fresh", "10").await;
+    let invoiced = a_product(&app, &token, "Invoiced", "10").await;
+    let contracted = a_product(&app, &token, "Contracted", "10").await;
+
+    async fn read(app: &common::TestApp, token: &str, id: &str) -> Value {
+        app.client
+            .get(app.url(&format!("/api/v1/products/{id}")))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("get product")
+            .json()
+            .await
+            .expect("product JSON")
+    }
+
+    // Creating says false: nothing can have sold a product that did not exist.
+    for id in [&fresh, &invoiced, &contracted] {
+        assert_eq!(read(&app, &token, id).await["in_use"], false, "{id}");
+    }
+
+    assert!(
+        invoice_with_product(&app, &token, company_id, &invoiced, "10")
+            .await
+            .status()
+            .is_success()
+    );
+    let contract_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO contracts
+           (id, tenant_id, name, company_id, contract_type, status,
+            start_date, billing_cycle)
+           VALUES ($1, $2, 'Managed', $3, 'managed_services', 'active',
+                   '2026-01-01', 'monthly')"#,
+    )
+    .bind(contract_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed contract");
+    sqlx::query(
+        r#"INSERT INTO contract_items
+           (id, tenant_id, contract_id, product_id, name, item_type, quantity,
+            unit_price, total_price, sort_order, billing_rule)
+           VALUES ($1, $2, $3, $4, 'Licences', 'product', 1, 10, 10, 0, 'every_period')"#,
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contract_id)
+    .bind(uuid::Uuid::parse_str(&contracted).expect("uuid"))
+    .execute(&pool)
+    .await
+    .expect("seed contract item");
+
+    // Get, one per reference kind.
+    assert_eq!(read(&app, &token, &fresh).await["in_use"], false);
+    assert_eq!(read(&app, &token, &invoiced).await["in_use"], true);
+    assert_eq!(read(&app, &token, &contracted).await["in_use"], true);
+
+    // The list carries the same answer, since it is the same column list.
+    let listed: Value = app
+        .client
+        .get(app.url("/api/v1/products"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("products JSON");
+    let by_name = |name: &str| {
+        listed["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} listed: {listed}"))["in_use"]
+            .clone()
+    };
+    assert_eq!(by_name("Fresh"), false);
+    assert_eq!(by_name("Invoiced"), true);
+    assert_eq!(by_name("Contracted"), true);
+
+    // An edit returns the same shape, so a client refreshing from the PUT
+    // response does not lose the flag.
+    let edited: Value = app
+        .client
+        .put(app.url(&format!("/api/v1/products/{invoiced}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "Invoiced", "sku": "Invoiced", "unit_price": "12",
+        }))
+        .send()
+        .await
+        .expect("edit")
+        .json()
+        .await
+        .expect("product JSON");
+    assert_eq!(edited["in_use"], true);
+}
+
 /// An FK check bypasses RLS, so a product id from another tenant would satisfy
 /// the constraint and link across tenants without a word. It is refused
 /// explicitly instead, and every link on the request is checked before the
@@ -272,6 +388,8 @@ async fn a_foreign_product_is_refused_and_no_line_is_written(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     // A product belonging to nobody this caller can see.
     let other_tenant = uuid::Uuid::new_v4();
@@ -331,6 +449,8 @@ async fn a_line_with_no_product_is_unaffected(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let resp = app
         .client
@@ -368,6 +488,8 @@ async fn replacing_the_lines_keeps_the_product_link(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
 
     let first = a_product(&app, &token, "First", "10").await;
     let second = a_product(&app, &token, "Second", "20").await;

@@ -1,6 +1,8 @@
 //! API module - combines all API routes
 
 #[cfg(feature = "server")]
+mod cors_origin;
+#[cfg(feature = "server")]
 mod router;
 
 #[cfg(feature = "server")]

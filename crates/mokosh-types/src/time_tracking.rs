@@ -358,3 +358,113 @@ pub struct UpsertTimeRoundingRuleRequest {
     #[serde(default)]
     pub is_default: bool,
 }
+
+// ============================================================================
+// PMS-950 work day: clock in and out, breaks, and the day's breakdown
+// ============================================================================
+
+/// One segment of a person's working day: `work` from clock-in to clock-out
+/// (or to the start of a break), `break` between two `work` segments. The day
+/// is derived from its segments rather than stored, so nothing here can
+/// disagree with what the person actually did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDaySegmentResponse {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    /// The day the segment belongs to. Kept across midnight, so a night shift
+    /// stays on the day it started.
+    pub date: NaiveDate,
+    /// `work` or `break`.
+    pub kind: String,
+    pub started_at: DateTime<Utc>,
+    /// `None` while the segment is open.
+    pub ended_at: Option<DateTime<Utc>>,
+    /// Elapsed minutes; an open segment counts up to now.
+    pub minutes: i64,
+}
+
+/// The body of a clock-in. `date` is the client's local day, the way a time
+/// entry carries the date the client sent; absent, today in the user's own
+/// zone (`users.timezone`).
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct ClockInRequest {
+    pub date: Option<NaiveDate>,
+}
+
+/// `GET /workday`: which day, and whose. `date` absent means the day of the
+/// open segment if there is one, else today in the caller's own zone, so a
+/// reload finds the clock where it was left. `user_id` is honoured for an admin and ignored for
+/// anyone else, who sees their own day.
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct WorkDayQuery {
+    pub date: Option<NaiveDate>,
+    pub user_id: Option<Uuid>,
+}
+
+/// One ticket's share of the day, summed over the day's entries naming it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDayTicketLine {
+    pub ticket_id: Uuid,
+    pub ticket_number: Option<String>,
+    pub ticket_title: Option<String>,
+    pub minutes: i64,
+    pub entry_count: i64,
+}
+
+/// One project's share of the day: entries naming the project and no ticket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDayProjectLine {
+    pub project_id: Uuid,
+    pub project_name: Option<String>,
+    pub minutes: i64,
+    pub entry_count: i64,
+}
+
+/// A bucket with no identity of its own: Administrative, or Unattached.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkDayBucket {
+    pub minutes: i64,
+    pub entry_count: i64,
+}
+
+/// The day's `time_entries` read by what they are attached to. The four parts
+/// partition the day's entries, so their minutes sum to `logged_minutes`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkDayBreakdown {
+    pub tickets: Vec<WorkDayTicketLine>,
+    pub projects: Vec<WorkDayProjectLine>,
+    /// The MSP's own time: `entry_kind = 'employee'` (PMS-942). Paperwork for
+    /// your employer is paid company time that belongs on the timesheet and on
+    /// no client.
+    pub administrative: WorkDayBucket,
+    /// Client work naming neither a ticket nor a project. PMS-942 says a
+    /// billable client call logged without a ticket is the client's time and
+    /// not the MSP's, so it is not filed under Administrative.
+    pub unattached: WorkDayBucket,
+}
+
+/// A person's day: the clock and the work, as two readings of the same rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDayResponse {
+    pub user_id: Uuid,
+    pub date: NaiveDate,
+    /// A segment on this day is still open.
+    pub is_clocked_in: bool,
+    /// The open segment is a break.
+    pub on_break: bool,
+    /// Whether this employer tracks breaks (`timesheets/track_breaks`, PMS-943).
+    /// With it off no break control is offered and the day is one segment.
+    pub track_breaks: bool,
+    pub segments: Vec<WorkDaySegmentResponse>,
+    /// Minutes in `work` segments, an open one counted to now.
+    pub clocked_minutes: i64,
+    /// Minutes in `break` segments.
+    pub break_minutes: i64,
+    /// Minutes across the day's time entries (`worked_minutes`).
+    pub logged_minutes: i64,
+    /// `clocked_minutes - logged_minutes`. Positive is clocked time nobody has
+    /// logged yet; negative is more logged than clocked. Reported, not
+    /// resolved: eight hours clocked against six logged is the normal case.
+    pub unlogged_minutes: i64,
+    pub breakdown: WorkDayBreakdown,
+}

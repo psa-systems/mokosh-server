@@ -1113,6 +1113,184 @@ async fn deleting_a_payment_recomputes_from_remaining(pool: PgPool) {
     );
 }
 
+// =====================================================================// PMS-993: the billing contact is the invoice recipient
+// ============================================================================
+
+/// AC2 negative: a recipient from another company (or another tenant) is a
+/// 400, not a silent cross-account link. FK checks bypass RLS, so nothing else
+/// was stopping it.
+#[sqlx::test]
+async fn invoice_rejects_a_billing_contact_from_another_company(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let other_company = common::seed_company_named(&pool, "Globex").await;
+    let stranger = common::seed_billing_contact(&pool, other_company).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "billing_contact_id": stranger,
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-07-15",
+            "lines": [{ "line_type": "service", "description": "Work", "quantity": "1", "unit_price": "100" }],
+        }))
+        .send()
+        .await
+        .expect("create invoice with a stranger");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a billing contact outside the company is rejected"
+    );
+}
+
+/// AC4: a company with no billing contact cannot have an invoice sent, and the
+/// refusal leaves nothing behind - no `sent_at`, no frozen issuer, no issued
+/// document. Those are what a partially-applied send would strand.
+#[sqlx::test]
+async fn sending_without_a_billing_contact_is_refused(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    // The pool is read again at the end to prove the row never moved off draft,
+    // so `boot` gets a clone rather than ownership.
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let invoice: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-07-15",
+            "lines": [{ "line_type": "service", "description": "Work", "quantity": "1", "unit_price": "100" }],
+        }))
+        .send()
+        .await
+        .expect("create invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    assert!(
+        invoice["billing_contact_id"].is_null(),
+        "no billing contact to inherit"
+    );
+    let invoice_id = Uuid::parse_str(invoice["id"].as_str().expect("id")).expect("uuid");
+
+    let resp = app
+        .client
+        .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "status": "sent" }))
+        .send()
+        .await
+        .expect("send invoice");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "sending to nobody is a 409"
+    );
+
+    let row = sqlx::query(
+        "SELECT status, sent_at, issuer_snapshot FROM invoices \
+         WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read invoice back");
+    assert_eq!(row.get::<String, _>("status"), "draft", "still a draft");
+    assert!(
+        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("sent_at")
+            .is_none(),
+        "a refused send stamps no sent_at"
+    );
+    assert!(
+        row.get::<Option<serde_json::Value>, _>("issuer_snapshot")
+            .is_none(),
+        "a refused send freezes no issuer"
+    );
+    // PMS-959 stores the issued document as a `files` ledger row, not a table
+    // of its own (see `billing::documents::store_issued`).
+    let documents: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM files \
+         WHERE tenant_id = $1 AND entity_id = $2 AND entity_type = 'invoice_document'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count issued documents");
+    assert_eq!(documents, 0, "a refused send writes no issued document");
+}
+
+/// AC2 + AC4: the send PERSISTS the recipient it resolved. Resolving only to
+/// decide the 409 would leave the column NULL, and the pay-now mail reads that
+/// column, so the invoice would go out addressed to nobody.
+#[sqlx::test]
+async fn sending_persists_the_resolved_billing_contact(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // Created BEFORE the company has a billing contact, so the draft stores
+    // NULL and only the send can fill it in.
+    let invoice: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-07-15",
+            "lines": [{ "line_type": "service", "description": "Work", "quantity": "1", "unit_price": "100" }],
+        }))
+        .send()
+        .await
+        .expect("create invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    let invoice_id = Uuid::parse_str(invoice["id"].as_str().expect("id")).expect("uuid");
+    assert!(invoice["billing_contact_id"].is_null());
+
+    let contact_id = common::seed_billing_contact(&pool, company_id).await;
+    let sent: serde_json::Value = app
+        .client
+        .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "status": "sent" }))
+        .send()
+        .await
+        .expect("send invoice")
+        .json()
+        .await
+        .expect("sent JSON");
+    assert_eq!(sent["status"].as_str(), Some("sent"));
+
+    let stored: Option<Uuid> = sqlx::query_scalar(
+        "SELECT billing_contact_id FROM invoices WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(invoice_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read recipient back");
+    assert_eq!(
+        stored,
+        Some(contact_id),
+        "the send writes the recipient it resolved, it does not only check it"
+    );
+}
+
 /// PMS-1004: a generated line describes the work, not the row.
 ///
 /// `Time entry {uuid}` was the description of every line the builder wrote,

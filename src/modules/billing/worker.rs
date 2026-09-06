@@ -53,3 +53,36 @@ impl Job for RecurringInvoicingWorker {
         Ok(())
     }
 }
+
+/// PMS-1037: mail the customer about overdue invoices on the tenant's
+/// schedule. Hourly, so each tenant's local sending hour is hit once a day;
+/// `invoice_reminders` keeps a second run in the same hour from sending
+/// twice.
+#[derive(Clone)]
+pub struct InvoiceReminderWorker {
+    service: BillingService,
+}
+
+impl InvoiceReminderWorker {
+    pub fn new(service: BillingService) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait]
+impl Job for InvoiceReminderWorker {
+    fn name(&self) -> &'static str {
+        "invoice_reminders"
+    }
+
+    async fn run(&self) -> AppResult<()> {
+        let sent = self
+            .service
+            .send_due_reminders_all_tenants(chrono::Utc::now())
+            .await?;
+        if sent > 0 {
+            tracing::info!(sent, "invoice reminder sweep");
+        }
+        Ok(())
+    }
+}

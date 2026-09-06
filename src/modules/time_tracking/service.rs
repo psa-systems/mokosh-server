@@ -15,7 +15,8 @@ use mokosh_types::tickets::BillingStatus;
 
 #[derive(Clone)]
 pub struct TimeTrackingService {
-    db: Database,
+    /// Shared with `work_day.rs`, the PMS-950 half of this service.
+    pub(super) db: Database,
 }
 
 impl TimeTrackingService {
@@ -1070,16 +1071,37 @@ impl TimeTrackingService {
 
         // The stamp is claimed, not written: `hours_consumed IS NULL` again, so
         // two concurrent creates for one id cannot both record a draw.
+        //
+        // PMS-1035: the stamp is also the billing signal. An entry fully
+        // inside the allotment becomes `prepaid`, so the time-entry invoice
+        // (which bills `ready_to_bill` only) never charges hourly for hours the
+        // customer already paid for. An entry that ran past the block keeps
+        // `ready_to_bill` and records the overage beside the draw: the hours
+        // past the allotment and the contract item's rate at that moment
+        // (NULL when it names none), which is what the invoice then bills.
+        // Only a `ready_to_bill` entry flips: one already on an invoice stays
+        // `billed`, which cannot happen here in practice because the claim is
+        // made at creation, but the CASE says so rather than assuming it.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"UPDATE time_entries
-               SET hours_consumed = $3, hours_balance_id = $4, updated_at = NOW()
+               SET hours_consumed  = $3,
+                   hours_balance_id = $4,
+                   overage_hours   = NULLIF($5, 0),
+                   overage_rate    = CASE WHEN $5 > 0 THEN $6 ELSE NULL END,
+                   billing_status  = CASE
+                       WHEN $5 > 0 OR billing_status <> 'ready_to_bill' THEN billing_status
+                       ELSE 'prepaid'
+                   END,
+                   updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2 AND hours_consumed IS NULL"#,
         )
         .bind(tenant_id)
         .bind(id)
         .bind(outcome.hours_applied)
         .bind(outcome.balance_id)
+        .bind(outcome.overage_hours)
+        .bind(outcome.overage_rate)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1112,9 +1134,22 @@ impl TimeTrackingService {
         // and locks the row in the same statement, so only the call that
         // actually clears the stamp gets a row and two of them cannot both
         // credit the same hours back.
+        // PMS-1035: forgetting the draw also forgets what it decided about
+        // billing. The overage columns go, and a `prepaid` entry is
+        // `ready_to_bill` again in full: with no block behind it, its hours
+        // are hourly work like any other, and a re-draw (an edit) decides
+        // afresh.
         let claimed: Option<(Option<Decimal>, Option<Uuid>)> = sqlx::query_as(
             r#"UPDATE time_entries te
-               SET hours_consumed = NULL, hours_balance_id = NULL, updated_at = NOW()
+               SET hours_consumed = NULL,
+                   hours_balance_id = NULL,
+                   overage_hours = NULL,
+                   overage_rate = NULL,
+                   billing_status = CASE
+                       WHEN te.billing_status = 'prepaid' THEN 'ready_to_bill'
+                       ELSE te.billing_status
+                   END,
+                   updated_at = NOW()
                FROM (
                    SELECT id, hours_consumed AS prev_hours, hours_balance_id AS prev_balance
                    FROM time_entries
@@ -1371,6 +1406,19 @@ impl TimeTrackingService {
 
         let now = Utc::now();
         let raw = (now - timer.started_at).num_minutes().max(1) as i32;
+        // PMS-1027: the entry is dated by the day it is where the timer's
+        // OWNER is, not the UTC day. An evening stop in the Americas used to
+        // land the entry on tomorrow and draw from next month's block of
+        // hours. The owner's zone rather than the caller's, because the entry
+        // is theirs.
+        let owner_tz: String =
+            sqlx::query_scalar("SELECT timezone FROM users WHERE id = $1 AND tenant_id = $2")
+                .bind(timer.user_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .unwrap_or_else(|| "UTC".to_string());
+        let today = mokosh_types::datetime::user_today(now, &owner_tz);
 
         // Active timer might not carry work_type_id / company_id; the
         // schema requires both on time_entries. Fall back to first
@@ -1441,7 +1489,7 @@ impl TimeTrackingService {
             &mut tx,
             tenant_id,
             company_id,
-            now.date_naive(),
+            today,
             kind.kind,
             kind.billable,
         )
@@ -1463,7 +1511,7 @@ impl TimeTrackingService {
         .bind(entry_id)
         .bind(tenant_id)
         .bind(timer.user_id)
-        .bind(now.date_naive())
+        .bind(today)
         .bind(timer.started_at.time())
         .bind(now.time())
         .bind(duration)
@@ -1914,6 +1962,10 @@ pub(crate) fn resolve_billing_status(
     if current == Some(BillingStatus::Billed) {
         return "billed";
     }
+    // PMS-1035: `prepaid` is not sticky the way `billed` is. An edit releases
+    // the draw and draws again, and the re-draw decides whether the entry is
+    // still covered; so an update resolves it from billability like a fresh
+    // entry and lets `consume_for_entry` re-stamp it.
     if is_billable {
         "ready_to_bill"
     } else {

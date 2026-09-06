@@ -121,11 +121,238 @@ async fn ensure_personal_tenant_provisions_then_is_idempotent(pool: PgPool) {
     assert_eq!(tenant_total, 3, "no duplicate tenants provisioned");
 }
 
+/// PMS-729 finalize: `copy_default_config` MUST propagate the
+/// transactional notification templates + rules that portal flows
+/// dispatch through. Without `auth.welcome` on a fresh tenant, the
+/// "grant portal access" write mints a setup token but the follow-on
+/// email dispatch silently drops (no template row -> nothing to
+/// render), so the customer never gets the setup link and the flow
+/// looks broken end-to-end. This regression test pins the template
+/// AND the delivery rule; either missing = red.
+#[sqlx::test]
+async fn create_tenant_copies_auth_welcome_template_and_rule(pool: PgPool) {
+    let svc = TenantService::new(mokosh_server::Database::from_pool(pool.clone()));
+    let req = mokosh_server::modules::tenants::CreateTenantRequest {
+        name: "PMS-729 Welcome-Template Check".into(),
+        slug: "pms729-welcome-copy".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "owner-pms729-welcome@example.test".into(),
+        admin_first_name: "Owner".into(),
+        admin_last_name: "Pms729Welcome".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant with default seed");
+
+    let template_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_templates \
+         WHERE tenant_id = $1 AND event_type = 'auth.welcome' AND channel_type = 'email'",
+    )
+    .bind(tenant.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count auth.welcome template");
+    assert_eq!(
+        template_count, 1,
+        "fresh tenant must have exactly one auth.welcome email template so the portal setup email has something to render"
+    );
+
+    let rule_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_rules \
+         WHERE tenant_id = $1 AND event_type = 'auth.welcome' AND is_active = TRUE",
+    )
+    .bind(tenant.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count auth.welcome rule");
+    assert_eq!(
+        rule_count, 1,
+        "fresh tenant must have exactly one active auth.welcome delivery rule so the dispatcher actually fires"
+    );
+}
+
+// mokosh-contact-login: pre-pivot `create_tenant_emails_portal_admin_setup_link`
+// removed. That test exercised `TenantService::provision_portal_admin_and_send_welcome`
+// which retired on this branch (prompt 001). Replacement e2e test for the
+// new contact plane lands in prompt 004.
+#[cfg(any())]
+async fn RETIRED(pool: PgPool) {
+    let notifications =
+        NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
+    // MAPPS-554 dev-port pin: pass a `http://host:PORT` frontend base URL
+    // so the emitted portal URL should preserve the port. Regression
+    // gate for the operator's 2026-08-24 report ("This link is
+    // expired or invalid" on first click) - pre-fix the emitted URL
+    // lost the dev port because portal_host_suffix does not carry
+    // one, and browsers hit port 80 where nothing serves.
+    let svc = TenantService::new(Database::from_pool(pool.clone()))
+        .with_dispatcher(notifications, "http://spa.test:4301".into())
+        .with_portal_host_suffix(".client.spa.test");
+
+    let req = CreateTenantRequest {
+        name: "MAPPS-554 Portal Admin Welcome".into(),
+        slug: "mapps554-portal-admin-welcome".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "admin-mapps554-welcome@example.test".into(),
+        admin_first_name: "Ada".into(),
+        admin_last_name: "Admin".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant with dispatcher + portal suffix");
+
+    // MAPPS-554: no `users` row for the admin email.
+    let users_for_admin: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND email = $2")
+            .bind(tenant.id)
+            .bind(&req.admin_email)
+            .fetch_one(&pool)
+            .await
+            .expect("count admin users row");
+    assert_eq!(
+        users_for_admin, 0,
+        "MAPPS-554: create_tenant must NOT insert a users row for the admin email"
+    );
+
+    // Exactly one portal admin contact, linked to the tenant's own_company.
+    let (contact_id, contact_company_id, contact_is_portal, contact_portal_role): (
+        uuid::Uuid,
+        uuid::Uuid,
+        bool,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT id, company_id, is_portal_user, portal_role FROM contacts \
+         WHERE tenant_id = $1 AND email = $2 ORDER BY created_at LIMIT 1",
+    )
+    .bind(tenant.id)
+    .bind(&req.admin_email)
+    .fetch_one(&pool)
+    .await
+    .expect("read admin contact row");
+    assert!(
+        contact_is_portal,
+        "MAPPS-554: provisioned admin contact must have is_portal_user = TRUE"
+    );
+    assert_eq!(
+        contact_portal_role.as_deref(),
+        Some("admin"),
+        "MAPPS-554: provisioned admin contact must have portal_role = 'admin'"
+    );
+    let own_company_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT own_company_id FROM tenants WHERE id = $1")
+            .bind(tenant.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read own_company_id");
+    assert_eq!(
+        contact_company_id, own_company_id,
+        "MAPPS-554: admin contact must be linked to the tenant's own_company"
+    );
+
+    let token_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM portal_setup_tokens \
+         WHERE tenant_id = $1 AND contact_id = $2 AND used_at IS NULL",
+    )
+    .bind(tenant.id)
+    .bind(contact_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count portal setup tokens");
+    assert_eq!(
+        token_count, 1,
+        "MAPPS-554: create_tenant must mint exactly one redeemable portal_setup_token for the admin contact"
+    );
+
+    let queued: (String, String, String) = sqlx::query_as(
+        "SELECT recipient, subject, body FROM notifications \
+         WHERE tenant_id = $1 AND channel_type = 'email' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(tenant.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read queued welcome notification");
+    assert_eq!(
+        queued.0, req.admin_email,
+        "queued email must be addressed to the freshly-created portal admin contact"
+    );
+    // MAPPS-554: URL carries the port from `frontend_base_url` when
+    // `portal_host_suffix` lacks one (dev). https for the non-localhost
+    // suffix (see the dev-vs-prod scheme derivation in
+    // `mint_and_send_portal_welcome`).
+    let expected_prefix = format!(
+        "https://{}.client.spa.test:4301/portal/set-password?token=",
+        req.slug,
+    );
+    assert!(
+        queued.2.contains(&expected_prefix),
+        "MAPPS-554: queued body must carry the tenant-subdomain portal setup link {expected_prefix}, got: {}",
+        queued.2,
+    );
+    assert!(
+        !queued.2.contains("/reset-password/") && !queued.2.contains("/set-password/"),
+        "MAPPS-554: queued body must NOT carry the mokosh-apex users-side link shape, got: {}",
+        queued.2,
+    );
+    assert!(
+        !queued.1.is_empty(),
+        "queued subject must be non-empty so the mail client renders a subject line"
+    );
+
+    // MAPPS-554 end-to-end: the emailed token must be redeemable via
+    // `PortalAuthService::setup_password`. Extracts the token straight
+    // out of the queued email body, feeds it to the same service the
+    // portal handler calls, and asserts the redemption returns 204 +
+    // writes `portal_password_hash`. Regression gate for the operator's
+    // 2026-08-24 report: "This link is expired or invalid. Ask your
+    // account team for a new one. But this is a brand new and fresh
+    // link only clicked ONCE!"
+    let token = queued
+        .2
+        .split(&expected_prefix)
+        .nth(1)
+        .and_then(|tail| {
+            tail.split(|c: char| c == '"' || c == '<' || c == ' ' || c == '\n')
+                .next()
+        })
+        .expect("extract token from queued body");
+    let portal_svc = mokosh_server::modules::portal::PortalAuthService::new(
+        Database::from_pool(pool.clone()),
+        "test-jwt-secret".to_string(),
+    );
+    portal_svc
+        .setup_password(token, "MAPPS-554-fresh-token-pass-01!")
+        .await
+        .expect("fresh token from create_tenant welcome must redeem cleanly");
+    let hash: Option<String> =
+        sqlx::query_scalar("SELECT portal_password_hash FROM contacts WHERE id = $1")
+            .bind(contact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal_password_hash");
+    assert!(
+        hash.is_some(),
+        "MAPPS-554: setup_password must persist portal_password_hash on redemption"
+    );
+}
+
 #[sqlx::test]
 async fn list_tenants_returns_default(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
-    let token = common::login(&app, &email, &password).await;
+    // MAPPS-518: /api/v1/tenants is gated on `RequirePlatformAdmin`, so use
+    // the platform-plane bearer minted by `/platform/login` (which
+    // `seed_admin` also seeds a row for). A tenant `AuthContext` bearer
+    // now returns 401 here.
+    let token = common::platform_login(&app, &email, &password).await;
 
     let resp = app
         .client
@@ -137,7 +364,7 @@ async fn list_tenants_returns_default(pool: PgPool) {
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
-        "list tenants should succeed for a super_admin"
+        "list tenants should succeed for a platform admin"
     );
 
     let body: serde_json::Value = resp.json().await.expect("tenants list JSON");
@@ -149,17 +376,21 @@ async fn list_tenants_returns_default(pool: PgPool) {
     assert_eq!(default["slug"].as_str(), Some("default"));
 }
 
-// PMS-260: `tenants::list_tenants` runs no SQL tenant filter (listing every
-// tenant is its whole job); the only thing standing between a tenant-scoped
-// caller and the full list is the route's SuperAdmin guard. Pin that guard: a
-// non-super-admin must get 403, never the global tenant list.
+// PMS-260 + MAPPS-518: `tenants::list_tenants` runs no SQL tenant filter
+// (listing every tenant is its whole job); the only thing standing between a
+// tenant-scoped caller and the full list is the route's
+// `RequirePlatformAdmin` guard (previously `RequireSuperAdmin`, before
+// MAPPS-518 retired the role-based bypass). Pin that guard: a tenant
+// bearer must get 401 (no platform admin identity in the token), never
+// the global tenant list.
 #[sqlx::test]
 async fn list_tenants_rejects_non_super_admin(pool: PgPool) {
     let (_admin_id, _admin_email, _admin_password) = common::seed_admin(&pool).await;
     // A second tenant exists, so an unscoped leak would be observable.
     let (_tenant_b_id, _b_uid, _b_email, _b_password) =
         common::seed_tenant_with_admin(&pool, "pms260-list-b").await;
-    // A tenant-A admin (role `admin`, NOT super_admin).
+    // A tenant-A admin (role `admin`) with only a tenant bearer, no
+    // platform_admins row.
     let (_tech_id, tech_email, tech_password) = common::seed_user(
         &pool,
         common::DEFAULT_TENANT_ID,
@@ -177,11 +408,11 @@ async fn list_tenants_rejects_non_super_admin(pool: PgPool) {
         .bearer_auth(&token)
         .send()
         .await
-        .expect("send list tenants as non-super-admin");
+        .expect("send list tenants as tenant-scoped caller");
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::FORBIDDEN,
-        "a non-super-admin must not be able to list all tenants"
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a tenant bearer must not pass the platform-admin gate"
     );
 }
 
@@ -452,6 +683,7 @@ async fn create_tenant_sets_org_kind(pool: PgPool) {
         admin_email: "owner-pms287@example.test".into(),
         admin_first_name: "Owner".into(),
         admin_last_name: "Pms287".into(),
+        branding: None,
     };
 
     let tenant = svc
@@ -481,6 +713,7 @@ async fn create_tenant_provisions_internal_own_company(pool: PgPool) {
         admin_email: "owner-pms413@example.test".into(),
         admin_first_name: "Owner".into(),
         admin_last_name: "Pms413".into(),
+        branding: None,
     };
 
     let tenant = svc
@@ -505,6 +738,93 @@ async fn create_tenant_provisions_internal_own_company(pool: PgPool) {
             .expect("own-company row exists");
     assert_eq!(company_type, "internal", "own-company is type internal");
     assert_eq!(name, "PMS-413 Org", "own-company is named after the tenant");
+}
+
+/// MAPPS-396: caller-supplied branding lands on the initial insert so the
+/// SPA can create-and-brand in one round-trip rather than a
+/// create-then-update pair. Round-trip: create -> read column ->
+/// GET response -> assert every populated field.
+#[sqlx::test]
+async fn create_tenant_persists_optional_branding(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let branding = mokosh_types::tenants::TenantBranding {
+        logo_url: Some("https://cdn.example/logo.svg".to_string()),
+        primary_color: Some("#2563eb".to_string()),
+        support_email: Some("help@acme-mapps396.example".to_string()),
+        ..Default::default()
+    };
+    let req = CreateTenantRequest {
+        name: "MAPPS-396 Branded".into(),
+        slug: "mapps396-branded".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "owner-mapps396@example.test".into(),
+        admin_first_name: "Owner".into(),
+        admin_last_name: "Mapps396".into(),
+        branding: Some(branding.clone()),
+    };
+
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant with branding must succeed");
+
+    let raw: serde_json::Value = sqlx::query_scalar("SELECT branding FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read branding");
+    assert_eq!(
+        raw["logo_url"].as_str(),
+        Some("https://cdn.example/logo.svg"),
+        "branding.logo_url must round-trip through create_tenant"
+    );
+    assert_eq!(
+        raw["primary_color"].as_str(),
+        Some("#2563eb"),
+        "branding.primary_color must round-trip through create_tenant"
+    );
+    assert_eq!(
+        raw["support_email"].as_str(),
+        Some("help@acme-mapps396.example"),
+        "branding.support_email must round-trip through create_tenant"
+    );
+}
+
+/// MAPPS-396: omitting `branding` lands the tenant with an empty-object
+/// default rather than NULL (the column is NOT NULL DEFAULT '{}') so
+/// pre-MAPPS-396 clients keep working.
+#[sqlx::test]
+async fn create_tenant_omitting_branding_uses_empty_default(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "MAPPS-396 Bare".into(),
+        slug: "mapps396-bare".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "owner-bare-mapps396@example.test".into(),
+        admin_first_name: "Owner".into(),
+        admin_last_name: "Bare".into(),
+        branding: None,
+    };
+
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant without branding must succeed");
+
+    let raw: serde_json::Value = sqlx::query_scalar("SELECT branding FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read branding");
+    assert_eq!(
+        raw,
+        serde_json::json!({}),
+        "omitted branding must land as empty object, not NULL / null"
+    );
 }
 
 /// PMS-413: a tenant provisioned off the PSA create path (e.g. a manually
@@ -1340,6 +1660,7 @@ async fn the_org_identity_loads_the_callers_own_tenant(pool: PgPool) {
                 admin_email: "owner-pms761@example.test".into(),
                 admin_first_name: "Owner".into(),
                 admin_last_name: "Pms761".into(),
+                branding: None,
             },
             &AuditCtx::system(common::DEFAULT_TENANT_ID),
         )
@@ -1393,6 +1714,7 @@ async fn a_new_tenant_can_actually_send_the_client_facing_email(pool: PgPool) {
                 admin_email: "owner-pms761b@example.test".into(),
                 admin_first_name: "Owner".into(),
                 admin_last_name: "Pms761b".into(),
+                branding: None,
             },
             &AuditCtx::system(common::DEFAULT_TENANT_ID),
         )
@@ -1418,6 +1740,382 @@ async fn a_new_tenant_can_actually_send_the_client_facing_email(pool: PgPool) {
     }
 }
 
+/// MAPPS-457: instance-wide creation cap set via `with_max_tenants`. When the
+/// current count is >= cap, `create_tenant` returns `AppError::Conflict` and
+/// commits no rows. Below-cap creates succeed and increment the count.
+#[sqlx::test]
+async fn create_tenant_enforces_max_tenants_cap(pool: PgPool) {
+    // Count the seed tenants the schema ships with so the cap math is against
+    // the real starting point, not a hardcoded expectation.
+    let seeded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
+        .fetch_one(&pool)
+        .await
+        .expect("count seeded tenants");
+    let cap = (seeded as usize) + 1;
+
+    let svc = TenantService::new(Database::from_pool(pool.clone())).with_max_tenants(Some(cap));
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    // First create fits under the cap (count -> cap - 1 + 1 = cap).
+    svc.create_tenant(
+        &CreateTenantRequest {
+            name: "MAPPS-457 Under Cap".into(),
+            slug: "mapps457-under".into(),
+            billing_email: None,
+            billing_contact_name: None,
+            subscription_plan: None,
+            admin_email: "under@example.test".into(),
+            admin_first_name: "Under".into(),
+            admin_last_name: "Cap".into(),
+            branding: None,
+        },
+        &ctx,
+    )
+    .await
+    .expect("first create should succeed (count < cap)");
+
+    // Second create is at cap, must be rejected 409.
+    let err = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "MAPPS-457 Over Cap".into(),
+                slug: "mapps457-over".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "over@example.test".into(),
+                admin_first_name: "Over".into(),
+                admin_last_name: "Cap".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("second create should be rejected at cap");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("cap reached"), "err must name the cap: {msg}");
+
+    // Row-count guard: the rejected create must not have partially inserted.
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
+        .fetch_one(&pool)
+        .await
+        .expect("count after rejection");
+    assert_eq!(
+        after as usize, cap,
+        "rejected create must leave the count at exactly the cap"
+    );
+}
+
+/// MAPPS-457: `with_max_tenants(None)` (unset env) leaves creation uncapped.
+/// Regression guard so future work does not accidentally default to a ceiling.
+#[sqlx::test]
+async fn create_tenant_uncapped_by_default(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone())).with_max_tenants(None);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+    for i in 0..3 {
+        svc.create_tenant(
+            &CreateTenantRequest {
+                name: format!("MAPPS-457 Uncapped {i}"),
+                slug: format!("mapps457-uncapped-{i}"),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: format!("uncapped-{i}@example.test"),
+                admin_first_name: "Un".into(),
+                admin_last_name: "Capped".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("uncapped create {i} should succeed: {e:?}"));
+    }
+}
+
+/// MAPPS-457: two non-personal tenants cannot share a name (case-insensitive).
+/// The second create returns 409 with the documented copy; no rows on the
+/// losing side. Personal tenants are exempt (covered by a peer test below).
+#[sqlx::test]
+async fn create_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    svc.create_tenant(
+        &CreateTenantRequest {
+            name: "Acme Corp".into(),
+            slug: "acme-1".into(),
+            billing_email: None,
+            billing_contact_name: None,
+            subscription_plan: None,
+            admin_email: "acme1@example.test".into(),
+            admin_first_name: "A".into(),
+            admin_last_name: "One".into(),
+            branding: None,
+        },
+        &ctx,
+    )
+    .await
+    .expect("first create succeeds");
+
+    let err = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                // Case-insensitive collision must trip the guard.
+                name: "acme corp".into(),
+                slug: "acme-2".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "acme2@example.test".into(),
+                admin_first_name: "A".into(),
+                admin_last_name: "Two".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("case-insensitive name collision must be rejected");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("name"), "err must mention name: {msg}");
+}
+
+/// MAPPS-457: personal tenants (auto-generated names from user first names) are
+/// exempt from the case-insensitive name uniqueness constraint. Two users named
+/// "Chris" can both provision a "Chris's workspace" tenant.
+#[sqlx::test]
+async fn create_personal_tenant_allows_duplicate_names(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let owner_a = uuid::Uuid::new_v4();
+    let owner_b = uuid::Uuid::new_v4();
+    svc.ensure_personal_tenant(owner_a, Some("Chris"), None)
+        .await
+        .expect("first personal tenant provisions");
+    svc.ensure_personal_tenant(owner_b, Some("Chris"), None)
+        .await
+        .expect("second personal tenant with the same auto-generated name still provisions");
+}
+
+/// MAPPS-457: rename via `update_tenant` also enforces case-insensitive
+/// uniqueness against every OTHER non-personal tenant; renaming to the row's
+/// own name is a no-op (idempotent).
+#[sqlx::test]
+async fn update_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
+    use mokosh_server::modules::auth::TenantId;
+    use mokosh_server::modules::tenants::UpdateTenantRequest;
+
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    let a = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "Bravo LLC".into(),
+                slug: "bravo".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "bravo@example.test".into(),
+                admin_first_name: "B".into(),
+                admin_last_name: "One".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect("create A");
+    let b = svc
+        .create_tenant(
+            &CreateTenantRequest {
+                name: "Charlie LLC".into(),
+                slug: "charlie".into(),
+                billing_email: None,
+                billing_contact_name: None,
+                subscription_plan: None,
+                admin_email: "charlie@example.test".into(),
+                admin_first_name: "C".into(),
+                admin_last_name: "One".into(),
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect("create B");
+
+    // Renaming B to A's name (case-insensitively) must be rejected.
+    let err = svc
+        .update_tenant(
+            TenantId::from_trusted(b.id),
+            &UpdateTenantRequest {
+                name: Some("bravo llc".into()),
+                slug: None,
+                billing_email: None,
+                billing_contact_name: None,
+                settings: None,
+                branding: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect_err("cross-row rename to a peer's name must be rejected");
+    assert!(format!("{err:?}").contains("name"));
+
+    // Renaming A to its own current name (case flipped) is a no-op, not a
+    // conflict against self.
+    svc.update_tenant(
+        TenantId::from_trusted(a.id),
+        &UpdateTenantRequest {
+            name: Some("BRAVO LLC".into()),
+            slug: None,
+            billing_email: None,
+            billing_contact_name: None,
+            settings: None,
+            branding: None,
+        },
+        &ctx,
+    )
+    .await
+    .expect("self-rename is idempotent");
+}
+
+/// MAPPS-459 (PMS-728 slice 3): entitlement absent = pass-through. A fresh
+/// tenant with no `tenant_membership_entitlements` row consults nothing (no
+/// integration wired), so `ensure_principal_usable` succeeds.
+#[sqlx::test]
+async fn ensure_principal_usable_passes_when_no_entitlement_row(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read seed admin");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect("no entitlement row = pass-through");
+}
+
+/// MAPPS-459: entitlement status = `active` passes. Regression pin so a future
+/// change to the entitlement writer does not accidentally block active tenants.
+#[sqlx::test]
+async fn ensure_principal_usable_passes_when_entitlement_active(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+    auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "active", None, None)
+        .await
+        .expect("write entitlement");
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read seed admin");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect("active entitlement = pass");
+}
+
+/// MAPPS-459: entitlement status = `suspended` rejects with the same "not
+/// active" copy the operator-side `tenants.status = 'suspended'` path returns,
+/// so a caller cannot distinguish billing suspension from operator suspension.
+#[sqlx::test]
+async fn ensure_principal_usable_rejects_when_entitlement_suspended(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+    auth.set_tenant_entitlement(
+        common::DEFAULT_TENANT_ID,
+        "suspended",
+        None,
+        Some("payment_failed"),
+    )
+    .await
+    .expect("write entitlement");
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read seed admin");
+    let err = auth
+        .ensure_principal_usable(&user)
+        .await
+        .expect_err("suspended entitlement must reject");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("not active"),
+        "reject uses the same wording as operator suspension: {msg}"
+    );
+}
+
+/// MAPPS-459: entitlement `active` but `expires_at < NOW()` rejects. Bunyip
+/// may hand us an active state that has since lapsed and there is no reason to
+/// wait for the next webhook to catch up.
+#[sqlx::test]
+async fn ensure_principal_usable_rejects_when_entitlement_expired(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+    auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "active", Some(past), None)
+        .await
+        .expect("write entitlement");
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read seed admin");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect_err("expired entitlement must reject");
+}
+
+/// MAPPS-459: upsert semantics - a later write replaces the prior state, so a
+/// suspended tenant that becomes active again on the next webhook is
+/// pass-through immediately.
+#[sqlx::test]
+async fn set_tenant_entitlement_upserts_on_repeat_writes(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+
+    auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "suspended", None, None)
+        .await
+        .expect("write suspended");
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read admin");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect_err("suspended rejects");
+
+    auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "active", None, None)
+        .await
+        .expect("write active");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect("re-activation lifts the reject");
+
+    // Exactly one row per tenant post-upsert.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tenant_membership_entitlements WHERE tenant_id = $1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 1, "one row per tenant, not one row per write");
+}
+
+/// MAPPS-459: an unknown status string is rejected at the write API so a
+/// misconfigured caller cannot smuggle a novel state into the enum column
+/// (the CHECK constraint would catch it too; the service-level guard just
+/// yields a clean 400 instead of a raw sqlx violation).
+#[sqlx::test]
+async fn set_tenant_entitlement_rejects_unknown_status(pool: PgPool) {
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+    let err = auth
+        .set_tenant_entitlement(common::DEFAULT_TENANT_ID, "not-a-status", None, None)
+        .await
+        .expect_err("unknown status must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("status") || msg.contains("active"),
+        "err mentions the invalid field: {msg}"
+    );
+}
+
 /// Migration 104: the seeded ticket-note copy names the organisation. The keys
 /// are supplied by `TicketsService::send_note_email`; an unresolved one would
 /// reach the client as literal braces, so template and context are asserted
@@ -1439,4 +2137,248 @@ async fn the_ticket_note_template_asks_for_the_organisation_identity(pool: PgPoo
             "the ticket-note body must render {key}: {body}"
         );
     }
+}
+
+// mokosh-contact-login: `cancel_tenant` retired with the Clients
+// tab (prompt 001). Removed alongside the pre-pivot test that
+// exercised it.
+#[cfg(any())]
+async fn cancel_and_reactivate_flip_tenant_status_RETIRED(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "MAPPS-558 Cancel Test".into(),
+        slug: "mapps558-cancel".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "cancel@mapps558.example".into(),
+        admin_first_name: "Cancel".into(),
+        admin_last_name: "Test".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant");
+    let tid = mokosh_server::modules::auth::TenantId::from_trusted(tenant.id);
+
+    svc.cancel_tenant(tid).await.expect("cancel_tenant");
+    let status: String = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read status after cancel");
+    assert_eq!(
+        status, "cancelled",
+        "MAPPS-558: cancel_tenant must set tenants.status = 'cancelled'"
+    );
+
+    svc.activate_tenant(tid).await.expect("activate_tenant");
+    let status_after: String = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
+        .bind(tenant.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read status after reactivate");
+    assert_eq!(
+        status_after, "active",
+        "MAPPS-558: activate_tenant must un-cancel a Cancelled tenant"
+    );
+}
+
+/// MAPPS-562: `create_tenant` must provision a hidden "system"
+/// `users` row so `tickets.created_by_id` (NOT NULL FK to users)
+/// has an attribution target on tenants that otherwise carry no
+/// admin/manager rows. Pre-562 the client provisioning path
+/// stopped inserting any users row (MAPPS-554), so portal ticket
+/// creation 500'd with CONFIGURATION_ERROR ("tenant has no
+/// admin/manager user to attribute it to"). Migration 137 backfills
+/// the same shape for pre-562 tenants.
+///
+/// Pins the row shape end-to-end: exists, role='admin' + status='active'
+/// (both required for the fallback query in
+/// TicketService::create_portal_ticket to see it), password_hash IS NULL
+/// (login is blocked - the row is unloginable by construction), email
+/// on the reserved suffix so a human user list can filter it out.
+#[sqlx::test]
+async fn create_tenant_provisions_system_attribution_user(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "MAPPS-562 System User".into(),
+        slug: "mapps562-system-user".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "admin@mapps562.example".into(),
+        admin_first_name: "Ada".into(),
+        admin_last_name: "Admin".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant");
+
+    let row: Option<(String, String, String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT email, role, status, password_hash, first_name, last_name \
+         FROM users WHERE tenant_id = $1 \
+         ORDER BY created_at LIMIT 1",
+    )
+    .bind(tenant.id)
+    .fetch_optional(&pool)
+    .await
+    .expect("read attribution user");
+    let (email, role, status, password_hash, first_name, last_name) =
+        row.expect("MAPPS-562: create_tenant must insert exactly one hidden system users row");
+
+    assert_eq!(
+        email, "system+mapps562-system-user@mokosh.local",
+        "MAPPS-562: attribution user email uses the reserved suffix"
+    );
+    assert_eq!(role, "admin", "MAPPS-562: attribution user role='admin'");
+    assert_eq!(
+        status, "active",
+        "MAPPS-562: attribution user status='active'"
+    );
+    assert!(
+        password_hash.is_none(),
+        "MAPPS-562: attribution user password_hash is NULL so it cannot log in"
+    );
+    assert_eq!(first_name, "System");
+    assert_eq!(last_name, "Attribution");
+
+    // Also pin: the fallback query in TicketService::create_portal_ticket
+    // sees this row. If someone changes the row shape and forgets to update
+    // the query (or vice versa), this test fails first.
+    let fallback: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users \
+         WHERE tenant_id = $1 AND status = 'active' \
+         AND role IN ('super_admin', 'admin', 'manager') \
+         ORDER BY created_at LIMIT 1",
+    )
+    .bind(tenant.id)
+    .fetch_optional(&pool)
+    .await
+    .expect("run fallback query");
+    assert!(
+        fallback.is_some(),
+        "MAPPS-562: fallback query must find the system attribution user"
+    );
+}
+
+/// mokosh-contact-login prompt 002: `create_tenant` must seed the
+/// three built-in portal_roles (Billing Contact / Support Contact /
+/// Read-Only) so a fresh tenant has something to assign in the
+/// Contact edit page from day one. Mirrors migration 142's shape for
+/// existing tenants; ON CONFLICT keeps a re-run idempotent.
+///
+/// Pin end-to-end: rows exist, capability sets match the spec, all
+/// three carry `is_builtin = TRUE`.
+#[sqlx::test]
+async fn create_tenant_seeds_three_builtin_portal_roles(pool: PgPool) {
+    let svc = TenantService::new(Database::from_pool(pool.clone()));
+    let req = CreateTenantRequest {
+        name: "mokosh-contact-login Builtin Roles".into(),
+        slug: "mcl-builtin-roles".into(),
+        billing_email: None,
+        billing_contact_name: None,
+        subscription_plan: None,
+        admin_email: "admin@mcl-builtin-roles.example".into(),
+        admin_first_name: "Ada".into(),
+        admin_last_name: "Admin".into(),
+        branding: None,
+    };
+    let tenant = svc
+        .create_tenant(&req, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create_tenant");
+
+    let rows: Vec<(String, Vec<String>, bool)> = sqlx::query_as(
+        "SELECT name, capabilities, is_builtin \
+         FROM portal_roles WHERE tenant_id = $1 ORDER BY name",
+    )
+    .bind(tenant.id)
+    .fetch_all(&pool)
+    .await
+    .expect("read portal_roles");
+    let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Billing Contact", "Read-Only", "Support Contact"],
+        "mokosh-contact-login prompt 002: create_tenant must seed exactly three built-in portal_roles"
+    );
+
+    for (_, _, is_builtin) in &rows {
+        assert!(
+            *is_builtin,
+            "mokosh-contact-login prompt 002: every seeded portal_role must carry is_builtin = TRUE"
+        );
+    }
+
+    let billing_caps = &rows.iter().find(|r| r.0 == "Billing Contact").unwrap().1;
+    assert!(
+        billing_caps.iter().any(|c| c == "invoices:pay")
+            && billing_caps.iter().any(|c| c == "quotes:accept"),
+        "Billing Contact must carry invoices:pay + quotes:accept, got {billing_caps:?}"
+    );
+
+    let support_caps = &rows.iter().find(|r| r.0 == "Support Contact").unwrap().1;
+    assert!(
+        support_caps.iter().any(|c| c == "tickets:write")
+            && support_caps.iter().any(|c| c == "kb:read"),
+        "Support Contact must carry tickets:write + kb:read, got {support_caps:?}"
+    );
+
+    let readonly_caps = &rows.iter().find(|r| r.0 == "Read-Only").unwrap().1;
+    assert!(
+        readonly_caps.iter().all(|c| c.ends_with(":read")),
+        "Read-Only must carry only *:read capabilities, got {readonly_caps:?}"
+    );
+
+    // Re-invoke: idempotency + ON CONFLICT DO NOTHING.
+    svc.seed_builtin_portal_roles(tenant.id)
+        .await
+        .expect("re-seed idempotently");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM portal_roles WHERE tenant_id = $1 AND is_builtin = TRUE",
+    )
+    .bind(tenant.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count built-in roles");
+    assert_eq!(
+        count, 3,
+        "mokosh-contact-login prompt 002: seed must stay idempotent (still 3 rows)"
+    );
+}
+
+/// mokosh-contact-login prompt 002: migration 138 added
+/// `companies.portal_slug`. Pin the column exists, is nullable, and
+/// starts unset on a fresh Company.
+#[sqlx::test]
+async fn companies_carry_a_nullable_portal_slug_column(pool: PgPool) {
+    let (admin_id, ..) = common::seed_admin(&pool).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
+        .bind(admin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read admin tenant");
+    let company_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'MCL Slug Column Test')",
+    )
+    .bind(company_id)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("insert company");
+    let slug: Option<String> =
+        sqlx::query_scalar("SELECT portal_slug FROM companies WHERE id = $1")
+            .bind(company_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal_slug column");
+    assert!(
+        slug.is_none(),
+        "mokosh-contact-login prompt 002: portal_slug must default to NULL"
+    );
 }
