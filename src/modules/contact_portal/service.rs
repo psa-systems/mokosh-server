@@ -1751,6 +1751,64 @@ impl ContactAuthService {
         Ok((enabled, secret, email.unwrap_or_default()))
     }
 
+    /// PMS-1086: change the password while signed in. Re-verifies the
+    /// current password (`reauthenticate`), holds the new one to the
+    /// shared policy `setup_password` applies, writes the hash, and
+    /// revokes every session family EXCEPT the caller's own (`sid`
+    /// names the row the access token was minted from), so a device
+    /// the customer no longer holds is signed out while the one they
+    /// are typing on keeps its refresh token: the PMS-1062 reset rule,
+    /// minus the changer. Refusals: 401 on a wrong current password
+    /// (the route spends re-auth budget on that one, PMS-881), 400
+    /// with the policy message on a weak new password, and the hash
+    /// is untouched on either.
+    #[tracing::instrument(skip_all)]
+    pub async fn change_password(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_sid: Uuid,
+        current_password: &str,
+        new_password: &str,
+    ) -> AppResult<()> {
+        self.reauthenticate(tenant_id, contact_id, current_password)
+            .await?;
+        let hint_strings = self.password_context_hints(contact_id).await?;
+        let hint_refs: Vec<&str> = hint_strings.iter().map(|s| s.as_str()).collect();
+        crate::utils::password_policy::validate(
+            new_password,
+            &hint_refs,
+            crate::utils::password_policy::PasswordPolicy::default(),
+        )
+        .map_err(|e| {
+            let crate::utils::password_policy::PasswordPolicyError::UserMessage(m) = e;
+            AppError::BadRequest(m)
+        })?;
+        let hash = hash_password(new_password)?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE contacts SET portal_password_hash = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(&hash)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE contact_id = $1 AND tenant_id = $2 AND revoked_at IS NULL \
+               AND family_id <> (SELECT family_id FROM contact_sessions WHERE id = $3)",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(current_sid)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// PMS-1085: the family the caller's access token belongs to, from
     /// its `sid`. `None` when the row is gone (a revoked-and-purged
     /// session), which the callers treat as "matches nothing".
