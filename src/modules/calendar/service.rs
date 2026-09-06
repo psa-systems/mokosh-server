@@ -22,6 +22,91 @@ use super::models::*;
 /// over a wide range cannot blow up memory.
 const MAX_OCCURRENCES_PER_SERIES: u16 = 1000;
 
+/// One bound filter value, in the shapes the appointment reads use.
+enum FilterBind<'a> {
+    Uuid(Uuid),
+    Text(&'a str),
+    Timestamp(DateTime<Utc>),
+}
+
+/// A dynamic WHERE clause whose conditions and bind values are built in
+/// ONE pass, so a condition cannot exist without the value that fills
+/// its placeholder.
+///
+/// PMS-1066: the appointment reads pushed conditions in one pass and
+/// bound values in another, and the `team_id` arm reached the first pass
+/// only. Its placeholder was then filled by the next value bound
+/// (`LIMIT`), which is a 500 (`operator does not exist: uuid = bigint`)
+/// and, had the types matched, a silently wrong page. Pushing both
+/// together makes that drift unrepresentable rather than caught by
+/// review. `saved_reports::compiler` builds its filters the same way;
+/// the other list endpoints still use two passes and are correct as
+/// they stand, and converging them is PMS-1103.
+///
+/// The tenant is always `$1` and is bound by the caller before any
+/// filter, so filter placeholders start at `$2`.
+struct FilterClauses<'a> {
+    conditions: Vec<String>,
+    binds: Vec<FilterBind<'a>>,
+}
+
+impl<'a> FilterClauses<'a> {
+    /// `fixed` are conditions carrying no bind of their own: the
+    /// tenant predicate every caller binds first, plus literal ones
+    /// such as `recurrence_rule IS NULL`.
+    fn new(fixed: &[&str]) -> Self {
+        Self {
+            conditions: fixed.iter().map(|c| (*c).to_string()).collect(),
+            binds: Vec::new(),
+        }
+    }
+
+    /// `predicate` is the column and its operator; the placeholder is
+    /// appended, so `("team_id =", ...)` becomes `team_id = $4`.
+    fn add(&mut self, predicate: &str, value: FilterBind<'a>) {
+        self.conditions
+            .push(format!("{predicate} ${}", self.next_placeholder()));
+        self.binds.push(value);
+    }
+
+    fn add_opt(&mut self, predicate: &str, value: Option<FilterBind<'a>>) {
+        if let Some(value) = value {
+            self.add(predicate, value);
+        }
+    }
+
+    fn where_clause(&self) -> String {
+        self.conditions.join(" AND ")
+    }
+
+    /// Index of the next placeholder: `$1` is the tenant, filters follow.
+    /// The caller uses it for the trailing `LIMIT` / `OFFSET`.
+    fn next_placeholder(&self) -> usize {
+        self.binds.len() + 2
+    }
+
+    fn binds(&self) -> &[FilterBind<'a>] {
+        &self.binds
+    }
+}
+
+/// Apply a [`FilterClauses`]' values to a sqlx query, in the order the
+/// conditions were built. A macro rather than a function because
+/// `QueryAs` and `QueryScalar` share no bind-taking trait.
+macro_rules! bind_filters {
+    ($query:expr, $filters:expr) => {{
+        let mut q = $query;
+        for value in $filters.binds() {
+            q = match value {
+                FilterBind::Uuid(v) => q.bind(*v),
+                FilterBind::Text(v) => q.bind(*v),
+                FilterBind::Timestamp(v) => q.bind(*v),
+            };
+        }
+        q
+    }};
+}
+
 #[derive(Clone)]
 pub struct CalendarService {
     db: Database,
@@ -153,7 +238,7 @@ impl CalendarService {
             (filter.from, filter.to, filter.appointment_type.as_ref())
         {
             let all = self
-                .appointments_in_range(tenant_id, from, to, filter.user_id)
+                .appointments_in_range(tenant_id, from, to, filter.user_id, filter.team_id)
                 .await?;
             let total = all.len() as u64;
             let start = pagination.offset() as usize;
@@ -164,35 +249,22 @@ impl CalendarService {
                 .collect();
             return Ok((page, total));
         }
-        let mut conditions = vec!["tenant_id = $1".to_string()];
-        let mut idx = 2;
-        if filter.user_id.is_some() {
-            conditions.push(format!("assigned_to_id = ${idx}"));
-            idx += 1;
-        }
-        if filter.appointment_type.is_some() {
-            conditions.push(format!("appointment_type = ${idx}"));
-            idx += 1;
-        }
-        if filter.from.is_some() {
-            conditions.push(format!("end_time >= ${idx}"));
-            idx += 1;
-        }
-        if filter.to.is_some() {
-            conditions.push(format!("start_time <= ${idx}"));
-            idx += 1;
-        }
+        let mut filters = FilterClauses::new(&["tenant_id = $1"]);
+        filters.add_opt("assigned_to_id =", filter.user_id.map(FilterBind::Uuid));
+        filters.add_opt(
+            "appointment_type =",
+            filter.appointment_type.as_deref().map(FilterBind::Text),
+        );
+        filters.add_opt("end_time >=", filter.from.map(FilterBind::Timestamp));
+        filters.add_opt("start_time <=", filter.to.map(FilterBind::Timestamp));
         // PMS-791 phase 4 / MAPPS-465: exact-team filter. The my_teams
         // convenience scope is on the DTO but its expansion needs a
         // caller_id thread-through that the calendar routes do not
-        // currently plumb; documented as follow-up on MAPPS-465.
-        if filter.team_id.is_some() {
-            conditions.push(format!("team_id = ${idx}"));
-            idx += 1;
-        }
-        let where_clause = conditions.join(" AND ");
-        let limit_placeholder = idx;
-        let offset_placeholder = idx + 1;
+        // currently plumb, so it is accepted and ignored: PMS-1102.
+        filters.add_opt("team_id =", filter.team_id.map(FilterBind::Uuid));
+        let where_clause = filters.where_clause();
+        let limit_placeholder = filters.next_placeholder();
+        let offset_placeholder = limit_placeholder + 1;
         let query = format!(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
@@ -204,24 +276,14 @@ impl CalendarService {
                LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"#
         );
         let count_query = format!("SELECT COUNT(*) FROM appointments WHERE {where_clause}");
-        let mut q = sqlx::query_as::<_, AppointmentRow>(&query).bind(tenant_id);
-        let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
-        if let Some(v) = filter.user_id {
-            q = q.bind(v);
-            cq = cq.bind(v);
-        }
-        if let Some(v) = &filter.appointment_type {
-            q = q.bind(v);
-            cq = cq.bind(v);
-        }
-        if let Some(v) = filter.from {
-            q = q.bind(v);
-            cq = cq.bind(v);
-        }
-        if let Some(v) = filter.to {
-            q = q.bind(v);
-            cq = cq.bind(v);
-        }
+        let q = bind_filters!(
+            sqlx::query_as::<_, AppointmentRow>(&query).bind(tenant_id),
+            filters
+        );
+        let cq = bind_filters!(
+            sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id),
+            filters
+        );
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q
             .bind(pagination.limit() as i64)
@@ -241,9 +303,11 @@ impl CalendarService {
     /// emitted - its occurrences are). Expansion happens here at read
     /// time; no occurrence rows are ever written to the DB.
     ///
-    /// `assigned_to_id` optionally narrows to one technician. The window
-    /// is required: an unbounded recurring series has no natural end, so
-    /// the caller must supply both bounds.
+    /// `assigned_to_id` optionally narrows to one technician and
+    /// `team_id` to one team; both narrow the recurring masters too, so
+    /// a team-scoped window expands only that team's series (PMS-1066).
+    /// The window is required: an unbounded recurring series has no
+    /// natural end, so the caller must supply both bounds.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn appointments_in_range(
         &self,
@@ -251,26 +315,19 @@ impl CalendarService {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         assigned_to_id: Option<Uuid>,
+        team_id: Option<Uuid>,
     ) -> AppResult<Vec<AppointmentResponse>> {
         // Non-recurring rows overlapping the window. The recurring
         // masters are fetched separately (next query) WITHOUT a time
         // filter, because a series that started before `from` can still
         // produce occurrences inside the window.
-        let mut conditions = vec![
-            "tenant_id = $1".to_string(),
-            "recurrence_rule IS NULL".to_string(),
-        ];
-        let mut idx = 2;
-        if assigned_to_id.is_some() {
-            conditions.push(format!("assigned_to_id = ${idx}"));
-            idx += 1;
-        }
-        let from_ph = idx;
-        let to_ph = idx + 1;
+        let mut filters = FilterClauses::new(&["tenant_id = $1", "recurrence_rule IS NULL"]);
+        filters.add_opt("assigned_to_id =", assigned_to_id.map(FilterBind::Uuid));
+        filters.add_opt("team_id =", team_id.map(FilterBind::Uuid));
         // overlap: end >= from AND start <= to
-        conditions.push(format!("end_time >= ${from_ph}"));
-        conditions.push(format!("start_time <= ${to_ph}"));
-        let where_clause = conditions.join(" AND ");
+        filters.add("end_time >=", FilterBind::Timestamp(from));
+        filters.add("start_time <=", FilterBind::Timestamp(to));
+        let where_clause = filters.where_clause();
         let plain_query = format!(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
@@ -281,22 +338,18 @@ impl CalendarService {
                ORDER BY start_time"#
         );
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let mut q = sqlx::query_as::<_, AppointmentRow>(&plain_query).bind(tenant_id);
-        if let Some(v) = assigned_to_id {
-            q = q.bind(v);
-        }
-        let plain_rows = q.bind(from).bind(to).fetch_all(&mut *tx).await?;
+        let q = bind_filters!(
+            sqlx::query_as::<_, AppointmentRow>(&plain_query).bind(tenant_id),
+            filters
+        );
+        let plain_rows = q.fetch_all(&mut *tx).await?;
 
         // Recurring masters: no time filter (the rule decides which
         // occurrences land in the window).
-        let mut rconditions = vec![
-            "tenant_id = $1".to_string(),
-            "recurrence_rule IS NOT NULL".to_string(),
-        ];
-        if assigned_to_id.is_some() {
-            rconditions.push("assigned_to_id = $2".to_string());
-        }
-        let rwhere = rconditions.join(" AND ");
+        let mut rfilters = FilterClauses::new(&["tenant_id = $1", "recurrence_rule IS NOT NULL"]);
+        rfilters.add_opt("assigned_to_id =", assigned_to_id.map(FilterBind::Uuid));
+        rfilters.add_opt("team_id =", team_id.map(FilterBind::Uuid));
+        let rwhere = rfilters.where_clause();
         let recurring_query = format!(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
@@ -306,10 +359,10 @@ impl CalendarService {
                FROM appointments WHERE {rwhere}
                ORDER BY start_time"#
         );
-        let mut rq = sqlx::query_as::<_, AppointmentRow>(&recurring_query).bind(tenant_id);
-        if let Some(v) = assigned_to_id {
-            rq = rq.bind(v);
-        }
+        let rq = bind_filters!(
+            sqlx::query_as::<_, AppointmentRow>(&recurring_query).bind(tenant_id),
+            rfilters
+        );
         let recurring_rows = rq.fetch_all(&mut *tx).await?;
 
         let mut out: Vec<AppointmentResponse> = plain_rows.into_iter().map(Into::into).collect();
@@ -1118,8 +1171,10 @@ impl CalendarService {
         to: DateTime<Utc>,
         assigned_to_id: Option<Uuid>,
     ) -> AppResult<DispatchResponse> {
+        // No team filter: `DispatchFilter` exposes none, so the board is
+        // never given one it could drop (PMS-1066).
         let appointments = self
-            .appointments_in_range(tenant_id, from, to, assigned_to_id)
+            .appointments_in_range(tenant_id, from, to, assigned_to_id, None)
             .await?;
 
         // Availability: optionally scoped to one technician.
