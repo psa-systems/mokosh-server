@@ -1,13 +1,40 @@
 //! mokosh-contact-login prompt 002: portal capability names.
 //!
 //! Contact roles hold an array of these (as TEXT[] in
-//! `portal_roles.capabilities`); the contact session JWT carries the
-//! union in its `caps` claim; every gated route + UI element checks
-//! membership against the union. `ALL_CAPABILITIES` is the canonical
+//! `portal_roles.capabilities`). `ALL_CAPABILITIES` is the canonical
 //! set the MSP admin's role editor exposes as checkboxes (prompt 007)
 //! and `PortalRoleService::create_role` validates against - unknown
 //! capability strings fail-closed at create-time so the DB never
 //! carries garbage that would silently disable a permission check.
+//!
+//! # The effective-permission read path (PMS-985)
+//!
+//! A contact's effective capability set is the union of
+//! `portal_roles.capabilities` over every `contact_role_assignments`
+//! row for that contact. It is READ FROM THE DATABASE ON EVERY REQUEST
+//! THAT DEPENDS ON IT. There is no cache: not in the process, not in
+//! the session, not in a connection. Nothing therefore has to be
+//! invalidated when an admin changes an assignment, and a grant or a
+//! revoke through the staff API lands on the contact's very next call
+//! with no restart and no re-login.
+//!
+//! One query backs it, in two copies with the same posture, both on the
+//! migrator pool with a belt-and-braces `WHERE tenant_id`:
+//!
+//! - [`crate::modules::auth::caller_context::load_contact_capabilities`],
+//!   which [`crate::modules::auth::CallerContext::require_capability`]
+//!   calls on the dual-plane routes (tickets, invoices, quotes,
+//!   contracts, assets, projects).
+//! - `ContactAuthService::load_capabilities`, which the contact-plane
+//!   routes call directly because `RequireContactAuth` does not go
+//!   through `CallerContext`.
+//!
+//! The `caps` claim on the contact JWT is NOT part of this path. It is
+//! minted for the SPA to paint with and the server never reads it back:
+//! `ContactSession` deliberately has no capability field, so a handler
+//! cannot reach for the snapshot instead of asking the database. That
+//! is the whole of the invalidation story, and it is why the answer to
+//! "how is this cache invalidated" is "there is no cache".
 //!
 //! Naming convention: `<domain>:<action>`. `<domain>` matches the
 //! mokosh-workspace tab it gates (tickets, invoices, quotes,
@@ -27,8 +54,10 @@
 //! Deferred follow-up capabilities (each becomes its own PMS ticket):
 //! - `tickets:attach_download` (download attachments on tickets scoped
 //!   to the Company)
-//! - `tickets:request_service` (submit a service-request form; overlaps
-//!   `forms:submit` if the request is form-driven)
+//! - `tickets:request_service` (submit a service-request form; the
+//!   `forms:submit` cap that once overlapped it was retired in PMS-1064
+//!   with the portal router, since the public magic-link form flow is
+//!   the customer-facing submit)
 //! - `tickets:mark_all_read` (bulk-clear notification badges on tickets)
 //! - `invoices:view_payments` (see payment history against invoices)
 //! - `invoices:pay_partial` (split pay flow; today `invoices:pay` covers
@@ -113,8 +142,6 @@ pub const ASSETS_REPORT_ISSUE: &str = "assets:report_issue";
 pub const PROJECTS_READ: &str = "projects:read";
 /// Read published Knowledge Base articles visible to the Company.
 pub const KB_READ: &str = "kb:read";
-/// Submit an MSP-published request form.
-pub const FORMS_SUBMIT: &str = "forms:submit";
 /// Read notifications addressed to the contact.
 pub const NOTIFICATIONS_READ: &str = "notifications:read";
 /// Edit own profile + password + MFA + own sessions.
@@ -167,7 +194,6 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     ASSETS_REPORT_ISSUE,
     PROJECTS_READ,
     KB_READ,
-    FORMS_SUBMIT,
     NOTIFICATIONS_READ,
     SETTINGS_MANAGE_OWN,
     SETTINGS_MANAGE_COMPANY_BRANDING,
@@ -212,7 +238,6 @@ mod tests {
             ASSETS_REPORT_ISSUE,
             PROJECTS_READ,
             KB_READ,
-            FORMS_SUBMIT,
             NOTIFICATIONS_READ,
             SETTINGS_MANAGE_OWN,
             CONTACTS_INVITE_SUB_USER,
