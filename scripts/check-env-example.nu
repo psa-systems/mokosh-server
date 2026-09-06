@@ -3,10 +3,23 @@
 # Environment-variable parity guard (PMS-836).
 #
 # Three sets have to agree:
-#   CODE     every env var `src/` and `crates/` read at run time
+#   CODE     every key the configuration registry declares (PMS-982), plus every
+#            env var `src/` and `crates/` still read directly
 #   TEMPLATE every key assigned in .env.example, commented-out lines included
 #   COMPOSE  every key in the `server` service's environment map in
 #            compose.dev.yml
+#
+# PMS-982 made the registry (src/config/registry.rs) the source of truth for the
+# first set: a value the application reads is declared there and asked for
+# through `crate::config::get`, so scanning the read SITE no longer sees the
+# name. That is also what closed this script's own hole. It extracted a key only
+# from a string literal or a `const` identifier inside the call, so
+# `BrandingAssetStore::max_bytes`, which computes its key from a closed match on
+# (scope, kind), was invisible, and five of its six keys were in neither file:
+# an operator could not set those limits in dev at all and got no error. The
+# direct-read scan below stays, because the bootstrap entry points and the
+# providers of record (config::guard::ENTRY_POINTS) legitimately read the
+# environment without going through the registry.
 #
 # A var in CODE with no TEMPLATE key is undiscoverable: an operator has no way
 # to learn it exists. A var in CODE with no COMPOSE line cannot be set in dev at
@@ -18,10 +31,14 @@
 #
 # Every deliberate asymmetry is listed in ALLOWLIST below with its reason.
 
-# Rust helpers that take an env var NAME as a string literal. A read through one
-# of these is a read, and missing them is how BUNYIP_WEBHOOK_SECRET stayed
-# invisible to a plain `env::var` grep.
-const ENV_HELPERS = ["require_env" "required_env" "resolve_secret"]
+# Rust helpers in the entry points that take an env var NAME as a string
+# literal. A read through one of these is a read, and missing them is how
+# BUNYIP_WEBHOOK_SECRET stayed invisible to a plain `env::var` grep.
+#
+# `resolve_secret` was in this list and is not any more: PMS-982 made it take a
+# `&ConfigKey`, so its three secrets are declared in the registry and are found
+# there instead.
+const ENV_HELPERS = ["require_env" "required_env"]
 
 # Same idea, for helpers that take the env var NAME as their SECOND argument.
 # `parse_tenant_arg_env(args, "MOKOSH_SHOWCASE_TENANT_ID", "showcase")` is a
@@ -77,6 +94,36 @@ const CODE_NOT_IN_COMPOSE = {
 # only when a key must stay in the template despite having no reader; there is
 # no such key today.
 const TEMPLATE_UNREAD = {}
+
+# The configuration registry file, whose declarations are the authoritative
+# list of keys the application reads through the provider (PMS-982).
+const REGISTRY_FILE = "src/config/registry.rs"
+
+# Every key `declare_keys!` declares, with its tier. The macro body is
+# `<Tier> <IDENT> = "NAME";` per line, and the tier is captured so a mismatch
+# between the name and the constant is visible rather than silently accepted.
+def registry-keys [] {
+    if not ($REGISTRY_FILE | path exists) {
+        print --stderr $"ERROR: ($REGISTRY_FILE) is missing; the configuration registry is the source of truth for this check"
+        exit 1
+    }
+    let declared = (
+        open --raw $REGISTRY_FILE
+        | decode utf-8
+        | parse --regex '(?m)^\s*(?<tier>Bootstrap|Application)\s+(?<ident>[A-Z][A-Z0-9_]*)\s*=\s*"(?<name>[A-Z][A-Z0-9_]*)"\s*;'
+    )
+    if ($declared | is-empty) {
+        print --stderr $"ERROR: no keys parsed out of ($REGISTRY_FILE); the declare_keys! shape changed and this check is no longer proving anything"
+        exit 1
+    }
+    let mismatched = ($declared | where {|row| $row.ident != $row.name })
+    if not ($mismatched | is-empty) {
+        print --stderr "ERROR: a registry constant does not match the key it declares."
+        for row in $mismatched { print --stderr $"  ($row.ident) declares ($row.name)" }
+        exit 1
+    }
+    $declared | get name | uniq | sort
+}
 
 # Extract every env var name the Rust sources read.
 def code-reads [] {
@@ -157,7 +204,9 @@ def compose-interpolations [] {
 }
 
 def main [] {
-    let code = (code-reads)
+    let registry = (registry-keys)
+    let direct = (code-reads)
+    let code = ($registry | append $direct | uniq | sort)
     let template = (template-keys)
     let compose = (compose-keys)
     let interpolated = (compose-interpolations)
@@ -202,7 +251,7 @@ def main [] {
     }
 
     if ($errors | is-empty) {
-        print $"env parity OK: ($code | length) vars read by code, ($template | length) keys in .env.example, ($compose | length) forwarded to the dev server"
+        print $"env parity OK: ($registry | length) keys declared in ($REGISTRY_FILE), ($code | length) vars read by code, ($template | length) keys in .env.example, ($compose | length) forwarded to the dev server"
     } else {
         print --stderr "ERROR: environment-variable parity broken."
         print --stderr "Every var the code reads needs a .env.example key AND a compose.dev.yml server line."

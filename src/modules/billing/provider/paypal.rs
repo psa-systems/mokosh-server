@@ -49,8 +49,7 @@ use crate::utils::error::{AppError, AppResult};
 /// test can point every call at a stub, exactly as `STRIPE_API_BASE` does for
 /// Stripe. When unset, the credential's `sandbox` flag picks the host.
 fn api_base(sandbox: bool) -> String {
-    if let Some(base) = std::env::var("PAYPAL_API_BASE")
-        .ok()
+    if let Some(base) = crate::config::get(&crate::config::registry::PAYPAL_API_BASE)
         .filter(|s| !s.trim().is_empty())
     {
         return base.trim_end_matches('/').to_string();

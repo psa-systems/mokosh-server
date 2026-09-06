@@ -26,6 +26,8 @@ use async_trait::async_trait;
 use ipnetwork::IpNetwork;
 use url::Url;
 
+use crate::config::{self, registry as keys, ConfigKey};
+
 /// True for addresses that can never be a public internet peer: loopback,
 /// RFC1918 / unique-local, link-local, unspecified, broadcast.
 ///
@@ -56,9 +58,9 @@ pub fn is_non_public_ip(ip: &IpAddr) -> bool {
 /// integrations legitimately run on their own ports, so they pass `None`.
 pub const WEB_PORTS: [u16; 2] = [80, 443];
 
-/// Env var naming the hosts and networks an operator has declared reachable
-/// even though they sit off the public internet.
-const ALLOWLIST_VAR: &str = "OUTBOUND_PRIVATE_ALLOWLIST";
+/// The configuration key naming the hosts and networks an operator has
+/// declared reachable even though they sit off the public internet.
+const ALLOWLIST_KEY: &ConfigKey = &keys::OUTBOUND_PRIVATE_ALLOWLIST;
 
 /// Resolve a host to its addresses. Injected so [`guard_outbound_url`] can be
 /// unit tested without DNS and without a socket.
@@ -157,24 +159,20 @@ static PRIVATE_TARGETS: OnceLock<PrivateTargetAllowlist> = OnceLock::new();
 /// Parse `OUTBOUND_PRIVATE_ALLOWLIST` once and cache it. Unset or empty means
 /// no exemption at all, so a deployment that never configures it gets the
 /// strict guard.
+///
+/// PMS-982: the value comes from the configuration provider, which reports a
+/// variable that is set but unreadable itself. The `OnceLock` stays, so when
+/// the allowlist is parsed is unchanged.
 pub fn private_target_allowlist() -> &'static PrivateTargetAllowlist {
     PRIVATE_TARGETS.get_or_init(|| {
-        let raw = match std::env::var(ALLOWLIST_VAR) {
-            Ok(raw) => raw,
-            Err(std::env::VarError::NotPresent) => String::new(),
-            // A value that is set but unreadable is not the same as unset: the
-            // operator configured an exemption that is about to be ignored.
-            Err(e) => {
-                tracing::error!(error = %e, "{ALLOWLIST_VAR} is set but unreadable; no target is exempt");
-                String::new()
-            }
-        };
+        let name = ALLOWLIST_KEY.name();
+        let raw = config::get(ALLOWLIST_KEY).unwrap_or_default();
         let allowlist = PrivateTargetAllowlist::parse(&raw);
         if !allowlist.is_empty() {
             tracing::info!(
                 hosts = allowlist.hosts.len(),
                 networks = allowlist.networks.len(),
-                "{ALLOWLIST_VAR} exempts private outbound targets"
+                "{name} exempts private outbound targets"
             );
         }
         allowlist

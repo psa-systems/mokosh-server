@@ -59,6 +59,43 @@ pub struct KbArticleResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+/// PMS-1082: the customer's projection of an article, what the contact
+/// arm of `GET /kb/articles` and `GET /kb/articles/{id}` answers with.
+/// Deliberately NOT `KbArticleResponse` (the PMS-1061 rule): a contact
+/// only ever sees a published article it is allowed to read, so
+/// `status`, `visibility` and `company_ids` would only describe the
+/// filter that let it through, and `author_id`, `view_count` and the
+/// vote tallies are the MSP's own signals about its staff and its
+/// readers.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContactKbArticleResponse {
+    pub id: Uuid,
+    pub title: String,
+    pub slug: String,
+    pub content: String,
+    pub summary: Option<String>,
+    pub category_id: Option<Uuid>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub tags: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<KbArticleResponse> for ContactKbArticleResponse {
+    fn from(a: KbArticleResponse) -> Self {
+        Self {
+            id: a.id,
+            title: a.title,
+            slug: a.slug,
+            content: a.content,
+            summary: a.summary,
+            category_id: a.category_id,
+            published_at: a.published_at,
+            tags: a.tags,
+            updated_at: a.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateKbArticleRequest {
     #[validate(length(min = 1, max = 255))]

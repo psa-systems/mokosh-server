@@ -84,6 +84,9 @@ endpoint, extend one of these files.
 | GET  /invoices | `list_invoices` | SCOPED |
 | GET  /invoices/{id} | `get_invoice` | SCOPED |
 | GET  /invoices/{id}/pdf | `get_invoice_pdf` | SCOPED (501 body, gates first) |
+| GET  /kb/categories | `list_categories` | SCOPED (`visibility <> 'internal'`; staff keep the module gate, PMS-1082) |
+| GET  /kb/articles | `list_articles` | SCOPED (`list_articles_for_contact`: published AND public or `client_specific` naming `session.company_id`; caller's `status`/`visibility` ignored; rows are `ContactKbArticleResponse`, PMS-1082) |
+| GET  /kb/articles/{id} | `get_article` | SCOPED (`get_portal_article`: 404 on internal, draft, foreign `client_specific` and unknown alike; `ContactKbArticleResponse`, PMS-1082) |
 | GET  /projects | `list_projects` | SCOPED (NULL house projects implicitly excluded; rows are `ContactProjectResponse`, PMS-1061) |
 | GET  /projects/{id} | `get_project` | SCOPED (`ContactProjectResponse`, PMS-1061) |
 | GET  /quotes | `list_quotes` | SCOPED (`list_quotes_for_company`: own company AND issued statuses only, PMS-1060) |
@@ -152,6 +155,12 @@ the scoped read + write paths. Together they assert:
 - Staff bearer callers bypass the scope check as designed.
 - A stale JWT that carries a since-revoked cap fails 403 within one
   request (the server DB-loads caps live per prompt 008).
+
+`tests/contact_kb.rs` (PMS-1082) covers the three KB reads: the
+visible slice for a contact with `kb:read`, the identical 404 for an
+internal, draft, foreign or unknown article, the 403 without the
+capability, the trimmed DTO, and the staff arm unchanged behind its
+module gate.
 
 New contact-plane endpoints MUST add their own test case in the
 appropriate file (per entity). A new `RequireCallerContext` route
