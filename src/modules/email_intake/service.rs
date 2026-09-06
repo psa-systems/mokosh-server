@@ -355,6 +355,13 @@ impl EmailIntakeService {
         .bind(&from)
         .execute(&mut *tx)
         .await?;
+        // PMS-1069: `contacts.company_id` is a mirror of the primary
+        // `contact_companies` row (PMS-806), and an edit re-derives the mirror
+        // from that table. Writing the mirror alone left this contact one
+        // `PUT /contacts/contacts/{id}` away from losing the company its tickets
+        // hang off, silently. Same transaction, so a rollback takes both.
+        crate::modules::contacts::ensure_primary_company_link(&mut tx, tenant_id.get(), contact_id)
+            .await?;
         tx.commit().await?;
         Ok(Some((contact_id, company_id)))
     }

@@ -26,6 +26,11 @@ pub use routes::contact_routes;
 pub use service::{
     BlockingRecords, CompanyBlocker, CompanyDeletionPreview, ContactService, COMPANY_BLOCKERS,
 };
+// PMS-1069: `contacts.company_id` is a mirror of the primary `contact_companies`
+// row, and every writer of the mirror outside this module writes the link
+// through this one function.
+#[cfg(feature = "server")]
+pub(crate) use service::ensure_primary_company_link;
 #[cfg(feature = "server")]
 pub use website_probe::{
     UnreachableReason, WebsiteProbe, WebsiteProbeLimiter, WebsiteProbeService, WwwChange,
