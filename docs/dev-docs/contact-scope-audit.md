@@ -102,6 +102,7 @@ endpoint, extend one of these files.
 | POST /tickets | `create_ticket` | SCOPED (portal pins `session.company_id` + `session.id`) |
 | GET  /tickets/{id} | `get_ticket` | SCOPED |
 | PATCH /tickets/{id} | `patch_ticket` | SCOPED + reporter-only |
+| GET  /tickets/{id}/sla | `get_ticket_sla` | SCOPED (`company_id = session.company_id` folded into the read; foreign id is the unknown-id 404; PMS-1087) |
 | POST /tickets/{id}/approvals/request | `request_approval_on_ticket` | SCOPED |
 | POST /tickets/{id}/attachments | `portal_attach_file` | SCOPED |
 | GET  /tickets/{id}/notes | `get_ticket_notes` | SCOPED (public notes only) |
@@ -159,6 +160,10 @@ the scoped read + write paths. Together they assert:
 - Staff bearer callers bypass the scope check as designed.
 - A stale JWT that carries a since-revoked cap fails 403 within one
   request (the server DB-loads caps live per prompt 008).
+
+`tests/contact_ticket_sla.rs` (PMS-1087) covers the SLA read: the
+four states on own tickets, the same shape for staff, a foreign ticket
+indistinguishable from an unknown id, 403 without `tickets:read`.
 
 `tests/contact_approvals.rs` (PMS-1084) covers the approvals a staff
 user addresses to a contact: the contact lists exactly those, decides
