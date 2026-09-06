@@ -18,6 +18,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::auth::mfa_secret;
 use crate::modules::auth::TenantId;
 use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
@@ -76,6 +77,10 @@ pub struct ContactAuthService {
     /// Base URL of the SPA (e.g. `http://localhost:4301`) so the
     /// reset-password email carries a full-URL link.
     spa_base_url: String,
+    /// PMS-1063: the `ENCRYPTION_KEY` that seals `contacts.portal_mfa_secret`
+    /// at rest, the PMS-871 rule the staff plane already follows for
+    /// `users.mfa_secret`. Zero in fixtures that never enrol.
+    encryption_key: [u8; 32],
 }
 
 impl ContactAuthService {
@@ -85,7 +90,15 @@ impl ContactAuthService {
             jwt_secret,
             notifications: None,
             spa_base_url: String::new(),
+            encryption_key: [0u8; 32],
         }
+    }
+
+    /// PMS-1063: attach the key that protects the TOTP secret at rest.
+    #[must_use]
+    pub fn with_encryption_key(mut self, encryption_key: [u8; 32]) -> Self {
+        self.encryption_key = encryption_key;
+        self
     }
 
     pub fn with_notifications(mut self, notifications: NotificationsService) -> Self {
@@ -124,7 +137,8 @@ impl ContactAuthService {
         slug: Option<&str>,
         email: &str,
         password: &str,
-        _mfa_code: Option<&str>,
+        mfa_code: Option<&str>,
+        recovery_code: Option<&str>,
         user_agent: Option<&str>,
         ip: Option<IpAddr>,
     ) -> AppResult<ContactLoginResponse> {
@@ -160,11 +174,13 @@ impl ContactAuthService {
         let contact_row: Option<(
             Uuid,
             Option<String>,
+            bool,
             Option<String>,
             Option<DateTime<Utc>>,
         )> = sqlx::query_as(
             r#"
-                SELECT id, portal_password_hash, portal_mfa_secret, portal_locked_until
+                SELECT id, portal_password_hash, portal_mfa_enabled, portal_mfa_secret,
+                       portal_locked_until
                 FROM contacts
                 WHERE tenant_id = $1
                   AND company_id = $2
@@ -178,7 +194,8 @@ impl ContactAuthService {
         .fetch_optional(self.db.migrator_pool())
         .await?;
 
-        let Some((contact_id, password_hash, _mfa_secret, locked_until)) = contact_row else {
+        let Some((contact_id, password_hash, mfa_enabled, mfa_secret, locked_until)) = contact_row
+        else {
             return Err(AppError::Unauthorized);
         };
 
@@ -201,6 +218,41 @@ impl ContactAuthService {
             return Err(AppError::Unauthorized);
         }
 
+        // PMS-1063: second factor. Password verified; a contact with
+        // MFA on gets no session until a TOTP code or a recovery code
+        // verifies. No code at all is the `mfa_required` pre-signal
+        // (empty tokens, the SPA re-POSTs with `mfa_code`); a wrong
+        // one is a 401 that ticks the PMS-501 lockout counter exactly
+        // as a wrong password does, so a second-factor grinder is
+        // throttled by the same persistent count.
+        if mfa_enabled {
+            let supplied_totp = mfa_code.map(str::trim).filter(|s| !s.is_empty());
+            let supplied_recovery = recovery_code.map(str::trim).filter(|s| !s.is_empty());
+            if supplied_totp.is_none() && supplied_recovery.is_none() {
+                return Ok(ContactLoginResponse {
+                    access_token: String::new(),
+                    refresh_token: String::new(),
+                    expires_at: Utc::now(),
+                    contact: None,
+                    mfa_required: true,
+                    password_setup_url: None,
+                });
+            }
+            let second_factor_ok = self
+                .verify_second_factor(
+                    tenant_id,
+                    contact_id,
+                    mfa_secret.as_deref(),
+                    supplied_totp,
+                    supplied_recovery,
+                )
+                .await?;
+            if !second_factor_ok {
+                let _ = self.register_failed_login(tenant_id, contact_id).await;
+                return Err(AppError::Unauthorized);
+            }
+        }
+
         // Success: reset counters + stamp last-login. Best-effort.
         let _ = sqlx::query(
             "UPDATE contacts \
@@ -217,8 +269,12 @@ impl ContactAuthService {
         let session_id = Uuid::new_v4();
         let (access_token, expires_at) =
             self.mint_access_token(tenant_id, contact_id, company_id, email, &caps, session_id)?;
+        // PMS-1062: a login starts a rotation family, named by its
+        // first session.
         let refresh_token = self
-            .mint_refresh_token(tenant_id, contact_id, session_id, user_agent, ip)
+            .mint_refresh_token(
+                tenant_id, contact_id, session_id, session_id, user_agent, ip,
+            )
             .await?;
         let me = self.me(tenant_id, contact_id).await?;
         Ok(ContactLoginResponse {
@@ -239,6 +295,16 @@ impl ContactAuthService {
     /// the token was ever valid, still valid, or freshly detected as
     /// stolen. Belt-and-braces recheck of tenant status + contact
     /// active so a suspend / revoke lands within one tick.
+    ///
+    /// PMS-1062: the new session inherits the presented one's
+    /// `family_id`, and a genuine token presented AFTER it was rotated
+    /// is the stolen-token signal: the honest customer rotated it, so
+    /// whoever presents it now holds a copy. That revokes the whole
+    /// family, the successor the customer is using included, so both
+    /// parties are signed out and the customer signs in again. The
+    /// secret is verified BEFORE the family is revoked: a session id
+    /// is not a secret (it rides in the access token's `sid`), and a
+    /// bare id must not be enough to sign a customer out.
     #[tracing::instrument(skip_all)]
     pub async fn refresh(
         &self,
@@ -250,25 +316,37 @@ impl ContactAuthService {
             parse_session_bound_token(presented).ok_or(AppError::Unauthorized)?;
 
         #[allow(clippy::type_complexity)]
-        let row: Option<(Uuid, Uuid, String, Option<DateTime<Utc>>, DateTime<Utc>)> =
-            sqlx::query_as(
-                r#"
-            SELECT tenant_id, contact_id, refresh_token_hash, revoked_at, expires_at
+        let row: Option<(
+            Uuid,
+            Uuid,
+            String,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+            Uuid,
+        )> = sqlx::query_as(
+            r#"
+            SELECT tenant_id, contact_id, refresh_token_hash, revoked_at, expires_at, family_id
             FROM contact_sessions
             WHERE id = $1
             "#,
-            )
-            .bind(session_id)
-            .fetch_optional(self.db.migrator_pool())
-            .await?;
+        )
+        .bind(session_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
 
-        let Some((tenant_id, contact_id, hash, revoked_at, expires_at)) = row else {
+        let Some((tenant_id, contact_id, hash, revoked_at, expires_at, family_id)) = row else {
             return Err(AppError::Unauthorized);
         };
-        if revoked_at.is_some() || expires_at <= Utc::now() {
+        if !verify_password(secret, &hash)? {
             return Err(AppError::Unauthorized);
         }
-        if !verify_password(secret, &hash)? {
+        if revoked_at.is_some() {
+            // Replay of a genuine, already-rotated token: theft
+            // detected, burn the family (PMS-1062).
+            self.revoke_session_family(family_id).await?;
+            return Err(AppError::Unauthorized);
+        }
+        if expires_at <= Utc::now() {
             return Err(AppError::Unauthorized);
         }
 
@@ -288,21 +366,29 @@ impl ContactAuthService {
             return Err(AppError::Unauthorized);
         };
         if !is_portal_user {
-            // Revoke the row so subsequent refreshes short-circuit.
-            let _ = sqlx::query("UPDATE contact_sessions SET revoked_at = NOW() WHERE id = $1")
-                .bind(session_id)
-                .execute(self.db.migrator_pool())
-                .await;
+            // Portal access revoked: burn the family so a later
+            // re-grant does not resurrect a token the caller still
+            // holds (PMS-1062).
+            self.revoke_session_family(family_id).await?;
             return Err(AppError::Unauthorized);
         }
 
-        // Rotate: revoke the old row, mint a fresh session with a new
-        // id. Old refresh tokens replayed against the revoked id 401
-        // on the next call above.
-        let _ = sqlx::query("UPDATE contact_sessions SET revoked_at = NOW() WHERE id = $1")
-            .bind(session_id)
-            .execute(self.db.migrator_pool())
-            .await;
+        // Rotate: revoke the old row BEFORE the successor is minted,
+        // and only if nobody else revoked it first. Two presenters
+        // racing onto one row would otherwise both get a live
+        // successor; the loser is treated as the replay it is.
+        let rotated = sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(session_id)
+        .execute(self.db.migrator_pool())
+        .await?
+        .rows_affected();
+        if rotated == 0 {
+            self.revoke_session_family(family_id).await?;
+            return Err(AppError::Unauthorized);
+        }
 
         let caps = self.load_capabilities(tenant_id, contact_id).await?;
         let company_id: Uuid =
@@ -321,7 +407,14 @@ impl ContactAuthService {
             new_session_id,
         )?;
         let refresh_token = self
-            .mint_refresh_token(tenant_id, contact_id, new_session_id, user_agent, ip)
+            .mint_refresh_token(
+                tenant_id,
+                contact_id,
+                new_session_id,
+                family_id,
+                user_agent,
+                ip,
+            )
             .await?;
         let me = self.me(tenant_id, contact_id).await?;
         Ok(ContactLoginResponse {
@@ -337,24 +430,55 @@ impl ContactAuthService {
     /// mokosh-contact-login prompt 004: revoke the refresh session
     /// backing the presented token. Idempotent + enumeration-resistant:
     /// unknown / already-revoked / malformed all return `Ok(())`.
+    ///
+    /// PMS-1062: the secret is verified first and the whole rotation
+    /// family goes, not the one row. A bare session id rides in every
+    /// access token's `sid`, so an id alone must not sign anyone out;
+    /// and a family that somehow holds two live rows (a rotation
+    /// race the refresh path lost) must not keep one alive past the
+    /// customer's sign-out.
     #[tracing::instrument(skip_all)]
     pub async fn logout(&self, presented: &str) -> AppResult<()> {
-        if let Some((session_id, _)) = parse_session_bound_token(presented) {
-            let _ = sqlx::query(
-                "UPDATE contact_sessions SET revoked_at = NOW() \
-                 WHERE id = $1 AND revoked_at IS NULL",
-            )
-            .bind(session_id)
-            .execute(self.db.migrator_pool())
-            .await;
+        let Some((session_id, secret)) = parse_session_bound_token(presented) else {
+            return Ok(());
+        };
+        let row: Option<(String, Uuid)> = sqlx::query_as(
+            "SELECT refresh_token_hash, family_id FROM contact_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((hash, family_id)) = row else {
+            return Ok(());
+        };
+        if !verify_password(secret, &hash)? {
+            return Ok(());
         }
+        self.revoke_session_family(family_id).await
+    }
+
+    /// PMS-1062: revoke every live session in one rotation family.
+    /// Called by the replay branch of `refresh`, by `logout`, and when
+    /// a refresh finds the contact's portal access gone.
+    async fn revoke_session_family(&self, family_id: Uuid) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE family_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(family_id)
+        .execute(self.db.migrator_pool())
+        .await?;
         Ok(())
     }
 
     /// mokosh-contact-login prompt 004: redeem the magic-link setup
     /// token from `grant_portal_access` (prompt 003) + the resend
     /// path. Sets `portal_password_hash`, marks the token used,
-    /// deletes any other unredeemed tokens for the same contact.
+    /// deletes any other unredeemed tokens for the same contact, and
+    /// (PMS-1062) revokes every live session the contact holds, so a
+    /// refresh token stolen before a reset does not survive it. The
+    /// reset path (`reset_password`) delegates here, so both share
+    /// the rule.
     ///
     /// Status contract:
     /// - valid, unused, unexpired -> Ok(())
@@ -479,6 +603,17 @@ impl ContactAuthService {
         .bind(contact_id)
         .bind(tenant_id)
         .bind(token_id)
+        .execute(&mut *tx)
+        .await?;
+        // A new password ends every existing session (PMS-1062): the
+        // customer signs in again with it, and a refresh token that
+        // leaked before the reset is dead the moment the reset lands.
+        sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE contact_id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1139,13 +1274,13 @@ impl ContactAuthService {
             String,
             String,
             String,
-            Option<String>,
+            bool,
             Option<String>,
         )> = sqlx::query_as(
             r#"
                 SELECT c.id, c.tenant_id, c.company_id, c.email,
                        co.name AS company_name, co.portal_slug,
-                       c.portal_mfa_secret, c.portal_password_hash
+                       c.portal_mfa_enabled, c.portal_password_hash
                 FROM contacts c
                 INNER JOIN companies co ON co.id = c.company_id
                 INNER JOIN tenants t ON t.id = c.tenant_id
@@ -1180,9 +1315,21 @@ impl ContactAuthService {
         // the code (out of scope for this ticket; contact MFA is
         // off by default).
         if candidates.len() == 1 {
-            let (contact_id, tid, company_id, email_row, _company_name, slug, mfa_secret, pwd_hash) =
-                candidates.into_iter().next().unwrap();
-            if mfa_secret.is_some() {
+            let (
+                contact_id,
+                tid,
+                company_id,
+                email_row,
+                _company_name,
+                slug,
+                mfa_enabled,
+                pwd_hash,
+            ) = candidates.into_iter().next().unwrap();
+            // PMS-1063: the gate is `portal_mfa_enabled`, the same
+            // flag the password login reads, not whether a secret
+            // happens to be staged: an enrolment that was started and
+            // abandoned must not lock the magic link.
+            if mfa_enabled {
                 return Ok(LoginLinkRedeemOutcome {
                     auto: Some(ContactLoginResponse {
                         access_token: String::new(),
@@ -1303,8 +1450,12 @@ impl ContactAuthService {
         let session_id = Uuid::new_v4();
         let (access_token, expires_at) =
             self.mint_access_token(tenant_id, contact_id, company_id, email, &caps, session_id)?;
+        // PMS-1062: a login starts a rotation family, named by its
+        // first session.
         let refresh_token = self
-            .mint_refresh_token(tenant_id, contact_id, session_id, user_agent, ip)
+            .mint_refresh_token(
+                tenant_id, contact_id, session_id, session_id, user_agent, ip,
+            )
             .await?;
         // Stamp last-login. Best-effort.
         let _ = sqlx::query(
@@ -1437,11 +1588,16 @@ impl ContactAuthService {
         Ok((token, exp))
     }
 
+    /// `family_id` is the first session of the rotation chain this
+    /// one belongs to (PMS-1062): a login or a magic-link redeem
+    /// passes its own `session_id`, a rotation passes the presented
+    /// row's family forward.
     async fn mint_refresh_token(
         &self,
         tenant_id: Uuid,
         contact_id: Uuid,
         session_id: Uuid,
+        family_id: Uuid,
         user_agent: Option<&str>,
         ip: Option<IpAddr>,
     ) -> AppResult<String> {
@@ -1452,8 +1608,8 @@ impl ContactAuthService {
         sqlx::query(
             r#"
             INSERT INTO contact_sessions (id, tenant_id, contact_id, refresh_token_hash,
-                                          expires_at, user_agent, ip_address)
-            VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::inet)
+                                          expires_at, user_agent, ip_address, family_id)
+            VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::inet, $8)
             "#,
         )
         .bind(session_id)
@@ -1463,9 +1619,455 @@ impl ContactAuthService {
         .bind(expires_at)
         .bind(user_agent)
         .bind(ip_text)
+        .bind(family_id)
         .execute(self.db.migrator_pool())
         .await?;
         Ok(format!("{session_id}.{secret}"))
+    }
+
+    /// PMS-1063: verify the second factor on a login. A recovery code
+    /// wins when both are supplied (the customer who lost their
+    /// authenticator must get in even if the SPA still sends an empty
+    /// `mfa_code`); otherwise the TOTP code is checked against the
+    /// stored secret with one step of skew, and a secret still stored
+    /// in the pre-PMS-871 plaintext shape is rewritten sealed once the
+    /// code it produced has verified.
+    async fn verify_second_factor(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        stored_secret: Option<&str>,
+        totp: Option<&str>,
+        recovery: Option<&str>,
+    ) -> AppResult<bool> {
+        if let Some(code) = recovery {
+            return self
+                .consume_recovery_code(tenant_id, contact_id, code)
+                .await;
+        }
+        let Some(code) = totp else {
+            return Ok(false);
+        };
+        let stored = stored_secret
+            .ok_or_else(|| AppError::Internal("MFA enabled but no secret stored".to_string()))?;
+        let opened = mfa_secret::open(stored, &self.encryption_key)?;
+        let secret = crate::utils::totp::base32_decode(opened.secret_b32())
+            .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
+        if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+            return Ok(false);
+        }
+        if opened.needs_upgrade() {
+            self.upgrade_legacy_portal_mfa_secret(
+                tenant_id,
+                contact_id,
+                stored,
+                opened.secret_b32(),
+            )
+            .await?;
+        }
+        Ok(true)
+    }
+
+    /// PMS-1063: burn one recovery code. `array_remove` is a no-op when
+    /// the hash is absent, and the `ANY` predicate keeps the UPDATE from
+    /// matching then, so `rows_affected` says whether a code was spent.
+    async fn consume_recovery_code(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        code: &str,
+    ) -> AppResult<bool> {
+        let candidate = crate::utils::recovery::hash_code_hex(code);
+        let rows = sqlx::query(
+            r#"
+            UPDATE contacts
+               SET portal_mfa_recovery_codes_hashes =
+                     array_remove(portal_mfa_recovery_codes_hashes, $1),
+                   updated_at = NOW()
+             WHERE id = $2
+               AND tenant_id = $3
+               AND $1 = ANY(portal_mfa_recovery_codes_hashes)
+            "#,
+        )
+        .bind(&candidate)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?
+        .rows_affected();
+        Ok(rows > 0)
+    }
+
+    /// PMS-1063 (the PMS-871 shape): rewrite a plaintext
+    /// `portal_mfa_secret` sealed. Guarded on the old value so a
+    /// concurrent re-enrolment is never overwritten.
+    async fn upgrade_legacy_portal_mfa_secret(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        stored: &str,
+        secret_b32: &str,
+    ) -> AppResult<()> {
+        let sealed = mfa_secret::seal(secret_b32, &self.encryption_key)?;
+        sqlx::query(
+            "UPDATE contacts SET portal_mfa_secret = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3 AND portal_mfa_secret = $4",
+        )
+        .bind(&sealed)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(stored)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
+    }
+
+    /// PMS-1063: re-verify the contact's password before a change to
+    /// its second factor. A stolen access token cannot cross this.
+    /// Returns the row's `portal_mfa_enabled` and `portal_mfa_secret`
+    /// for the caller's next step.
+    async fn reauthenticate(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_password: &str,
+    ) -> AppResult<(bool, Option<String>, String)> {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(bool, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT portal_mfa_enabled, portal_mfa_secret, portal_password_hash, email \
+             FROM contacts WHERE id = $1 AND tenant_id = $2 AND is_portal_user = TRUE",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((enabled, secret, password_hash, email)) = row else {
+            return Err(AppError::Unauthorized);
+        };
+        let hash = password_hash.ok_or(AppError::Unauthorized)?;
+        if !verify_password(current_password, &hash)? {
+            return Err(AppError::Unauthorized);
+        }
+        Ok((enabled, secret, email.unwrap_or_default()))
+    }
+
+    /// PMS-1086: change the password while signed in. Re-verifies the
+    /// current password (`reauthenticate`), holds the new one to the
+    /// shared policy `setup_password` applies, writes the hash, and
+    /// revokes every session family EXCEPT the caller's own (`sid`
+    /// names the row the access token was minted from), so a device
+    /// the customer no longer holds is signed out while the one they
+    /// are typing on keeps its refresh token: the PMS-1062 reset rule,
+    /// minus the changer. Refusals: 401 on a wrong current password
+    /// (the route spends re-auth budget on that one, PMS-881), 400
+    /// with the policy message on a weak new password, and the hash
+    /// is untouched on either.
+    #[tracing::instrument(skip_all)]
+    pub async fn change_password(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_sid: Uuid,
+        current_password: &str,
+        new_password: &str,
+    ) -> AppResult<()> {
+        self.reauthenticate(tenant_id, contact_id, current_password)
+            .await?;
+        let hint_strings = self.password_context_hints(contact_id).await?;
+        let hint_refs: Vec<&str> = hint_strings.iter().map(|s| s.as_str()).collect();
+        crate::utils::password_policy::validate(
+            new_password,
+            &hint_refs,
+            crate::utils::password_policy::PasswordPolicy::default(),
+        )
+        .map_err(|e| {
+            let crate::utils::password_policy::PasswordPolicyError::UserMessage(m) = e;
+            AppError::BadRequest(m)
+        })?;
+        let hash = hash_password(new_password)?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE contacts SET portal_password_hash = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(&hash)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE contact_id = $1 AND tenant_id = $2 AND revoked_at IS NULL \
+               AND family_id <> (SELECT family_id FROM contact_sessions WHERE id = $3)",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(current_sid)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// PMS-1085: the family the caller's access token belongs to, from
+    /// its `sid`. `None` when the row is gone (a revoked-and-purged
+    /// session), which the callers treat as "matches nothing".
+    async fn family_of_session(
+        &self,
+        tenant_id: Uuid,
+        session_id: Uuid,
+    ) -> AppResult<Option<Uuid>> {
+        let family: Option<Uuid> = sqlx::query_scalar(
+            "SELECT family_id FROM contact_sessions WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(session_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        Ok(family)
+    }
+
+    /// PMS-1085: the contact's live sessions, one per rotation family
+    /// (the newest unrevoked, unexpired row of each), newest login
+    /// first. `current` marks the family the caller's `sid` is in.
+    ///
+    /// SAFETY (PMS-285): both filters are the caller's own tenant and
+    /// contact ids from the verified JWT; the migrator pool is what
+    /// every `contact_sessions` read here uses.
+    #[tracing::instrument(skip_all)]
+    pub async fn list_sessions(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_sid: Uuid,
+    ) -> AppResult<Vec<ContactSessionResponse>> {
+        let current_family = self.family_of_session(tenant_id, current_sid).await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<String>,
+            Option<ipnetwork::IpNetwork>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT ON (s.family_id)
+                   s.family_id,
+                   (SELECT MIN(f.created_at) FROM contact_sessions f
+                     WHERE f.family_id = s.family_id) AS issued_at,
+                   s.created_at AS last_seen_at,
+                   s.expires_at, s.user_agent, s.ip_address
+            FROM contact_sessions s
+            WHERE s.contact_id = $1
+              AND s.tenant_id = $2
+              AND s.revoked_at IS NULL
+              AND s.expires_at > NOW()
+            ORDER BY s.family_id, s.created_at DESC
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_all(self.db.migrator_pool())
+        .await?;
+        let mut sessions: Vec<ContactSessionResponse> = rows
+            .into_iter()
+            .map(
+                |(family_id, issued_at, last_seen_at, expires_at, user_agent, ip)| {
+                    ContactSessionResponse {
+                        id: family_id,
+                        issued_at,
+                        last_seen_at,
+                        expires_at,
+                        user_agent,
+                        ip_address: ip.map(|ip| ip.ip().to_string()),
+                        current: current_family == Some(family_id),
+                    }
+                },
+            )
+            .collect();
+        sessions.sort_by(|a, b| b.issued_at.cmp(&a.issued_at));
+        Ok(sessions)
+    }
+
+    /// PMS-1085: end one of the caller's OTHER sessions by family id.
+    /// The caller's own family is refused with a 400 pointing at
+    /// `/auth/logout`, which also clears the SPA's in-memory token; a
+    /// family that is not the caller's (unknown, or another contact's)
+    /// is a silent 204, the enumeration-resistant shape logout has.
+    #[tracing::instrument(skip_all)]
+    pub async fn revoke_session(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_sid: Uuid,
+        family_id: Uuid,
+    ) -> AppResult<()> {
+        if self.family_of_session(tenant_id, current_sid).await? == Some(family_id) {
+            return Err(AppError::BadRequest(
+                "Use /auth/logout to sign out of the current session".to_string(),
+            ));
+        }
+        let owns: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM contact_sessions \
+             WHERE family_id = $1 AND contact_id = $2 AND tenant_id = $3)",
+        )
+        .bind(family_id)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        if !owns {
+            return Ok(());
+        }
+        self.revoke_session_family(family_id).await
+    }
+
+    /// PMS-1063: start MFA enrolment. Stages a fresh TOTP secret on the
+    /// contact row, sealed at rest, WITHOUT flipping
+    /// `portal_mfa_enabled`: only `enable_mfa`, after a live code has
+    /// verified, turns it on, so a mis-set authenticator cannot lock
+    /// the customer out. Calling this again before enable replaces the
+    /// staged secret. 409 when MFA is already on: disable first.
+    #[tracing::instrument(skip_all)]
+    pub async fn start_mfa_enrollment(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_password: &str,
+    ) -> AppResult<ContactMfaSetupResponse> {
+        let (enabled, _, email) = self
+            .reauthenticate(tenant_id, contact_id, current_password)
+            .await?;
+        if enabled {
+            return Err(AppError::Conflict("MFA is already enabled".to_string()));
+        }
+        let secret = crate::utils::totp::generate_secret();
+        let secret_b32 = crate::utils::totp::base32_encode(&secret);
+        let sealed = mfa_secret::seal(&secret_b32, &self.encryption_key)?;
+        sqlx::query(
+            "UPDATE contacts SET portal_mfa_secret = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(&sealed)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        // The issuer the authenticator shows beside the code, the way
+        // the staff plane labels it (PMS-789): a colon inside the name
+        // would split the otpauth label once the app decodes it.
+        let app = crate::utils::app_name::app_name().replace(':', " ");
+        let label = format!("{app}:{email}");
+        let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, &app);
+        Ok(ContactMfaSetupResponse {
+            secret: secret_b32,
+            provisioning_uri,
+        })
+    }
+
+    /// PMS-1063: finish MFA enrolment. Re-verifies the password, checks
+    /// one live code against the staged secret, flips
+    /// `portal_mfa_enabled`, and mints the single-use recovery codes,
+    /// returned once and stored as hashes.
+    #[tracing::instrument(skip_all)]
+    pub async fn enable_mfa(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        code: &str,
+        current_password: &str,
+    ) -> AppResult<ContactMfaEnableResponse> {
+        let (enabled, stored, _) = self
+            .reauthenticate(tenant_id, contact_id, current_password)
+            .await?;
+        if enabled {
+            return Err(AppError::Conflict("MFA is already enabled".to_string()));
+        }
+        let stored = stored.ok_or_else(|| {
+            AppError::BadRequest("MFA enrollment has not been started".to_string())
+        })?;
+        let opened = mfa_secret::open(&stored, &self.encryption_key)?;
+        let secret = crate::utils::totp::base32_decode(opened.secret_b32())
+            .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
+        if crate::utils::totp::verify(&secret, code, Utc::now(), 1).is_none() {
+            return Err(AppError::BadRequest("Invalid MFA code".to_string()));
+        }
+        let recovery_codes = crate::utils::recovery::generate_set();
+        let hashes: Vec<String> = recovery_codes
+            .iter()
+            .map(|c| crate::utils::recovery::hash_code_hex(c))
+            .collect();
+        // Seal on the way in too, so a secret staged before the key
+        // was wired (or by a seed) does not stay plaintext past this.
+        let sealed = mfa_secret::seal(opened.secret_b32(), &self.encryption_key)?;
+        sqlx::query(
+            r#"
+            UPDATE contacts
+               SET portal_mfa_enabled = TRUE,
+                   portal_mfa_secret = $1,
+                   portal_mfa_enrolled_at = NOW(),
+                   portal_mfa_recovery_codes_hashes = $2,
+                   updated_at = NOW()
+             WHERE id = $3 AND tenant_id = $4
+            "#,
+        )
+        .bind(&sealed)
+        .bind(&hashes)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(ContactMfaEnableResponse { recovery_codes })
+    }
+
+    /// PMS-1063: remove MFA. Needs the current password AND a live code
+    /// or an unspent recovery code, so a stolen access token cannot
+    /// quietly weaken the account. Not enabled is the same 401 as a
+    /// wrong password, so the response does not say which.
+    #[tracing::instrument(skip_all)]
+    pub async fn disable_mfa(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_password: &str,
+        code: &str,
+    ) -> AppResult<()> {
+        let (enabled, stored, _) = self
+            .reauthenticate(tenant_id, contact_id, current_password)
+            .await?;
+        if !enabled {
+            return Err(AppError::Unauthorized);
+        }
+        let code = code.trim();
+        let looks_like_totp = code.chars().all(|c| c.is_ascii_digit());
+        let (totp, recovery) = if looks_like_totp {
+            (Some(code), None)
+        } else {
+            (None, Some(code))
+        };
+        if !self
+            .verify_second_factor(tenant_id, contact_id, stored.as_deref(), totp, recovery)
+            .await?
+        {
+            return Err(AppError::Unauthorized);
+        }
+        sqlx::query(
+            r#"
+            UPDATE contacts
+               SET portal_mfa_enabled = FALSE,
+                   portal_mfa_secret = NULL,
+                   portal_mfa_enrolled_at = NULL,
+                   portal_mfa_recovery_codes_hashes = '{}',
+                   updated_at = NOW()
+             WHERE id = $1 AND tenant_id = $2
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
     }
 
     /// Best-effort: increment `portal_failed_login_count` and arm
@@ -1608,7 +2210,7 @@ impl ContactAuthService {
         &self,
         tenant_id: TenantId,
         company_id: Uuid,
-        caps: &[String],
+        contact_id: Uuid,
     ) -> AppResult<super::models::ContactDashboardSummary> {
         // MAPPS-705: gate each aggregate + activity section on the
         // caller's capabilities. A tile whose underlying list the
@@ -1617,6 +2219,10 @@ impl ContactAuthService {
         // caller could not click into. A contact holding zero caps
         // sees zero rows across the board, which is what the
         // empty-state SPA landing renders.
+        //
+        // PMS-985: the set is loaded here rather than taken as an
+        // argument, so no caller can hand this a stale snapshot.
+        let caps = self.load_capabilities(tenant_id.get(), contact_id).await?;
         let has = |cap: &str| caps.iter().any(|c| c == cap);
         let can_read_tickets = has(super::capabilities::TICKETS_READ);
         let can_read_invoices = has(super::capabilities::INVOICES_READ);

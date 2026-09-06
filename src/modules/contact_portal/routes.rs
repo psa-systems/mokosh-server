@@ -12,7 +12,7 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use validator::Validate;
 
@@ -29,6 +29,12 @@ const REFRESH_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
 #[derive(Clone)]
 pub struct ContactRouterState {
     pub service: Arc<ContactAuthService>,
+    /// PMS-1086 (the PMS-881 shape): failure-counted budget for the
+    /// password re-auth on `PUT /auth/me/password` and
+    /// `POST /auth/me/mfa/disable`, one instance for both so grinding
+    /// the password through one does not reset the other. Only a
+    /// rejected re-auth spends it.
+    pub reauth_limiter: Arc<crate::modules::auth::rate_limit::ReauthRateLimiter>,
 }
 
 /// Build the `/api/v1/contact/*` sub-router. Layered with
@@ -42,6 +48,7 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
     };
     let state = ContactRouterState {
         service: service_arc,
+        reauth_limiter: crate::modules::auth::rate_limit::ReauthRateLimiter::new(10, 5),
     };
     Router::new()
         .route("/auth/login", post(login))
@@ -58,6 +65,20 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         // MAPPS-636 removed the picker for. A caller who hits this
         // URL now 404s.
         .route("/auth/me", get(me).put(update_me))
+        // PMS-1086: change the password while signed in, behind the
+        // session AND the current password; revokes every other
+        // session family.
+        .route("/auth/me/password", put(change_password))
+        // PMS-1063: MFA enrolment and removal, behind the session AND
+        // the current password (setup, enable, disable all re-verify
+        // it), the shape the retired portal had at /portal/auth/me/mfa/*.
+        .route("/auth/me/mfa/setup", post(mfa_setup))
+        .route("/auth/me/mfa/enable", post(mfa_enable))
+        .route("/auth/me/mfa/disable", post(mfa_disable))
+        // PMS-1085: the caller's live sessions (one per rotation
+        // family) and "sign out that other browser".
+        .route("/auth/me/sessions", get(list_sessions))
+        .route("/auth/me/sessions/{session_id}", delete(revoke_session))
         // MAPPS-618 (mokosh-branding prompt 002): contact-plane brand
         // editor. Gated on `settings:manage_company_branding`; server
         // derives the target Company from the caller's session, so a
@@ -136,6 +157,7 @@ async fn login(
             &request.email,
             &request.password,
             request.mfa_code.as_deref(),
+            request.recovery_code.as_deref(),
             ua.as_deref(),
             Some(addr.ip()),
         )
@@ -287,6 +309,164 @@ async fn me(
     Ok(Json(me))
 }
 
+/// PMS-1063: start MFA enrolment. Mints a fresh TOTP secret onto the
+/// contact row without flipping `portal_mfa_enabled`; the response
+/// carries the base32 secret and the `otpauth://` URI for a QR code.
+async fn mfa_setup(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Json(request): Json<ContactMfaSetupRequest>,
+) -> AppResult<Json<ContactMfaSetupResponse>> {
+    request.validate()?;
+    let resp = state
+        .service
+        .start_mfa_enrollment(session.tenant_id, session.id, &request.current_password)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// PMS-1063: finish MFA enrolment. Verifies one live code against the
+/// staged secret, flips `portal_mfa_enabled`, and returns the recovery
+/// codes once.
+async fn mfa_enable(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Json(request): Json<ContactMfaEnableRequest>,
+) -> AppResult<Json<ContactMfaEnableResponse>> {
+    request.validate()?;
+    let resp = state
+        .service
+        .enable_mfa(
+            session.tenant_id,
+            session.id,
+            &request.code,
+            &request.current_password,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+/// PMS-1063: remove MFA. Needs the current password and a live code
+/// or a recovery code; clears the secret and the recovery codes.
+async fn mfa_disable(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<ContactMfaDisableRequest>,
+) -> AppResult<StatusCode> {
+    request.validate()?;
+    let ip = reauth_client_ip(addr, &headers);
+    check_reauth_budget(&state, ip, session.id)?;
+    let result = state
+        .service
+        .disable_mfa(
+            session.tenant_id,
+            session.id,
+            &request.current_password,
+            &request.code,
+        )
+        .await;
+    spend_reauth_budget_on_refusal(&state, ip, session.id, &result);
+    result?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-1086: change the password while signed in. The current-password
+/// re-auth shares the failure budget with `mfa_disable` (PMS-881), so a
+/// stolen access token cannot grind the password at full rate through
+/// either route; a correct password never spends any.
+async fn change_password(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<ContactChangePasswordRequest>,
+) -> AppResult<StatusCode> {
+    request.validate()?;
+    let ip = reauth_client_ip(addr, &headers);
+    check_reauth_budget(&state, ip, session.id)?;
+    let result = state
+        .service
+        .change_password(
+            session.tenant_id,
+            session.id,
+            session.sid,
+            &request.current_password,
+            &request.new_password,
+        )
+        .await;
+    spend_reauth_budget_on_refusal(&state, ip, session.id, &result);
+    result?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Source IP for the re-auth buckets: the forwarded chain behind
+/// Traefik, else the peer (PMS-587), the way the staff route keys it.
+fn reauth_client_ip(addr: SocketAddr, headers: &HeaderMap) -> std::net::IpAddr {
+    crate::utils::client_ip::extract_client_ip(
+        addr.ip(),
+        headers,
+        crate::utils::client_ip::trusted_proxies(),
+    )
+}
+
+/// 429 with the wait when either re-auth bucket is spent, BEFORE the
+/// credential is compared.
+fn check_reauth_budget(
+    state: &ContactRouterState,
+    ip: std::net::IpAddr,
+    contact_id: uuid::Uuid,
+) -> AppResult<()> {
+    match state.reauth_limiter.check(ip, contact_id) {
+        Ok(()) => Ok(()),
+        Err(retry_after) => Err(AppError::RateLimited {
+            retry_after_seconds: Some(retry_after),
+        }),
+    }
+}
+
+/// Only a rejected re-auth (the service's 401) spends budget: a weak
+/// new password or a database error is not a credential guess.
+fn spend_reauth_budget_on_refusal<T>(
+    state: &ContactRouterState,
+    ip: std::net::IpAddr,
+    contact_id: uuid::Uuid,
+    result: &AppResult<T>,
+) {
+    if matches!(result, Err(AppError::Unauthorized)) {
+        state.reauth_limiter.record_failure(ip, contact_id);
+    }
+}
+
+/// PMS-1085: the caller's live sessions, one per rotation family,
+/// with `current` on the one this access token belongs to.
+async fn list_sessions(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+) -> AppResult<Json<Vec<ContactSessionResponse>>> {
+    let sessions = state
+        .service
+        .list_sessions(session.tenant_id, session.id, session.sid)
+        .await?;
+    Ok(Json(sessions))
+}
+
+/// PMS-1085: end one of the caller's other sessions. The caller's own
+/// is a 400 pointing at `/auth/logout`; an id that is not the caller's
+/// is a silent 204.
+async fn revoke_session(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Path(session_id): Path<uuid::Uuid>,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .revoke_session(session.tenant_id, session.id, session.sid, session_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// PMS-935: contact profile self-edit. Gated on
 /// `settings:manage_own` (DB-loaded per request; JWT `caps` is
 /// UI-only so a role revoke lands within one tick, not after the
@@ -402,11 +582,14 @@ async fn dashboard_summary(
     RequireContactAuth(session): RequireContactAuth,
 ) -> AppResult<Json<ContactDashboardSummary>> {
     let tenant = TenantId::from_trusted(session.tenant_id);
-    // MAPPS-705: pass the caller's capabilities so the aggregator can
-    // skip the tiles + activity rows the caller cannot open.
+    // MAPPS-705: the aggregator skips the tiles + activity rows the
+    // caller cannot open. PMS-985: it loads that capability set itself,
+    // from `portal_roles`, for this request - it used to be handed the
+    // JWT's snapshot, so a tile a role had just granted stayed empty
+    // until the token was re-minted.
     let summary = state
         .service
-        .dashboard_summary(tenant, session.company_id, &session.caps)
+        .dashboard_summary(tenant, session.company_id, session.id)
         .await?;
     Ok(Json(summary))
 }

@@ -8,13 +8,10 @@
 //! replay, 400 on an expired or unknown token, 400 with the policy
 //! message on a weak password with the token left unused.
 //!
-//! Two groups the retired portal pinned are gone with it. Its
-//! `PUT /portal/auth/me/password` change-password route has no contact
-//! plane counterpart (`PUT /contact/auth/me` edits the profile and
-//! carries no password field). And a successful reset revoked every live
-//! refresh token; `ContactAuthService::setup_password` writes the hash
-//! and marks the token used without touching `contact_sessions`. The
-//! first is on the PMS-1064 ledger; the second is PMS-1062.
+//! The retired portal's `PUT /portal/auth/me/password` is back as
+//! `PUT /contact/auth/me/password` (PMS-1086) and pinned at the end of
+//! this file; a successful reset revoking every live session is back
+//! since PMS-1062 and pinned below too.
 
 mod common;
 
@@ -271,4 +268,217 @@ async fn reset_password_weak_password_returns_400_and_token_unused(pool: PgPool)
     // And the same token then redeems.
     let retry = reset(&app, &token, STRONG).await;
     assert_eq!(retry.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
+// PMS-1062: a reset ends every session the contact holds, on every
+// device, so a refresh token stolen before the reset does not survive
+// it. The new password signs in fresh.
+#[sqlx::test]
+async fn reset_password_revokes_every_live_session(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
+    let app = common::boot(pool.clone()).await;
+
+    // Two devices signed in, one of them rotated once.
+    let first = common::contact_login(&app, &contact).await;
+    let rt_first = first["refresh_token"].as_str().unwrap().to_string();
+    let rotated = app
+        .client
+        .post(app.url("/api/v1/contact/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": rt_first }))
+        .send()
+        .await
+        .expect("rotate");
+    let rt_rotated = rotated.json::<serde_json::Value>().await.unwrap()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let second = common::contact_login(&app, &contact).await;
+    let rt_second = second["refresh_token"].as_str().unwrap().to_string();
+
+    let (_, token) = seed_reset_token(
+        &pool,
+        contact.id,
+        "reset-secret-abcdefghij",
+        in_thirty_minutes(),
+    )
+    .await;
+    let resp = reset(&app, &token, STRONG).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM contact_sessions WHERE contact_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(contact.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(live, 0, "no live session survives the reset");
+
+    for (label, rt) in [("rotated", &rt_rotated), ("second device", &rt_second)] {
+        let refresh = app
+            .client
+            .post(app.url("/api/v1/contact/auth/refresh"))
+            .json(&serde_json::json!({ "refresh_token": rt }))
+            .send()
+            .await
+            .expect("refresh after reset");
+        assert_eq!(
+            refresh.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{label} refresh token is dead after the reset"
+        );
+    }
+
+    let login = common::contact_login_response(&app, &contact, STRONG).await;
+    assert_eq!(
+        login.status(),
+        reqwest::StatusCode::OK,
+        "new password signs in"
+    );
+}
+
+// ---- PMS-1086: change password while signed in ------------------------
+
+async fn change_password(
+    app: &common::TestApp,
+    token: &str,
+    current: &str,
+    new: &str,
+) -> reqwest::Response {
+    app.client
+        .put(app.url("/api/v1/contact/auth/me/password"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "current_password": current, "new_password": new }))
+        .send()
+        .await
+        .expect("send change-password")
+}
+
+async fn refresh(app: &common::TestApp, refresh_token: &str) -> reqwest::Response {
+    app.client
+        .post(app.url("/api/v1/contact/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": refresh_token }))
+        .send()
+        .await
+        .expect("send refresh")
+}
+
+// The right pair is 204: the new password signs in, the old is refused,
+// the other device's refresh token is dead, and the caller's own still
+// rotates.
+#[sqlx::test]
+async fn change_password_happy_path_keeps_the_caller_signed_in(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
+    let app = common::boot(pool.clone()).await;
+    let other = common::contact_login(&app, &contact).await;
+    let rt_other = other["refresh_token"].as_str().unwrap().to_string();
+    let mine = common::contact_login(&app, &contact).await;
+    let token = mine["access_token"].as_str().unwrap().to_string();
+    let rt_mine = mine["refresh_token"].as_str().unwrap().to_string();
+
+    let resp = change_password(&app, &token, common::CONTACT_PASSWORD, STRONG).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let old = common::contact_login_response(&app, &contact, common::CONTACT_PASSWORD).await;
+    assert_eq!(
+        old.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "old password refused"
+    );
+    let new = common::contact_login_response(&app, &contact, STRONG).await;
+    assert_eq!(
+        new.status(),
+        reqwest::StatusCode::OK,
+        "new password signs in"
+    );
+
+    let dead = refresh(&app, &rt_other).await;
+    assert_eq!(
+        dead.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the other device is signed out"
+    );
+    let alive = refresh(&app, &rt_mine).await;
+    assert!(
+        alive.status().is_success(),
+        "the caller's own family still rotates, got {}",
+        alive.status()
+    );
+}
+
+// A wrong current password is 401 with the hash untouched, and five of
+// them spend the re-auth budget: the sixth is 429 before any comparison.
+#[sqlx::test]
+async fn change_password_wrong_current_is_401_and_rate_limited(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::contact_token(&app, &contact).await;
+    let before: Option<String> =
+        sqlx::query_scalar("SELECT portal_password_hash FROM contacts WHERE id = $1")
+            .bind(contact.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    for _ in 0..5 {
+        let resp = change_password(&app, &token, "not-the-password", STRONG).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    let sixth = change_password(&app, &token, common::CONTACT_PASSWORD, STRONG).await;
+    assert_eq!(
+        sixth.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "budget spent: even the right password waits"
+    );
+    let after: Option<String> =
+        sqlx::query_scalar("SELECT portal_password_hash FROM contacts WHERE id = $1")
+            .bind(contact.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "hash untouched");
+}
+
+// A weak new password is 400 with the policy message, the hash is
+// untouched, and it spends no re-auth budget.
+#[sqlx::test]
+async fn change_password_weak_new_is_400_and_spends_no_budget(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::contact_token(&app, &contact).await;
+
+    for _ in 0..6 {
+        let resp = change_password(&app, &token, common::CONTACT_PASSWORD, "short").await;
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let still = common::contact_login_response(&app, &contact, common::CONTACT_PASSWORD).await;
+    assert_eq!(
+        still.status(),
+        reqwest::StatusCode::OK,
+        "old password still signs in"
+    );
+    let ok = change_password(&app, &token, common::CONTACT_PASSWORD, STRONG).await;
+    assert_eq!(
+        ok.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "weak attempts spent no budget"
+    );
+}
+
+// No session: 401 before anything is read.
+#[sqlx::test]
+async fn change_password_requires_a_session(pool: PgPool) {
+    let _contact = seed_portal_contact(&pool, "user@example.com").await;
+    let app = common::boot(pool).await;
+    let resp = app
+        .client
+        .put(app.url("/api/v1/contact/auth/me/password"))
+        .json(&serde_json::json!({
+            "current_password": common::CONTACT_PASSWORD,
+            "new_password": STRONG,
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
