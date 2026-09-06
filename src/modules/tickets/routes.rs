@@ -12,9 +12,9 @@ use validator::Validate;
 use super::{
     AttachmentService, CreateNoteRequest, CreateTicketRequest, NoteType, TicketCategoryResponse,
     TicketFilter, TicketNoteResponse, TicketPriority, TicketQueue, TicketResponse, TicketService,
-    TicketStatus, TicketType, UpdateNoteRequest, UpdateTicketRequest, UpsertTicketCategoryRequest,
-    UpsertTicketPriorityRequest, UpsertTicketQueueRequest, UpsertTicketStatusRequest,
-    UpsertTicketTypeRequest,
+    TicketSlaResponse, TicketStatus, TicketType, UpdateNoteRequest, UpdateTicketRequest,
+    UpsertTicketCategoryRequest, UpsertTicketPriorityRequest, UpsertTicketQueueRequest,
+    UpsertTicketStatusRequest, UpsertTicketTypeRequest,
 };
 use crate::db::Database;
 use crate::modules::approvals::{ApprovalResponse, ApprovalsService};
@@ -87,6 +87,7 @@ pub fn ticket_routes(
         .route("/", get(list_tickets))
         .route("/", post(create_ticket))
         .route("/{ticket_id}", get(get_ticket))
+        .route("/{ticket_id}/sla", get(get_ticket_sla))
         .route("/{ticket_id}", put(update_ticket))
         // PMS-937: dual-plane PATCH. Contact callers gate on
         // `tickets:edit_own` and may only edit the title / description
@@ -242,6 +243,33 @@ async fn get_ticket(
         }
     }
     Ok(Json(resp))
+}
+
+/// PMS-1087: dual-plane, the `get_ticket` split. A contact holding
+/// `tickets:read` gets the SLA state of its own Company's ticket, the
+/// Company folded into the read so a foreign ticket is a 404 exactly
+/// as an unknown id is; staff get any ticket of the tenant. Same
+/// shape on both arms, and nothing internal in it.
+async fn get_ticket_sla(
+    State(state): State<TicketRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    Path(ticket_id): Path<Uuid>,
+) -> AppResult<Json<TicketSlaResponse>> {
+    let tenant = caller.tenant();
+    let company_scope = match &caller {
+        CallerContext::Staff(_) => None,
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::TICKETS_READ, &db).await?;
+            Some(session.company_id)
+        }
+    };
+    Ok(Json(
+        state
+            .ticket_service
+            .get_ticket_sla(tenant, ticket_id, company_scope)
+            .await?,
+    ))
 }
 
 async fn update_ticket(
