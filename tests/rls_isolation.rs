@@ -163,3 +163,121 @@ async fn rls_fail_closed_and_with_check(pool: PgPool) {
         .await
         .expect("drop app role");
 }
+
+/// PMS-1040: `tenant_memberships` gained the fail-closed policy in migration
+/// 191, and the only writer that reaches it is
+/// `sync_user_to_identity_and_membership`, the AFTER INSERT OR UPDATE trigger
+/// on `users` (migration 157, last replaced by 164). The migration header
+/// argues from `users` already being under FORCEd RLS that the mirror cannot
+/// fail-close: the trigger propagates `NEW.tenant_id`, which is the value the
+/// GUC already had to match for the `users` write itself to be allowed. That
+/// argument is what this test stops being an argument. A mirror write silently
+/// rejected by the new policy would leave the seat plane behind the `users`
+/// plane, and nothing else in the suite drives that trigger as a NOBYPASSRLS
+/// role.
+#[sqlx::test]
+async fn the_users_membership_mirror_survives_the_membership_policy(pool: PgPool) {
+    let tenant_a = Uuid::from_u128(1);
+    let role = format!("mokosh_rls_test_{}", Uuid::new_v4().simple());
+    let user_id = Uuid::new_v4();
+    let email = format!("mirror-{}@example.com", Uuid::new_v4().simple());
+
+    let mut conn = pool.acquire().await.expect("acquire dedicated connection");
+
+    // Seed the users row as the superuser. The trigger fires here too and
+    // creates the identity + membership rows this test then mutates.
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, first_name, last_name, role) \
+         VALUES ($1, $2, $3, 'Mirror', 'Probe', 'technician')",
+    )
+    .bind(user_id)
+    .bind(tenant_a)
+    .bind(&email)
+    .execute(&mut *conn)
+    .await
+    .expect("seed users row under tenant A");
+
+    sqlx::query(&format!(
+        "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("create unprivileged app role");
+    sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("grant schema usage");
+    // Exactly what the mirror touches: the users row, the membership row it
+    // maintains, and the identity row it keeps in step.
+    sqlx::query(&format!(
+        "GRANT SELECT, INSERT, UPDATE ON users, tenant_memberships, identities TO {role}"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("grant table privileges");
+
+    sqlx::query(&format!("SET ROLE {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("set role to unprivileged app role");
+
+    // 1) Fail-closed read: the membership plane is invisible without a GUC,
+    //    which is the whole point of giving the table a policy.
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM tenant_memberships")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count memberships with no GUC");
+    assert_eq!(
+        count, 0,
+        "an unset GUC must expose zero membership rows (fail-closed)"
+    );
+
+    // 2) With the tenant's own GUC the mirror still works end to end: the
+    //    `users` UPDATE fires the trigger, and the trigger's write to
+    //    `tenant_memberships` passes WITH CHECK because it carries the same
+    //    tenant_id the GUC names.
+    sqlx::query("SELECT set_config('app.current_tenant', $1, false)")
+        .bind(tenant_a.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("set GUC to tenant A");
+    sqlx::query("UPDATE users SET role = 'manager', updated_at = NOW() WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await
+        .expect("the users write must not be rejected by the membership policy");
+
+    let mirrored: String = sqlx::query_scalar(
+        "SELECT tm.role FROM tenant_memberships tm \
+         JOIN identities i ON i.id = tm.identity_id \
+         WHERE lower(i.email) = lower($1) AND tm.tenant_id = $2",
+    )
+    .bind(&email)
+    .bind(tenant_a)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("read the mirrored membership under the tenant GUC");
+    assert_eq!(
+        mirrored, "manager",
+        "the users -> tenant_memberships mirror must still reach the seat row"
+    );
+
+    sqlx::query("RESET ROLE")
+        .execute(&mut *conn)
+        .await
+        .expect("reset role");
+    sqlx::query(&format!(
+        "REVOKE ALL ON users, tenant_memberships, identities FROM {role}"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("revoke table privileges");
+    sqlx::query(&format!("REVOKE ALL ON SCHEMA public FROM {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("revoke schema usage");
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("drop app role");
+}

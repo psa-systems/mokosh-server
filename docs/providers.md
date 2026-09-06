@@ -25,6 +25,9 @@ without losing it.
 Payment (`PaymentProvider`) and RMM (`RmmProvider`) are also providers, but they are chosen per tenant as an
 integration rather than per deployment as infrastructure, so they do not appear in the tables below.
 
+`src/config/`, `src/secrets/` and `src/storage/` each implement the kind of the same name.
+[ROADMAP.md](ROADMAP.md) links the phase, and the issue, for every kind.
+
 ## The three tiers
 
 The tiers are separated by **bootstrap order**, not by how secret a value is. That is the only line that can be
@@ -40,6 +43,24 @@ enabled for the other kinds. Any enabled provider may serve it.
 **Tenant** is what belongs to one MSP tenant rather than to the deployment: a tenant's payment-gateway
 credentials, a tenant's logo. These are addressed by a key that carries the tenant (`SecretKey`, `ObjectKey`), so
 one tenant's key cannot name another tenant's value.
+
+## The registry, and the one read path
+
+A trait alone does not prevent the incident. Bunyip had a working Infisical client and still read secrets from the
+database, because nothing forced the read through the seam. Two things do, and a kind is not finished until it has
+both:
+
+- **A declared registry.** Every key the application may read is declared, with its tier, in one place. An
+  undeclared key is not a runtime miss; it does not compile, because the read takes a declared key rather than a
+  string. `src/config/registry.rs` is the configuration kind's, and `scripts/check-env-example.nu` compares it
+  against `.env.example` and the dev compose environment in both directions.
+- **A read path that cannot be bypassed.** A read that goes around the provider fails the build. For
+  configuration that is `config::guard`, which fails `cargo test --lib` on an environment read outside
+  `src/config/` and the entry points it names, each with one stated reason.
+
+An entry point is narrow, and there are only two kinds of it. A **bootstrap entry point** runs before there is an
+application to configure. A **provider of record** is the one reader of its own selection variable, or of the
+values a provider is constructed from: a provider cannot be built out of what it is being built to serve.
 
 ## Where each is configured
 

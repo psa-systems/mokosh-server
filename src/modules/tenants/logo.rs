@@ -59,8 +59,7 @@ pub struct TenantLogoConfig {
 
 impl TenantLogoConfig {
     pub fn from_env() -> Self {
-        let max_bytes = std::env::var("TENANT_LOGO_MAX_BYTES")
-            .ok()
+        let max_bytes = crate::config::get(&crate::config::registry::TENANT_LOGO_MAX_BYTES)
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_BYTES);

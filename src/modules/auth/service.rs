@@ -1204,7 +1204,11 @@ impl AuthService {
         // RLS-exempt: see the migration header for the "pre-auth / cross-
         // tenant entitlement lookup path" reason, and 038's ENABLE-RLS loop
         // runs at migration time only, so nothing enables RLS on 154's
-        // table after the fact.
+        // table after the fact. PMS-1040 put that exemption where it is
+        // enforced rather than only asserted: the table is named in
+        // `ALLOWED_WITHOUT_RLS` (`tests/rls_coverage.rs`), so a migration
+        // that gives it a policy fails the guard instead of silently
+        // fail-closing this read to `None` and passing every tenant.
         let entitlement: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
             "SELECT status, expires_at FROM tenant_membership_entitlements WHERE tenant_id = $1",
         )

@@ -9,9 +9,20 @@
 //! gate - with three of them wrapped in a `BEGIN` / `set_config` / `ROLLBACK`
 //! transaction, for twenty round trips in all.
 //!
-//! The budget is now two statements: one `users` read (carrying the waiting
-//! -invite flag) and the PMS-698 `tenants` status gate, which is
-//! security-relevant and deliberately NOT cached.
+//! The budget is now three statements: one `users` read (carrying the waiting
+//! -invite flag), the PMS-698 `tenants` status gate, and the MAPPS-459
+//! `tenant_membership_entitlements` read that gate makes right after it. All
+//! three are security-relevant and deliberately NOT cached.
+//!
+//! PMS-1042: the budget was two until MAPPS-459 (PMS-728 slice 3) added the
+//! entitlement read inside `AuthService::ensure_tenant_active`, where it runs
+//! unconditionally for every caller in every tenant, right after the `tenants`
+//! status read it extends. That landed while this test was already failing on
+//! its own setup (the abolished JIT self-signup), so nothing reported the third
+//! statement. It is NOT an invitation lookup: the "is an invite waiting" flag is
+//! an `EXISTS` inside the one `users` read, so the invitation this test now
+//! seeds costs no statement of its own. Folding the two tenant-gate reads back
+//! into one round trip is PMS-1059.
 //!
 //! The count comes from a `tracing` subscriber that records `sqlx::query`
 //! events, which is the in-process equivalent of Postgres `log_statement=all`
@@ -131,10 +142,10 @@ fn claims(sub: Uuid) -> AtClaims {
 /// How many statements one authenticated request may cost before the handler
 /// runs. Raising this number is a throughput regression, not a test failure to
 /// paper over: see the module docs for what each statement is.
-const QUERY_BUDGET: usize = 2;
+const QUERY_BUDGET: usize = 3;
 
 #[sqlx::test]
-async fn an_authenticated_bunyip_request_costs_two_statements(pool: PgPool) {
+async fn an_authenticated_bunyip_request_costs_three_statements(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry().with(RecordingLayer(recorder.clone())),
@@ -144,7 +155,32 @@ async fn an_authenticated_bunyip_request_costs_two_statements(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
     let sub = Uuid::new_v4();
 
-    // First sight: the full JIT path, with userinfo-supplied email and name.
+    // MAPPS-458 (PMS-728 slice 2): bunyip is no longer an onboarding surface, so
+    // a first-sight identity is placed only when a pending invitation matches
+    // its verified address. This test measured the cost of an ALREADY-PLACED
+    // caller and never the first placement, so the invitation is setup: it is
+    // consumed by that first call and leaves nothing pending, which is why the
+    // measured budget below is still 2. The invite lookup that would add a
+    // statement runs only while an invite is still waiting, and
+    // `find_bunyip_principal` carries that flag on the one `users` read.
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    // Seeded with SQL rather than `InvitationsService::create`, whose
+    // `invited_by` is a `users` foreign key: this file deliberately carries no
+    // `common` harness, because the recording subscriber it installs is
+    // process-global (see the module docs).
+    sqlx::query(
+        "INSERT INTO tenant_invitations (tenant_id, email, role, expires_at) \
+         VALUES ($1, 'budget@example.com', 'manager', NOW() + INTERVAL '7 days')",
+    )
+    .bind(org)
+    .execute(&pool)
+    .await
+    .expect("seed the pending invitation");
+
+    // First sight: the invited placement, with userinfo-supplied email and name.
     place_bunyip_user(
         &auth,
         Some(&tenants),
@@ -224,6 +260,14 @@ async fn an_authenticated_bunyip_request_costs_two_statements(pool: PgPool) {
             .iter()
             .any(|s| s.contains("SELECT status FROM tenants")),
         "the PMS-698 principal gate still runs on every request: {statements:#?}"
+    );
+    // PMS-1042: the third statement is named, so the budget above is spent on a
+    // statement somebody chose rather than on slack a future read can grow into.
+    assert!(
+        statements
+            .iter()
+            .any(|s| s.contains("tenant_membership_entitlements")),
+        "the third statement is the MAPPS-459 entitlement read: {statements:#?}"
     );
 
     // No transaction: the pre-PMS-777 path wrapped three of its reads in
