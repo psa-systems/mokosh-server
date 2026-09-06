@@ -12,8 +12,13 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::KbService;
-use crate::modules::auth::{RequireKnowledgeBase, RequireManager, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireCallerContext, RequireKnowledgeBase, RequireManager, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
+use crate::modules::settings::SettingsService;
+use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
@@ -78,30 +83,64 @@ pub fn kb_routes(service: KbService) -> Router {
             "/kb/articles/{id}/measured-duration",
             get(article_measured_duration),
         )
-        // The portal-visible feed lives on the portal tree at
-        // `GET /api/v1/portal/kb`, behind `PortalAuthMiddleware` /
-        // `RequirePortalAuth` and scoped to the authenticated contact's
-        // tenant + company (`KbService::list_portal_articles_for_company`).
-        // It is intentionally NOT mounted here: this agent tree carries
-        // only `RequireKnowledgeBase` (agent) auth, so a route named
-        // "portal" here would either be unreachable by portal tokens or,
-        // worse, expose the portal feed under agent auth that trusts the
-        // caller's own tenant rather than the portal contact's. See
-        // `modules/portal/routes.rs::list_kb`.
+        // PMS-1082: the three reads above (`GET /kb/categories`,
+        // `GET /kb/articles`, `GET /kb/articles/{id}`) are dual-plane
+        // (`RequireCallerContext`): a contact holding `kb:read` gets the
+        // published, Company-visible slice through them, which is what
+        // the SPA's Knowledge Base nav calls. Everything else on this
+        // tree stays behind `RequireKnowledgeBase`, which a contact
+        // bearer never satisfies.
         .with_state(state)
 }
 
 async fn list_categories(
     State(s): State<KbRouterState>,
-    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbCategoryResponse>>> {
-    let (items, total) = s.service.list_categories(u.tenant(), &pagination).await?;
+    // PMS-1082: a contact with `kb:read` sees the non-internal
+    // categories; staff keep the module gate they had.
+    let tenant = caller.tenant();
+    let (items, total) = match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_kb_enabled(auth, &settings).await?;
+            s.service.list_categories(tenant, &pagination).await?
+        }
+        CallerContext::Contact(_) => {
+            caller.require_capability(caps::KB_READ, &db).await?;
+            s.service
+                .list_categories_for_contact(tenant, &pagination)
+                .await?
+        }
+    };
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
         total,
     )))
+}
+
+/// PMS-1082: the staff arm of a dual-plane KB read keeps exactly the
+/// surface `RequireKnowledgeBase` gave it: an authenticated staff
+/// user AND the tenant's `knowledge_base` module on, else the same
+/// 404 the extractor answers. The contact arm deliberately does not
+/// consult the module flag: `kb:read` on the contact's role is the
+/// authorization signal there (the PMS-935 rule), and the flag is
+/// the MSP's staff-side toggle.
+async fn assert_staff_kb_enabled(
+    auth: &crate::modules::auth::AuthState,
+    settings: &SettingsService,
+) -> AppResult<()> {
+    let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
+    if !settings
+        .is_module_enabled(user.tenant(), "knowledge_base")
+        .await?
+    {
+        return Err(AppError::NotFound("Knowledge base module".to_string()));
+    }
+    Ok(())
 }
 
 async fn create_category(
@@ -139,17 +178,44 @@ async fn delete_category(
 
 async fn list_articles(
     State(s): State<KbRouterState>,
-    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Query(f): Query<KbArticleFilter>,
     Query(pagination): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<KbArticleResponse>>> {
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     f.validate()?;
-    let (items, total) = s.service.list_articles(u.tenant(), &f, &pagination).await?;
-    Ok(Json(PaginatedResponse::from_params(
-        items,
-        &pagination,
-        total,
-    )))
+    // PMS-1082: dual-plane. The contact arm requires `kb:read`
+    // (DB-loaded per request, the JWT `caps` claim is UI-only) and is
+    // scoped by the session's Company to the published, visible slice;
+    // its `status` and `visibility` params are ignored by the service.
+    // PMS-1061: it answers with `ContactKbArticleResponse`, never the
+    // staff type.
+    let tenant = caller.tenant();
+    Ok(match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_kb_enabled(auth, &settings).await?;
+            let (items, total) = s.service.list_articles(tenant, &f, &pagination).await?;
+            Json(PaginatedResponse::from_params(items, &pagination, total)).into_response()
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::KB_READ, &db).await?;
+            let (items, total) = s
+                .service
+                .list_articles_for_contact(tenant, session.company_id, &f, &pagination)
+                .await?;
+            Json(PaginatedResponse::from_params(
+                items
+                    .into_iter()
+                    .map(ContactKbArticleResponse::from)
+                    .collect::<Vec<_>>(),
+                &pagination,
+                total,
+            ))
+            .into_response()
+        }
+    })
 }
 
 async fn create_article(
@@ -169,10 +235,32 @@ async fn create_article(
 
 async fn get_article(
     State(s): State<KbRouterState>,
-    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<KbArticleResponse>> {
-    Ok(Json(s.service.get_article(u.tenant(), id).await?))
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    // PMS-1082: a contact reads through `get_portal_article`, whose
+    // WHERE clause carries the visibility rule, so an internal
+    // article, a draft and another Company's `client_specific`
+    // article all 404 exactly as an unknown id does, and the staff
+    // `view_count` is not bumped by a customer's read.
+    let tenant = caller.tenant();
+    Ok(match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_kb_enabled(auth, &settings).await?;
+            Json(s.service.get_article(tenant, id).await?).into_response()
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::KB_READ, &db).await?;
+            let article = s
+                .service
+                .get_portal_article(tenant, session.company_id, id)
+                .await?;
+            Json(ContactKbArticleResponse::from(article)).into_response()
+        }
+    })
 }
 
 async fn update_article(
