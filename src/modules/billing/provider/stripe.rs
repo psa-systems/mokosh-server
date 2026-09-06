@@ -33,8 +33,7 @@ use crate::utils::error::{AppError, AppResult};
 /// Stripe REST API base. Overridable via `STRIPE_API_BASE` so an integration
 /// test can point the checkout call at a stub; defaults to the live host.
 fn api_base() -> String {
-    std::env::var("STRIPE_API_BASE")
-        .ok()
+    crate::config::get(&crate::config::registry::STRIPE_API_BASE)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "https://api.stripe.com".to_string())
 }

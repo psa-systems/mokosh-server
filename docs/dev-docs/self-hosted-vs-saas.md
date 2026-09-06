@@ -59,8 +59,8 @@ the guess would present as a deployment that no longer boots. Moving those rows
 needs the deployed values read first, which is PMS-1018.
 
 **The profile supplies defaults and locks nothing.** Explicit configuration
-wins for its own kind - `SECRET_BACKEND`, `STORAGE_BACKEND`, `SMTP_HOST`,
-`OIDC_ISSUER` - and every provider stays available at runtime in both modes, so
+wins for its own kind - `CONFIG_BACKEND`, `SECRET_BACKEND`, `STORAGE_BACKEND`,
+`SMTP_HOST`, `OIDC_ISSUER` - and every provider stays available at runtime in both modes, so
 an operator can enable a second one during a migration.
 
 Each kind's resolution records **who decided it**, profile or explicit

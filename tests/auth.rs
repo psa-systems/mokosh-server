@@ -900,6 +900,268 @@ async fn legacy_plaintext_mfa_secret_logs_in_and_upgrades(pool: PgPool) {
 }
 
 // ============================================================================
+// PMS-1055: mfa_secret is ciphertext on BOTH planes and no trigger carries it
+// ============================================================================
+
+/// Read `identities.mfa_secret` for the identity the seeded admin's users row
+/// created (the mirror's INSERT branch reuses the users id as the identity id).
+async fn stored_identity_mfa_secret(pool: &PgPool, identity_id: Uuid) -> String {
+    sqlx::query_scalar::<_, Option<String>>("SELECT mfa_secret FROM identities WHERE id = $1")
+        .bind(identity_id)
+        .fetch_one(pool)
+        .await
+        .expect("read identities.mfa_secret")
+        .expect("identities.mfa_secret is set")
+}
+
+/// Write one plane's `mfa_secret` WITHOUT the users <-> identities mirror
+/// running, so a test can construct a two-plane state directly instead of
+/// through the very triggers it is about to assert on. `app.skip_users_identity_mirror`
+/// is the MAPPS-548 opt-out and is transaction-scoped (`set_config(.., true)`).
+async fn set_mfa_secret_unmirrored(pool: &PgPool, table: &str, id: Uuid, value: &str) {
+    let mut tx = pool.begin().await.expect("begin unmirrored write");
+    sqlx::query("SELECT set_config('app.skip_users_identity_mirror', 'on', true)")
+        .execute(&mut *tx)
+        .await
+        .expect("suppress the mirror for this transaction");
+    sqlx::query(&format!(
+        "UPDATE {table} SET mfa_secret = $1, updated_at = NOW() WHERE id = $2"
+    ))
+    .bind(value)
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .expect("write mfa_secret unmirrored");
+    tx.commit().await.expect("commit unmirrored write");
+}
+
+/// PMS-1055: neither mirror direction carries `mfa_secret`, so an update that
+/// has nothing to do with the secret cannot rewrite it on the other plane.
+///
+/// Both directions are pinned because both could do the damage. The reverse
+/// one is the realistic case: `record_identity_mfa_success` stamps
+/// `identities.mfa_last_totp_step` on every successful identity-plane
+/// verification, and while that trigger carried `mfa_secret` the stamp copied
+/// the identity's value over the users row - turning a sealed secret back into
+/// a plaintext one with no error and nothing in a log. The forward direction is
+/// the same defect with the planes swapped (a users row still legacy after a
+/// per-tenant login, any unrelated `users` write, a sealed identity).
+#[sqlx::test]
+async fn neither_mirror_direction_can_rewrite_an_mfa_secret(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let setup: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/setup"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send mfa setup")
+        .json()
+        .await
+        .expect("mfa setup JSON");
+    let secret_b32 = setup["secret"].as_str().expect("secret").to_string();
+    let sealed = stored_mfa_secret(&app.pool, uid).await;
+    assert_eq!(
+        stored_identity_mfa_secret(&app.pool, uid).await,
+        sealed,
+        "enrolment seals the same value onto both planes"
+    );
+
+    // Reverse direction. Put the identity plane back to the pre-PMS-871
+    // plaintext (the state of a row enrolled before the encryption), then make
+    // the unrelated write the login path really makes.
+    set_mfa_secret_unmirrored(&app.pool, "identities", uid, &secret_b32).await;
+    assert_eq!(
+        stored_mfa_secret(&app.pool, uid).await,
+        sealed,
+        "precondition: the users plane is still sealed"
+    );
+    sqlx::query(
+        "UPDATE identities SET mfa_last_totp_step = 424242, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(uid)
+    .execute(&app.pool)
+    .await
+    .expect("stamp the identity-plane TOTP watermark");
+    let after_watermark = stored_mfa_secret(&app.pool, uid).await;
+    assert_eq!(
+        after_watermark, sealed,
+        "stamping the identity watermark must not rewrite the users-plane secret"
+    );
+    assert_eq!(
+        mokosh_server::utils::crypto::decrypt(&after_watermark, &TEST_ENCRYPTION_KEY)
+            .expect("the users-plane secret is still ciphertext"),
+        secret_b32,
+        "and it still decrypts to the enrolled secret"
+    );
+
+    // Forward direction, planes swapped: a users row still holding the legacy
+    // plaintext must not fan it over the sealed identity plane.
+    set_mfa_secret_unmirrored(&app.pool, "identities", uid, &sealed).await;
+    set_mfa_secret_unmirrored(&app.pool, "users", uid, &secret_b32).await;
+    sqlx::query("UPDATE users SET phone = '555-0100', updated_at = NOW() WHERE id = $1")
+        .bind(uid)
+        .execute(&app.pool)
+        .await
+        .expect("make an unrelated users-plane write");
+    let identity_after = stored_identity_mfa_secret(&app.pool, uid).await;
+    assert_eq!(
+        identity_after, sealed,
+        "an unrelated users write must not rewrite the identity-plane secret"
+    );
+    assert_eq!(
+        mokosh_server::utils::crypto::decrypt(&identity_after, &TEST_ENCRYPTION_KEY)
+            .expect("the identity-plane secret is still ciphertext"),
+        secret_b32,
+        "and it still decrypts to the enrolled secret"
+    );
+}
+
+/// PMS-1055: a user who enrolled AFTER PMS-871 can still complete an
+/// identity-first login (no tenant hint in the body), over HTTP.
+///
+/// This is the path that was a hard 500: `authenticate_identity_first` handed
+/// `identities.mfa_secret` - ciphertext, since the enrolment seals it - straight
+/// to `base32_decode`, which accepts only `A-Z2-7` and rejected the `0`, `1`,
+/// `8`, `9`, `+` and `/` base64 routinely carries.
+#[sqlx::test]
+async fn identity_first_login_verifies_the_sealed_identity_secret(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let secret = enroll_and_enable_mfa(&app, &token).await;
+    let secret_b32 = mokosh_server::utils::totp::base32_encode(&secret);
+
+    let stored = stored_identity_mfa_secret(&app.pool, uid).await;
+    assert_eq!(
+        mokosh_server::utils::crypto::decrypt(&stored, &TEST_ENCRYPTION_KEY)
+            .expect("the identity plane holds AES-256-GCM ciphertext"),
+        secret_b32,
+        "the identity plane stores the same sealed secret the users plane does"
+    );
+
+    // No `tenant_id` and no `tenant_slug`: the router drops into
+    // `authenticate_identity_first`, which reads the identity plane.
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let login = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "mfa_code": code_now,
+        }))
+        .send()
+        .await
+        .expect("send identity-first login with mfa_code");
+    let status = login.status();
+    let body = login.text().await.expect("identity-first login body");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "identity-first login must verify against the sealed secret; body: {body}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body).expect("identity-first login JSON");
+    assert!(
+        !body["access_token"].as_str().unwrap_or("").is_empty(),
+        "the single membership auto-scopes, so tokens are issued"
+    );
+}
+
+/// PMS-1055: one human with a seat in two tenants holds ONE TOTP secret, and
+/// every `users` row at their email carries it.
+///
+/// `enable_mfa` flips `mfa_enabled` on the identity row, and THAT still mirrors
+/// onto every users row at the email (only `mfa_secret` left the mirror in
+/// migration 195). So a users row that did not receive the secret is a row with
+/// `mfa_enabled` true and nothing to verify against, and the tenant-hinted
+/// login branch answers `AppError::Internal("MFA enabled without secret")` - a
+/// 500 in the second tenant caused by enrolling in the first. `write_mfa_secret`
+/// is what closes that: it writes both planes by email, not the caller's row.
+#[sqlx::test]
+async fn enrolling_in_one_tenant_arms_the_same_secret_in_the_other(pool: PgPool) {
+    let (_uid, email, password) = common::seed_admin(&pool).await;
+
+    // A second seat for the same human: their own tenant, their own users row,
+    // their own password hash (MAPPS-551 keeps passwords per tenant).
+    let tenant_b_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) \
+         VALUES ($1, 'Tenant B', 'tenant-b', 'active', 'org')",
+    )
+    .bind(tenant_b_id)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b");
+    let tenant_b_user_id = Uuid::new_v4();
+    let password_hash =
+        mokosh_server::utils::crypto::hash_password(&password).expect("hash tenant-b password");
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'Test', 'Admin', 'admin', 'active', NOW())",
+    )
+    .bind(tenant_b_user_id)
+    .bind(tenant_b_id)
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b seat");
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let secret = enroll_and_enable_mfa(&app, &token).await;
+    let secret_b32 = mokosh_server::utils::totp::base32_encode(&secret);
+
+    let (b_enabled, b_secret): (bool, Option<String>) =
+        sqlx::query_as("SELECT mfa_enabled, mfa_secret FROM users WHERE id = $1")
+            .bind(tenant_b_user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read the tenant-b seat");
+    assert!(
+        b_enabled,
+        "the identity plane is the source of truth for mfa_enabled, and it still mirrors"
+    );
+    assert_eq!(
+        mokosh_server::utils::crypto::decrypt(
+            b_secret
+                .as_deref()
+                .expect("the tenant-b seat holds the secret"),
+            &TEST_ENCRYPTION_KEY
+        )
+        .expect("sealed on the tenant-b seat too"),
+        secret_b32,
+        "the same sealed secret reached the other tenant's users row"
+    );
+
+    // The half that matters to the human: the second factor works in tenant B.
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let login = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_id": tenant_b_id,
+            "mfa_code": code_now,
+        }))
+        .send()
+        .await
+        .expect("send tenant-b login");
+    let status = login.status();
+    let body = login.text().await.expect("tenant-b login body");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "MFA enrolled in one tenant must verify in the other; body: {body}"
+    );
+}
+
+// ============================================================================
 // PMS-502: second-factor anti-replay + per-account attempt lockout
 // ============================================================================
 
@@ -1104,6 +1366,16 @@ async fn seed_mfa_enabled(pool: &PgPool, user_id: Uuid) -> Vec<u8> {
         .execute(pool)
         .await
         .expect("enable MFA on the seeded user");
+    // PMS-1055: the identity plane holds the secret too, and since migration
+    // 195 no trigger carries it there. A pre-PMS-871 enrolment left the same
+    // plaintext on both planes (the mirror copied it), so seeding both is what
+    // reproduces that state now that the fixture has to write it itself.
+    sqlx::query("UPDATE identities SET mfa_enabled = TRUE, mfa_secret = $1 WHERE id = $2")
+        .bind(&secret_b32)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("enable MFA on the seeded user's identity");
     secret.to_vec()
 }
 
@@ -2670,13 +2942,31 @@ async fn mfa_enable_writes_to_identity_plane(pool: PgPool) {
             .await
             .expect("read identity mfa");
     assert!(id_enabled, "identity.mfa_enabled TRUE");
-    assert_eq!(
+    // PMS-1055: this assertion used to read `id_secret == secret_b32`, i.e.
+    // that the identity plane holds the RAW base32 secret. That was written
+    // before PMS-871 encrypted the column and the two met, and it is now the
+    // wrong property: it would only hold on a plane that stores a TOTP secret
+    // in the clear. The property it encodes instead is the one MAPPS-501
+    // actually argued for - the identity plane carries the secret enrolment
+    // issued - stated in the representation PMS-871 settled on: AES-256-GCM
+    // under `ENCRYPTION_KEY`, the same on both planes.
+    assert_ne!(
         id_secret.as_deref(),
         Some(secret_b32.as_str()),
-        "identity.mfa_secret matches setup"
+        "identity.mfa_secret must not be the base32 secret in the clear"
+    );
+    assert_eq!(
+        mokosh_server::utils::crypto::decrypt(
+            id_secret.as_deref().expect("identity.mfa_secret is set"),
+            &TEST_ENCRYPTION_KEY
+        )
+        .expect("identity.mfa_secret is AES-256-GCM ciphertext"),
+        secret_b32,
+        "identity.mfa_secret decrypts to the secret setup returned"
     );
 
-    // Users row mirrors via MAPPS-498.
+    // Users row holds the same sealed value: one seal, written to both planes
+    // by `start_mfa_enrollment` (PMS-1055), no longer by the MAPPS-498 mirror.
     let (u_enabled, u_secret): (bool, Option<String>) =
         sqlx::query_as("SELECT mfa_enabled, mfa_secret FROM users WHERE id = $1")
             .bind(admin_id)
@@ -2756,6 +3046,16 @@ async fn mfa_disable_clears_identity_plane(pool: PgPool) {
             .await
             .expect("read hashes");
     assert!(hashes.is_empty(), "recovery hashes cleared on users");
+
+    // PMS-1055: `disable_mfa` clears the users-plane secret itself. The mirror
+    // stopped carrying `mfa_secret` in migration 195, so a disable that leaned
+    // on the trigger would leave a usable TOTP secret at rest on `users`.
+    let u_secret: Option<String> = sqlx::query_scalar("SELECT mfa_secret FROM users WHERE id = $1")
+        .bind(admin_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("read users mfa_secret");
+    assert!(u_secret.is_none(), "users.mfa_secret NULL");
 }
 
 /// MAPPS-499 (MAPPS-496 stage 2a): change_password writes the new

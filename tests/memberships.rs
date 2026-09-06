@@ -65,6 +65,21 @@ async fn insert_tenant(pool: &PgPool, name: &str, slug: &str) -> Uuid {
     id
 }
 
+/// Insert the `user_sessions` row a hand-minted access token names in its
+/// `sid`, mirroring the columns `AuthService::login` writes.
+async fn insert_session_row(pool: &PgPool, session_id: Uuid, tenant_id: Uuid, user_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO user_sessions (id, tenant_id, user_id, token_hash, expires_at) \
+         VALUES ($1, $2, $3, 'legacy-token-test-hash', NOW() + INTERVAL '1 hour')",
+    )
+    .bind(session_id)
+    .bind(tenant_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("insert user_sessions row");
+}
+
 async fn insert_user_row(pool: &PgPool, tenant_id: Uuid, email: &str, role: &str) -> Uuid {
     let id = Uuid::new_v4();
     let password_hash = mokosh_server::utils::crypto::hash_password("test-password-12345")
@@ -167,14 +182,33 @@ async fn legacy_token_without_mid_still_authorizes_and_resolves_membership(pool:
     // pass fills the active membership via (email, tenant_id) lookup.
     let (admin_id, email, _password) = common::seed_admin(&pool).await;
 
-    // Need a real session row: `ensure_user_and_tenant_active` accepts
-    // any decoded access token whose sub + tid resolve, but the enrich
-    // pass needs the identity/membership rows populated (phase-1
-    // migration handles that).
     let app = common::boot(pool).await;
     let session_id = Uuid::new_v4();
     let legacy_token =
         mint_legacy_access_token(admin_id, common::DEFAULT_TENANT_ID, &email, session_id);
+
+    // MAPPS-531: `ensure_user_and_tenant_active` refuses an access token whose
+    // `sid` names no live `user_sessions` row, which is what makes a legacy
+    // sign-out revoke the access token and not only the refresh. The legacy
+    // claim shape is no exception, so assert that first: with no session row
+    // the token is refused 403 even though sub + tid resolve.
+    let refused = app
+        .client
+        .get(app.url("/api/v1/auth/memberships"))
+        .bearer_auth(&legacy_token)
+        .send()
+        .await
+        .expect("send /memberships with no session row");
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "legacy token naming no session row must be refused"
+    );
+
+    // Seed the row the token names. MAPPS-531 requires it; the enrich pass
+    // then fills the active membership from (email, tenant_id) because the
+    // token carries no `mid` claim.
+    insert_session_row(&app.pool, session_id, common::DEFAULT_TENANT_ID, admin_id).await;
 
     let resp = app
         .client

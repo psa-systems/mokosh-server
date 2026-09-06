@@ -145,9 +145,9 @@ impl std::fmt::Display for PortalDevSeedReport {
 
 /// Refuse to run outside dev/test.
 fn require_dev_environment() -> anyhow::Result<()> {
-    let env = std::env::var("ENVIRONMENT")
+    let env = crate::config::get(&crate::config::registry::ENVIRONMENT)
         .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_else(|_| "development".to_string());
+        .unwrap_or_else(|| "development".to_string());
     match env.as_str() {
         "development" | "dev" | "test" => Ok(()),
         other => Err(anyhow!(

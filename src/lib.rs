@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod cli;
+pub mod config;
 pub mod db;
 pub mod infisical;
 pub mod modules;

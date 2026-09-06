@@ -59,11 +59,11 @@ use super::data::{demo_companies, demo_contacts, demo_projects, demo_sla, demo_t
 fn demo_seed_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let environment =
-            std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
+        let environment = crate::config::get(&crate::config::registry::ENVIRONMENT)
+            .unwrap_or_else(|| "development".to_string());
         seed_enabled_for(
             &environment,
-            std::env::var("MOKOSH_DEMO_SEED").ok().as_deref(),
+            crate::config::get(&crate::config::registry::MOKOSH_DEMO_SEED).as_deref(),
         )
     })
 }
@@ -93,8 +93,7 @@ fn seed_enabled_for(environment: &str, override_flag: Option<&str>) -> bool {
 /// Returns `None` when the env var is unset (single-tenant / test / legacy
 /// deployments), in which case there is no shared tenant to exclude.
 fn shared_landing_tenant() -> Option<Uuid> {
-    std::env::var("OIDC_DEFAULT_TENANT_ID")
-        .ok()
+    crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID)
         .and_then(|s| Uuid::parse_str(s.trim()).ok())
 }
 

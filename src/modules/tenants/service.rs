@@ -30,7 +30,9 @@ use super::models::*;
 /// `compose.dev.yml` enumerates the environment, so a forwarded-but-unset key
 /// arrives as `""`; without this it would fail tenant provisioning outright.
 fn seed_source_tenant_id() -> AppResult<Uuid> {
-    parse_seed_source_tenant_id(std::env::var("MOKOSH_SEED_TENANT_ID").ok().as_deref())
+    parse_seed_source_tenant_id(
+        crate::config::get(&crate::config::registry::MOKOSH_SEED_TENANT_ID).as_deref(),
+    )
 }
 
 /// The pure parse, split out so it is unit-testable without process env

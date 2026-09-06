@@ -1013,8 +1013,7 @@ fn infisical_probe() -> Option<&'static InfisicalProbe> {
         .get_or_init(|| {
             // GOV-50: the Infisical instance URL is read from the canonical
             // INFISICAL_ADDRESS only.
-            let raw = std::env::var("INFISICAL_ADDRESS")
-                .ok()
+            let raw = crate::config::get(&crate::config::registry::INFISICAL_ADDRESS)
                 .filter(|v| !v.trim().is_empty());
             build_infisical_probe(raw)
         })
