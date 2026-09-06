@@ -469,45 +469,117 @@ impl NotificationsService {
         user_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<NotificationInboxItemResponse>, u64)> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let total: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM notifications
-               WHERE tenant_id = $1 AND user_id = $2 AND channel_type = 'in_app'"#,
-        )
-        .bind(tenant_id)
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        self.list_inbox_for(tenant_id, InboxOwner::User(user_id), pagination)
+            .await
+    }
 
-        let rows = sqlx::query_as::<_, InboxRow>(
-            r#"SELECT id, channel_type, subject, body, status, sent_at, read_at, created_at
-               FROM notifications
-               WHERE tenant_id = $1 AND user_id = $2 AND channel_type = 'in_app'
-               ORDER BY created_at DESC
-               LIMIT $3 OFFSET $4"#,
-        )
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(&mut *tx)
-        .await?;
+    /// PMS-1083: the contact arm of `GET /notifications`, the rows the
+    /// dispatcher wrote against `notifications.contact_id`.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn list_inbox_for_contact(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<NotificationInboxItemResponse>, u64)> {
+        self.list_inbox_for(tenant_id, InboxOwner::Contact(contact_id), pagination)
+            .await
+    }
+
+    async fn list_inbox_for(
+        &self,
+        tenant_id: TenantId,
+        owner: InboxOwner,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<NotificationInboxItemResponse>, u64)> {
+        // Two statements per owner kind rather than one with a CASE, so
+        // each stays on its own partial index (migrations 013 and 142).
+        let (count_sql, list_sql, owner_id) = match owner {
+            InboxOwner::User(id) => (
+                r#"SELECT COUNT(*) FROM notifications
+                   WHERE tenant_id = $1 AND user_id = $2 AND channel_type = 'in_app'"#,
+                r#"SELECT id, channel_type, subject, body, status, sent_at, read_at, created_at,
+                          entity_type, entity_id
+                   FROM notifications
+                   WHERE tenant_id = $1 AND user_id = $2 AND channel_type = 'in_app'
+                   ORDER BY created_at DESC
+                   LIMIT $3 OFFSET $4"#,
+                id,
+            ),
+            InboxOwner::Contact(id) => (
+                r#"SELECT COUNT(*) FROM notifications
+                   WHERE tenant_id = $1 AND contact_id = $2 AND channel_type = 'in_app'"#,
+                r#"SELECT id, channel_type, subject, body, status, sent_at, read_at, created_at,
+                          entity_type, entity_id
+                   FROM notifications
+                   WHERE tenant_id = $1 AND contact_id = $2 AND channel_type = 'in_app'
+                   ORDER BY created_at DESC
+                   LIMIT $3 OFFSET $4"#,
+                id,
+            ),
+        };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let total: i64 = sqlx::query_scalar(count_sql)
+            .bind(tenant_id)
+            .bind(owner_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = sqlx::query_as::<_, InboxRow>(list_sql)
+            .bind(tenant_id)
+            .bind(owner_id)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn mark_read(&self, tenant_id: TenantId, user_id: Uuid, id: Uuid) -> AppResult<()> {
+        self.mark_read_for(tenant_id, InboxOwner::User(user_id), id)
+            .await
+    }
+
+    /// PMS-1083: the contact arm of `POST /notifications/{id}/read`. A
+    /// row that is not the contact's own is a 404, never a 403, so the
+    /// route confirms nothing about another inbox.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, contact_id = %contact_id))]
+    pub async fn mark_read_for_contact(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        id: Uuid,
+    ) -> AppResult<()> {
+        self.mark_read_for(tenant_id, InboxOwner::Contact(contact_id), id)
+            .await
+    }
+
+    async fn mark_read_for(
+        &self,
+        tenant_id: TenantId,
+        owner: InboxOwner,
+        id: Uuid,
+    ) -> AppResult<()> {
+        let (sql, owner_id) = match owner {
+            InboxOwner::User(id) => (
+                r#"UPDATE notifications SET read_at = NOW()
+                   WHERE tenant_id = $1 AND user_id = $2 AND id = $3"#,
+                id,
+            ),
+            InboxOwner::Contact(id) => (
+                r#"UPDATE notifications SET read_at = NOW()
+                   WHERE tenant_id = $1 AND contact_id = $2 AND id = $3"#,
+                id,
+            ),
+        };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let n = sqlx::query(
-            r#"UPDATE notifications SET read_at = NOW()
-               WHERE tenant_id = $1 AND user_id = $2 AND id = $3"#,
-        )
-        .bind(tenant_id)
-        .bind(user_id)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let n = sqlx::query(sql)
+            .bind(tenant_id)
+            .bind(owner_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         if n == 0 {
             return Err(AppError::NotFound("Notification".to_string()));
         }
@@ -841,8 +913,9 @@ impl NotificationsService {
             if !message.user_ids.is_empty() {
                 fanout += sqlx::query(
                     r#"INSERT INTO notifications
-                       (tenant_id, user_id, channel_type, template_id, subject, body, body_html, status)
-                       SELECT $1, u, $2, $3, $4, $5, $6, 'pending'
+                       (tenant_id, user_id, channel_type, template_id, subject, body, body_html,
+                        status, entity_type, entity_id)
+                       SELECT $1, u, $2, $3, $4, $5, $6, 'pending', $8, $9
                        FROM UNNEST($7::uuid[]) AS u"#,
                 )
                 .bind(tenant_id)
@@ -852,6 +925,8 @@ impl NotificationsService {
                 .bind(&message.body_text)
                 .bind(&message.body_html)
                 .bind(&message.user_ids)
+                .bind(&message.entity_type)
+                .bind(message.entity_id)
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
@@ -859,8 +934,9 @@ impl NotificationsService {
             if !message.emails.is_empty() {
                 fanout += sqlx::query(
                     r#"INSERT INTO notifications
-                       (tenant_id, channel_type, template_id, recipient, subject, body, body_html, status)
-                       SELECT $1, $2, $3, r, $4, $5, $6, 'pending'
+                       (tenant_id, channel_type, template_id, recipient, subject, body, body_html,
+                        status, entity_type, entity_id)
+                       SELECT $1, $2, $3, r, $4, $5, $6, 'pending', $8, $9
                        FROM UNNEST($7::text[]) AS r"#,
                 )
                 .bind(tenant_id)
@@ -870,6 +946,32 @@ impl NotificationsService {
                 .bind(&message.body_text)
                 .bind(&message.body_html)
                 .bind(&message.emails)
+                .bind(&message.entity_type)
+                .bind(message.entity_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            }
+            // PMS-1083: the contact's inbox row, against `contact_id`
+            // (migration 142). `contact_ids` is empty off the `in_app`
+            // channel by construction.
+            if !message.contact_ids.is_empty() {
+                fanout += sqlx::query(
+                    r#"INSERT INTO notifications
+                       (tenant_id, contact_id, channel_type, template_id, subject, body, body_html,
+                        status, entity_type, entity_id)
+                       SELECT $1, c, $2, $3, $4, $5, $6, 'pending', $8, $9
+                       FROM UNNEST($7::uuid[]) AS c"#,
+                )
+                .bind(tenant_id)
+                .bind(&message.channel)
+                .bind(message.template_id)
+                .bind(&message.subject)
+                .bind(&message.body_text)
+                .bind(&message.body_html)
+                .bind(&message.contact_ids)
+                .bind(&message.entity_type)
+                .bind(message.entity_id)
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
@@ -1008,15 +1110,15 @@ impl NotificationsService {
         // a click-through link straight to the entity's detail page.
         // Absent / malformed values simply skip the columns and leave
         // NULL (matches the auth.* / system-event case, where there
-        // is no single entity to deep-link).
-        // MAPPS-656: dead until the contact-plane fanout is re-threaded through RenderedNotification
-        let _ctx_entity_type: Option<String> = context
+        // is no single entity to deep-link). Stamped on every row of
+        // every recipient kind since PMS-1083 (MAPPS-656 recorded the
+        // pair as parsed and never written).
+        let ctx_entity_type: Option<String> = context
             .get("entity_type")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty() && s.chars().count() <= 50);
-        // MAPPS-656: dead until the contact-plane fanout is re-threaded through RenderedNotification
-        let _ctx_entity_id: Option<Uuid> = context
+        let ctx_entity_id: Option<Uuid> = context
             .get("entity_id")
             .and_then(|v| v.as_str())
             .and_then(|s| Uuid::parse_str(s).ok());
@@ -1131,10 +1233,9 @@ impl NotificationsService {
             // Portal notification-preferences: same shape as user prefs
             // but keyed on contact_id (see contact_notification_preferences,
             // migration 120). A contact who opted out sees no fanout on
-            // in_app or email for this event.
-            // MAPPS-656: dead until the contact-plane fanout is re-threaded through RenderedNotification
-            let _contact_prefs = self
-                .load_contact_preferences(tenant_id, &contact_ids, event_type)
+            // in_app for this event (PMS-1083).
+            let contact_prefs = self
+                .load_contact_preferences(&mut *conn, tenant_id, &contact_ids, event_type)
                 .await?;
 
             // PMS-782: rendered once per rule, not once per channel. The
@@ -1190,6 +1291,20 @@ impl NotificationsService {
                     } else {
                         emails.clone()
                     },
+                    // PMS-1083: a contact is an inbox recipient only. On
+                    // any other channel the row would need an address the
+                    // dispatcher does not resolve for a contact.
+                    contact_ids: if channel == "in_app" {
+                        contact_ids
+                            .iter()
+                            .copied()
+                            .filter(|cid| accepts_channel(contact_prefs.get(cid), channel))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    entity_type: ctx_entity_type.clone(),
+                    entity_id: ctx_entity_id,
                     subject: subject.clone(),
                     body_text: body.clone(),
                     body_html: body_html.clone(),
@@ -1228,6 +1343,7 @@ impl NotificationsService {
     /// contact with no row is absent from the map (accept-all).
     async fn load_contact_preferences(
         &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         contact_ids: &[Uuid],
         event_type: &str,
@@ -1235,7 +1351,9 @@ impl NotificationsService {
         if contact_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // On the dispatch's own connection, so a contact recipient does
+        // not open a second transaction beside the one the fanout is in
+        // (the PMS-782 budget: one BEGIN per dispatch).
         let rows: Vec<(Uuid, Option<bool>, Vec<String>)> = sqlx::query_as(
             r#"SELECT contact_id, is_enabled, channel_types
                FROM contact_notification_preferences
@@ -1244,7 +1362,7 @@ impl NotificationsService {
         .bind(tenant_id)
         .bind(contact_ids)
         .bind(event_type)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?;
         Ok(rows
             .into_iter()
@@ -1294,8 +1412,20 @@ struct RenderedNotification {
     /// notification preferences for this (event_type, channel).
     user_ids: Vec<Uuid>,
     /// Standalone addresses with no `users` row. Always empty on the
-    /// `in_app` channel, which needs a user to show the row to.
+    /// `in_app` channel, which needs a user or a contact to show the
+    /// row to.
     emails: Vec<String>,
+    /// PMS-1083: recipients with a `contacts` row, already filtered by
+    /// their `contact_notification_preferences` for this (event_type,
+    /// channel). Written against `notifications.contact_id` on the
+    /// `in_app` channel only: a contact's inbox is what the contact
+    /// plane reads, and a contact's email goes through the existing
+    /// `recipient_email` path where the caller chose to send one.
+    contact_ids: Vec<Uuid>,
+    /// Per-entity deep link stamped on every row this message queues
+    /// (`context.entity_type` / `context.entity_id`, migration 150).
+    entity_type: Option<String>,
+    entity_id: Option<Uuid>,
     subject: Option<String>,
     body_text: String,
     body_html: Option<String>,
@@ -1588,6 +1718,8 @@ struct InboxRow {
     sent_at: Option<chrono::DateTime<chrono::Utc>>,
     read_at: Option<chrono::DateTime<chrono::Utc>>,
     created_at: chrono::DateTime<chrono::Utc>,
+    entity_type: Option<String>,
+    entity_id: Option<Uuid>,
 }
 
 impl From<InboxRow> for NotificationInboxItemResponse {
@@ -1601,8 +1733,19 @@ impl From<InboxRow> for NotificationInboxItemResponse {
             sent_at: r.sent_at,
             read_at: r.read_at,
             created_at: r.created_at,
+            entity_type: r.entity_type,
+            entity_id: r.entity_id,
         }
     }
+}
+
+/// PMS-1083: whose inbox a read addresses. A staff user's rows hang
+/// off `notifications.user_id`, a contact's off `contact_id`
+/// (migration 142); the two never share a row.
+#[derive(Debug, Clone, Copy)]
+enum InboxOwner {
+    User(Uuid),
+    Contact(Uuid),
 }
 
 #[derive(sqlx::FromRow)]
