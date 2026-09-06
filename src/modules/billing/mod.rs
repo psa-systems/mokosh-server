@@ -44,4 +44,4 @@ pub use provider::{CheckoutParams, CheckoutSession, PaymentEvent, PaymentProvide
 pub use routes::billing_routes;
 pub use service::BillingService;
 pub use webhook::{provider_webhook_handler, ProviderWebhookState};
-pub use worker::RecurringInvoicingWorker;
+pub use worker::{InvoiceReminderWorker, RecurringInvoicingWorker};

@@ -43,6 +43,13 @@ pub fn billing_routes(service: BillingService) -> Router {
             "/invoices/{invoice_id}",
             get(get_invoice).put(update_invoice),
         )
+        // PMS-1036: the bad-debt record. POST rather than a status on PUT
+        // because a sent invoice is frozen to `update_invoice` and this is
+        // a decision with its own reason and audit row, not an edit.
+        .route(
+            "/invoices/{invoice_id}/write-off",
+            axum::routing::post(write_off_invoice),
+        )
         // PMS-911 / PMS-936: the invoice as a client receives it. Rendered
         // from the issuer snapshot frozen when it was sent, so a later rebrand
         // cannot change a document somebody already holds. Contact plane gates
@@ -558,6 +565,25 @@ async fn get_credit_note(
 
 /// Finance-gated, like every other write that moves money: raising a credit
 /// note reduces what a client owes.
+/// PMS-1036: write an invoice off. Finance only, like every other write to
+/// an issued document. 409 names the status when the invoice is not one that
+/// can be written off; the reason is required.
+async fn write_off_invoice(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(invoice_id): Path<Uuid>,
+    Json(request): Json<WriteOffInvoiceRequest>,
+) -> AppResult<Json<InvoiceResponse>> {
+    request.validate()?;
+    let invoice = state
+        .service
+        .write_off_invoice(user.tenant(), invoice_id, user.id, &request, &ctx)
+        .await?;
+    Ok(Json(invoice))
+}
+
 async fn create_credit_note(
     State(state): State<BillingRouterState>,
     RequireBilling { user, .. }: RequireBilling,
@@ -609,6 +635,51 @@ async fn get_statement(
     Ok(Json(statement))
 }
 
+/// PMS-1006: `?template=` on the invoice PDF, for trying a layout on the MSP's
+/// own data before committing the tenant to it.
+#[derive(serde::Deserialize)]
+struct TemplatePreview {
+    template: Option<String>,
+}
+
+impl TemplatePreview {
+    /// The template to preview in, or an error naming why there is none.
+    ///
+    /// Refused on a frozen invoice, and not quietly ignored there: that path
+    /// serves the bytes that were sent (PMS-959), so honouring an override
+    /// would hand back a document that is not the one the customer holds, and
+    /// dropping it silently would answer a different question from the one
+    /// asked. An unknown key is refused for the same reason the branding
+    /// validator refuses one: falling back to Classic would show a layout
+    /// nobody asked for and call it the answer. And it is a staff affordance:
+    /// PMS-936 opened this route to the contact plane, where the reader is the
+    /// customer rather than the MSP choosing a layout, so a contact passing it
+    /// is told so rather than quietly served a document nobody picked.
+    fn resolve(self, frozen: bool, staff: bool) -> AppResult<Option<crate::pdf::Template>> {
+        let Some(key) = self.template else {
+            return Ok(None);
+        };
+        let template = crate::pdf::Template::from_key(key.trim()).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "`template` must be one of {}",
+                crate::pdf::Template::KEYS.join(", ")
+            ))
+        })?;
+        if !staff {
+            return Err(AppError::BadRequest(
+                "`template` is not accepted here: this document is the one issued for you"
+                    .to_string(),
+            ));
+        }
+        if frozen {
+            return Err(AppError::BadRequest(
+                "This invoice has been issued, so its document is the one that was sent and cannot be re-rendered in another template".to_string(),
+            ));
+        }
+        Ok(Some(template))
+    }
+}
+
 /// PMS-911 / PMS-936: dual-plane `GET /invoices/{id}/pdf`.
 ///
 /// Contact plane gates on `invoices:download_pdf` plus a Company-scope check
@@ -621,6 +692,7 @@ async fn get_invoice_pdf(
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Path(invoice_id): Path<Uuid>,
+    Query(preview): Query<TemplatePreview>,
 ) -> AppResult<Response> {
     let tenant = caller.tenant();
     match &caller {
@@ -639,6 +711,10 @@ async fn get_invoice_pdf(
             return Err(AppError::NotFound("Invoice".to_string()));
         }
     }
+    let preview = preview.resolve(
+        invoice.status.is_frozen(),
+        matches!(caller, CallerContext::Staff(_)),
+    )?;
     // PMS-959: the bytes that were sent, when there are any. A live render is
     // the fallback for a draft, which has not been sent and has nothing to
     // preserve, and for an invoice sent before PMS-959, which is how those
@@ -657,7 +733,14 @@ async fn get_invoice_pdf(
     let bytes = match stored {
         Some(stored) => stored,
         None => {
-            let issuer = state.service.invoice_issuer(tenant, invoice_id).await?;
+            let mut issuer = state.service.invoice_issuer(tenant, invoice_id).await?;
+            // PMS-1006: the override, applied to the resolved issuer so the
+            // preview differs from the tenant's stored choice in exactly one
+            // thing. With no parameter this is the tenant's own template, which
+            // is what makes a draft preview the bytes the send will store.
+            if let Some(template) = preview {
+                issuer.template = template;
+            }
             let bill_to = state
                 .service
                 .bill_to(tenant, invoice.company_id, invoice.billing_contact_id)

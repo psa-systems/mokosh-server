@@ -18,8 +18,6 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const PORTAL_PASSWORD: &str = "portal-password-12345";
-
 async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
@@ -32,45 +30,15 @@ async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
     id
 }
 
-async fn seed_portal_contact(pool: &PgPool, company_id: Uuid, email: &str) -> Uuid {
-    let id = Uuid::new_v4();
-    let hash =
-        mokosh_server::utils::crypto::hash_password(PORTAL_PASSWORD).expect("hash portal password");
-    sqlx::query(
-        r#"
-        INSERT INTO contacts (
-            id, tenant_id, company_id, first_name, last_name, email,
-            is_portal_user, portal_password_hash
-        )
-        VALUES ($1, $2, $3, 'Portal', 'Contact', $4, TRUE, $5)
-        "#,
-    )
-    .bind(id)
-    .bind(common::DEFAULT_TENANT_ID)
-    .bind(company_id)
-    .bind(email)
-    .bind(&hash)
-    .execute(pool)
-    .await
-    .expect("seed portal contact");
-    id
-}
-
-async fn portal_token(app: &common::TestApp, email: &str) -> String {
-    let resp = app
-        .client
-        .post(app.url("/api/v1/portal/auth/login"))
-        .json(&serde_json::json!({
-            "tenant_slug": "default",
-            "email": email,
-            "password": PORTAL_PASSWORD,
-        }))
-        .send()
-        .await
-        .expect("send portal login");
-    assert!(resp.status().is_success(), "portal login should 2xx");
-    let body: Value = resp.json().await.expect("portal login JSON");
-    body["access_token"].as_str().expect("token").to_string()
+/// The client's sign-off comes from a contact on the contact plane
+/// (PMS-1025, ported in PMS-1031) holding the Billing Contact role, which
+/// carries `quotes:accept`.
+async fn seed_portal_contact(
+    pool: &PgPool,
+    company_id: Uuid,
+    email: &str,
+) -> common::PortalContact {
+    common::seed_portal_contact(pool, company_id, email, &["Billing Contact"]).await
 }
 
 /// Build a quote and walk it all the way to `accepted` through the real
@@ -89,7 +57,7 @@ async fn accepted_quote(
         .bearer_auth(token)
         .json(&serde_json::json!({
             "company_id": company,
-            "billing_contact_id": contact,
+            "billing_contact_id": contact.id,
             "title": "Provide LLM access to Employees",
             "description": "Set up Private Network, set up a web service with SSL, configure users + LLM software.",
             "lines": [
@@ -125,10 +93,10 @@ async fn accepted_quote(
         .expect("send");
     assert_eq!(sent.status(), StatusCode::OK);
 
-    let portal = portal_token(app, email).await;
+    let portal = common::contact_token(app, &contact).await;
     let accepted = app
         .client
-        .post(app.url(&format!("/api/v1/portal/quotes/{quote_id}/accept")))
+        .post(app.url(&format!("/api/v1/quotes/{quote_id}/accept")))
         .bearer_auth(&portal)
         .send()
         .await
