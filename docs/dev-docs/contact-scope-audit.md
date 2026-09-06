@@ -87,6 +87,8 @@ endpoint, extend one of these files.
 | GET  /kb/categories | `list_categories` | SCOPED (`visibility <> 'internal'`; staff keep the module gate, PMS-1082) |
 | GET  /kb/articles | `list_articles` | SCOPED (`list_articles_for_contact`: published AND public or `client_specific` naming `session.company_id`; caller's `status`/`visibility` ignored; rows are `ContactKbArticleResponse`, PMS-1082) |
 | GET  /kb/articles/{id} | `get_article` | SCOPED (`get_portal_article`: 404 on internal, draft, foreign `client_specific` and unknown alike; `ContactKbArticleResponse`, PMS-1082) |
+| GET  /notifications | `list_inbox` | SCOPED (`list_inbox_for_contact`: `notifications.contact_id = session.id`; a staff row hangs off `user_id` and never matches; PMS-1083) |
+| POST /notifications/{id}/read | `mark_read` | SCOPED (`mark_read_for_contact`: UPDATE keyed on `contact_id`, foreign id is a 404; PMS-1083) |
 | GET  /projects | `list_projects` | SCOPED (NULL house projects implicitly excluded; rows are `ContactProjectResponse`, PMS-1061) |
 | GET  /projects/{id} | `get_project` | SCOPED (`ContactProjectResponse`, PMS-1061) |
 | GET  /quotes | `list_quotes` | SCOPED (`list_quotes_for_company`: own company AND issued statuses only, PMS-1060) |
@@ -155,6 +157,12 @@ the scoped read + write paths. Together they assert:
 - Staff bearer callers bypass the scope check as designed.
 - A stale JWT that carries a since-revoked cap fails 403 within one
   request (the server DB-loads caps live per prompt 008).
+
+`tests/contact_notifications.rs` (PMS-1083) covers the inbox: the
+dispatcher writes the contact's `in_app` row (and none for an opted-out
+contact), the list shows the caller's rows and neither a sibling's nor a
+staff user's, mark-read is idempotent and a foreign id is a 404, and a
+contact without `notifications:read` is 403.
 
 `tests/contact_kb.rs` (PMS-1082) covers the three KB reads: the
 visible slice for a contact with `kb:read`, the identical 404 for an
