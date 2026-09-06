@@ -398,3 +398,68 @@ async fn revoking_another_session_writes_a_row(pool: PgPool) {
         .unwrap();
     assert_eq!(dead.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
+
+// The magic-link redeem (PMS-1077) shares the second-factor rows with
+// the password login: a wrong code writes `portal.mfa_failed`, the
+// pre-signal writes nothing, and the completed link writes
+// `portal.login_link`.
+#[sqlx::test]
+async fn a_wrong_second_factor_on_the_magic_link_writes_mfa_failed(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "link-mfa@example.com").await;
+    let secret = mokosh_server::utils::totp::generate_secret();
+    sqlx::query(
+        "UPDATE contacts SET portal_mfa_enabled = TRUE, portal_mfa_secret = $1 WHERE id = $2",
+    )
+    .bind(mokosh_server::utils::totp::base32_encode(&secret))
+    .bind(contact.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let intent_id = Uuid::new_v4();
+    let link_secret = mokosh_server::utils::crypto::generate_token(32);
+    let hash = mokosh_server::utils::crypto::hash_password(&link_secret).unwrap();
+    sqlx::query(
+        "INSERT INTO portal_login_intents (id, tenant_id, email, secret_hash, expires_at) \
+         VALUES ($1, $2, $3, $4, NOW() + INTERVAL '15 minutes')",
+    )
+    .bind(intent_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(&contact.email)
+    .bind(&hash)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let token = format!("{intent_id}.{link_secret}");
+    let app = common::boot(pool.clone()).await;
+    let redeem = |body: serde_json::Value| {
+        app.client
+            .post(app.url("/api/v1/contact/auth/login-link/redeem"))
+            .header("User-Agent", "audit-suite/1.0")
+            .json(&body)
+            .send()
+    };
+
+    let pre = redeem(serde_json::json!({ "token": token })).await.unwrap();
+    assert_eq!(pre.status(), reqwest::StatusCode::OK);
+    assert!(rows(&pool, contact.id, "portal.mfa_failed")
+        .await
+        .is_empty());
+    assert!(rows(&pool, contact.id, "portal.login_link")
+        .await
+        .is_empty());
+
+    let wrong = redeem(serde_json::json!({ "token": token, "mfa_code": "000000" }))
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let row = assert_one(&pool, contact.id, "portal.mfa_failed", "login").await;
+    assert_eq!(row.4.as_deref(), Some("audit-suite/1.0"));
+
+    let code = mokosh_server::utils::totp::code_at(&secret, chrono::Utc::now());
+    let ok = redeem(serde_json::json!({ "token": token, "mfa_code": code }))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), reqwest::StatusCode::OK);
+    assert_one(&pool, contact.id, "portal.login_link", "login").await;
+    assert_eq!(rows(&pool, contact.id, "portal.mfa_failed").await.len(), 1);
+}

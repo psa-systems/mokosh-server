@@ -1481,6 +1481,20 @@ impl ContactAuthService {
                     // retries), and say so with the login's 401
                     // rather than the link's 400.
                     let _ = self.register_failed_login(tid, contact_id).await;
+                    // PMS-1089: the same row the password login writes
+                    // for a wrong code. The transaction is released
+                    // first so the audit write does not wait on a
+                    // second pool connection while this one is held.
+                    drop(tx);
+                    self.audit(
+                        tid,
+                        Some(contact_id),
+                        AuditAction::Login,
+                        "portal.mfa_failed",
+                        user_agent,
+                        ip,
+                    )
+                    .await;
                     return Err(AppError::Unauthorized);
                 }
             }
