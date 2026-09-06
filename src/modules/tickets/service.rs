@@ -31,6 +31,54 @@ pub struct TicketService {
 }
 
 impl TicketService {
+    /// PMS-1087: the SLA state of one ticket. `company_scope` is the
+    /// contact plane's Company, folded into the WHERE clause so a
+    /// ticket of another Company is a 404 exactly as an unknown id is;
+    /// staff pass `None`. The state is `compute_sla_status` over the
+    /// same clock the list badge uses (created, due, resolved, closed,
+    /// and the status's `is_closed` flag), so the two never disagree.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, ticket_id = %ticket_id))]
+    pub async fn get_ticket_sla(
+        &self,
+        tenant_id: TenantId,
+        ticket_id: Uuid,
+        company_scope: Option<Uuid>,
+    ) -> AppResult<TicketSlaResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<TicketSlaRow> = sqlx::query_as(
+            "SELECT t.created_at, t.sla_due_date, t.first_response_due, t.first_response_at, \
+                    t.resolution_due, t.resolved_at, t.closed_at, \
+                    s.name AS status_name, s.is_closed AS status_is_closed \
+             FROM tickets t \
+             JOIN ticket_statuses s ON s.id = t.status_id \
+             WHERE t.tenant_id = $1 AND t.id = $2 \
+               AND ($3::uuid IS NULL OR t.company_id = $3)",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .bind(company_scope)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let row = row.ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
+        let status = mokosh_types::tickets::compute_sla_status(&mokosh_types::tickets::SlaClock {
+            created_at: row.created_at,
+            sla_due_date: row.sla_due_date,
+            closed_at: row.closed_at,
+            resolved_at: row.resolved_at,
+            status_is_closed: row.status_is_closed,
+        });
+        Ok(TicketSlaResponse {
+            sla_due_date: row.sla_due_date,
+            first_response_due: row.first_response_due,
+            first_response_at: row.first_response_at,
+            resolution_due: row.resolution_due,
+            resolved_at: row.resolved_at,
+            closed_at: row.closed_at,
+            status: status.into(),
+            status_name: row.status_name,
+        })
+    }
+
     /// Build a TicketService backed by `LogMailer`. Kept so call sites
     /// that don't need real SMTP (test factories, the legacy
     /// constructor) keep compiling.
@@ -3523,4 +3571,18 @@ mod pms931_note_edit_tests {
             assert!(reason.split_whitespace().count() >= 6, "{reason}");
         }
     }
+}
+
+/// PMS-1087: the columns `get_ticket_sla` reads.
+#[derive(sqlx::FromRow)]
+struct TicketSlaRow {
+    created_at: chrono::DateTime<chrono::Utc>,
+    sla_due_date: Option<chrono::DateTime<chrono::Utc>>,
+    first_response_due: Option<chrono::DateTime<chrono::Utc>>,
+    first_response_at: Option<chrono::DateTime<chrono::Utc>>,
+    resolution_due: Option<chrono::DateTime<chrono::Utc>>,
+    resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    closed_at: Option<chrono::DateTime<chrono::Utc>>,
+    status_name: String,
+    status_is_closed: bool,
 }

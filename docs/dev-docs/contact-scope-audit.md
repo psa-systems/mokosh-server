@@ -86,6 +86,7 @@ endpoint, extend one of these files.
 | GET  /invoices | `list_invoices` | SCOPED |
 | GET  /invoices/{id} | `get_invoice` | SCOPED |
 | GET  /invoices/{id}/pdf | `get_invoice_pdf` | SCOPED (501 body, gates first) |
+| GET  /invoices/{id}/payments | `list_invoice_payments` | SCOPED (`invoice_ledger`: `company_id = session.company_id` folded into the invoice lookup, foreign id is the unknown-id 404; customer-safe subset; PMS-1088) |
 | GET  /kb/categories | `list_categories` | SCOPED (`visibility <> 'internal'`; staff keep the module gate, PMS-1082) |
 | GET  /kb/articles | `list_articles` | SCOPED (`list_articles_for_contact`: published AND public or `client_specific` naming `session.company_id`; caller's `status`/`visibility` ignored; rows are `ContactKbArticleResponse`, PMS-1082) |
 | GET  /kb/articles/{id} | `get_article` | SCOPED (`get_portal_article`: 404 on internal, draft, foreign `client_specific` and unknown alike; `ContactKbArticleResponse`, PMS-1082) |
@@ -102,6 +103,7 @@ endpoint, extend one of these files.
 | POST /tickets | `create_ticket` | SCOPED (portal pins `session.company_id` + `session.id`) |
 | GET  /tickets/{id} | `get_ticket` | SCOPED |
 | PATCH /tickets/{id} | `patch_ticket` | SCOPED + reporter-only |
+| GET  /tickets/{id}/sla | `get_ticket_sla` | SCOPED (`company_id = session.company_id` folded into the read; foreign id is the unknown-id 404; PMS-1087) |
 | POST /tickets/{id}/approvals/request | `request_approval_on_ticket` | SCOPED |
 | POST /tickets/{id}/attachments | `portal_attach_file` | SCOPED |
 | GET  /tickets/{id}/notes | `get_ticket_notes` | SCOPED (public notes only) |
@@ -160,6 +162,10 @@ the scoped read + write paths. Together they assert:
 - A stale JWT that carries a since-revoked cap fails 403 within one
   request (the server DB-loads caps live per prompt 008).
 
+`tests/contact_ticket_sla.rs` (PMS-1087) covers the SLA read: the
+four states on own tickets, the same shape for staff, a foreign ticket
+indistinguishable from an unknown id, 403 without `tickets:read`.
+
 `tests/contact_approvals.rs` (PMS-1084) covers the approvals a staff
 user addresses to a contact: the contact lists exactly those, decides
 each once with the contact recorded, a sibling's, a staff role's and an
@@ -171,6 +177,11 @@ dispatcher writes the contact's `in_app` row (and none for an opted-out
 contact), the list shows the caller's rows and neither a sibling's nor a
 staff user's, mark-read is idempotent and a foreign id is a 404, and a
 contact without `notifications:read` is 403.
+
+`tests/contact_invoice_payments.rs` (PMS-1088) covers the invoice
+ledger: payments and refunds newest first in the safe subset, an empty
+ledger, the staff shape, a foreign invoice with payments answering the
+unknown-id 404, 403 without `invoices:read`.
 
 `tests/contact_kb.rs` (PMS-1082) covers the three KB reads: the
 visible slice for a contact with `kb:read`, the identical 404 for an
