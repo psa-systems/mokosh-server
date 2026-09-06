@@ -1510,8 +1510,7 @@ fn effective_role_from_bunyip(bunyip_role: Option<&str>, local: UserRole) -> Use
 }
 
 fn default_bunyip_tenant_id() -> uuid::Uuid {
-    std::env::var("OIDC_DEFAULT_TENANT_ID")
-        .ok()
+    crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID)
         .and_then(|s| uuid::Uuid::parse_str(&s).ok())
         .unwrap_or_else(|| uuid::Uuid::from_u128(1))
 }

@@ -302,6 +302,12 @@ fn only_the_auth_service_and_the_startup_wiring_know_the_deployment_mode() {
         "src/api/router.rs",
         // Re-export only.
         "src/utils/mod.rs",
+        // PMS-982: names the variable in the stated reason for its entry in
+        // `config::guard::ENTRY_POINTS` (it locates the providers, so it
+        // cannot be served by one). Prose, not a consultation: nothing in
+        // `src/config/` asks which mode this is, which is why the module takes
+        // a provider NAME rather than a `DeploymentMode`.
+        "src/config/guard.rs",
     ];
 
     let mut stack = vec![std::path::PathBuf::from("src")];
