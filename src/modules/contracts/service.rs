@@ -1135,6 +1135,7 @@ impl ContractsService {
             hours_applied,
             overage_hours,
             overage_amount,
+            overage_rate: item.overage_rate,
             balance_id: balance.id,
         })
     }

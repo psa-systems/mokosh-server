@@ -177,6 +177,12 @@ jobs:
         # looks healthy. That gap is why the first two occurrences could not
         # be pinned down (PMS-740).
         #
+        # --no-fail-fast (PMS-1031): without it `cargo test --tests` stops at the
+        # first failing binary, so one broken suite reports as "everything
+        # that sorts after it did not run" and 40 non-portal failures on main
+        # were invisible even to someone looking at the area. With it every
+        # binary runs and the summary names each red one; the step still fails.
+        #
         # The inner `timeout` bounds the harness itself (PMS-823). Run #4017
         # wedged mid-suite, so `status=$?` never ran and none of the reporting
         # below it did either; the log just stopped. SIGQUIT gives the Rust
@@ -189,7 +195,7 @@ jobs:
           ( while :; do df -P -BM . | awk 'NR==2 {gsub(/M/, "", $4); print $4}'; sleep 5; done ) > /tmp/disk-samples.txt 2>/dev/null &
           sampler=$!
           set +e
-          timeout --signal=QUIT --kill-after=30s 25m cargo test --tests -- --test-threads=4
+          timeout --signal=QUIT --kill-after=30s 25m cargo test --tests --no-fail-fast -- --test-threads=4
           status=$?
           set -e
           kill "${sampler}" 2>/dev/null || true
