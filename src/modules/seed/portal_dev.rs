@@ -468,6 +468,11 @@ fn derive_agent_name(slug: &str) -> (String, String) {
 /// Insert a portal-enabled contact under the tenant + company. Keyed by
 /// `(tenant_id, email)` so re-running does not create duplicates but
 /// also does NOT rehash / reset an existing dev password.
+/// PMS-1069: `contacts.company_id` is a mirror of the primary
+/// `contact_companies` row (PMS-806), so the fixture writes the link through
+/// `ensure_primary_company_link` rather than the mirror alone. A seeded contact
+/// that loses its company on the first edit is a fixture that reproduces the
+/// bug rather than the product.
 async fn upsert_portal_contact(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -487,6 +492,8 @@ async fn upsert_portal_contact(
 
     let hash = crate::utils::crypto::hash_password(PORTAL_DEV_PASSWORD)
         .map_err(|e| anyhow!("hash portal seed password: {e}"))?;
+    let contact_id = Uuid::new_v4();
+    let mut tx = pool.begin().await?;
     sqlx::query(
         r#"
         INSERT INTO contacts (
@@ -496,15 +503,17 @@ async fn upsert_portal_contact(
         VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
         "#,
     )
-    .bind(Uuid::new_v4())
+    .bind(contact_id)
     .bind(tenant_id)
     .bind(company_id)
     .bind(spec.contact_first)
     .bind(spec.contact_last)
     .bind(spec.contact_email)
     .bind(&hash)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    crate::modules::contacts::ensure_primary_company_link(&mut tx, tenant_id, contact_id).await?;
+    tx.commit().await?;
     *inserted = true;
     Ok(())
 }
