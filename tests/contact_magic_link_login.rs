@@ -567,25 +567,50 @@ async fn redeem_revoked_between_mint_and_click_returns_400(pool: PgPool) {
     );
 }
 
-/// mokosh-contact-login prompt 010: single-match auto-mint gated on
-/// MFA. When the target contact has `portal_mfa_enabled` set, the
-/// redeem returns `mfa_required = true` with empty tokens. PMS-1063:
-/// the gate is the flag, the same one the password login reads, not
-/// whether a secret happens to be staged.
+/// PMS-1077: a contact with MFA on completes the magic-link login on the
+/// second POST. The first POST (no code) is the `mfa_required` pre-signal
+/// and leaves the intent unconsumed; a wrong code is a 401 that ticks the
+/// PMS-501 counter and leaves it live; the right code consumes it and
+/// mints; the replay afterwards is the generic 400.
 #[sqlx::test]
-async fn mfa_gates_single_match_auto_mint(pool: PgPool) {
+async fn mfa_on_the_magic_link_completes_on_the_second_post(pool: PgPool) {
     let (contact_id, _co_id, _slug) = seed_portal_contact(&pool, "mfa@mcl.example").await;
+    let secret = mokosh_server::utils::totp::generate_secret();
+    let secret_b32 = mokosh_server::utils::totp::base32_encode(&secret);
+    let pwd = mokosh_server::utils::crypto::hash_password("Xy9#pQ4v!Lm2wRt7").expect("hash");
     sqlx::query(
-        "UPDATE contacts SET portal_mfa_enabled = TRUE, portal_mfa_secret = 'JBSWY3DPEHPK3PXP' \
-         WHERE id = $1",
+        "UPDATE contacts SET portal_mfa_enabled = TRUE, portal_mfa_secret = $1, \
+         portal_password_hash = $2 WHERE id = $3",
     )
+    .bind(&secret_b32)
+    .bind(&pwd)
     .bind(contact_id)
     .execute(&pool)
     .await
-    .expect("set mfa secret");
+    .expect("enable mfa");
+    clear_intents(&pool).await;
     let token = mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "mfa@mcl.example", None).await;
+    let intent_id: Uuid = token.split('.').next().unwrap().parse().unwrap();
     let app = common::boot(pool.clone()).await;
 
+    let used = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
+            "SELECT used_at FROM portal_login_intents WHERE id = $1",
+        )
+        .bind(intent_id)
+        .fetch_one(&pool)
+        .await
+        .expect("used_at")
+    };
+    let failed = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i32>("SELECT portal_failed_login_count FROM contacts WHERE id = $1")
+            .bind(contact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+    };
+
+    // First POST: pre-signal, nothing consumed.
     let resp = app
         .client
         .post(app.url("/api/v1/contact/auth/login-link/redeem"))
@@ -595,18 +620,136 @@ async fn mfa_gates_single_match_auto_mint(pool: PgPool) {
         .expect("redeem mfa");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await.expect("mfa JSON");
-    let auto = &body["auto"];
-    assert!(!auto.is_null(), "prompt 010: MFA gate still sets auto");
+    assert_eq!(body["auto"]["mfa_required"].as_bool(), Some(true));
+    assert_eq!(body["auto"]["access_token"].as_str(), Some(""));
+    assert!(
+        used(pool.clone()).await.is_none(),
+        "pre-signal leaves the link live"
+    );
+
+    // Wrong code: 401, counter ticks, link still live.
+    let wrong = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
+        .json(&serde_json::json!({ "token": token, "mfa_code": "000000" }))
+        .send()
+        .await
+        .expect("wrong code");
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
     assert_eq!(
-        auto["mfa_required"].as_bool(),
-        Some(true),
-        "prompt 010: MFA-enrolled contact must return mfa_required = true"
+        failed(pool.clone()).await,
+        1,
+        "wrong code ticks the counter"
+    );
+    assert!(
+        used(pool.clone()).await.is_none(),
+        "wrong code leaves the link live"
+    );
+
+    // Right code: session minted, link consumed, counter reset.
+    let code = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let right = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
+        .json(&serde_json::json!({ "token": token, "mfa_code": code }))
+        .send()
+        .await
+        .expect("right code");
+    assert_eq!(right.status(), reqwest::StatusCode::OK);
+    assert!(
+        right.headers().get("set-cookie").is_some(),
+        "refresh cookie rides on the minted response"
+    );
+    let body: serde_json::Value = right.json().await.expect("mint JSON");
+    assert_eq!(body["auto"]["mfa_required"].as_bool(), Some(false));
+    assert!(!body["auto"]["access_token"].as_str().unwrap().is_empty());
+    assert_eq!(body["auto"]["contact"]["mfa_enabled"], true);
+    assert!(
+        used(pool.clone()).await.is_some(),
+        "right code consumes the link"
     );
     assert_eq!(
-        auto["access_token"].as_str(),
-        Some(""),
-        "prompt 010: MFA gate must NOT hand out a session token"
+        failed(pool.clone()).await,
+        0,
+        "a sign-in resets the counter"
     );
+
+    // Replay after consumption: the generic 400, even with a valid code.
+    let code = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let replay = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
+        .json(&serde_json::json!({ "token": token, "mfa_code": code }))
+        .send()
+        .await
+        .expect("replay");
+    assert_eq!(replay.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// PMS-1077: a recovery code completes the magic-link login too, once.
+#[sqlx::test]
+async fn a_recovery_code_completes_the_magic_link_once(pool: PgPool) {
+    let (contact_id, _co_id, _slug) = seed_portal_contact(&pool, "recover@mcl.example").await;
+    let secret_b32 =
+        mokosh_server::utils::totp::base32_encode(&mokosh_server::utils::totp::generate_secret());
+    let pwd = mokosh_server::utils::crypto::hash_password("Xy9#pQ4v!Lm2wRt7").expect("hash");
+    let recovery = mokosh_server::utils::recovery::generate_code();
+    let hashes = vec![mokosh_server::utils::recovery::hash_code_hex(&recovery)];
+    sqlx::query(
+        "UPDATE contacts SET portal_mfa_enabled = TRUE, portal_mfa_secret = $1, \
+         portal_password_hash = $2, portal_mfa_recovery_codes_hashes = $3 WHERE id = $4",
+    )
+    .bind(&secret_b32)
+    .bind(&pwd)
+    .bind(&hashes)
+    .bind(contact_id)
+    .execute(&pool)
+    .await
+    .expect("enable mfa");
+    clear_intents(&pool).await;
+    let app = common::boot(pool.clone()).await;
+
+    let token = mint_intent_direct(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "recover@mcl.example",
+        None,
+    )
+    .await;
+    let first = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
+        .json(&serde_json::json!({ "token": token, "mfa_code": "", "recovery_code": recovery }))
+        .send()
+        .await
+        .expect("recovery");
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = first.json().await.expect("JSON");
+    assert!(!body["auto"]["access_token"].as_str().unwrap().is_empty());
+    let left: Vec<String> =
+        sqlx::query_scalar("SELECT portal_mfa_recovery_codes_hashes FROM contacts WHERE id = $1")
+            .bind(contact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("hashes");
+    assert!(left.is_empty(), "the code is spent");
+
+    // A fresh link with the spent code: 401, link left live.
+    let token = mint_intent_direct(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "recover@mcl.example",
+        None,
+    )
+    .await;
+    let again = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
+        .json(&serde_json::json!({ "token": token, "recovery_code": recovery }))
+        .send()
+        .await
+        .expect("spent");
+    assert_eq!(again.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 // ---------------------------------------------------------------------------
