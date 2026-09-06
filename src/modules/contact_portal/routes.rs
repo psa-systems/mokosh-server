@@ -280,7 +280,13 @@ async fn redeem_login_link(
         .map(|s| s.to_string());
     let outcome = state
         .service
-        .redeem_login_link(&request.token, ua.as_deref(), Some(addr.ip()))
+        .redeem_login_link(
+            &request.token,
+            request.mfa_code.as_deref(),
+            request.recovery_code.as_deref(),
+            ua.as_deref(),
+            Some(addr.ip()),
+        )
         .await?;
     // Attach the refresh cookie only on the auto-mint path where a
     // real session was minted (mfa_required = false + tokens set).
