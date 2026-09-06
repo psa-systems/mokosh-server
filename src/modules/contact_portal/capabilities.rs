@@ -207,6 +207,62 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     CONTACTS_MANAGE_SUB_USER,
 ];
 
+/// PMS-1118: the capability set each built-in portal role holds, the
+/// union every seed migration has produced (171 inserted, 179, 180 and
+/// 197 appended, 199 backfilled). `TenantService::seed_builtin_portal_roles`
+/// binds these for a new tenant, so a tenant created today holds what
+/// one that predates the migrations holds; `builtin_roles_match_the_seed_migrations`
+/// fails the build when a migration appends a capability without adding
+/// it here, and `tests/tenants.rs` pins a freshly created tenant against
+/// the default tenant's rows. A new built-in capability is added in a NEW
+/// migration (the 179 shape) AND here, in the same change.
+pub const BUILTIN_BILLING_CONTACT: &[&str] = &[
+    INVOICES_READ,
+    INVOICES_PAY,
+    QUOTES_READ,
+    QUOTES_ACCEPT,
+    NOTIFICATIONS_READ,
+    SETTINGS_MANAGE_OWN,
+    INVOICES_DOWNLOAD_PDF,
+    QUOTES_DOWNLOAD_PDF,
+];
+
+/// See [`BUILTIN_BILLING_CONTACT`].
+pub const BUILTIN_SUPPORT_CONTACT: &[&str] = &[
+    TICKETS_READ,
+    TICKETS_WRITE,
+    TICKETS_COMMENT,
+    KB_READ,
+    NOTIFICATIONS_READ,
+    SETTINGS_MANAGE_OWN,
+    TICKETS_REOPEN,
+    TICKETS_ATTACH_FILE,
+    ASSETS_REPORT_ISSUE,
+    TICKETS_EDIT_OWN,
+    TICKETS_REQUEST_APPROVAL,
+    APPROVALS_DECIDE,
+];
+
+/// See [`BUILTIN_BILLING_CONTACT`].
+pub const BUILTIN_READ_ONLY: &[&str] = &[
+    TICKETS_READ,
+    INVOICES_READ,
+    QUOTES_READ,
+    CONTRACTS_READ,
+    ASSETS_READ,
+    PROJECTS_READ,
+    KB_READ,
+    NOTIFICATIONS_READ,
+];
+
+/// The three built-in roles by the name the migrations seeded, in the
+/// order the seed inserts them.
+pub const BUILTIN_ROLES: &[(&str, &[&str])] = &[
+    ("Billing Contact", BUILTIN_BILLING_CONTACT),
+    ("Support Contact", BUILTIN_SUPPORT_CONTACT),
+    ("Read-Only", BUILTIN_READ_ONLY),
+];
+
 /// Predicate for validating a role's capability set at write time.
 /// Returns `Ok(())` when every entry in `caps` appears in
 /// [`ALL_CAPABILITIES`]; returns the first offending value otherwise.
@@ -277,26 +333,20 @@ mod tests {
         assert!(validate_capabilities(&[]).is_ok());
     }
 
+    /// PMS-1118: the seed migrations are immutable SQL literals, so this
+    /// canary holds their per-role capability strings and checks two
+    /// things: every string is a real capability (a mismatch the other
+    /// way renders as an unknown capability in the UI), and the union
+    /// each role's migrations produced is exactly the constant the code
+    /// seed binds for a new tenant. A migration that appends a
+    /// capability without adding it to the constant fails here, which is
+    /// the gap PMS-1118 closed: 179, 180 and 197 had each patched
+    /// existing rows while new tenants kept 171's sets.
     #[test]
-    fn all_capabilities_match_seed_migration() {
-        // The migration 142 seed hardcodes the built-in role capability
-        // sets as SQL string literals; keep this test as a canary that
-        // every capability referenced by the seed also exists in the
-        // Rust enum. If someone extends the seed with a new capability
-        // string and forgets to add it here, the SPA will not gate on
-        // it and this test does not catch that specific mistake - but
-        // a mismatch in the other direction (Rust drops one the seed
-        // still references) shows up as an unrenderable role in the UI.
-        //
-        // PMS-936 (migration 150) extends the built-in role capability
-        // sets - Billing Contact gains the PDF-download caps; Support
-        // Contact gains reopen + attach + report_issue - so those
-        // strings ALSO have to appear in `ALL_CAPABILITIES`. Both
-        // migrations are pinned by the same canary because migrations
-        // are immutable: extending the seed happens in a NEW file, and
-        // this test must know about every seed file that ships a cap
-        // string.
-        let seed_billing_142 = &[
+    fn builtin_roles_match_the_seed_migrations() {
+        use std::collections::BTreeSet;
+        // Migration 171 (mokosh-contact-login prompt 002): the insert.
+        let billing_171 = &[
             "invoices:read",
             "invoices:pay",
             "quotes:read",
@@ -304,7 +354,7 @@ mod tests {
             "notifications:read",
             "settings:manage_own",
         ];
-        let seed_support_142 = &[
+        let support_171 = &[
             "tickets:read",
             "tickets:write",
             "tickets:comment",
@@ -312,7 +362,7 @@ mod tests {
             "notifications:read",
             "settings:manage_own",
         ];
-        let seed_readonly_142 = &[
+        let readonly_171 = &[
             "tickets:read",
             "invoices:read",
             "quotes:read",
@@ -322,40 +372,48 @@ mod tests {
             "kb:read",
             "notifications:read",
         ];
-        // Migration 150 (PMS-936) APPENDs to the two role rows already
-        // present. Only the additions are listed here; the base set is
-        // still validated above via the 142 arrays.
-        let seed_billing_150_add = &["invoices:download_pdf", "quotes:download_pdf"];
-        let seed_support_150_add = &[
+        // Migration 179 (PMS-936): appends.
+        let billing_179 = &["invoices:download_pdf", "quotes:download_pdf"];
+        let support_179 = &[
             "tickets:reopen",
             "tickets:attach_file",
             "assets:report_issue",
         ];
-        // Migration 151 (PMS-937) APPENDs the contact-owned ticket edit
-        // and contact-initiated approval-request caps to the Support
-        // Contact row. Same immutable-migration + append-with-dedupe
-        // shape as 150. Read-Only + Billing Contact are unchanged (both
-        // caps mutate state and are irrelevant to the billing surface).
-        let seed_support_151_add = &["tickets:edit_own", "tickets:request_approval"];
-        // Migration 197 (PMS-1084) APPENDs the decide cap to the
-        // Support Contact row, the other side of `tickets:request_approval`.
-        let seed_support_197_add = &["approvals:decide"];
-        let all_seeds: &[&[&str]] = &[
-            seed_billing_142,
-            seed_support_142,
-            seed_readonly_142,
-            seed_billing_150_add,
-            seed_support_150_add,
-            seed_support_151_add,
-            seed_support_197_add,
+        // Migration 180 (PMS-937): appends.
+        let support_180 = &["tickets:edit_own", "tickets:request_approval"];
+        // Migration 197 (PMS-1084): appends.
+        let support_197 = &["approvals:decide"];
+        // Migration 199 (PMS-1118) re-appends the unions above and adds
+        // nothing, so it has no entry of its own.
+
+        fn union(parts: &[&[&'static str]]) -> BTreeSet<&'static str> {
+            parts.iter().flat_map(|p| p.iter().copied()).collect()
+        }
+        let migrated: [(&str, BTreeSet<&str>); 3] = [
+            ("Billing Contact", union(&[billing_171, billing_179])),
+            (
+                "Support Contact",
+                union(&[support_171, support_179, support_180, support_197]),
+            ),
+            ("Read-Only", union(&[readonly_171])),
         ];
-        for seed in all_seeds {
-            for cap in *seed {
+        for (name, caps) in &migrated {
+            for cap in caps {
                 assert!(
-                    ALL_CAPABILITIES.iter().any(|k| k == cap),
-                    "seed migration references `{cap}` but it is missing from ALL_CAPABILITIES"
+                    ALL_CAPABILITIES.contains(cap),
+                    "seed migration references `{cap}` on {name} but it is missing from ALL_CAPABILITIES"
                 );
             }
+            let (_, constant) = BUILTIN_ROLES
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} is missing from BUILTIN_ROLES"));
+            let constant: BTreeSet<&str> = constant.iter().copied().collect();
+            assert_eq!(
+                &constant, caps,
+                "{name}: the code seed (BUILTIN_ROLES) and the migrations disagree; add the capability to both in the same change"
+            );
         }
+        assert_eq!(BUILTIN_ROLES.len(), migrated.len());
     }
 }

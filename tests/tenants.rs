@@ -2334,6 +2334,45 @@ async fn create_tenant_seeds_three_builtin_portal_roles(pool: PgPool) {
         "Read-Only must carry only *:read capabilities, got {readonly_caps:?}"
     );
 
+    // PMS-1118: a tenant created today holds exactly what the default
+    // tenant holds after every seed migration (171 inserted it, 179, 180,
+    // 197 appended, 199 backfilled), and exactly what the code seed's
+    // constants say. Compared as sets, per role, in both directions.
+    for (name, _, _) in &rows {
+        let fresh: std::collections::BTreeSet<String> = rows
+            .iter()
+            .find(|r| &r.0 == name)
+            .unwrap()
+            .1
+            .iter()
+            .cloned()
+            .collect();
+        let migrated: Vec<String> = sqlx::query_scalar(
+            "SELECT unnest(capabilities) FROM portal_roles \
+             WHERE tenant_id = $1 AND name = $2 AND is_builtin = TRUE",
+        )
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(name)
+        .fetch_all(&pool)
+        .await
+        .expect("default tenant role");
+        let migrated: std::collections::BTreeSet<String> = migrated.into_iter().collect();
+        assert_eq!(
+            fresh, migrated,
+            "PMS-1118: {name} on a new tenant must equal the migrated default tenant's row"
+        );
+        let constant: std::collections::BTreeSet<String> =
+            mokosh_server::modules::contact_portal::capabilities::BUILTIN_ROLES
+                .iter()
+                .find(|(n, _)| n == name)
+                .expect("built-in role in BUILTIN_ROLES")
+                .1
+                .iter()
+                .map(|c| c.to_string())
+                .collect();
+        assert_eq!(fresh, constant, "PMS-1118: {name} must equal BUILTIN_ROLES");
+    }
+
     // Re-invoke: idempotency + ON CONFLICT DO NOTHING.
     svc.seed_builtin_portal_roles(tenant.id)
         .await
