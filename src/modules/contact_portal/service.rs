@@ -269,8 +269,12 @@ impl ContactAuthService {
         let session_id = Uuid::new_v4();
         let (access_token, expires_at) =
             self.mint_access_token(tenant_id, contact_id, company_id, email, &caps, session_id)?;
+        // PMS-1062: a login starts a rotation family, named by its
+        // first session.
         let refresh_token = self
-            .mint_refresh_token(tenant_id, contact_id, session_id, user_agent, ip)
+            .mint_refresh_token(
+                tenant_id, contact_id, session_id, session_id, user_agent, ip,
+            )
             .await?;
         let me = self.me(tenant_id, contact_id).await?;
         Ok(ContactLoginResponse {
@@ -291,6 +295,16 @@ impl ContactAuthService {
     /// the token was ever valid, still valid, or freshly detected as
     /// stolen. Belt-and-braces recheck of tenant status + contact
     /// active so a suspend / revoke lands within one tick.
+    ///
+    /// PMS-1062: the new session inherits the presented one's
+    /// `family_id`, and a genuine token presented AFTER it was rotated
+    /// is the stolen-token signal: the honest customer rotated it, so
+    /// whoever presents it now holds a copy. That revokes the whole
+    /// family, the successor the customer is using included, so both
+    /// parties are signed out and the customer signs in again. The
+    /// secret is verified BEFORE the family is revoked: a session id
+    /// is not a secret (it rides in the access token's `sid`), and a
+    /// bare id must not be enough to sign a customer out.
     #[tracing::instrument(skip_all)]
     pub async fn refresh(
         &self,
@@ -302,25 +316,37 @@ impl ContactAuthService {
             parse_session_bound_token(presented).ok_or(AppError::Unauthorized)?;
 
         #[allow(clippy::type_complexity)]
-        let row: Option<(Uuid, Uuid, String, Option<DateTime<Utc>>, DateTime<Utc>)> =
-            sqlx::query_as(
-                r#"
-            SELECT tenant_id, contact_id, refresh_token_hash, revoked_at, expires_at
+        let row: Option<(
+            Uuid,
+            Uuid,
+            String,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+            Uuid,
+        )> = sqlx::query_as(
+            r#"
+            SELECT tenant_id, contact_id, refresh_token_hash, revoked_at, expires_at, family_id
             FROM contact_sessions
             WHERE id = $1
             "#,
-            )
-            .bind(session_id)
-            .fetch_optional(self.db.migrator_pool())
-            .await?;
+        )
+        .bind(session_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
 
-        let Some((tenant_id, contact_id, hash, revoked_at, expires_at)) = row else {
+        let Some((tenant_id, contact_id, hash, revoked_at, expires_at, family_id)) = row else {
             return Err(AppError::Unauthorized);
         };
-        if revoked_at.is_some() || expires_at <= Utc::now() {
+        if !verify_password(secret, &hash)? {
             return Err(AppError::Unauthorized);
         }
-        if !verify_password(secret, &hash)? {
+        if revoked_at.is_some() {
+            // Replay of a genuine, already-rotated token: theft
+            // detected, burn the family (PMS-1062).
+            self.revoke_session_family(family_id).await?;
+            return Err(AppError::Unauthorized);
+        }
+        if expires_at <= Utc::now() {
             return Err(AppError::Unauthorized);
         }
 
@@ -340,21 +366,29 @@ impl ContactAuthService {
             return Err(AppError::Unauthorized);
         };
         if !is_portal_user {
-            // Revoke the row so subsequent refreshes short-circuit.
-            let _ = sqlx::query("UPDATE contact_sessions SET revoked_at = NOW() WHERE id = $1")
-                .bind(session_id)
-                .execute(self.db.migrator_pool())
-                .await;
+            // Portal access revoked: burn the family so a later
+            // re-grant does not resurrect a token the caller still
+            // holds (PMS-1062).
+            self.revoke_session_family(family_id).await?;
             return Err(AppError::Unauthorized);
         }
 
-        // Rotate: revoke the old row, mint a fresh session with a new
-        // id. Old refresh tokens replayed against the revoked id 401
-        // on the next call above.
-        let _ = sqlx::query("UPDATE contact_sessions SET revoked_at = NOW() WHERE id = $1")
-            .bind(session_id)
-            .execute(self.db.migrator_pool())
-            .await;
+        // Rotate: revoke the old row BEFORE the successor is minted,
+        // and only if nobody else revoked it first. Two presenters
+        // racing onto one row would otherwise both get a live
+        // successor; the loser is treated as the replay it is.
+        let rotated = sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(session_id)
+        .execute(self.db.migrator_pool())
+        .await?
+        .rows_affected();
+        if rotated == 0 {
+            self.revoke_session_family(family_id).await?;
+            return Err(AppError::Unauthorized);
+        }
 
         let caps = self.load_capabilities(tenant_id, contact_id).await?;
         let company_id: Uuid =
@@ -373,7 +407,14 @@ impl ContactAuthService {
             new_session_id,
         )?;
         let refresh_token = self
-            .mint_refresh_token(tenant_id, contact_id, new_session_id, user_agent, ip)
+            .mint_refresh_token(
+                tenant_id,
+                contact_id,
+                new_session_id,
+                family_id,
+                user_agent,
+                ip,
+            )
             .await?;
         let me = self.me(tenant_id, contact_id).await?;
         Ok(ContactLoginResponse {
@@ -389,24 +430,55 @@ impl ContactAuthService {
     /// mokosh-contact-login prompt 004: revoke the refresh session
     /// backing the presented token. Idempotent + enumeration-resistant:
     /// unknown / already-revoked / malformed all return `Ok(())`.
+    ///
+    /// PMS-1062: the secret is verified first and the whole rotation
+    /// family goes, not the one row. A bare session id rides in every
+    /// access token's `sid`, so an id alone must not sign anyone out;
+    /// and a family that somehow holds two live rows (a rotation
+    /// race the refresh path lost) must not keep one alive past the
+    /// customer's sign-out.
     #[tracing::instrument(skip_all)]
     pub async fn logout(&self, presented: &str) -> AppResult<()> {
-        if let Some((session_id, _)) = parse_session_bound_token(presented) {
-            let _ = sqlx::query(
-                "UPDATE contact_sessions SET revoked_at = NOW() \
-                 WHERE id = $1 AND revoked_at IS NULL",
-            )
-            .bind(session_id)
-            .execute(self.db.migrator_pool())
-            .await;
+        let Some((session_id, secret)) = parse_session_bound_token(presented) else {
+            return Ok(());
+        };
+        let row: Option<(String, Uuid)> = sqlx::query_as(
+            "SELECT refresh_token_hash, family_id FROM contact_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((hash, family_id)) = row else {
+            return Ok(());
+        };
+        if !verify_password(secret, &hash)? {
+            return Ok(());
         }
+        self.revoke_session_family(family_id).await
+    }
+
+    /// PMS-1062: revoke every live session in one rotation family.
+    /// Called by the replay branch of `refresh`, by `logout`, and when
+    /// a refresh finds the contact's portal access gone.
+    async fn revoke_session_family(&self, family_id: Uuid) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE family_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(family_id)
+        .execute(self.db.migrator_pool())
+        .await?;
         Ok(())
     }
 
     /// mokosh-contact-login prompt 004: redeem the magic-link setup
     /// token from `grant_portal_access` (prompt 003) + the resend
     /// path. Sets `portal_password_hash`, marks the token used,
-    /// deletes any other unredeemed tokens for the same contact.
+    /// deletes any other unredeemed tokens for the same contact, and
+    /// (PMS-1062) revokes every live session the contact holds, so a
+    /// refresh token stolen before a reset does not survive it. The
+    /// reset path (`reset_password`) delegates here, so both share
+    /// the rule.
     ///
     /// Status contract:
     /// - valid, unused, unexpired -> Ok(())
@@ -531,6 +603,17 @@ impl ContactAuthService {
         .bind(contact_id)
         .bind(tenant_id)
         .bind(token_id)
+        .execute(&mut *tx)
+        .await?;
+        // A new password ends every existing session (PMS-1062): the
+        // customer signs in again with it, and a refresh token that
+        // leaked before the reset is dead the moment the reset lands.
+        sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE contact_id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1367,8 +1450,12 @@ impl ContactAuthService {
         let session_id = Uuid::new_v4();
         let (access_token, expires_at) =
             self.mint_access_token(tenant_id, contact_id, company_id, email, &caps, session_id)?;
+        // PMS-1062: a login starts a rotation family, named by its
+        // first session.
         let refresh_token = self
-            .mint_refresh_token(tenant_id, contact_id, session_id, user_agent, ip)
+            .mint_refresh_token(
+                tenant_id, contact_id, session_id, session_id, user_agent, ip,
+            )
             .await?;
         // Stamp last-login. Best-effort.
         let _ = sqlx::query(
@@ -1501,11 +1588,16 @@ impl ContactAuthService {
         Ok((token, exp))
     }
 
+    /// `family_id` is the first session of the rotation chain this
+    /// one belongs to (PMS-1062): a login or a magic-link redeem
+    /// passes its own `session_id`, a rotation passes the presented
+    /// row's family forward.
     async fn mint_refresh_token(
         &self,
         tenant_id: Uuid,
         contact_id: Uuid,
         session_id: Uuid,
+        family_id: Uuid,
         user_agent: Option<&str>,
         ip: Option<IpAddr>,
     ) -> AppResult<String> {
@@ -1516,8 +1608,8 @@ impl ContactAuthService {
         sqlx::query(
             r#"
             INSERT INTO contact_sessions (id, tenant_id, contact_id, refresh_token_hash,
-                                          expires_at, user_agent, ip_address)
-            VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::inet)
+                                          expires_at, user_agent, ip_address, family_id)
+            VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::inet, $8)
             "#,
         )
         .bind(session_id)
@@ -1527,6 +1619,7 @@ impl ContactAuthService {
         .bind(expires_at)
         .bind(user_agent)
         .bind(ip_text)
+        .bind(family_id)
         .execute(self.db.migrator_pool())
         .await?;
         Ok(format!("{session_id}.{secret}"))
