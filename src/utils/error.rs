@@ -400,13 +400,20 @@ mod server_impl {
             match err {
                 sqlx::Error::RowNotFound => Self::NotFound("Record".to_string()),
                 sqlx::Error::Database(db_err) => {
-                    // Check for unique constraint violations
+                    // Check for unique constraint violations. Deliberate
+                    // suppression (error-visibility rule §4): a 23505 is the
+                    // caller re-sending a row that already exists, which the
+                    // 409 states in full, so it is logged at `debug` and not
+                    // `error`. Every other code is a real fault.
                     if let Some(code) = db_err.code() {
                         if code == "23505" {
+                            tracing::debug!("Unique violation: {:?}", db_err);
                             return Self::Conflict("That record already exists".to_string());
                         }
                     }
-                    // Log the actual error but return a generic message
+                    // The generic message is all the client gets, so the
+                    // Postgres cause (message, table, column, constraint)
+                    // must reach the log here or it reaches nobody. PMS-1039.
                     tracing::error!("Database error: {:?}", db_err);
                     Self::Database("Database operation failed".to_string())
                 }
