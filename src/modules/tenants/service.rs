@@ -1720,7 +1720,7 @@ impl TenantService {
                        'notifications:read', 'settings:manage_own'], TRUE),
                 ($1, 'Support Contact',
                  ARRAY['tickets:read', 'tickets:write', 'tickets:comment', 'kb:read',
-                       'notifications:read', 'settings:manage_own'], TRUE),
+                       'notifications:read', 'settings:manage_own', 'approvals:decide'], TRUE),
                 ($1, 'Read-Only',
                  ARRAY['tickets:read', 'invoices:read', 'quotes:read', 'contracts:read',
                        'assets:read', 'projects:read', 'kb:read', 'notifications:read'], TRUE)
