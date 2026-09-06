@@ -10,10 +10,13 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 async fn seed_portal_contact(pool: &PgPool, email: &str) -> common::PortalContact {
+    // One company per contact, named after it: company names are
+    // unique per tenant.
     let company = Uuid::new_v4();
-    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme Co')")
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, $3)")
         .bind(company)
         .bind(common::DEFAULT_TENANT_ID)
+        .bind(format!("{email} Co"))
         .execute(pool)
         .await
         .expect("seed company");
