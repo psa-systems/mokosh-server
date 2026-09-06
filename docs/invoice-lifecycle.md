@@ -27,8 +27,20 @@ Because the status transition to `void` also flows through `update_invoice`, thi
 ## What each state can do
 
 - `draft` / `pending` (editable): edit header and lines, Send (-> `sent`, subject to the recipient precondition below), or Void (-> `void`). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
-- `sent` / `partially_paid` (collectible): the only action is Record Payment, which runs through `record_payment` (a separate path, not `update_invoice`) and advances the status `sent` -> `partially_paid` -> `paid` as the balance is collected.
-- `paid` / `void` / `written_off` (terminal): no further lifecycle actions.
+- `sent` / `partially_paid` (collectible): Record Payment, which runs through `record_payment` (a separate path, not `update_invoice`) and advances the status `sent` -> `partially_paid` -> `paid` as the balance is collected; Credit (a credit note, PMS-953); or Write off (PMS-1036, below).
+- `paid` / `void` / `written_off` (terminal): no further lifecycle actions. A payment recorded against a `written_off` invoice is a recovery: it is kept and the status stands.
+
+## Writing off, distinct from crediting (PMS-1036)
+
+`POST /invoices/{id}/write-off` with `{ reason }` (required) moves a `sent` or `partially_paid` invoice to `written_off` and records `written_off_at`, `written_off_by_id`, `write_off_reason` and `write_off_amount`, the balance at that moment, frozen. Finance only, like every other write to an issued document. `draft` (delete it), `paid`, `void` and `written_off` are refused with a 409 naming the status. There is no reversal.
+
+A credit note says the customer did not owe this and reduces revenue. A write-off says the customer owes it and will not pay: a bad-debt expense. The books treat them differently, so `balance_due` is left exactly as it was (the debt was not forgiven), the online payment path refuses the invoice the way it refuses `void`, and `recompute_invoice_balance` keeps the status standing through any later payment or credit (its status CASE reads `written_off_at` first). The statement (PMS-954) lists a written-off invoice under its own `write_offs` line kind, dated by the write-off and carrying the frozen amount, and takes `total_written_off` out of the closing balance: the customer is no longer asked to settle it, and a period that closed before the write-off is not rewritten by it.
+
+## Overdue and reminders (PMS-1037)
+
+Overdue is derived on every read, never stored: `is_overdue` and `days_overdue` on `InvoiceResponse` are `status IN ('sent', 'partially_paid') AND balance_due > 0 AND due_date < today`, computed in the tenant's day (`read_tenant_zone`, PMS-1030), and `GET /invoices?overdue=true` filters on the same predicate. A stored flag would be a second home for a fact `due_date` and `balance_due` already hold, and the only one that could be stale.
+
+Reminders are a worker. `InvoiceReminderWorker` runs hourly; for each tenant with `billing_reminders/enabled` and a `schedule` (day offsets such as `[3, 7, 14, 30]`), at the tenant's local `send_hour` (default 8), it mails every overdue invoice whose `days_overdue` equals a step, to the address the invoice was emailed to (PMS-992) else the resolved billing contact (PMS-993), with the stored document attached (PMS-959) and the pay link when a gateway is connected. `invoice_reminders` records each send per invoice per step and is the idempotency guard, so a run that fires twice in the hour sends once; a refused send releases the claim so the next run tries again. Late fees are deliberately not here: a fee is a new line on a new document, and its own ticket.
 
 ## Sending requires a recipient
 
@@ -64,6 +76,23 @@ Where the contact comes from differs by document, and the difference is the poin
 - **Statement**: the company's *current* `default_billing_contact_id`. A statement spans many invoices that may each name a different person, and PMS-954 made it a read model that stores nothing, so it renders from today exactly as its issuer and its branding do. Reassigning the role does change the next statement.
 
 Documents issued before this landed are not re-rendered. PMS-959 stores an invoice's PDF inside the transaction that first sends it and a credit note's inside the transaction that creates it, and `GET /invoices/{id}/pdf` and `GET /credit-notes/{id}/pdf` serve those bytes whenever there are any. Only invoices sent and credit notes created after this change carry the contact; an older document keeps the bytes its customer already holds. A live render (a draft preview, or anything issued before PMS-959) does pick the contact up.
+
+## The document template
+
+PMS-1006. `tenants.branding.invoice_template` chooses how a document is laid out: `classic`, `modern` or `compact`. The keys are validated in `src/modules/tenants/branding.rs` against `pdf::Template`, and anything else is refused with a message naming the three. Absent or null is `classic`, which is the output every document had before templates existed, so a tenant that never chooses sees nothing change.
+
+The choice is tenant-wide, not per invoice. An MSP's documents should look alike, and there is no per-invoice override: the bytes of an issued document are what the record is, so a per-invoice field would store a value nothing could read back off the document.
+
+Which documents follow it:
+
+- The invoice, at the moment it is rendered. A draft renders live, so it follows the tenant's current choice; `GET /invoices/{id}/pdf?template=<key>` previews another one on the MSP's own data while the invoice is still editable. The parameter is a staff affordance: PMS-936 opened that route to the contact plane too, and a contact passing it is refused rather than served a layout nobody picked.
+- The credit note, at creation, which is when it is issued and when its document is stored (PMS-953, PMS-959).
+- The statement, every time, because PMS-954 made it a read model that stores nothing.
+- NOT the report export (`GET /reports/{key}/export?format=pdf`). An internal report is not a document a client receives and carries no branding at all; it stays Classic.
+
+An already-sent invoice keeps its stored bytes. PMS-959 writes the rendered PDF inside the transaction that first moves the invoice to `sent`, and `GET /invoices/{id}/pdf` serves those bytes for any frozen invoice, so changing `invoice_template` (or the accent colour, or the legal name) afterwards cannot alter a document a customer already holds. For the same reason `?template=` is a 400 on a frozen invoice rather than a re-render: that path serves what was sent, and there is only one answer to give.
+
+`primary_color` is the accent the Modern template draws its head band in; a tenant that set none gets `pdf::DEFAULT_ACCENT`. The band's own text is dark or light according to the band colour's relative luminance, so a pale brand colour does not produce white on white.
 
 ## UI
 

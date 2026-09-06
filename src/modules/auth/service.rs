@@ -4208,13 +4208,7 @@ fn sha256_hex(input: &str) -> String {
 /// + hyphens, uppercase) consistent with code generation.
 #[cfg(feature = "server")]
 fn recovery_code_hex_hash(code: &str) -> String {
-    let raw = crate::utils::recovery::hash_code(code);
-    let mut out = String::with_capacity(raw.len() * 2);
-    for b in raw {
-        use std::fmt::Write;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
+    crate::utils::recovery::hash_code_hex(code)
 }
 
 /// Domain of the JIT placeholder address (`{sub}@unresolved.invalid`) stored

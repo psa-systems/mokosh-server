@@ -11,6 +11,7 @@
 //! invoice someone has to generate and look at.
 
 use chrono::NaiveDate;
+use rust_decimal::Decimal;
 
 /// Notes longer than this are cut. An invoice line is a description, not the
 /// technician's write-up, and the PDF truncates a cell with an ellipsis at a
@@ -59,6 +60,35 @@ pub fn time_entry_line(
     }
 }
 
+/// PMS-1035: the description of a time-entry line that bills only the part
+/// of the entry past a block-hours allotment.
+///
+/// [`time_entry_line`] followed by ` - {overage}h over the {prepaid}h block`,
+/// or ` - {overage}h past an exhausted block` when nothing of the entry was
+/// covered, so the customer reads why the line is shorter than the entry
+/// and the quantity beside it is the overage alone. The rate is the line's
+/// unit price and is not repeated here. Hours print without trailing zeros
+/// (`2h`, `1.5h`).
+pub fn time_entry_overage_line(
+    date: NaiveDate,
+    work_type: &str,
+    ticket: Option<TicketRef<'_>>,
+    notes: Option<&str>,
+    overage_hours: Decimal,
+    prepaid_hours: Decimal,
+) -> String {
+    let base = time_entry_line(date, work_type, ticket, notes);
+    let over = overage_hours.normalize();
+    if prepaid_hours > Decimal::ZERO {
+        format!(
+            "{base} - {over}h over the {}h block",
+            prepaid_hours.normalize()
+        )
+    } else {
+        format!("{base} - {over}h past an exhausted block")
+    }
+}
+
 /// The first non-blank line of a note, cut to [`MAX_NOTES_CHARS`].
 fn first_line(notes: &str) -> Option<String> {
     let line = notes.lines().map(str::trim).find(|l| !l.is_empty())?;
@@ -93,6 +123,34 @@ mod tests {
         assert_eq!(
             line,
             "2026-08-27 Remote support: T000042 Printer offline - Rebooted the print spooler"
+        );
+    }
+
+    #[test]
+    fn an_overage_line_says_how_much_ran_past_which_block() {
+        let line = time_entry_overage_line(
+            day(),
+            "Remote support",
+            None,
+            Some("Server migration"),
+            Decimal::new(20, 1),
+            Decimal::from(8),
+        );
+        assert_eq!(
+            line,
+            "2026-08-27 Remote support: Server migration - 2h over the 8h block"
+        );
+        let exhausted = time_entry_overage_line(
+            day(),
+            "Remote support",
+            None,
+            None,
+            Decimal::new(15, 1),
+            Decimal::ZERO,
+        );
+        assert_eq!(
+            exhausted,
+            "2026-08-27 Remote support - 1.5h past an exhausted block"
         );
     }
 

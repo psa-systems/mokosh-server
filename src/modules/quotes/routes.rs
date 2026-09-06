@@ -82,22 +82,33 @@ async fn list_quotes(
     State(state): State<QuotesRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
-    Query(mut filter): Query<QuoteFilter>,
+    Query(filter): Query<QuoteFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<QuoteResponse>>> {
     filter.validate()?;
     let tenant = caller.tenant();
-    match &caller {
-        CallerContext::Staff(auth) => assert_staff_billing_finance(auth)?,
+    let today = caller.today(&db).await?;
+    let (quotes, total) = match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+            state
+                .service
+                .list_quotes(tenant, today, &filter, &pagination)
+                .await?
+        }
+        // PMS-1060: the company scope alone handed a contact its company's
+        // drafts. `list_quotes_for_company` is the read the retired portal
+        // router used: the caller's company AND only the issued statuses
+        // (`CLIENT_VISIBLE_STATUSES`), so working state never reaches a
+        // customer.
         CallerContext::Contact(session) => {
             caller.require_capability(caps::QUOTES_READ, &db).await?;
-            filter.company_id = Some(session.company_id);
+            state
+                .service
+                .list_quotes_for_company(tenant, today, session.company_id, &pagination)
+                .await?
         }
-    }
-    let (quotes, total) = state
-        .service
-        .list_quotes(tenant, caller.today(&db).await?, &filter, &pagination)
-        .await?;
+    };
     Ok(Json(PaginatedResponse::from_params(
         quotes,
         &pagination,
@@ -111,24 +122,28 @@ async fn get_quote(
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(quote_id): Path<Uuid>,
 ) -> AppResult<Json<QuoteResponse>> {
-    match &caller {
-        CallerContext::Staff(auth) => assert_staff_billing_finance(auth)?,
-        CallerContext::Contact(_) => {
-            caller.require_capability(caps::QUOTES_READ, &db).await?;
+    let today = caller.today(&db).await?;
+    let quote = match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+            state
+                .service
+                .get_quote(caller.tenant(), quote_id, today)
+                .await?
         }
-    }
-    let quote = state
-        .service
-        .get_quote(caller.tenant(), quote_id, caller.today(&db).await?)
-        .await?;
-    if let CallerContext::Contact(session) = &caller {
         // mokosh-contact-login prompt 008: 404 (not 403) on a foreign
-        // Company so a contact cannot probe for another Company's
-        // quote ids.
-        if quote.company_id != session.company_id {
-            return Err(AppError::NotFound("Quote".to_string()));
+        // Company so a contact cannot probe for another Company's quote
+        // ids. PMS-1060: the same 404 for the caller's own un-issued
+        // quote, so the portal never confirms an internal quote exists;
+        // `get_quote_for_company` is the one place both checks live.
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::QUOTES_READ, &db).await?;
+            state
+                .service
+                .get_quote_for_company(caller.tenant(), today, session.company_id, quote_id)
+                .await?
         }
-    }
+    };
     Ok(Json(quote))
 }
 
@@ -160,23 +175,27 @@ async fn get_quote_pdf(
 ) -> AppResult<axum::response::Response> {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    match &caller {
-        CallerContext::Staff(auth) => assert_staff_billing_finance(auth)?,
-        CallerContext::Contact(_) => {
+    let today = caller.today(&db).await?;
+    // PMS-1060: the contact read is the issued-only, own-company one, so a
+    // draft's document is a 404 for a customer the way the quote itself is.
+    let _quote = match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth)?;
+            state
+                .service
+                .get_quote(caller.tenant(), quote_id, today)
+                .await?
+        }
+        CallerContext::Contact(session) => {
             caller
                 .require_capability(caps::QUOTES_DOWNLOAD_PDF, &db)
                 .await?;
+            state
+                .service
+                .get_quote_for_company(caller.tenant(), today, session.company_id, quote_id)
+                .await?
         }
-    }
-    let quote = state
-        .service
-        .get_quote(caller.tenant(), quote_id, caller.today(&db).await?)
-        .await?;
-    if let CallerContext::Contact(session) = &caller {
-        if quote.company_id != session.company_id {
-            return Err(AppError::NotFound("Quote".to_string()));
-        }
-    }
+    };
     Ok((
         StatusCode::NOT_IMPLEMENTED,
         "quote PDF download is not yet wired; see PMS-936 follow-up",
