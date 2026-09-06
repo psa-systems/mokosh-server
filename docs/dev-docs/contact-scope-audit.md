@@ -76,6 +76,8 @@ endpoint, extend one of these files.
 
 | method path | handler | verdict |
 |---|---|---|
+| GET  /approvals/pending | `pending_for_caller` | SCOPED (`pending_for_contact`: `approver_contact_id = session.id`, pending only; PMS-1084) |
+| POST /approvals/{id}/decision | `decide` | SCOPED (`decide_as_contact`: lookup keyed on `approver_contact_id`, foreign id is a 404, decided once; PMS-1084) |
 | GET  /assets | `list_assets` | SCOPED (force-set `filter.company_id`; rows are `ContactAssetResponse`, PMS-1061) |
 | GET  /assets/{id} | `get_asset` | SCOPED (404 on foreign; `ContactAssetResponse`, PMS-1061) |
 | POST /assets/{id}/report-issue | `report_asset_issue` | SCOPED (portal uses `asset.company_id`) |
@@ -157,6 +159,12 @@ the scoped read + write paths. Together they assert:
 - Staff bearer callers bypass the scope check as designed.
 - A stale JWT that carries a since-revoked cap fails 403 within one
   request (the server DB-loads caps live per prompt 008).
+
+`tests/contact_approvals.rs` (PMS-1084) covers the approvals a staff
+user addresses to a contact: the contact lists exactly those, decides
+each once with the contact recorded, a sibling's, a staff role's and an
+unknown id are 404 alike, staff cannot decide a contact's row, and a
+contact without `approvals:decide` is 403.
 
 `tests/contact_notifications.rs` (PMS-1083) covers the inbox: the
 dispatcher writes the contact's `in_app` row (and none for an opted-out

@@ -30,7 +30,9 @@ use super::models::{
     ApprovalResponse, ApprovalTarget, CreateApprovalRequest, DecideApprovalRequest,
 };
 use super::service::ApprovalsService;
-use crate::modules::auth::{RequireAuth, RequireTimesheets};
+use crate::db::Database;
+use crate::modules::auth::{CallerContext, RequireAuth, RequireCallerContext, RequireTimesheets};
+use crate::modules::contact_portal::capabilities as caps;
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
@@ -220,34 +222,76 @@ async fn create_for_quote(
     Ok(Json(row))
 }
 
+/// PMS-1084: dual-plane. A staff user gets the queue addressed to it
+/// by id or by role, as before; a contact holding `approvals:decide`
+/// (DB-loaded per request) gets the pending rows addressed to it by
+/// `approver_contact_id`. Same shape on both arms, so the SPA's one
+/// queue page serves both.
 async fn pending_for_caller(
     State(s): State<ApprovalsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
 ) -> AppResult<Json<Vec<ApprovalResponse>>> {
-    // CurrentUser carries a single role; pass it as a one-element list
-    // so the service stays role-source-agnostic and a future
-    // multi-role identity can pass the full set without a signature
-    // change.
-    let roles = vec![u.role.as_str().to_string()];
-    let rows = s
-        .service
-        .pending_for_user(u.tenant_id, u.id, &roles)
-        .await?;
+    let rows = match &caller {
+        CallerContext::Staff(auth) => {
+            let u = staff_user(auth)?;
+            // CurrentUser carries a single role; pass it as a one-element
+            // list so the service stays role-source-agnostic and a future
+            // multi-role identity can pass the full set without a
+            // signature change.
+            let roles = vec![u.role.as_str().to_string()];
+            s.service
+                .pending_for_user(u.tenant_id, u.id, &roles)
+                .await?
+        }
+        CallerContext::Contact(session) => {
+            caller
+                .require_capability(caps::APPROVALS_DECIDE, &db)
+                .await?;
+            s.service
+                .pending_for_contact(session.tenant_id, session.id)
+                .await?
+        }
+    };
     Ok(Json(rows))
 }
 
+/// PMS-1084: dual-plane, the same split as `pending_for_caller`. The
+/// contact arm decides only a row addressed to the contact; anything
+/// else is a 404.
 async fn decide(
     State(s): State<ApprovalsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(id): Path<Uuid>,
     Json(req): Json<DecideApprovalRequest>,
 ) -> AppResult<Json<ApprovalResponse>> {
     req.validate().map_err(AppError::from)?;
-    let row = s
-        .service
-        .decide(u.tenant_id, id, u.id, u.role.as_str(), req)
-        .await?;
+    let row = match &caller {
+        CallerContext::Staff(auth) => {
+            let u = staff_user(auth)?;
+            s.service
+                .decide(u.tenant_id, id, u.id, u.role.as_str(), req)
+                .await?
+        }
+        CallerContext::Contact(session) => {
+            caller
+                .require_capability(caps::APPROVALS_DECIDE, &db)
+                .await?;
+            s.service
+                .decide_as_contact(session.tenant_id, id, session.id, req)
+                .await?
+        }
+    };
     Ok(Json(row))
+}
+
+/// The staff arm of a dual-plane approval route keeps the surface
+/// `RequireAuth` gave it: an authenticated staff user, else 401.
+fn staff_user(
+    auth: &crate::modules::auth::AuthState,
+) -> AppResult<&crate::modules::auth::CurrentUser> {
+    auth.user.as_ref().ok_or(AppError::Unauthorized)
 }
 
 async fn cancel(
