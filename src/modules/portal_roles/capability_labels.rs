@@ -55,6 +55,12 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
             description: "Ask your MSP for formal approval on a ticket (e.g. approve out-of-scope work, sign off on a resolution).".to_string(),
         },
         CapabilityDescriptor {
+            key: caps::APPROVALS_DECIDE.to_string(),
+            label: "Decide approvals".to_string(),
+            group: "Approvals".to_string(),
+            description: "See the approvals your MSP has addressed to you and approve or reject each one (e.g. sign off on a change request or on out-of-scope work).".to_string(),
+        },
+        CapabilityDescriptor {
             key: caps::INVOICES_READ.to_string(),
             label: "View invoices".to_string(),
             group: "Invoices".to_string(),
