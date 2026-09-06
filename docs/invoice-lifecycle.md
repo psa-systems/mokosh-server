@@ -27,8 +27,20 @@ Because the status transition to `void` also flows through `update_invoice`, thi
 ## What each state can do
 
 - `draft` / `pending` (editable): edit header and lines, Send (-> `sent`, subject to the recipient precondition below), or Void (-> `void`). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
-- `sent` / `partially_paid` (collectible): the only action is Record Payment, which runs through `record_payment` (a separate path, not `update_invoice`) and advances the status `sent` -> `partially_paid` -> `paid` as the balance is collected.
-- `paid` / `void` / `written_off` (terminal): no further lifecycle actions.
+- `sent` / `partially_paid` (collectible): Record Payment, which runs through `record_payment` (a separate path, not `update_invoice`) and advances the status `sent` -> `partially_paid` -> `paid` as the balance is collected; Credit (a credit note, PMS-953); or Write off (PMS-1036, below).
+- `paid` / `void` / `written_off` (terminal): no further lifecycle actions. A payment recorded against a `written_off` invoice is a recovery: it is kept and the status stands.
+
+## Writing off, distinct from crediting (PMS-1036)
+
+`POST /invoices/{id}/write-off` with `{ reason }` (required) moves a `sent` or `partially_paid` invoice to `written_off` and records `written_off_at`, `written_off_by_id`, `write_off_reason` and `write_off_amount`, the balance at that moment, frozen. Finance only, like every other write to an issued document. `draft` (delete it), `paid`, `void` and `written_off` are refused with a 409 naming the status. There is no reversal.
+
+A credit note says the customer did not owe this and reduces revenue. A write-off says the customer owes it and will not pay: a bad-debt expense. The books treat them differently, so `balance_due` is left exactly as it was (the debt was not forgiven), the online payment path refuses the invoice the way it refuses `void`, and `recompute_invoice_balance` keeps the status standing through any later payment or credit (its status CASE reads `written_off_at` first). The statement (PMS-954) lists a written-off invoice under its own `write_offs` line kind, dated by the write-off and carrying the frozen amount, and takes `total_written_off` out of the closing balance: the customer is no longer asked to settle it, and a period that closed before the write-off is not rewritten by it.
+
+## Overdue and reminders (PMS-1037)
+
+Overdue is derived on every read, never stored: `is_overdue` and `days_overdue` on `InvoiceResponse` are `status IN ('sent', 'partially_paid') AND balance_due > 0 AND due_date < today`, computed in the tenant's day (`read_tenant_zone`, PMS-1030), and `GET /invoices?overdue=true` filters on the same predicate. A stored flag would be a second home for a fact `due_date` and `balance_due` already hold, and the only one that could be stale.
+
+Reminders are a worker. `InvoiceReminderWorker` runs hourly; for each tenant with `billing_reminders/enabled` and a `schedule` (day offsets such as `[3, 7, 14, 30]`), at the tenant's local `send_hour` (default 8), it mails every overdue invoice whose `days_overdue` equals a step, to the address the invoice was emailed to (PMS-992) else the resolved billing contact (PMS-993), with the stored document attached (PMS-959) and the pay link when a gateway is connected. `invoice_reminders` records each send per invoice per step and is the idempotency guard, so a run that fires twice in the hour sends once; a refused send releases the claim so the next run tries again. Late fees are deliberately not here: a fee is a new line on a new document, and its own ticket.
 
 ## Sending requires a recipient
 
