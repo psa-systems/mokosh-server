@@ -415,7 +415,7 @@ impl TeamsService {
         let rows: Vec<TeamMemberJoinRow> = sqlx::query_as(
             r#"
             SELECT tm.user_id, u.email, u.first_name, u.last_name, u.avatar_url,
-                   tm.role, tm.joined_at
+                   tm.role, tm.created_at AS joined_at
             FROM team_members tm
             JOIN users u ON u.id = tm.user_id AND u.tenant_id = tm.tenant_id
             WHERE tm.tenant_id = $1 AND tm.team_id = $2
@@ -463,8 +463,8 @@ impl TeamsService {
     // ------------------------------------------------------------------
 
     /// Add a member. `user_id` must be a user in the SAME tenant (F1).
-    /// PK on `(tenant_id, team_id, user_id)` guarantees uniqueness; a
-    /// concurrent duplicate INSERT surfaces as 409 via `map_pg_error`.
+    /// `UNIQUE (team_id, user_id)` guarantees uniqueness; a concurrent
+    /// duplicate INSERT surfaces as a 409 from the 23505 arm below.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, team_id = %team_id))]
     pub async fn add_member(
         &self,
@@ -493,26 +493,38 @@ impl TeamsService {
             return Err(AppError::NotFound("Team".to_string()));
         }
 
-        let insert = sqlx::query(
+        // PMS-1039: `joined_at` is not a column. `team_members` rows are
+        // written once when a member joins and afterwards only ever UPDATEd
+        // to change `role`, so `created_at` already holds that fact and the
+        // INSERT takes its default; every read aliases it back to the wire
+        // name. RETURNING it means the response carries the stored value
+        // rather than a Rust-side `Utc::now()` approximation of it.
+        let insert = sqlx::query_scalar::<_, DateTime<Utc>>(
             r#"
-            INSERT INTO team_members (tenant_id, team_id, user_id, role, joined_at)
-            VALUES ($1, $2, $3, $4, NOW())
+            INSERT INTO team_members (tenant_id, team_id, user_id, role)
+            VALUES ($1, $2, $3, $4)
+            RETURNING created_at
             "#,
         )
         .bind(*tenant_id)
         .bind(team_id)
         .bind(request.user_id)
         .bind(role)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await;
 
-        match insert {
-            Ok(_) => {}
+        let joined_at = match insert {
+            Ok(created_at) => created_at,
+            // Deliberate suppression (error-visibility rule §4): 23505 here is
+            // only ever the `UNIQUE(team_id, user_id)` duplicate, and the 409
+            // states that cause in full, so the sqlx error carries nothing the
+            // caller does not already get. Every other code falls through to
+            // the shared mapping, which logs the Postgres message at `error`.
             Err(sqlx::Error::Database(dbe)) if dbe.code().as_deref() == Some("23505") => {
                 return Err(AppError::conflict("User is already a member of this team"));
             }
             Err(e) => return Err(e.into()),
-        }
+        };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(tm) FROM team_members tm \
@@ -541,7 +553,7 @@ impl TeamsService {
             team_id,
             user_id: request.user_id,
             role: role.to_string(),
-            joined_at: Utc::now(),
+            joined_at,
         })
     }
 
@@ -609,7 +621,7 @@ impl TeamsService {
         // rows against the row we just committed.
         let mut read_tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: TeamMemberRow = sqlx::query_as(
-            "SELECT tenant_id, team_id, user_id, role, joined_at \
+            "SELECT tenant_id, team_id, user_id, role, created_at AS joined_at \
              FROM team_members WHERE tenant_id = $1 AND team_id = $2 AND user_id = $3",
         )
         .bind(*tenant_id)
