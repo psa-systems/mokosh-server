@@ -73,6 +73,40 @@ impl KbService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// PMS-1082: the contact arm of `GET /kb/categories`. A category
+    /// carries no Company scope, so the rule is only that an
+    /// `internal` category stays with the staff; the articles under a
+    /// visible category are still filtered one by one by
+    /// [`Self::list_articles_for_contact`].
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_categories_for_contact(
+        &self,
+        tenant_id: TenantId,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<KbCategoryResponse>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM kb_categories \
+             WHERE tenant_id = $1 AND visibility <> 'internal'",
+        )
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let rows = sqlx::query_as::<_, CatRow>(
+            r#"SELECT id, name, description, parent_id, slug, visibility, sort_order
+               FROM kb_categories WHERE tenant_id = $1 AND visibility <> 'internal'
+               ORDER BY sort_order, name
+               LIMIT $2 OFFSET $3"#,
+        )
+        .bind(tenant_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_category(
         &self,
@@ -206,8 +240,63 @@ impl KbService {
         filter: &KbArticleFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
+        self.list_articles_in_scope(tenant_id, filter, pagination, KbReadScope::Staff)
+            .await
+    }
+
+    /// PMS-1082: the contact arm of `GET /kb/articles`. The same
+    /// builder as the staff list (so `category_id` and `q` behave the
+    /// same for a customer), with the portal visibility rule appended
+    /// as a fixed condition: `status = 'published'` AND (`public` OR
+    /// `client_specific` naming the caller's Company). The caller's
+    /// `status` and `visibility` filters are IGNORED here rather than
+    /// ANDed in, because a contact must not be able to ask for drafts
+    /// or internal articles and get an honest "none" back that a
+    /// second query could then widen; the scope is the session's, not
+    /// the request's.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn list_articles_for_contact(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        filter: &KbArticleFilter,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
+        let filter = KbArticleFilter {
+            category_id: filter.category_id,
+            q: filter.q.clone(),
+            status: None,
+            visibility: None,
+        };
+        self.list_articles_in_scope(
+            tenant_id,
+            &filter,
+            pagination,
+            KbReadScope::Contact { company_id },
+        )
+        .await
+    }
+
+    async fn list_articles_in_scope(
+        &self,
+        tenant_id: TenantId,
+        filter: &KbArticleFilter,
+        pagination: &PaginationParams,
+        scope: KbReadScope,
+    ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
         let mut conditions = vec!["tenant_id = $1".to_string()];
         let mut idx = 2;
+        let scope_company = match scope {
+            KbReadScope::Staff => None,
+            KbReadScope::Contact { company_id } => {
+                conditions.push(format!(
+                    "status = 'published' AND (visibility = 'public' \
+                     OR (visibility = 'client_specific' AND ${idx} = ANY(company_ids)))"
+                ));
+                idx += 1;
+                Some(company_id)
+            }
+        };
         if filter.category_id.is_some() {
             conditions.push(format!("category_id = ${idx}"));
             idx += 1;
@@ -258,6 +347,10 @@ impl KbService {
         let count_query = format!("SELECT COUNT(*) FROM kb_articles WHERE {where_clause}");
         let mut q = sqlx::query_as::<_, ArticleRow>(&query).bind(tenant_id);
         let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
+        if let Some(v) = scope_company {
+            q = q.bind(v);
+            cq = cq.bind(v);
+        }
         if let Some(v) = filter.category_id {
             q = q.bind(v);
             cq = cq.bind(v);
@@ -1010,13 +1103,13 @@ impl KbService {
 
     /// Portal feed for a specific customer contact (PMS-84 / PMS-32).
     ///
-    /// This is the contact-facing query and the only portal-visible feed:
-    /// a `client_specific` article is only
-    /// returned when the caller's `company_id` is listed in the article's
-    /// `company_ids` array. `public` articles are always included. The
-    /// `company_id` is taken from the authenticated portal contact's JWT
-    /// claim (`CurrentContact.company_id`), so the scoping cannot be
-    /// widened by the client.
+    /// The contact-facing visibility rule with no other filter: a
+    /// `client_specific` article is only returned when the caller's
+    /// `company_id` is listed in its `company_ids`, a `public` one is
+    /// always included, and only `published` rows qualify. Since
+    /// PMS-1082 this is [`Self::list_articles_for_contact`] with an
+    /// empty filter, which is what the dual-plane route serves; the
+    /// `company_id` comes from the contact session, never the request.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
     pub async fn list_portal_articles_for_company(
         &self,
@@ -1024,40 +1117,13 @@ impl KbService {
         company_id: Uuid,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<KbArticleResponse>, u64)> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let total: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM kb_articles
-               WHERE tenant_id = $1 AND status = 'published'
-                 AND (
-                       visibility = 'public'
-                    OR (visibility = 'client_specific' AND $2 = ANY(company_ids))
-                 )"#,
+        self.list_articles_for_contact(
+            tenant_id,
+            company_id,
+            &KbArticleFilter::default(),
+            pagination,
         )
-        .bind(tenant_id)
-        .bind(company_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        let rows = sqlx::query_as::<_, ArticleRow>(
-            r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
-                      author_id, view_count, helpful_count, not_helpful_count,
-                      published_at, tags, company_ids, created_at, updated_at
-               FROM kb_articles
-               WHERE tenant_id = $1 AND status = 'published'
-                 AND (
-                       visibility = 'public'
-                    OR (visibility = 'client_specific' AND $2 = ANY(company_ids))
-                 )
-               ORDER BY updated_at DESC
-               LIMIT $3 OFFSET $4"#,
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(&mut *tx)
-        .await?;
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+        .await
     }
 
     /// PMS-485: list KB articles ordered by how many tickets cite them
@@ -1098,6 +1164,15 @@ impl KbService {
             })
             .collect())
     }
+}
+
+/// PMS-1082: who is reading the article list. A staff reader sees the
+/// tenant's whole catalogue subject to the request's filters; a contact
+/// sees the published, Company-visible slice regardless of them.
+#[derive(Debug, Clone, Copy)]
+enum KbReadScope {
+    Staff,
+    Contact { company_id: Uuid },
 }
 
 #[derive(sqlx::FromRow)]
