@@ -81,11 +81,64 @@ pub struct ContactLoginRequest {
     #[validate(length(min = 1, message = "password is required"))]
     pub password: String,
     /// TOTP code, sent on the second attempt after a `mfa_required`
-    /// response. `contact.portal_mfa_secret` verifies it. Optional
-    /// today (MFA is off by default on contacts); reserved for a
-    /// follow-up ticket that adds the enrol flow.
+    /// response. Verified against `contacts.portal_mfa_secret` when
+    /// `portal_mfa_enabled` is set (PMS-1063); ignored otherwise.
     #[serde(default)]
     pub mfa_code: Option<String>,
+    /// One of the single-use recovery codes handed out when MFA was
+    /// enabled, for a contact whose authenticator is gone. Wins over
+    /// `mfa_code` when both are present, so an SPA that still sends an
+    /// empty `mfa_code` cannot block the recovery path (PMS-1063).
+    #[serde(default)]
+    pub recovery_code: Option<String>,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/setup` body. The
+/// current password is required so a stolen access token cannot
+/// enrol an attacker's authenticator on the customer's account.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactMfaSetupRequest {
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/setup` response. The
+/// base32 secret is shown for manual entry and the `otpauth://` URI is
+/// rendered as a QR code; neither is ever returned again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactMfaSetupResponse {
+    pub secret: String,
+    pub provisioning_uri: String,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/enable` body. Proves
+/// possession of the authenticator with one live code, and re-proves
+/// the password so an enrolment started with a stolen token cannot be
+/// finished with it either.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactMfaEnableRequest {
+    #[validate(length(min = 6, max = 8, message = "code must be 6-8 digits"))]
+    pub code: String,
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/enable` response. The
+/// recovery codes are surfaced once; only their hashes are stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactMfaEnableResponse {
+    pub recovery_codes: Vec<String>,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/disable` body. Needs
+/// the current password AND a live code (or a recovery code) so a
+/// stolen access token cannot quietly remove the second factor.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactMfaDisableRequest {
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+    #[validate(length(min = 6, max = 20, message = "code is required"))]
+    pub code: String,
 }
 
 /// Response body for `POST /api/v1/contact/auth/login` +

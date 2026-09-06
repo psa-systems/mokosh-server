@@ -259,7 +259,7 @@ test:
 # Run the Postgres-backed integration suite in the dev compose `server` container.
 [group: 'test']
 test-integration: ensure-env
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --tests -- --test-threads=4'
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --tests --no-fail-fast -- --test-threads=4'
 
 # Verify the demo-critical path only: demo-data seeding (seed_demo) and the
 # tenant import/export round-trip (data_transfer). A fast, targeted subset of

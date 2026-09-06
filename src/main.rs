@@ -699,6 +699,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway_credential_mover,
         std::time::Duration::from_secs(3600),
     );
+    // PMS-1037: overdue invoice reminders, hourly so each tenant's local
+    // sending hour is hit once a day. Built with delivery (the mailer and the
+    // portal origin) because it mails, unlike the recurring generator above.
+    let invoice_reminder_worker = mokosh_server::modules::billing::InvoiceReminderWorker::new(
+        mokosh_server::modules::billing::BillingService::with_delivery(
+            db.clone(),
+            encryption_key,
+            mailer.clone(),
+            config.spa_base_url.clone(),
+            secrets.clone(),
+        ),
+    );
+    scheduler.register(
+        invoice_reminder_worker,
+        std::time::Duration::from_secs(3600),
+    );
 
     let _scheduler_handles = scheduler.start();
 

@@ -271,6 +271,9 @@ async fn seed_invoice_on_company(pool: &PgPool, tenant_id: Uuid, company_id: Uui
     id
 }
 
+/// An ISSUED quote (`sent`): since PMS-1060 a contact's read is limited to
+/// the issued statuses, so a draft here would be a 404 before any
+/// capability check and the cap matrix below would not be exercised.
 async fn seed_quote_on_company(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -280,8 +283,8 @@ async fn seed_quote_on_company(
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO quotes (id, tenant_id, quote_number, company_id, title, status, \
-         valid_until, subtotal, tax_amount, total, currency, requested_by_id) \
-         VALUES ($1, $2, $3, $4, $5, 'draft', CURRENT_DATE + 30, 100, 0, 100, 'USD', $6)",
+         valid_until, subtotal, tax_amount, total, currency, requested_by_id, sent_at) \
+         VALUES ($1, $2, $3, $4, $5, 'sent', CURRENT_DATE + 30, 100, 0, 100, 'USD', $6, NOW())",
     )
     .bind(id)
     .bind(tenant_id)
