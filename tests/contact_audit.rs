@@ -317,3 +317,84 @@ async fn mfa_setup_enable_disable_write_rows(pool: PgPool) {
     assert_eq!(disable.status(), reqwest::StatusCode::NO_CONTENT);
     assert_one(&pool, contact.id, "portal.mfa_disabled", "update").await;
 }
+
+// Signing out another browser (PMS-1085) writes a row on the contact
+// who revoked; the refused own-session delete and an id that is not
+// the caller's write nothing.
+#[sqlx::test]
+async fn revoking_another_session_writes_a_row(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "revoke@example.com").await;
+    let app = common::boot(pool.clone()).await;
+    let first = common::contact_login(&app, &contact).await;
+    let second = common::contact_login(&app, &contact).await;
+    let access = second["access_token"].as_str().unwrap();
+
+    let listed: Vec<serde_json::Value> = app
+        .client
+        .get(app.url("/api/v1/contact/auth/me/sessions"))
+        .bearer_auth(access)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let own = listed
+        .iter()
+        .find(|s| s["current"] == true)
+        .and_then(|s| s["id"].as_str())
+        .unwrap()
+        .to_string();
+    let other = listed
+        .iter()
+        .find(|s| s["current"] == false)
+        .and_then(|s| s["id"].as_str())
+        .unwrap()
+        .to_string();
+
+    let refused = app
+        .client
+        .delete(app.url(&format!("/api/v1/contact/auth/me/sessions/{own}")))
+        .bearer_auth(access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    let unknown = app
+        .client
+        .delete(app.url(&format!(
+            "/api/v1/contact/auth/me/sessions/{}",
+            Uuid::new_v4()
+        )))
+        .bearer_auth(access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(rows(&pool, contact.id, "portal.session_revoked")
+        .await
+        .is_empty());
+
+    let revoked = app
+        .client
+        .delete(app.url(&format!("/api/v1/contact/auth/me/sessions/{other}")))
+        .bearer_auth(access)
+        .header("User-Agent", "audit-suite/1.0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), reqwest::StatusCode::NO_CONTENT);
+    let row = assert_one(&pool, contact.id, "portal.session_revoked", "logout").await;
+    assert_eq!(row.4.as_deref(), Some("audit-suite/1.0"));
+    assert!(row.3.is_some(), "client ip on the row");
+
+    // The revoked browser is out; the caller is still in.
+    let dead = app
+        .client
+        .post(app.url("/api/v1/contact/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": first["refresh_token"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dead.status(), reqwest::StatusCode::UNAUTHORIZED);
+}

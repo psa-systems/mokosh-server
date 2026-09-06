@@ -2014,6 +2014,8 @@ impl ContactAuthService {
         contact_id: Uuid,
         current_sid: Uuid,
         family_id: Uuid,
+        user_agent: Option<&str>,
+        ip: Option<IpAddr>,
     ) -> AppResult<()> {
         if self.family_of_session(tenant_id, current_sid).await? == Some(family_id) {
             return Err(AppError::BadRequest(
@@ -2032,7 +2034,19 @@ impl ContactAuthService {
         if !owns {
             return Ok(());
         }
-        self.revoke_session_family(family_id).await
+        self.revoke_session_family(family_id).await?;
+        // PMS-1089: the row names the contact who revoked, not the
+        // family that died; the family id rides in the tracing span.
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Logout,
+            "portal.session_revoked",
+            user_agent,
+            ip,
+        )
+        .await;
+        Ok(())
     }
 
     /// PMS-1063: start MFA enrolment. Stages a fresh TOTP secret on the
