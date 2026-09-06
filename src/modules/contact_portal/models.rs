@@ -318,6 +318,15 @@ pub struct LoginLinkRedeemOutcome {
 pub struct ContactRedeemLoginLinkRequest {
     #[validate(length(min = 1, message = "token is required"))]
     pub token: String,
+    /// PMS-1077: the second POST for a contact with MFA on carries the
+    /// same token plus the TOTP code; the first POST answered
+    /// `mfa_required: true` and left the link live.
+    #[serde(default)]
+    pub mfa_code: Option<String>,
+    /// PMS-1077: a single-use recovery code instead of the TOTP, the
+    /// same rule as the password login (wins when both are sent).
+    #[serde(default)]
+    pub recovery_code: Option<String>,
 }
 
 // MAPPS-637: `LoginLinkCandidates`, `LoginLinkCandidate`,
