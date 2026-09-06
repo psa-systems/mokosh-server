@@ -12,7 +12,11 @@ use validator::Validate;
 
 use super::models::*;
 use super::service::NotificationsService;
-use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
+use crate::db::Database;
+use crate::modules::auth::{
+    CallerContext, RequireAdmin, RequireAuth, RequireCallerContext, TenantScoped,
+};
+use crate::modules::contact_portal::capabilities as caps;
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
@@ -196,12 +200,32 @@ async fn upsert_user_pref(
     ))
 }
 
+/// PMS-1083: dual-plane. A staff user reads the rows against its
+/// `user_id`, a contact holding `notifications:read` (DB-loaded per
+/// request) the rows against its `contact_id`; the two never share a
+/// row, so neither arm can see the other's inbox. Same envelope and
+/// item shape on both, which is what the SPA's bell reads.
 async fn list_inbox(
     State(s): State<NotificationsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationInboxItemResponse>>> {
-    let (items, total) = s.service.list_inbox(u.tenant(), u.id, &pagination).await?;
+    let tenant = caller.tenant();
+    let (items, total) = match &caller {
+        CallerContext::Staff(auth) => {
+            let user = staff_user(auth)?;
+            s.service.list_inbox(tenant, user.id, &pagination).await?
+        }
+        CallerContext::Contact(session) => {
+            caller
+                .require_capability(caps::NOTIFICATIONS_READ, &db)
+                .await?;
+            s.service
+                .list_inbox_for_contact(tenant, session.id, &pagination)
+                .await?
+        }
+    };
     Ok(Json(PaginatedResponse::from_params(
         items,
         &pagination,
@@ -209,12 +233,39 @@ async fn list_inbox(
     )))
 }
 
+/// PMS-1083: dual-plane, the same split as `list_inbox`. A row that is
+/// not the caller's own is a 404 on both arms.
 async fn mark_read(
     State(s): State<NotificationsRouterState>,
-    RequireAuth(u): RequireAuth,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.mark_read(u.tenant(), u.id, id).await
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            let user = staff_user(auth)?;
+            s.service.mark_read(tenant, user.id, id).await
+        }
+        CallerContext::Contact(session) => {
+            caller
+                .require_capability(caps::NOTIFICATIONS_READ, &db)
+                .await?;
+            s.service
+                .mark_read_for_contact(tenant, session.id, id)
+                .await
+        }
+    }
+}
+
+/// The staff arm of a dual-plane inbox read keeps the surface
+/// `RequireAuth` gave it: an authenticated staff user, else 401.
+fn staff_user(
+    auth: &crate::modules::auth::AuthState,
+) -> AppResult<&crate::modules::auth::CurrentUser> {
+    auth.user
+        .as_ref()
+        .ok_or(crate::utils::error::AppError::Unauthorized)
 }
 
 async fn list_rules(
