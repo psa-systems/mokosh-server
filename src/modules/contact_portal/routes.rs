@@ -58,6 +58,12 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         // MAPPS-636 removed the picker for. A caller who hits this
         // URL now 404s.
         .route("/auth/me", get(me).put(update_me))
+        // PMS-1063: MFA enrolment and removal, behind the session AND
+        // the current password (setup, enable, disable all re-verify
+        // it), the shape the retired portal had at /portal/auth/me/mfa/*.
+        .route("/auth/me/mfa/setup", post(mfa_setup))
+        .route("/auth/me/mfa/enable", post(mfa_enable))
+        .route("/auth/me/mfa/disable", post(mfa_disable))
         // MAPPS-618 (mokosh-branding prompt 002): contact-plane brand
         // editor. Gated on `settings:manage_company_branding`; server
         // derives the target Company from the caller's session, so a
@@ -136,6 +142,7 @@ async fn login(
             &request.email,
             &request.password,
             request.mfa_code.as_deref(),
+            request.recovery_code.as_deref(),
             ua.as_deref(),
             Some(addr.ip()),
         )
@@ -285,6 +292,63 @@ async fn me(
 ) -> AppResult<Json<ContactMe>> {
     let me = state.service.me(session.tenant_id, session.id).await?;
     Ok(Json(me))
+}
+
+/// PMS-1063: start MFA enrolment. Mints a fresh TOTP secret onto the
+/// contact row without flipping `portal_mfa_enabled`; the response
+/// carries the base32 secret and the `otpauth://` URI for a QR code.
+async fn mfa_setup(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Json(request): Json<ContactMfaSetupRequest>,
+) -> AppResult<Json<ContactMfaSetupResponse>> {
+    request.validate()?;
+    let resp = state
+        .service
+        .start_mfa_enrollment(session.tenant_id, session.id, &request.current_password)
+        .await?;
+    Ok(Json(resp))
+}
+
+/// PMS-1063: finish MFA enrolment. Verifies one live code against the
+/// staged secret, flips `portal_mfa_enabled`, and returns the recovery
+/// codes once.
+async fn mfa_enable(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Json(request): Json<ContactMfaEnableRequest>,
+) -> AppResult<Json<ContactMfaEnableResponse>> {
+    request.validate()?;
+    let resp = state
+        .service
+        .enable_mfa(
+            session.tenant_id,
+            session.id,
+            &request.code,
+            &request.current_password,
+        )
+        .await?;
+    Ok(Json(resp))
+}
+
+/// PMS-1063: remove MFA. Needs the current password and a live code
+/// or a recovery code; clears the secret and the recovery codes.
+async fn mfa_disable(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Json(request): Json<ContactMfaDisableRequest>,
+) -> AppResult<StatusCode> {
+    request.validate()?;
+    state
+        .service
+        .disable_mfa(
+            session.tenant_id,
+            session.id,
+            &request.current_password,
+            &request.code,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// PMS-935: contact profile self-edit. Gated on

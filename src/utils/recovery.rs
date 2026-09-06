@@ -45,6 +45,20 @@ pub fn hash_code(code: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// [`hash_code`] as lowercase hex, the form both `users` and `contacts`
+/// keep in their `TEXT[]` recovery-code columns (PMS-1063: one
+/// definition, so the staff and contact planes cannot drift on how a
+/// code is stored).
+pub fn hash_code_hex(code: &str) -> String {
+    let raw = hash_code(code);
+    let mut out = String::with_capacity(raw.len() * 2);
+    for b in raw {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
