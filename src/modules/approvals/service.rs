@@ -37,11 +37,15 @@ struct ApprovalRow {
     approver_user_id: Option<Uuid>,
     approver_user_name: Option<String>,
     approver_role: Option<String>,
+    approver_contact_id: Option<Uuid>,
+    approver_contact_name: Option<String>,
     status: String,
     notes: Option<String>,
     decision_notes: Option<String>,
     decided_by_id: Option<Uuid>,
     decided_by_name: Option<String>,
+    decided_by_contact_id: Option<Uuid>,
+    decided_by_contact_name: Option<String>,
     requested_at: DateTime<Utc>,
     decided_at: Option<DateTime<Utc>>,
 }
@@ -62,11 +66,15 @@ impl From<ApprovalRow> for ApprovalResponse {
             approver_user_id: r.approver_user_id,
             approver_user_name: r.approver_user_name,
             approver_role: r.approver_role,
+            approver_contact_id: r.approver_contact_id,
+            approver_contact_name: r.approver_contact_name,
             status: r.status,
             notes: r.notes,
             decision_notes: r.decision_notes,
             decided_by_id: r.decided_by_id,
             decided_by_name: r.decided_by_name,
+            decided_by_contact_id: r.decided_by_contact_id,
+            decided_by_contact_name: r.decided_by_contact_name,
             requested_at: r.requested_at,
             decided_at: r.decided_at,
         }
@@ -82,9 +90,14 @@ const SELECT_FIELDS: &str = "
     NULLIF(TRIM(CONCAT(rbc.first_name, ' ', rbc.last_name)), '') AS requested_by_contact_name,
     a.approver_user_id,
     NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS approver_user_name,
-    a.approver_role, a.status, a.notes, a.decision_notes,
+    a.approver_role,
+    a.approver_contact_id,
+    NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS approver_contact_name,
+    a.status, a.notes, a.decision_notes,
     a.decided_by_id,
     NULLIF(TRIM(CONCAT(db.first_name, ' ', db.last_name)), '') AS decided_by_name,
+    a.decided_by_contact_id,
+    NULLIF(TRIM(CONCAT(dbc.first_name, ' ', dbc.last_name)), '') AS decided_by_contact_name,
     CASE a.target
         WHEN 'ticket' THEN t.ticket_number
         WHEN 'quote' THEN q.quote_number
@@ -114,7 +127,9 @@ const SELECT_JOINS: &str = "
     LEFT JOIN users rb ON rb.id = a.requested_by_id
     LEFT JOIN contacts rbc ON rbc.id = a.requested_by_contact_id
     LEFT JOIN users au ON au.id = a.approver_user_id
+    LEFT JOIN contacts ac ON ac.id = a.approver_contact_id
     LEFT JOIN users db ON db.id = a.decided_by_id
+    LEFT JOIN contacts dbc ON dbc.id = a.decided_by_contact_id
     LEFT JOIN tickets t
            ON a.target = 'ticket' AND t.id = a.entity_id AND t.tenant_id = a.tenant_id
     LEFT JOIN change_requests cr
@@ -198,6 +213,32 @@ impl ApprovalsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// PMS-1084: the contact arm of `GET /approvals/pending`. Only the
+    /// rows addressed to this contact (`approver_contact_id`), pending
+    /// only, the same shape and order as the staff queue so the SPA's
+    /// one page serves both planes. The contact id comes from the
+    /// session, never from the request.
+    pub async fn pending_for_contact(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<Vec<ApprovalResponse>> {
+        let q = format!(
+            "SELECT {SELECT_FIELDS} \
+             FROM ticket_approvals a {SELECT_JOINS} \
+             WHERE a.tenant_id = $1 AND a.status = 'pending' \
+               AND a.approver_contact_id = $2 \
+             ORDER BY a.requested_at ASC",
+        );
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = sqlx::query_as::<_, ApprovalRow>(&q)
+            .bind(tenant_id)
+            .bind(contact_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// PMS-937: contact-initiated approval request against a ticket.
     /// The route layer enforces cap gate + Company-scope before
     /// calling in - this service trusts the ticket and writes the row.
@@ -268,6 +309,7 @@ impl ApprovalsService {
             CreateApprovalRequest {
                 approver_user_id: None,
                 approver_role: Some("admin".to_string()),
+                approver_contact_id: None,
                 notes: Some(note),
             },
         )
@@ -289,11 +331,12 @@ impl ApprovalsService {
         requested_by_id: Uuid,
         req: CreateApprovalRequest,
     ) -> AppResult<ApprovalResponse> {
-        let by_user = req.approver_user_id.is_some();
-        let by_role = req.approver_role.is_some();
-        if by_user == by_role {
+        let approver_kinds = usize::from(req.approver_user_id.is_some())
+            + usize::from(req.approver_role.is_some())
+            + usize::from(req.approver_contact_id.is_some());
+        if approver_kinds != 1 {
             return Err(AppError::BadRequest(
-                "Set exactly one of approver_user_id or approver_role".into(),
+                "Set exactly one of approver_user_id, approver_role or approver_contact_id".into(),
             ));
         }
         let legacy_ticket_id: Option<Uuid> = match target {
@@ -301,11 +344,30 @@ impl ApprovalsService {
             _ => None,
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1084: a contact approver must be a portal user of this
+        // tenant. Checked here rather than left to the FK, because the
+        // FK bypasses RLS and would let a foreign tenant's contact id
+        // link silently (the PMS-333 reason).
+        if let Some(contact_id) = req.approver_contact_id {
+            let ok: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM contacts \
+                 WHERE id = $1 AND tenant_id = $2 AND is_portal_user = TRUE)",
+            )
+            .bind(contact_id)
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !ok {
+                return Err(AppError::BadRequest(
+                    "approver_contact_id is not a portal contact of this tenant".into(),
+                ));
+            }
+        }
         let insert = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO ticket_approvals \
                  (tenant_id, target, entity_id, ticket_id, requested_by_id, \
-                  approver_user_id, approver_role, notes) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                  approver_user_id, approver_role, approver_contact_id, notes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              RETURNING id",
         )
         .bind(tenant_id)
@@ -315,6 +377,7 @@ impl ApprovalsService {
         .bind(requested_by_id)
         .bind(req.approver_user_id)
         .bind(&req.approver_role)
+        .bind(req.approver_contact_id)
         .bind(&req.notes)
         .fetch_one(&mut *tx)
         .await?;
@@ -396,6 +459,75 @@ impl ApprovalsService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        self.get(tenant_id, id).await
+    }
+
+    /// PMS-1084: the contact arm of `POST /approvals/{id}/decision`.
+    /// The lookup is keyed on `approver_contact_id`, so a row that is
+    /// not addressed to this contact (another contact's, a staff
+    /// user's, an unknown id) is a 404 and never a 403: the route
+    /// confirms nothing about an approval the contact cannot see. An
+    /// already-decided row answers the same 400 the staff arm gives.
+    /// The decision records `decided_by_contact_id` (migration 197)
+    /// and writes a `portal.approval_{status}` audit row.
+    pub async fn decide_as_contact(
+        &self,
+        tenant_id: Uuid,
+        id: Uuid,
+        contact_id: Uuid,
+        req: DecideApprovalRequest,
+    ) -> AppResult<ApprovalResponse> {
+        let new_status = match req.decision.as_str() {
+            "approve" => "approved",
+            "reject" => "rejected",
+            _ => {
+                return Err(AppError::BadRequest(
+                    "Decision must be 'approve' or 'reject'".into(),
+                ));
+            }
+        };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM ticket_approvals \
+             WHERE tenant_id = $1 AND id = $2 AND approver_contact_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(contact_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let status = status.ok_or(AppError::NotFound("Approval not found".into()))?;
+        if status != "pending" {
+            return Err(AppError::BadRequest(format!(
+                "Approval is already {status}"
+            )));
+        }
+        sqlx::query(
+            "UPDATE ticket_approvals SET status = $4, decision_notes = $5, \
+                                          decided_by_contact_id = $3, decided_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2 AND approver_contact_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(contact_id)
+        .bind(new_status)
+        .bind(&req.decision_notes)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if let Err(err) = crate::modules::audit::audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            Some(contact_id),
+            crate::modules::audit::AuditAction::Update,
+            &format!("portal.approval_{new_status}"),
+            None,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(%tenant_id, %contact_id, approval_id = %id, error = %err, "approval decision audit row was not written");
+        }
         self.get(tenant_id, id).await
     }
 
