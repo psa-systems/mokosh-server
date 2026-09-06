@@ -93,6 +93,30 @@ pub struct ContactLoginRequest {
     pub recovery_code: Option<String>,
 }
 
+/// PMS-1085: one row on `GET /api/v1/contact/auth/me/sessions`. A
+/// session here is a ROTATION FAMILY (PMS-1062), not a refresh-token
+/// row: `id` is `contact_sessions.family_id`, which a rotation keeps,
+/// so the SPA can hold on to it across the 15-minute refresh cycle
+/// and `DELETE .../sessions/{id}` names the same thing the list
+/// showed. `issued_at` is the login that started the family;
+/// `last_seen_at` is the latest rotation; `expires_at`, `user_agent`
+/// and `ip_address` are the live row's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactSessionResponse {
+    pub id: Uuid,
+    pub issued_at: chrono::DateTime<chrono::Utc>,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
+    /// `true` for the family the caller's own access token (`sid`)
+    /// belongs to, so the SPA can label "this browser" and hide its
+    /// delete button: self sign-out is `POST /auth/logout`.
+    pub current: bool,
+}
+
 /// PMS-1063: `POST /api/v1/contact/auth/me/mfa/setup` body. The
 /// current password is required so a stolen access token cannot
 /// enrol an attacker's authenticator on the customer's account.

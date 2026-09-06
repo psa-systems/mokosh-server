@@ -12,7 +12,7 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use validator::Validate;
 
@@ -64,6 +64,10 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         .route("/auth/me/mfa/setup", post(mfa_setup))
         .route("/auth/me/mfa/enable", post(mfa_enable))
         .route("/auth/me/mfa/disable", post(mfa_disable))
+        // PMS-1085: the caller's live sessions (one per rotation
+        // family) and "sign out that other browser".
+        .route("/auth/me/sessions", get(list_sessions))
+        .route("/auth/me/sessions/{session_id}", delete(revoke_session))
         // MAPPS-618 (mokosh-branding prompt 002): contact-plane brand
         // editor. Gated on `settings:manage_company_branding`; server
         // derives the target Company from the caller's session, so a
@@ -347,6 +351,34 @@ async fn mfa_disable(
             &request.current_password,
             &request.code,
         )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// PMS-1085: the caller's live sessions, one per rotation family,
+/// with `current` on the one this access token belongs to.
+async fn list_sessions(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+) -> AppResult<Json<Vec<ContactSessionResponse>>> {
+    let sessions = state
+        .service
+        .list_sessions(session.tenant_id, session.id, session.sid)
+        .await?;
+    Ok(Json(sessions))
+}
+
+/// PMS-1085: end one of the caller's other sessions. The caller's own
+/// is a 400 pointing at `/auth/logout`; an id that is not the caller's
+/// is a silent 204.
+async fn revoke_session(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Path(session_id): Path<uuid::Uuid>,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .revoke_session(session.tenant_id, session.id, session.sid, session_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
