@@ -68,6 +68,6 @@ These are gates in their own right, and no step of `check.yml` covers them.
 | Recipe | Covered in CI by | Why it is not in `just check` |
 | --- | --- | --- |
 | `check-docker` | [`build-oci-image.yml`](../../.forgejo/workflows/build-oci-image.yml) | Builds the OCI builder stage: minutes per run, needs a Docker builder and the crates.io network. Run it by hand when touching `oci-build/Dockerfile`. |
-| `test-integration` | [`integration.yml`](../../.forgejo/workflows/integration.yml) | Needs a Postgres container. PMS-267 split it out of `check.yml` for the same reason. |
+| `test-integration` | [`integration.yml`](../../.forgejo/workflows/integration.yml) | Needs a Postgres container. PMS-267 split it out of `check.yml` for the same reason. CI builds the test binaries in a step of its own and then runs them under a 25 minute `timeout`, so the timer bounds the tests and not the compile (PMS-1100); the recipe runs both in one `cargo test`. |
 | `verify-demo` | none | Targeted subset of `test-integration` (`seed_demo` + `data_transfer`), same Postgres requirement (PMS-677). |
 | `test-e2e` | [`e2e.yml`](../../.forgejo/workflows/e2e.yml) | Playwright against staging or `$E2E_BASE_URL`: needs a deployed environment (PMS-140). |

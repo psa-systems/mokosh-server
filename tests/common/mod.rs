@@ -723,8 +723,8 @@ pub async fn seed_team_member(
 ) {
     sqlx::query(
         r#"
-        INSERT INTO team_members (tenant_id, team_id, user_id, role, joined_at)
-        VALUES ($1, $2, $3, $4, NOW())
+        INSERT INTO team_members (tenant_id, team_id, user_id, role)
+        VALUES ($1, $2, $3, $4)
         "#,
     )
     .bind(tenant_id)
@@ -734,6 +734,61 @@ pub async fn seed_team_member(
     .execute(pool)
     .await
     .expect("seed_team_member");
+}
+
+/// PMS-1039: seed a ticket optionally attached to a team. `tickets` has
+/// `status_id` / `priority_id` / `queue_id` FKs to the seeded lookup
+/// tables, never the `status` / `priority` text columns the teams suite
+/// had been inserting, and `created_by_id` is NOT NULL. Resolves the
+/// lookups the way `seed_ticket_and_note` does.
+#[allow(dead_code)]
+pub async fn seed_ticket_for_team(
+    pool: &PgPool,
+    company_id: Uuid,
+    created_by_id: Uuid,
+    ticket_number: &str,
+    team_id: Option<Uuid>,
+) -> Uuid {
+    let status_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_statuses WHERE tenant_id = $1 LIMIT 1")
+            .bind(DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("status");
+    let priority_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_priorities WHERE tenant_id = $1 LIMIT 1")
+            .bind(DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("priority");
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(DEFAULT_TENANT_ID)
+            .fetch_one(pool)
+            .await
+            .expect("queue");
+    let ticket_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO tickets
+            (id, tenant_id, ticket_number, title, status_id, priority_id,
+             queue_id, company_id, created_by_id, team_id)
+        VALUES ($1, $2, $3, 'team ticket', $4, $5, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(ticket_number)
+    .bind(status_id)
+    .bind(priority_id)
+    .bind(queue_id)
+    .bind(company_id)
+    .bind(created_by_id)
+    .bind(team_id)
+    .execute(pool)
+    .await
+    .expect("seed_ticket_for_team");
+    ticket_id
 }
 
 /// PMS-791 / MAPPS-461: shorthand for the common test setup — an admin

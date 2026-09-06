@@ -18,6 +18,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use uuid::Uuid;
 
 use crate::db::Database;
+use crate::modules::audit::{audit_portal_event, AuditAction};
 use crate::modules::auth::mfa_secret;
 use crate::modules::auth::TenantId;
 use crate::modules::notifications::NotificationsService;
@@ -215,6 +216,15 @@ impl ContactAuthService {
             // if we cross the threshold. Errors here do not fail the
             // response - they just skip the lockout write.
             let _ = self.register_failed_login(tenant_id, contact_id).await;
+            self.audit(
+                tenant_id,
+                Some(contact_id),
+                AuditAction::Login,
+                "portal.login_failed",
+                user_agent,
+                ip,
+            )
+            .await;
             return Err(AppError::Unauthorized);
         }
 
@@ -249,9 +259,28 @@ impl ContactAuthService {
                 .await?;
             if !second_factor_ok {
                 let _ = self.register_failed_login(tenant_id, contact_id).await;
+                self.audit(
+                    tenant_id,
+                    Some(contact_id),
+                    AuditAction::Login,
+                    "portal.mfa_failed",
+                    user_agent,
+                    ip,
+                )
+                .await;
                 return Err(AppError::Unauthorized);
             }
         }
+
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Login,
+            "portal.login",
+            user_agent,
+            ip,
+        )
+        .await;
 
         // Success: reset counters + stamp last-login. Best-effort.
         let _ = sqlx::query(
@@ -344,6 +373,15 @@ impl ContactAuthService {
             // Replay of a genuine, already-rotated token: theft
             // detected, burn the family (PMS-1062).
             self.revoke_session_family(family_id).await?;
+            self.audit(
+                tenant_id,
+                Some(contact_id),
+                AuditAction::Logout,
+                "portal.refresh_replay_detected",
+                user_agent,
+                ip,
+            )
+            .await;
             return Err(AppError::Unauthorized);
         }
         if expires_at <= Utc::now() {
@@ -370,6 +408,15 @@ impl ContactAuthService {
             // re-grant does not resurrect a token the caller still
             // holds (PMS-1062).
             self.revoke_session_family(family_id).await?;
+            self.audit(
+                tenant_id,
+                Some(contact_id),
+                AuditAction::Logout,
+                "portal.refresh_refused_inactive",
+                user_agent,
+                ip,
+            )
+            .await;
             return Err(AppError::Unauthorized);
         }
 
@@ -387,6 +434,15 @@ impl ContactAuthService {
         .rows_affected();
         if rotated == 0 {
             self.revoke_session_family(family_id).await?;
+            self.audit(
+                tenant_id,
+                Some(contact_id),
+                AuditAction::Logout,
+                "portal.refresh_replay_detected",
+                user_agent,
+                ip,
+            )
+            .await;
             return Err(AppError::Unauthorized);
         }
 
@@ -438,23 +494,39 @@ impl ContactAuthService {
     /// race the refresh path lost) must not keep one alive past the
     /// customer's sign-out.
     #[tracing::instrument(skip_all)]
-    pub async fn logout(&self, presented: &str) -> AppResult<()> {
+    pub async fn logout(
+        &self,
+        presented: &str,
+        user_agent: Option<&str>,
+        ip: Option<IpAddr>,
+    ) -> AppResult<()> {
         let Some((session_id, secret)) = parse_session_bound_token(presented) else {
             return Ok(());
         };
-        let row: Option<(String, Uuid)> = sqlx::query_as(
-            "SELECT refresh_token_hash, family_id FROM contact_sessions WHERE id = $1",
+        let row: Option<(String, Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "SELECT refresh_token_hash, family_id, tenant_id, contact_id \
+             FROM contact_sessions WHERE id = $1",
         )
         .bind(session_id)
         .fetch_optional(self.db.migrator_pool())
         .await?;
-        let Some((hash, family_id)) = row else {
+        let Some((hash, family_id, tenant_id, contact_id)) = row else {
             return Ok(());
         };
         if !verify_password(secret, &hash)? {
             return Ok(());
         }
-        self.revoke_session_family(family_id).await
+        self.revoke_session_family(family_id).await?;
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Logout,
+            "portal.logout",
+            user_agent,
+            ip,
+        )
+        .await;
+        Ok(())
     }
 
     /// PMS-1062: revoke every live session in one rotation family.
@@ -486,6 +558,18 @@ impl ContactAuthService {
     /// - expired / malformed / unknown -> `AppError::BadRequest`
     #[tracing::instrument(skip_all)]
     pub async fn setup_password(&self, token: &str, new_password: &str) -> AppResult<()> {
+        self.set_password_with_token(token, new_password, "portal.setup_password")
+            .await
+    }
+
+    /// The shared body of `setup_password` and `reset_password`; the
+    /// two differ only in the audit subtype they record (PMS-1089).
+    async fn set_password_with_token(
+        &self,
+        token: &str,
+        new_password: &str,
+        audit_subtype: &str,
+    ) -> AppResult<()> {
         // Diagnostic-only: log which of the four failure modes fired
         // (parse, no-candidates, no-hash-match, expired), so a "link
         // says expired" bug report tells us which branch it hit
@@ -617,6 +701,15 @@ impl ContactAuthService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            audit_subtype,
+            None,
+            None,
+        )
+        .await;
         Ok(())
     }
 
@@ -703,7 +796,8 @@ impl ContactAuthService {
     /// both flows.
     #[tracing::instrument(skip_all)]
     pub async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()> {
-        self.setup_password(token, new_password).await
+        self.set_password_with_token(token, new_password, "portal.password_reset")
+            .await
     }
 
     /// mokosh-contact-login prompt 004: hydrate every field the SPA
@@ -1387,6 +1481,20 @@ impl ContactAuthService {
                     // retries), and say so with the login's 401
                     // rather than the link's 400.
                     let _ = self.register_failed_login(tid, contact_id).await;
+                    // PMS-1089: the same row the password login writes
+                    // for a wrong code. The transaction is released
+                    // first so the audit write does not wait on a
+                    // second pool connection while this one is held.
+                    drop(tx);
+                    self.audit(
+                        tid,
+                        Some(contact_id),
+                        AuditAction::Login,
+                        "portal.mfa_failed",
+                        user_agent,
+                        ip,
+                    )
+                    .await;
                     return Err(AppError::Unauthorized);
                 }
             }
@@ -1531,6 +1639,15 @@ impl ContactAuthService {
         .bind(contact_id)
         .bind(tenant_id)
         .execute(self.db.migrator_pool())
+        .await;
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Login,
+            "portal.login_link",
+            user_agent,
+            ip,
+        )
         .await;
         let me = self.me(tenant_id, contact_id).await?;
         Ok(ContactLoginResponse {
@@ -1871,6 +1988,15 @@ impl ContactAuthService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            "portal.password_changed",
+            None,
+            None,
+        )
+        .await;
         Ok(())
     }
 
@@ -1967,6 +2093,8 @@ impl ContactAuthService {
         contact_id: Uuid,
         current_sid: Uuid,
         family_id: Uuid,
+        user_agent: Option<&str>,
+        ip: Option<IpAddr>,
     ) -> AppResult<()> {
         if self.family_of_session(tenant_id, current_sid).await? == Some(family_id) {
             return Err(AppError::BadRequest(
@@ -1985,7 +2113,19 @@ impl ContactAuthService {
         if !owns {
             return Ok(());
         }
-        self.revoke_session_family(family_id).await
+        self.revoke_session_family(family_id).await?;
+        // PMS-1089: the row names the contact who revoked, not the
+        // family that died; the family id rides in the tracing span.
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Logout,
+            "portal.session_revoked",
+            user_agent,
+            ip,
+        )
+        .await;
+        Ok(())
     }
 
     /// PMS-1063: start MFA enrolment. Stages a fresh TOTP secret on the
@@ -2025,6 +2165,15 @@ impl ContactAuthService {
         let app = crate::utils::app_name::app_name().replace(':', " ");
         let label = format!("{app}:{email}");
         let provisioning_uri = crate::utils::totp::provisioning_uri(&secret_b32, &label, &app);
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            "portal.mfa_setup_started",
+            None,
+            None,
+        )
+        .await;
         Ok(ContactMfaSetupResponse {
             secret: secret_b32,
             provisioning_uri,
@@ -2083,6 +2232,15 @@ impl ContactAuthService {
         .bind(tenant_id)
         .execute(self.db.migrator_pool())
         .await?;
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            "portal.mfa_enabled",
+            None,
+            None,
+        )
+        .await;
         Ok(ContactMfaEnableResponse { recovery_codes })
     }
 
@@ -2132,7 +2290,51 @@ impl ContactAuthService {
         .bind(tenant_id)
         .execute(self.db.migrator_pool())
         .await?;
+        self.audit(
+            tenant_id,
+            Some(contact_id),
+            AuditAction::Update,
+            "portal.mfa_disabled",
+            None,
+            None,
+        )
+        .await;
         Ok(())
+    }
+
+    /// PMS-1089: record a contact-plane auth event in `audit_log`
+    /// (`entity_type = 'portal_contact'`, the contact in `entity_id`,
+    /// the subtype in `new_values.event`), the shape the retired portal
+    /// wrote and `AuditService` already reads. Best-effort: a failed
+    /// audit write is logged and never changes the auth response.
+    async fn audit(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Option<Uuid>,
+        action: AuditAction,
+        subtype: &str,
+        user_agent: Option<&str>,
+        ip: Option<IpAddr>,
+    ) {
+        if let Err(err) = audit_portal_event(
+            self.db.migrator_pool(),
+            tenant_id,
+            contact_id,
+            action,
+            subtype,
+            ip.map(|ip| ip.to_string()),
+            user_agent.map(str::to_string),
+        )
+        .await
+        {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                contact_id = ?contact_id,
+                subtype,
+                error = %err,
+                "contact audit row was not written"
+            );
+        }
     }
 
     /// Best-effort: increment `portal_failed_login_count` and arm

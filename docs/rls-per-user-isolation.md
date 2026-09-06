@@ -66,19 +66,28 @@ in the 2026-06-12 draft had all moved by the time anyone followed them.
   In dev and CI without the role split both pools are the same connection, and a superuser or
   `BYPASSRLS` role bypasses RLS unconditionally: role posture, not the policy, is what decides
   whether the backstop is live. `docs/postgres-security.md` covers the role provisioning.
-- **Coverage of the invariant is tested, with an empty allowlist.**
+- **Coverage of the invariant is tested, and the allowlist is where an exemption is decided.**
   `tests/rls_coverage.rs` (PMS-683) introspects the fully-migrated schema and lists every
   `public` table that has a `tenant_id` column but is missing RLS enabled, RLS forced, or a
-  `tenant_isolation` policy. Its `ALLOWED_WITHOUT_RLS` allowlist is now
-  `const ALLOWED_WITHOUT_RLS: &[&str] = &[];` - empty.
+  `tenant_isolation` policy. Its `ALLOWED_WITHOUT_RLS` allowlist holds one entry,
+  `tenant_membership_entitlements`, whose read is pre-auth and cross-tenant and so cannot
+  carry the GUC; enabling RLS there would fail-close the read to `None`, which
+  `ensure_principal_usable` reads as "no entitlement row, never lock anybody out" and would
+  pass every suspended tenant. Read the entry's own comment for the full reason.
 
-  What the empty allowlist guarantees, and the reason it is the useful fact for anyone adding
-  a table: **a new table with a `tenant_id` column whose migration does not enable, force and
-  attach the `tenant_isolation` policy fails `every_tenant_table_has_rls_or_is_allowlisted`
-  outright.** There is no entry left to hide behind. Copy the three statements from an
-  existing migration (`105_form_definition_drafts.sql` is the shortest current example) into
-  the new one. The test's second assertion runs the other way: an allowlisted table that has
-  since gained RLS must be deleted from the list, so the list cannot rot back into cover.
+  What the near-empty allowlist guarantees, and the reason it is the useful fact for anyone
+  adding a table: **a new table with a `tenant_id` column whose migration does not enable,
+  force and attach the `tenant_isolation` policy fails
+  `every_tenant_table_has_rls_or_is_allowlisted` outright.** There is no entry to hide behind.
+  Copy the three statements from an existing migration (`105_form_definition_drafts.sql` is
+  the shortest current example) into the new one. The test's second assertion runs the other
+  way: an allowlisted table that has since gained RLS must be deleted from the list, so the
+  list cannot rot back into cover.
+
+  PMS-1040 is why an exemption belongs in that list and nowhere else.
+  `tenant_membership_entitlements` was declared exempt in migration 154's header and again at
+  the call site, and the one list that enforces anything was never told, so the guard read the
+  table as an oversight rather than a decision. A rule recorded only in prose is not a rule.
 - **Behaviour is tested too, not just schema shape.** `tests/rls_isolation.rs` and
   `tests/tenantless_table_rls.rs` drive the policies through a purpose-created
   `NOSUPERUSER NOBYPASSRLS` role (`#[sqlx::test]` itself connects as the superuser, which
@@ -130,8 +139,10 @@ was invisible to `tests/rls_coverage.rs`, whose query required a `tenant_id` col
 `tenantless_table_rls.rs` names tables rather than sweeping, so `quote_lines` (`092`) and
 `credit_note_lines` (`122`) were both added after `041` in exactly this shape and neither made
 a test go red. `every_tenantless_table_has_rls_or_is_exempt` (PMS-874) now sweeps the other
-half of the schema and requires the policy on every tenantless table except the two entries in
-its `TENANTLESS_WITHOUT_RLS` list, `tenants` and `_sqlx_migrations`, each carrying its reason.
+half of the schema and requires the policy on every tenantless table except the entries in its
+`TENANTLESS_WITHOUT_RLS` list, each carrying its reason: `tenants`, `_sqlx_migrations`, and
+(PMS-1040) `identities` and `platform_admins`, the two cross-tenant identity-plane tables that
+have no tenant to scope to and no parent to join through.
 
 ### Tables WITH tenant_id (70)
 

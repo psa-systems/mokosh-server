@@ -191,10 +191,19 @@ async fn refresh(
 
 async fn logout(
     State(state): State<ContactRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ContactLogoutRequest>,
 ) -> Result<Response, AppError> {
     request.validate()?;
-    state.service.logout(&request.refresh_token).await?;
+    let ua = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    state
+        .service
+        .logout(&request.refresh_token, ua.as_deref(), Some(addr.ip()))
+        .await?;
     let mut resp = StatusCode::NO_CONTENT.into_response();
     add_cookie(resp.headers_mut(), &clear_refresh_cookie());
     Ok(resp)
@@ -464,11 +473,24 @@ async fn list_sessions(
 async fn revoke_session(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(session_id): Path<uuid::Uuid>,
 ) -> AppResult<StatusCode> {
+    let ua = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     state
         .service
-        .revoke_session(session.tenant_id, session.id, session.sid, session_id)
+        .revoke_session(
+            session.tenant_id,
+            session.id,
+            session.sid,
+            session_id,
+            ua.as_deref(),
+            Some(addr.ip()),
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
