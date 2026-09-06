@@ -22,12 +22,12 @@ pub struct ContactSession {
     pub tenant_id: Uuid,
     pub company_id: Uuid,
     pub email: String,
-    /// The union of every assigned role's capability set at the moment
-    /// the JWT was minted. Belt-and-braces: privileged mutation
-    /// endpoints re-load the effective set from `portal_roles` per
-    /// request so a role revoke lands within one tick (prompt 008
-    /// enforces this on the mutation paths).
-    pub caps: Vec<String>,
+    // PMS-985: this deliberately carries NO capability set. Every
+    // server-side decision loads the effective set from `portal_roles`
+    // for the request being served (see
+    // `crate::modules::auth::caller_context::load_contact_capabilities`),
+    // so a field here would only ever be the stale copy minted into the
+    // JWT, and the compiler is what stops a handler reaching for it.
     /// `contact_sessions.id` - the refresh-token session row this
     /// access token was minted from. Used by the logout + rotate paths.
     pub sid: Uuid,
@@ -42,6 +42,12 @@ pub struct ContactJwtClaims {
     pub tid: Uuid,
     pub cid: Uuid,
     pub email: String,
+    /// The effective capability set as it stood when this token was
+    /// minted, for the SPA to paint with. PMS-985: the server NEVER
+    /// reads it back - `decode_token` hands it to nobody - because it
+    /// is a snapshot and an admin can change the assignment a second
+    /// later. It stays on the wire so a cold-loading SPA has something
+    /// to render before `GET /contact/auth/me` returns.
     pub caps: Vec<String>,
     pub sid: Uuid,
     #[serde(rename = "typ")]
@@ -75,11 +81,100 @@ pub struct ContactLoginRequest {
     #[validate(length(min = 1, message = "password is required"))]
     pub password: String,
     /// TOTP code, sent on the second attempt after a `mfa_required`
-    /// response. `contact.portal_mfa_secret` verifies it. Optional
-    /// today (MFA is off by default on contacts); reserved for a
-    /// follow-up ticket that adds the enrol flow.
+    /// response. Verified against `contacts.portal_mfa_secret` when
+    /// `portal_mfa_enabled` is set (PMS-1063); ignored otherwise.
     #[serde(default)]
     pub mfa_code: Option<String>,
+    /// One of the single-use recovery codes handed out when MFA was
+    /// enabled, for a contact whose authenticator is gone. Wins over
+    /// `mfa_code` when both are present, so an SPA that still sends an
+    /// empty `mfa_code` cannot block the recovery path (PMS-1063).
+    #[serde(default)]
+    pub recovery_code: Option<String>,
+}
+
+/// PMS-1086: `PUT /api/v1/contact/auth/me/password` body. The current
+/// password is re-verified so a stolen access token cannot rotate the
+/// credential out from under the customer; the new one goes through
+/// the shared password policy.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactChangePasswordRequest {
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+    #[validate(length(min = 1, message = "new_password is required"))]
+    pub new_password: String,
+}
+
+/// PMS-1085: one row on `GET /api/v1/contact/auth/me/sessions`. A
+/// session here is a ROTATION FAMILY (PMS-1062), not a refresh-token
+/// row: `id` is `contact_sessions.family_id`, which a rotation keeps,
+/// so the SPA can hold on to it across the 15-minute refresh cycle
+/// and `DELETE .../sessions/{id}` names the same thing the list
+/// showed. `issued_at` is the login that started the family;
+/// `last_seen_at` is the latest rotation; `expires_at`, `user_agent`
+/// and `ip_address` are the live row's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactSessionResponse {
+    pub id: Uuid,
+    pub issued_at: chrono::DateTime<chrono::Utc>,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
+    /// `true` for the family the caller's own access token (`sid`)
+    /// belongs to, so the SPA can label "this browser" and hide its
+    /// delete button: self sign-out is `POST /auth/logout`.
+    pub current: bool,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/setup` body. The
+/// current password is required so a stolen access token cannot
+/// enrol an attacker's authenticator on the customer's account.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactMfaSetupRequest {
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/setup` response. The
+/// base32 secret is shown for manual entry and the `otpauth://` URI is
+/// rendered as a QR code; neither is ever returned again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactMfaSetupResponse {
+    pub secret: String,
+    pub provisioning_uri: String,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/enable` body. Proves
+/// possession of the authenticator with one live code, and re-proves
+/// the password so an enrolment started with a stolen token cannot be
+/// finished with it either.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactMfaEnableRequest {
+    #[validate(length(min = 6, max = 8, message = "code must be 6-8 digits"))]
+    pub code: String,
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/enable` response. The
+/// recovery codes are surfaced once; only their hashes are stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactMfaEnableResponse {
+    pub recovery_codes: Vec<String>,
+}
+
+/// PMS-1063: `POST /api/v1/contact/auth/me/mfa/disable` body. Needs
+/// the current password AND a live code (or a recovery code) so a
+/// stolen access token cannot quietly remove the second factor.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct ContactMfaDisableRequest {
+    #[validate(length(min = 1, message = "current_password is required"))]
+    pub current_password: String,
+    #[validate(length(min = 6, max = 20, message = "code is required"))]
+    pub code: String,
 }
 
 /// Response body for `POST /api/v1/contact/auth/login` +

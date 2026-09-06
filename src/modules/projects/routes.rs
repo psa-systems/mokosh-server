@@ -90,13 +90,16 @@ async fn list_projects(
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Query(mut f): Query<ProjectFilter>,
     Query(p): Query<PaginationParams>,
-) -> AppResult<Json<PaginatedResponse<ProjectResponse>>> {
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     f.validate()?;
     // PMS-935: dual-plane sweep. Contact callers must hold
     // `projects:read`; server stamps `company_id` from the session
     // so a spoofed query param cannot widen visibility. Projects
     // with a NULL `company_id` (staff-side house projects) are
-    // implicitly excluded from the contact view.
+    // implicitly excluded from the contact view. PMS-1061: the contact
+    // arm answers with `ContactProjectResponse`, the customer's
+    // projection, never the staff type.
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
@@ -106,7 +109,20 @@ async fn list_projects(
         }
     }
     let (items, total) = s.service.list_projects(tenant, &f, &p).await?;
-    Ok(Json(PaginatedResponse::from_params(items, &p, total)))
+    Ok(match &caller {
+        CallerContext::Staff(_) => {
+            Json(PaginatedResponse::from_params(items, &p, total)).into_response()
+        }
+        CallerContext::Contact(_) => Json(PaginatedResponse::from_params(
+            items
+                .into_iter()
+                .map(ContactProjectResponse::from)
+                .collect::<Vec<_>>(),
+            &p,
+            total,
+        ))
+        .into_response(),
+    })
 }
 
 /// PMS-894: tenant-wide project totals, so the SPA's list page can render its
@@ -135,10 +151,12 @@ async fn get_project(
     RequireCallerContext(caller): RequireCallerContext,
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<ProjectResponse>> {
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     // PMS-935: contact-plane callers 404 on a foreign Company's
     // project (or a house project with a NULL company_id) so a probe
-    // cannot confirm existence.
+    // cannot confirm existence. PMS-1061: a contact gets
+    // `ContactProjectResponse`, never the staff type.
     let tenant = caller.tenant();
     match &caller {
         CallerContext::Staff(auth) => assert_staff_authenticated(auth)?,
@@ -147,12 +165,15 @@ async fn get_project(
         }
     }
     let project = s.service.get_project(tenant, id).await?;
-    if let CallerContext::Contact(session) = &caller {
-        if project.company_id != Some(session.company_id) {
-            return Err(AppError::NotFound("Project".to_string()));
+    Ok(match &caller {
+        CallerContext::Staff(_) => Json(project).into_response(),
+        CallerContext::Contact(session) => {
+            if project.company_id != Some(session.company_id) {
+                return Err(AppError::NotFound("Project".to_string()));
+            }
+            Json(ContactProjectResponse::from(project)).into_response()
         }
-    }
-    Ok(Json(project))
+    })
 }
 
 /// PMS-935: baseline "must be authenticated staff" check inlined

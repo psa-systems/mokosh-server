@@ -11,12 +11,12 @@
 //! so a caller cannot tell "unknown token" from "expired" from "replay
 //! detected" without another side channel.
 //!
-//! Two cases the retired portal pinned are gone with it: a replayed
-//! refresh token revoked every live token in its rotation chain, and a
-//! logout did the same. A contact session (`contact_sessions`) is
-//! revoked one row at a time and carries no chain, so a replay is a
-//! 401 for the replayed token only; that gap is PMS-1062 rather than
-//! pinned here as if it were the design.
+//! PMS-1062 restored the two rules the retired portal held and the
+//! PMS-1031 port could not pin: a contact session carries a
+//! `family_id` (the first session of its rotation chain), a replayed
+//! refresh token revokes every live token in that family, and so does
+//! a logout. Both verify the secret first, so a bare session id (which
+//! rides in every access token's `sid`) cannot sign a customer out.
 
 mod common;
 
@@ -147,37 +147,106 @@ async fn refresh_rotates_both_tokens(pool: PgPool) {
 // after it has already been rotated once fails closed. (The retired
 // portal also revoked the successor; the contact plane does not, see the
 // module comment.)
+// AC (H2, PMS-1062): a replayed refresh token is the stolen-token
+// signal, and it revokes the WHOLE rotation family: the honest
+// customer's current token dies with the replayed one, so both parties
+// are signed out and the customer signs in again. A second login is a
+// new family and is untouched.
 #[sqlx::test]
-async fn replayed_refresh_is_refused(pool: PgPool) {
+async fn replayed_refresh_revokes_the_whole_rotation_chain(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
+    let app = common::boot(pool.clone()).await;
+    let login_body = login(&app, &contact).await;
+    let rt_1 = login_body["refresh_token"].as_str().unwrap().to_string();
+
+    // Honest customer rotates twice: rt_1 -> rt_2 -> rt_3.
+    let round_one = refresh(&app, &rt_1).await;
+    let rt_2 = round_one.json::<serde_json::Value>().await.unwrap()["refresh_token"]
+        .as_str()
+        .expect("rt_2")
+        .to_string();
+    let round_two = refresh(&app, &rt_2).await;
+    let rt_3 = round_two.json::<serde_json::Value>().await.unwrap()["refresh_token"]
+        .as_str()
+        .expect("rt_3")
+        .to_string();
+
+    // A second device signs in on its own: a separate family.
+    let other_body = login(&app, &contact).await;
+    let rt_other = other_body["refresh_token"].as_str().unwrap().to_string();
+
+    // Every row of the first chain names the login session as family.
+    let families: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT family_id FROM contact_sessions WHERE contact_id = $1 ORDER BY 1",
+    )
+    .bind(contact.id)
+    .fetch_all(&pool)
+    .await
+    .expect("families");
+    assert_eq!(families.len(), 2, "one family per login, {families:?}");
+
+    // Attacker replays rt_1 (already rotated) -> 401 ...
+    let replay = refresh(&app, &rt_1).await;
+    assert_unauthorized_envelope(replay, "replayed rt_1").await;
+
+    // ... and the honest customer's live rt_3 is dead with it.
+    let honest = refresh(&app, &rt_3).await;
+    assert_unauthorized_envelope(honest, "rt_3 after the rt_1 replay").await;
+    let live_in_chain: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM contact_sessions \
+         WHERE contact_id = $1 AND revoked_at IS NULL \
+           AND family_id <> (SELECT family_id FROM contact_sessions WHERE id = $2)",
+    )
+    .bind(contact.id)
+    .bind(rt_other.split('.').next().unwrap().parse::<Uuid>().unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(live_in_chain, 0, "no live row left in the replayed family");
+
+    // The other device's family still rotates.
+    let other = refresh(&app, &rt_other).await;
+    assert!(
+        other.status().is_success(),
+        "the untouched family rotates, got {}",
+        other.status()
+    );
+}
+
+// PMS-1062: a session id is not a secret (it rides in the access
+// token's `sid`), so a replay carrying a wrong secret is a plain 401
+// and revokes nothing. Only a GENUINE token presented after its
+// rotation is the theft signal.
+#[sqlx::test]
+async fn replay_with_a_wrong_secret_revokes_nothing(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
     let login_body = login(&app, &contact).await;
     let rt_1 = login_body["refresh_token"].as_str().unwrap().to_string();
-
-    // Honest customer rotates once and gets rt_2.
     let round_one = refresh(&app, &rt_1).await;
-    let round_one_body: serde_json::Value = round_one.json().await.unwrap();
-    let rt_2 = round_one_body["refresh_token"]
+    let rt_2 = round_one.json::<serde_json::Value>().await.unwrap()["refresh_token"]
         .as_str()
         .expect("rt_2")
         .to_string();
 
-    // Attacker replays rt_1 (already rotated) -> 401.
-    let replay = refresh(&app, &rt_1).await;
-    assert_unauthorized_envelope(replay, "replayed rt_1").await;
+    let (id_1, _) = rt_1.split_once('.').unwrap();
+    let forged = format!("{id_1}.not-the-secret-at-all-0123456789");
+    let replay = refresh(&app, &forged).await;
+    assert_unauthorized_envelope(replay, "forged secret on a rotated id").await;
+    let logout_forged = logout(&app, &forged).await;
+    assert_eq!(logout_forged.status(), reqwest::StatusCode::NO_CONTENT);
 
-    // The honest customer's rt_2 still rotates.
-    let round_two = refresh(&app, &rt_2).await;
+    let honest = refresh(&app, &rt_2).await;
     assert!(
-        round_two.status().is_success(),
-        "rt_2 rotates after the rt_1 replay, got {}",
-        round_two.status()
+        honest.status().is_success(),
+        "rt_2 still rotates after a forged replay, got {}",
+        honest.status()
     );
 }
 
-// AC (H1): logout revokes the presented refresh token, so a stolen
-// access token cannot be renewed once the customer signs out; the token
-// it was rotated from was already revoked by the rotation.
+// AC (H1, PMS-1062): logout revokes the presented refresh token and
+// its whole rotation family, so a stolen access token cannot be renewed
+// once the customer signs out.
 #[sqlx::test]
 async fn logout_revokes_the_refresh_token(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
