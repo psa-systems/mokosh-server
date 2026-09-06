@@ -82,6 +82,8 @@ struct ClaimedRow {
     id: Uuid,
     tenant_id: Uuid,
     user_id: Option<Uuid>,
+    /// PMS-1083: a contact's inbox row (`notifications.contact_id`).
+    contact_id: Option<Uuid>,
     channel: String,
     recipient: Option<String>,
     subject: Option<String>,
@@ -236,7 +238,7 @@ impl DispatcherWorker {
                 next_attempt_at = NOW() + ($2 * INTERVAL '1 second')
             FROM due
             WHERE n.id = due.id
-            RETURNING n.id, n.tenant_id, n.user_id, n.channel_type, n.recipient,
+            RETURNING n.id, n.tenant_id, n.user_id, n.contact_id, n.channel_type, n.recipient,
                       n.subject, n.body, n.body_html, n.attempt_count, n.created_at
             "#,
         )
@@ -251,6 +253,7 @@ impl DispatcherWorker {
                     id: row.try_get("id")?,
                     tenant_id: row.try_get("tenant_id")?,
                     user_id: row.try_get("user_id")?,
+                    contact_id: row.try_get("contact_id")?,
                     channel: row.try_get("channel_type")?,
                     recipient: row.try_get("recipient")?,
                     subject: row.try_get("subject")?,
@@ -327,11 +330,12 @@ impl DispatcherWorker {
     ) -> Result<(), DeliveryError> {
         match row.channel.as_str() {
             "in_app" => {
-                // Row is already visible via GET /api/v1/notifications;
+                // Row is already visible via GET /api/v1/notifications,
+                // to the user or to the contact it names (PMS-1083);
                 // flipping status to 'sent' IS the delivery for in-app.
-                if row.user_id.is_none() {
+                if row.user_id.is_none() && row.contact_id.is_none() {
                     return Err(DeliveryError::Permanent(
-                        "in_app notification has no user_id".to_string(),
+                        "in_app notification has no user_id and no contact_id".to_string(),
                     ));
                 }
                 Ok(())

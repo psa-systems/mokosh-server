@@ -86,6 +86,11 @@ pub struct NotificationInboxItemResponse {
     pub sent_at: Option<DateTime<Utc>>,
     pub read_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// The row the notification is about (`ticket`, `invoice`, ...) and
+    /// its id, when the dispatch context named one (migration 150,
+    /// written since PMS-1083), so an inbox can deep-link.
+    pub entity_type: Option<String>,
+    pub entity_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
