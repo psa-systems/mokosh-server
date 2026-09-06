@@ -10,7 +10,7 @@
 //! the BYPASSRLS migrator pool with no `app.current_tenant` GUC. That is a
 //! requirement, not a convenience: PMS-1040 audited every call site below,
 //! confirmed all of them pass `db().migrator_pool()`, and on that basis
-//! migration 191 gave `tenant_memberships` the fail-closed
+//! migration 195 gave `tenant_memberships` the fail-closed
 //! `tenant_isolation` policy as a backstop. A caller that hands one of
 //! these functions the bare NOBYPASSRLS `db().pool()` now reads zero
 //! membership rows. `identities` has no `tenant_id` to scope to and stays

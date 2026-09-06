@@ -68,7 +68,7 @@ const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
 ///   (`IdentityRepo::*` call sites in `src/modules/auth/middleware.rs`,
 ///   `src/modules/auth/service.rs`, `src/modules/tenants/routes.rs`). Its seat
 ///   table, `tenant_memberships`, DOES carry a `tenant_id` and gained the policy
-///   in migration 191. PMS-1040.
+///   in migration 195. PMS-1040.
 /// * `platform_admins` - the platform super-admin registry (MAPPS-513,
 ///   migration `160_platform_admins.sql`), deliberately outside tenancy so the
 ///   persona's credential lifecycle never intersects a tenant admin's identity.
