@@ -267,11 +267,17 @@ async fn one_dispatch_is_one_transaction(pool: PgPool) {
     );
 
     // The whole statement budget, so a new per-row read cannot creep back in
-    // unnoticed: the rule read, the template read, the preference read, the
-    // three inserts, the set_config and the COMMIT.
+    // unnoticed: the branding read, the rule read, the template read, the
+    // preference read, the three inserts, the set_config and the COMMIT.
+    //
+    // PMS-1068: the branding read (PMS-729 phase 2 section 6 slice 5) landed after
+    // PMS-782 wrote this budget and was never added to the count, so a nine-
+    // statement dispatch was being measured against an eight-statement
+    // enumeration. It is one statement, not one transaction, because it now
+    // runs on the dispatch's own connection.
     assert_eq!(
         statements.len(),
-        8,
+        9,
         "unexpected statement budget for one dispatch: {statements:#?}"
     );
 }

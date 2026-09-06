@@ -779,8 +779,13 @@ impl NotificationsService {
     ///
     /// Caller-supplied keys ALWAYS win: a test that passes an explicit
     /// `msp_name` in context sees that value, not the DB one.
+    ///
+    /// Reads `tenants` on the caller's connection (PMS-1068), whose
+    /// transaction has already set the tenant GUC, rather than opening a
+    /// second one of its own.
     async fn enrich_with_branding(
         &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         mut context: serde_json::Value,
     ) -> AppResult<serde_json::Value> {
@@ -792,13 +797,11 @@ impl NotificationsService {
             context = serde_json::json!({});
         }
 
-        let row: Option<(String, serde_json::Value)> = {
-            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String, serde_json::Value)> =
             sqlx::query_as(r#"SELECT name, branding FROM tenants WHERE id = $1"#)
                 .bind(tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?
-        };
+                .fetch_optional(&mut *conn)
+                .await?;
 
         let (name, branding) = match row {
             Some(r) => r,
@@ -880,6 +883,13 @@ impl NotificationsService {
     /// The rows are now atomic as a set: a mid-fan-out failure queues nothing
     /// rather than half the recipients, which is the right semantic here
     /// because retries live on the row, not on the dispatch.
+    ///
+    /// PMS-1068: the branding read and the template batch load had drifted back
+    /// out of that transaction into two of their own, so the reads that decided
+    /// WHAT to queue could not see the transaction that queued it. Both now run
+    /// on the caller's connection, and
+    /// `tests/notification_dispatch_query_budget.rs` counts the `set_config`
+    /// and the `COMMIT` so a third cannot come back unnoticed.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch(
         &self,
@@ -1067,7 +1077,7 @@ impl NotificationsService {
         // override. Applied here (not in dispatch) so `preview` renders the
         // same context and neither can drift.
         let enriched_context = self
-            .enrich_with_branding(tenant_id, context.clone())
+            .enrich_with_branding(&mut *conn, tenant_id, context.clone())
             .await?;
         // PMS-789: the deployment's name is supplied here rather than by each
         // of the dispatch call sites, so no template can name the product and
@@ -1129,29 +1139,30 @@ impl NotificationsService {
         // (N+1 against `notification_templates`); a busy dispatch with
         // 4-5 rules on the same event would spend most of its wall-
         // clock on template lookups. One IN() call keyed by tenant
-        // still passes the RLS policy (same GUC posture per PMS-261).
+        // still passes the RLS policy (same GUC posture per PMS-261):
+        // it runs on the caller's connection, whose transaction already
+        // set the GUC, rather than opening a second one (PMS-1068).
         let template_ids: Vec<Uuid> = rules.iter().filter_map(|r| r.template_id).collect();
         let template_index: HashMap<Uuid, TemplateRow> = if template_ids.is_empty() {
             HashMap::new()
         } else {
-            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             let rows: Vec<TemplateRow> = sqlx::query_as(
                 "SELECT id, name, event_type, channel_type, subject, body_text, body_html, is_active \
                  FROM notification_templates WHERE id = ANY($1)",
             )
             .bind(&template_ids)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut *conn)
             .await?;
             rows.into_iter().map(|t| (t.id, t)).collect()
         };
 
         let mut messages: Vec<RenderedNotification> = Vec::new();
         for rule in rules {
-            // PMS-782 batch: templates were loaded up front by tenant-scoped tx
-            // (see `template_index` above), so the per-rule lookup is one hash
-            // hit rather than a round-trip. Main's per-rule fetch was PMS-261's
-            // RLS-safe read; the batch retains the same tenant-scoped tx and
-            // therefore keeps the RLS GUC set for the read.
+            // PMS-782 batch: templates were loaded up front (see
+            // `template_index` above), so the per-rule lookup is one hash hit
+            // rather than a round-trip. Main's per-rule fetch was PMS-261's
+            // RLS-safe read; the batch runs inside the caller's tenant
+            // transaction and therefore keeps the RLS GUC set for the read.
             let template = rule
                 .template_id
                 .and_then(|tid| template_index.get(&tid).cloned());
@@ -1772,5 +1783,87 @@ impl From<RuleRow> for NotificationRuleResponse {
             template_id: r.template_id,
             is_active: r.is_active.unwrap_or(true),
         }
+    }
+}
+
+/// PMS-1068: the reads that decide what a dispatch queues run inside the
+/// transaction that queues it.
+///
+/// [`NotificationsService::dispatch`] and [`NotificationsService::preview`]
+/// each open one `begin_with_tenant` transaction and hand the connection to
+/// [`NotificationsService::render_event`]. A read inside `render_event` that
+/// opens its own transaction instead runs on a second connection, so it cannot
+/// see the caller's uncommitted writes, and it costs the caller a BEGIN, a
+/// `set_config` and a rollback per read on a path that is awaited inline on
+/// request handling.
+///
+/// That is not a rule the compiler can express: `self.db` is in scope
+/// throughout, so `begin_with_tenant` compiles anywhere. PMS-782 stated the
+/// rule in a doc comment and two later changes broke it anyway (the PMS-729
+/// branding read, and the template batch load that replaced a per-rule
+/// transaction with one transaction where it needed none), so the source is
+/// what gets read - the `billing::routes::finance_gate` and
+/// `contacts::service::mirror_writers` shape, under `cargo test --lib`, with
+/// no script, recipe or CI step to add.
+///
+/// `tests/notification_dispatch_query_budget.rs` is the behavioural half: this
+/// scan proves no transaction is opened in the render path, that test counts
+/// the `set_config` and the `COMMIT` a real dispatch actually issues.
+#[cfg(test)]
+mod one_transaction_per_dispatch {
+    /// The functions that run on the caller's connection and must never open a
+    /// transaction of their own.
+    const RENDER_PATH: &[&str] = &["async fn render_event(", "async fn enrich_with_branding("];
+
+    /// Return the body of the function whose signature starts at `start`, by
+    /// matching braces from the signature's opening `{`. Every brace in these
+    /// bodies is balanced (`{{key}}` placeholders in comments come in pairs,
+    /// as does `json!({})`), so a plain depth count is enough.
+    fn body_of(text: &str, start: usize) -> &str {
+        let open = start
+            + text[start..]
+                .find('{')
+                .expect("a function signature is followed by its body");
+        let mut depth = 0usize;
+        for (offset, ch) in text[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[open..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after the signature at byte {start}");
+    }
+
+    #[test]
+    fn no_read_in_the_render_path_opens_its_own_transaction() {
+        // The CALL, not the name: `render_event` carries a comment recounting
+        // the per-rule transaction the template batch replaced, and a mention
+        // in prose is not a transaction. Assembled so the needle is not its own
+        // hit either.
+        let needle = format!(".begin_with{}(", "_tenant");
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file!());
+        let text = std::fs::read_to_string(&path).expect("read this source file");
+
+        let mut offenders: Vec<&str> = Vec::new();
+        for signature in RENDER_PATH {
+            let start = text.find(signature).unwrap_or_else(|| {
+                panic!("{signature} is gone; rename it here or the guard scans nothing")
+            });
+            if body_of(&text, start).contains(&needle) {
+                offenders.push(signature);
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these run on the caller's connection and must not open a transaction \
+             of their own (PMS-1068); read on the `conn` argument instead: {offenders:?}",
+        );
     }
 }
