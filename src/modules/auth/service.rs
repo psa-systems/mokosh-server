@@ -898,7 +898,7 @@ impl AuthService {
                 // cannot drive the write, and idempotent (the UPDATE matches
                 // the plaintext it read), so a concurrent re-enrolment wins.
                 if stored.needs_upgrade() {
-                    self.upgrade_legacy_mfa_secret(user.tenant_id, user.id, stored.secret_b32())
+                    self.upgrade_legacy_mfa_secret(&user.email, stored.secret_b32())
                         .await?;
                 }
             } else {
@@ -2041,33 +2041,66 @@ impl AuthService {
         self.get_user_by_id(tenant_id, user_id).await
     }
 
-    /// PMS-871: rewrite a pre-encryption `users.mfa_secret` as ciphertext.
+    /// PMS-1055: `mfa_secret` has ONE value per human, written to both planes
+    /// and to every `users` row at that email, by this method and nothing else.
     ///
-    /// Called only after the presented code has verified against that very
-    /// plaintext, so a wrong guess never triggers a write. `AND mfa_secret =
-    /// $4` makes it idempotent and keeps it from clobbering a secret that a
-    /// concurrent re-enrolment staged between the read and this update: the
-    /// row is left alone rather than pinned back to a secret nobody holds.
-    async fn upgrade_legacy_mfa_secret(
+    /// Migration 195 took the column out of both directions of the users <->
+    /// identities mirror (a mirror that copies a secret verbatim can turn a
+    /// sealed one back into plaintext), so the application owns the fan-out
+    /// that trigger used to perform. It has to cover every users row at the
+    /// email, not just the caller's: `enable_mfa` flips `mfa_enabled` on the
+    /// identity row, and THAT still mirrors onto every users row at the email,
+    /// so a users row left without the secret is a row whose next
+    /// tenant-scoped login reads `mfa_enabled` true with nothing to verify
+    /// against and answers 500.
+    ///
+    /// `value` is the sealed secret, or `None` to clear it. `previous` is the
+    /// idempotency guard for the PMS-871 in-place legacy upgrade (`AND
+    /// mfa_secret = $previous`): a row holding anything else - already sealed,
+    /// re-enrolled, cleared - is left alone rather than pinned back to a secret
+    /// nobody holds. `None` writes unconditionally.
+    ///
+    /// SAFETY (PMS-285): the migrator pool, because one human's secret spans
+    /// every tenant they hold a seat in and `identities` has no tenant column
+    /// at all, so no single tenant GUC covers the write. Both statements are
+    /// pinned to the one email whose password (or, on the identity-first path,
+    /// whose TOTP code) has already verified, and they write one column.
+    async fn write_mfa_secret(
         &self,
-        tenant_id: Uuid,
-        user_id: Uuid,
-        secret_b32: &str,
+        email: &str,
+        value: Option<&str>,
+        previous: Option<&str>,
     ) -> AppResult<()> {
-        let sealed = mfa_secret::seal(secret_b32, &self.encryption_key)?;
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
-            "UPDATE users SET mfa_secret = $1, updated_at = NOW() \
-             WHERE id = $2 AND tenant_id = $3 AND mfa_secret = $4",
-        )
-        .bind(&sealed)
-        .bind(user_id)
-        .bind(tenant_id)
-        .bind(secret_b32)
-        .execute(&mut *tx)
-        .await?;
+        let guard = if previous.is_some() {
+            " AND mfa_secret = $3"
+        } else {
+            ""
+        };
+        let mut tx = self.db.migrator_pool().begin().await?;
+        for table in ["identities", "users"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET mfa_secret = $1, updated_at = NOW() \
+                 WHERE lower(email) = lower($2){guard}"
+            ))
+            .bind(value)
+            .bind(email)
+            .bind(previous)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// PMS-871: rewrite a pre-encryption `mfa_secret` as ciphertext.
+    ///
+    /// Called only after the presented code has verified against that very
+    /// plaintext, so a wrong guess never triggers a write, and guarded on the
+    /// plaintext so a re-enrolment that landed in between wins.
+    async fn upgrade_legacy_mfa_secret(&self, email: &str, secret_b32: &str) -> AppResult<()> {
+        let sealed = mfa_secret::seal(secret_b32, &self.encryption_key)?;
+        self.write_mfa_secret(email, Some(&sealed), Some(secret_b32))
+            .await
     }
 
     /// Begin MFA enrollment. Generates a fresh TOTP secret, persists it
@@ -2095,17 +2128,13 @@ impl AuthService {
         // needs; it is never at rest in the clear.
         let stored = mfa_secret::seal(&secret_b32, &self.encryption_key)?;
 
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
-            "UPDATE users SET mfa_secret = $1, updated_at = NOW() \
-             WHERE id = $2 AND tenant_id = $3",
-        )
-        .bind(&stored)
-        .bind(user_id)
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        // PMS-1055: one seal, written wherever this human's secret lives.
+        // Migration 195 took `mfa_secret` out of the mirror, so the identity
+        // plane - which `authenticate_identity_first` verifies against - is
+        // this method's to write. Sealing twice would be two ciphertexts for
+        // one secret and no way to tell they agree.
+        self.write_mfa_secret(&user.email, Some(&stored), None)
+            .await?;
 
         // PMS-789: the issuer an authenticator app shows next to the code.
         // The colon is the otpauth label separator, so one inside the operator's
@@ -2150,7 +2179,7 @@ impl AuthService {
             return Err(AppError::BadRequest("Invalid MFA code".to_string()));
         }
         if stored.needs_upgrade() {
-            self.upgrade_legacy_mfa_secret(tenant_id, user_id, stored.secret_b32())
+            self.upgrade_legacy_mfa_secret(&user.email, stored.secret_b32())
                 .await?;
         }
 
@@ -2211,10 +2240,19 @@ impl AuthService {
         // + watermark on identities (source of truth); clear recovery
         // hashes on users (users-only column). Both writes share the
         // same tx.
+        //
+        // PMS-1055: the secret is cleared through `write_mfa_secret`, on both
+        // planes and on every users row at this email. `mfa_enabled` still
+        // mirrors back from the identity write, but `mfa_secret` no longer does
+        // (migration 195), so leaning on the trigger would leave a usable TOTP
+        // secret at rest on a row whose MFA the user just turned off. It runs
+        // AFTER the flag write and not before: this way a failure leaves MFA
+        // off with an unusable secret still stored (the next enrolment
+        // overwrites it), where the other order would leave it ON with nothing
+        // to verify against, which is a lockout.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE identities SET mfa_enabled = FALSE, \
-                                   mfa_secret = NULL, \
                                    mfa_last_totp_step = 0, \
                                    updated_at = NOW() \
              WHERE lower(email) = lower($1)",
@@ -2231,6 +2269,7 @@ impl AuthService {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        self.write_mfa_secret(&user.email, None, None).await?;
 
         Ok(())
     }
@@ -3596,7 +3635,9 @@ impl AuthService {
         // 3. MFA at the identity level. Mirrors the tenant-hint branch's
         //    contract: no code -> `mfa_required` shape (empty tokens,
         //    user=None). Verification uses the identity's mfa_secret,
-        //    which the phase-1 trigger keeps in sync with users.mfa_secret.
+        //    which PMS-1055 keeps in step with users.mfa_secret from
+        //    the application (enrolment, legacy upgrade and disable all
+        //    write both planes) rather than from the mirror trigger.
         if identity.mfa_enabled {
             let code = request
                 .mfa_code
@@ -3627,12 +3668,24 @@ impl AuthService {
                     // path within its ~60s window. Compare-and-set on
                     // `identities.mfa_last_totp_step`; 0 rows
                     // affected == replay.
-                    let secret_b32 = identity.mfa_secret.as_deref().ok_or_else(|| {
+                    let stored = identity.mfa_secret.as_deref().ok_or_else(|| {
                         AppError::Internal("MFA enabled without secret".to_string())
                     })?;
-                    let secret = crate::utils::totp::base32_decode(secret_b32).map_err(|_| {
-                        AppError::Internal("stored MFA secret is corrupt".to_string())
-                    })?;
+                    // PMS-1055: `identities.mfa_secret` holds the SAME
+                    // AES-256-GCM ciphertext `users.mfa_secret` has
+                    // held since PMS-871 - one representation, both
+                    // planes - so it is classified and decrypted the
+                    // way the tenant-hint branch does it. Handing the
+                    // raw column to `base32_decode` was a hard 500
+                    // ("Internal error: stored MFA secret is corrupt")
+                    // for every user enrolled after PMS-871, because
+                    // base64 routinely carries `0`, `1`, `8`, `9`, `+`
+                    // and `/` and the base32 alphabet is `A-Z2-7`.
+                    let stored = mfa_secret::open(stored, &self.encryption_key)?;
+                    let secret =
+                        crate::utils::totp::base32_decode(stored.secret_b32()).map_err(|_| {
+                            AppError::Internal("stored MFA secret is corrupt".to_string())
+                        })?;
                     let step = match crate::utils::totp::verify(&secret, code, Utc::now(), 1) {
                         Some(step) => step,
                         None => return Err(AppError::Unauthorized),
@@ -3650,6 +3703,14 @@ impl AuthService {
                         // yields, so timing does not leak "replay vs
                         // wrong code" to an attacker.
                         return Err(AppError::Unauthorized);
+                    }
+                    // PMS-871's in-place upgrade, on this plane: the code
+                    // verified against a pre-encryption row and was not a
+                    // replay, so seal it now. Gated on both so a guess cannot
+                    // drive the write.
+                    if stored.needs_upgrade() {
+                        self.upgrade_legacy_mfa_secret(&identity.email, stored.secret_b32())
+                            .await?;
                     }
                 }
             }
