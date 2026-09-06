@@ -1751,6 +1751,178 @@ impl ContactAuthService {
         Ok((enabled, secret, email.unwrap_or_default()))
     }
 
+    /// PMS-1086: change the password while signed in. Re-verifies the
+    /// current password (`reauthenticate`), holds the new one to the
+    /// shared policy `setup_password` applies, writes the hash, and
+    /// revokes every session family EXCEPT the caller's own (`sid`
+    /// names the row the access token was minted from), so a device
+    /// the customer no longer holds is signed out while the one they
+    /// are typing on keeps its refresh token: the PMS-1062 reset rule,
+    /// minus the changer. Refusals: 401 on a wrong current password
+    /// (the route spends re-auth budget on that one, PMS-881), 400
+    /// with the policy message on a weak new password, and the hash
+    /// is untouched on either.
+    #[tracing::instrument(skip_all)]
+    pub async fn change_password(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_sid: Uuid,
+        current_password: &str,
+        new_password: &str,
+    ) -> AppResult<()> {
+        self.reauthenticate(tenant_id, contact_id, current_password)
+            .await?;
+        let hint_strings = self.password_context_hints(contact_id).await?;
+        let hint_refs: Vec<&str> = hint_strings.iter().map(|s| s.as_str()).collect();
+        crate::utils::password_policy::validate(
+            new_password,
+            &hint_refs,
+            crate::utils::password_policy::PasswordPolicy::default(),
+        )
+        .map_err(|e| {
+            let crate::utils::password_policy::PasswordPolicyError::UserMessage(m) = e;
+            AppError::BadRequest(m)
+        })?;
+        let hash = hash_password(new_password)?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE contacts SET portal_password_hash = $1, updated_at = NOW() \
+             WHERE id = $2 AND tenant_id = $3",
+        )
+        .bind(&hash)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE contact_sessions SET revoked_at = NOW() \
+             WHERE contact_id = $1 AND tenant_id = $2 AND revoked_at IS NULL \
+               AND family_id <> (SELECT family_id FROM contact_sessions WHERE id = $3)",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .bind(current_sid)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// PMS-1085: the family the caller's access token belongs to, from
+    /// its `sid`. `None` when the row is gone (a revoked-and-purged
+    /// session), which the callers treat as "matches nothing".
+    async fn family_of_session(
+        &self,
+        tenant_id: Uuid,
+        session_id: Uuid,
+    ) -> AppResult<Option<Uuid>> {
+        let family: Option<Uuid> = sqlx::query_scalar(
+            "SELECT family_id FROM contact_sessions WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(session_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        Ok(family)
+    }
+
+    /// PMS-1085: the contact's live sessions, one per rotation family
+    /// (the newest unrevoked, unexpired row of each), newest login
+    /// first. `current` marks the family the caller's `sid` is in.
+    ///
+    /// SAFETY (PMS-285): both filters are the caller's own tenant and
+    /// contact ids from the verified JWT; the migrator pool is what
+    /// every `contact_sessions` read here uses.
+    #[tracing::instrument(skip_all)]
+    pub async fn list_sessions(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_sid: Uuid,
+    ) -> AppResult<Vec<ContactSessionResponse>> {
+        let current_family = self.family_of_session(tenant_id, current_sid).await?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            Uuid,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            DateTime<Utc>,
+            Option<String>,
+            Option<ipnetwork::IpNetwork>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT ON (s.family_id)
+                   s.family_id,
+                   (SELECT MIN(f.created_at) FROM contact_sessions f
+                     WHERE f.family_id = s.family_id) AS issued_at,
+                   s.created_at AS last_seen_at,
+                   s.expires_at, s.user_agent, s.ip_address
+            FROM contact_sessions s
+            WHERE s.contact_id = $1
+              AND s.tenant_id = $2
+              AND s.revoked_at IS NULL
+              AND s.expires_at > NOW()
+            ORDER BY s.family_id, s.created_at DESC
+            "#,
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_all(self.db.migrator_pool())
+        .await?;
+        let mut sessions: Vec<ContactSessionResponse> = rows
+            .into_iter()
+            .map(
+                |(family_id, issued_at, last_seen_at, expires_at, user_agent, ip)| {
+                    ContactSessionResponse {
+                        id: family_id,
+                        issued_at,
+                        last_seen_at,
+                        expires_at,
+                        user_agent,
+                        ip_address: ip.map(|ip| ip.ip().to_string()),
+                        current: current_family == Some(family_id),
+                    }
+                },
+            )
+            .collect();
+        sessions.sort_by(|a, b| b.issued_at.cmp(&a.issued_at));
+        Ok(sessions)
+    }
+
+    /// PMS-1085: end one of the caller's OTHER sessions by family id.
+    /// The caller's own family is refused with a 400 pointing at
+    /// `/auth/logout`, which also clears the SPA's in-memory token; a
+    /// family that is not the caller's (unknown, or another contact's)
+    /// is a silent 204, the enumeration-resistant shape logout has.
+    #[tracing::instrument(skip_all)]
+    pub async fn revoke_session(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        current_sid: Uuid,
+        family_id: Uuid,
+    ) -> AppResult<()> {
+        if self.family_of_session(tenant_id, current_sid).await? == Some(family_id) {
+            return Err(AppError::BadRequest(
+                "Use /auth/logout to sign out of the current session".to_string(),
+            ));
+        }
+        let owns: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM contact_sessions \
+             WHERE family_id = $1 AND contact_id = $2 AND tenant_id = $3)",
+        )
+        .bind(family_id)
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        if !owns {
+            return Ok(());
+        }
+        self.revoke_session_family(family_id).await
+    }
+
     /// PMS-1063: start MFA enrolment. Stages a fresh TOTP secret on the
     /// contact row, sealed at rest, WITHOUT flipping
     /// `portal_mfa_enabled`: only `enable_mfa`, after a live code has
@@ -2038,7 +2210,7 @@ impl ContactAuthService {
         &self,
         tenant_id: TenantId,
         company_id: Uuid,
-        caps: &[String],
+        contact_id: Uuid,
     ) -> AppResult<super::models::ContactDashboardSummary> {
         // MAPPS-705: gate each aggregate + activity section on the
         // caller's capabilities. A tile whose underlying list the
@@ -2047,6 +2219,10 @@ impl ContactAuthService {
         // caller could not click into. A contact holding zero caps
         // sees zero rows across the board, which is what the
         // empty-state SPA landing renders.
+        //
+        // PMS-985: the set is loaded here rather than taken as an
+        // argument, so no caller can hand this a stale snapshot.
+        let caps = self.load_capabilities(tenant_id.get(), contact_id).await?;
         let has = |cap: &str| caps.iter().any(|c| c == cap);
         let can_read_tickets = has(super::capabilities::TICKETS_READ);
         let can_read_invoices = has(super::capabilities::INVOICES_READ);
