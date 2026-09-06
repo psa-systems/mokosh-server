@@ -8,13 +8,12 @@
 //! replay, 400 on an expired or unknown token, 400 with the policy
 //! message on a weak password with the token left unused.
 //!
-//! Two groups the retired portal pinned are gone with it. Its
+//! One group the retired portal pinned is gone with it: its
 //! `PUT /portal/auth/me/password` change-password route has no contact
 //! plane counterpart (`PUT /contact/auth/me` edits the profile and
-//! carries no password field). And a successful reset revoked every live
-//! refresh token; `ContactAuthService::setup_password` writes the hash
-//! and marks the token used without touching `contact_sessions`. The
-//! first is on the PMS-1064 ledger; the second is PMS-1062.
+//! carries no password field). That is on the PMS-1064 ledger. The
+//! other rule it held, a successful reset revokes every live session,
+//! is back since PMS-1062 and pinned below.
 
 mod common;
 
@@ -271,4 +270,71 @@ async fn reset_password_weak_password_returns_400_and_token_unused(pool: PgPool)
     // And the same token then redeems.
     let retry = reset(&app, &token, STRONG).await;
     assert_eq!(retry.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
+// PMS-1062: a reset ends every session the contact holds, on every
+// device, so a refresh token stolen before the reset does not survive
+// it. The new password signs in fresh.
+#[sqlx::test]
+async fn reset_password_revokes_every_live_session(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
+    let app = common::boot(pool.clone()).await;
+
+    // Two devices signed in, one of them rotated once.
+    let first = common::contact_login(&app, &contact).await;
+    let rt_first = first["refresh_token"].as_str().unwrap().to_string();
+    let rotated = app
+        .client
+        .post(app.url("/api/v1/contact/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": rt_first }))
+        .send()
+        .await
+        .expect("rotate");
+    let rt_rotated = rotated.json::<serde_json::Value>().await.unwrap()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let second = common::contact_login(&app, &contact).await;
+    let rt_second = second["refresh_token"].as_str().unwrap().to_string();
+
+    let (_, token) = seed_reset_token(
+        &pool,
+        contact.id,
+        "reset-secret-abcdefghij",
+        in_thirty_minutes(),
+    )
+    .await;
+    let resp = reset(&app, &token, STRONG).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM contact_sessions WHERE contact_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(contact.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(live, 0, "no live session survives the reset");
+
+    for (label, rt) in [("rotated", &rt_rotated), ("second device", &rt_second)] {
+        let refresh = app
+            .client
+            .post(app.url("/api/v1/contact/auth/refresh"))
+            .json(&serde_json::json!({ "refresh_token": rt }))
+            .send()
+            .await
+            .expect("refresh after reset");
+        assert_eq!(
+            refresh.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{label} refresh token is dead after the reset"
+        );
+    }
+
+    let login = common::contact_login_response(&app, &contact, STRONG).await;
+    assert_eq!(
+        login.status(),
+        reqwest::StatusCode::OK,
+        "new password signs in"
+    );
 }
