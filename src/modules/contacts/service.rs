@@ -3515,6 +3515,16 @@ impl ContactService {
         if let Some(ref links) = links {
             self.write_contact_companies(&mut tx, tenant_id, contact_id, links)
                 .await?;
+        } else {
+            // PMS-1069: with no list in the request the recompute below derives
+            // `company_id` from links this edit never touched, so a contact
+            // written outside the CRUD path (email intake, portal-admin
+            // provisioning, the dev seeder, a direct INSERT) lost its company on
+            // the first edit of any field. Adopt the mirror as the primary link
+            // first, so the recompute reads a link table that agrees with it.
+            // Only reachable when there are no links at all, so an explicit
+            // empty list still unlinks the contact.
+            ensure_primary_company_link(&mut tx, tenant_id.get(), contact_id).await?;
         }
         // Unconditional: the mirrors are derived state, so re-deriving them is
         // idempotent when nothing changed and self-healing when it did.
@@ -4287,6 +4297,55 @@ fn resolve_company_list(entries: &[ContactCompanyLinkInput]) -> Vec<ResolvedLink
         .collect()
 }
 
+// ============================================================================
+// PMS-1069: the mirror and its child table cannot disagree
+// ============================================================================
+
+/// Give a `contacts.company_id` written outside the CRUD path its matching
+/// primary `contact_companies` row.
+///
+/// PMS-806 made `company_id` a MIRROR of the primary link and
+/// [`ContactService::recompute_contact_mirrors`] re-derives it from
+/// `contact_companies` on every edit, so a contact holding a `company_id` with
+/// no link loses that company on the first edit of any field, silently. Three
+/// writers outside this module insert `contacts.company_id` on its own (email
+/// intake, tenant portal-admin provisioning, the dev seeder), and migration 108
+/// backfilled the link table once, so every such row written since is in that
+/// state. This is the one write that repairs it, and the one those writers
+/// call, so a fourth cannot get it wrong in a fourth way.
+///
+/// Idempotent and information-preserving: it fires only when the contact has a
+/// `company_id` and NO links at all, so it can never contradict an authoritative
+/// list written by [`ContactService::write_contact_companies`] (including the
+/// empty list that legitimately unlinks a contact). `title` is copied from the
+/// contact the way migration 108's backfill copied it.
+pub(crate) async fn ensure_primary_company_link(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: Uuid,
+    contact_id: Uuid,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO contact_companies
+            (tenant_id, contact_id, company_id, title, is_primary, sort_order)
+        SELECT c.tenant_id, c.id, c.company_id, c.title, TRUE, 0
+        FROM contacts c
+        WHERE c.tenant_id = $1
+          AND c.id = $2
+          AND c.company_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM contact_companies l WHERE l.contact_id = c.id
+          )
+        ON CONFLICT (contact_id, company_id) DO NOTHING
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(contact_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 #[derive(sqlx::FromRow)]
 struct ContactPhoneRow {
     id: Uuid,
@@ -4549,5 +4608,117 @@ mod tests {
         );
 
         assert!(phones_from_scalars(None, None, None).is_empty());
+    }
+}
+
+/// PMS-1069: no fifth writer can put a mirror column on a `contacts` row and
+/// leave the child table it mirrors empty.
+#[cfg(test)]
+mod mirror_writers {
+    /// Every `INSERT INTO contacts` in `src/` that names a mirror column writes
+    /// the child rows that column is derived from.
+    ///
+    /// `contacts.company_id` / `phone` / `mobile` / `fax` are maintained mirrors
+    /// of `contact_companies` and `contact_phones` (PMS-806), and every contact
+    /// update re-derives them from those tables. A writer that sets a mirror
+    /// alone therefore does not write a slightly incomplete row: it writes a row
+    /// whose company or phone number disappears on the first edit of any field,
+    /// with no error and nothing in the audit log saying a link was removed.
+    ///
+    /// Three writers outside `modules/contacts` had it that way for the whole
+    /// life of the mirror, which is what this scan exists to stop happening a
+    /// fourth time. The rule cannot be a type: these are raw `sqlx::query`
+    /// statements the compiler has no opinion about, so the source is what gets
+    /// read - the way `repo_hygiene` and `billing::routes::finance_gate` do,
+    /// under `cargo test --lib`, with no script, recipe or CI step to add.
+    ///
+    /// Scoped to INSERTs. An UPDATE that writes a mirror column has the same
+    /// problem and a different shape (a partial `COALESCE` update rather than a
+    /// whole row), and `ContactPortalService::update_self` is in that state
+    /// today: PMS-1107.
+    #[test]
+    fn every_contacts_insert_writes_the_child_rows_its_mirrors_derive_from() {
+        // Assembled so the needle is not its own hit. Prose in this file still
+        // names the statement, so a backticked mention is skipped below.
+        let needle = format!("INSERT INTO {}", "contacts");
+        // The company link and the phone list have one writer each. Either name
+        // in the window counts: `write_contact_companies` is the CRUD path's
+        // authoritative rewrite, `ensure_primary_company_link` is the one write
+        // every other path uses.
+        const COMPANY_WRITERS: &[&str] =
+            &["write_contact_companies", "ensure_primary_company_link"];
+        const PHONE_WRITERS: &[&str] = &["write_contact_phones"];
+        // Enough to cover the statement, its binds and the child write that
+        // follows it. Every current site fits in well under half of this.
+        const WINDOW: usize = 3000;
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        let mut pending = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read source directory") {
+                let entry = entry.expect("read directory entry");
+                let path = entry.path();
+                if entry.file_type().expect("read entry type").is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                for (offset, _) in text.match_indices(&needle) {
+                    // A backticked mention is prose (this module's own doc
+                    // comment and assertion message), never a statement, and
+                    // counting one would soften the tripwire below.
+                    if text[..offset].ends_with('`') {
+                        continue;
+                    }
+                    seen += 1;
+                    let rest = &text[offset..];
+                    let window = &rest[..rest.len().min(WINDOW)];
+                    // The column list: everything up to the VALUES / SELECT that
+                    // feeds it. A statement with no column list names no column
+                    // this scan can clear, so it lands on every rule at once.
+                    let columns = window
+                        .find("VALUES")
+                        .into_iter()
+                        .chain(window.find("SELECT"))
+                        .min()
+                        .map(|end| &window[..end])
+                        .unwrap_or(window);
+                    let where_ =
+                        format!("{}: {}", path.display(), &columns[..columns.len().min(60)]);
+                    if columns.contains("company_id")
+                        && !COMPANY_WRITERS.iter().any(|w| window.contains(w))
+                    {
+                        offenders.push(format!("{where_} sets company_id with no link write"));
+                    }
+                    if (columns.contains("phone")
+                        || columns.contains("mobile")
+                        || columns.contains("fax"))
+                        && !PHONE_WRITERS.iter().any(|w| window.contains(w))
+                    {
+                        offenders.push(format!("{where_} sets a phone mirror with no phone write"));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            seen >= 4,
+            "the scan found only {seen} `INSERT INTO contacts` statements, so it \
+             has stopped matching this repository's shape and is no longer \
+             proving anything"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these writers set a mirror column without the child rows it is \
+             derived from, so the value disappears on the contact's first edit: \
+             {offenders:#?}. Call `ensure_primary_company_link` (or \
+             `write_contact_companies` / `write_contact_phones`) in the same \
+             transaction as the INSERT."
+        );
     }
 }

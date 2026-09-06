@@ -604,9 +604,15 @@ impl TenantService {
     /// closed if `own_company_id` is still NULL: that means the
     /// caller skipped `ensure_own_company` (a programming error - the
     /// contacts.company_id FK is NOT NULL).
+    ///
+    /// PMS-1069: `pub` so the regression test can drive this writer itself
+    /// rather than re-typing its INSERT into a fixture. Its only in-crate caller
+    /// (`provision_portal_admin_and_send_welcome`) is retired pending the
+    /// MAPPS-656/657 restoration decision, so a fixture copy would be the only
+    /// thing standing between a restored provisioner and the same silent
+    /// company-link loss. Same reason `COMPANY_BLOCKERS` is exported.
     // Contact-plane retirement fallout; retained pending MAPPS-656/657 restoration decision
-    #[allow(dead_code)]
-    async fn insert_portal_admin_contact(
+    pub async fn insert_portal_admin_contact(
         &self,
         tenant_id: Uuid,
         admin_email: &str,
@@ -644,6 +650,14 @@ impl TenantService {
         .bind(admin_email)
         .execute(&mut *tx)
         .await?;
+        // PMS-1069: `contacts.company_id` is a mirror of the primary
+        // `contact_companies` row (PMS-806) and an edit re-derives it from that
+        // table, so the mirror written above needs its link or the first edit of
+        // this contact drops the company. Without a company `send_setup_email`
+        // has no portal to point at and the grant mail is never delivered, so
+        // the admin's portal invite went missing with only a WARN to show for it.
+        crate::modules::contacts::ensure_primary_company_link(&mut tx, tenant_id, contact_id)
+            .await?;
         tx.commit().await?;
         Ok(contact_id)
     }

@@ -354,14 +354,6 @@ services:
       # for the predicate.
       CORS_ORIGIN: ${CORS_ORIGIN:-}
 
-      # PMS-729 phase 2 H8: Cloudflare Turnstile on portal login. Both
-      # keys empty (default) leaves the feature off; the per-IP failure
-      # counter still ticks so a future toggle-on picks up warm state.
-      # See .env.example for the source of the keys.
-      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
-      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
-      TURNSTILE_TRIGGER_THRESHOLD: ${TURNSTILE_TRIGGER_THRESHOLD:-}
-
       # MAPPS-425 / PMS-748 / MAPPS-429: the emailed-link and email-branding
       # trio. SPA_BASE_URL falls back to CLIENT_ORIGIN, so it only needs setting
       # on a stack where the SPA is not the login origin; PUBLIC_API_BASE_URL is
