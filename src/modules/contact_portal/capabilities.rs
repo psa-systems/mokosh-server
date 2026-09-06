@@ -54,8 +54,10 @@
 //! Deferred follow-up capabilities (each becomes its own PMS ticket):
 //! - `tickets:attach_download` (download attachments on tickets scoped
 //!   to the Company)
-//! - `tickets:request_service` (submit a service-request form; overlaps
-//!   `forms:submit` if the request is form-driven)
+//! - `tickets:request_service` (submit a service-request form; the
+//!   `forms:submit` cap that once overlapped it was retired in PMS-1064
+//!   with the portal router, since the public magic-link form flow is
+//!   the customer-facing submit)
 //! - `tickets:mark_all_read` (bulk-clear notification badges on tickets)
 //! - `invoices:view_payments` (see payment history against invoices)
 //! - `invoices:pay_partial` (split pay flow; today `invoices:pay` covers
@@ -140,8 +142,6 @@ pub const ASSETS_REPORT_ISSUE: &str = "assets:report_issue";
 pub const PROJECTS_READ: &str = "projects:read";
 /// Read published Knowledge Base articles visible to the Company.
 pub const KB_READ: &str = "kb:read";
-/// Submit an MSP-published request form.
-pub const FORMS_SUBMIT: &str = "forms:submit";
 /// Read notifications addressed to the contact.
 pub const NOTIFICATIONS_READ: &str = "notifications:read";
 /// Edit own profile + password + MFA + own sessions.
@@ -194,7 +194,6 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     ASSETS_REPORT_ISSUE,
     PROJECTS_READ,
     KB_READ,
-    FORMS_SUBMIT,
     NOTIFICATIONS_READ,
     SETTINGS_MANAGE_OWN,
     SETTINGS_MANAGE_COMPANY_BRANDING,
@@ -239,7 +238,6 @@ mod tests {
             ASSETS_REPORT_ISSUE,
             PROJECTS_READ,
             KB_READ,
-            FORMS_SUBMIT,
             NOTIFICATIONS_READ,
             SETTINGS_MANAGE_OWN,
             CONTACTS_INVITE_SUB_USER,

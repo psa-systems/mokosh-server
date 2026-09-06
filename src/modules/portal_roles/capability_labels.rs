@@ -124,12 +124,6 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
                 .to_string(),
         },
         CapabilityDescriptor {
-            key: caps::FORMS_SUBMIT.to_string(),
-            label: "Submit request forms".to_string(),
-            group: "Forms".to_string(),
-            description: "Submit an MSP-published request form.".to_string(),
-        },
-        CapabilityDescriptor {
             key: caps::NOTIFICATIONS_READ.to_string(),
             label: "Read notifications".to_string(),
             group: "Notifications".to_string(),
