@@ -781,7 +781,8 @@ impl KbService {
     /// and record the restore as a NEW monotonic version (so the history
     /// is append-only and the restore itself is auditable). Tenant-scoped:
     /// the article must belong to `tenant_id` and the version must belong
-    /// to that article.
+    /// to that article. Answers the version it wrote (PMS-1126), which
+    /// names the version it brought back and carries the caller's note.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn restore_article_version(
         &self,
@@ -789,7 +790,8 @@ impl KbService {
         article_id: Uuid,
         version_number: i32,
         editor: Uuid,
-    ) -> AppResult<KbArticleResponse> {
+        request: &RestoreKbArticleVersionRequest,
+    ) -> AppResult<KbArticleVersionResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Confirm the article is in this tenant before touching versions.
         let exists: bool = sqlx::query_scalar(
@@ -830,17 +832,17 @@ impl KbService {
         // The restore lands as a fresh version so editing still snapshots
         // on top of it (monotonic numbering preserved), and says which
         // version it brought back (PMS-1126).
-        Self::snapshot_version(
+        let written = Self::snapshot_version(
             &mut tx,
             article_id,
             &title,
             &content,
             editor,
-            VersionProvenance::restore(version_number, None),
+            VersionProvenance::restore(version_number, request.change_note.as_deref()),
         )
         .await?;
         tx.commit().await?;
-        self.get_article_inner(tenant_id, article_id, false).await
+        Ok(written)
     }
 
     /// Record a `helpful` vote for `user_id` on a tenant-scoped article.
