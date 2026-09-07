@@ -15,6 +15,9 @@
 //!   editor; restore takes a note, names the version it brought back, and
 //!   needs the manager role; edit, restore and delete are audited and the
 //!   per-record history route reads them
+//! - PMS-1127: `GET /kb/articles/{id}/tickets` lists the tickets that
+//!   reference the article by either FK, open first, one row per ticket,
+//!   and answers 404 for another tenant's article
 //! - ratings are per-user, mutually exclusive, and toggleable: one vote
 //!   per account, switching helpful<->not_helpful flips in place, a repeat
 //!   click un-votes, a second user votes independently, and the GET vote
@@ -1552,4 +1555,183 @@ async fn article_writes_are_audited_and_readable_as_history(pool: PgPool) {
         Some("Audited"),
         "the delete row carries the article as it was"
     );
+}
+
+// ============================================================================
+// PMS-1127: the tickets that reference an article
+// ============================================================================
+
+/// Three tickets point at the article (one from it, one working it, one
+/// both), a fourth is unrelated; one of the pointing ones is closed. The
+/// route lists the three, open ones first, one row per ticket with the
+/// stronger relation, and a second tenant's admin gets 404 for it.
+#[sqlx::test]
+async fn article_tickets_lists_referencing_tickets_open_first(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let (_other_tenant, _other_admin, other_email, other_password) =
+        common::seed_tenant_with_admin(&pool, "pms-1127-other").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let article = create_article(
+        &app,
+        &token,
+        serde_json::json!({ "title": "Load bearing", "slug": "load-bearing", "content": "body" }),
+    )
+    .await;
+    let article_id = article["id"].as_str().expect("article id").to_string();
+    let article_uuid = uuid::Uuid::parse_str(&article_id).expect("article uuid");
+
+    let tenant = common::DEFAULT_TENANT_ID;
+    // Opened from the article, oldest touch.
+    seed_ticket_for_article(
+        &pool,
+        tenant,
+        company_id,
+        admin_id,
+        "T-SRC",
+        Some(article_uuid),
+        9,
+    )
+    .await;
+    // Works the article (procedure only).
+    seed_ticket_for_article(&pool, tenant, company_id, admin_id, "T-PROC", None, 5).await;
+    // Both columns: one row, `procedure`.
+    seed_ticket_for_article(
+        &pool,
+        tenant,
+        company_id,
+        admin_id,
+        "T-BOTH",
+        Some(article_uuid),
+        1,
+    )
+    .await;
+    // Unrelated.
+    seed_ticket_for_article(&pool, tenant, company_id, admin_id, "T-NONE", None, 2).await;
+    for number in ["T-PROC", "T-BOTH"] {
+        sqlx::query(
+            "UPDATE tickets SET procedure_kb_article_id = $1 WHERE tenant_id = $2 AND ticket_number = $3",
+        )
+        .bind(article_uuid)
+        .bind(tenant)
+        .bind(number)
+        .execute(&pool)
+        .await
+        .expect("set procedure article");
+    }
+    // Close the most recently touched one, so ordering cannot be "by
+    // updated_at" alone.
+    let closed_status: uuid::Uuid = sqlx::query_scalar(
+        r#"INSERT INTO ticket_statuses (tenant_id, name, color, is_closed)
+           VALUES ($1, 'Closed (PMS-1127)', '#000000', TRUE) RETURNING id"#,
+    )
+    .bind(tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("closed status");
+    sqlx::query(
+        "UPDATE tickets SET status_id = $1 WHERE tenant_id = $2 AND ticket_number = 'T-BOTH'",
+    )
+    .bind(closed_status)
+    .bind(tenant)
+    .execute(&pool)
+    .await
+    .expect("close T-BOTH");
+    // The tickets trigger stamps updated_at = NOW() on every UPDATE, so the
+    // order the rows are touched in is the order they are listed in: T-SRC
+    // then T-PROC, each its own statement and so its own clock reading.
+    for number in ["T-SRC", "T-PROC"] {
+        sqlx::query("UPDATE tickets SET title = title WHERE tenant_id = $1 AND ticket_number = $2")
+            .bind(tenant)
+            .bind(number)
+            .execute(&pool)
+            .await
+            .expect("touch ticket");
+    }
+
+    let resp = app
+        .client
+        .get(app.url(&format!("/api/v1/kb/articles/{article_id}/tickets")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list tickets");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("tickets JSON");
+    assert_eq!(body["meta"]["total"].as_u64(), Some(3), "{body}");
+    let rows = body["data"].as_array().expect("data");
+    let numbers: Vec<&str> = rows
+        .iter()
+        .map(|r| r["ticket_number"].as_str().expect("number"))
+        .collect();
+    // Open first (most recently touched first), then the closed one.
+    assert_eq!(numbers, ["T-PROC", "T-SRC", "T-BOTH"], "{body}");
+    let by_number = |n: &str| {
+        rows.iter()
+            .find(|r| r["ticket_number"] == n)
+            .expect(n)
+            .clone()
+    };
+    assert_eq!(by_number("T-SRC")["relation"].as_str(), Some("source"));
+    assert_eq!(by_number("T-PROC")["relation"].as_str(), Some("procedure"));
+    assert_eq!(by_number("T-BOTH")["relation"].as_str(), Some("procedure"));
+    assert_eq!(
+        by_number("T-BOTH")["status_is_closed"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        by_number("T-BOTH")["status"].as_str(),
+        Some("Closed (PMS-1127)")
+    );
+    assert_eq!(
+        by_number("T-SRC")["status_is_closed"].as_bool(),
+        Some(false)
+    );
+    assert!(
+        by_number("T-SRC")["priority"].is_string(),
+        "priority name rides along"
+    );
+    assert!(by_number("T-SRC")["title"].is_string());
+
+    // Another tenant's admin, with the module on, cannot see it: 404, the
+    // versions list's answer for an article outside the tenant.
+    let other_token = {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/auth/login"))
+            .json(&serde_json::json!({
+                "email": other_email,
+                "password": other_password,
+                "tenant_slug": "pms-1127-other",
+            }))
+            .send()
+            .await
+            .expect("send other login");
+        assert!(resp.status().is_success(), "other login {}", resp.status());
+        let body: serde_json::Value = resp.json().await.expect("login JSON");
+        body["access_token"].as_str().expect("token").to_string()
+    };
+    let enable = app
+        .client
+        .put(app.url("/api/v1/settings/modules/knowledge_base"))
+        .bearer_auth(&other_token)
+        .json(&serde_json::json!({ "is_enabled": true }))
+        .send()
+        .await
+        .expect("enable module");
+    assert!(
+        enable.status().is_success(),
+        "enable module {}",
+        enable.status()
+    );
+    let resp = app
+        .client
+        .get(app.url(&format!("/api/v1/kb/articles/{article_id}/tickets")))
+        .bearer_auth(&other_token)
+        .send()
+        .await
+        .expect("send cross-tenant list");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
