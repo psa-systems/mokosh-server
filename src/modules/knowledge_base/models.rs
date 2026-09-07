@@ -232,6 +232,26 @@ pub struct KbArticleVersionResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// PMS-1127: a ticket that references an article, one row of
+/// `GET /kb/articles/{id}/tickets`. `relation` says how: `source` for a
+/// ticket opened FROM the article (`tickets.source_kb_article_id`,
+/// migration 068) and `procedure` for a ticket the article says how to
+/// work (`tickets.procedure_kb_article_id`, migration 099). A ticket
+/// carrying both is one row, `procedure`, because that is the stronger
+/// claim on the article. Closed tickets come after open ones so the panel
+/// leads with what is still leaning on the article.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbArticleTicketRow {
+    pub id: Uuid,
+    pub ticket_number: String,
+    pub title: String,
+    pub status: String,
+    pub status_is_closed: bool,
+    pub priority: Option<String>,
+    pub relation: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// PMS-485: row in the "Top ticket-driving articles" widget. One row
 /// per published KB article, ordered by descending `ticket_count` over
 /// the configurable `since` window.

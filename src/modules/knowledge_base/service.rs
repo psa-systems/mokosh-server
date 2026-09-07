@@ -1142,6 +1142,63 @@ impl KbService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// PMS-1127: the tickets that reference `article_id` through either FK,
+    /// open first and then most recently touched first, paginated. An
+    /// article outside the caller's tenant answers 404 before any ticket is
+    /// read, the same shape as the versions list. The status join is an
+    /// inner join because `tickets.status_id` is `NOT NULL`; the priority is
+    /// a left join so a ticket whose priority row is gone still lists.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_article_tickets(
+        &self,
+        tenant_id: TenantId,
+        article_id: Uuid,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<KbArticleTicketRow>, u64)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(article_id)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound("KB article".to_string()));
+        }
+        let total: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM tickets
+               WHERE tenant_id = $1
+                 AND (source_kb_article_id = $2 OR procedure_kb_article_id = $2)"#,
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let rows = sqlx::query_as::<_, ArticleTicketRow>(
+            r#"SELECT t.id, t.ticket_number, t.title,
+                      s.name AS status, COALESCE(s.is_closed, FALSE) AS status_is_closed,
+                      p.name AS priority,
+                      CASE WHEN t.procedure_kb_article_id = $2 THEN 'procedure' ELSE 'source' END
+                          AS relation,
+                      t.updated_at
+               FROM tickets t
+               JOIN ticket_statuses s ON s.id = t.status_id
+               LEFT JOIN ticket_priorities p ON p.id = t.priority_id
+               WHERE t.tenant_id = $1
+                 AND (t.source_kb_article_id = $2 OR t.procedure_kb_article_id = $2)
+               ORDER BY COALESCE(s.is_closed, FALSE) ASC, t.updated_at DESC
+               LIMIT $3 OFFSET $4"#,
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .bind(pagination.limit() as i64)
+        .bind(pagination.offset() as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
     /// Portal single-article read for a specific customer contact. Enforces
     /// the same publish + visibility rules as
     /// [`Self::list_portal_articles_for_company`]: `status = 'published'` AND
@@ -1419,6 +1476,33 @@ impl<'a> VersionProvenance<'a> {
         self.change_note
             .map(str::trim)
             .filter(|note| !note.is_empty())
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ArticleTicketRow {
+    id: Uuid,
+    ticket_number: String,
+    title: String,
+    status: String,
+    status_is_closed: bool,
+    priority: Option<String>,
+    relation: String,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<ArticleTicketRow> for KbArticleTicketRow {
+    fn from(r: ArticleTicketRow) -> Self {
+        Self {
+            id: r.id,
+            ticket_number: r.ticket_number,
+            title: r.title,
+            status: r.status,
+            status_is_closed: r.status_is_closed,
+            priority: r.priority,
+            relation: r.relation,
+            updated_at: r.updated_at,
+        }
     }
 }
 
