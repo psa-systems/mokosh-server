@@ -51,7 +51,6 @@ endpoint, extend one of these files.
 | POST /auth/login | `login` | N/A |
 | POST /auth/login-link | `request_login_link` | N/A |
 | POST /auth/login-link/redeem | `redeem_login_link` | N/A |
-| POST /auth/login-link/select | `select_login_candidate` | N/A |
 | POST /auth/logout | `logout` | N/A |
 | GET  /auth/me | `me` | SCOPED (own profile) |
 | PUT  /auth/me | `update_me` | SCOPED (own profile, DB cap re-check) |
