@@ -4243,6 +4243,20 @@ impl BillingService {
             .fetch_optional(&mut **tx)
             .await?;
         }
+        // MAPPS-727: name the finance user who wrote the invoice off, the
+        // shape `decided_by_name` has on an approval; a deleted user reads
+        // as no name rather than an error.
+        if let Some(user_id) = resp.written_off_by_id {
+            resp.written_off_by_name = sqlx::query_scalar(
+                "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
+                 FROM users WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+        }
         Ok(resp)
     }
 
@@ -5840,6 +5854,7 @@ impl From<InvoiceRow> for InvoiceResponse {
             days_overdue: 0,
             written_off_at: r.written_off_at,
             written_off_by_id: r.written_off_by_id,
+            written_off_by_name: None,
             write_off_reason: r.write_off_reason,
             write_off_amount: r.write_off_amount,
             created_at: r.created_at,

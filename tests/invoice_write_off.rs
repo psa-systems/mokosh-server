@@ -151,6 +151,8 @@ async fn a_sent_invoice_with_a_balance_is_written_off_with_a_reason(pool: PgPool
     assert_eq!(dec(&body["write_off_amount"]), Decimal::from(400));
     assert_eq!(body["write_off_reason"], "Customer ceased trading");
     assert_eq!(body["written_off_by_id"], admin_id.to_string());
+    // MAPPS-727: the detail names the actor for the page.
+    assert_eq!(body["written_off_by_name"], "Test Admin");
     assert!(body["written_off_at"].is_string());
     assert_eq!(
         dec(&body["balance_due"]),
