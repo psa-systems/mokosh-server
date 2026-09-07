@@ -193,6 +193,11 @@ pub struct InvoiceResponse {
     /// late payment lands afterwards.
     pub written_off_at: Option<DateTime<Utc>>,
     pub written_off_by_id: Option<Uuid>,
+    /// MAPPS-727: the display name behind `written_off_by_id`, resolved on
+    /// `GET /:id` the way `company_name` is, so the page can say who
+    /// without a users lookup it has no route for. `None` on list rollups
+    /// and on a deleted user.
+    pub written_off_by_name: Option<String>,
     pub write_off_reason: Option<String>,
     pub write_off_amount: Option<Decimal>,
     pub created_at: DateTime<Utc>,
