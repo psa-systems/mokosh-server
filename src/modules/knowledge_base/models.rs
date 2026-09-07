@@ -46,6 +46,19 @@ pub struct KbArticleResponse {
     pub visibility: String,
     pub status: String,
     pub author_id: Uuid,
+    /// PMS-1126: the author's display name, "Unknown" when the user row is
+    /// gone. Names, never ids, are what the page shows.
+    pub author_name: String,
+    /// PMS-1126: who last wrote the row through any path (edit, restore,
+    /// task toggle, metadata-only edit). `None` only for an article that
+    /// has never been written since creation AND carries no version, which
+    /// no API path produces; a row from before migration 200 falls back to
+    /// the latest version's editor.
+    pub updated_by_id: Option<Uuid>,
+    pub updated_by_name: Option<String>,
+    /// PMS-1126: the highest version number, so a client can mark the
+    /// current row in the history without a second request.
+    pub current_version: i32,
     pub view_count: i32,
     pub helpful_count: i32,
     pub not_helpful_count: i32,
@@ -205,6 +218,9 @@ pub struct KbArticleVersionResponse {
     pub title: String,
     pub content: String,
     pub edited_by_id: Uuid,
+    /// PMS-1126: the editor's display name, "Unknown" when the user row is
+    /// gone.
+    pub edited_by_name: String,
     /// PMS-1126: what the editor said the change was for, when they said.
     pub change_note: Option<String>,
     /// PMS-1126: `create` for the snapshot seeded with the article, `edit`
