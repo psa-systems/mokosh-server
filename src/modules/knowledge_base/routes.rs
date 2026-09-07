@@ -83,6 +83,10 @@ pub fn kb_routes(service: KbService) -> Router {
             "/kb/articles/{id}/measured-duration",
             get(article_measured_duration),
         )
+        // PMS-1127: the tickets that reference this article, by either FK.
+        // A read over columns that already exist; the panel that shows
+        // whether an article is load-bearing needs no new plumbing.
+        .route("/kb/articles/{id}/tickets", get(list_article_tickets))
         // PMS-1082: the three reads above (`GET /kb/categories`,
         // `GET /kb/articles`, `GET /kb/articles/{id}`) are dual-plane
         // (`RequireCallerContext`): a contact holding `kb:read` gets the
@@ -433,6 +437,25 @@ async fn list_top_ticket_driving_articles(
             .list_top_ticket_driving_articles(u.tenant(), since, limit)
             .await?,
     ))
+}
+
+/// PMS-1127: staff only, like every KB read that is not one of the three
+/// dual-plane ones; a contact bearer never satisfies `RequireKnowledgeBase`.
+async fn list_article_tickets(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    Path(id): Path<Uuid>,
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<KbArticleTicketRow>>> {
+    let (items, total) = s
+        .service
+        .list_article_tickets(u.tenant(), id, &pagination)
+        .await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 #[derive(Debug, serde::Deserialize)]
