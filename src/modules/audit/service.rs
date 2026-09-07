@@ -231,8 +231,10 @@ impl AuditService {
 /// per-record endpoint. Restricting the set keeps that endpoint from exposing
 /// audit trails for sensitive entities (billing, auth) that a technician
 /// should not browse, while covering the record types whose detail pages
-/// surface a change history (PMS-182/184/185).
-pub const HISTORY_ENTITY_TYPES: &[&str] = &["tickets", "tasks", "projects", "assets"];
+/// surface a change history (PMS-182/184/185). `kb_articles` joined in
+/// PMS-1126, when its update, restore and delete started writing rows.
+pub const HISTORY_ENTITY_TYPES: &[&str] =
+    &["tickets", "tasks", "projects", "assets", "kb_articles"];
 
 /// Columns excluded from a record's `changed_fields` diff: bookkeeping that
 /// changes on every write and would otherwise drown the meaningful edits.

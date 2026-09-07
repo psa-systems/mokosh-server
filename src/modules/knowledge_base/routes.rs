@@ -267,12 +267,15 @@ async fn update_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_article(u.tenant(), id, u.id, &req).await?,
+        s.service
+            .update_article(u.tenant(), id, u.id, &req, &ctx)
+            .await?,
     ))
 }
 
@@ -326,9 +329,10 @@ async fn delete_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_article(u.tenant(), id).await
+    s.service.delete_article(u.tenant(), id, &ctx).await
 }
 
 async fn list_article_versions(
@@ -348,14 +352,27 @@ async fn list_article_versions(
     )))
 }
 
+/// PMS-1126: `RequireManager` like the article PUT it is a form of. Before
+/// this the route carried only the module gate, so a technician who could
+/// not edit an article could still rewrite it to any past version. Takes an
+/// optional `{ "change_note" }` (an absent or empty body is `{}`) and
+/// answers the version the restore wrote rather than the article, because
+/// that row, with its `restored_from_version`, is what the caller asked
+/// for; the article itself is one GET away and the client re-reads it
+/// anyway.
 async fn restore_article_version(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    _m: RequireManager,
+    ctx: crate::modules::audit::AuditCtx,
     Path((id, version_number)): Path<(Uuid, i32)>,
-) -> AppResult<Json<KbArticleResponse>> {
+    body: Option<Json<RestoreKbArticleVersionRequest>>,
+) -> AppResult<Json<KbArticleVersionResponse>> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    req.validate()?;
     Ok(Json(
         s.service
-            .restore_article_version(u.tenant(), id, version_number, u.id)
+            .restore_article_version(u.tenant(), id, version_number, u.id, &req, &ctx)
             .await?,
     ))
 }

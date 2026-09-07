@@ -10,6 +10,11 @@
 //! - restoring a prior version brings its content back as a NEW version
 //! - pg_trgm search finds an article by a fuzzy term
 //! - duplicate per-tenant slug is rejected (409)
+//! - PMS-1126: a version says who wrote it (by name), what kind of change
+//!   it was and why; a metadata-only edit creates no version but stamps the
+//!   editor; restore takes a note, names the version it brought back, and
+//!   needs the manager role; edit, restore and delete are audited and the
+//!   per-record history route reads them
 //! - ratings are per-user, mutually exclusive, and toggleable: one vote
 //!   per account, switching helpful<->not_helpful flips in place, a repeat
 //!   click un-votes, a second user votes independently, and the GET vote
@@ -1237,5 +1242,314 @@ async fn procedure_kb_article_round_trips_and_stays_out_of_the_driving_widget(po
     assert!(
         after.is_none(),
         "deleting the article must NULL the linkage, got {after:?}"
+    );
+}
+
+// ============================================================================
+// PMS-1126: provenance on versions, names on the article, audited writes
+// ============================================================================
+
+/// Every version names its editor and says what kind of change it was;
+/// an edit's note rides on the version it creates and a metadata-only edit
+/// creates none; a restore names the version it brought back and answers
+/// that row; the article carries names, its last editor and its current
+/// version number.
+#[sqlx::test]
+async fn versions_say_who_what_kind_and_why(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let article = create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Provenance",
+            "slug": "provenance",
+            "content": "first draft",
+        }),
+    )
+    .await;
+    let article_id = article["id"].as_str().expect("article id").to_string();
+    assert_eq!(article["author_name"].as_str(), Some("Test Admin"));
+    assert_eq!(
+        article["updated_by_id"].as_str(),
+        Some(admin_id.to_string().as_str()),
+        "creation is the first write, so the author is the last editor"
+    );
+    assert_eq!(article["updated_by_name"].as_str(), Some("Test Admin"));
+    assert_eq!(article["current_version"].as_i64(), Some(1));
+
+    let v = versions(&app, &token, &article_id).await;
+    let first = &v["data"].as_array().expect("versions data")[0];
+    assert_eq!(first["change_kind"].as_str(), Some("create"));
+    assert_eq!(first["edited_by_name"].as_str(), Some("Test Admin"));
+    assert!(first["change_note"].is_null());
+    assert!(first["restored_from_version"].is_null());
+
+    // An edit with a note: the note is trimmed onto the version it creates.
+    let put = app
+        .client
+        .put(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "content": "second draft",
+            "change_note": "  tightened the wording  ",
+        }))
+        .send()
+        .await
+        .expect("send edit");
+    assert!(
+        put.status().is_success(),
+        "edit should 2xx, got {}",
+        put.status()
+    );
+    let edited: serde_json::Value = put.json().await.expect("edit JSON");
+    assert_eq!(edited["current_version"].as_i64(), Some(2));
+
+    let v = versions(&app, &token, &article_id).await;
+    let newest = &v["data"].as_array().expect("versions data")[0];
+    assert_eq!(newest["version_number"].as_i64(), Some(2));
+    assert_eq!(newest["change_kind"].as_str(), Some("edit"));
+    assert_eq!(
+        newest["change_note"].as_str(),
+        Some("tightened the wording")
+    );
+    assert_eq!(newest["edited_by_name"].as_str(), Some("Test Admin"));
+
+    // A metadata-only edit creates no version, so its note has nowhere to
+    // go and is dropped; the row still records who wrote it.
+    let put = app
+        .client
+        .put(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "tags": ["howto"],
+            "change_note": "retagged",
+        }))
+        .send()
+        .await
+        .expect("send metadata edit");
+    assert!(put.status().is_success());
+    let retagged: serde_json::Value = put.json().await.expect("metadata edit JSON");
+    assert_eq!(
+        retagged["current_version"].as_i64(),
+        Some(2),
+        "a metadata-only edit creates no version"
+    );
+    assert_eq!(retagged["updated_by_name"].as_str(), Some("Test Admin"));
+    let v = versions(&app, &token, &article_id).await;
+    assert_eq!(v["meta"]["total"].as_u64(), Some(2));
+
+    // A restore with a note answers the version it wrote and names the
+    // version it brought back.
+    let restore = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/kb/articles/{article_id}/versions/1/restore"
+        )))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "change_note": "the second draft lost the warning" }))
+        .send()
+        .await
+        .expect("send restore");
+    assert!(
+        restore.status().is_success(),
+        "restore should 2xx, got {}",
+        restore.status()
+    );
+    let written: serde_json::Value = restore.json().await.expect("restore JSON");
+    assert_eq!(written["version_number"].as_i64(), Some(3));
+    assert_eq!(written["change_kind"].as_str(), Some("restore"));
+    assert_eq!(written["restored_from_version"].as_i64(), Some(1));
+    assert_eq!(
+        written["change_note"].as_str(),
+        Some("the second draft lost the warning")
+    );
+    assert_eq!(written["content"].as_str(), Some("first draft"));
+    assert_eq!(written["edited_by_name"].as_str(), Some("Test Admin"));
+
+    // A restore with no body at all is the same as `{}`.
+    let bare = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/kb/articles/{article_id}/versions/2/restore"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send bare restore");
+    assert!(
+        bare.status().is_success(),
+        "a bodiless restore should 2xx, got {}",
+        bare.status()
+    );
+    let bare: serde_json::Value = bare.json().await.expect("bare restore JSON");
+    assert_eq!(bare["version_number"].as_i64(), Some(4));
+    assert!(bare["change_note"].is_null());
+    assert_eq!(bare["restored_from_version"].as_i64(), Some(2));
+
+    let live = app
+        .client
+        .get(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get")
+        .json::<serde_json::Value>()
+        .await
+        .expect("get JSON");
+    assert_eq!(live["content"].as_str(), Some("second draft"));
+    assert_eq!(live["current_version"].as_i64(), Some(4));
+}
+
+/// Restore is an edit in another shape, so it takes the role the edit
+/// takes. Before PMS-1126 the route carried only the module gate.
+#[sqlx::test]
+async fn a_technician_cannot_restore_a_version(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let (_tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "kb-tech@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let tech = common::login(&app, &tech_email, &tech_password).await;
+
+    let article = create_article(
+        &app,
+        &token,
+        serde_json::json!({ "title": "Gated", "slug": "gated", "content": "body" }),
+    )
+    .await;
+    let article_id = article["id"].as_str().expect("article id");
+
+    // The technician may read the history...
+    let list = app
+        .client
+        .get(app.url(&format!("/api/v1/kb/articles/{article_id}/versions")))
+        .bearer_auth(&tech)
+        .send()
+        .await
+        .expect("send list as technician");
+    assert_eq!(list.status(), reqwest::StatusCode::OK);
+
+    // ...and may not rewrite the article to any of it.
+    let restore = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/kb/articles/{article_id}/versions/1/restore"
+        )))
+        .bearer_auth(&tech)
+        .send()
+        .await
+        .expect("send restore as technician");
+    assert_eq!(restore.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let v = versions(&app, &token, article_id).await;
+    assert_eq!(v["meta"]["total"].as_u64(), Some(1), "nothing was written");
+}
+
+/// Create, edit, restore and delete each leave an audit row, and the
+/// per-record history route reads them for `kb_articles`.
+#[sqlx::test]
+async fn article_writes_are_audited_and_readable_as_history(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let article = create_article(
+        &app,
+        &token,
+        serde_json::json!({ "title": "Audited", "slug": "audited", "content": "one" }),
+    )
+    .await;
+    let article_id = article["id"].as_str().expect("article id").to_string();
+    let uuid = uuid::Uuid::parse_str(&article_id).expect("article uuid");
+
+    let put = app
+        .client
+        .put(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "content": "two" }))
+        .send()
+        .await
+        .expect("send edit");
+    assert!(put.status().is_success());
+    let restore = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/kb/articles/{article_id}/versions/1/restore"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send restore");
+    assert!(restore.status().is_success());
+
+    let history = app
+        .client
+        .get(app.url(&format!(
+            "/api/v1/audit-log/entity/kb_articles/{article_id}"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send history");
+    assert_eq!(history.status(), reqwest::StatusCode::OK);
+    let history: serde_json::Value = history.json().await.expect("history JSON");
+    assert_eq!(
+        history["meta"]["total"].as_u64(),
+        Some(3),
+        "create, edit and restore each audited"
+    );
+    let newest = &history["data"].as_array().expect("history data")[0];
+    assert_eq!(newest["action"].as_str(), Some("update"));
+    assert!(
+        newest["changed_fields"]
+            .as_array()
+            .expect("changed fields")
+            .iter()
+            .any(|f| f.as_str() == Some("content")),
+        "the restore's row names the content it moved: {newest}"
+    );
+
+    let del = app
+        .client
+        .delete(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete");
+    assert!(
+        del.status().is_success(),
+        "delete should 2xx, got {}",
+        del.status()
+    );
+
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE entity_type = 'kb_articles' AND entity_id = $1 \
+         ORDER BY timestamp, action",
+    )
+    .bind(uuid)
+    .fetch_all(&pool)
+    .await
+    .expect("read audit rows");
+    assert_eq!(actions, ["create", "update", "update", "delete"]);
+    let (old_title,): (Option<String>,) = sqlx::query_as(
+        "SELECT old_values->>'title' FROM audit_log \
+         WHERE entity_type = 'kb_articles' AND entity_id = $1 AND action = 'delete'",
+    )
+    .bind(uuid)
+    .fetch_one(&pool)
+    .await
+    .expect("read delete row");
+    assert_eq!(
+        old_title.as_deref(),
+        Some("Audited"),
+        "the delete row carries the article as it was"
     );
 }

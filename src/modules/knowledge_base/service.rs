@@ -337,10 +337,7 @@ impl KbService {
         let limit_placeholder = idx;
         let offset_placeholder = idx + 1;
         let query = format!(
-            r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
-                      author_id, view_count, helpful_count, not_helpful_count,
-                      published_at, tags, company_ids, created_at, updated_at
-               FROM kb_articles WHERE {where_clause}
+            r#"{ARTICLE_SELECT} WHERE {where_clause}
                ORDER BY {order_by}
                LIMIT ${limit_placeholder} OFFSET ${offset_placeholder}"#
         );
@@ -451,8 +448,8 @@ impl KbService {
         // Seed the first version.
         sqlx::query(
             r#"INSERT INTO kb_article_versions
-               (article_id, version_number, title, content, edited_by_id)
-               VALUES ($1, 1, $2, $3, $4)"#,
+               (article_id, version_number, title, content, edited_by_id, change_kind)
+               VALUES ($1, 1, $2, $3, $4, 'create')"#,
         )
         .bind(id)
         .bind(&request.title)
@@ -460,13 +457,7 @@ impl KbService {
         .bind(author_id)
         .execute(&mut *tx)
         .await?;
-        let after: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(t) FROM kb_articles t WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id)
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let after = Self::article_snapshot(&mut tx, tenant_id, id).await?;
         audit_write(
             &mut *tx,
             tenant_id,
@@ -499,12 +490,9 @@ impl KbService {
         bump_view: bool,
     ) -> AppResult<KbArticleResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row = sqlx::query_as::<_, ArticleRow>(
-            r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
-                      author_id, view_count, helpful_count, not_helpful_count,
-                      published_at, tags, company_ids, created_at, updated_at
-               FROM kb_articles WHERE tenant_id = $1 AND id = $2"#,
-        )
+        let row = sqlx::query_as::<_, ArticleRow>(&format!(
+            "{ARTICLE_SELECT} WHERE tenant_id = $1 AND id = $2"
+        ))
         .bind(tenant_id)
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -528,6 +516,7 @@ impl KbService {
         id: Uuid,
         editor: Uuid,
         request: &UpdateKbArticleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<KbArticleResponse> {
         let prior = self.get_article_inner(tenant_id, id, false).await?;
 
@@ -562,6 +551,7 @@ impl KbService {
         };
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before = Self::article_snapshot(&mut tx, tenant_id, id).await?;
         let n = sqlx::query(
             r#"UPDATE kb_articles SET
                 title = COALESCE($3, title),
@@ -581,6 +571,7 @@ impl KbService {
                         THEN NOW()
                     ELSE published_at
                 END,
+                updated_by_id = $12,
                 updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
@@ -595,6 +586,7 @@ impl KbService {
         .bind(&request.status)
         .bind(&request.tags)
         .bind(&company_ids)
+        .bind(editor)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -613,6 +605,7 @@ impl KbService {
                 request.title.as_ref().unwrap_or(&prior.title),
                 request.content.as_ref().unwrap_or(&prior.content),
                 editor,
+                VersionProvenance::edit(request.change_note.as_deref()),
             )
             .await?;
         }
@@ -632,8 +625,41 @@ impl KbService {
         .execute(&mut *tx)
         .await?;
 
+        // PMS-1126: the edit is audited like the create was, so the Audit
+        // Log page reads an article's history and a deleted article still
+        // has a trail.
+        let after = Self::article_snapshot(&mut tx, tenant_id, id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "kb_articles",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+
         tx.commit().await?;
         self.get_article_inner(tenant_id, id, false).await
+    }
+
+    /// PMS-1126: the row as `audit_log` records it, before and after a
+    /// write. `None` when the row is not there, which the caller has already
+    /// turned into a 404 or is about to.
+    async fn article_snapshot(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<Option<serde_json::Value>> {
+        Ok(sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM kb_articles t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?)
     }
 
     /// PMS-922: upsert the caller's draft for `article_id`.
@@ -735,40 +761,57 @@ impl KbService {
     /// Append a new monotonic version row for `article_id` inside an open
     /// transaction. Shared by `update_article` (snapshot-on-edit) and
     /// `restore_article_version` (snapshot-on-restore) so the
-    /// `MAX(version_number) + 1` numbering stays in one place.
+    /// `MAX(version_number) + 1` numbering stays in one place. Answers the
+    /// row it wrote so a caller can hand it back without a second read
+    /// (PMS-1126).
     async fn snapshot_version(
         tx: &mut sqlx::PgConnection,
         article_id: Uuid,
         title: &str,
         content: &str,
         editor: Uuid,
-    ) -> AppResult<i32> {
+        provenance: VersionProvenance<'_>,
+    ) -> AppResult<KbArticleVersionResponse> {
         let next: i32 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(version_number), 0) + 1 FROM kb_article_versions WHERE article_id = $1",
         )
         .bind(article_id)
         .fetch_one(&mut *tx)
         .await?;
-        sqlx::query(
-            r#"INSERT INTO kb_article_versions
-               (article_id, version_number, title, content, edited_by_id)
-               VALUES ($1, $2, $3, $4, $5)"#,
-        )
+        let row = sqlx::query_as::<_, VersionRow>(&format!(
+            r#"WITH written AS (
+                   INSERT INTO kb_article_versions
+                   (article_id, version_number, title, content, edited_by_id,
+                    change_note, change_kind, restored_from_version)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   RETURNING id, article_id, version_number, title, content, edited_by_id,
+                             change_note, change_kind, restored_from_version, created_at
+               )
+               SELECT v.id, v.article_id, v.version_number, v.title, v.content, v.edited_by_id,
+                      {USER_NAME_SQL} AS edited_by_name,
+                      v.change_note, v.change_kind, v.restored_from_version, v.created_at
+               FROM written v
+               LEFT JOIN users u ON u.id = v.edited_by_id"#
+        ))
         .bind(article_id)
         .bind(next)
         .bind(title)
         .bind(content)
         .bind(editor)
-        .execute(&mut *tx)
+        .bind(provenance.note())
+        .bind(provenance.kind.as_str())
+        .bind(provenance.restored_from)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(next)
+        Ok(row.into())
     }
 
     /// Restore a prior version's `title`/`content` onto the live article
     /// and record the restore as a NEW monotonic version (so the history
     /// is append-only and the restore itself is auditable). Tenant-scoped:
     /// the article must belong to `tenant_id` and the version must belong
-    /// to that article.
+    /// to that article. Answers the version it wrote (PMS-1126), which
+    /// names the version it brought back and carries the caller's note.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn restore_article_version(
         &self,
@@ -776,19 +819,15 @@ impl KbService {
         article_id: Uuid,
         version_number: i32,
         editor: Uuid,
-    ) -> AppResult<KbArticleResponse> {
+        request: &RestoreKbArticleVersionRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<KbArticleVersionResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        // Confirm the article is in this tenant before touching versions.
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE id = $1 AND tenant_id = $2)",
-        )
-        .bind(article_id)
-        .bind(tenant_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !exists {
+        // Confirm the article is in this tenant before touching versions;
+        // the row read here is also the audit row's "before".
+        let Some(before) = Self::article_snapshot(&mut tx, tenant_id, article_id).await? else {
             return Err(AppError::NotFound("KB article".to_string()));
-        }
+        };
 
         let snapshot: Option<(String, String)> = sqlx::query_as(
             r#"SELECT title, content FROM kb_article_versions
@@ -804,20 +843,42 @@ impl KbService {
 
         sqlx::query(
             r#"UPDATE kb_articles
-               SET title = $3, content = $4, updated_at = NOW()
+               SET title = $3, content = $4, updated_by_id = $5, updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2"#,
         )
         .bind(tenant_id)
         .bind(article_id)
         .bind(&title)
         .bind(&content)
+        .bind(editor)
         .execute(&mut *tx)
         .await?;
         // The restore lands as a fresh version so editing still snapshots
-        // on top of it (monotonic numbering preserved).
-        Self::snapshot_version(&mut tx, article_id, &title, &content, editor).await?;
+        // on top of it (monotonic numbering preserved), and says which
+        // version it brought back (PMS-1126).
+        let written = Self::snapshot_version(
+            &mut tx,
+            article_id,
+            &title,
+            &content,
+            editor,
+            VersionProvenance::restore(version_number, request.change_note.as_deref()),
+        )
+        .await?;
+        let after = Self::article_snapshot(&mut tx, tenant_id, article_id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "kb_articles",
+            Some(article_id),
+            Some(before),
+            after,
+        )
+        .await?;
         tx.commit().await?;
-        self.get_article_inner(tenant_id, article_id, false).await
+        Ok(written)
     }
 
     /// Record a `helpful` vote for `user_id` on a tenant-scoped article.
@@ -1005,8 +1066,16 @@ impl KbService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_article(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_article(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1126: the row as it was is the only trace a hard delete
+        // leaves (versions, drafts, attachments and votes cascade with it).
+        let before = Self::article_snapshot(&mut tx, tenant_id, id).await?;
         let n = sqlx::query("DELETE FROM kb_articles WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -1016,6 +1085,17 @@ impl KbService {
         if n == 0 {
             return Err(AppError::NotFound("KB article".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "kb_articles",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1044,12 +1124,16 @@ impl KbService {
                 .bind(article_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let rows = sqlx::query_as::<_, VersionRow>(
-            r#"SELECT id, article_id, version_number, title, content, edited_by_id, created_at
-               FROM kb_article_versions WHERE article_id = $1
-               ORDER BY version_number DESC
-               LIMIT $2 OFFSET $3"#,
-        )
+        let rows = sqlx::query_as::<_, VersionRow>(&format!(
+            r#"SELECT v.id, v.article_id, v.version_number, v.title, v.content, v.edited_by_id,
+                      {USER_NAME_SQL} AS edited_by_name,
+                      v.change_note, v.change_kind, v.restored_from_version, v.created_at
+               FROM kb_article_versions v
+               LEFT JOIN users u ON u.id = v.edited_by_id
+               WHERE v.article_id = $1
+               ORDER BY v.version_number DESC
+               LIMIT $2 OFFSET $3"#
+        ))
         .bind(article_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
@@ -1079,19 +1163,16 @@ impl KbService {
         id: Uuid,
     ) -> AppResult<KbArticleResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row = sqlx::query_as::<_, ArticleRow>(
-            r#"SELECT id, title, slug, content, summary, category_id, visibility, status,
-                      author_id, view_count, helpful_count, not_helpful_count,
-                      published_at, tags, company_ids, created_at, updated_at
-               FROM kb_articles
+        let row = sqlx::query_as::<_, ArticleRow>(&format!(
+            r#"{ARTICLE_SELECT}
                WHERE tenant_id = $1
                  AND id = $2
                  AND status = 'published'
                  AND (
                        visibility = 'public'
                     OR (visibility = 'client_specific' AND $3 = ANY(company_ids))
-                 )"#,
-        )
+                 )"#
+        ))
         .bind(tenant_id)
         .bind(id)
         .bind(company_id)
@@ -1200,6 +1281,41 @@ impl From<CatRow> for KbCategoryResponse {
     }
 }
 
+/// PMS-1126: a staff user's display name as the KB shows it, from the
+/// `users` row aliased `u`; NULL when the join found no row or the name
+/// is blank, which the Rust side prints as "Unknown".
+const USER_NAME_SQL: &str = "NULLIF(TRIM(u.first_name || ' ' || u.last_name), '')";
+
+/// PMS-1126: the one column list every `ArticleRow` read shares, with the
+/// provenance the page prints resolved beside the row: the author's name,
+/// the last editor (the row's `updated_by_id`, else the latest version's
+/// `edited_by_id` for a row from before migration 200) and their name,
+/// and the current version number. A lateral join rather than three
+/// scalar subqueries in every caller, so the fallback rule is written
+/// once. The lateral exposes no column named like one on `kb_articles`,
+/// so a caller's unqualified `WHERE tenant_id = $1 AND id = $2` stays
+/// unambiguous.
+const ARTICLE_SELECT: &str = r#"SELECT kb_articles.id, title, slug, content, summary, category_id, visibility, status,
+              author_id, view_count, helpful_count, not_helpful_count,
+              published_at, tags, company_ids, created_at, updated_at,
+              prov.author_name, prov.editor_id AS updated_by_id,
+              prov.editor_name AS updated_by_name, prov.current_version
+       FROM kb_articles
+       LEFT JOIN LATERAL (
+           SELECT (SELECT NULLIF(TRIM(u.first_name || ' ' || u.last_name), '')
+                   FROM users u WHERE u.id = kb_articles.author_id) AS author_name,
+                  e.editor_id,
+                  (SELECT NULLIF(TRIM(u.first_name || ' ' || u.last_name), '')
+                   FROM users u WHERE u.id = e.editor_id) AS editor_name,
+                  (SELECT MAX(v.version_number) FROM kb_article_versions v
+                   WHERE v.article_id = kb_articles.id) AS current_version
+           FROM (SELECT COALESCE(
+                     kb_articles.updated_by_id,
+                     (SELECT v.edited_by_id FROM kb_article_versions v
+                      WHERE v.article_id = kb_articles.id
+                      ORDER BY v.version_number DESC LIMIT 1)) AS editor_id) e
+       ) prov ON TRUE"#;
+
 #[derive(sqlx::FromRow)]
 struct ArticleRow {
     id: Uuid,
@@ -1211,6 +1327,10 @@ struct ArticleRow {
     visibility: Option<String>,
     status: Option<String>,
     author_id: Uuid,
+    author_name: Option<String>,
+    updated_by_id: Option<Uuid>,
+    updated_by_name: Option<String>,
+    current_version: Option<i32>,
     view_count: Option<i32>,
     helpful_count: Option<i32>,
     not_helpful_count: Option<i32>,
@@ -1233,6 +1353,12 @@ impl From<ArticleRow> for KbArticleResponse {
             visibility: r.visibility.unwrap_or_else(|| "internal".into()),
             status: r.status.unwrap_or_else(|| "draft".into()),
             author_id: r.author_id,
+            author_name: r.author_name.unwrap_or_else(unknown_user),
+            updated_by_name: r
+                .updated_by_id
+                .map(|_| r.updated_by_name.unwrap_or_else(unknown_user)),
+            updated_by_id: r.updated_by_id,
+            current_version: r.current_version.unwrap_or(0),
             view_count: r.view_count.unwrap_or(0),
             helpful_count: r.helpful_count.unwrap_or(0),
             not_helpful_count: r.not_helpful_count.unwrap_or(0),
@@ -1245,6 +1371,57 @@ impl From<ArticleRow> for KbArticleResponse {
     }
 }
 
+/// PMS-1126: what a version row records about itself beyond its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeKind {
+    Edit,
+    Restore,
+}
+
+impl ChangeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChangeKind::Edit => "edit",
+            ChangeKind::Restore => "restore",
+        }
+    }
+}
+
+/// PMS-1126: the provenance a snapshot is written with. `create` is not a
+/// variant here because the creation snapshot is seeded inline by
+/// `create_article` with the article's own INSERT, never through
+/// `snapshot_version`.
+struct VersionProvenance<'a> {
+    kind: ChangeKind,
+    change_note: Option<&'a str>,
+    restored_from: Option<i32>,
+}
+
+impl<'a> VersionProvenance<'a> {
+    fn edit(change_note: Option<&'a str>) -> Self {
+        Self {
+            kind: ChangeKind::Edit,
+            change_note,
+            restored_from: None,
+        }
+    }
+
+    fn restore(from_version: i32, change_note: Option<&'a str>) -> Self {
+        Self {
+            kind: ChangeKind::Restore,
+            change_note,
+            restored_from: Some(from_version),
+        }
+    }
+
+    /// The note as stored: trimmed, and a blank one is no note.
+    fn note(&self) -> Option<&'a str> {
+        self.change_note
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct VersionRow {
     id: Uuid,
@@ -1253,7 +1430,17 @@ struct VersionRow {
     title: String,
     content: String,
     edited_by_id: Uuid,
+    edited_by_name: Option<String>,
+    change_note: Option<String>,
+    change_kind: String,
+    restored_from_version: Option<i32>,
     created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// PMS-1126: what the page prints for a user whose row is gone. Never an
+/// id: the reader cannot do anything with one.
+fn unknown_user() -> String {
+    "Unknown".to_string()
 }
 
 impl From<VersionRow> for KbArticleVersionResponse {
@@ -1265,6 +1452,10 @@ impl From<VersionRow> for KbArticleVersionResponse {
             title: r.title,
             content: r.content,
             edited_by_id: r.edited_by_id,
+            edited_by_name: r.edited_by_name.unwrap_or_else(unknown_user),
+            change_note: r.change_note,
+            change_kind: r.change_kind,
+            restored_from_version: r.restored_from_version,
             created_at: r.created_at,
         }
     }
