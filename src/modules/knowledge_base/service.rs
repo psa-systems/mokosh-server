@@ -1199,6 +1199,342 @@ impl KbService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    // ------------------------------------------------------------------
+    // PMS-1128: comments
+    // ------------------------------------------------------------------
+
+    /// Every comment on the article as a two-level tree: roots oldest first,
+    /// each with its replies oldest first. Deleted rows stay in place with an
+    /// empty body. 404 for an article outside the tenant, before any comment
+    /// is read.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_comments(
+        &self,
+        tenant_id: TenantId,
+        article_id: Uuid,
+    ) -> AppResult<Vec<KbCommentResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(article_id)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !exists {
+            return Err(AppError::NotFound("KB article".to_string()));
+        }
+        let rows = sqlx::query_as::<_, CommentRow>(&format!(
+            "{COMMENT_SELECT} WHERE c.tenant_id = $1 AND c.article_id = $2 ORDER BY c.created_at, c.id"
+        ))
+        .bind(tenant_id)
+        .bind(article_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut roots: Vec<KbCommentResponse> = Vec::new();
+        let mut replies: Vec<KbCommentResponse> = Vec::new();
+        for row in rows {
+            let comment: KbCommentResponse = row.into();
+            if comment.parent_id.is_some() {
+                replies.push(comment);
+            } else {
+                roots.push(comment);
+            }
+        }
+        for reply in replies {
+            if let Some(root) = roots.iter_mut().find(|r| Some(r.id) == reply.parent_id) {
+                root.replies.push(reply);
+            }
+        }
+        Ok(roots)
+    }
+
+    /// A new root, or a reply to a root. A reply must answer a live root on
+    /// the same article and carries no anchor; an anchored root records the
+    /// article's current version as `anchor_version`, the version the quote
+    /// was taken from.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_comment(
+        &self,
+        tenant_id: TenantId,
+        article_id: Uuid,
+        author_id: Uuid,
+        request: &CreateKbCommentRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<KbCommentResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let current_version: Option<i32> = sqlx::query_scalar(
+            r#"SELECT (SELECT MAX(v.version_number) FROM kb_article_versions v WHERE v.article_id = a.id)
+               FROM kb_articles a WHERE a.id = $1 AND a.tenant_id = $2"#,
+        )
+        .bind(article_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|v: Option<i32>| v.unwrap_or(0))
+        .map(Some)
+        .unwrap_or(None);
+        let Some(current_version) = current_version else {
+            return Err(AppError::NotFound("KB article".to_string()));
+        };
+
+        if let Some(parent_id) = request.parent_id {
+            if request.anchor.is_some() {
+                return Err(AppError::validation_field(
+                    "anchor",
+                    "a reply carries no anchor; anchor the root it answers",
+                ));
+            }
+            let parent: Option<(Uuid, Option<Uuid>, Option<chrono::DateTime<chrono::Utc>>)> =
+                sqlx::query_as(
+                    "SELECT article_id, parent_id, deleted_at FROM kb_article_comments \
+                     WHERE id = $1 AND tenant_id = $2",
+                )
+                .bind(parent_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            match parent {
+                Some((parent_article, None, None)) if parent_article == article_id => {}
+                _ => {
+                    return Err(AppError::validation_field(
+                        "parent_id",
+                        "a reply answers a top-level comment on this article",
+                    ));
+                }
+            }
+        }
+
+        let anchor_version = request.anchor.as_ref().map(|_| current_version);
+        let id: Uuid = sqlx::query_scalar(
+            r#"INSERT INTO kb_article_comments
+               (tenant_id, article_id, parent_id, author_id, body, anchor, anchor_version)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               RETURNING id"#,
+        )
+        .bind(tenant_id)
+        .bind(article_id)
+        .bind(request.parent_id)
+        .bind(author_id)
+        .bind(request.body.trim())
+        .bind(&request.anchor)
+        .bind(anchor_version)
+        .fetch_one(&mut *tx)
+        .await?;
+        let after = Self::comment_snapshot(&mut tx, tenant_id, id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "kb_article_comments",
+            Some(id),
+            None,
+            after,
+        )
+        .await?;
+        let written = Self::read_comment(&mut tx, tenant_id, id).await?;
+        tx.commit().await?;
+        Ok(written)
+    }
+
+    /// The author, or an admin, rewrites the text; `edited_at` says so. A
+    /// deleted comment cannot be edited back into existence.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_comment(
+        &self,
+        tenant_id: TenantId,
+        comment_id: Uuid,
+        editor_id: Uuid,
+        editor_is_admin: bool,
+        request: &UpdateKbCommentRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<KbCommentResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let current = Self::read_comment(&mut tx, tenant_id, comment_id).await?;
+        Self::assert_may_change(&current, editor_id, editor_is_admin, "edit")?;
+        let before = Self::comment_snapshot(&mut tx, tenant_id, comment_id).await?;
+        sqlx::query(
+            r#"UPDATE kb_article_comments
+               SET body = $3, edited_at = NOW(), updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(comment_id)
+        .bind(request.body.trim())
+        .execute(&mut *tx)
+        .await?;
+        let after = Self::comment_snapshot(&mut tx, tenant_id, comment_id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "kb_article_comments",
+            Some(comment_id),
+            before,
+            after,
+        )
+        .await?;
+        let written = Self::read_comment(&mut tx, tenant_id, comment_id).await?;
+        tx.commit().await?;
+        Ok(written)
+    }
+
+    /// Soft: the row keeps its place so the thread keeps its shape, and the
+    /// text is what goes. The author, or an admin.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_comment(
+        &self,
+        tenant_id: TenantId,
+        comment_id: Uuid,
+        editor_id: Uuid,
+        editor_is_admin: bool,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let current = Self::read_comment(&mut tx, tenant_id, comment_id).await?;
+        Self::assert_may_change(&current, editor_id, editor_is_admin, "delete")?;
+        let before = Self::comment_snapshot(&mut tx, tenant_id, comment_id).await?;
+        sqlx::query(
+            r#"UPDATE kb_article_comments
+               SET deleted_at = NOW(), updated_at = NOW()
+               WHERE tenant_id = $1 AND id = $2"#,
+        )
+        .bind(tenant_id)
+        .bind(comment_id)
+        .execute(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "kb_article_comments",
+            Some(comment_id),
+            before,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Resolve or reopen a root. Any staff role: an article accumulates
+    /// fixed issues and folding one away is not editing anyone's words.
+    /// A reply cannot be resolved on its own and a deleted root cannot be.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn set_comment_resolved(
+        &self,
+        tenant_id: TenantId,
+        comment_id: Uuid,
+        user_id: Uuid,
+        resolved: bool,
+        ctx: &AuditCtx,
+    ) -> AppResult<KbCommentResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let current = Self::read_comment(&mut tx, tenant_id, comment_id).await?;
+        if current.parent_id.is_some() {
+            return Err(AppError::validation_field(
+                "id",
+                "resolve the thread, not a reply in it",
+            ));
+        }
+        if current.deleted {
+            return Err(AppError::Conflict("This comment was deleted.".to_string()));
+        }
+        let before = Self::comment_snapshot(&mut tx, tenant_id, comment_id).await?;
+        if resolved {
+            sqlx::query(
+                r#"UPDATE kb_article_comments
+                   SET resolved_at = NOW(), resolved_by_id = $3, updated_at = NOW()
+                   WHERE tenant_id = $1 AND id = $2"#,
+            )
+            .bind(tenant_id)
+            .bind(comment_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"UPDATE kb_article_comments
+                   SET resolved_at = NULL, resolved_by_id = NULL, updated_at = NOW()
+                   WHERE tenant_id = $1 AND id = $2"#,
+            )
+            .bind(tenant_id)
+            .bind(comment_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let after = Self::comment_snapshot(&mut tx, tenant_id, comment_id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "kb_article_comments",
+            Some(comment_id),
+            before,
+            after,
+        )
+        .await?;
+        let written = Self::read_comment(&mut tx, tenant_id, comment_id).await?;
+        tx.commit().await?;
+        Ok(written)
+    }
+
+    /// The ticket-note rule: the author, or an admin; a manager is
+    /// deliberately not enough, because changing another person's words is
+    /// granted on purpose. A deleted comment is not changed again.
+    fn assert_may_change(
+        current: &KbCommentResponse,
+        editor_id: Uuid,
+        editor_is_admin: bool,
+        verb: &str,
+    ) -> AppResult<()> {
+        if current.deleted {
+            return Err(AppError::Conflict("This comment was deleted.".to_string()));
+        }
+        if current.author_id != editor_id && !editor_is_admin {
+            return Err(AppError::Forbidden(format!(
+                "You can only {verb} comments you wrote."
+            )));
+        }
+        Ok(())
+    }
+
+    /// One comment with names resolved, replies left empty. 404 when it is
+    /// not in the tenant.
+    async fn read_comment(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        comment_id: Uuid,
+    ) -> AppResult<KbCommentResponse> {
+        sqlx::query_as::<_, CommentRow>(&format!(
+            "{COMMENT_SELECT} WHERE c.tenant_id = $1 AND c.id = $2"
+        ))
+        .bind(tenant_id)
+        .bind(comment_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(Into::into)
+        .ok_or_else(|| AppError::NotFound("Comment".to_string()))
+    }
+
+    async fn comment_snapshot(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<Option<serde_json::Value>> {
+        Ok(sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM kb_article_comments t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?)
+    }
+
     /// Portal single-article read for a specific customer contact. Enforces
     /// the same publish + visibility rules as
     /// [`Self::list_portal_articles_for_company`]: `status = 'published'` AND
@@ -1476,6 +1812,65 @@ impl<'a> VersionProvenance<'a> {
         self.change_note
             .map(str::trim)
             .filter(|note| !note.is_empty())
+    }
+}
+
+/// PMS-1128: the one column list every comment read shares, names beside
+/// the row. The author's name is the row's, never an id; a deleted
+/// comment's body is dropped here so no caller can forget to.
+const COMMENT_SELECT: &str = r#"SELECT c.id, c.article_id, c.parent_id, c.author_id,
+              NULLIF(TRIM(a.first_name || ' ' || a.last_name), '') AS author_name,
+              a.avatar_url AS author_avatar_url,
+              CASE WHEN c.deleted_at IS NULL THEN c.body ELSE '' END AS body,
+              c.anchor, c.anchor_version, c.created_at, c.edited_at,
+              c.resolved_at, c.resolved_by_id,
+              NULLIF(TRIM(r.first_name || ' ' || r.last_name), '') AS resolved_by_name,
+              (c.deleted_at IS NOT NULL) AS deleted
+       FROM kb_article_comments c
+       LEFT JOIN users a ON a.id = c.author_id
+       LEFT JOIN users r ON r.id = c.resolved_by_id"#;
+
+#[derive(sqlx::FromRow)]
+struct CommentRow {
+    id: Uuid,
+    article_id: Uuid,
+    parent_id: Option<Uuid>,
+    author_id: Uuid,
+    author_name: Option<String>,
+    author_avatar_url: Option<String>,
+    body: String,
+    anchor: Option<serde_json::Value>,
+    anchor_version: Option<i32>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    edited_at: Option<chrono::DateTime<chrono::Utc>>,
+    resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    resolved_by_id: Option<Uuid>,
+    resolved_by_name: Option<String>,
+    deleted: bool,
+}
+
+impl From<CommentRow> for KbCommentResponse {
+    fn from(r: CommentRow) -> Self {
+        Self {
+            id: r.id,
+            article_id: r.article_id,
+            parent_id: r.parent_id,
+            author_id: r.author_id,
+            author_name: r.author_name.unwrap_or_else(unknown_user),
+            author_avatar_url: r.author_avatar_url,
+            body: r.body,
+            anchor: r.anchor,
+            anchor_version: r.anchor_version,
+            created_at: r.created_at,
+            edited_at: r.edited_at,
+            resolved_at: r.resolved_at,
+            resolved_by_name: r
+                .resolved_by_id
+                .map(|_| r.resolved_by_name.unwrap_or_else(unknown_user)),
+            resolved_by_id: r.resolved_by_id,
+            deleted: r.deleted,
+            replies: Vec::new(),
+        }
     }
 }
 

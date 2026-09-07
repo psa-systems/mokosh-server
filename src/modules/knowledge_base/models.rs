@@ -232,6 +232,52 @@ pub struct KbArticleVersionResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// PMS-1128: one comment on an article, with its replies nested when it is
+/// a root. Names ride along and ids never stand alone on the page. A
+/// deleted comment keeps its place with `deleted: true` and an empty body,
+/// so a reply is not orphaned by the removal of what it answered.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbCommentResponse {
+    pub id: Uuid,
+    pub article_id: Uuid,
+    pub parent_id: Option<Uuid>,
+    pub author_id: Uuid,
+    pub author_name: String,
+    pub author_avatar_url: Option<String>,
+    pub body: String,
+    /// PMS-1130 reserves this for the inline comments; stored and returned
+    /// opaque here.
+    pub anchor: Option<serde_json::Value>,
+    pub anchor_version: Option<i32>,
+    pub created_at: DateTime<Utc>,
+    pub edited_at: Option<DateTime<Utc>>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolved_by_id: Option<Uuid>,
+    pub resolved_by_name: Option<String>,
+    pub deleted: bool,
+    pub replies: Vec<KbCommentResponse>,
+}
+
+/// PMS-1128: the body of `POST /kb/articles/{id}/comments`.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateKbCommentRequest {
+    #[validate(length(min = 1, max = 20000))]
+    pub body: String,
+    /// The root this answers. A reply answers a root and never a reply.
+    pub parent_id: Option<Uuid>,
+    /// PMS-1130: a root's anchor into the text. A reply carries none.
+    pub anchor: Option<serde_json::Value>,
+}
+
+/// PMS-1128: the body of `PUT /kb/comments/{id}`. Only the text moves; the
+/// anchor is immutable and the thread shape is not something an edit
+/// changes.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateKbCommentRequest {
+    #[validate(length(min = 1, max = 20000))]
+    pub body: String,
+}
+
 /// PMS-1127: a ticket that references an article, one row of
 /// `GET /kb/articles/{id}/tickets`. `relation` says how: `source` for a
 /// ticket opened FROM the article (`tickets.source_kb_article_id`,

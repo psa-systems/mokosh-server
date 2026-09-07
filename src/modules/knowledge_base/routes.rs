@@ -87,6 +87,21 @@ pub fn kb_routes(service: KbService) -> Router {
         // A read over columns that already exist; the panel that shows
         // whether an article is load-bearing needs no new plumbing.
         .route("/kb/articles/{id}/tickets", get(list_article_tickets))
+        // PMS-1128: staff discussion on an article. Every route here is
+        // behind RequireKnowledgeBase and nothing else: any staff role may
+        // comment (the ticket-note rule), and a contact bearer never
+        // satisfies the gate, which is the whole of the permissions model
+        // (there is no customer-visible comment to gate).
+        .route(
+            "/kb/articles/{id}/comments",
+            get(list_comments).post(create_comment),
+        )
+        .route(
+            "/kb/comments/{id}",
+            put(update_comment).delete(delete_comment),
+        )
+        .route("/kb/comments/{id}/resolve", post(resolve_comment))
+        .route("/kb/comments/{id}/unresolve", post(unresolve_comment))
         // PMS-1082: the three reads above (`GET /kb/categories`,
         // `GET /kb/articles`, `GET /kb/articles/{id}`) are dual-plane
         // (`RequireCallerContext`): a contact holding `kb:read` gets the
@@ -456,6 +471,85 @@ async fn list_article_tickets(
         &pagination,
         total,
     )))
+}
+
+/// PMS-1128: roots with their replies, oldest first.
+async fn list_comments(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<KbCommentResponse>>> {
+    Ok(Json(s.service.list_comments(u.tenant(), id).await?))
+}
+
+async fn create_comment(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+    Json(req): Json<CreateKbCommentRequest>,
+) -> AppResult<(axum::http::StatusCode, Json<KbCommentResponse>)> {
+    req.validate()?;
+    let created = s
+        .service
+        .create_comment(u.tenant(), id, u.id, &req, &ctx)
+        .await?;
+    Ok((axum::http::StatusCode::CREATED, Json(created)))
+}
+
+/// The author, or an admin. `Manager` is deliberately absent, the
+/// ticket-note rule: editing another person's words is granted on purpose.
+async fn update_comment(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateKbCommentRequest>,
+) -> AppResult<Json<KbCommentResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service
+            .update_comment(u.tenant(), id, u.id, u.role.is_admin(), &req, &ctx)
+            .await?,
+    ))
+}
+
+async fn delete_comment(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+) -> AppResult<axum::http::StatusCode> {
+    s.service
+        .delete_comment(u.tenant(), id, u.id, u.role.is_admin(), &ctx)
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn resolve_comment(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<KbCommentResponse>> {
+    Ok(Json(
+        s.service
+            .set_comment_resolved(u.tenant(), id, u.id, true, &ctx)
+            .await?,
+    ))
+}
+
+async fn unresolve_comment(
+    State(s): State<KbRouterState>,
+    RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<KbCommentResponse>> {
+    Ok(Json(
+        s.service
+            .set_comment_resolved(u.tenant(), id, u.id, false, &ctx)
+            .await?,
+    ))
 }
 
 #[derive(Debug, serde::Deserialize)]
