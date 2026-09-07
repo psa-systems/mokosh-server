@@ -267,12 +267,15 @@ async fn update_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateKbArticleRequest>,
 ) -> AppResult<Json<KbArticleResponse>> {
     req.validate()?;
     Ok(Json(
-        s.service.update_article(u.tenant(), id, u.id, &req).await?,
+        s.service
+            .update_article(u.tenant(), id, u.id, &req, &ctx)
+            .await?,
     ))
 }
 
@@ -326,9 +329,10 @@ async fn delete_article(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
+    ctx: crate::modules::audit::AuditCtx,
     Path(id): Path<Uuid>,
 ) -> AppResult<()> {
-    s.service.delete_article(u.tenant(), id).await
+    s.service.delete_article(u.tenant(), id, &ctx).await
 }
 
 async fn list_article_versions(
@@ -360,6 +364,7 @@ async fn restore_article_version(
     State(s): State<KbRouterState>,
     RequireKnowledgeBase { user: u, .. }: RequireKnowledgeBase,
     _m: RequireManager,
+    ctx: crate::modules::audit::AuditCtx,
     Path((id, version_number)): Path<(Uuid, i32)>,
     body: Option<Json<RestoreKbArticleVersionRequest>>,
 ) -> AppResult<Json<KbArticleVersionResponse>> {
@@ -367,7 +372,7 @@ async fn restore_article_version(
     req.validate()?;
     Ok(Json(
         s.service
-            .restore_article_version(u.tenant(), id, version_number, u.id, &req)
+            .restore_article_version(u.tenant(), id, version_number, u.id, &req, &ctx)
             .await?,
     ))
 }

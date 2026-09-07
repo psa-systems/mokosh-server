@@ -457,13 +457,7 @@ impl KbService {
         .bind(author_id)
         .execute(&mut *tx)
         .await?;
-        let after: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT to_jsonb(t) FROM kb_articles t WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id)
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let after = Self::article_snapshot(&mut tx, tenant_id, id).await?;
         audit_write(
             &mut *tx,
             tenant_id,
@@ -522,6 +516,7 @@ impl KbService {
         id: Uuid,
         editor: Uuid,
         request: &UpdateKbArticleRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<KbArticleResponse> {
         let prior = self.get_article_inner(tenant_id, id, false).await?;
 
@@ -556,6 +551,7 @@ impl KbService {
         };
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before = Self::article_snapshot(&mut tx, tenant_id, id).await?;
         let n = sqlx::query(
             r#"UPDATE kb_articles SET
                 title = COALESCE($3, title),
@@ -629,8 +625,41 @@ impl KbService {
         .execute(&mut *tx)
         .await?;
 
+        // PMS-1126: the edit is audited like the create was, so the Audit
+        // Log page reads an article's history and a deleted article still
+        // has a trail.
+        let after = Self::article_snapshot(&mut tx, tenant_id, id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "kb_articles",
+            Some(id),
+            before,
+            after,
+        )
+        .await?;
+
         tx.commit().await?;
         self.get_article_inner(tenant_id, id, false).await
+    }
+
+    /// PMS-1126: the row as `audit_log` records it, before and after a
+    /// write. `None` when the row is not there, which the caller has already
+    /// turned into a 404 or is about to.
+    async fn article_snapshot(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<Option<serde_json::Value>> {
+        Ok(sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM kb_articles t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?)
     }
 
     /// PMS-922: upsert the caller's draft for `article_id`.
@@ -791,19 +820,14 @@ impl KbService {
         version_number: i32,
         editor: Uuid,
         request: &RestoreKbArticleVersionRequest,
+        ctx: &AuditCtx,
     ) -> AppResult<KbArticleVersionResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        // Confirm the article is in this tenant before touching versions.
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM kb_articles WHERE id = $1 AND tenant_id = $2)",
-        )
-        .bind(article_id)
-        .bind(tenant_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !exists {
+        // Confirm the article is in this tenant before touching versions;
+        // the row read here is also the audit row's "before".
+        let Some(before) = Self::article_snapshot(&mut tx, tenant_id, article_id).await? else {
             return Err(AppError::NotFound("KB article".to_string()));
-        }
+        };
 
         let snapshot: Option<(String, String)> = sqlx::query_as(
             r#"SELECT title, content FROM kb_article_versions
@@ -839,6 +863,18 @@ impl KbService {
             &content,
             editor,
             VersionProvenance::restore(version_number, request.change_note.as_deref()),
+        )
+        .await?;
+        let after = Self::article_snapshot(&mut tx, tenant_id, article_id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "kb_articles",
+            Some(article_id),
+            Some(before),
+            after,
         )
         .await?;
         tx.commit().await?;
@@ -1030,8 +1066,16 @@ impl KbService {
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
-    pub async fn delete_article(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+    pub async fn delete_article(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1126: the row as it was is the only trace a hard delete
+        // leaves (versions, drafts, attachments and votes cascade with it).
+        let before = Self::article_snapshot(&mut tx, tenant_id, id).await?;
         let n = sqlx::query("DELETE FROM kb_articles WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -1041,6 +1085,17 @@ impl KbService {
         if n == 0 {
             return Err(AppError::NotFound("KB article".to_string()));
         }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "kb_articles",
+            Some(id),
+            before,
+            None,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
