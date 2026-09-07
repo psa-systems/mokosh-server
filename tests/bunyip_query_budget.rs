@@ -206,9 +206,9 @@ async fn an_authenticated_bunyip_request_costs_three_statements(pool: PgPool) {
     )
     .await
     {
-        LocalPlacement::Placed(state) => {
-            state.expect("warm-up request authenticates from local state")
-        }
+        LocalPlacement::Placed(outcome) => outcome
+            .0
+            .expect("warm-up request authenticates from local state"),
         LocalPlacement::UserinfoNeeded => panic!("an already-placed user must not need userinfo"),
     };
 
@@ -223,7 +223,7 @@ async fn an_authenticated_bunyip_request_costs_three_statements(pool: PgPool) {
     )
     .await
     {
-        LocalPlacement::Placed(state) => state,
+        LocalPlacement::Placed(outcome) => outcome.0,
         LocalPlacement::UserinfoNeeded => panic!("an already-placed user must not need userinfo"),
     };
     recorder.armed.store(false, Ordering::SeqCst);

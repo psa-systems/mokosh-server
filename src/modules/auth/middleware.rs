@@ -874,7 +874,7 @@ async fn ensure_user_from_bunyip(
         match place_bunyip_user_from_local_state(auth_service, tenants, invitations, sub, claims)
             .await
         {
-            LocalPlacement::Placed(state) => return (*state, None),
+            LocalPlacement::Placed(outcome) => return *outcome,
             LocalPlacement::UserinfoNeeded => {
                 let info = verifier.userinfo(bearer).await;
                 // MAPPS-335: bind the userinfo response to the verified at+jwt by
@@ -936,10 +936,14 @@ async fn ensure_user_from_bunyip(
 /// PMS-777: how far [`place_bunyip_user_from_local_state`] got.
 pub enum LocalPlacement {
     /// Local state was enough: the caller is placed (or rejected by the
-    /// PMS-698 principal gate) with no `/oauth2/userinfo` hop. Boxed so the
-    /// `AuthState` (which carries a whole `CurrentUser`) does not set the size
-    /// of the empty `UserinfoNeeded` variant.
-    Placed(Box<Option<AuthState>>),
+    /// PMS-698 principal gate) with no `/oauth2/userinfo` hop. The second
+    /// half is the gate's own error when it refused, so the middleware can
+    /// answer its 403 (PMS-1125: this path used to keep only the state, and
+    /// an inactive user placed in a real tenant, the everyday shape, got a
+    /// bare 401 with nothing in the log). Boxed so the `AuthState` (which
+    /// carries a whole `CurrentUser`) does not set the size of the empty
+    /// `UserinfoNeeded` variant.
+    Placed(Box<(Option<AuthState>, Option<AppError>)>),
     /// Local state was not enough - a first-sight user, a user stuck in the
     /// legacy default tenant, a placeholder email, or a waiting invite - so the
     /// caller must fetch `/oauth2/userinfo` and run the full path.
@@ -966,6 +970,7 @@ pub async fn place_bunyip_user_from_local_state(
 ) -> LocalPlacement {
     let principal = match resolve_bunyip_caller(auth_service, invitations, sub).await {
         UserinfoDecision::Needed => return LocalPlacement::UserinfoNeeded,
+        UserinfoDecision::Rejected(e) => return LocalPlacement::Placed(Box::new((None, Some(e)))),
         UserinfoDecision::Skip(principal) => *principal,
     };
     LocalPlacement::Placed(Box::new(
@@ -984,8 +989,7 @@ pub async fn place_bunyip_user_from_local_state(
             claims,
             Some(principal),
         )
-        .await
-        .0,
+        .await,
     ))
 }
 
@@ -994,6 +998,10 @@ pub async fn place_bunyip_user_from_local_state(
 /// not read the same rows again.
 enum UserinfoDecision {
     Needed,
+    /// PMS-1125: the row exists and the PMS-698 gate refused it. Decided
+    /// before any placement question, so a refused principal is never
+    /// re-homed or provisioned on its way to the refusal.
+    Rejected(AppError),
     // Boxed: the principal carries a whole `User`, and `Needed` (the rarer but
     // still routine variant) would otherwise pay for it on every request.
     Skip(Box<BunyipPrincipal>),
@@ -1041,6 +1049,25 @@ async fn resolve_bunyip_caller(
             return UserinfoDecision::Needed;
         }
     };
+    // PMS-1125: the PMS-698 principal gate runs on the row as read, BEFORE
+    // the placement decisions below. Every branch after this one can move
+    // the user (the default-tenant backfill and an invite both re-home, and
+    // the backfill provisions a personal tenant first), and `place_bunyip_caller`
+    // used to run the gate only after those writes: an inactive user's
+    // request re-homed the row and only then was refused, which left the
+    // legacy token, whose `tid` still named the old tenant, answering 404
+    // "User not found" instead of the gate's 403. A refused principal now
+    // causes no side effect at all. The `Skip` path relies on this having
+    // run, so `place_bunyip_caller` does not gate a pre-resolved row twice.
+    if let Err(e) = auth_service.ensure_principal_usable(&principal.user).await {
+        tracing::info!(
+            error = %e,
+            user = %principal.user.id,
+            tenant_id = %principal.user.tenant_id,
+            "rejecting bunyip principal"
+        );
+        return UserinfoDecision::Rejected(e);
+    }
     let (tenant, role) = &principal.placement;
     // Stuck in the legacy default tenant: PMS-245 re-homes them to their own
     // personal tenant via the full placement path.
@@ -1165,6 +1192,11 @@ async fn place_bunyip_caller(
     claims: &super::oidc_rs::AtClaims,
     resolved: Option<BunyipPrincipal>,
 ) -> (Option<AuthState>, Option<AppError>) {
+    // PMS-1125: a pre-resolved row already passed the PMS-698 gate in
+    // `resolve_bunyip_caller`, and it stays in the tenant it was read from
+    // on that path (no invite, no backfill), so gating it again below would
+    // only repeat the tenant-status read the query budget counts once.
+    let gated_on_resolve = resolved.is_some();
     let placement = match resolved.as_ref() {
         Some(principal) => Some(principal.placement.clone()),
         None => auth_service.find_user_placement(sub).await.ok().flatten(),
@@ -1390,13 +1422,22 @@ async fn place_bunyip_caller(
     // Excludes the PMS-681 `iat`-vs-`password_changed_at` cutoff on purpose:
     // bunyip owns the credential here, so a mokosh-side password change is not
     // a revocation signal for a bunyip token.
-    if let Err(e) = auth_service.ensure_principal_usable(&user).await {
-        tracing::info!(error = %e, user = %user.id, tenant_id = %user.tenant_id, "rejecting bunyip principal");
-        // Propagate the rejection so the middleware can short-circuit with the
-        // AppError's 403 "This organization is not active" response instead of
-        // falling through to legacy + landing on a generic 401 the SPA reads
-        // as "session expired" and loops on.
-        return (None, Some(e));
+    //
+    // PMS-1125: on the production path the gate has already run in
+    // `resolve_bunyip_caller` on the row as it was read, before any
+    // placement write (see `gated_on_resolve`). This is the gate for the
+    // callers that start here with no pre-resolved row: the userinfo branch
+    // (a first-sight user, whose row did not exist to gate, or a moved one,
+    // whose new tenant must be checked) and the placement tests.
+    if !gated_on_resolve {
+        if let Err(e) = auth_service.ensure_principal_usable(&user).await {
+            tracing::info!(error = %e, user = %user.id, tenant_id = %user.tenant_id, "rejecting bunyip principal");
+            // Propagate the rejection so the middleware can short-circuit with the
+            // AppError's 403 "This organization is not active" response instead of
+            // falling through to legacy + landing on a generic 401 the SPA reads
+            // as "session expired" and loops on.
+            return (None, Some(e));
+        }
     }
 
     // Mark the invite accepted now the user is placed (best-effort).
