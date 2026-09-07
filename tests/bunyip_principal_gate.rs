@@ -127,13 +127,21 @@ impl StubOp {
 }
 
 async fn tickets_status(app: &common::TestApp, token: &str) -> reqwest::StatusCode {
-    app.client
+    tickets_response(app, token).await.0
+}
+
+/// PMS-1125: the status AND the body, so the two paths can be pinned to the
+/// same refusal rather than merely both to "not 2xx".
+async fn tickets_response(app: &common::TestApp, token: &str) -> (reqwest::StatusCode, String) {
+    let resp = app
+        .client
         .get(app.url("/api/v1/tickets"))
         .bearer_auth(token)
         .send()
         .await
-        .expect("GET /tickets")
-        .status()
+        .expect("GET /tickets");
+    let status = resp.status();
+    (status, resp.text().await.unwrap_or_default())
 }
 
 /// AC3: after `POST /tenants/{id}/suspend` a previously working bunyip bearer
@@ -261,13 +269,115 @@ async fn inactive_user_rejects_both_auth_paths(pool: PgPool) {
         .await
         .expect("deactivate user");
 
-    assert!(
-        !tickets_status(&app, &bunyip).await.is_success(),
-        "bunyip bearer must be rejected once the user is inactive"
+    // PMS-1125: both paths answer the PMS-698 gate's own 403 and message,
+    // not a generic 401 the SPA reads as "session expired" and loops on.
+    let (bunyip_status, bunyip_body) = tickets_response(&app, &bunyip).await;
+    let (legacy_status, legacy_body) = tickets_response(&app, &legacy).await;
+    assert_eq!(
+        bunyip_status,
+        reqwest::StatusCode::FORBIDDEN,
+        "bunyip bearer must be refused by the principal gate: {bunyip_body}"
+    );
+    assert_eq!(
+        legacy_status,
+        reqwest::StatusCode::FORBIDDEN,
+        "legacy bearer must be refused by the principal gate: {legacy_body}"
     );
     assert!(
-        !tickets_status(&app, &legacy).await.is_success(),
-        "legacy bearer must be rejected once the user is inactive"
+        bunyip_body.contains("Account is not active"),
+        "the bunyip refusal names the reason: {bunyip_body}"
+    );
+    assert_eq!(
+        bunyip_body, legacy_body,
+        "both paths answer the same refusal for the same principal"
+    );
+
+    // PMS-1125: the refusal causes no placement side effect. This fixture
+    // sits in the default tenant as a demoted `admin`, exactly the shape the
+    // PMS-245 backfill re-homes; before the gate moved ahead of that
+    // decision, the refused request provisioned a personal tenant and moved
+    // the row into it, which is what made the legacy bearer above 404.
+    let tenant_id: Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
+        .bind(admin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the user's tenant");
+    assert_eq!(
+        tenant_id,
+        common::DEFAULT_TENANT_ID,
+        "a refused principal is not re-homed on its way to the refusal"
+    );
+}
+
+/// PMS-1125: the everyday shape, and the one the 2026-09-07 staging outage
+/// had. A user already placed in a real tenant takes the PMS-777 local-state
+/// path (no userinfo hop, no re-home), and that path used to keep only the
+/// `AuthState` half of the placement result: the PMS-698 gate's 403 was
+/// dropped, the middleware fell through to the legacy decoder, and every
+/// request answered a bare 401 with nothing but a false `JWT error` in the
+/// log. Pins that the refusal reaches the caller from this path too.
+#[sqlx::test]
+async fn inactive_user_in_a_real_tenant_gets_the_gate_reason_on_the_fast_path(pool: PgPool) {
+    let (_tenant_id, admin_id, email, password) =
+        common::seed_tenant_with_admin(&pool, "pms-1125-fast-path").await;
+    let op = StubOp::spawn(admin_id, &email).await;
+    let app = common::boot_with_bunyip(pool.clone(), op.verifier()).await;
+
+    let bunyip = op.mint(admin_id, "admin");
+    let legacy = {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/auth/login"))
+            .json(&serde_json::json!({
+                "email": email,
+                "password": password,
+                "tenant_slug": "pms-1125-fast-path",
+            }))
+            .send()
+            .await
+            .expect("send /auth/login request");
+        assert!(
+            resp.status().is_success(),
+            "legacy login for the seeded tenant admin expected 2xx, got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("/auth/login JSON body");
+        body["access_token"]
+            .as_str()
+            .expect("login response has access_token")
+            .to_string()
+    };
+
+    assert!(
+        tickets_status(&app, &bunyip).await.is_success(),
+        "bunyip bearer works while the user is active"
+    );
+
+    sqlx::query("UPDATE users SET status = 'inactive' WHERE id = $1")
+        .bind(admin_id)
+        .execute(&pool)
+        .await
+        .expect("deactivate user");
+
+    let (bunyip_status, bunyip_body) = tickets_response(&app, &bunyip).await;
+    let (legacy_status, legacy_body) = tickets_response(&app, &legacy).await;
+    assert_eq!(
+        bunyip_status,
+        reqwest::StatusCode::FORBIDDEN,
+        "the local-state path must carry the gate's 403 out: {bunyip_body}"
+    );
+    assert!(
+        bunyip_body.contains("Account is not active"),
+        "the refusal names the reason: {bunyip_body}"
+    );
+    assert_eq!(
+        legacy_status,
+        reqwest::StatusCode::FORBIDDEN,
+        "{legacy_body}"
+    );
+    assert_eq!(
+        bunyip_body, legacy_body,
+        "both paths answer the same refusal for the same principal"
     );
 }
 
