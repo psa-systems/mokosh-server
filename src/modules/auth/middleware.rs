@@ -267,11 +267,19 @@ pub async fn auth_middleware(
             // A credential was presented; assume it is rejected until a path
             // accepts it (settled after both branches have run).
             outcome = BearerOutcome::Rejected;
+            // PMS-1125: whether the verifier accepted the token. A verified
+            // at+jwt is never a legacy HS256 token, so when its principal
+            // cannot be resolved the legacy branch below has nothing to add:
+            // it would only log a false `JWT error: InvalidAlgorithm` for
+            // the EdDSA header, which is the line that misdirected the
+            // 2026-09-07 staging triage.
+            let mut bunyip_verified = false;
             // 1. Bunyip-as-OP Resource-Server path (new). Tokens minted by
             //    bunyip-api carry typ=at+jwt + iss=bunyip's OIDC_ISSUER.
             let from_bunyip = match auth_middleware.bunyip.as_ref() {
                 Some(v) => match v.verify_at_jwt(token).await {
                     Ok(claims) => {
+                        bunyip_verified = true;
                         candidate_sub = uuid::Uuid::parse_str(&claims.sub).ok();
                         let (state, rejection) = ensure_user_from_bunyip(
                             &auth_middleware.auth_service,
@@ -311,6 +319,21 @@ pub async fn auth_middleware(
             };
             if let Some(state) = from_bunyip {
                 state
+            } else if bunyip_verified {
+                // PMS-1125: the token is bunyip's and it verified, but no
+                // usable principal came back. The branch that refused it has
+                // already said why (the PMS-698 gate carries its 403 in
+                // `principal_rejection`, the MAPPS-458 and JIT refusals log
+                // their own lines); when none was carried, say so here at
+                // warn, so a support report of "everything 401s" has one
+                // line to grep for instead of a silence.
+                if principal_rejection.is_none() {
+                    tracing::warn!(
+                        sub = ?candidate_sub,
+                        "bunyip bearer verified but no usable principal was resolved; the preceding auth line names the reason"
+                    );
+                }
+                AuthState::default()
             } else {
                 // 2. Legacy HS256 cookie path. Only an `access` token is a
                 // valid Bearer credential; `decode_token` runs
