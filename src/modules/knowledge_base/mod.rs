@@ -2,6 +2,7 @@
 pub mod attachment_move;
 pub mod attachments;
 
+pub mod mentions;
 pub mod models;
 pub mod routes;
 pub mod service;

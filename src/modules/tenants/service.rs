@@ -2202,7 +2202,12 @@ impl TenantService {
                                  -- copied here so a new tenant's contacts can
                                  -- request a sign-in link and actually receive
                                  -- one instead of a silent no-op.
-                                 'auth.login_link')
+                                 'auth.login_link',
+                                 -- PMS-1129: the in-app row an @mention in
+                                 -- a KB comment queues for the person named.
+                                 -- Seeded for the default tenant by migration
+                                 -- 202, which also backfills older tenants.
+                                 'kb.comment.mention')
             "#,
         )
         .bind(new_tenant_id)
@@ -2243,7 +2248,10 @@ impl TenantService {
                                    -- the recurring-sign-in magic-link email
                                    -- actually fans out. A template with no rule
                                    -- is a message that is never sent.
-                                   'auth.login_link')
+                                   'auth.login_link',
+                                   -- PMS-1129: pair the kb.comment.mention template
+                                   -- above with its rule.
+                                   'kb.comment.mention')
             "#,
         )
         .bind(new_tenant_id)
