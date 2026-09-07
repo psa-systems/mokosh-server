@@ -1,11 +1,16 @@
 //! mokosh-contact-login prompt 010 (PMS-918): end-to-end tests for
-//! the magic-link login + multi-Company picker.
+//! the magic-link login.
 //!
-//! Covers all 14 cases in the spec's Tests section: enumeration
-//! resistance of the finder, rate limits (per-IP + per-email), the
-//! redeem branches (auto-mint / picker / MFA / replay / expired /
-//! revoked), the select branch (happy path + candidate-swap guard +
-//! expired selection token), and the cross-tenant isolation
+//! One policy runs through the whole file (MAPPS-637, retested under
+//! PMS-1065): a login link is scoped to ONE Company by `portal_id` or
+//! slug, and no token ever unlocks more than one contact. So the
+//! finder drops a request that names neither, and a redeem whose token
+//! matches two contacts is an invalid link rather than a picker.
+//!
+//! Covers the finder's enumeration resistance, the two rate limits
+//! (per-IP and per-email), the redeem branches (auto-mint /
+//! multi-match refusal / MFA / replay / expired / revoked /
+//! first-login password gate), and the cross-tenant isolation
 //! invariant.
 
 mod common;
@@ -423,11 +428,13 @@ async fn redeem_single_match_auto_mints_session(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
-/// mokosh-contact-login prompt 010: multi-match returns the picker
-/// payload. Two Companies under the same email + same tenant. No
-/// session tokens are set on the response.
+/// MAPPS-637: multi-match is an invalid-link outcome, not a picker.
+/// Two Companies under the same email + same tenant. The response is
+/// the generic 400 the expired and revoked branches produce, carries
+/// no candidate payload of any kind, and the intent is consumed so the
+/// token cannot be re-presented.
 #[sqlx::test]
-async fn redeem_multi_match_returns_picker_payload(pool: PgPool) {
+async fn redeem_multi_match_returns_invalid_link(pool: PgPool) {
     let (_a_id, _a_co, _a_slug) = seed_portal_contact_in_tenant(
         &pool,
         common::DEFAULT_TENANT_ID,
@@ -444,6 +451,12 @@ async fn redeem_multi_match_returns_picker_payload(pool: PgPool) {
     .await;
     let token =
         mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "multi@mcl.example", None).await;
+    let intent_id: Uuid = token
+        .split('.')
+        .next()
+        .expect("intent id prefix")
+        .parse()
+        .expect("intent id parses");
     let app = common::boot(pool.clone()).await;
 
     let resp = app
@@ -453,31 +466,32 @@ async fn redeem_multi_match_returns_picker_payload(pool: PgPool) {
         .send()
         .await
         .expect("redeem multi");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = resp.json().await.expect("redeem JSON");
-    assert!(
-        body["auto"].is_null(),
-        "prompt 010: multi-match must not mint an auto session"
-    );
-    let candidates = &body["candidates"];
-    assert!(
-        !candidates.is_null(),
-        "prompt 010: multi-match must return candidates"
-    );
-    let companies = candidates["companies"]
-        .as_array()
-        .expect("candidates.companies");
     assert_eq!(
-        companies.len(),
-        2,
-        "prompt 010: picker must list both Companies"
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "MAPPS-637: a token matching more than one contact must be refused as an invalid link"
+    );
+    let body: serde_json::Value = resp.json().await.expect("redeem JSON");
+    assert_eq!(
+        body["error"]["message"].as_str(),
+        Some("This link is invalid or has expired"),
+        "MAPPS-637: multi-match must be indistinguishable from an expired link, got {body}"
     );
     assert!(
-        candidates["selection_token"]
-            .as_str()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false),
-        "prompt 010: multi-match must carry a non-empty selection_token"
+        body["auto"].is_null() && body["candidates"].is_null(),
+        "MAPPS-637: the refusal must carry no session and no candidate payload, got {body}"
+    );
+
+    // The intent is spent, so a second click cannot re-present it.
+    let used: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT used_at FROM portal_login_intents WHERE id = $1")
+            .bind(intent_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read intent");
+    assert!(
+        used.is_some(),
+        "MAPPS-637: a multi-match redeem must consume the intent"
     );
 }
 
@@ -752,190 +766,12 @@ async fn a_recovery_code_completes_the_magic_link_once(pool: PgPool) {
     assert_eq!(again.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-// ---------------------------------------------------------------------------
-// Select: happy path + guards
-// ---------------------------------------------------------------------------
-
-/// mokosh-contact-login prompt 010: multi-match then select mints a
-/// session for the chosen contact. `sub` claim on the access token
-/// matches the picked contact_id.
-#[sqlx::test]
-async fn select_mints_session_for_chosen_contact(pool: PgPool) {
-    let (a_id, _a_co, _a_slug) = seed_portal_contact_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        "Alpha Co",
-        "sel@mcl.example",
-    )
-    .await;
-    let (_b_id, _b_co, _b_slug) = seed_portal_contact_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        "Beta Co",
-        "sel@mcl.example",
-    )
-    .await;
-    // Option-1 gate: both contacts already carry a password so the
-    // select mints a session rather than bouncing to set-password.
-    stamp_password_hash(&pool, a_id).await;
-    stamp_password_hash(&pool, _b_id).await;
-    let token = mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "sel@mcl.example", None).await;
-    let app = common::boot(pool.clone()).await;
-
-    let redeem = app
-        .client
-        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
-        .json(&serde_json::json!({ "token": token }))
-        .send()
-        .await
-        .expect("redeem multi");
-    let redeem_body: serde_json::Value = redeem.json().await.expect("redeem JSON");
-    let selection_token = redeem_body["candidates"]["selection_token"]
-        .as_str()
-        .expect("selection_token")
-        .to_string();
-
-    let select = app
-        .client
-        .post(app.url("/api/v1/contact/auth/login-link/select"))
-        .json(&serde_json::json!({
-            "selection_token": selection_token,
-            "contact_id": a_id,
-        }))
-        .send()
-        .await
-        .expect("select a");
-    assert_eq!(select.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = select.json().await.expect("select JSON");
-    assert_eq!(
-        body["contact"]["id"].as_str(),
-        Some(a_id.to_string().as_str()),
-        "prompt 010: session me.id must match the picked contact"
-    );
-}
-
-/// mokosh-contact-login prompt 010: select with a contact_id that
-/// was NOT part of the redeem's candidate list returns 400. Prevents
-/// a caller from swapping to an unrelated contact.
-#[sqlx::test]
-async fn select_rejects_contact_id_not_in_candidates(pool: PgPool) {
-    let (_a_id, _a_co, _a_slug) = seed_portal_contact_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        "Alpha Co",
-        "guard@mcl.example",
-    )
-    .await;
-    let (_b_id, _b_co, _b_slug) = seed_portal_contact_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        "Beta Co",
-        "guard@mcl.example",
-    )
-    .await;
-    // Third contact under a THIRD Company / same tenant, NOT part of
-    // the intent's email match.
-    let (foreign_id, _c_co, _c_slug) = seed_portal_contact_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        "Gamma Co",
-        "foreign@mcl.example",
-    )
-    .await;
-    let token =
-        mint_intent_direct(&pool, common::DEFAULT_TENANT_ID, "guard@mcl.example", None).await;
-    let app = common::boot(pool.clone()).await;
-
-    let redeem = app
-        .client
-        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
-        .json(&serde_json::json!({ "token": token }))
-        .send()
-        .await
-        .expect("redeem");
-    let redeem_body: serde_json::Value = redeem.json().await.expect("redeem JSON");
-    let selection_token = redeem_body["candidates"]["selection_token"]
-        .as_str()
-        .expect("selection_token")
-        .to_string();
-
-    let select = app
-        .client
-        .post(app.url("/api/v1/contact/auth/login-link/select"))
-        .json(&serde_json::json!({
-            "selection_token": selection_token,
-            "contact_id": foreign_id,
-        }))
-        .send()
-        .await
-        .expect("select foreign");
-    assert_eq!(
-        select.status(),
-        reqwest::StatusCode::BAD_REQUEST,
-        "prompt 010: unrelated contact_id must 400"
-    );
-}
-
-/// mokosh-contact-login prompt 010: selection JWT expired -> 400.
-/// Constructs a JWT with `exp` in the past under the same shape the
-/// service issues.
-#[sqlx::test]
-async fn select_rejects_expired_selection_token(pool: PgPool) {
-    let (a_id, _a_co, _a_slug) = seed_portal_contact_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        "Alpha Co",
-        "expsel@mcl.example",
-    )
-    .await;
-    let app = common::boot(pool.clone()).await;
-
-    // Build an already-expired selection JWT under the same secret
-    // the router uses (`test-jwt-secret-that-is-clearly-not-for-prod`,
-    // set in `tests/common/mod.rs`).
-    #[derive(serde::Serialize)]
-    struct Claims<'a> {
-        intent_id: Uuid,
-        tid: Uuid,
-        candidate_contact_ids: Vec<Uuid>,
-        #[serde(rename = "typ")]
-        typ: &'a str,
-        iat: i64,
-        exp: i64,
-    }
-    let now = Utc::now();
-    let claims = Claims {
-        intent_id: Uuid::new_v4(),
-        tid: common::DEFAULT_TENANT_ID,
-        candidate_contact_ids: vec![a_id],
-        typ: "contact_login_select",
-        iat: (now - Duration::minutes(30)).timestamp(),
-        // Well past the jsonwebtoken default 60s leeway.
-        exp: (now - Duration::minutes(15)).timestamp(),
-    };
-    let selection_token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::default(),
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(b"test-jwt-secret-that-is-clearly-not-for-prod"),
-    )
-    .expect("encode expired JWT");
-
-    let resp = app
-        .client
-        .post(app.url("/api/v1/contact/auth/login-link/select"))
-        .json(&serde_json::json!({
-            "selection_token": selection_token,
-            "contact_id": a_id,
-        }))
-        .send()
-        .await
-        .expect("select expired");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::BAD_REQUEST,
-        "prompt 010: expired selection_token must 400"
-    );
-}
+// MAPPS-637 (pinned here under PMS-1065): the multi-Company picker is
+// gone, so this file has no Select section. Its route, the selection
+// JWT and the candidate DTOs were all retired with it, and the four
+// cases that drove them were deleted rather than rewritten: there is
+// no code path left for them to pin. What replaced them is
+// `redeem_multi_match_returns_invalid_link` above.
 
 // ---------------------------------------------------------------------------
 // Cross-tenant isolation
@@ -1101,92 +937,34 @@ async fn redeem_single_match_with_no_password_returns_setup_url(pool: PgPool) {
     );
 }
 
-/// Same option-1 gate on the multi-Company select path: the picker
-/// hands back a session ONLY when the chosen contact already has a
-/// password; else it returns `password_setup_url` scoped to that
-/// specific contact's Company.
+/// MAPPS-637: a login-link request that names neither `portal_id` nor
+/// a slug is dropped, and a KNOWN email is dropped exactly as an
+/// unknown one is. The cross-tenant `SELECT DISTINCT c.tenant_id ...
+/// WHERE LOWER(c.email) = LOWER($1)` fan-out that used to mint one
+/// intent per matched tenant, and mail one link per intent, was the
+/// aggregation primitive retired: a request naming no Company must not
+/// be answered with every Company the address is on file under.
+///
+/// Both halves matter. 204 keeps the drop enumeration-resistant, and
+/// zero intents plus zero mail is what says it was actually dropped
+/// rather than served. `login_link_without_slug_unknown_email_stays_enum_resistant`
+/// below covers only the unknown-email side, so without this a known
+/// email that silently minted nothing would be untested.
 #[sqlx::test]
-async fn select_with_no_password_returns_setup_url(pool: PgPool) {
-    let (a_id, _a_co, a_slug) = seed_portal_contact_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        "Alpha Co",
-        "selnopw@mcl.example",
-    )
-    .await;
-    let (_b_id, _b_co, _b_slug) = seed_portal_contact_in_tenant(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        "Beta Co",
-        "selnopw@mcl.example",
-    )
-    .await;
-    // Neither contact has a password: both should bounce on select.
-    let token = mint_intent_direct(
-        &pool,
-        common::DEFAULT_TENANT_ID,
-        "selnopw@mcl.example",
-        None,
-    )
-    .await;
-    let app = common::boot(pool.clone()).await;
-
-    let redeem = app
-        .client
-        .post(app.url("/api/v1/contact/auth/login-link/redeem"))
-        .json(&serde_json::json!({ "token": token }))
-        .send()
-        .await
-        .expect("redeem multi");
-    let redeem_body: serde_json::Value = redeem.json().await.expect("redeem JSON");
-    let selection_token = redeem_body["candidates"]["selection_token"]
-        .as_str()
-        .expect("selection_token")
-        .to_string();
-
-    let select = app
-        .client
-        .post(app.url("/api/v1/contact/auth/login-link/select"))
-        .json(&serde_json::json!({
-            "selection_token": selection_token,
-            "contact_id": a_id,
-        }))
-        .send()
-        .await
-        .expect("select");
-    assert_eq!(select.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = select.json().await.expect("select JSON");
-    assert_eq!(
-        body["access_token"].as_str(),
-        Some(""),
-        "option-1: select must NOT mint a session for a password-less contact"
-    );
-    let setup_url = body["password_setup_url"]
-        .as_str()
-        .expect("password_setup_url present on the select response");
-    let expected_prefix = format!("/portal/{a_slug}/set-password?token=");
-    assert!(
-        setup_url.contains(&expected_prefix),
-        "option-1: select's setup URL must be scoped to the picked contact's Company, got: {setup_url}"
-    );
-}
-
-/// Regression: a fresh browser hitting /portal/find has no
-/// `mokosh:contact_last_slug` in localStorage, so the client posts
-/// `{ email, slug: null }` to /contact/auth/login-link. The
-/// pre-fix server dropped that shape silently (both slug + portal_id
-/// missing) and no email was sent. The fix falls back to a
-/// cross-tenant email match: look up every active-tenant Company
-/// with a portal contact carrying that email, mint one intent per
-/// matching tenant, dispatch one email per intent. Zero matches still
-/// = zero intents (enum-resistant), but a known email now actually
-/// gets a link.
-#[sqlx::test]
-async fn login_link_without_slug_falls_back_to_cross_tenant_email_match(pool: PgPool) {
+async fn login_link_without_slug_for_a_known_email_mints_nothing(pool: PgPool) {
     let (_contact_id, _company_id, _slug) = seed_portal_contact(&pool, "nosslug@mcl.example").await;
     // Nuke the intent grant_portal_access minted so the assertion
-    // below reflects only the finder call.
+    // below reflects only the finder call. Its notification row is not
+    // deletable the same way (other tests read the table), so take a
+    // baseline and assert the finder adds nothing to it.
     clear_intents(&pool).await;
+    let mail_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE recipient = $1 AND channel_type = 'email'",
+    )
+    .bind("nosslug@mcl.example")
+    .fetch_one(&pool)
+    .await
+    .expect("count notifications before");
     let app = common::boot(pool.clone()).await;
 
     let resp = app
@@ -1199,40 +977,29 @@ async fn login_link_without_slug_falls_back_to_cross_tenant_email_match(pool: Pg
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::NO_CONTENT,
-        "finder must 204 regardless of the slug being present"
+        "MAPPS-637: the drop must answer 204, the same as any other finder submission"
     );
 
-    let intent_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM portal_login_intents \
-         WHERE tenant_id = $1 AND LOWER(email) = LOWER($2)",
-    )
-    .bind(common::DEFAULT_TENANT_ID)
-    .bind("nosslug@mcl.example")
-    .fetch_one(&pool)
-    .await
-    .expect("count intents");
+    let intent_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM portal_login_intents")
+        .fetch_one(&pool)
+        .await
+        .expect("count intents");
     assert_eq!(
-        intent_count, 1,
-        "cross-tenant fallback must mint exactly one intent for the matched tenant"
+        intent_count, 0,
+        "MAPPS-637: a request naming no portal_id and no slug must mint zero intents, \
+         even for an email that is on file"
     );
 
-    // And the auth.login_link email must actually queue (composed with
-    // migration 149's template seed from the earlier fix).
-    let body: String = sqlx::query_scalar(
-        "SELECT body FROM notifications \
-         WHERE tenant_id = $1 AND recipient = $2 AND channel_type = 'email' \
-         ORDER BY created_at DESC LIMIT 1",
+    let mail_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE recipient = $1 AND channel_type = 'email'",
     )
-    .bind(common::DEFAULT_TENANT_ID)
     .bind("nosslug@mcl.example")
     .fetch_one(&pool)
     .await
-    .expect(
-        "finder without slug must still queue the login-link email; if this returns RowNotFound the fallback path is broken",
-    );
-    assert!(
-        body.contains("/portal/pick?token="),
-        "cross-tenant fallback email must carry the magic-link URL, got: {body}"
+    .expect("count notifications after");
+    assert_eq!(
+        mail_after, mail_before,
+        "MAPPS-637: the retired fan-out must queue no login-link mail"
     );
 }
 
