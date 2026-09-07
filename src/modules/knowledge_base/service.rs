@@ -451,8 +451,8 @@ impl KbService {
         // Seed the first version.
         sqlx::query(
             r#"INSERT INTO kb_article_versions
-               (article_id, version_number, title, content, edited_by_id)
-               VALUES ($1, 1, $2, $3, $4)"#,
+               (article_id, version_number, title, content, edited_by_id, change_kind)
+               VALUES ($1, 1, $2, $3, $4, 'create')"#,
         )
         .bind(id)
         .bind(&request.title)
@@ -613,6 +613,7 @@ impl KbService {
                 request.title.as_ref().unwrap_or(&prior.title),
                 request.content.as_ref().unwrap_or(&prior.content),
                 editor,
+                VersionProvenance::edit(request.change_note.as_deref()),
             )
             .await?;
         }
@@ -735,33 +736,42 @@ impl KbService {
     /// Append a new monotonic version row for `article_id` inside an open
     /// transaction. Shared by `update_article` (snapshot-on-edit) and
     /// `restore_article_version` (snapshot-on-restore) so the
-    /// `MAX(version_number) + 1` numbering stays in one place.
+    /// `MAX(version_number) + 1` numbering stays in one place. Answers the
+    /// row it wrote so a caller can hand it back without a second read
+    /// (PMS-1126).
     async fn snapshot_version(
         tx: &mut sqlx::PgConnection,
         article_id: Uuid,
         title: &str,
         content: &str,
         editor: Uuid,
-    ) -> AppResult<i32> {
+        provenance: VersionProvenance<'_>,
+    ) -> AppResult<KbArticleVersionResponse> {
         let next: i32 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(version_number), 0) + 1 FROM kb_article_versions WHERE article_id = $1",
         )
         .bind(article_id)
         .fetch_one(&mut *tx)
         .await?;
-        sqlx::query(
+        let row = sqlx::query_as::<_, VersionRow>(
             r#"INSERT INTO kb_article_versions
-               (article_id, version_number, title, content, edited_by_id)
-               VALUES ($1, $2, $3, $4, $5)"#,
+               (article_id, version_number, title, content, edited_by_id,
+                change_note, change_kind, restored_from_version)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               RETURNING id, article_id, version_number, title, content, edited_by_id,
+                         change_note, change_kind, restored_from_version, created_at"#,
         )
         .bind(article_id)
         .bind(next)
         .bind(title)
         .bind(content)
         .bind(editor)
-        .execute(&mut *tx)
+        .bind(provenance.note())
+        .bind(provenance.kind.as_str())
+        .bind(provenance.restored_from)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(next)
+        Ok(row.into())
     }
 
     /// Restore a prior version's `title`/`content` onto the live article
@@ -814,8 +824,17 @@ impl KbService {
         .execute(&mut *tx)
         .await?;
         // The restore lands as a fresh version so editing still snapshots
-        // on top of it (monotonic numbering preserved).
-        Self::snapshot_version(&mut tx, article_id, &title, &content, editor).await?;
+        // on top of it (monotonic numbering preserved), and says which
+        // version it brought back (PMS-1126).
+        Self::snapshot_version(
+            &mut tx,
+            article_id,
+            &title,
+            &content,
+            editor,
+            VersionProvenance::restore(version_number, None),
+        )
+        .await?;
         tx.commit().await?;
         self.get_article_inner(tenant_id, article_id, false).await
     }
@@ -1045,7 +1064,8 @@ impl KbService {
                 .fetch_one(&mut *tx)
                 .await?;
         let rows = sqlx::query_as::<_, VersionRow>(
-            r#"SELECT id, article_id, version_number, title, content, edited_by_id, created_at
+            r#"SELECT id, article_id, version_number, title, content, edited_by_id,
+                      change_note, change_kind, restored_from_version, created_at
                FROM kb_article_versions WHERE article_id = $1
                ORDER BY version_number DESC
                LIMIT $2 OFFSET $3"#,
@@ -1245,6 +1265,57 @@ impl From<ArticleRow> for KbArticleResponse {
     }
 }
 
+/// PMS-1126: what a version row records about itself beyond its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeKind {
+    Edit,
+    Restore,
+}
+
+impl ChangeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChangeKind::Edit => "edit",
+            ChangeKind::Restore => "restore",
+        }
+    }
+}
+
+/// PMS-1126: the provenance a snapshot is written with. `create` is not a
+/// variant here because the creation snapshot is seeded inline by
+/// `create_article` with the article's own INSERT, never through
+/// `snapshot_version`.
+struct VersionProvenance<'a> {
+    kind: ChangeKind,
+    change_note: Option<&'a str>,
+    restored_from: Option<i32>,
+}
+
+impl<'a> VersionProvenance<'a> {
+    fn edit(change_note: Option<&'a str>) -> Self {
+        Self {
+            kind: ChangeKind::Edit,
+            change_note,
+            restored_from: None,
+        }
+    }
+
+    fn restore(from_version: i32, change_note: Option<&'a str>) -> Self {
+        Self {
+            kind: ChangeKind::Restore,
+            change_note,
+            restored_from: Some(from_version),
+        }
+    }
+
+    /// The note as stored: trimmed, and a blank one is no note.
+    fn note(&self) -> Option<&'a str> {
+        self.change_note
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct VersionRow {
     id: Uuid,
@@ -1253,6 +1324,9 @@ struct VersionRow {
     title: String,
     content: String,
     edited_by_id: Uuid,
+    change_note: Option<String>,
+    change_kind: String,
+    restored_from_version: Option<i32>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -1265,6 +1339,9 @@ impl From<VersionRow> for KbArticleVersionResponse {
             title: r.title,
             content: r.content,
             edited_by_id: r.edited_by_id,
+            change_note: r.change_note,
+            change_kind: r.change_kind,
+            restored_from_version: r.restored_from_version,
             created_at: r.created_at,
         }
     }

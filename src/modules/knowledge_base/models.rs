@@ -141,6 +141,22 @@ pub struct UpdateKbArticleRequest {
     /// is not `client_specific` the scope is cleared regardless.
     #[serde(default)]
     pub company_ids: Option<Vec<Uuid>>,
+    /// PMS-1126: why this edit was made, stored on the version the save
+    /// creates. Trimmed; blank is the same as absent. A save that creates
+    /// no version (a metadata-only edit) keeps no note, because there is
+    /// no version for it to explain.
+    #[validate(length(max = 500))]
+    pub change_note: Option<String>,
+}
+
+/// PMS-1126: the body of `POST /kb/articles/{id}/versions/{n}/restore`.
+/// Optional, and an empty body is the same as `{}`.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct RestoreKbArticleVersionRequest {
+    /// Why the version was brought back, stored on the restore's own
+    /// version row beside `restored_from_version`.
+    #[validate(length(max = 500))]
+    pub change_note: Option<String>,
 }
 
 /// PMS-922: the in-progress body an author has not saved yet.
@@ -189,6 +205,14 @@ pub struct KbArticleVersionResponse {
     pub title: String,
     pub content: String,
     pub edited_by_id: Uuid,
+    /// PMS-1126: what the editor said the change was for, when they said.
+    pub change_note: Option<String>,
+    /// PMS-1126: `create` for the snapshot seeded with the article, `edit`
+    /// for a save that changed the title or content, `restore` for a
+    /// version brought back through the restore route.
+    pub change_kind: String,
+    /// PMS-1126: for a `restore`, the version it brought back.
+    pub restored_from_version: Option<i32>,
     pub created_at: DateTime<Utc>,
 }
 
