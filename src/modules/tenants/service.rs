@@ -800,6 +800,12 @@ impl TenantService {
         let context = serde_json::json!({
             "recipient_contact_id": contact_id.to_string(),
             "recipient_email": admin_email,
+            // PMS-1140: the template opens with `{{salutation}}` and the
+            // renderer emits an unsupplied key verbatim, so this path was
+            // sending a literal `{{salutation}},` as the mail's first line.
+            // `display_name` stays the bare name beside it, the shape the
+            // staff invite path already uses (PMS-774).
+            "salutation": crate::utils::email::salutation(&display_name),
             "display_name": display_name,
             "setup_link": setup_link,
             "client_portal_url": client_portal_url,
@@ -808,8 +814,16 @@ impl TenantService {
         // (create path) or resolved (resend path); `from_trusted` bridges
         // into the typed scope, and `dispatch` sets the GUC per query via
         // `begin_with_tenant`.
+        // PMS-1140: the portal-admin event, not the staff one. Both recipients
+        // are MSP-side so both mails keep `{{app_name}}`, but only this one
+        // carries `{{client_portal_url}}`, which a shared template could not
+        // do without a conditional the renderer does not have.
         match notify
-            .dispatch(TenantId::from_trusted(tenant_id), "auth.welcome", &context)
+            .dispatch(
+                TenantId::from_trusted(tenant_id),
+                "auth.portal_welcome",
+                &context,
+            )
             .await
         {
             Ok(_) => {
