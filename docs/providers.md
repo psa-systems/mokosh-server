@@ -16,7 +16,7 @@ without losing it.
 | Kind | Trait | Providers | Tier | Refreshable |
 |---|---|---|---|---|
 | Configuration | `ConfigProvider` | environment, file, database, Bunyip | bootstrap + application | application only |
-| Secrets (deployment) | `SecretProvider` | environment, file, database, Infisical | application | yes |
+| Secrets (deployment) | `AppSecretProvider` | environment, file, database, Infisical | application | yes |
 | Secrets (tenant) | `SecretProvider` | database, Infisical | tenant | yes |
 | Storage | `ObjectProvider` | local, S3 | tenant | no |
 | Authentication | `AuthProvider` | Bunyip OIDC, local | application | no |
@@ -25,7 +25,10 @@ without losing it.
 Payment (`PaymentProvider`) and RMM (`RmmProvider`) are also providers, but they are chosen per tenant as an
 integration rather than per deployment as infrastructure, so they do not appear in the tables below.
 
-`src/config/`, `src/secrets/` and `src/storage/` each implement the kind of the same name.
+`src/config/`, `src/secrets/`, `src/storage/` and `src/app_secrets/` implement the kinds above. `src/app_secrets/`
+(PMS-988) is Mokosh's application-tier `AppSecretProvider`, with a `GovernedSecret` registry that starts at
+`SMTP_PASSWORD` and grows the day another deployment-wide secret joins it. Its selection variable is `SECRET_BACKEND`,
+the same variable the tenant tier reads: both tiers pick the same provider on purpose.
 [ROADMAP.md](ROADMAP.md) links the phase, and the issue, for every kind.
 
 ## The three tiers
@@ -89,7 +92,8 @@ For every declared key, the application checks which enabled providers hold it, 
 | Situation | What happens |
 |---|---|
 | The highest-priority provider holds it | Used. Recorded. |
-| No provider holds it | Warning, naming the feature that will not work |
+| No provider holds it, and the registry names a feature its absence disables | Warning, naming the feature that will not work |
+| No provider holds it, and the registry names no such feature | Silent (the key is legitimately unset by design; see the module note in `src/config/registry.rs`) |
 | More than one provider holds it | Warning per duplicate, naming the purge command |
 | The highest-priority provider does not hold it, a lower one does | **Fatal.** The process exits. |
 

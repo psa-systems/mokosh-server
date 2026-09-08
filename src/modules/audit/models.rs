@@ -53,6 +53,14 @@ pub struct FieldChange {
 #[derive(Debug, Clone, Serialize)]
 pub struct EntityHistoryEntry {
     pub id: Uuid,
+    /// PMS-974: which record this entry describes. Equal to the requested
+    /// entity type for the record's own rows; `ticket_notes` for an edit to
+    /// one of a ticket's notes, which the ticket's history now carries so a
+    /// client can render it as a note edit rather than a ticket edit.
+    pub entity_type: String,
+    /// PMS-974: the record the entry describes, so a `ticket_notes` entry in
+    /// a ticket's history can be tied to the note it changed.
+    pub entity_id: Option<Uuid>,
     pub action: String,
     pub user_id: Option<Uuid>,
     pub changed_fields: Vec<String>,

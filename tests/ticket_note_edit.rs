@@ -339,3 +339,272 @@ async fn an_edit_cannot_change_what_kind_of_note_it_is(pool: PgPool) {
         .expect("read back");
     assert_eq!(kind, "internal", "the extra field is ignored, not applied");
 }
+
+// ============================================================================
+// PMS-974: the WHO gate is a tenant policy, every served note says whether
+// the caller may edit it, and the ticket's own history carries the edit.
+// ============================================================================
+
+/// `PUT /settings` with `tickets/note_editing`, the way an administrator sets
+/// it, so the validator on the write path is exercised too.
+async fn set_policy(app: &common::TestApp, admin_token: &str, value: &str) -> reqwest::Response {
+    app.client
+        .put(app.url("/api/v1/settings"))
+        .bearer_auth(admin_token)
+        .json(&serde_json::json!({
+            "category": "tickets",
+            "key": "note_editing",
+            "value": value,
+        }))
+        .send()
+        .await
+        .expect("send setting")
+}
+
+async fn list_notes(app: &common::TestApp, token: &str, ticket_id: Uuid) -> Vec<Value> {
+    let body: Value = app
+        .client
+        .get(app.url(&format!("/api/v1/tickets/{ticket_id}/notes")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("list notes")
+        .json()
+        .await
+        .expect("notes JSON");
+    body["data"].as_array().cloned().expect("notes data")
+}
+
+fn can_edit(notes: &[Value], note_id: Uuid) -> bool {
+    notes
+        .iter()
+        .find(|n| n["id"].as_str() == Some(&note_id.to_string()))
+        .unwrap_or_else(|| panic!("note {note_id} is in the list"))["can_edit"]
+        .as_bool()
+        .expect("can_edit is a boolean")
+}
+
+/// `off` makes every note append-only, the author's own included, and the
+/// refusal names the setting so the agent knows who can change it. The policy
+/// is a closed set: a value outside it is refused at the write, not read as
+/// the default silently.
+#[sqlx::test(migrations = "./migrations")]
+async fn editing_can_be_switched_off_for_the_organisation(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let (ticket_id, _) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let note_id = seed_note(&pool, ticket_id, admin_id, "internal", false, None).await;
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let refused = set_policy(&app, &token, "anyone").await;
+    assert_eq!(refused.status(), 422, "{:?}", refused.text().await);
+
+    let set = set_policy(&app, &token, "off").await;
+    assert_eq!(set.status(), 200, "{:?}", set.text().await);
+
+    let resp = edit(&app, &token, ticket_id, note_id, "not even the owner").await;
+    assert_eq!(resp.status(), 403);
+    let body: Value = resp.json().await.expect("JSON body");
+    let text = body.to_string();
+    assert!(
+        text.contains("tickets/note_editing"),
+        "the refusal names the setting: {text}"
+    );
+
+    let stored: String = sqlx::query_scalar("SELECT content FROM ticket_notes WHERE id = $1")
+        .bind(note_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back");
+    assert_eq!(stored, "the original text");
+
+    // Switching it back restores the default rule for the same request.
+    let set = set_policy(&app, &token, "author_or_admin").await;
+    assert_eq!(set.status(), 200);
+    let resp = edit(&app, &token, ticket_id, note_id, "corrected").await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+}
+
+/// A manager edits another person's note only when the tenant granted it on
+/// purpose. Under the default the answer is the PMS-931 one, so a tenant that
+/// never opened the setting sees no change.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_manager_edits_others_notes_only_under_author_or_manager(pool: PgPool) {
+    let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
+    let (_, manager_email, manager_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "manager@example.com",
+        "manager",
+    )
+    .await;
+    let company_id = common::seed_company(&pool).await;
+    let (ticket_id, _) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let note_id = seed_note(&pool, ticket_id, admin_id, "internal", false, None).await;
+
+    let app = common::boot(pool.clone()).await;
+    let admin_token = common::login(&app, &admin_email, &admin_password).await;
+    let manager_token = common::login(&app, &manager_email, &manager_password).await;
+
+    let resp = edit(&app, &manager_token, ticket_id, note_id, "as a manager").await;
+    assert_eq!(resp.status(), 403, "the default keeps managers out");
+    assert!(!can_edit(
+        &list_notes(&app, &manager_token, ticket_id).await,
+        note_id
+    ));
+
+    let set = set_policy(&app, &admin_token, "author_or_manager").await;
+    assert_eq!(set.status(), 200, "{:?}", set.text().await);
+
+    assert!(can_edit(
+        &list_notes(&app, &manager_token, ticket_id).await,
+        note_id
+    ));
+    let resp = edit(&app, &manager_token, ticket_id, note_id, "as a manager").await;
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    let body: Value = resp.json().await.expect("JSON body");
+    assert_eq!(body["can_edit"], true, "and the edited note still says so");
+}
+
+/// `can_edit` is the conjunction of the policy and the row's state, answered
+/// by the rule the PUT enforces, so a client can show an Edit control on it
+/// without mirroring the gates by hand.
+#[sqlx::test(migrations = "./migrations")]
+async fn each_note_says_whether_the_caller_may_edit_it(pool: PgPool) {
+    let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
+    let (tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "tech@example.com",
+        "technician",
+    )
+    .await;
+    let company_id = common::seed_company(&pool).await;
+    let (ticket_id, _) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let contact_id = seed_contact(&pool, company_id).await;
+
+    let own_internal = seed_note(&pool, ticket_id, tech_id, "internal", false, None).await;
+    let own_emailed = seed_note(&pool, ticket_id, tech_id, "public", true, None).await;
+    let admins_note = seed_note(&pool, ticket_id, admin_id, "internal", false, None).await;
+    let customers = seed_note(
+        &pool,
+        ticket_id,
+        admin_id,
+        "public",
+        false,
+        Some(contact_id),
+    )
+    .await;
+
+    let app = common::boot(pool.clone()).await;
+    let admin_token = common::login(&app, &admin_email, &admin_password).await;
+    let tech_token = common::login(&app, &tech_email, &tech_password).await;
+
+    let as_tech = list_notes(&app, &tech_token, ticket_id).await;
+    assert!(can_edit(&as_tech, own_internal), "the author's own note");
+    assert!(
+        !can_edit(&as_tech, own_emailed),
+        "their own, but the customer holds a copy"
+    );
+    assert!(!can_edit(&as_tech, admins_note), "somebody else's");
+    assert!(!can_edit(&as_tech, customers), "the customer's words");
+
+    let as_admin = list_notes(&app, &admin_token, ticket_id).await;
+    assert!(can_edit(&as_admin, own_internal), "an admin edits anyone's");
+    assert!(can_edit(&as_admin, admins_note));
+    assert!(
+        !can_edit(&as_admin, customers),
+        "but not the customer's, whatever the role"
+    );
+
+    // A note created this request answers too.
+    let created: Value = app
+        .client
+        .post(app.url(&format!("/api/v1/tickets/{ticket_id}/notes")))
+        .bearer_auth(&tech_token)
+        .json(&serde_json::json!({ "content": "fresh", "note_type": "internal" }))
+        .send()
+        .await
+        .expect("add note")
+        .json()
+        .await
+        .expect("note JSON");
+    assert_eq!(created["can_edit"], true, "{created}");
+
+    let set = set_policy(&app, &admin_token, "off").await;
+    assert_eq!(set.status(), 200);
+    let as_admin = list_notes(&app, &admin_token, ticket_id).await;
+    assert!(
+        as_admin.iter().all(|n| n["can_edit"] == false),
+        "off means nobody, the admin included: {as_admin:?}"
+    );
+}
+
+/// The audit row PMS-931 wrote was invisible from anything a technician could
+/// open: the ticket's history read only `tickets` rows. It now carries the
+/// note edit, typed so the client can say "note edited", with the replaced
+/// text beside the new one.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_tickets_own_history_carries_the_note_edit(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let (ticket_id, _) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let (other_ticket, _) = common::seed_ticket_and_note(&pool, admin_id, company_id).await;
+    let note_id = seed_note(&pool, ticket_id, admin_id, "internal", false, None).await;
+    let other_note = seed_note(&pool, other_ticket, admin_id, "internal", false, None).await;
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    assert_eq!(
+        edit(&app, &token, ticket_id, note_id, "the corrected text")
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        edit(&app, &token, other_ticket, other_note, "elsewhere")
+            .await
+            .status(),
+        200
+    );
+
+    let hist: Value = app
+        .client
+        .get(app.url(&format!("/api/v1/audit-log/entity/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get ticket history")
+        .json()
+        .await
+        .expect("history JSON");
+    let entries = hist["data"].as_array().expect("history data");
+    let note_edits: Vec<&Value> = entries
+        .iter()
+        .filter(|e| e["entity_type"] == "ticket_notes")
+        .collect();
+    assert_eq!(
+        note_edits.len(),
+        1,
+        "one note edit on this ticket, none from the other: {entries:?}"
+    );
+    let entry = note_edits[0];
+    assert_eq!(entry["entity_id"], note_id.to_string().as_str(), "{entry}");
+    assert_eq!(entry["action"], "update");
+    let change = entry["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .find(|c| c["field"] == "content")
+        .unwrap_or_else(|| panic!("the content change is in the entry: {entry}"));
+    assert_eq!(change["old"], "the original text");
+    assert_eq!(change["new"], "the corrected text");
+    assert!(
+        entries
+            .iter()
+            .all(|e| e["entity_type"] != "ticket_notes" || e["action"] != "create"),
+        "adding a note is the journal's to show, not the history's: {entries:?}"
+    );
+}

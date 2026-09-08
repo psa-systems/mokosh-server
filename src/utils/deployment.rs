@@ -383,22 +383,28 @@ pub const SELF_HOSTED_PROVIDER_DEFAULTS: [ProviderDefaults; 5] = [
 
 /// The `saas` defaults.
 ///
-/// Authentication is the one row that differs, and it is the row this mode
-/// exists for: bunyip first, with the legacy local path still enabled behind
-/// it until PMS-981 deprecates it. That is what a `saas` instance does today,
-/// since `create_api_router` mounts both.
+/// Two rows differ from `self-hosted`, and both reflect what the deployed
+/// SaaS instance actually runs today (PMS-1018 read the deployment's
+/// configuration to confirm):
 ///
-/// The other four rows deliberately match `self-hosted`, and the reason is the
-/// acceptance criterion itself: the `saas` defaults must reproduce CURRENT
-/// deployed behaviour, and current deployed behaviour for secrets, storage,
-/// email and configuration is whatever that deployment's own environment sets,
-/// which explicit configuration continues to decide. Writing `infisical` or
-/// `s3` in here would be a guess about an environment that is not in this
-/// repository, and it would not be a merely inaccurate guess: a deployment
-/// that sets neither would change backend on the next restart, and
-/// `InfisicalSecretStore::from_env` refuses to build without its own
-/// variables, so the guess would present as a deployment that no longer boots.
-/// Moving those rows needs the deployed values read first, which is PMS-1018.
+/// - authentication: `bunyip` first, with the legacy local path still enabled
+///   behind it until PMS-981 deprecates it, which is what `create_api_router`
+///   already mounts.
+/// - email: `smtp`, because the SaaS deployment sets `SMTP_HOST` explicitly
+///   (nc-01: `mail.psa.systems`), so `MailerConfig::from_env` selects
+///   `SmtpMailer` in every real boot. The `log` default was correct only in
+///   the sense that it was safe when the deployed value was unknown; with
+///   the value confirmed, the profile now names the provider the deployment
+///   uses.
+///
+/// The other three rows (configuration, secrets, storage) still match
+/// `self-hosted`. The SaaS deployment sets neither `SECRET_BACKEND` nor
+/// `STORAGE_BACKEND`, so both resolve to the code default today, and moving
+/// their profile rows would change nothing until the deployment names an
+/// alternate provider explicitly. Writing `infisical` or `s3` here without
+/// the deployment setting either would boot-fail a deployment that sets
+/// neither, because `InfisicalSecretProvider::from_env` (and `S3Provider`)
+/// refuse to build without their variables.
 pub const SAAS_PROVIDER_DEFAULTS: [ProviderDefaults; 5] = [
     ProviderDefaults {
         kind: ProviderKind::Configuration,
@@ -414,7 +420,7 @@ pub const SAAS_PROVIDER_DEFAULTS: [ProviderDefaults; 5] = [
     },
     ProviderDefaults {
         kind: ProviderKind::Email,
-        providers: &[provider::LOG],
+        providers: &[provider::SMTP],
     },
     ProviderDefaults {
         kind: ProviderKind::Storage,
@@ -705,22 +711,30 @@ mod tests {
         }
     }
 
-    /// The `saas` profile reproduces current deployed behaviour, which means
-    /// it differs from `self-hosted` in exactly the one place the code already
-    /// behaves differently today: `create_api_router` mounts bunyip alongside
-    /// the legacy local path when the mode is `saas`. Every other kind is
-    /// decided by that deployment's own explicit configuration, so its row
-    /// must not move without the deployed values in hand.
+    /// The `saas` profile reproduces current deployed behaviour, which is why
+    /// its rows can be moved off `self-hosted` only after the deployed values
+    /// are confirmed. PMS-1018 confirmed them: the SaaS deployment mounts
+    /// bunyip alongside the legacy local path (already true through
+    /// `create_api_router` when the mode is `saas`) AND sets `SMTP_HOST`
+    /// explicitly, so `MailerConfig::from_env` selects `SmtpMailer` on every
+    /// real boot. Secrets, storage and configuration stay on the self-hosted
+    /// row because the deployment sets none of `SECRET_BACKEND`,
+    /// `STORAGE_BACKEND` and no configuration provider selection today.
     #[test]
-    fn the_saas_defaults_differ_from_self_hosted_only_in_authentication() {
+    fn the_saas_defaults_reflect_confirmed_deployed_providers() {
         for kind in ProviderKind::ALL {
             let self_hosted = DeploymentMode::SelfHosted.default_providers_for(kind);
             let saas = DeploymentMode::Saas.default_providers_for(kind);
-            if kind == ProviderKind::Authentication {
-                assert_eq!(self_hosted, [provider::LOCAL]);
-                assert_eq!(saas, [provider::BUNYIP, provider::LOCAL]);
-            } else {
-                assert_eq!(saas, self_hosted, "{kind}");
+            match kind {
+                ProviderKind::Authentication => {
+                    assert_eq!(self_hosted, [provider::LOCAL]);
+                    assert_eq!(saas, [provider::BUNYIP, provider::LOCAL]);
+                }
+                ProviderKind::Email => {
+                    assert_eq!(self_hosted, [provider::LOG]);
+                    assert_eq!(saas, [provider::SMTP]);
+                }
+                _ => assert_eq!(saas, self_hosted, "{kind}"),
             }
         }
     }

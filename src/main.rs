@@ -449,6 +449,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encryption_key = mokosh_server::utils::crypto::parse_encryption_key(&config.encryption_key)
         .expect("ENCRYPTION_KEY must be 32 bytes (or 64 hex chars)");
 
+    // PMS-988: the application-tier secret module (`crate::app_secrets`)
+    // ships as a scaffold in this PR - the trait, the four providers, the
+    // `GovernedSecret` registry, the boot classification and the tests are
+    // all in the tree, but nothing here calls `init_from_env` yet and no
+    // read path goes through it. Wiring lands with the migrate CLI (PMS-1012)
+    // and an operator runbook, so a deployment whose `SMTP_PASSWORD` is a
+    // plain compose variable rather than a `SMTP_PASSWORD_FILE` compose
+    // secret has a documented migration to walk before boot starts refusing
+    // the plain-var path. `SMTP_PASSWORD` therefore still reads through the
+    // configuration provider today.
+
     // PMS-789: load the deployment's product name into the process cache
     // before anything can render it. Warn-and-continue rather than hard-fail:
     // the consumers are display strings with a working default, and refusing to
