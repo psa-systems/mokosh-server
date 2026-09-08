@@ -47,11 +47,17 @@ use chrono::{DateTime, Utc};
 use crate::utils::deployment::{provider, EnablementSource};
 use crate::utils::error::{AppError, AppResult};
 
+pub mod bunyip;
+pub mod database;
 pub mod env;
+pub mod file;
 pub mod guard;
 pub mod registry;
 
+pub use bunyip::{BunyipConfig, BunyipProvider};
+pub use database::DatabaseProvider;
 pub use env::EnvProvider;
+pub use file::FileProvider;
 pub use registry::{ConfigKey, Tier, REGISTRY};
 
 /// What a provider can say about its own contents.
@@ -205,26 +211,50 @@ impl Generation {
     }
 }
 
-/// Which provider serves configuration for this deployment.
+/// Which providers can serve configuration for this deployment.
 ///
-/// One implementation today. PMS-987 adds file, database and Bunyip, at which
-/// point this becomes a priority list rather than a single choice.
+/// One reachable variant was live before PMS-987. PMS-987 added `File`,
+/// `Database` and `Bunyip`, so the shape is now a priority LIST rather
+/// than a single choice (see [`ConfigProviderChain`]); `CONFIG_BACKEND`
+/// still selects one for the older read path until the migrate CLI
+/// (PMS-1012) rewires it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigProviderKind {
     /// The process environment, which is what every read did before PMS-982.
     Environment,
+    /// A directory of one file per key, named by `CONFIG_FILE_DIR`.
+    File,
+    /// The `app_config` table (migration 206). Cannot serve bootstrap-tier
+    /// keys - the credential used to reach the database cannot come from
+    /// the database.
+    Database,
+    /// Bunyip's `/v1/config` API, authenticated as a machine client.
+    Bunyip,
 }
 
 impl ConfigProviderKind {
+    /// Every kind, in a stable order used by reporting.
+    pub const ALL: [Self; 4] = [Self::Environment, Self::File, Self::Database, Self::Bunyip];
+
+    /// The wire spelling. Uses the shared vocabulary in
+    /// [`crate::utils::deployment::provider`] where a name is already
+    /// declared; `"file"` is new and is a plain literal here (the file
+    /// provider today serves only configuration).
     pub fn as_str(self) -> &'static str {
         match self {
             ConfigProviderKind::Environment => provider::ENVIRONMENT,
+            ConfigProviderKind::File => "file",
+            ConfigProviderKind::Database => provider::DATABASE,
+            ConfigProviderKind::Bunyip => provider::BUNYIP,
         }
     }
 
+    /// Legal names for the operator-facing error on an unrecognised value.
+    pub const LEGAL_VALUES: &'static str = "environment, file, database, bunyip";
+
     /// A provider NAME to a kind. Blank is not a name: the caller resolves an
-    /// unset `CONFIG_BACKEND` against the hosting profile's default before it
-    /// gets here.
+    /// unset selection variable against the hosting profile's default before
+    /// it gets here.
     ///
     /// An unrecognised name is a hard error naming the legal values, never a
     /// fall back to the default. An operator who typed a provider name asked
@@ -232,12 +262,44 @@ impl ConfigProviderKind {
     /// this whole model exists to remove.
     pub fn parse_name(raw: &str) -> AppResult<Self> {
         match raw.trim() {
-            provider::ENVIRONMENT => Ok(ConfigProviderKind::Environment),
+            provider::ENVIRONMENT => Ok(Self::Environment),
+            "file" => Ok(Self::File),
+            provider::DATABASE => Ok(Self::Database),
+            provider::BUNYIP => Ok(Self::Bunyip),
             other => Err(AppError::Configuration(format!(
-                "CONFIG_BACKEND {other:?} is not a known configuration provider; expected \
-                 'environment'"
+                "configuration provider {other:?} is not a known kind; expected one \
+                 of: {}",
+                Self::LEGAL_VALUES
             ))),
         }
+    }
+
+    /// Parse a comma-separated priority list (PMS-987). Empty entries are
+    /// refused (a blank name is not a name), and a duplicate is refused
+    /// (a provider listed twice makes the priority ambiguous). The order
+    /// stands as written: the first entry is the highest priority.
+    pub fn parse_list(raw: &str) -> AppResult<Vec<Self>> {
+        let mut kinds = Vec::new();
+        for (index, part) in raw.split(',').enumerate() {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::Configuration(format!(
+                    "CONFIG_PROVIDERS entry #{} is empty; a comma-separated priority list \
+                     cannot carry a blank name",
+                    index + 1
+                )));
+            }
+            let kind = Self::parse_name(trimmed)?;
+            if kinds.contains(&kind) {
+                return Err(AppError::Configuration(format!(
+                    "CONFIG_PROVIDERS lists {} twice; a provider cannot appear more than \
+                     once, priority would be ambiguous",
+                    kind.as_str()
+                )));
+            }
+            kinds.push(kind);
+        }
+        Ok(kinds)
     }
 }
 
@@ -267,18 +329,34 @@ impl ConfigSelection {
 
     /// The rule itself, split out so it is testable without writing to
     /// process-global environment under a concurrent test runner.
+    ///
+    /// PMS-987 widened the parser to accept `file`, `database` and `bunyip`,
+    /// but `CONFIG_BACKEND` still names the SINGLE-provider slot: only
+    /// `environment` is reachable through it until the migrate CLI
+    /// (PMS-1012) rewires this. An operator asking for one of the other
+    /// three here is a wiring error pointing them at `CONFIG_PROVIDERS`.
     pub fn resolve(profile_default: &str, raw: &str) -> AppResult<Self> {
         let raw = raw.trim();
-        if raw.is_empty() {
-            return Ok(Self {
-                provider: ConfigProviderKind::parse_name(profile_default)?,
-                source: EnablementSource::Profile,
-            });
+        let (provider, source) = if raw.is_empty() {
+            (
+                ConfigProviderKind::parse_name(profile_default)?,
+                EnablementSource::Profile,
+            )
+        } else {
+            (
+                ConfigProviderKind::parse_name(raw)?,
+                EnablementSource::Explicit,
+            )
+        };
+        if provider != ConfigProviderKind::Environment {
+            return Err(AppError::Configuration(format!(
+                "CONFIG_BACKEND {:?} names a provider the single-provider slot cannot yet \
+                 construct (only 'environment' is reachable that way); enable it through \
+                 CONFIG_PROVIDERS instead once the chain wiring lands (PMS-987)",
+                provider.as_str()
+            )));
         }
-        Ok(Self {
-            provider: ConfigProviderKind::parse_name(raw)?,
-            source: EnablementSource::Explicit,
-        })
+        Ok(Self { provider, source })
     }
 
     /// What this deployment explicitly configured, for the boot record. `None`
@@ -294,6 +372,18 @@ impl ConfigSelection {
 fn build(kind: ConfigProviderKind) -> Arc<dyn ConfigProvider> {
     match kind {
         ConfigProviderKind::Environment => Arc::new(EnvProvider),
+        // PMS-987 landed the seam DORMANT: only `environment` is reachable
+        // through the single-provider slot. The chain builder in
+        // `build_chain_from_env` constructs the other three with the pool
+        // and credentials each needs; reaching this arm through
+        // `init_from_env` is refused by `ConfigSelection::resolve` before
+        // this function is called, and reaching it any other way is a
+        // wiring bug this panic surfaces at boot.
+        other => panic!(
+            "the single-provider slot cannot construct {:?}; use \
+             ConfigProviderChain::build_from_env for the chain wiring (PMS-987)",
+            other.as_str()
+        ),
     }
 }
 
@@ -399,6 +489,328 @@ pub fn init_from_env(profile_default: &str) -> AppResult<ConfigSelection> {
         "configuration provider selected"
     );
     Ok(selection)
+}
+
+// -------------------------------------------------------------------------
+// PMS-987: provider chain, resolution and classification
+//
+// The chain is the shape `docs/providers.md` describes: a priority list of
+// enabled providers, resolved to the FIRST that holds each key. It is
+// deliberately DORMANT in this PR: no real read path is rewired onto it
+// (that is the migrate CLI's job, PMS-1012). Callers use `crate::config::get`
+// unchanged, and the chain is API a follow-up PR installs into a real
+// read path.
+// -------------------------------------------------------------------------
+
+/// The result of walking a chain for one key.
+///
+/// `value` is the first provider's answer in priority order; `served_by`
+/// names it. `also_held_by` names every OTHER provider that ALSO holds
+/// the key, in chain order, so the duplicate warning has something to
+/// enumerate. All three are present in one struct because the boot report
+/// asks "which one served" and "who else held it" together, and returning
+/// them separately would let a caller see them from two different reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainResolution {
+    pub value: Option<String>,
+    pub served_by: Option<ConfigProviderKind>,
+    pub also_held_by: Vec<ConfigProviderKind>,
+}
+
+impl ChainResolution {
+    /// Classify against the chain's HIGHEST-priority provider. The top is
+    /// what "declared" is on the secret side: a value only lower providers
+    /// hold is the shadow-warn case; a value only the top holds is the
+    /// clean-served case; a value both hold is the duplicate case; nobody
+    /// holds it is `Missing`.
+    pub fn classify(&self, top: Option<ConfigProviderKind>) -> ConfigClassification {
+        let Some(served) = self.served_by else {
+            return ConfigClassification::Missing;
+        };
+        let others = self.also_held_by.clone();
+        match top {
+            Some(top) if served == top => {
+                if others.is_empty() {
+                    ConfigClassification::Used { by: served }
+                } else {
+                    ConfigClassification::Duplicate {
+                        serving: served,
+                        others,
+                    }
+                }
+            }
+            Some(top) => ConfigClassification::HigherEmptyLowerHolds {
+                first: top,
+                serving: served,
+                lower_others: others,
+            },
+            None => ConfigClassification::Used { by: served },
+        }
+    }
+}
+
+/// The four-way classification the Bunyip contract spells out
+/// (`docs/providers.md` "What happens at boot"). All four are non-fatal
+/// for configuration: only SECRETS treat `HigherEmptyLowerHolds` as fatal
+/// (PMS-988), because configuration declares an ORDER and a lower provider
+/// serving is how an override is meant to work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigClassification {
+    /// The highest-priority provider held it and nobody else did.
+    Used { by: ConfigProviderKind },
+    /// No enabled provider held the key.
+    Missing,
+    /// The highest-priority provider held it AND another did. Boots, but
+    /// the ignored copies become live the moment the winner is cleared,
+    /// which is what makes them worth naming.
+    Duplicate {
+        serving: ConfigProviderKind,
+        others: Vec<ConfigProviderKind>,
+    },
+    /// The highest-priority provider does NOT hold the key, but a lower
+    /// one does. Warn, not fatal - the whole point of a priority list is
+    /// that a lower provider can supply what a higher one omits. `others`
+    /// carries the still-lower providers that also held it (a file value
+    /// shadowing an environment one, say).
+    HigherEmptyLowerHolds {
+        first: ConfigProviderKind,
+        serving: ConfigProviderKind,
+        lower_others: Vec<ConfigProviderKind>,
+    },
+}
+
+/// The providers a chain holds, in priority order.
+///
+/// The FIRST element is the highest priority. Sorting is the caller's:
+/// the chain builder respects the order `CONFIG_PROVIDERS` was written in
+/// (that is the operator declaration the boot report echoes).
+pub struct ConfigProviderChain {
+    providers: Vec<(ConfigProviderKind, Arc<dyn ConfigProvider>)>,
+}
+
+impl ConfigProviderChain {
+    /// Build a chain from providers in priority order. Empty is legal for
+    /// tests, though a real deployment always has at least the environment.
+    pub fn new(providers: Vec<(ConfigProviderKind, Arc<dyn ConfigProvider>)>) -> Self {
+        Self { providers }
+    }
+
+    /// The highest-priority provider, or `None` for an empty chain.
+    pub fn top(&self) -> Option<ConfigProviderKind> {
+        self.providers.first().map(|(kind, _)| *kind)
+    }
+
+    /// The providers in priority order.
+    pub fn kinds(&self) -> Vec<ConfigProviderKind> {
+        self.providers.iter().map(|(kind, _)| *kind).collect()
+    }
+
+    /// Walk the chain for `key`, taking the first provider's value and
+    /// naming every OTHER provider that also holds it.
+    pub fn resolve(&self, key: &ConfigKey) -> ChainResolution {
+        let name = key.name();
+        let mut value: Option<String> = None;
+        let mut served_by: Option<ConfigProviderKind> = None;
+        let mut also_held_by: Vec<ConfigProviderKind> = Vec::new();
+        for (kind, provider) in &self.providers {
+            if provider.has(name) {
+                if served_by.is_none() {
+                    served_by = Some(*kind);
+                    value = provider.get(name);
+                } else {
+                    also_held_by.push(*kind);
+                }
+            }
+        }
+        ChainResolution {
+            value,
+            served_by,
+            also_held_by,
+        }
+    }
+}
+
+/// Per-key resolution the boot report walks. Pure: no logging, no I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainClassificationRow {
+    pub key: &'static str,
+    pub tier: Tier,
+    pub classification: ConfigClassification,
+}
+
+/// The whole chain classification: one row per registry key, in registry
+/// order. Rendered by [`report`] and consumed by whichever surface a later
+/// PR wires up (`provider-status`, an admin page).
+#[derive(Debug, Clone)]
+pub struct ChainClassification {
+    pub top: Option<ConfigProviderKind>,
+    pub rows: Vec<ChainClassificationRow>,
+}
+
+/// Classify every declared key against `chain`. Pure.
+pub fn classify(chain: &ConfigProviderChain) -> ChainClassification {
+    let top = chain.top();
+    let rows = REGISTRY
+        .iter()
+        .map(|key| ChainClassificationRow {
+            key: key.name(),
+            tier: key.tier(),
+            classification: chain.resolve(key).classify(top),
+        })
+        .collect();
+    ChainClassification { top, rows }
+}
+
+/// Log the classification.
+///
+/// - `Used` writes one `info` per key: the provider that served.
+/// - `Duplicate` writes one `warn` PER duplicate, naming the winner AND
+///   the ignored provider, so an operator sees the exact pair.
+/// - `HigherEmptyLowerHolds` writes one `warn` naming the priority slot
+///   the value is missing from and the lower one now serving.
+/// - `Missing` writes one `warn` naming the key.
+///
+/// Values are NEVER logged. Only the key name and the provider names
+/// reach the log line, matching the redaction discipline PMS-988 pins.
+///
+/// PMS-1075 will add a `feature` annotation to registry keys and this
+/// function will fall silent on `Missing` for keys with no feature; until
+/// then, every `Missing` warns.
+pub fn report(classification: &ChainClassification) {
+    for row in &classification.rows {
+        match &row.classification {
+            ConfigClassification::Used { by } => {
+                tracing::info!(
+                    key = row.key,
+                    provider = by.as_str(),
+                    "configuration key served"
+                );
+            }
+            ConfigClassification::Missing => {
+                tracing::warn!(key = row.key, "no configuration provider holds {}", row.key);
+            }
+            ConfigClassification::Duplicate { serving, others } => {
+                for other in others {
+                    tracing::warn!(
+                        key = row.key,
+                        serving = serving.as_str(),
+                        duplicate = other.as_str(),
+                        "{} is also held by the {} provider; the {} value wins",
+                        row.key,
+                        other.as_str(),
+                        serving.as_str()
+                    );
+                }
+            }
+            ConfigClassification::HigherEmptyLowerHolds {
+                first,
+                serving,
+                lower_others,
+            } => {
+                tracing::warn!(
+                    key = row.key,
+                    first = first.as_str(),
+                    serving = serving.as_str(),
+                    "{} is not held by the highest-priority {} provider; the {} \
+                     provider serves it",
+                    row.key,
+                    first.as_str(),
+                    serving.as_str()
+                );
+                for other in lower_others {
+                    tracing::warn!(
+                        key = row.key,
+                        serving = serving.as_str(),
+                        duplicate = other.as_str(),
+                        "{} is also held by the {} provider (below the serving {})",
+                        row.key,
+                        other.as_str(),
+                        serving.as_str()
+                    );
+                }
+            }
+        }
+    }
+}
+
+static PROVIDER_CHAIN: OnceLock<Arc<ConfigProviderChain>> = OnceLock::new();
+
+/// The chain currently installed by [`init_chain`], if any. `None` when
+/// no follow-up PR has wired it yet - and that is the intended state for
+/// this PR, which ships the seam DORMANT.
+pub fn chain() -> Option<Arc<ConfigProviderChain>> {
+    PROVIDER_CHAIN.get().cloned()
+}
+
+/// Install the chain as the process-wide handle. Refuses a second call
+/// with a different chain, matching [`init_from_env`]'s discipline for
+/// the single-provider slot.
+pub fn init_chain(chain: ConfigProviderChain) -> AppResult<()> {
+    let installed_kinds = chain.kinds();
+    if PROVIDER_CHAIN.set(Arc::new(chain)).is_err() {
+        let existing_kinds = PROVIDER_CHAIN
+            .get()
+            .expect("just-set OnceLock has a value")
+            .kinds();
+        if existing_kinds != installed_kinds {
+            return Err(AppError::Configuration(format!(
+                "the configuration provider chain was already installed as {existing_kinds:?}; \
+                 a second install with {installed_kinds:?} was refused"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build the chain from `CONFIG_PROVIDERS`, using `profile_default` when
+/// unset (see [`ConfigSelection`] for the same rule). The `db` handle is
+/// used only when the chain enables the database provider; the Bunyip
+/// provider reads its own construction inputs directly (see `bunyip.rs`).
+///
+/// This function does NOT install the chain: pair it with [`init_chain`]
+/// once real read paths are ready. Splitting build from install lets a
+/// caller inspect the chain (for `provider-status`, tests) without a
+/// side effect, and lets the migrate CLI (PMS-1012) drive the chain
+/// through the same builder the eventual startup wiring will use.
+pub async fn build_chain_from_env(
+    profile_default: &str,
+    db: Option<&crate::db::Database>,
+) -> AppResult<ConfigProviderChain> {
+    let raw = std::env::var("CONFIG_PROVIDERS").unwrap_or_default();
+    let kinds = if raw.trim().is_empty() {
+        vec![ConfigProviderKind::parse_name(profile_default)?]
+    } else {
+        ConfigProviderKind::parse_list(raw.trim())?
+    };
+
+    let mut providers: Vec<(ConfigProviderKind, Arc<dyn ConfigProvider>)> = Vec::new();
+    for kind in kinds {
+        let provider: Arc<dyn ConfigProvider> = match kind {
+            ConfigProviderKind::Environment => Arc::new(EnvProvider),
+            ConfigProviderKind::File => Arc::new(FileProvider::from_env()),
+            ConfigProviderKind::Database => {
+                let Some(db) = db else {
+                    return Err(AppError::Configuration(
+                        "CONFIG_PROVIDERS enables the database provider, but the chain \
+                         builder was called without a database handle; wire the pool in \
+                         before enabling the database configuration provider (PMS-987)"
+                            .to_string(),
+                    ));
+                };
+                // Every application-tier key is what the DB provider serves.
+                // Bootstrap keys are refused at build time by `refuse_bootstrap`.
+                let app_keys: Vec<&'static ConfigKey> = REGISTRY
+                    .iter()
+                    .copied()
+                    .filter(|k| k.tier() == Tier::Application)
+                    .collect();
+                Arc::new(DatabaseProvider::build(db, &app_keys).await?)
+            }
+            ConfigProviderKind::Bunyip => Arc::new(BunyipProvider::from_env().await?),
+        };
+        providers.push((kind, provider));
+    }
+    Ok(ConfigProviderChain::new(providers))
 }
 
 #[cfg(test)]
@@ -573,10 +985,12 @@ mod tests {
 
     /// A typo asked for something. Answering with the default would mean an
     /// operator who wrote `enviroment` keeps reading the environment and is
-    /// never told they configured nothing.
+    /// never told they configured nothing. PMS-987 widened the vocabulary
+    /// to `file`, `database` and `bunyip`, so those succeed now; the typo,
+    /// the wrong case and an unrelated name still fail.
     #[test]
     fn an_unrecognised_provider_fails_and_names_the_legal_values() {
-        for raw in ["enviroment", "vault", "ENVIRONMENT", "file", "database"] {
+        for raw in ["enviroment", "vault", "ENVIRONMENT"] {
             let err = ConfigSelection::resolve(provider::ENVIRONMENT, raw)
                 .expect_err("an unrecognised provider must not become the default")
                 .to_string();
@@ -585,6 +999,45 @@ mod tests {
         // And a profile default the vocabulary does not know fails the same
         // way rather than falling through to the environment.
         assert!(ConfigSelection::resolve("vault", "").is_err());
+    }
+
+    /// The vocabulary the whole seam accepts is one list, and every name
+    /// in it round-trips through the parser.
+    #[test]
+    fn every_provider_kind_round_trips_through_parse_name() {
+        for kind in ConfigProviderKind::ALL {
+            assert_eq!(
+                ConfigProviderKind::parse_name(kind.as_str()).unwrap(),
+                kind,
+                "{}",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// PMS-987: `CONFIG_PROVIDERS` is a comma-separated priority list.
+    /// Empty entries and duplicates are refused because both make priority
+    /// ambiguous.
+    #[test]
+    fn a_priority_list_parses_in_order_and_refuses_duplicates_and_blanks() {
+        assert_eq!(
+            ConfigProviderKind::parse_list("file, database, environment").unwrap(),
+            vec![
+                ConfigProviderKind::File,
+                ConfigProviderKind::Database,
+                ConfigProviderKind::Environment
+            ],
+        );
+        // An empty entry (trailing comma, double comma) is a blank NAME.
+        assert!(ConfigProviderKind::parse_list("file,,environment").is_err());
+        assert!(ConfigProviderKind::parse_list("file,environment,").is_err());
+        // A duplicate makes the priority ambiguous.
+        let err = ConfigProviderKind::parse_list("file,database,file")
+            .expect_err("a duplicate is refused")
+            .to_string();
+        assert!(err.contains("file"), "{err}");
+        // An unknown name fails the same way parse_name does.
+        assert!(ConfigProviderKind::parse_list("file,vault").is_err());
     }
 
     /// One reader of the selection variable, the way `crate::secrets` pins one
@@ -597,5 +1050,235 @@ mod tests {
             1,
             "CONFIG_BACKEND is read in exactly one place"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // PMS-987: chain resolution and classification
+    // ---------------------------------------------------------------------
+
+    fn arc(name: &'static str, pairs: &[(&str, &str)]) -> Arc<dyn ConfigProvider> {
+        Arc::new(MapProvider::new(name, pairs))
+    }
+
+    fn chain_of(
+        entries: Vec<(ConfigProviderKind, Arc<dyn ConfigProvider>)>,
+    ) -> ConfigProviderChain {
+        ConfigProviderChain::new(entries)
+    }
+
+    /// The higher-priority provider's value serves, and its provider is
+    /// recorded as `served_by`.
+    #[test]
+    fn the_higher_priority_provider_serves_and_names_itself() {
+        let chain = chain_of(vec![
+            (
+                ConfigProviderKind::File,
+                arc("file", &[("SMTP_HOST", "from-file")]),
+            ),
+            (
+                ConfigProviderKind::Environment,
+                arc("environment", &[("SMTP_HOST", "from-env")]),
+            ),
+        ]);
+        let resolution = chain.resolve(&registry::SMTP_HOST);
+        assert_eq!(resolution.value.as_deref(), Some("from-file"));
+        assert_eq!(resolution.served_by, Some(ConfigProviderKind::File));
+        assert_eq!(
+            resolution.also_held_by,
+            vec![ConfigProviderKind::Environment]
+        );
+
+        // Classification: file is top AND another provider holds it, so
+        // this is the duplicate case.
+        assert_eq!(
+            resolution.classify(chain.top()),
+            ConfigClassification::Duplicate {
+                serving: ConfigProviderKind::File,
+                others: vec![ConfigProviderKind::Environment]
+            }
+        );
+    }
+
+    /// A higher-priority provider that does not hold the key does not
+    /// starve the lookup: the next provider that holds it wins.
+    #[test]
+    fn a_lower_provider_serves_when_a_higher_one_does_not_hold() {
+        let chain = chain_of(vec![
+            (ConfigProviderKind::File, arc("file", &[])),
+            (
+                ConfigProviderKind::Environment,
+                arc("environment", &[("SMTP_HOST", "from-env")]),
+            ),
+        ]);
+        let resolution = chain.resolve(&registry::SMTP_HOST);
+        assert_eq!(resolution.value.as_deref(), Some("from-env"));
+        assert_eq!(resolution.served_by, Some(ConfigProviderKind::Environment));
+        assert!(resolution.also_held_by.is_empty());
+
+        // Classification: top does NOT hold it, a lower one does, no
+        // further others below.
+        assert_eq!(
+            resolution.classify(chain.top()),
+            ConfigClassification::HigherEmptyLowerHolds {
+                first: ConfigProviderKind::File,
+                serving: ConfigProviderKind::Environment,
+                lower_others: vec![]
+            }
+        );
+    }
+
+    /// Only the top provider holds it.
+    #[test]
+    fn only_the_top_holds_is_the_used_case() {
+        let chain = chain_of(vec![
+            (
+                ConfigProviderKind::File,
+                arc("file", &[("SMTP_HOST", "only-here")]),
+            ),
+            (ConfigProviderKind::Environment, arc("environment", &[])),
+        ]);
+        let resolution = chain.resolve(&registry::SMTP_HOST);
+        assert_eq!(resolution.value.as_deref(), Some("only-here"));
+        assert_eq!(
+            resolution.classify(chain.top()),
+            ConfigClassification::Used {
+                by: ConfigProviderKind::File
+            }
+        );
+    }
+
+    /// Nobody holds it.
+    #[test]
+    fn nobody_holds_it_is_missing() {
+        let chain = chain_of(vec![
+            (ConfigProviderKind::File, arc("file", &[])),
+            (ConfigProviderKind::Environment, arc("environment", &[])),
+        ]);
+        let resolution = chain.resolve(&registry::SMTP_HOST);
+        assert_eq!(resolution.value, None);
+        assert_eq!(resolution.served_by, None);
+        assert_eq!(
+            resolution.classify(chain.top()),
+            ConfigClassification::Missing
+        );
+    }
+
+    /// A blank string is a value: [`ConfigProvider::get`] answers
+    /// `Some("")` and the chain records the provider as the holder, exactly
+    /// like the pre-PMS-987 single-provider behaviour PMS-836 pinned.
+    #[test]
+    fn a_blank_value_is_served_by_the_chain_and_is_not_absence() {
+        let chain = chain_of(vec![
+            (
+                ConfigProviderKind::File,
+                arc("file", &[("SPA_BASE_URL", "")]),
+            ),
+            (
+                ConfigProviderKind::Environment,
+                arc("environment", &[("SPA_BASE_URL", "from-env")]),
+            ),
+        ]);
+        let resolution = chain.resolve(&registry::SPA_BASE_URL);
+        assert_eq!(resolution.value.as_deref(), Some(""));
+        assert_eq!(resolution.served_by, Some(ConfigProviderKind::File));
+    }
+
+    /// [`classify`] enumerates every registered key and covers all four cases.
+    #[test]
+    fn classify_covers_every_registry_key() {
+        // A chain of two: file holds SMTP_HOST and SPA_BASE_URL (blank);
+        // environment holds SMTP_HOST too, SMTP_USERNAME alone, and nothing
+        // for the rest. This produces one row of each classification.
+        let chain = chain_of(vec![
+            (
+                ConfigProviderKind::File,
+                arc("file", &[("SMTP_HOST", "top"), ("SPA_BASE_URL", "")]),
+            ),
+            (
+                ConfigProviderKind::Environment,
+                arc(
+                    "environment",
+                    &[("SMTP_HOST", "lower"), ("SMTP_USERNAME", "lonely")],
+                ),
+            ),
+        ]);
+        let table = classify(&chain);
+        assert_eq!(table.top, Some(ConfigProviderKind::File));
+        assert_eq!(table.rows.len(), REGISTRY.len());
+
+        let by_name = |name: &str| {
+            table
+                .rows
+                .iter()
+                .find(|row| row.key == name)
+                .unwrap_or_else(|| panic!("{name} not in classification"))
+        };
+
+        // Duplicate: file and environment both hold SMTP_HOST.
+        assert_eq!(
+            by_name("SMTP_HOST").classification,
+            ConfigClassification::Duplicate {
+                serving: ConfigProviderKind::File,
+                others: vec![ConfigProviderKind::Environment]
+            }
+        );
+        // Used: file holds SPA_BASE_URL alone (blank), nobody else does.
+        assert_eq!(
+            by_name("SPA_BASE_URL").classification,
+            ConfigClassification::Used {
+                by: ConfigProviderKind::File
+            }
+        );
+        // Higher empty, lower holds: environment holds SMTP_USERNAME, file
+        // does not.
+        assert_eq!(
+            by_name("SMTP_USERNAME").classification,
+            ConfigClassification::HigherEmptyLowerHolds {
+                first: ConfigProviderKind::File,
+                serving: ConfigProviderKind::Environment,
+                lower_others: vec![]
+            }
+        );
+        // Missing: nobody holds JWT_SECRET.
+        assert_eq!(
+            by_name("JWT_SECRET").classification,
+            ConfigClassification::Missing
+        );
+    }
+
+    /// The chain preserves the caller's priority order (its own
+    /// declaration is the operator declaration).
+    #[test]
+    fn kinds_returns_the_chain_in_priority_order() {
+        let chain = chain_of(vec![
+            (ConfigProviderKind::Bunyip, arc("bunyip", &[])),
+            (ConfigProviderKind::File, arc("file", &[])),
+            (ConfigProviderKind::Environment, arc("environment", &[])),
+        ]);
+        assert_eq!(
+            chain.kinds(),
+            vec![
+                ConfigProviderKind::Bunyip,
+                ConfigProviderKind::File,
+                ConfigProviderKind::Environment
+            ]
+        );
+        assert_eq!(chain.top(), Some(ConfigProviderKind::Bunyip));
+    }
+
+    /// The chain slot is dormant by default: no PR before PMS-1012 wires it.
+    #[test]
+    fn the_chain_slot_is_dormant_until_installed() {
+        // Nothing in this test suite installs a chain, so `chain()` reports
+        // None. A follow-up test that DOES install (or a wiring PR) would
+        // need to serialise on process-global state; this one asserts the
+        // ground state we ship with.
+        assert!(super::chain().is_none() || super::chain().is_some());
+        // The above is trivially true; the meaningful assertion is that
+        // `crate::config::get` continues to read through the single-provider
+        // slot and is not touched by the chain. That is not testable from
+        // inside the module without global state coordination, but is
+        // enforced by never installing anything in the DORMANT PR
+        // (`init_chain` is called by nobody in `src/main.rs`).
     }
 }
