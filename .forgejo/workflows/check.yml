@@ -87,6 +87,19 @@ jobs:
         run: |
           nu scripts/check-migration-immutability.nu
 
+      - name: Guarded content migrations
+        # PMS-1117: a migration after prefix 206 that guards an UPDATE's WHERE
+        # clause on a content-column literal (e.g. notification_templates
+        # .subject) must also assert its GET DIAGNOSTICS row count via
+        # mokosh_assert_content_rows_matched (migration 205), so a prior
+        # migration having already rewritten that text fails the migration
+        # instead of silently matching zero rows and no-opping. This hit the
+        # same two rows twice (migrations 139, 152) and neither was caught by
+        # review, CI, or deploy.
+        shell: nu {0}
+        run: |
+          nu scripts/check-guarded-content-migrations.nu
+
       - name: No duplicate mail copy
         # PMS-700: transactional email bodies live in notification_templates
         # and are rendered by the dispatcher. A second hard-coded copy in
