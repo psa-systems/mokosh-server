@@ -84,7 +84,7 @@ endpoint, extend one of these files.
 | GET  /contracts/{id} | `get_contract` | SCOPED (`ContactContractResponse`, PMS-1061) |
 | GET  /invoices | `list_invoices` | SCOPED |
 | GET  /invoices/{id} | `get_invoice` | SCOPED |
-| GET  /invoices/{id}/pdf | `get_invoice_pdf` | SCOPED (501 body, gates first) |
+| GET  /invoices/{id}/pdf | `get_invoice_pdf` | SCOPED (cap gate first, then Company-scope 404 on a foreign invoice, then serves the document: PMS-959 stored bytes, else a live render) |
 | GET  /invoices/{id}/payments | `list_invoice_payments` | SCOPED (`invoice_ledger`: `company_id = session.company_id` folded into the invoice lookup, foreign id is the unknown-id 404; customer-safe subset; PMS-1088) |
 | GET  /kb/categories | `list_categories` | SCOPED (`visibility <> 'internal'`; staff keep the module gate, PMS-1082) |
 | GET  /kb/articles | `list_articles` | SCOPED (`list_articles_for_contact`: published AND public or `client_specific` naming `session.company_id`; caller's `status`/`visibility` ignored; rows are `ContactKbArticleResponse`, PMS-1082) |
