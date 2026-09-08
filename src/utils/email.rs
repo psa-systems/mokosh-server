@@ -693,6 +693,13 @@ impl MailerConfig {
     /// PMS-982: the six `SMTP_*` values come from the configuration provider.
     /// Every emptiness and default rule below is unchanged; only where the
     /// string comes from moved.
+    ///
+    /// PMS-988 (deferred wiring): `SMTP_PASSWORD` will move onto the
+    /// application-tier secret provider (`crate::app_secrets`) when that
+    /// seam's migrate CLI lands (PMS-1012) and there is an operator runbook
+    /// to walk. Until then the read stays on the configuration provider so
+    /// a deployment whose `SMTP_PASSWORD` is a plain compose variable
+    /// upgrades without a fatal boot.
     pub fn from_env() -> AppResult<Self> {
         let host = config::get(&keys::SMTP_HOST).filter(|s| !s.is_empty());
         let port = config::get(&keys::SMTP_PORT)
