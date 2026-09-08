@@ -2207,7 +2207,20 @@ impl TenantService {
                                  -- a KB comment queues for the person named.
                                  -- Seeded for the default tenant by migration
                                  -- 202, which also backfills older tenants.
-                                 'kb.comment.mention')
+                                 'kb.comment.mention',
+                                 -- PMS-1140: the portal-side halves of the two
+                                 -- mails that used to serve two audiences from
+                                 -- one template. `auth.portal_password_reset`
+                                 -- is what a customer resetting their portal
+                                 -- password receives, and
+                                 -- `auth.portal_welcome` is what this service
+                                 -- sends the MSP admin it provisions just
+                                 -- below. Seeded for the default tenant by
+                                 -- migration 206, which also backfills older
+                                 -- tenants; copied here so a tenant created
+                                 -- from now on can send either at all.
+                                 'auth.portal_password_reset',
+                                 'auth.portal_welcome')
             "#,
         )
         .bind(new_tenant_id)
@@ -2251,7 +2264,14 @@ impl TenantService {
                                    'auth.login_link',
                                    -- PMS-1129: pair the kb.comment.mention template
                                    -- above with its rule.
-                                   'kb.comment.mention')
+                                   'kb.comment.mention',
+                                   -- PMS-1140: pair both portal templates above
+                                   -- with their rules. A template with no rule
+                                   -- is a message that is never sent, and one
+                                   -- of these two is how the tenant this call
+                                   -- is provisioning reaches its own admin.
+                                   'auth.portal_password_reset',
+                                   'auth.portal_welcome')
             "#,
         )
         .bind(new_tenant_id)
