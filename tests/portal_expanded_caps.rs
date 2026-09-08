@@ -3,7 +3,7 @@
 //!
 //!   - `tickets:reopen`         POST /api/v1/tickets/{id}/reopen
 //!   - `tickets:attach_file`    POST /api/v1/tickets/{id}/attachments
-//!   - `invoices:download_pdf`  GET  /api/v1/invoices/{id}/pdf (501 stub)
+//!   - `invoices:download_pdf`  GET  /api/v1/invoices/{id}/pdf
 //!   - `assets:report_issue`    POST /api/v1/assets/{id}/report-issue
 //!   - `quotes:download_pdf`    GET  /api/v1/quotes/{id}/pdf (501 stub)
 //!
@@ -252,6 +252,31 @@ async fn seed_asset_on_company(
     .await
     .expect("seed asset");
     id
+}
+
+/// Assert a response is the served PDF document, not merely a status a
+/// gateless handler could also produce (PMS-1033). Content type and the
+/// `%PDF-` magic together are what make the served rows below a real
+/// negative control for the capability gate.
+async fn assert_pdf_body(resp: reqwest::Response, context: &str) {
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = resp.bytes().await.expect("read pdf body");
+    assert_eq!(status, StatusCode::OK, "{context}: must serve the document");
+    assert!(
+        content_type.starts_with("application/pdf"),
+        "{context}: content-type was {content_type}"
+    );
+    assert!(
+        body.starts_with(b"%PDF-"),
+        "{context}: body is not a PDF ({} bytes)",
+        body.len()
+    );
 }
 
 async fn seed_invoice_on_company(pool: &PgPool, tenant_id: Uuid, company_id: Uuid) -> Uuid {
@@ -619,11 +644,15 @@ async fn staff_bypasses_attach_file_cap_200(pool: PgPool) {
 }
 
 // ============================================================================
-// invoices:download_pdf (501 stub - cap gate is what matters)
+// invoices:download_pdf (a served document since PMS-876 / PMS-959)
 // ============================================================================
 
+/// PMS-1033: the route was a 501 stub when PMS-936 wrote this row and
+/// serves a real document now, so the assertion moved to the document
+/// itself. A gate this test exists to pin cannot be proved by a status a
+/// gateless handler would also produce.
 #[sqlx::test]
-async fn contact_with_invoices_download_pdf_reaches_stub_501(pool: PgPool) {
+async fn contact_with_invoices_download_pdf_is_served(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
         seed_contact_with_roles(&app, &pool, "inv-pdf-ok", &["Billing Contact"]).await;
@@ -636,21 +665,25 @@ async fn contact_with_invoices_download_pdf_reaches_stub_501(pool: PgPool) {
         .send()
         .await
         .expect("pdf");
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_IMPLEMENTED,
-        "PMS-936: contact with invoices:download_pdf clears the gate and hits the 501 stub"
-    );
+    assert_pdf_body(
+        resp,
+        "PMS-936: contact with invoices:download_pdf clears the gate",
+    )
+    .await;
 }
 
+/// PMS-1033: the invoice is seeded on the contact's OWN Company, so the
+/// capability is the only thing between this caller and the document. It
+/// used to sit on a foreign one, which meant a handler that had lost its
+/// gate still answered the 404 the Company scope gives - the row passed
+/// without the gate it was written to pin.
 #[sqlx::test]
 async fn contact_without_invoices_download_pdf_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Support Contact has no invoices:* caps.
-    let (_own_company, _c, _e, token) =
+    let (own_company, _c, _e, token) =
         seed_contact_with_roles(&app, &pool, "inv-pdf-nocap", &["Support Contact"]).await;
-    let plain_co = seed_plain_company(&pool, common::DEFAULT_TENANT_ID, "inv-pdf-nocap-co").await;
-    let invoice_id = seed_invoice_on_company(&pool, common::DEFAULT_TENANT_ID, plain_co).await;
+    let invoice_id = seed_invoice_on_company(&pool, common::DEFAULT_TENANT_ID, own_company).await;
 
     let resp = app
         .client
@@ -690,7 +723,7 @@ async fn contact_with_invoices_download_pdf_foreign_company_404(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn staff_bypasses_invoices_download_pdf_cap_501(pool: PgPool) {
+async fn staff_bypasses_invoices_download_pdf_cap(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let staff_token = common::login(&app, &admin_email, &admin_password).await;
@@ -704,11 +737,11 @@ async fn staff_bypasses_invoices_download_pdf_cap_501(pool: PgPool) {
         .send()
         .await
         .expect("pdf");
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_IMPLEMENTED,
-        "PMS-936: staff caller clears the RequireBilling+RequireFinance gate and hits the 501 stub"
-    );
+    assert_pdf_body(
+        resp,
+        "PMS-936: staff caller clears the RequireBilling+RequireFinance gate",
+    )
+    .await;
 }
 
 // ============================================================================
