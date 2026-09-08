@@ -778,10 +778,15 @@ impl ContactAuthService {
                 "display_name": contact_first_name.unwrap_or_default(),
                 "reset_link": reset_link,
             });
+            // PMS-1140: the portal-side event, not the staff one. The
+            // recipient here is a `contacts` row, the MSP's customer, and
+            // `auth.password_reset` names the product (migration 116) because
+            // it now serves staff only. Migration 206 seeded and backfilled
+            // this event's template for every tenant.
             let _ = notify
                 .dispatch(
                     TenantId::from_trusted(tenant_id),
-                    "auth.password_reset",
+                    "auth.portal_password_reset",
                     &context,
                 )
                 .await;
