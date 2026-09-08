@@ -36,7 +36,7 @@ There is no second deployment-shape variable.
 | configuration | `environment` | `environment` |
 | secrets | `database` | `database` |
 | authentication | `local` | `bunyip`, then `local` |
-| email | `log` | `log` |
+| email | `log` | `smtp` |
 | storage | `local` | `local` |
 
 Nothing in the `self-hosted` column reaches outside the deployment, which is
@@ -45,18 +45,23 @@ object store" means concretely;
 `the_self_hosted_defaults_need_no_external_service` enforces it against
 `EXTERNAL_SERVICE_PROVIDERS`.
 
-Authentication is the one row that differs, and it is the row the mode exists
-for: bunyip first, with the legacy local path still enabled behind it until
-PMS-981 deprecates it, which is what a `saas` instance does today. The other
-four rows match `self-hosted` deliberately. The `saas` profile has to reproduce
-CURRENT deployed behaviour, and current deployed behaviour for secrets,
-storage, email and configuration is whatever that deployment's own environment
-sets. Writing `infisical` or `s3` into the table would be a guess about an
-environment that is not in this repository, and not a merely inaccurate one: a
-deployment that sets neither would change backend on the next restart, and
-`InfisicalSecretProvider::from_env` refuses to build without its own variables, so
-the guess would present as a deployment that no longer boots. Moving those rows
-needs the deployed values read first, which is PMS-1018.
+Two rows differ from `self-hosted`, and both reflect what the deployed SaaS
+instance actually runs today: authentication mounts bunyip alongside the legacy
+local path (`create_api_router` already does this when the mode is `saas`,
+until PMS-981 deprecates local), and email uses `smtp` because the deployment
+sets `SMTP_HOST` explicitly (nc-01: `mail.psa.systems`), so
+`MailerConfig::from_env` selects `SmtpMailer` on every real boot. PMS-1018 is
+the change that read the deployment's configuration and moved the email row
+onto the confirmed value.
+
+Secrets, storage and configuration still match `self-hosted` because the SaaS
+deployment sets none of `SECRET_BACKEND`, `STORAGE_BACKEND` and no
+configuration provider selection, so all three resolve to the code default
+today. Writing `infisical` or `s3` here without the deployment naming them
+explicitly would boot-fail a deployment that sets neither, because
+`InfisicalSecretProvider::from_env` (and `S3Provider`) refuse to build without
+their variables. Moving those rows needs the deployment to set the variable
+first.
 
 **The profile supplies defaults and locks nothing.** Explicit configuration
 wins for its own kind - `CONFIG_BACKEND`, `SECRET_BACKEND`, `STORAGE_BACKEND`,
