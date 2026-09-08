@@ -1,4 +1,5 @@
 //! Knowledge base module: categories, articles, versions, portal visibility.
+pub mod anchor;
 pub mod attachment_move;
 pub mod attachments;
 

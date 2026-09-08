@@ -265,7 +265,9 @@ pub struct CreateKbCommentRequest {
     pub body: String,
     /// The root this answers. A reply answers a root and never a reply.
     pub parent_id: Option<Uuid>,
-    /// PMS-1130: a root's anchor into the text. A reply carries none.
+    /// PMS-1130: a root's anchor into the text, a W3C `TextQuoteSelector`
+    /// whose shape `knowledge_base::anchor::validate` checks and whose
+    /// meaning the server never reads. A reply carries none.
     pub anchor: Option<serde_json::Value>,
 }
 
