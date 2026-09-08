@@ -99,6 +99,19 @@ pub fn validate_setting_value(
             Value::Bool(_) => Ok(()),
             _ => Err(bad("value", "expected a boolean")),
         },
+        // PMS-974: who may edit a ticket note, on top of the row-state rules
+        // `TicketService::note_edit_block` applies regardless. Tenant-level,
+        // because the tenant IS the MSP: the "organization default with an MSP
+        // override" the ticket asked for collapses to one tier here. Unset is
+        // `author_or_admin`, the PMS-931 behaviour, so nothing moves for a
+        // tenant that configured nothing.
+        ("tickets", "note_editing") => match value.as_str() {
+            Some(s) if crate::modules::tickets::NoteEditPolicy::parse(s).is_some() => Ok(()),
+            _ => Err(bad(
+                "value",
+                "expected one of \"off\", \"author_or_admin\", \"author_or_manager\"",
+            )),
+        },
         ("notifications", "default_locale") => match value.as_str() {
             Some(s) if !s.is_empty() && s.len() <= 10 => Ok(()),
             _ => Err(bad("value", "expected a non-empty locale string (max 10)")),
@@ -266,5 +279,23 @@ mod tests {
     fn an_unknown_key_outside_branding_is_still_accepted_with_a_warning() {
         assert!(validate_setting_value("experiments", "new_knob", &json!(1)).is_ok());
         assert!(validate_setting_value("branding", "new_knob", &json!(1)).is_err());
+    }
+
+    /// PMS-974: the policy is a closed set. A value outside it would be read
+    /// as the default silently, so it is refused at the write instead.
+    #[test]
+    fn the_note_editing_policy_is_one_of_three_names() {
+        for legal in ["off", "author_or_admin", "author_or_manager"] {
+            assert!(
+                validate_setting_value("tickets", "note_editing", &json!(legal)).is_ok(),
+                "{legal} is a policy"
+            );
+        }
+        for illegal in [json!("anyone"), json!(true), json!(""), json!(null)] {
+            assert!(
+                validate_setting_value("tickets", "note_editing", &illegal).is_err(),
+                "{illegal} is not"
+            );
+        }
     }
 }
