@@ -2,7 +2,7 @@
 //!
 //! Verifies the dispatcher enriches every render context with the
 //! tenant's identity (`msp_name`, `msp_logo_url`, `msp_primary_color`,
-//! `msp_support_email`) and that the migration-006-updated default
+//! `msp_support_email`) and that the branded default
 //! `auth.password_reset` template uses those placeholders so a
 //! password-reset email arrives with the MSP's brand on the subject,
 //! logo in the header, and support email in the footer.
@@ -61,21 +61,25 @@ async fn dispatch_injects_tenant_branding_into_render_context(pool: PgPool) {
         .await
         .expect("default password-reset template exists");
 
-    // Sanity check: the migration 110 UPDATE landed.
+    // Sanity check: the branding UPDATE landed. The branding migration is
+    // 139, not the 110 these messages used to name (110 is the contacts
+    // company_id FK and has nothing to do with notifications). PMS-1124:
+    // 139 guarded on the migration 021 subject that 116 had already
+    // rewritten, so it matched zero rows until 203 re-applied it.
     assert!(
         subject.as_deref().unwrap_or("").contains("{{msp_name}}"),
-        "migration 110 did not rewrite the subject: {subject:?}"
+        "migration 139/203 did not rewrite the subject: {subject:?}"
     );
     assert!(
         body_text.contains("{{msp_name}}"),
-        "migration 110 did not rewrite the plain-text body: {body_text}"
+        "migration 139/203 did not rewrite the plain-text body: {body_text}"
     );
     assert!(
         body_html
             .as_deref()
             .unwrap_or("")
             .contains("{{msp_primary_color}}"),
-        "migration 110 did not rewrite the html body: {body_html:?}"
+        "migration 139/203 did not rewrite the html body: {body_html:?}"
     );
 
     let new_tpl = Uuid::new_v4();
@@ -360,4 +364,42 @@ async fn caller_context_overrides_branding_defaults(pool: PgPool) {
     .expect("read row");
 
     assert_eq!(body, "body: Explicit override wins", "unexpected: {body}");
+}
+
+/// PMS-1124: the welcome mail is the other half of what migration 139 was
+/// written to brand, and it failed the same way for the same reason. It had
+/// no test, so only the password-reset half was ever caught. Migration 152
+/// then guarded on 139's output, so the client-portal paragraph it adds never
+/// landed either; the fix restores 152's copy, not 139's, because 152 will
+/// never run again.
+#[sqlx::test]
+async fn the_default_welcome_template_is_branded(pool: PgPool) {
+    let (subject, body_text, body_html): (Option<String>, String, Option<String>) = sqlx::query_as(
+        r#"SELECT subject, body_text, body_html
+               FROM notification_templates
+               WHERE tenant_id = '00000000-0000-0000-0000-000000000001'
+                 AND event_type = 'auth.welcome'
+                 AND channel_type = 'email'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("default welcome template exists");
+
+    assert!(
+        subject.as_deref().unwrap_or("").contains("{{msp_name}}"),
+        "the welcome subject must name the MSP: {subject:?}"
+    );
+    assert!(
+        body_text.contains("{{msp_support_email}}"),
+        "the welcome text body must carry the MSP footer: {body_text}"
+    );
+    let html = body_html.as_deref().unwrap_or("");
+    assert!(
+        html.contains("{{msp_primary_color}}") && html.contains("{{msp_logo_url}}"),
+        "the welcome html body must carry the branded header: {html}"
+    );
+    assert!(
+        body_text.contains("{{client_portal_url}}"),
+        "migration 152's client-portal paragraph must survive the rebrand: {body_text}"
+    );
 }
