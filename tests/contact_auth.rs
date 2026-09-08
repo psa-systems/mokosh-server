@@ -504,8 +504,16 @@ async fn contact_login_with_no_credential_returns_401(pool: PgPool) {
 /// before it reaches the hash-compare, so the "empty submitted password"
 /// branch cannot slip through even if a future service-layer refactor
 /// weakens the NULL-hash guard.
+///
+/// PMS-1033: the status is 422, not the 400 this case pinned when it was
+/// written. `AppError::Validation` maps to 422 crate-wide
+/// (`src/utils/error.rs`), which is what every other validator case in the
+/// suite reads back, so the test was the stale side and no handler moved.
+/// Axum's own deserialize rejection is also 422, so the status alone would
+/// no longer prove the validator ran: the envelope's `VALIDATION_ERROR`
+/// code and the `password` field entry are what distinguish the two.
 #[sqlx::test]
-async fn contact_login_with_empty_password_returns_400(pool: PgPool) {
+async fn contact_login_with_empty_password_returns_422(pool: PgPool) {
     let (_contact_id, slug, _token) = seed_portal_contact(&pool, "empty-pw@mcl.example").await;
     let app = common::boot(pool.clone()).await;
 
@@ -522,8 +530,22 @@ async fn contact_login_with_empty_password_returns_400(pool: PgPool) {
         .expect("empty-password login");
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::BAD_REQUEST,
-        "PMS-917: DTO validator must refuse an empty password with 400"
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "PMS-917: DTO validator must refuse an empty password with 422"
+    );
+    let body: serde_json::Value = resp.json().await.expect("validation body is JSON");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("VALIDATION_ERROR"),
+        "the refusal must be the DTO validator, not axum's deserialize rejection"
+    );
+    assert!(
+        body["error"]["errors"]
+            .as_array()
+            .is_some_and(|errors| errors
+                .iter()
+                .any(|e| e["field"].as_str() == Some("password"))),
+        "the field-level errors must name `password`: {body}"
     );
 }
 
