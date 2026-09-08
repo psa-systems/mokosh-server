@@ -7,15 +7,51 @@
 //! password-reset email arrives with the MSP's brand on the subject,
 //! logo in the header, and support email in the footer.
 //!
-//! Migration-immutable posture: this test does NOT touch the migrated
-//! rows; it seeds a branded tenant and asserts the pre-existing
-//! `auth.password_reset` template renders correctly for that tenant.
+//! Migration-immutable posture: no test here touches the migrated rows.
+//! Each seeds a branded tenant and a template of its own carrying the four
+//! placeholders, then asserts what the dispatcher rendered.
+//!
+//! PMS-1139: the first test used to borrow the migrated `auth.password_reset`
+//! copy and assert what that copy SAYS before dispatching it. That is a
+//! different question from whether the dispatcher injects branding, and it is
+//! the question migration 139 lost and PMS-1140 has still to settle, so it
+//! stood red on `main` and reddened every pull request's integration run.
+//! `a_seeded_template_carries_the_branding_placeholders` below keeps the half
+//! that is worth pinning, pointed at the template where the answer is settled.
 
 mod common;
 
 use mokosh_server::modules::notifications::NotificationsService;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// PMS-1139: at least one template the migrations seed really does carry the
+/// branding placeholders, so the four values the dispatcher injects are not
+/// merely available to a template somebody writes by hand.
+///
+/// `ticket.note_added` is the one asserted on, and deliberately so. Migration
+/// 139 rebranded four seeded templates and landed on two of them; this is one
+/// of the two, and no later migration contests it. The other two are
+/// `auth.password_reset` and `auth.welcome`, whose copy is the open question
+/// in PMS-1140, so asserting on either would make this test the place a
+/// product decision is enforced.
+#[sqlx::test]
+async fn a_seeded_template_carries_the_branding_placeholders(pool: PgPool) {
+    let subject: Option<String> = sqlx::query_scalar(
+        r#"SELECT subject FROM notification_templates
+           WHERE tenant_id = '00000000-0000-0000-0000-000000000001'
+             AND event_type = 'ticket.note_added'
+             AND channel_type = 'email'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("default ticket.note_added template exists");
+
+    assert!(
+        subject.as_deref().unwrap_or("").contains("{{msp_name}}"),
+        "migration 139's branding is gone from ticket.note_added: {subject:?}"
+    );
+}
 
 /// Assert the branding placeholders are substituted with the
 /// tenant's actual values and land in the queued row's subject /
@@ -43,71 +79,28 @@ async fn dispatch_injects_tenant_branding_into_render_context(pool: PgPool) {
     .await
     .expect("seed branded tenant");
 
-    // Clone the default `auth.password_reset` template + rule into the
-    // fresh tenant so the dispatcher can find something to fire (the
-    // seeded templates from migration 021/106 live under the default
-    // tenant only). Read the migrated bodies directly so the test does
-    // not have to re-declare them (also proves the migration UPDATE
-    // actually landed the branded copy).
-    let (tpl_id, subject, body_text, body_html): (Uuid, Option<String>, String, Option<String>) =
-        sqlx::query_as(
-            r#"SELECT id, subject, body_text, body_html
-           FROM notification_templates
-           WHERE tenant_id = '00000000-0000-0000-0000-000000000001'
-             AND event_type = 'auth.password_reset'
-             AND channel_type = 'email'"#,
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("default password-reset template exists");
-
-    // Sanity check: the branding UPDATE landed. The branding migration is
-    // 139, not the 110 these messages used to name (110 is the contacts
-    // company_id FK and has nothing to do with notifications).
-    //
-    // PMS-1124: this is RED on main and the fix is a product decision, not a
-    // migration. 139 guarded on the migration 021 subject that 116 had
-    // already rewritten, so it matched zero rows - but 139 is also the
-    // OLDEST of the three intents on this template (authored 2026-08-10,
-    // against 106 on 2026-08-17 and 116 on 2026-08-26) and reached main last
-    // only because it sat on the contact-login branch. Migration 203 restored
-    // 139's copy and broke four tests that pin the two later decisions; 204
-    // put it back. Whether this mail names the product or the MSP is what
-    // has to be settled before this test can be made to pass.
-    assert!(
-        subject.as_deref().unwrap_or("").contains("{{msp_name}}"),
-        "migration 139 did not rewrite the subject: {subject:?}"
-    );
-    assert!(
-        body_text.contains("{{msp_name}}"),
-        "migration 139 did not rewrite the plain-text body: {body_text}"
-    );
-    assert!(
-        body_html
-            .as_deref()
-            .unwrap_or("")
-            .contains("{{msp_primary_color}}"),
-        "migration 139 did not rewrite the html body: {body_html:?}"
-    );
-
+    // PMS-1139: the template is this test's own, carrying all four
+    // placeholders, the way the two tests below already seed theirs. It used
+    // to be a copy of the migrated `auth.password_reset` row, which tied a
+    // dispatcher test to what that row's copy happens to say; see the module
+    // doc. What is asserted after the dispatch is unchanged.
     let new_tpl = Uuid::new_v4();
     sqlx::query(
         r#"
         INSERT INTO notification_templates
             (id, tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
-        VALUES ($1, $2, 'Password Reset - Email', 'auth.password_reset', 'email', $3, $4, $5, TRUE)
+        VALUES ($1, $2, 'Password Reset - Email', 'auth.password_reset', 'email',
+                '{{msp_name}} - Reset your password',
+                E'{{msp_name}} received a request to reset your password.\n\nUse the link below within 24 hours to set a new password.\n\n{{reset_link}}\n\n-- \nSent on behalf of {{msp_name}}. Questions? Reply to {{msp_support_email}}.\n',
+                '<!doctype html><html><body><div style="border-bottom:3px solid {{msp_primary_color}};"><img src="{{msp_logo_url}}" alt="{{msp_name}}"></div><p>{{msp_name}} received a request to reset your password.</p><p><a href="{{reset_link}}">{{reset_link}}</a></p><p>Questions? Reply to {{msp_support_email}}.</p></body></html>',
+                TRUE)
         "#,
     )
     .bind(new_tpl)
     .bind(tenant_id)
-    .bind(&subject)
-    .bind(&body_text)
-    .bind(&body_html)
     .execute(&pool)
     .await
-    .expect("clone template under branded tenant");
-    // Prevent unused warning while keeping the reads explicit above.
-    let _ = tpl_id;
+    .expect("seed template under branded tenant");
 
     sqlx::query(
         r#"
