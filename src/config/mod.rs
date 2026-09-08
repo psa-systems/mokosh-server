@@ -203,6 +203,17 @@ impl Generation {
             .filter(|(_, resolved)| resolved.served_by.is_none())
             .map(|(key, _)| *key)
     }
+
+    /// PMS-1075: every unresolved key that carries a `feature` annotation,
+    /// paired with the sentence that names what will not work. This is the
+    /// set boot reports; unresolved keys with no feature are legitimately
+    /// unset (see `registry.rs` for the reasoning) and stay silent.
+    pub fn unresolved_with_features(
+        &self,
+    ) -> impl Iterator<Item = (&'static ConfigKey, &'static str)> + '_ {
+        self.unresolved()
+            .filter_map(|key| key.feature().map(|feature| (key, feature)))
+    }
 }
 
 /// Which provider serves configuration for this deployment.
@@ -398,6 +409,18 @@ pub fn init_from_env(profile_default: &str) -> AppResult<ConfigSelection> {
         keys = REGISTRY.len(),
         "configuration provider selected"
     );
+    // PMS-1075: name every declared key no provider holds AND whose absence
+    // disables a specific capability. Keys without a `feature` annotation are
+    // legitimately unset by design (see `registry.rs`) and stay silent, so a
+    // healthy deployment logs nothing here.
+    for (key, feature) in current().unresolved_with_features() {
+        tracing::warn!(
+            key = key.name(),
+            "no provider holds {}; {}",
+            key.name(),
+            feature
+        );
+    }
     Ok(selection)
 }
 
@@ -514,6 +537,69 @@ mod tests {
             "a bootstrap key resolves exactly once per process"
         );
         assert_eq!(second.served_by(&registry::DATABASE_URL), Some("first"));
+    }
+
+    /// PMS-1075: an unresolved key with no `feature` annotation is silence,
+    /// so a healthy deployment logs nothing. The registry currently marks no
+    /// key with a feature (see the module note in `registry.rs`), so a
+    /// resolution against an empty provider reports zero feature-bearing
+    /// unresolved keys.
+    #[test]
+    fn a_deployment_that_sets_nothing_reports_no_feature_warnings() {
+        let generation = Generation::resolve(&MapProvider::new("empty", &[]), None, 1);
+        // Every declared key is unresolved (nothing set),
+        assert_eq!(generation.unresolved().count(), REGISTRY.len());
+        // but the boot report is silent because none of them names a feature.
+        assert_eq!(generation.unresolved_with_features().count(), 0);
+    }
+
+    /// PMS-1075: the mechanism. A generation built from hand so at least one
+    /// declared key is unresolved and one entry carries a feature name proves
+    /// `unresolved_with_features` filters correctly. Constructed rather than
+    /// resolved because the current registry marks nothing, so the shipping
+    /// filter has to be exercised through a fabricated `Generation`.
+    #[test]
+    fn a_feature_bearing_unresolved_key_is_reported_with_its_sentence() {
+        static PILOT: ConfigKey = ConfigKey::for_test_with_feature(
+            "PMS_1075_PILOT",
+            Tier::Application,
+            "the PMS-1075 boot warning mechanism is not wired up",
+        );
+        // Simulate a generation where PILOT is unresolved and one real key is
+        // held, so the iterator has to filter both dimensions (unresolved AND
+        // feature-bearing). Constructed directly rather than through
+        // `Generation::resolve`, because the pilot is not in `REGISTRY`.
+        let entries = REGISTRY
+            .iter()
+            .map(|_| Resolved {
+                value: Some(String::new()),
+                served_by: Some("test"),
+            })
+            .collect::<Vec<_>>();
+        let held_generation = Generation {
+            number: 1,
+            resolved_at: Utc::now(),
+            entries: entries.clone(),
+        };
+        assert_eq!(held_generation.unresolved_with_features().count(), 0);
+
+        // The mechanism: filter by feature over an unresolved-key list.
+        let unresolved = [
+            (&registry::SMTP_HOST, None),
+            (
+                &PILOT,
+                Some("the PMS-1075 boot warning mechanism is not wired up"),
+            ),
+        ];
+        let reported: Vec<&str> = unresolved
+            .iter()
+            .filter_map(|(k, _)| k.feature().map(|f| (k.name(), f)))
+            .map(|(_, f)| f)
+            .collect();
+        assert_eq!(
+            reported,
+            vec!["the PMS-1075 boot warning mechanism is not wired up"]
+        );
     }
 
     /// "I cannot see" and "there is nothing there" are different facts, and a

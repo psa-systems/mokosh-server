@@ -18,6 +18,28 @@
 //! points and the providers of record, each listed in
 //! [`crate::config::guard::ENTRY_POINTS`] with the reason it may go around the
 //! seam.
+//!
+//! # Feature annotation (PMS-1075)
+//!
+//! A key may carry an optional `feature = "..."` line beside its tier. When it
+//! does, boot warns if no provider held the key, naming the feature that will
+//! not work. When it does not, an unresolved key is legitimately unset and boot
+//! stays silent about it.
+//!
+//! The reason the default is `None`: warning on every unresolved key would
+//! warn on every boot of a correctly configured deployment. Most of the
+//! declared keys are legitimately unset - `SMTP_USERNAME`,
+//! `ABUSE_CONTACT_EMAIL`, `IP2LOCATION_DB_PATH`, `OUTBOUND_PRIVATE_ALLOWLIST`,
+//! the six branding caps - and a warning that fires on a healthy deployment
+//! is one operators learn to skip, which makes the real one invisible, the
+//! failure mode PMS-1009 exists to remove. So a key carries a `feature` only
+//! when its absence disables a specific capability that no boot check already
+//! fatal-fails on, and the current registry marks none: `ENCRYPTION_KEY` and
+//! `JWT_SECRET` already boot-fail through `resolve_secret`, `SMTP_HOST` unset
+//! selects `LogMailer` on purpose, `LOGIN_APPROVAL_ENABLED` unset is off by
+//! design (PMS-658), and every other candidate carries a documented default
+//! an operator selects on purpose. Keys are annotated here as features
+//! surface where absence is silent-and-wrong.
 
 use std::fmt;
 
@@ -51,7 +73,8 @@ impl fmt::Display for Tier {
     }
 }
 
-/// One declared key: the name a provider is asked for, and its tier.
+/// One declared key: the name a provider is asked for, its tier, and the
+/// feature its absence disables (when any).
 ///
 /// Constructed only by the [`declare_keys`] macro below, so a key and its
 /// registry entry come from one declaration and cannot drift apart.
@@ -59,6 +82,11 @@ impl fmt::Display for Tier {
 pub struct ConfigKey {
     name: &'static str,
     tier: Tier,
+    /// PMS-1075: the sentence naming what stops working when no provider
+    /// holds this key. `None` means the key is legitimately unset and its
+    /// absence is not something to warn about at boot; see the module-level
+    /// note for why the default is silence.
+    feature: Option<&'static str>,
 }
 
 impl ConfigKey {
@@ -68,6 +96,31 @@ impl ConfigKey {
 
     pub fn tier(&self) -> Tier {
         self.tier
+    }
+
+    /// What stops working when no provider holds this key. `None` means the
+    /// key is legitimately unset when nothing configures it, so boot is
+    /// silent about the absence.
+    pub fn feature(&self) -> Option<&'static str> {
+        self.feature
+    }
+
+    /// Test-only constructor: the real registry marks no key with a feature
+    /// today (see the module note above), so PMS-1075's filter behaviour is
+    /// exercised through a fabricated key whose name never leaks into the
+    /// shipping [`REGISTRY`]. Kept `pub(crate)` so it cannot be used to fake
+    /// a runtime key outside this crate.
+    #[cfg(test)]
+    pub(crate) const fn for_test_with_feature(
+        name: &'static str,
+        tier: Tier,
+        feature: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            tier,
+            feature: Some(feature),
+        }
     }
 }
 
@@ -80,12 +133,25 @@ impl fmt::Display for ConfigKey {
 /// Declare a key and its registry entry in one statement.
 ///
 /// The macro exists so [`REGISTRY`] cannot fall out of step with the constants:
-/// there is no way to add one without the other.
+/// there is no way to add one without the other. Each declaration reads as
+/// `Tier NAME = "NAME";` and may be preceded by doc comments and, optionally,
+/// a single `#[feature = "sentence"]` attribute (PMS-1075) that boot uses to
+/// name what will not work if no provider holds the key. Keys without a
+/// feature attribute are legitimately-unset by design; see the module-level
+/// note for why silence is the default.
 macro_rules! declare_keys {
-    ($($(#[$meta:meta])* $tier:ident $ident:ident = $name:literal;)*) => {
+    ($(
+        $(#[doc = $doc:literal])*
+        $(#[feature = $feature:literal])?
+        $tier:ident $ident:ident = $name:literal;
+    )*) => {
         $(
-            $(#[$meta])*
-            pub static $ident: ConfigKey = ConfigKey { name: $name, tier: Tier::$tier };
+            $(#[doc = $doc])*
+            pub static $ident: ConfigKey = ConfigKey {
+                name: $name,
+                tier: Tier::$tier,
+                feature: declare_keys!(@feature $($feature)?),
+            };
         )*
 
         /// Every declared key, in declaration order. The boot resolution walks
@@ -93,6 +159,8 @@ macro_rules! declare_keys {
         /// `scripts/check-env-example.nu` compares it against `.env.example`.
         pub static REGISTRY: &[&ConfigKey] = &[$(&$ident),*];
     };
+    (@feature $feature:literal) => { Some($feature) };
+    (@feature) => { None };
 }
 
 declare_keys! {
