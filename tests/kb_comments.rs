@@ -489,3 +489,217 @@ async fn a_contact_never_sees_a_comment(pool: PgPool) {
         .expect("send contact delete");
     assert_eq!(del.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
+
+// ============================================================================
+// PMS-1129: @mentions notify once
+// ============================================================================
+
+async fn mention_rows(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+) -> Vec<(String, Option<String>, Option<uuid::Uuid>, String)> {
+    sqlx::query_as(
+        r#"SELECT channel_type, entity_type, entity_id, body FROM notifications
+           WHERE user_id = $1 ORDER BY created_at"#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .expect("read notifications")
+}
+
+/// Two colleagues named, the author naming themselves, an unknown handle and
+/// an ambiguous one: exactly one in-app row per named colleague, none for the
+/// author, nothing for the rest. An edit that adds a handle notifies that
+/// person once; a re-save notifies nobody; the mention rows say who was told.
+#[sqlx::test]
+async fn a_mention_notifies_the_named_colleague_exactly_once(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let (ada_id, _, _) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "ada.lovelace@example.com",
+        "technician",
+    )
+    .await;
+    let (grace_id, _, _) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "grace@example.com",
+        "manager",
+    )
+    .await;
+    // Two people who both answer to @test (the seeded first name), so
+    // "@test" names nobody.
+    let (sam_a, _, _) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "sam.a@example.com",
+        "technician",
+    )
+    .await;
+    let (sam_b, _, _) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "sam.b@example.com",
+        "technician",
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+    let admin = common::login(&app, &email, &password).await;
+    let article_id = create_article(&app, &admin, "mentions").await;
+
+    let created = post_comment(
+        &app,
+        &admin,
+        &article_id,
+        serde_json::json!({ "body": "@ada.lovelace and @grace, see this. cc @test-admin (me), @nobody, @test." }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = created.json().await.expect("comment JSON");
+    let comment_id = uuid::Uuid::parse_str(created["id"].as_str().expect("id")).expect("uuid");
+
+    let ada = mention_rows(&pool, ada_id).await;
+    assert_eq!(ada.len(), 1, "one in-app row for Ada: {ada:?}");
+    assert_eq!(ada[0].0, "in_app");
+    assert_eq!(ada[0].1.as_deref(), Some("kb_articles"), "deep link kind");
+    assert_eq!(
+        ada[0].2,
+        Some(uuid::Uuid::parse_str(&article_id).expect("article uuid")),
+        "deep link target"
+    );
+    assert!(
+        ada[0].3.contains("Test Admin mentioned you"),
+        "{}",
+        ada[0].3
+    );
+    assert!(
+        ada[0].3.contains("mentions"),
+        "the article title is named: {}",
+        ada[0].3
+    );
+    assert_eq!(
+        mention_rows(&pool, grace_id).await.len(),
+        1,
+        "one for Grace"
+    );
+    assert_eq!(
+        mention_rows(&pool, admin_id).await.len(),
+        0,
+        "the author is not told about their own comment"
+    );
+    assert_eq!(
+        mention_rows(&pool, sam_a).await.len(),
+        0,
+        "an ambiguous handle names nobody"
+    );
+    assert_eq!(mention_rows(&pool, sam_b).await.len(), 0);
+
+    let told: Vec<(uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT user_id, notified_at FROM kb_comment_mentions WHERE comment_id = $1 ORDER BY user_id",
+    )
+    .bind(comment_id)
+    .fetch_all(&pool)
+    .await
+    .expect("mention rows");
+    let mut named: Vec<uuid::Uuid> = told.iter().map(|(u, _)| *u).collect();
+    named.sort();
+    let mut expected = vec![ada_id, grace_id, admin_id];
+    expected.sort();
+    assert_eq!(
+        named, expected,
+        "the author's self-mention is recorded, not notified"
+    );
+    for (user, at) in &told {
+        if *user == admin_id {
+            assert!(at.is_none(), "the author was not told");
+        } else {
+            assert!(at.is_some(), "{user} was stamped as told");
+        }
+    }
+
+    // A re-save of the same text: nothing new.
+    let same = app
+        .client
+        .put(app.url(&format!("/api/v1/kb/comments/{comment_id}")))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({ "body": "@ada.lovelace and @grace, see this. cc @test-admin (me), @nobody, @test. (typo fixed)" }))
+        .send()
+        .await
+        .expect("send re-save");
+    assert_eq!(same.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        mention_rows(&pool, ada_id).await.len(),
+        1,
+        "no second row for Ada"
+    );
+    assert_eq!(mention_rows(&pool, grace_id).await.len(), 1);
+
+    // An edit that adds Sam A by the unambiguous handle: exactly one more.
+    let added = app
+        .client
+        .put(app.url(&format!("/api/v1/kb/comments/{comment_id}")))
+        .bearer_auth(&admin)
+        .json(&serde_json::json!({ "body": "@ada.lovelace and @grace and now @sam.a too." }))
+        .send()
+        .await
+        .expect("send edit adding a mention");
+    assert_eq!(added.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        mention_rows(&pool, sam_a).await.len(),
+        1,
+        "the newly named person is told once"
+    );
+    assert_eq!(
+        mention_rows(&pool, ada_id).await.len(),
+        1,
+        "and nobody is told twice"
+    );
+}
+
+/// A comment with no mention writes no mention row and no notification,
+/// and an inactive colleague is not a mention target.
+#[sqlx::test]
+async fn no_mention_no_row_and_an_inactive_user_is_not_named(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let (gone_id, _, _) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "gone@example.com",
+        "technician",
+    )
+    .await;
+    sqlx::query("UPDATE users SET status = 'inactive' WHERE id = $1")
+        .bind(gone_id)
+        .execute(&pool)
+        .await
+        .expect("deactivate");
+    let app = common::boot(pool.clone()).await;
+    let admin = common::login(&app, &email, &password).await;
+    let article_id = create_article(&app, &admin, "quiet").await;
+
+    let plain = post_comment(
+        &app,
+        &admin,
+        &article_id,
+        serde_json::json!({ "body": "No one named here." }),
+    )
+    .await;
+    assert_eq!(plain.status(), reqwest::StatusCode::CREATED);
+    let naming_gone = post_comment(
+        &app,
+        &admin,
+        &article_id,
+        serde_json::json!({ "body": "@gone are you there?" }),
+    )
+    .await;
+    assert_eq!(naming_gone.status(), reqwest::StatusCode::CREATED);
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_comment_mentions")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 0);
+    assert_eq!(mention_rows(&pool, gone_id).await.len(), 0);
+}

@@ -236,7 +236,8 @@ pub fn create_api_router(
         spa_base_url.clone(),
     );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
-    let kb_service = KbService::new(db.clone());
+    // PMS-1129: an @mention in a KB comment notifies through the queue.
+    let kb_service = KbService::new(db.clone()).with_notifications(notifications_service.clone());
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
     // acceptance), so created invites email the invitee.
     let invitations_service =

@@ -9,16 +9,31 @@ use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
+use super::mentions;
 use super::models::*;
+use crate::modules::notifications::NotificationsService;
 
 #[derive(Clone)]
 pub struct KbService {
     db: Database,
+    /// PMS-1129: where an @mention's notification goes. `None` in the older
+    /// test fixtures that build the service bare; a mention is then recorded
+    /// and not delivered, which the log says.
+    notifications: Option<NotificationsService>,
 }
 
 impl KbService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            notifications: None,
+        }
+    }
+
+    /// PMS-1129: thread the dispatcher in, the `TicketService` shape.
+    pub fn with_notifications(mut self, notifications: NotificationsService) -> Self {
+        self.notifications = Some(notifications);
+        self
     }
 
     /// Reject any `company_ids` entry that is not a company owned by this
@@ -1334,7 +1349,11 @@ impl KbService {
         )
         .await?;
         let written = Self::read_comment(&mut tx, tenant_id, id).await?;
+        let newly_mentioned =
+            Self::record_mentions(&mut tx, tenant_id, id, author_id, &written.body).await?;
         tx.commit().await?;
+        self.notify_mentions(tenant_id, &written, &newly_mentioned)
+            .await;
         Ok(written)
     }
 
@@ -1377,8 +1396,163 @@ impl KbService {
         )
         .await?;
         let written = Self::read_comment(&mut tx, tenant_id, comment_id).await?;
+        let newly_mentioned =
+            Self::record_mentions(&mut tx, tenant_id, comment_id, editor_id, &written.body).await?;
         tx.commit().await?;
+        self.notify_mentions(tenant_id, &written, &newly_mentioned)
+            .await;
         Ok(written)
+    }
+
+    /// PMS-1129: write one `kb_comment_mentions` row per person the body
+    /// names and answer the people whose row THIS write inserted, minus the
+    /// actor. The primary key is the once-only guard: an edit that adds a
+    /// handle inserts that one row, a re-save of the same text inserts none.
+    /// The author naming themselves is recorded (the row is true) and left
+    /// out of the answer (nobody needs telling what they just wrote).
+    async fn record_mentions(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        comment_id: Uuid,
+        actor_id: Uuid,
+        body: &str,
+    ) -> AppResult<Vec<Uuid>> {
+        if mentions::tokens(body).is_empty() {
+            return Ok(Vec::new());
+        }
+        let people: Vec<(Uuid, String, String, String)> = sqlx::query_as(
+            r#"SELECT id, first_name, last_name, LOWER(split_part(email, '@', 1))
+               FROM users WHERE tenant_id = $1 AND status = 'active'"#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let people: Vec<mentions::Person> = people
+            .into_iter()
+            .map(|(id, first_name, last_name, handle)| mentions::Person {
+                id,
+                first_name,
+                last_name,
+                handle,
+            })
+            .collect();
+        let mut inserted: Vec<Uuid> = Vec::new();
+        for user_id in mentions::mentioned(body, &people) {
+            let fresh: Option<Uuid> = sqlx::query_scalar(
+                r#"INSERT INTO kb_comment_mentions (tenant_id, comment_id, user_id)
+                   VALUES ($1, $2, $3)
+                   ON CONFLICT (comment_id, user_id) DO NOTHING
+                   RETURNING user_id"#,
+            )
+            .bind(tenant_id)
+            .bind(comment_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(user_id) = fresh {
+                if user_id != actor_id {
+                    inserted.push(user_id);
+                }
+            }
+        }
+        Ok(inserted)
+    }
+
+    /// PMS-1129: one `kb.comment.mention` dispatch per newly mentioned
+    /// person, after the comment has committed so a rolled-back comment
+    /// queues nothing. A dispatch that fails is logged and does not fail
+    /// the request: the comment is written, and the row without
+    /// `notified_at` says who was not told.
+    async fn notify_mentions(
+        &self,
+        tenant_id: TenantId,
+        comment: &KbCommentResponse,
+        user_ids: &[Uuid],
+    ) {
+        if user_ids.is_empty() {
+            return;
+        }
+        let Some(notify) = &self.notifications else {
+            tracing::warn!(
+                comment = %comment.id,
+                mentioned = user_ids.len(),
+                "kb comment mentions recorded but no dispatcher is wired; nobody was notified"
+            );
+            return;
+        };
+        // Tenant-scoped reads and writes, never the bare pool: the rows are
+        // behind fail-closed RLS and would simply not be there.
+        let article_title: String = match self.db.begin_with_tenant(tenant_id).await {
+            Ok(mut tx) => {
+                let title = sqlx::query_scalar::<_, String>(
+                    "SELECT title FROM kb_articles WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(comment.article_id)
+                .fetch_optional(&mut *tx)
+                .await;
+                match title {
+                    Ok(Some(title)) => title,
+                    Ok(None) => "a knowledge base article".to_string(),
+                    Err(e) => {
+                        tracing::error!(error = %e, comment = %comment.id, "kb mention: article title unreadable");
+                        "a knowledge base article".to_string()
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, comment = %comment.id, "kb mention: no connection for the title");
+                "a knowledge base article".to_string()
+            }
+        };
+        let excerpt: String = comment.body.chars().take(200).collect();
+        for user_id in user_ids {
+            let context = serde_json::json!({
+                "recipient_user_id": user_id.to_string(),
+                "article_id": comment.article_id.to_string(),
+                "article_title": article_title,
+                "comment_id": comment.id.to_string(),
+                "author_name": comment.author_name,
+                "excerpt": excerpt,
+                "entity_type": "kb_articles",
+                "entity_id": comment.article_id.to_string(),
+            });
+            match notify
+                .dispatch(tenant_id, "kb.comment.mention", &context)
+                .await
+            {
+                Ok(_) => {
+                    if let Err(e) =
+                        Self::stamp_notified(&self.db, tenant_id, comment.id, *user_id).await
+                    {
+                        tracing::error!(error = %e, comment = %comment.id, user = %user_id, "kb mention: notified_at not stamped");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, comment = %comment.id, user = %user_id, "kb mention: dispatch failed");
+                }
+            }
+        }
+    }
+
+    async fn stamp_notified(
+        db: &Database,
+        tenant_id: TenantId,
+        comment_id: Uuid,
+        user_id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE kb_comment_mentions SET notified_at = NOW() \
+             WHERE tenant_id = $1 AND comment_id = $2 AND user_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(comment_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Soft: the row keeps its place so the thread keeps its shape, and the
