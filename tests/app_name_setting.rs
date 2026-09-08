@@ -488,9 +488,18 @@ async fn no_seeded_template_still_names_the_product_literally(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("count templated");
+    // PMS-1140 made this three. `auth.password_reset` and `auth.welcome` are
+    // migration 116's two, and `auth.portal_welcome` is the MSP admin's copy
+    // of the welcome, split off so the shared template stopped serving two
+    // audiences. It keeps `{{app_name}}` deliberately: its recipient is the
+    // MSP's own admin being onboarded onto the product, not a client, and the
+    // mail that DOES go to a client, `auth.portal_password_reset`, carries
+    // `{{msp_name}}` and no product name at all. The count is asserted rather
+    // than a lower bound because a new template quietly naming the product is
+    // what this test exists to catch.
     assert_eq!(
-        templated, 2,
-        "expected the two transactional templates to carry the placeholder"
+        templated, 3,
+        "expected the three MSP-side transactional templates to carry the placeholder"
     );
 }
 
