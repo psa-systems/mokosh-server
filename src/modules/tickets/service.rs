@@ -1010,6 +1010,26 @@ impl TicketService {
         }
     }
 
+    /// The tenant's `tickets/note_editing` policy (PMS-974). A stored value
+    /// the parser refuses reads as the default rather than as "off", because
+    /// the write path validates it and a hand-edited row should not lock every
+    /// note in the tenant silently.
+    pub async fn note_edit_policy(&self, tenant_id: TenantId) -> AppResult<NoteEditPolicy> {
+        let stored = crate::modules::settings::read_note_editing(&self.db, tenant_id).await?;
+        Ok(stored
+            .as_deref()
+            .and_then(NoteEditPolicy::parse)
+            .unwrap_or_default())
+    }
+
+    /// May `user` edit this note, all gates considered (PMS-974)? The policy
+    /// answers WHO, [`Self::note_edit_block`] answers WHETHER THIS ROW, and
+    /// this is the conjunction `update_note` enforces, so a client that shows
+    /// an Edit control on it is never refused for a reason it could have seen.
+    pub fn note_editable_by(note: &TicketNote, user: &CurrentUser, policy: NoteEditPolicy) -> bool {
+        policy.permits(user, note.created_by_id) && Self::note_edit_block(note).is_none()
+    }
+
     /// Edit a note's text (PMS-931).
     ///
     /// `/tickets/{id}/notes` served GET and POST and nothing else, so a note was
@@ -1022,6 +1042,9 @@ impl TicketService {
     /// WHETHER this row may be edited at all is the row's state rather than the
     /// caller's rights, so it gets 409 with a message naming the reason; see
     /// [`Self::note_edit_block`].
+    ///
+    /// The WHO gate is the tenant's `tickets/note_editing` policy since
+    /// PMS-974 (`NoteEditPolicy`); the default reproduces the PMS-931 rule.
     ///
     /// The audit row carries the old content as well as the new one, which is
     /// what makes editing acceptable at all: the original survives the edit and
@@ -1044,13 +1067,22 @@ impl TicketService {
             return Err(AppError::NotFound("Note".to_string()));
         }
 
-        // The author, or an admin. `Manager` is deliberately absent: editing
-        // another person's words is worth granting on purpose rather than by
-        // inheriting `can_manage_users`.
-        if note.created_by_id != editor.id && !editor.role.is_admin() {
-            return Err(AppError::Forbidden(
-                "You can only edit notes you wrote.".to_string(),
-            ));
+        // WHO: the tenant's policy. By default the author or an admin, with
+        // `Manager` deliberately absent: editing another person's words is
+        // worth granting on purpose (`author_or_manager`) rather than by
+        // inheriting `can_manage_users`. Each refusal names what would have to
+        // change, because "Forbidden" alone does not tell an agent whether to
+        // ask the author or the administrator.
+        let policy = self.note_edit_policy(tenant_id).await?;
+        if !policy.permits(editor, note.created_by_id) {
+            return Err(AppError::Forbidden(match policy {
+                NoteEditPolicy::Off => "Editing notes is switched off for this organisation \
+                     (setting tickets/note_editing). Add a new note instead."
+                    .to_string(),
+                NoteEditPolicy::AuthorOrAdmin | NoteEditPolicy::AuthorOrManager => {
+                    "You can only edit notes you wrote.".to_string()
+                }
+            }));
         }
 
         if let Some(reason) = Self::note_edit_block(&note) {
