@@ -3,6 +3,7 @@
 //! Axum-based REST API for Mokosh Server.
 
 pub mod api;
+pub mod app_secrets;
 pub mod cli;
 pub mod config;
 pub mod db;

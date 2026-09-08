@@ -690,18 +690,29 @@ pub struct MailerConfig {
 }
 
 impl MailerConfig {
-    /// PMS-982: the six `SMTP_*` values come from the configuration provider.
-    /// Every emptiness and default rule below is unchanged; only where the
-    /// string comes from moved.
+    /// PMS-982: the SMTP transport values come from the configuration
+    /// provider. PMS-988: `SMTP_PASSWORD` is an application-tier governed
+    /// secret and comes from `crate::app_secrets::current()` when that seam
+    /// is initialised; the configuration provider is the fallback for test
+    /// paths and seeders that never reach `main`. Every emptiness and
+    /// default rule below is unchanged; only where the string comes from
+    /// moved.
     pub fn from_env() -> AppResult<Self> {
         let host = config::get(&keys::SMTP_HOST).filter(|s| !s.is_empty());
         let port = config::get(&keys::SMTP_PORT)
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(587);
         let username = config::get(&keys::SMTP_USERNAME).filter(|s| !s.is_empty());
-        let password = config::get(&keys::SMTP_PASSWORD)
-            .filter(|s| !s.is_empty())
-            .map(SecretString::from);
+        // PMS-988: read the SMTP password through the app-tier secret
+        // provider. `current()` returns `None` when `init_from_env` has not
+        // run, in which case the configuration registry is the fallback so
+        // test binaries and seeders behave exactly as they did before.
+        let password = match crate::app_secrets::current() {
+            Some(secrets) => secrets.get(crate::app_secrets::GovernedSecret::SmtpPassword),
+            None => config::get(&keys::SMTP_PASSWORD),
+        }
+        .filter(|s| !s.is_empty())
+        .map(SecretString::from);
         let from = config::get(&keys::SMTP_FROM)
             .unwrap_or_else(|| "Mokosh <noreply@example.com>".to_string());
         let tls = SmtpTls::parse(&config::get(&keys::SMTP_TLS).unwrap_or_default())?;

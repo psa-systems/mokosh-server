@@ -449,6 +449,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encryption_key = mokosh_server::utils::crypto::parse_encryption_key(&config.encryption_key)
         .expect("ENCRYPTION_KEY must be 32 bytes (or 64 hex chars)");
 
+    // PMS-988: application-tier secrets, in the Bunyip contract's shape. Build
+    // every provider whose construction inputs are present (environment
+    // always, file if APP_SECRETS_DIR is set, database always, infisical if
+    // INFISICAL_ADDRESS is set), select the declared one from SECRET_BACKEND
+    // (same variable the tenant tier reads; both tiers pick the same
+    // provider), and enforce the four-way classification. A `Misplaced`
+    // secret is a fatal boot error - `enforce` returns AppError::Configuration
+    // and startup exits non-zero, which is the whole point of the contract.
+    // Runs before MailerConfig is built so SMTP_PASSWORD reads through the
+    // declared provider on the first mailer construction.
+    let _app_secrets_selection = mokosh_server::app_secrets::init_from_env(
+        hosting_profile
+            .default_provider_for(ProviderKind::Secrets)
+            .expect("secrets profile default"),
+        db.clone(),
+        encryption_key,
+    )
+    .await?;
+
     // PMS-789: load the deployment's product name into the process cache
     // before anything can render it. Warn-and-continue rather than hard-fail:
     // the consumers are display strings with a working default, and refusing to
