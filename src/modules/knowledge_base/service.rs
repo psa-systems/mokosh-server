@@ -1320,6 +1320,11 @@ impl KbService {
             }
         }
 
+        // PMS-1130: the shape is checked here and nothing else about the
+        // anchor is: resolving it is the client's job on render.
+        if let Some(anchor) = &request.anchor {
+            super::anchor::validate(anchor)?;
+        }
         let anchor_version = request.anchor.as_ref().map(|_| current_version);
         let id: Uuid = sqlx::query_scalar(
             r#"INSERT INTO kb_article_comments

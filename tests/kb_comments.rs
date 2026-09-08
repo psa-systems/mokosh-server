@@ -9,7 +9,9 @@
 //! - any staff role resolves and reopens a root; a reply cannot be resolved
 //! - a soft-deleted comment keeps its place with an empty body, cannot be
 //!   edited or resolved again, and its replies survive
-//! - an anchored root records the article's current version
+//! - an anchored root records the article's current version, is stored and
+//!   returned byte-identical, and a malformed anchor is 422 naming the
+//!   field (PMS-1130)
 //! - a contact holding `kb:read` on a published public article gets 401 on
 //!   every comment route: there is no customer-visible comment
 
@@ -702,4 +704,98 @@ async fn no_mention_no_row_and_an_inactive_user_is_not_named(pool: PgPool) {
         .expect("count");
     assert_eq!(rows, 0);
     assert_eq!(mention_rows(&pool, gone_id).await.len(), 0);
+}
+
+// ============================================================================
+// PMS-1130: the anchor's shape
+// ============================================================================
+
+/// A full selector round-trips as given; each shape rule answers 422 naming
+/// the field, before any row is written.
+#[sqlx::test]
+async fn an_anchor_is_kept_as_given_and_a_malformed_one_names_its_field(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let admin = common::login(&app, &email, &password).await;
+    let article_id = create_article(&app, &admin, "anchor-shape").await;
+
+    let full = serde_json::json!({
+        "type": "TextQuoteSelector",
+        "exact": "Some text.",
+        "prefix": "# Body",
+        "suffix": "The end",
+        "refinedBy": { "type": "TextPositionSelector", "start": 5, "end": 15 }
+    });
+    let created = post_comment(
+        &app,
+        &admin,
+        &article_id,
+        serde_json::json!({ "body": "here", "anchor": full }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = created.json().await.expect("comment JSON");
+    assert_eq!(created["anchor"], full, "stored and returned as given");
+    assert_eq!(created["anchor_version"].as_i64(), Some(1));
+
+    // PMS-924: every string in a JSON body is trimmed before any handler
+    // sees it, so context that is only whitespace arrives empty and a quote
+    // loses its edge whitespace. Pinned so the client's resolver is written
+    // against what the server actually keeps.
+    let edged = serde_json::json!({
+        "type": "TextQuoteSelector", "exact": " Some ", "prefix": "\n\n", "suffix": "\n"
+    });
+    let created = post_comment(
+        &app,
+        &admin,
+        &article_id,
+        serde_json::json!({ "body": "edge", "anchor": edged }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = created.json().await.expect("comment JSON");
+    assert_eq!(created["anchor"]["exact"].as_str(), Some("Some"));
+    assert_eq!(created["anchor"]["prefix"].as_str(), Some(""));
+    assert_eq!(created["anchor"]["suffix"].as_str(), Some(""));
+
+    let bad = [
+        (serde_json::json!({ "exact": "x" }), "anchor"),
+        (
+            serde_json::json!({ "type": "TextQuoteSelector", "exact": "" }),
+            "anchor.exact",
+        ),
+        (
+            serde_json::json!({ "type": "TextQuoteSelector", "exact": "x", "prefix": "p".repeat(65) }),
+            "anchor.prefix",
+        ),
+        (
+            serde_json::json!({ "type": "TextQuoteSelector", "exact": "x", "refinedBy": { "type": "TextPositionSelector", "start": 9, "end": 2 } }),
+            "anchor.refinedBy.end",
+        ),
+        (
+            serde_json::json!({ "type": "TextQuoteSelector", "exact": "x", "extra": 1 }),
+            "anchor",
+        ),
+    ];
+    for (anchor, field) in bad {
+        let resp = post_comment(
+            &app,
+            &admin,
+            &article_id,
+            serde_json::json!({ "body": "bad", "anchor": anchor }),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{field}"
+        );
+        let text = resp.text().await.expect("body");
+        assert!(text.contains(field), "{field} named in {text}");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_article_comments")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 2, "no row for a refused anchor");
 }
