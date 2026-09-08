@@ -16,9 +16,7 @@ without losing it.
 | Kind | Trait | Providers | Tier | Refreshable |
 |---|---|---|---|---|
 | Configuration | `ConfigProvider` | environment, file, database, Bunyip | bootstrap + application | application only |
-
-The file, database and Bunyip configuration providers landed dormant in PMS-987 (the seam only, wired but not resolving any read); the priority chain wiring lands with the migrate CLI (PMS-1012).
-| Secrets (deployment) | `SecretProvider` | environment, file, database, Infisical | application | yes |
+| Secrets (deployment) | `AppSecretProvider` | environment, file, database, Infisical | application | yes |
 | Secrets (tenant) | `SecretProvider` | database, Infisical | tenant | yes |
 | Storage | `ObjectProvider` | local, S3 | tenant | no |
 | Authentication | `AuthProvider` | Bunyip OIDC, local | application | no |
@@ -27,7 +25,10 @@ The file, database and Bunyip configuration providers landed dormant in PMS-987 
 Payment (`PaymentProvider`) and RMM (`RmmProvider`) are also providers, but they are chosen per tenant as an
 integration rather than per deployment as infrastructure, so they do not appear in the tables below.
 
-`src/config/`, `src/secrets/` and `src/storage/` each implement the kind of the same name.
+`src/config/`, `src/secrets/`, `src/storage/` and `src/app_secrets/` implement the kinds above. `src/app_secrets/`
+(PMS-988) is Mokosh's application-tier `AppSecretProvider`, with a `GovernedSecret` registry that starts at
+`SMTP_PASSWORD` and grows the day another deployment-wide secret joins it. Its selection variable is `SECRET_BACKEND`,
+the same variable the tenant tier reads: both tiers pick the same provider on purpose.
 [ROADMAP.md](ROADMAP.md) links the phase, and the issue, for every kind.
 
 ## The three tiers

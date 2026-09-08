@@ -176,6 +176,10 @@ declare_keys! {
     /// AES-256-GCM key for at-rest encryption, which a database-backed
     /// provider would need in order to read anything it stored.
     Bootstrap ENCRYPTION_KEY = "ENCRYPTION_KEY";
+    /// PMS-988: directory the file-backed application-tier secret provider
+    /// reads. A provider is built from this at boot, so it is bootstrap; unset
+    /// means the file provider is not enabled and holds nothing.
+    Bootstrap APP_SECRETS_DIR = "APP_SECRETS_DIR";
 
     // PMS-987: the configuration chain and the two providers whose
     // construction values themselves live under Configuration. Bootstrap
@@ -336,6 +340,7 @@ mod tests {
                 "BUNYIP_CONFIG_URL",
                 "BUNYIP_CONFIG_CLIENT_ID",
                 "BUNYIP_CONFIG_CLIENT_SECRET",
+                "APP_SECRETS_DIR",
             ],
             "adding a bootstrap key means arguing that a provider cannot serve it"
         );

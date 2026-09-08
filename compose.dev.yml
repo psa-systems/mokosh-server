@@ -296,6 +296,10 @@ services:
       # reproduces the code's own fallback in SecretsConfig::from_env, so an
       # unset variable behaves the same here as it does in production.
       SECRET_BACKEND: ${SECRET_BACKEND:-database}
+      # PMS-988: directory the application-tier file secret provider reads.
+      # Empty means the file provider is not built; the `:-` default reproduces
+      # the code's own behaviour when APP_SECRETS_DIR is unset.
+      APP_SECRETS_DIR: ${APP_SECRETS_DIR:-}
       # PMS-982: `environment`, the only kind reachable via the SINGLE-provider
       # slot today. The `:-` default reproduces the code's own fallback in
       # ConfigSelection::from_env.
