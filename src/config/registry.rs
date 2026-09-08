@@ -176,6 +176,13 @@ declare_keys! {
     /// AES-256-GCM key for at-rest encryption, which a database-backed
     /// provider would need in order to read anything it stored.
     Bootstrap ENCRYPTION_KEY = "ENCRYPTION_KEY";
+    /// PMS-981: authentication provider enablement, a comma-separated priority
+    /// list (`bunyip,local` by default in `saas`; `local` in `self-hosted`).
+    /// Bootstrap because provider enablement is bootstrap configuration
+    /// (PMS-1009): the resolved chain is built once at startup and a change
+    /// needs a restart, since the trait objects the chain is made of are
+    /// already holding the old shape.
+    Bootstrap AUTH_PROVIDERS = "AUTH_PROVIDERS";
 
     // -- Application: the server's own shape ---------------------------------
 
@@ -294,9 +301,12 @@ mod tests {
         }
     }
 
-    /// The bootstrap tier is small and stated, because every key in it is one
-    /// a later provider cannot serve. Growing it silently is how the tier
-    /// stops meaning "what a provider is made from".
+    /// The bootstrap tier is small and stated, because every key in it either
+    /// names a value a later provider cannot serve (the three connection- and
+    /// encryption-material keys) or names PROVIDER ENABLEMENT itself, which
+    /// resolves once at startup because a chain of trait objects is already
+    /// holding the shape it decided. Growing it silently is how the tier
+    /// stops meaning "resolves exactly once per process".
     #[test]
     fn the_bootstrap_tier_is_exactly_what_a_provider_is_made_from() {
         let bootstrap: Vec<&str> = REGISTRY
@@ -306,8 +316,15 @@ mod tests {
             .collect();
         assert_eq!(
             bootstrap,
-            ["DATABASE_URL", "MOKOSH_APP_DATABASE_URL", "ENCRYPTION_KEY"],
-            "adding a bootstrap key means arguing that a provider cannot serve it"
+            [
+                "DATABASE_URL",
+                "MOKOSH_APP_DATABASE_URL",
+                "ENCRYPTION_KEY",
+                "AUTH_PROVIDERS",
+            ],
+            "adding a bootstrap key means arguing that a provider cannot serve \
+             it, or that the value chooses which providers run and so must not \
+             change under the running chain"
         );
     }
 }

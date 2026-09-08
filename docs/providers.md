@@ -19,7 +19,7 @@ without losing it.
 | Secrets (deployment) | `SecretProvider` | environment, file, database, Infisical | application | yes |
 | Secrets (tenant) | `SecretProvider` | database, Infisical | tenant | yes |
 | Storage | `ObjectProvider` | local, S3 | tenant | no |
-| Authentication | `AuthProvider` | Bunyip OIDC, local | application | no |
+| Authentication | `AuthProvider` | Bunyip OIDC, local | application | no (PMS-981: seam landed dormant; wiring lands with the deprecation of the legacy path) |
 | Email | `Mailer` | smtp, log, Bunyip relay | application | yes |
 
 Payment (`PaymentProvider`) and RMM (`RmmProvider`) are also providers, but they are chosen per tenant as an
