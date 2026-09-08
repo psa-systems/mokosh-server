@@ -335,12 +335,12 @@ mod tests {
                 "DATABASE_URL",
                 "MOKOSH_APP_DATABASE_URL",
                 "ENCRYPTION_KEY",
+                "APP_SECRETS_DIR",
                 "CONFIG_FILE_DIR",
                 "CONFIG_PROVIDERS",
                 "BUNYIP_CONFIG_URL",
                 "BUNYIP_CONFIG_CLIENT_ID",
                 "BUNYIP_CONFIG_CLIENT_SECRET",
-                "APP_SECRETS_DIR",
             ],
             "adding a bootstrap key means arguing that a provider cannot serve it"
         );
