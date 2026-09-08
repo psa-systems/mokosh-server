@@ -48,6 +48,7 @@ use crate::utils::deployment::{provider, EnablementSource};
 use crate::utils::error::{AppError, AppResult};
 
 pub mod env;
+pub mod flags;
 pub mod guard;
 pub mod registry;
 
