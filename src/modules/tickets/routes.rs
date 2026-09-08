@@ -10,11 +10,12 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    AttachmentService, CreateNoteRequest, CreateTicketRequest, NoteType, TicketCategoryResponse,
-    TicketFilter, TicketNoteResponse, TicketPriority, TicketQueue, TicketResponse, TicketService,
-    TicketSlaResponse, TicketStatus, TicketType, UpdateNoteRequest, UpdateTicketRequest,
-    UpsertTicketCategoryRequest, UpsertTicketPriorityRequest, UpsertTicketQueueRequest,
-    UpsertTicketStatusRequest, UpsertTicketTypeRequest,
+    AttachmentService, CreateNoteRequest, CreateTicketRequest, NoteEditPolicy, NoteType,
+    TicketCategoryResponse, TicketFilter, TicketNote, TicketNoteResponse, TicketPriority,
+    TicketQueue, TicketResponse, TicketService, TicketSlaResponse, TicketStatus, TicketType,
+    UpdateNoteRequest, UpdateTicketRequest, UpsertTicketCategoryRequest,
+    UpsertTicketPriorityRequest, UpsertTicketQueueRequest, UpsertTicketStatusRequest,
+    UpsertTicketTypeRequest,
 };
 use crate::db::Database;
 use crate::modules::approvals::{ApprovalResponse, ApprovalsService};
@@ -24,6 +25,7 @@ use crate::modules::auth::{
 use crate::modules::contact_portal::capabilities as caps;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
+use mokosh_types::auth::CurrentUser;
 
 #[derive(Clone)]
 pub struct TicketRouterState {
@@ -477,6 +479,33 @@ async fn assign_ticket(
     Ok(Json(resp))
 }
 
+/// PMS-974: the one construction of a note's wire shape for the four handlers
+/// that serve one, so `can_edit` is answered by the same rule everywhere
+/// (`TicketService::note_editable_by`, which is what the PUT enforces). A
+/// contact session passes no viewer and gets `false`: the edit route is
+/// staff-only. `name_fallback` is what a note created this request is named
+/// by when the row carries no author name yet.
+fn note_response(
+    note: TicketNote,
+    name_fallback: Option<String>,
+    viewer: Option<(&CurrentUser, NoteEditPolicy)>,
+) -> TicketNoteResponse {
+    let can_edit =
+        viewer.is_some_and(|(user, policy)| TicketService::note_editable_by(&note, user, policy));
+    TicketNoteResponse {
+        id: note.id,
+        note_type: note.note_type,
+        content: note.content,
+        is_email_sent: note.is_email_sent,
+        created_by_id: note.created_by_id,
+        created_by_name: note.created_by_name.or(name_fallback).unwrap_or_default(),
+        created_by_contact_id: note.created_by_contact_id,
+        created_at: note.created_at,
+        updated_at: note.updated_at,
+        can_edit,
+    }
+}
+
 async fn get_ticket_notes(
     State(state): State<TicketRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -491,36 +520,29 @@ async fn get_ticket_notes(
     // service scopes the query to `note_type = 'public'` so internal
     // notes never reach the wire.
     let tenant = caller.tenant();
-    let (notes, total) = match &caller {
+    let (notes, total, viewer) = match &caller {
         CallerContext::Staff(auth) => {
             let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
-            state
+            let policy = state.ticket_service.note_edit_policy(user.tenant()).await?;
+            let (notes, total) = state
                 .ticket_service
                 .get_ticket_notes(user.tenant(), ticket_id, &pagination)
-                .await?
+                .await?;
+            (notes, total, Some((user, policy)))
         }
         CallerContext::Contact(session) => {
             caller.require_capability(caps::TICKETS_READ, &db).await?;
-            state
+            let (notes, total) = state
                 .ticket_service
                 .list_portal_ticket_notes(tenant, session.company_id, ticket_id, &pagination)
-                .await?
+                .await?;
+            (notes, total, None)
         }
     };
 
     let responses: Vec<TicketNoteResponse> = notes
         .into_iter()
-        .map(|n| TicketNoteResponse {
-            id: n.id,
-            note_type: n.note_type,
-            content: n.content,
-            is_email_sent: n.is_email_sent,
-            created_by_id: n.created_by_id,
-            created_by_name: n.created_by_name.unwrap_or_default(),
-            created_by_contact_id: n.created_by_contact_id,
-            created_at: n.created_at,
-            updated_at: n.updated_at,
-        })
+        .map(|n| note_response(n, None, viewer))
         .collect();
 
     Ok(Json(PaginatedResponse::from_params(
@@ -543,23 +565,14 @@ async fn list_contact_notes(
     Path(contact_id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketNoteResponse>>> {
+    let policy = state.ticket_service.note_edit_policy(user.tenant()).await?;
     let (notes, total) = state
         .ticket_service
         .list_notes_by_contact(user.tenant(), contact_id, &pagination)
         .await?;
     let responses: Vec<TicketNoteResponse> = notes
         .into_iter()
-        .map(|n| TicketNoteResponse {
-            id: n.id,
-            note_type: n.note_type,
-            content: n.content,
-            is_email_sent: n.is_email_sent,
-            created_by_id: n.created_by_id,
-            created_by_name: n.created_by_name.unwrap_or_default(),
-            created_by_contact_id: n.created_by_contact_id,
-            created_at: n.created_at,
-            updated_at: n.updated_at,
-        })
+        .map(|n| note_response(n, None, Some((&user, policy))))
         .collect();
     Ok(Json(PaginatedResponse::from_params(
         responses,
@@ -578,15 +591,15 @@ async fn add_note(
 ) -> AppResult<Json<TicketNoteResponse>> {
     request.validate()?;
 
-    let (note, name_fallback) = match &caller {
+    let (note, name_fallback, viewer) = match &caller {
         CallerContext::Staff(auth) => {
             let user = auth.user.as_ref().ok_or(AppError::Unauthorized)?;
             let note = state
                 .ticket_service
                 .add_note(user.tenant(), ticket_id, user.id, &request, &ctx)
                 .await?;
-            let fallback = user.full_name();
-            (note, fallback)
+            let policy = state.ticket_service.note_edit_policy(user.tenant()).await?;
+            (note, user.full_name(), Some((user, policy)))
         }
         CallerContext::Contact(session) => {
             // mokosh-contact-login prompt 008: gate on tickets:comment
@@ -611,21 +624,11 @@ async fn add_note(
                     request.content.clone(),
                 )
                 .await?;
-            (note, session.email.clone())
+            (note, session.email.clone(), None)
         }
     };
 
-    Ok(Json(TicketNoteResponse {
-        id: note.id,
-        note_type: note.note_type,
-        content: note.content,
-        is_email_sent: note.is_email_sent,
-        created_by_id: note.created_by_id,
-        created_by_name: note.created_by_name.unwrap_or(name_fallback),
-        created_by_contact_id: note.created_by_contact_id,
-        created_at: note.created_at,
-        updated_at: note.updated_at,
-    }))
+    Ok(Json(note_response(note, Some(name_fallback), viewer)))
 }
 
 /// PMS-931. Content only; see `UpdateNoteRequest` for why `note_type` and
@@ -644,18 +647,13 @@ async fn update_note(
         .ticket_service
         .update_note(user.tenant(), ticket_id, note_id, &user, &request, &ctx)
         .await?;
+    let policy = state.ticket_service.note_edit_policy(user.tenant()).await?;
 
-    Ok(Json(TicketNoteResponse {
-        id: note.id,
-        note_type: note.note_type,
-        content: note.content,
-        is_email_sent: note.is_email_sent,
-        created_by_id: note.created_by_id,
-        created_by_name: note.created_by_name.unwrap_or_else(|| user.full_name()),
-        created_by_contact_id: note.created_by_contact_id,
-        created_at: note.created_at,
-        updated_at: note.updated_at,
-    }))
+    Ok(Json(note_response(
+        note,
+        Some(user.full_name()),
+        Some((&user, policy)),
+    )))
 }
 
 /// PMS-936: body for `POST /tickets/{id}/reopen`. Optional reason is

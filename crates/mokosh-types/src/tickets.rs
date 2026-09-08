@@ -710,6 +710,14 @@ pub struct TicketNoteResponse {
     /// note nobody has edited, because both come from the same transaction's
     /// `NOW()`, so a client marks a note as edited on a strict `>`.
     pub updated_at: DateTime<Utc>,
+    /// PMS-974: whether the caller may edit this note, all gates considered:
+    /// the tenant's `tickets/note_editing` policy AND the row's own state (a
+    /// customer's words and an emailed public note refuse regardless). The
+    /// server answers it with the rule `PUT /tickets/{id}/notes/{note_id}`
+    /// enforces, so a client that shows an Edit control on it is never refused
+    /// for a reason it could have seen. Always `false` for a contact session.
+    #[serde(default)]
+    pub can_edit: bool,
 }
 
 // ============================================================================

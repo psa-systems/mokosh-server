@@ -446,6 +446,24 @@ pub async fn read_track_breaks(db: &Database, tenant_id: TenantId) -> AppResult<
     Ok(value.and_then(|v| v.as_bool()).unwrap_or(false))
 }
 
+/// PMS-974: who may edit a ticket note (`tickets/note_editing`), as the
+/// stored string; `NoteEditPolicy::parse` in the tickets module gives it a
+/// meaning. Unset means `author_or_admin`, the PMS-931 rule, so a tenant that
+/// never opened the setting keeps the behaviour it had. A stored value the
+/// parser refuses is treated the same way by the caller, which cannot happen
+/// through `PUT /settings` (validated) but can through a hand-written row.
+pub async fn read_note_editing(db: &Database, tenant_id: TenantId) -> AppResult<Option<String>> {
+    let mut tx = db.begin_with_tenant(tenant_id).await?;
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'tickets' AND key = 'note_editing'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(value.and_then(|v| v.as_str().map(str::to_string)))
+}
+
 /// PMS-1028: the currency an invoice is issued in when nothing names one
 /// (`billing_prefs/currency`, a 3-letter ISO 4217 code the settings route
 /// validates). Unset means `USD`, which is what every writer hardcoded

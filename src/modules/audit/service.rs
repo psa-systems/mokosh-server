@@ -191,6 +191,13 @@ impl AuditService {
     /// to expose to non-admins for the whitelisted entity types
     /// (`HISTORY_ENTITY_TYPES`). Powers the detail-page change-history feeds
     /// in PMS-182 (tickets), PMS-184 (tasks) and projects.
+    ///
+    /// One record's history also carries its children's (PMS-974): a
+    /// ticket's includes the `ticket_notes` rows whose snapshot names the
+    /// ticket, minus their `create` rows, because the note itself is the
+    /// record of its creation and the journal already shows it. Before this
+    /// a note edit was audited (PMS-931) but nothing a technician could open
+    /// showed it, so "with an audit log entry" was true only at the table.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_entity_history(
         &self,
@@ -200,25 +207,25 @@ impl AuditService {
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<EntityHistoryEntry>, u64)> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_log
-             WHERE tenant_id = $1 AND entity_type = $2 AND entity_id = $3",
-        )
+        let total: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM audit_log WHERE {HISTORY_WHERE}"
+        ))
         .bind(tenant_id)
         .bind(entity_type)
         .bind(entity_id)
+        .bind(entity_id.to_string())
         .fetch_one(&mut *tx)
         .await?;
 
-        let rows = sqlx::query_as::<_, HistoryRow>(
-            r#"SELECT id, action, user_id, old_values, new_values, timestamp
-               FROM audit_log
-               WHERE tenant_id = $1 AND entity_type = $2 AND entity_id = $3
-               ORDER BY timestamp DESC LIMIT $4 OFFSET $5"#,
-        )
+        let rows = sqlx::query_as::<_, HistoryRow>(&format!(
+            "SELECT id, entity_type, entity_id, action, user_id, old_values, new_values, timestamp \
+             FROM audit_log WHERE {HISTORY_WHERE} \
+             ORDER BY timestamp DESC LIMIT $5 OFFSET $6"
+        ))
         .bind(tenant_id)
         .bind(entity_type)
         .bind(entity_id)
+        .bind(entity_id.to_string())
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
@@ -226,6 +233,19 @@ impl AuditService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 }
+
+/// The rows one record's history is made of (PMS-974): its own, plus its
+/// children's for the one parent-child pair that has one. `$1` tenant, `$2`
+/// entity type, `$3` entity id, `$4` the same id as text. Shared by the count
+/// and the page so the two cannot disagree about what is in the list. The
+/// child arm compares the ticket id inside the JSONB snapshot as text, which
+/// migration 205 indexes; the id is bound twice rather than cast in SQL so
+/// the parameter's type is never inferred two ways.
+const HISTORY_WHERE: &str = "tenant_id = $1 AND ( \
+       (entity_type = $2 AND entity_id = $3) \
+    OR ($2 = 'tickets' AND entity_type = 'ticket_notes' AND action <> 'create' \
+        AND (new_values ->> 'ticket_id') = $4) \
+   )";
 
 /// Entity types whose change history may be read through the non-admin
 /// per-record endpoint. Restricting the set keeps that endpoint from exposing
@@ -324,6 +344,8 @@ fn humanize_field(field: &str) -> String {
 #[derive(sqlx::FromRow)]
 struct HistoryRow {
     id: Uuid,
+    entity_type: String,
+    entity_id: Option<Uuid>,
     action: String,
     user_id: Option<Uuid>,
     old_values: Option<serde_json::Value>,
@@ -347,6 +369,8 @@ impl From<HistoryRow> for EntityHistoryEntry {
         let changed_fields = changes.iter().map(|c| c.field.clone()).collect();
         Self {
             id: r.id,
+            entity_type: r.entity_type,
+            entity_id: r.entity_id,
             action: r.action,
             user_id: r.user_id,
             changed_fields,
