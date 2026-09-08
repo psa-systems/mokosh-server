@@ -16,6 +16,8 @@ without losing it.
 | Kind | Trait | Providers | Tier | Refreshable |
 |---|---|---|---|---|
 | Configuration | `ConfigProvider` | environment, file, database, Bunyip | bootstrap + application | application only |
+
+The file, database and Bunyip configuration providers landed dormant in PMS-987 (the seam only, wired but not resolving any read); the priority chain wiring lands with the migrate CLI (PMS-1012).
 | Secrets (deployment) | `SecretProvider` | environment, file, database, Infisical | application | yes |
 | Secrets (tenant) | `SecretProvider` | database, Infisical | tenant | yes |
 | Storage | `ObjectProvider` | local, S3 | tenant | no |

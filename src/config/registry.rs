@@ -177,6 +177,27 @@ declare_keys! {
     /// provider would need in order to read anything it stored.
     Bootstrap ENCRYPTION_KEY = "ENCRYPTION_KEY";
 
+    // PMS-987: the configuration chain and the two providers whose
+    // construction values themselves live under Configuration. Bootstrap
+    // because every one of them is what a provider is BUILT FROM (a
+    // directory, an API base, a machine credential), and configuration
+    // that says where to find configuration cannot live inside what it
+    // locates.
+
+    /// Directory the file configuration provider reads, one file per key.
+    Bootstrap CONFIG_FILE_DIR = "CONFIG_FILE_DIR";
+    /// Comma-separated priority list of enabled configuration providers,
+    /// e.g. `file,database,environment`. Empty falls back to the hosting
+    /// profile's default. This is provider ENABLEMENT and cannot be
+    /// served by any provider it enables.
+    Bootstrap CONFIG_PROVIDERS = "CONFIG_PROVIDERS";
+    /// Base URL of the Bunyip API the Bunyip configuration provider reads.
+    Bootstrap BUNYIP_CONFIG_URL = "BUNYIP_CONFIG_URL";
+    /// Machine-credential client id for `POST /v1/oauth2/token`.
+    Bootstrap BUNYIP_CONFIG_CLIENT_ID = "BUNYIP_CONFIG_CLIENT_ID";
+    /// Machine-credential client secret for `POST /v1/oauth2/token`.
+    Bootstrap BUNYIP_CONFIG_CLIENT_SECRET = "BUNYIP_CONFIG_CLIENT_SECRET";
+
     // -- Application: the server's own shape ---------------------------------
 
     Application ENVIRONMENT = "ENVIRONMENT";
@@ -306,7 +327,16 @@ mod tests {
             .collect();
         assert_eq!(
             bootstrap,
-            ["DATABASE_URL", "MOKOSH_APP_DATABASE_URL", "ENCRYPTION_KEY"],
+            [
+                "DATABASE_URL",
+                "MOKOSH_APP_DATABASE_URL",
+                "ENCRYPTION_KEY",
+                "CONFIG_FILE_DIR",
+                "CONFIG_PROVIDERS",
+                "BUNYIP_CONFIG_URL",
+                "BUNYIP_CONFIG_CLIENT_ID",
+                "BUNYIP_CONFIG_CLIENT_SECRET",
+            ],
             "adding a bootstrap key means arguing that a provider cannot serve it"
         );
     }
