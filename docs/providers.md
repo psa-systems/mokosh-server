@@ -89,7 +89,8 @@ For every declared key, the application checks which enabled providers hold it, 
 | Situation | What happens |
 |---|---|
 | The highest-priority provider holds it | Used. Recorded. |
-| No provider holds it | Warning, naming the feature that will not work |
+| No provider holds it, and the registry names a feature its absence disables | Warning, naming the feature that will not work |
+| No provider holds it, and the registry names no such feature | Silent (the key is legitimately unset by design; see the module note in `src/config/registry.rs`) |
 | More than one provider holds it | Warning per duplicate, naming the purge command |
 | The highest-priority provider does not hold it, a lower one does | **Fatal.** The process exits. |
 
