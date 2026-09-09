@@ -62,7 +62,7 @@ pre-commit: ensure-env
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-validate-parity check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
 
 # Keep every relative Markdown link pointing at a file that exists (PMS-850).
 # The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and
@@ -112,6 +112,18 @@ check-migrations:
 [group: 'check']
 check-migration-immutability:
     nu scripts/check-migration-immutability.nu
+
+# Keep a guarded content UPDATE from matching zero rows in silence (PMS-1117).
+# A migration after prefix 209 that guards a WHERE clause on a content-column
+# literal (e.g. notification_templates.subject) must also assert its own
+# GET DIAGNOSTICS row count with mokosh_assert_content_rows_matched (migration
+# 208), so a prior migration having already rewritten that text fails the
+# migration instead of silently no-opping (this hit auth.password_reset and
+# auth.welcome twice: migrations 139 and 152).
+[doc("Fail if a migration after 209 guards content UPDATE without asserting its row count (PMS-1117).")]
+[group: 'check']
+check-guarded-content-migrations:
+    nu scripts/check-guarded-content-migrations.nu
 
 # Keep request-serving queries off the bare app pool (PMS-692). A `.pool()` call
 # hits the NOBYPASSRLS pool and fail-closes RLS-covered rows to zero, so it is
@@ -244,6 +256,18 @@ fmt:
 test:
     cargo test --workspace
 
+# Create the DB roles the migrations grant to, on the dev cluster (PMS-988).
+# Migration 207 grants on `app_secrets` to `mokosh_app`, and a GRANT to a role
+# that does not exist is a hard error, so a `#[sqlx::test]` database fails at
+# migration 207 on a cluster where the server never booted and so never ran its
+# own `provision_roles`. integration.yml runs the same file against its postgres
+# service; scripts/test-db-roles.sql carries the reasoning.
+[doc("Create the DB roles the Postgres-backed suite needs before it runs (PMS-988).")]
+[group: 'test']
+ensure-test-db-roles: ensure-env
+    docker compose --file {{ compose_file }} up --detach --wait postgres
+    docker compose --file {{ compose_file }} exec -T postgres sh -c 'psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --set=ON_ERROR_STOP=1' < scripts/test-db-roles.sql
+
 # Mirrors .forgejo/workflows/integration.yml one-to-one. Unlike `just pre-commit`
 # this omits `--no-deps`, so the compose `postgres` dependency starts. PMS-267.
 #
@@ -258,7 +282,7 @@ test:
 # compose environment rather than reaching the host shell.
 # Run the Postgres-backed integration suite in the dev compose `server` container.
 [group: 'test']
-test-integration: ensure-env
+test-integration: ensure-env ensure-test-db-roles
     docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --tests --no-fail-fast -- --test-threads=4'
 
 # Verify the demo-critical path only: demo-data seeding (seed_demo) and the
@@ -269,7 +293,7 @@ test-integration: ensure-env
 # run a `#[sqlx::test]` suite).
 [doc("Run the demo-critical subset of the integration suite: seed_demo plus data_transfer (PMS-677).")]
 [group: 'test']
-verify-demo: ensure-env
+verify-demo: ensure-env ensure-test-db-roles
     docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --test seed_demo --test data_transfer -- --test-threads=4'
 
 # Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
