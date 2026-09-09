@@ -62,7 +62,7 @@ pre-commit: ensure-env
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-pool-safety check-validate-parity check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
 
 # Keep every relative Markdown link pointing at a file that exists (PMS-850).
 # The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and
@@ -112,6 +112,18 @@ check-migrations:
 [group: 'check']
 check-migration-immutability:
     nu scripts/check-migration-immutability.nu
+
+# Keep a guarded content UPDATE from matching zero rows in silence (PMS-1117).
+# A migration after prefix 209 that guards a WHERE clause on a content-column
+# literal (e.g. notification_templates.subject) must also assert its own
+# GET DIAGNOSTICS row count with mokosh_assert_content_rows_matched (migration
+# 208), so a prior migration having already rewritten that text fails the
+# migration instead of silently no-opping (this hit auth.password_reset and
+# auth.welcome twice: migrations 139 and 152).
+[doc("Fail if a migration after 209 guards content UPDATE without asserting its row count (PMS-1117).")]
+[group: 'check']
+check-guarded-content-migrations:
+    nu scripts/check-guarded-content-migrations.nu
 
 # Keep request-serving queries off the bare app pool (PMS-692). A `.pool()` call
 # hits the NOBYPASSRLS pool and fail-closes RLS-covered rows to zero, so it is

@@ -24,6 +24,7 @@ just check-fmt              # cargo fmt --all --check
 just check-docker           # build the OCI image's builder stage only (validation; NOT in `just check`)
 just check-migrations       # fail if two migrations share a numeric prefix
 just check-migration-immutability # fail if a migration already on main is modified or deleted
+just check-guarded-content-migrations # fail if a migration after 209 guards a content UPDATE without asserting its row count
 just check-pool-safety      # fail if a serving `.pool()` call lacks its `// SAFETY` note
 just check-validate-parity  # fail if a Create*Request and its Update*Request validate a field differently
 just check-mail-copy        # fail if a `Mailer` helper duplicates a seeded template's copy
