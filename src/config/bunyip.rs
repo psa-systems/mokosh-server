@@ -20,6 +20,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use async_trait::async_trait;
+
 use super::{ConfigProvider, Enumeration, REGISTRY};
 use crate::utils::error::{AppError, AppResult};
 
@@ -135,6 +137,7 @@ impl BunyipProvider {
     }
 }
 
+#[async_trait]
 impl ConfigProvider for BunyipProvider {
     fn name(&self) -> &'static str {
         "bunyip"
@@ -150,6 +153,15 @@ impl ConfigProvider for BunyipProvider {
 
     fn list(&self) -> Enumeration {
         Enumeration::Keys(self.values.keys().cloned().collect())
+    }
+
+    /// Bunyip's `PUT /v1/config/{KEY}` is a follow-up ticket; today the
+    /// Bunyip provider stays read-only, so an operator asking to migrate
+    /// TO it gets a named refusal rather than a silent success.
+    async fn set(&self, _key: &str, _value: &str) -> AppResult<()> {
+        Err(AppError::Configuration(
+            "bunyip provider write is not implemented".to_string(),
+        ))
     }
 }
 

@@ -4,12 +4,15 @@
 //! exactly what every call site read before the seam existed, so a deployment
 //! that configures nothing behaves identically.
 
+use async_trait::async_trait;
+
 use super::{ConfigProvider, Enumeration, REGISTRY};
 use crate::utils::deployment::provider;
 
 /// Reads `std::env`. Stateless, so it is cheap to build and safe to share.
 pub struct EnvProvider;
 
+#[async_trait]
 impl ConfigProvider for EnvProvider {
     fn name(&self) -> &'static str {
         provider::ENVIRONMENT

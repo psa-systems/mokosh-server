@@ -42,6 +42,7 @@
 
 use std::sync::{Arc, OnceLock, RwLock};
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::utils::deployment::{provider, EnablementSource};
@@ -96,6 +97,12 @@ impl Enumeration {
 /// [`ConfigKey`], because a provider is a transport and the registry is what
 /// decides which names are legitimate; keeping the two apart is what lets a
 /// test drive a provider with an arbitrary map.
+///
+/// PMS-1012 grew `set` and `delete` on the same trait so provider-migrate and
+/// provider-purge can walk it, and it is `#[async_trait]` for their sake: the
+/// read paths stay sync (they already resolved from a `Generation`), the
+/// writers run in the CLI's async runtime.
+#[async_trait]
 pub trait ConfigProvider: Send + Sync {
     /// The provider's name, as an operator writes it and as the boot record
     /// reports it.
@@ -118,6 +125,29 @@ pub trait ConfigProvider: Send + Sync {
     /// What this provider holds, or [`Enumeration::Unsupported`].
     fn list(&self) -> Enumeration {
         Enumeration::Unsupported
+    }
+
+    /// PMS-1012: write one configuration value. The default returns
+    /// `AppError::Configuration` naming the provider, so a provider that has
+    /// not been updated for a write path refuses loudly rather than silently
+    /// no-oping. The environment and Bunyip providers keep the default.
+    async fn set(&self, key: &str, value: &str) -> AppResult<()> {
+        let _ = (key, value);
+        Err(AppError::Configuration(format!(
+            "{} provider does not support writes",
+            self.name()
+        )))
+    }
+
+    /// PMS-1012: delete one configuration value. Same default posture as
+    /// [`ConfigProvider::set`]. The CLI's `provider-purge` reports the
+    /// refusal per key.
+    async fn delete(&self, key: &str) -> AppResult<()> {
+        let _ = key;
+        Err(AppError::Configuration(format!(
+            "{} provider does not support deletes",
+            self.name()
+        )))
     }
 }
 
@@ -241,6 +271,12 @@ pub enum ConfigProviderKind {
     Database,
     /// Bunyip's `/v1/config` API, authenticated as a machine client.
     Bunyip,
+}
+
+impl std::fmt::Display for ConfigProviderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl ConfigProviderKind {
@@ -628,6 +664,16 @@ impl ConfigProviderChain {
         self.providers.iter().map(|(kind, _)| *kind).collect()
     }
 
+    /// PMS-1012: (kind, provider) pairs in priority order, so the CLI can
+    /// index a specific provider or iterate them without reaching into the
+    /// private field.
+    pub fn entries_for_cli(&self) -> Vec<(ConfigProviderKind, Arc<dyn ConfigProvider>)> {
+        self.providers
+            .iter()
+            .map(|(kind, provider)| (*kind, provider.clone()))
+            .collect()
+    }
+
     /// Walk the chain for `key`, taking the first provider's value and
     /// naming every OTHER provider that also holds it.
     pub fn resolve(&self, key: &ConfigKey) -> ChainResolution {
@@ -867,6 +913,7 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl ConfigProvider for MapProvider {
         fn name(&self) -> &'static str {
             self.name

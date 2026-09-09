@@ -30,6 +30,8 @@ use std::path::PathBuf;
 
 use crate::infisical::{run_dev_bootstrap, BootstrapInput, DevBootstrapConfig};
 
+pub mod providers;
+
 const DEFAULT_URL: &str = "http://localhost:28002";
 const DEFAULT_PROJECT_NAME: &str = "mokosh";
 const DEFAULT_IDENTITY_NAME: &str = "mokosh-machine";
@@ -50,6 +52,9 @@ pub fn is_subcommand(name: &str) -> bool {
             | "showcase-seed"
             | "showcase-refresh"
             | "showcase-teardown"
+            | "provider-status"
+            | "provider-migrate"
+            | "provider-purge"
     )
 }
 
@@ -64,6 +69,15 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         Some("showcase-seed") => run_showcase("showcase-seed", args).await,
         Some("showcase-refresh") => run_showcase("showcase-refresh", args).await,
         Some("showcase-teardown") => run_showcase("showcase-teardown", args).await,
+        Some("provider-status") => providers::run_provider_status(args)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}")),
+        Some("provider-migrate") => providers::run_provider_migrate(args)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}")),
+        Some("provider-purge") => providers::run_provider_purge(args)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}")),
         other => anyhow::bail!("not an operator subcommand: {other:?}"),
     }
 }

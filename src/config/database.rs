@@ -35,6 +35,9 @@
 //! process to see it, which is what the migrate CLI (PMS-1012) will drive.
 
 use std::collections::HashMap;
+use std::sync::RwLock;
+
+use async_trait::async_trait;
 
 use super::{ConfigKey, ConfigProvider, Enumeration, Tier};
 use crate::db::Database;
@@ -43,7 +46,19 @@ use crate::utils::error::{AppError, AppResult};
 /// The database-backed configuration provider. Populated once by
 /// [`DatabaseProvider::build`]; never mutated afterwards.
 pub struct DatabaseProvider {
-    values: HashMap<String, String>,
+    /// The pool half of the provider, split so unit tests can build the
+    /// cache without a live pool.
+    writer: WriteBackend,
+    values: RwLock<HashMap<String, String>>,
+}
+
+/// The pool half of the provider.
+enum WriteBackend {
+    /// The real backend: a database pool.
+    Real { db: Database },
+    /// A test-only sentinel; every `set`/`delete` refuses.
+    #[cfg(test)]
+    Disabled,
 }
 
 impl DatabaseProvider {
@@ -57,7 +72,8 @@ impl DatabaseProvider {
         let names: Vec<&'static str> = keys.iter().map(|k| k.name()).collect();
         if names.is_empty() {
             return Ok(Self {
-                values: HashMap::new(),
+                writer: WriteBackend::Real { db: db.clone() },
+                values: RwLock::new(HashMap::new()),
             });
         }
 
@@ -78,14 +94,20 @@ impl DatabaseProvider {
             .filter(|(name, _)| names.contains(&name.as_str()))
             .collect();
 
-        Ok(Self { values })
+        Ok(Self {
+            writer: WriteBackend::Real { db: db.clone() },
+            values: RwLock::new(values),
+        })
     }
 
     /// Build from an already-materialised map. Kept crate-visible so tests
     /// can drive the trait without a live pool.
     #[cfg(test)]
     pub(crate) fn from_map(values: HashMap<String, String>) -> Self {
-        Self { values }
+        Self {
+            writer: WriteBackend::Disabled,
+            values: RwLock::new(values),
+        }
     }
 }
 
@@ -111,21 +133,99 @@ pub(crate) fn refuse_bootstrap(keys: &[&'static ConfigKey]) -> AppResult<()> {
     }
 }
 
+#[async_trait]
 impl ConfigProvider for DatabaseProvider {
     fn name(&self) -> &'static str {
         "database"
     }
 
     fn get(&self, key: &str) -> Option<String> {
-        self.values.get(key).cloned()
+        self.values
+            .read()
+            .expect("the app_config cache lock is never held across a panic")
+            .get(key)
+            .cloned()
     }
 
     fn has(&self, key: &str) -> bool {
-        self.values.contains_key(key)
+        self.values
+            .read()
+            .expect("the app_config cache lock is never held across a panic")
+            .contains_key(key)
     }
 
     fn list(&self) -> Enumeration {
-        Enumeration::Keys(self.values.keys().cloned().collect())
+        Enumeration::Keys(
+            self.values
+                .read()
+                .expect("the app_config cache lock is never held across a panic")
+                .keys()
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// PMS-1012: upsert `key` -> `value` into `app_config` and update the
+    /// cache. The row and the cache move together, so a read that follows
+    /// a write sees the new value. A failing DB write leaves the cache and
+    /// the previous value serving.
+    async fn set(&self, key: &str, value: &str) -> AppResult<()> {
+        let db = match &self.writer {
+            WriteBackend::Real { db } => db,
+            #[cfg(test)]
+            WriteBackend::Disabled => {
+                return Err(AppError::Configuration(
+                    "database configuration provider was built without a pool; writes are \
+                     disabled"
+                        .to_string(),
+                ));
+            }
+        };
+        // SAFETY (PMS-285): app_config is application-scope and carries no
+        // RLS policy; there is no tenant GUC to set.
+        sqlx::query(
+            r#"
+            INSERT INTO app_config (name, value, created_at, updated_at)
+            VALUES ($1, $2, NOW(), NOW())
+            ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+            "#,
+        )
+        .bind(key)
+        .bind(value)
+        .execute(db.migrator_pool())
+        .await
+        .map_err(|e| AppError::Database(format!("could not write app_config row: {e}")))?;
+        self.values
+            .write()
+            .expect("the app_config cache lock is never held across a panic")
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    /// PMS-1012: delete the `app_config` row and drop the cached value. A
+    /// row that is already gone is not an error.
+    async fn delete(&self, key: &str) -> AppResult<()> {
+        let db = match &self.writer {
+            WriteBackend::Real { db } => db,
+            #[cfg(test)]
+            WriteBackend::Disabled => {
+                return Err(AppError::Configuration(
+                    "database configuration provider was built without a pool; deletes are \
+                     disabled"
+                        .to_string(),
+                ));
+            }
+        };
+        sqlx::query("DELETE FROM app_config WHERE name = $1")
+            .bind(key)
+            .execute(db.migrator_pool())
+            .await
+            .map_err(|e| AppError::Database(format!("could not delete app_config row: {e}")))?;
+        self.values
+            .write()
+            .expect("the app_config cache lock is never held across a panic")
+            .remove(key);
+        Ok(())
     }
 }
 

@@ -24,6 +24,9 @@
 //! crypto helpers to hand back bytes lands without a schema change.
 
 use std::collections::HashMap;
+use std::sync::RwLock;
+
+use async_trait::async_trait;
 
 use super::{AppSecretProvider, GovernedSecret};
 use crate::db::Database;
@@ -32,12 +35,26 @@ use crate::utils::error::{AppError, AppResult};
 
 /// The database-backed application-tier secret provider.
 ///
-/// The cache is populated once by [`DatabaseProvider::load`] and never
-/// mutated afterwards; a value written elsewhere reaches this process on the
-/// next process boot (or the next `init_from_env` invocation from an admin
-/// live-reload path, which will land with the CLI in PMS-1012).
+/// The cache is populated once by [`DatabaseProvider::load`] and kept in step
+/// with the row store through the PMS-1012 write path: [`Self::set`] encrypts,
+/// upserts, and updates the cache in one call, so a read immediately after a
+/// write returns the value just written. Cross-process writes reach this
+/// process on the next boot or the next admin live-reload.
 pub struct DatabaseProvider {
-    values: HashMap<&'static str, String>,
+    writer: WriteBackend,
+    values: RwLock<HashMap<&'static str, String>>,
+}
+
+/// The pool half of the provider, split from the cache so unit tests can
+/// build the cache without a live pool.
+enum WriteBackend {
+    /// The real backend: a database pool plus the `ENCRYPTION_KEY` needed to
+    /// encrypt on write and decrypt on load.
+    Real { db: Database, key: [u8; 32] },
+    /// A test-only sentinel; every `set`/`delete` refuses so unit tests that
+    /// only exercise the read path stay pool-free.
+    #[cfg(test)]
+    Disabled,
 }
 
 impl DatabaseProvider {
@@ -69,7 +86,7 @@ impl DatabaseProvider {
                 .await
                 .map_err(|e| AppError::Database(format!("could not preload app_secrets: {e}")))?;
 
-        let mut values: HashMap<&'static str, String> = HashMap::new();
+        let mut loaded: HashMap<&'static str, String> = HashMap::new();
         for (row_name, ciphertext) in rows {
             let Some(&secret) = GovernedSecret::ALL
                 .iter()
@@ -99,7 +116,7 @@ impl DatabaseProvider {
             match crypto::decrypt(ciphertext_str, &encryption_key) {
                 Ok(plaintext) => {
                     if !plaintext.is_empty() {
-                        values.insert(secret.name(), plaintext);
+                        loaded.insert(secret.name(), plaintext);
                     }
                 }
                 Err(e) => {
@@ -113,24 +130,118 @@ impl DatabaseProvider {
                 }
             }
         }
-        Ok(Self { values })
+        Ok(Self {
+            writer: WriteBackend::Real {
+                db: db.clone(),
+                key: encryption_key,
+            },
+            values: RwLock::new(loaded),
+        })
     }
 }
 
+#[async_trait]
 impl AppSecretProvider for DatabaseProvider {
     fn name(&self) -> &'static str {
         "database"
     }
 
     fn get(&self, secret: GovernedSecret) -> Option<String> {
-        self.values.get(secret.name()).cloned()
+        self.values
+            .read()
+            .expect("the app-tier database cache lock is never held across a panic")
+            .get(secret.name())
+            .cloned()
     }
 
     fn has(&self, secret: GovernedSecret) -> bool {
         // The value is small, but avoiding the clone in the survey is worth
         // one extra method definition: `has` is called for every provider by
         // every classification, `get` only for the one that serves.
-        self.values.contains_key(secret.name())
+        self.values
+            .read()
+            .expect("the app-tier database cache lock is never held across a panic")
+            .contains_key(secret.name())
+    }
+
+    /// PMS-1012: encrypt `value`, upsert the `app_secrets` row, and store the
+    /// plaintext in the in-memory cache so a read that follows the write sees
+    /// it. The row and the cache are updated in the same call and the cache
+    /// is only touched on a successful write, so a failing DB write leaves
+    /// the previous value serving.
+    async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
+        let (db, key) = match &self.writer {
+            WriteBackend::Real { db, key } => (db, key),
+            #[cfg(test)]
+            WriteBackend::Disabled => {
+                return Err(AppError::Configuration(
+                    "database provider was built without a pool; writes are disabled".to_string(),
+                ));
+            }
+        };
+        let ciphertext = crypto::encrypt(value, key)?;
+        let ciphertext_bytes = ciphertext.as_bytes().to_vec();
+        // SAFETY (PMS-285): app_secrets is application-scope and carries no
+        // RLS; there is no tenant GUC to set. The migrator pool owns the
+        // table (see migration 207) and is safe to use for the upsert.
+        sqlx::query(
+            r#"
+            INSERT INTO app_secrets (name, ciphertext, created_at, updated_at)
+            VALUES ($1, $2, NOW(), NOW())
+            ON CONFLICT (name) DO UPDATE SET ciphertext = EXCLUDED.ciphertext, updated_at = NOW()
+            "#,
+        )
+        .bind(secret.name())
+        .bind(&ciphertext_bytes)
+        .execute(db.migrator_pool())
+        .await
+        .map_err(|e| AppError::Database(format!("could not write app_secrets row: {e}")))?;
+        self.values
+            .write()
+            .expect("the app-tier database cache lock is never held across a panic")
+            .insert(secret.name(), value.to_string());
+        Ok(())
+    }
+
+    /// PMS-1012: delete the `app_secrets` row and drop the plaintext from the
+    /// cache. A row that is already gone is not an error: the caller
+    /// (`provider-purge`) has already checked the interlock and either the
+    /// row was never there or another writer got to it first.
+    async fn delete(&self, secret: GovernedSecret) -> AppResult<()> {
+        let db = match &self.writer {
+            WriteBackend::Real { db, .. } => db,
+            #[cfg(test)]
+            WriteBackend::Disabled => {
+                return Err(AppError::Configuration(
+                    "database provider was built without a pool; deletes are disabled".to_string(),
+                ));
+            }
+        };
+        sqlx::query("DELETE FROM app_secrets WHERE name = $1")
+            .bind(secret.name())
+            .execute(db.migrator_pool())
+            .await
+            .map_err(|e| AppError::Database(format!("could not delete app_secrets row: {e}")))?;
+        self.values
+            .write()
+            .expect("the app-tier database cache lock is never held across a panic")
+            .remove(secret.name());
+        Ok(())
+    }
+}
+
+impl DatabaseProvider {
+    /// Test-only constructor: build a provider whose cache is populated but
+    /// whose DB handle is never used. The trait's read paths hit the cache,
+    /// so this is enough to exercise `get` and `has` without a real pool;
+    /// `set` and `delete` refuse loudly, and are exercised behind an
+    /// integration test that has a pool.
+    #[cfg(test)]
+    pub(crate) fn from_cache(values: HashMap<&'static str, String>) -> Self {
+        Self {
+            writer: WriteBackend::Disabled,
+            values: RwLock::new(values),
+        }
     }
 }
 
@@ -143,29 +254,25 @@ mod tests {
     /// a real postgres pool.
     #[test]
     fn cache_serves_the_loaded_value() {
-        let provider = DatabaseProvider {
-            values: [(GovernedSecret::SmtpPassword.name(), "hunter2".to_string())]
+        let provider = DatabaseProvider::from_cache(
+            [(GovernedSecret::SmtpPassword.name(), "hunter2".to_string())]
                 .into_iter()
                 .collect(),
-        };
+        );
         assert_eq!(
             provider.get(GovernedSecret::SmtpPassword),
             Some("hunter2".to_string())
         );
         assert!(provider.has(GovernedSecret::SmtpPassword));
 
-        let empty = DatabaseProvider {
-            values: HashMap::new(),
-        };
+        let empty = DatabaseProvider::from_cache(HashMap::new());
         assert!(!empty.has(GovernedSecret::SmtpPassword));
         assert_eq!(empty.get(GovernedSecret::SmtpPassword), None);
     }
 
     #[test]
     fn database_provider_is_writable_and_named() {
-        let provider = DatabaseProvider {
-            values: HashMap::new(),
-        };
+        let provider = DatabaseProvider::from_cache(HashMap::new());
         assert!(provider.is_writable());
         assert_eq!(provider.name(), "database");
     }
