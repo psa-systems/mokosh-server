@@ -391,6 +391,24 @@ pub struct ClockInRequest {
     pub date: Option<NaiveDate>,
 }
 
+/// PMS-1145: the body of a segment correction. Every field is optional and
+/// an absent one leaves that part of the segment alone, so a caller fixing a
+/// clock-out time does not have to restate the start.
+///
+/// `ended_at` is doubly optional on purpose and the two levels mean different
+/// things: absent leaves the end as it is, and an explicit `null` REOPENS the
+/// segment, which is how a clock-out entered by mistake is undone. The
+/// service refuses the reopen when the person already has another segment
+/// open, because the partial unique index would refuse it anyway and a 409
+/// naming the reason is better than a constraint violation.
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct UpdateWorkDaySegmentRequest {
+    pub date: Option<NaiveDate>,
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub ended_at: Option<Option<DateTime<Utc>>>,
+}
+
 /// `GET /workday`: which day, and whose. `date` absent means the day of the
 /// open segment if there is one, else today in the caller's own zone, so a
 /// reload finds the clock where it was left. `user_id` is honoured for an admin and ignored for

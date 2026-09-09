@@ -8,13 +8,41 @@
 //! second concept. Nothing here creates a time entry: the day view is a reading
 //! over the rows `POST /time-entries` and the item timer already write, so an
 //! employee's day and a client's invoice are two readings of the same rows.
+//!
+//! PMS-1145 added the correction half. Until it, the five routes here all
+//! acted on *now* - clock in, clock out, break, end break - and a segment,
+//! once written, could not be changed by anything: a wrong clock-in time, a
+//! clock-out an hour late or a stray segment from a mis-tap was permanent and
+//! correctable only with database access. That is a gap against the
+//! neighbouring feature, where a `time_entries` row (the thing a customer is
+//! billed from) can be edited and deleted through the API.
+//!
+//! Three things about the correction are decisions rather than mechanics.
+//!
+//! **Who may do it is a tenant setting** (`timesheets/segment_editing`,
+//! [`SegmentEditPolicy`]), the `tickets/note_editing` shape from PMS-974,
+//! because it is the same question with the same failure mode: a value
+//! outside the closed set read as the default in silence.
+//!
+//! **The row is edited in place and the change is audited.** `audit_log` is
+//! where this codebase's history lives, and a void-and-replace column would
+//! be a second home for it - one every existing query would have to learn to
+//! skip, the partial unique index on the open segment included.
+//!
+//! **No day is frozen.** `work_day_segments` is read by this module and
+//! nothing else: an invoice bills `time_entries` and a timesheet approves
+//! `time_entries`, so a segment correction changes neither, and there is
+//! nothing for a freeze to protect. If that stops being true, this is the
+//! comment that has to change with it.
 
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
+use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
-use crate::modules::settings::read_track_breaks;
+use crate::modules::settings::{read_segment_editing, read_track_breaks};
 use crate::utils::error::{AppError, AppResult};
+use mokosh_types::auth::CurrentUser;
 use mokosh_types::datetime::user_today;
 
 use super::models::*;
@@ -41,6 +69,20 @@ impl SegmentRow {
         (self.ended_at.unwrap_or(now) - self.started_at)
             .num_minutes()
             .max(0)
+    }
+
+    /// The row as an audit payload. Written by hand rather than through
+    /// `to_jsonb(t)` so a column added later does not silently start
+    /// appearing in the audit history without anyone deciding it should.
+    fn audit_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "user_id": self.user_id,
+            "date": self.date,
+            "kind": self.kind,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+        })
     }
 
     fn into_response(self, now: DateTime<Utc>) -> WorkDaySegmentResponse {
@@ -250,6 +292,187 @@ impl TimeTrackingService {
             open_new_segment(&mut tx, tenant_id, user_id, date, SEGMENT_KIND_WORK, now).await?;
         tx.commit().await?;
         Ok(segment.into_response(now))
+    }
+
+    /// PMS-1145: correct a recorded segment.
+    ///
+    /// The policy decides WHO (see [`SegmentEditPolicy`]); this decides what
+    /// a correction may leave behind. Three refusals, and each is a state the
+    /// table's own constraints would otherwise reject with a message naming a
+    /// constraint rather than the problem:
+    ///
+    /// - an end before its start (the `CHECK` on the table),
+    /// - a second open segment for the person, which is what reopening a
+    ///   closed one can produce (the partial unique index), and
+    /// - a segment that is still open being given a start in the future,
+    ///   which would read as negative elapsed time on the day view.
+    ///
+    /// The day is not recomputed anywhere, because there is nothing to
+    /// recompute: PMS-950 derives every total from the segments on each read,
+    /// which is the property that makes this operation safe at all.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, segment_id = %segment_id))]
+    pub async fn update_segment(
+        &self,
+        tenant_id: TenantId,
+        caller: &CurrentUser,
+        ctx: &AuditCtx,
+        segment_id: Uuid,
+        request: &UpdateWorkDaySegmentRequest,
+    ) -> AppResult<WorkDaySegmentResponse> {
+        let policy = self.segment_edit_policy(tenant_id).await?;
+        let now = Utc::now();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Locked for the rest of the transaction: two corrections to one
+        // segment, or a correction racing a clock-out, must queue rather than
+        // both read the same row.
+        let sql = format!(
+            "SELECT {SEGMENT_COLUMNS} FROM work_day_segments \
+             WHERE tenant_id = $1 AND id = $2 FOR UPDATE"
+        );
+        let before: Option<SegmentRow> = sqlx::query_as(&sql)
+            .bind(tenant_id)
+            .bind(segment_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(before) = before else {
+            return Err(AppError::NotFound("Work day segment".to_string()));
+        };
+        if !policy.permits(caller, before.user_id) {
+            // 403 and not 404: the segment exists and the caller may well be
+            // able to READ the day it belongs to, so pretending it is absent
+            // would be a lie they can immediately disprove.
+            return Err(AppError::Forbidden(
+                "Not allowed to correct this work day segment".to_string(),
+            ));
+        }
+
+        let date = request.date.unwrap_or(before.date);
+        let started_at = request.started_at.unwrap_or(before.started_at);
+        // Absent leaves the end alone; an explicit null reopens the segment.
+        let ended_at = match request.ended_at {
+            None => before.ended_at,
+            Some(value) => value,
+        };
+
+        if let Some(end) = ended_at {
+            if end < started_at {
+                return Err(AppError::BadRequest(
+                    "A segment cannot end before it starts".to_string(),
+                ));
+            }
+        } else {
+            if started_at > now {
+                return Err(AppError::BadRequest(
+                    "An open segment cannot start in the future".to_string(),
+                ));
+            }
+            // Reopening while something else is open is the one refusal a
+            // caller can hit without doing anything obviously wrong, so it
+            // says which segment is in the way.
+            if let Some(open) = open_segment(&mut tx, tenant_id, before.user_id).await? {
+                if open.id != segment_id {
+                    return Err(AppError::Conflict(
+                        "This person already has an open segment; close it before reopening this one"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        let sql = format!(
+            "UPDATE work_day_segments SET date = $3, started_at = $4, ended_at = $5 \
+             WHERE tenant_id = $1 AND id = $2 RETURNING {SEGMENT_COLUMNS}"
+        );
+        let after: SegmentRow = sqlx::query_as(&sql)
+            .bind(tenant_id)
+            .bind(segment_id)
+            .bind(date)
+            .bind(started_at)
+            .bind(ended_at)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "work_day_segments",
+            Some(segment_id),
+            Some(before.audit_value()),
+            Some(after.audit_value()),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(after.into_response(now))
+    }
+
+    /// PMS-1145: remove a recorded segment.
+    ///
+    /// A delete rather than a flag, for the reason the module docs give: the
+    /// day is derived from its segments on every read, so removing one is
+    /// complete by construction, and `audit_log` holds what it was. Deleting
+    /// the OPEN segment is allowed and is how a mis-tapped clock-in is undone
+    /// - it leaves the person clocked out, which is what they were.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, segment_id = %segment_id))]
+    pub async fn delete_segment(
+        &self,
+        tenant_id: TenantId,
+        caller: &CurrentUser,
+        ctx: &AuditCtx,
+        segment_id: Uuid,
+    ) -> AppResult<()> {
+        let policy = self.segment_edit_policy(tenant_id).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let sql = format!(
+            "SELECT {SEGMENT_COLUMNS} FROM work_day_segments \
+             WHERE tenant_id = $1 AND id = $2 FOR UPDATE"
+        );
+        let before: Option<SegmentRow> = sqlx::query_as(&sql)
+            .bind(tenant_id)
+            .bind(segment_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(before) = before else {
+            return Err(AppError::NotFound("Work day segment".to_string()));
+        };
+        if !policy.permits(caller, before.user_id) {
+            return Err(AppError::Forbidden(
+                "Not allowed to correct this work day segment".to_string(),
+            ));
+        }
+
+        sqlx::query("DELETE FROM work_day_segments WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(segment_id)
+            .execute(&mut *tx)
+            .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "work_day_segments",
+            Some(segment_id),
+            Some(before.audit_value()),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The tenant's correction policy, or the default when it is unset or
+    /// holds a value the closed set does not contain. A row outside the set
+    /// cannot be written through `PUT /settings`, which validates it, but can
+    /// exist from a hand-written row - and reading it as the default is the
+    /// same fallback `NoteEditPolicy` takes for the same reason.
+    async fn segment_edit_policy(&self, tenant_id: TenantId) -> AppResult<SegmentEditPolicy> {
+        Ok(read_segment_editing(&self.db, tenant_id)
+            .await?
+            .and_then(|stored| SegmentEditPolicy::parse(&stored))
+            .unwrap_or_default())
     }
 
     /// Clock out: close whichever segment is open. A day may end on a break,
