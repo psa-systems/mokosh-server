@@ -47,6 +47,7 @@ just ci-stalls-self-test    # prove the stall report still reports, on fixtures,
 # Format, test, build
 just fmt                    # cargo fmt --all
 just test                   # cargo test
+just ensure-test-db-roles   # create the DB roles the migrations grant to, before the Postgres-backed suite
 just test-integration       # Postgres-backed tests/*.rs suite in the dev `server` container (mirrors CI integration.yml)
 just verify-demo            # the demo-critical subset of the integration suite (seed_demo + data_transfer)
 just test-e2e [args]        # Playwright E2E suite against staging or $E2E_BASE_URL (args go to `playwright test`)
