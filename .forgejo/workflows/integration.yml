@@ -156,6 +156,23 @@ jobs:
             echo "S3_SECRET_ACCESS_KEY=mokosh-ci-password"
           } >> "$GITHUB_ENV"
 
+      - name: Create the DB roles the migrations grant to
+        # PMS-988: migration 207 (`app_secrets`) ends with `GRANT ... TO
+        # mokosh_app`, and Postgres rejects a GRANT to a role that does not
+        # exist (42704), so every `#[sqlx::test]` in the suite failed at
+        # migration 207 before its body ran. A real deployment never reaches
+        # that: `provision_roles` creates the split roles at startup, before
+        # the migrations run. This job has no server startup, so the step that
+        # prepares the cluster creates the role instead. The statement lives in
+        # a file because `just ensure-test-db-roles` runs the same one against
+        # the dev cluster; scripts/test-db-roles.sql says why only the name is
+        # reproduced.
+        #
+        # ON_ERROR_STOP is not optional: psql exits 0 on a failed statement
+        # without it, which would put the failure back where it was, in the
+        # test output rather than here.
+        run: psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --file scripts/test-db-roles.sql
+
       - name: Build the integration test binaries
         # PMS-1100: compile every `tests/*.rs` binary BEFORE the timed step,
         # under only the job's outer budget. The 25 minute `timeout` below
