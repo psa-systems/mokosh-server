@@ -387,6 +387,27 @@ async fn every_work_day_route_is_gone_when_the_flag_is_off(pool: PgPool) {
             "POST {path} must read as a route that does not exist"
         );
     }
+    // PMS-1145: the correction routes carry the same gate. A route added to
+    // this file and not to this list is a feature the module flag does not
+    // actually turn off.
+    let id = Uuid::new_v4();
+    let response = app
+        .client
+        .put(app.url(&format!("/api/v1/workday/segments/{id}")))
+        .bearer_auth(&token)
+        .json(&json!({}))
+        .send()
+        .await
+        .expect("correct a segment");
+    assert_eq!(response.status(), 404, "PUT /workday/segments/{{id}}");
+    let response = app
+        .client
+        .delete(app.url(&format!("/api/v1/workday/segments/{id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("remove a segment");
+    assert_eq!(response.status(), 404, "DELETE /workday/segments/{{id}}");
 }
 
 /// A technician's day is their own; an admin may read anyone's.
