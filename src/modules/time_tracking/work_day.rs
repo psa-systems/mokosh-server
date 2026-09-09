@@ -99,6 +99,51 @@ impl SegmentRow {
     }
 }
 
+/// PMS-1146: the sentence a clock-in gets when something is already open.
+///
+/// It names the day and how long the segment has been running, because the
+/// case that produces this refusal in practice is not "you are already
+/// working" - it is a clock-out forgotten on a previous day, and the person
+/// reading it does not know that yet. Without the day, the only reading is
+/// "clock out now", which writes the whole intervening time as one segment
+/// and turns a forgotten tap into a false long day.
+///
+/// It points at the correction rather than at the clock-out for the same
+/// reason: PMS-1145 made `PUT /workday/segments/{id}` able to close a segment
+/// at a time the person chooses, so the recovery that keeps the record honest
+/// is available and worth naming here.
+fn open_segment_conflict(open: &SegmentRow, now: DateTime<Utc>) -> String {
+    let running = fmt_elapsed(open.minutes(now));
+    if open.kind == SEGMENT_KIND_BREAK {
+        format!(
+            "Already clocked in and on a break, on {} for {running}. \
+             End the break or clock out first; if the break should have ended \
+             earlier, correct that segment instead.",
+            open.date
+        )
+    } else {
+        format!(
+            "Already clocked in on {} for {running}. Clock out first; if you \
+             forgot to clock out that day, correct that segment instead so the \
+             time in between is not recorded as worked.",
+            open.date
+        )
+    }
+}
+
+/// Whole minutes as a human span: "23h 41m", "41m". Only ever used in the
+/// refusal above, so it is deliberately not a general duration formatter -
+/// the API's durations are minutes on the wire and stay that way.
+fn fmt_elapsed(minutes: i64) -> String {
+    let minutes = minutes.max(0);
+    let (hours, rest) = (minutes / 60, minutes % 60);
+    if hours > 0 {
+        format!("{hours}h {rest}m")
+    } else {
+        format!("{rest}m")
+    }
+}
+
 /// The person's open segment, whatever its kind or date, locked for the rest
 /// of the transaction so two transitions on one clock queue rather than both
 /// reading the same open row.
@@ -280,12 +325,14 @@ impl TimeTrackingService {
         let now = Utc::now();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         if let Some(open) = open_segment(&mut tx, tenant_id, user_id).await? {
-            let message = if open.kind == SEGMENT_KIND_BREAK {
-                "Already clocked in and on a break; end the break or clock out first"
-            } else {
-                "Already clocked in; clock out first"
-            };
-            return Err(AppError::Conflict(message.to_string()));
+            // PMS-1146: the refusal names what is in the way. It used to say
+            // only "Already clocked in; clock out first", which is true and
+            // useless on the case that actually produces it: a clock-out
+            // forgotten on a previous day. The person is told to clock out of
+            // a day they thought was over, with nothing saying which day, and
+            // the cheapest reading - clock out now - writes the whole
+            // intervening time as one segment.
+            return Err(AppError::Conflict(open_segment_conflict(&open, now)));
         }
         let date = request.date.unwrap_or_else(|| user_today(now, user_tz));
         let segment =
@@ -572,17 +619,26 @@ impl TimeTrackingService {
         let now = Utc::now();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        let date = match date {
-            Some(date) => date,
-            None => sqlx::query_scalar::<_, NaiveDate>(
-                "SELECT date FROM work_day_segments \
-                 WHERE tenant_id = $1 AND user_id = $2 AND ended_at IS NULL",
-            )
-            .bind(tenant_id)
-            .bind(user_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .unwrap_or_else(|| user_today(now, user_tz)),
+        // PMS-1146: which day, and where that day came from. The second half
+        // is reported because the first is not always today and a client
+        // cannot tell the difference by looking: it does not know whether the
+        // server chose the day or was handed it.
+        let (date, date_source) = match date {
+            Some(date) => (date, WorkDayDateSource::Requested),
+            None => {
+                let open_day: Option<NaiveDate> = sqlx::query_scalar(
+                    "SELECT date FROM work_day_segments \
+                     WHERE tenant_id = $1 AND user_id = $2 AND ended_at IS NULL",
+                )
+                .bind(tenant_id)
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                match open_day {
+                    Some(day) => (day, WorkDayDateSource::OpenSegment),
+                    None => (user_today(now, user_tz), WorkDayDateSource::Today),
+                }
+            }
         };
 
         let sql = format!(
@@ -647,7 +703,66 @@ impl TimeTrackingService {
             logged_minutes,
             unlogged_minutes: clocked_minutes - logged_minutes,
             breakdown: bucket(rows),
+            date_source,
         })
+    }
+}
+
+#[cfg(test)]
+mod pms1146_tests {
+    use super::*;
+
+    fn segment(kind: &str, date: (i32, u32, u32), started: &str) -> SegmentRow {
+        SegmentRow {
+            id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            date: NaiveDate::from_ymd_opt(date.0, date.1, date.2).expect("a date"),
+            kind: kind.to_string(),
+            started_at: started.parse().expect("a start"),
+            ended_at: None,
+        }
+    }
+
+    /// The refusal names the day and the elapsed time. Both halves matter and
+    /// for different reasons: the day, because the person believes that day
+    /// ended; the elapsed, because twenty-three hours is what tells them this
+    /// is a forgotten clock-out rather than this morning.
+    #[test]
+    fn the_refusal_names_the_day_and_how_long_it_has_run() {
+        let open = segment("work", (2026, 6, 15), "2026-06-15T09:14:00Z");
+        let now: DateTime<Utc> = "2026-06-16T08:55:00Z".parse().expect("now");
+        let message = open_segment_conflict(&open, now);
+        assert!(message.contains("2026-06-15"), "the day: {message}");
+        assert!(message.contains("23h 41m"), "the elapsed: {message}");
+        // And it points at the correction, which is the route that can close
+        // it at the right time (PMS-1145).
+        assert!(message.contains("correct that segment"), "{message}");
+    }
+
+    /// A break says so, because "clock out first" is the wrong instruction
+    /// when what is open is a break.
+    #[test]
+    fn a_break_gets_its_own_refusal() {
+        let open = segment("break", (2026, 6, 15), "2026-06-15T12:30:00Z");
+        let now: DateTime<Utc> = "2026-06-15T13:05:00Z".parse().expect("now");
+        let message = open_segment_conflict(&open, now);
+        assert!(message.contains("on a break"), "{message}");
+        assert!(message.contains("End the break"), "{message}");
+        assert!(
+            message.contains("35m"),
+            "under an hour drops the hours: {message}"
+        );
+    }
+
+    /// Minutes only below an hour, and a clock that somehow reads backwards
+    /// does not produce a negative span in a message.
+    #[test]
+    fn the_elapsed_span_is_readable_at_both_ends() {
+        assert_eq!(fmt_elapsed(0), "0m");
+        assert_eq!(fmt_elapsed(59), "59m");
+        assert_eq!(fmt_elapsed(60), "1h 0m");
+        assert_eq!(fmt_elapsed(1421), "23h 41m");
+        assert_eq!(fmt_elapsed(-5), "0m");
     }
 }
 
