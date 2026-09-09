@@ -1,5 +1,5 @@
 //! The database configuration provider (PMS-987): read declared keys out of
-//! the `app_config` table (migration 206).
+//! the `app_config` table (migration 210).
 //!
 //! `app_config` is one row per key (`name` PRIMARY KEY), the value stored
 //! in plaintext because this is configuration, not secrets. The encrypted
@@ -64,7 +64,7 @@ impl DatabaseProvider {
         // SAFETY (PMS-285): app_config is application-scope and carries no
         // RLS policy; there is no tenant GUC to set. `db.pool()` is the
         // request-serving `mokosh_app` pool, which has SELECT on the table
-        // per migration 206.
+        // per migration 210.
         let rows: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
             "SELECT name, value FROM app_config WHERE name = ANY($1)",
         )
