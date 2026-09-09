@@ -1,4 +1,4 @@
--- PMS-1117: apply the guarded-content-UPDATE assertion (migration 205) to
+-- PMS-1117: apply the guarded-content-UPDATE assertion (migration 208) to
 -- notification_templates first, since `auth.password_reset` and
 -- `auth.welcome` are the two rows migrations 139 and 152 silently missed.
 --

@@ -13,7 +13,7 @@
 # matched zero rows on every database that ever ran them, and neither was
 # caught by review, CI, or deploy.
 #
-# Migration 205 (`mokosh_assert_content_rows_matched`) gives every future
+# Migration 208 (`mokosh_assert_content_rows_matched`) gives every future
 # guarded content UPDATE a way to assert its own match count and RAISE instead
 # of silently no-opping; CLAUDE.md's Migrations section documents the
 # convention. This script is the CI half: any migration numbered above the
@@ -26,9 +26,9 @@
 # Migrations already committed are exempt: the convention "applies only to
 # migrations written after it" (PMS-1117's own stated cost), and migrations are
 # immutable, so 139/152/203/204 cannot be retrofitted. `CUTOFF_PREFIX` is
-# migration 206, the last migration that predates this check.
+# migration 209, the last migration that predates this check.
 
-const CUTOFF_PREFIX = 206
+const CUTOFF_PREFIX = 209
 
 # Free-text columns known to hold guardable seeded content. Extend this list
 # (not the regex shape) when a guarded content UPDATE against a new column
@@ -77,7 +77,7 @@ def main [] {
         print --stderr "how it silently no-ops when a prior migration already rewrote that text."
         print --stderr "Wrap the UPDATE in a DO block, capture GET DIAGNOSTICS matched = ROW_COUNT,"
         print --stderr "and call mokosh_assert_content_rows_matched(matched, expected, context) (see"
-        print --stderr "migration 205) so a zero-row match fails the migration instead of shipping."
+        print --stderr "migration 208) so a zero-row match fails the migration instead of shipping."
         print --stderr ($violations | table)
         exit 1
     }
