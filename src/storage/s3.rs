@@ -712,7 +712,7 @@ mod tests {
         );
         assert_eq!(
             S3Provider::object_key(&ObjectKey::tenant_logo(TENANT, "png")).unwrap(),
-            format!("tenant-logos/{TENANT}.png")
+            format!("{TENANT}/logo.png")
         );
         assert_eq!(
             S3Provider::object_key(&ObjectKey::kb_attachment(TENANT, OBJECT)).unwrap(),
