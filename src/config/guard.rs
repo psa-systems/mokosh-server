@@ -74,6 +74,19 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
                  configuration and cannot be served by what it locates. Whether provider \
                  selection should itself come from a provider is PMS-987's question",
     },
+    EntryPoint {
+        path: "src/config/file.rs",
+        reason: "the file configuration provider (PMS-987) reads CONFIG_FILE_DIR at \
+                 construction; a provider cannot be built from a value served by itself, \
+                 which is why CONFIG_FILE_DIR is a bootstrap key",
+    },
+    EntryPoint {
+        path: "src/config/bunyip.rs",
+        reason: "the Bunyip configuration provider (PMS-987) reads BUNYIP_CONFIG_URL, \
+                 BUNYIP_CONFIG_CLIENT_ID and BUNYIP_CONFIG_CLIENT_SECRET at construction; \
+                 the machine credential a provider authenticates with cannot be served by \
+                 what it authenticates for",
+    },
 ];
 
 #[cfg(test)]
@@ -149,13 +162,19 @@ mod tests {
             if !source.contains(&needle) {
                 continue;
             }
+            // ENTRY_POINTS is checked BEFORE the `src/config/` blanket skip
+            // so a sub-module inside the provider can be a documented entry
+            // point rather than being lost in the prefix (PMS-987 sub-provider
+            // files). The blanket skip below then covers `mod.rs`, `env.rs`
+            // and any other read that legitimately lives beside the seam
+            // itself.
+            if ENTRY_POINTS.iter().any(|entry| entry.path == file) {
+                entry_point_reads += 1;
+                continue;
+            }
             // The provider itself, and the registry beside it, are where the
             // reads are supposed to be.
             if file.starts_with("src/config/") {
-                continue;
-            }
-            if ENTRY_POINTS.iter().any(|entry| entry.path == file) {
-                entry_point_reads += 1;
                 continue;
             }
             if MIGRATED_READS.contains(&file.as_str()) {
