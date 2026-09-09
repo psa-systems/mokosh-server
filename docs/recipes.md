@@ -24,6 +24,7 @@ just check-fmt              # cargo fmt --all --check
 just check-docker           # build the OCI image's builder stage only (validation; NOT in `just check`)
 just check-migrations       # fail if two migrations share a numeric prefix
 just check-migration-immutability # fail if a migration already on main is modified or deleted
+just check-guarded-content-migrations # fail if a migration after 209 guards a content UPDATE without asserting its row count
 just check-pool-safety      # fail if a serving `.pool()` call lacks its `// SAFETY` note
 just check-validate-parity  # fail if a Create*Request and its Update*Request validate a field differently
 just check-mail-copy        # fail if a `Mailer` helper duplicates a seeded template's copy
@@ -46,6 +47,7 @@ just ci-stalls-self-test    # prove the stall report still reports, on fixtures,
 # Format, test, build
 just fmt                    # cargo fmt --all
 just test                   # cargo test
+just ensure-test-db-roles   # create the DB roles the migrations grant to, before the Postgres-backed suite
 just test-integration       # Postgres-backed tests/*.rs suite in the dev `server` container (mirrors CI integration.yml)
 just verify-demo            # the demo-critical subset of the integration suite (seed_demo + data_transfer)
 just test-e2e [args]        # Playwright E2E suite against staging or $E2E_BASE_URL (args go to `playwright test`)
