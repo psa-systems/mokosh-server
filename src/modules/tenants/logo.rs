@@ -75,6 +75,15 @@ impl Default for TenantLogoConfig {
 
 /// The extension a stored logo takes, or `bin` for a mime that never passed
 /// [`check_mime`] (unreachable through the routes; kept total for callers).
+///
+/// Public as `extension_for_mime` for `TenantLogoMover`, which reads a mime out
+/// of a branding row and has to reach the same extension the upload stored the
+/// file under. A second mapping there would be a mover that looks in the wrong
+/// place and reports success.
+pub fn extension_for_mime(mime: &str) -> &'static str {
+    extension_for(mime)
+}
+
 fn extension_for(mime: &str) -> &'static str {
     EXTENSIONS
         .iter()
@@ -181,10 +190,26 @@ impl TenantLogoStore {
     }
 
     /// Read the stored bytes for a tenant whose branding says it has a logo.
+    ///
+    /// Falls back to the pre-move shared-directory location, because a logo
+    /// uploaded before the layout changed is still sitting there until
+    /// `TenantLogoMover` reaches it, and the alternative is every such tenant's
+    /// mark disappearing from their portal and their emails between the deploy
+    /// and the first tick. The fallback is a named legacy KEY rather than a
+    /// second lookup inside the provider, so it is visible here and dies with
+    /// the variant.
     pub async fn read(&self, tenant_id: Uuid, mime: &str) -> AppResult<Vec<u8>> {
         let mime = check_mime(mime)?;
+        let extension = extension_for(mime);
+        if let Ok(bytes) = self
+            .store
+            .read(&ObjectKey::tenant_logo(tenant_id, extension))
+            .await
+        {
+            return Ok(bytes);
+        }
         self.store
-            .read(&ObjectKey::tenant_logo(tenant_id, extension_for(mime)))
+            .read(&ObjectKey::legacy_tenant_logo(tenant_id, extension))
             .await
             .map_err(|_| AppError::NotFound("Logo".to_string()))
     }
@@ -192,11 +217,18 @@ impl TenantLogoStore {
     /// Delete every stored format for this tenant. Best effort: a logo the
     /// branding no longer points at is invisible, so a failed unlink must not
     /// fail the request that cleared it.
+    /// Both locations, for as long as both can hold a file: a replace that
+    /// cleared only the new path would leave the pre-move file behind, and the
+    /// read above would serve it as if the logo had never been replaced.
     pub async fn remove(&self, tenant_id: Uuid) {
         for (_, extension) in EXTENSIONS {
             let _ = self
                 .store
                 .delete(&ObjectKey::tenant_logo(tenant_id, *extension))
+                .await;
+            let _ = self
+                .store
+                .delete(&ObjectKey::legacy_tenant_logo(tenant_id, *extension))
                 .await;
         }
     }

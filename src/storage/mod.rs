@@ -97,9 +97,24 @@ pub enum ObjectKind {
     /// A file attached to a ticket or a ticket note. Stored per tenant since
     /// PMS-19, which is why this one already had isolation in its path.
     TicketAttachment { id: Uuid },
-    /// The tenant's logo, named for the tenant inside a shared directory. The
-    /// extension comes from the validated mime type, and is the only
-    /// caller-supplied string anywhere in this module: see `validate_segment`.
+    /// The tenant's live logo, under its own tenant directory. The extension
+    /// comes from the validated mime type, and is the only caller-supplied
+    /// string anywhere in this module: see `validate_segment`.
+    ///
+    /// It was `tenant-logos/{tenant}.{ext}` until this change: a shared
+    /// directory with the tenant in the FILENAME, which is the last kind still
+    /// shaped that way after PMS-960 moved KB attachments out of it. The tenant
+    /// was never missing from that path, so this is not an isolation fix; it is
+    /// that one directory per tenant is the layout every other kind already
+    /// has, and a per-tenant prefix is what a per-tenant bucket or quota is
+    /// later built on.
+    ///
+    /// `{tenant}/logo.{ext}` and not `{tenant}/branding/logo.{ext}`, because
+    /// `{tenant}/branding/` holds the content-addressed frozen copies
+    /// ([`ObjectKind::BrandingLogo`]) and this object is the opposite of those:
+    /// one per tenant, overwritten in place. It cannot collide with a ticket
+    /// attachment beside it, which is `{tenant}/{uuid}`, because `logo` is not
+    /// a UUID.
     TenantLogo { extension: String },
     /// An image embedded in a KB article (PMS-923).
     ///
@@ -156,6 +171,19 @@ pub enum ObjectKind {
     /// rather than from a request: the mover, and the public read's fallback.
     /// Delete this variant once no deployment can still hold a file under it.
     LegacyKbAttachment { id: Uuid },
+    /// Where the live logo used to live: `tenant-logos/{tenant}.{ext}`, a
+    /// shared directory with the tenant in the filename.
+    ///
+    /// Its own variant for the same reason [`ObjectKind::LegacyKbAttachment`]
+    /// is one: reaching the old location has to mean saying "legacy" at the
+    /// call site, because a fallback hidden inside a provider applies to every
+    /// read. Every logo uploaded before this change is at one of these until
+    /// the mover reaches it, and its three callers all derive the tenant from a
+    /// database row rather than from a request: the mover, the read fallback,
+    /// and the delete that clears a replaced logo.
+    ///
+    /// Delete this variant once no deployment can still hold a file under it.
+    LegacyTenantLogo { extension: String },
 }
 
 /// How long an object has to be kept (PMS-959).
@@ -192,6 +220,7 @@ impl ObjectKind {
             | ObjectKind::TenantLogo { .. }
             | ObjectKind::KbAttachment { .. }
             | ObjectKind::LegacyKbAttachment { .. }
+            | ObjectKind::LegacyTenantLogo { .. }
             // A frozen logo lives as long as the documents that show it, which
             // is the financial retention above; it is content-addressed and
             // shared, so it cannot be reasoned about on its own and no sweep
@@ -257,6 +286,17 @@ impl ObjectKey {
         Self {
             tenant_id,
             kind: ObjectKind::LegacyKbAttachment { id },
+        }
+    }
+
+    /// The shared-directory location the live logo used to have. See
+    /// [`ObjectKind::LegacyTenantLogo`] for who may call this.
+    pub fn legacy_tenant_logo(tenant_id: Uuid, extension: impl Into<String>) -> Self {
+        Self {
+            tenant_id,
+            kind: ObjectKind::LegacyTenantLogo {
+                extension: extension.into(),
+            },
         }
     }
 }
@@ -398,7 +438,7 @@ impl ObjectKey {
                 // in this module. Everything else is a UUID, which cannot
                 // contain a separator or a dot-dot by construction.
                 validate_segment(extension)?;
-                PathBuf::from("tenant-logos").join(format!("{}.{extension}", self.tenant_id))
+                PathBuf::from(self.tenant_id.to_string()).join(format!("logo.{extension}"))
             }
             ObjectKind::KbAttachment { id } => PathBuf::from(self.tenant_id.to_string())
                 .join("kb-articles")
@@ -418,6 +458,10 @@ impl ObjectKey {
             }
             ObjectKind::LegacyKbAttachment { id } => {
                 PathBuf::from("kb-articles").join(id.to_string())
+            }
+            ObjectKind::LegacyTenantLogo { extension } => {
+                validate_segment(extension)?;
+                PathBuf::from("tenant-logos").join(format!("{}.{extension}", self.tenant_id))
             }
         };
         Ok(path)
@@ -697,8 +741,16 @@ mod tests {
                 .unwrap(),
             PathBuf::from(format!("/data/attachments/{TENANT}/{OBJECT}"))
         );
+        // Under its tenant since PMS-960's follow-up; the shared directory it
+        // came from is still addressable, because every logo uploaded before
+        // that release is sitting at it until the mover reaches it.
         assert_eq!(
             s.path_for(&ObjectKey::tenant_logo(TENANT, "png")).unwrap(),
+            PathBuf::from(format!("/data/attachments/{TENANT}/logo.png"))
+        );
+        assert_eq!(
+            s.path_for(&ObjectKey::legacy_tenant_logo(TENANT, "png"))
+                .unwrap(),
             PathBuf::from(format!("/data/attachments/tenant-logos/{TENANT}.png"))
         );
         // PMS-960 moved this one under its tenant. The path it came from is
@@ -836,10 +888,24 @@ mod tests {
                 "{hostile:?} must be refused"
             );
         }
+        // The legacy key takes the same string and must refuse the same set:
+        // it is reached with the extension read back out of a branding row,
+        // and a row can hold whatever an older release let through.
+        for hostile in ["../x", "..", "png/../../..", "png\0", "", "a/b"] {
+            assert!(
+                s.path_for(&ObjectKey::legacy_tenant_logo(TENANT, hostile))
+                    .is_err(),
+                "{hostile:?} must be refused on the legacy key too"
+            );
+        }
         // And the real ones still work.
         for ok in ["png", "jpeg", "jpg", "gif", "webp", "bin"] {
             let path = s.path_for(&ObjectKey::tenant_logo(TENANT, ok)).unwrap();
-            assert!(path.starts_with("/data/attachments/tenant-logos"));
+            assert!(path.starts_with(format!("/data/attachments/{TENANT}")));
+            let legacy = s
+                .path_for(&ObjectKey::legacy_tenant_logo(TENANT, ok))
+                .unwrap();
+            assert!(legacy.starts_with("/data/attachments/tenant-logos"));
         }
     }
 
