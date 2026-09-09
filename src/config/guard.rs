@@ -48,9 +48,23 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
     },
     EntryPoint {
         path: "src/secrets/mod.rs",
-        reason: "the one reader of SECRET_BACKEND: provider enablement is bootstrap \
-                 configuration, and configuration that says where to find configuration cannot \
-                 live inside what it locates",
+        reason: "the one reader of SECRET_BACKEND for the tenant tier: provider enablement is \
+                 bootstrap configuration, and configuration that says where to find configuration \
+                 cannot live inside what it locates",
+    },
+    EntryPoint {
+        path: "src/app_secrets/mod.rs",
+        reason: "the one reader of SECRET_BACKEND for the application tier (PMS-988), separate \
+                 from the tenant tier's reader because the two tiers accept different provider \
+                 sets and each is the entry point for its own tier's selection",
+    },
+    EntryPoint {
+        path: "src/app_secrets/env.rs",
+        reason: "the {NAME}_FILE compose-secret variables the app-tier environment provider \
+                 reads are computed from GovernedSecret::name() (PMS-988), so they are not \
+                 declared configuration keys; the environment provider is what a config-served \
+                 declaration would have been built out of, so it reads env directly for the \
+                 same reason SECRET_BACKEND does",
     },
     EntryPoint {
         path: "src/secrets/infisical.rs",

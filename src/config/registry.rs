@@ -176,6 +176,10 @@ declare_keys! {
     /// AES-256-GCM key for at-rest encryption, which a database-backed
     /// provider would need in order to read anything it stored.
     Bootstrap ENCRYPTION_KEY = "ENCRYPTION_KEY";
+    /// PMS-988: directory the file-backed application-tier secret provider
+    /// reads. A provider is built from this at boot, so it is bootstrap; unset
+    /// means the file provider is not enabled and holds nothing.
+    Bootstrap APP_SECRETS_DIR = "APP_SECRETS_DIR";
 
     // -- Application: the server's own shape ---------------------------------
 
@@ -317,7 +321,12 @@ mod tests {
             .collect();
         assert_eq!(
             bootstrap,
-            ["DATABASE_URL", "MOKOSH_APP_DATABASE_URL", "ENCRYPTION_KEY"],
+            [
+                "DATABASE_URL",
+                "MOKOSH_APP_DATABASE_URL",
+                "ENCRYPTION_KEY",
+                "APP_SECRETS_DIR",
+            ],
             "adding a bootstrap key means arguing that a provider cannot serve it"
         );
     }
