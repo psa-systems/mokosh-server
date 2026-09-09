@@ -61,6 +61,11 @@ const SEEDED_EVENT_TYPES: &[&str] = &[
     "sla.breached",
     "auth.password_reset",
     "auth.welcome",
+    // PMS-1140: the portal-side halves. Without these a fixture tenant's
+    // customer gets no password-reset mail in mailpit at all, which is the
+    // silence this seed exists to prevent.
+    "auth.portal_password_reset",
+    "auth.portal_welcome",
     "forms.request_link",
 ];
 
