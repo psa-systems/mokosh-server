@@ -60,6 +60,15 @@ const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
 ///
 /// * `_sqlx_migrations` - sqlx's own ledger. Global schema state, written only
 ///   by the BYPASSRLS migrator role, holding no tenant data.
+/// * `app_secrets` - the application-tier secret store (PMS-988, migration
+///   `207_app_secrets_table.sql`). Application tier means process-wide by
+///   definition: one row per governed secret for the whole deployment, so
+///   there is no tenant column to scope by and no parent to join through. Its
+///   only reader is `DatabaseProvider::load` (`src/app_secrets/database.rs`,
+///   carrying the `SAFETY (PMS-285)` note), which preloads every governed
+///   secret at boot on the request-serving pool with no `app.current_tenant`
+///   GUC, because there is no tenant at that point and never will be. The
+///   migration header decided this; the entry here is what makes it a rule.
 /// * `identities` - the cross-tenant identity plane (MAPPS-475, migration
 ///   `157_identities_and_memberships.sql`). One human is one row that exists
 ///   across every tenant they hold a seat in, so there is no tenant to scope to
@@ -83,6 +92,7 @@ const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
 /// and `128`). PMS-874.
 const TENANTLESS_WITHOUT_RLS: &[&str] = &[
     "_sqlx_migrations",
+    "app_secrets",
     "identities",
     "platform_admins",
     "tenants",
