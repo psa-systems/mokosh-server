@@ -735,6 +735,276 @@ pub fn try_refresh(request: RefreshRequest) -> RefreshOutcome {
     }
 }
 
+// -- PMS-984: staleness report -------------------------------------------
+
+/// What the current provider's `list()` said about its contents, in the shape
+/// a staleness report renders.
+///
+/// `Supported` and `Unsupported` are DIFFERENT facts, and never collapse into
+/// each other. An empty `Supported(Vec::new())` says "I listed my keys and
+/// there were none"; `Unsupported` says "I cannot enumerate". Merging the
+/// two would have an operator purge a value that is still the only copy of
+/// it. This is the AC #6 line the report exists to hold.
+#[derive(Clone, PartialEq, Eq)]
+pub enum EnumerationStatus {
+    /// The provider listed its keys. The `Vec` is the NAMES the provider says
+    /// it holds, never a value.
+    Supported(Vec<String>),
+    /// The provider does not implement enumeration.
+    Unsupported,
+}
+
+impl EnumerationStatus {
+    /// Adapt the trait's [`Enumeration`] into the report-facing shape.
+    fn from_enumeration(enumeration: Enumeration) -> Self {
+        match enumeration {
+            Enumeration::Keys(keys) => EnumerationStatus::Supported(keys),
+            Enumeration::Unsupported => EnumerationStatus::Unsupported,
+        }
+    }
+}
+
+/// Redaction-safe `Debug`: prints only the enumeration shape and, when
+/// `Supported`, the key NAMES the provider listed. The [`ConfigProvider`]
+/// trait's `list()` returns names by construction, so this is safe by
+/// construction; hand-rolled rather than derived so a future field on
+/// `Supported` (a per-key attribute, say) does not silently reach a log.
+impl std::fmt::Debug for EnumerationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnumerationStatus::Supported(names) => f
+                .debug_tuple("EnumerationStatus::Supported")
+                .field(names)
+                .finish(),
+            EnumerationStatus::Unsupported => f.write_str("EnumerationStatus::Unsupported"),
+        }
+    }
+}
+
+/// Whether the recorded generation and a live presence check agree on this
+/// key.
+///
+/// The four variants stay OPEN even where today's single-provider slot
+/// cannot itself produce a given transition, so wiring the PMS-987 provider
+/// chain later lights up a variant instead of adding one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StalenessState {
+    /// Recorded and live agree: either both say the same provider serves it,
+    /// or both say nobody does.
+    Unchanged,
+    /// The recorded generation said no provider held this key; the live
+    /// probe says one does now. An operator added a value since the
+    /// resolution.
+    AppearedSinceResolution,
+    /// The recorded generation said a provider held this key; the live probe
+    /// says nobody does. An operator removed a value since the resolution.
+    DisappearedSinceResolution,
+    /// The recorded generation said one provider held this key; the live
+    /// probe says a DIFFERENT provider holds it now.
+    ///
+    /// Today the single-provider slot cannot itself produce this transition:
+    /// [`Generation::served_by`] names the one installed provider and the
+    /// live probe walks that same one, so a served key can only be seen by
+    /// its recorder or by nobody. The variant is derived from the shape
+    /// anyway, so the PMS-987 chain wiring lights it up without another
+    /// API-shape change.
+    ChangedProviderSinceResolution,
+}
+
+/// One declared key's contribution to a [`StalenessReport`].
+///
+/// The recorded serving provider and the live presence result are stored as
+/// TWO facts and never collapsed into one, because their DIVERGENCE is the
+/// whole signal the report exists to name. A single column reading "current"
+/// would hide a provider that stopped holding a key boot said it held, which
+/// is exactly the moment an operator refreshes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StalenessRow {
+    /// The key name (NAME only, never the value).
+    pub key: &'static str,
+    /// PMS-1075: the sentence naming what stops working when no provider
+    /// holds this key. Mirrored here so the operator sees why an absent key
+    /// matters.
+    pub feature: Option<&'static str>,
+    /// The provider the RECORDED generation says served this key. `None`
+    /// means nobody held it at the moment the recorded generation was
+    /// resolved.
+    pub recorded_served_by: Option<&'static str>,
+    /// Whether the current provider holds the key TODAY, from a fresh
+    /// `ConfigProvider::has(key.name())` call. Presence only, never the
+    /// value.
+    pub live_holds: bool,
+    /// Derived from `recorded_served_by` and `live_holds`.
+    pub state: StalenessState,
+}
+
+/// Redaction-safe `Debug`: prints only the key NAME, the feature sentence,
+/// provider NAMES, and booleans. No value field exists on this row and none
+/// is added: `no_value_field_in_staleness_row` reads this file's own source
+/// and fails the build on a `value:` or `resolved_value:` addition, the way
+/// `finance_gate::UNGATED` scans its own source.
+impl std::fmt::Debug for StalenessRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StalenessRow")
+            .field("key", &self.key)
+            .field("feature", &self.feature)
+            .field("recorded_served_by", &self.recorded_served_by)
+            .field("live_holds", &self.live_holds)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+/// A snapshot of the divergence between the recorded generation and the
+/// providers as they stand right now.
+///
+/// This is PMS-984's OBSERVATION half. [`try_refresh`] is the ACTION half;
+/// the two live at the same URL when the admin endpoint lands (PMS-989 /
+/// PMS-1012), and the operator's job is to spot the [`Self::divergent_keys`]
+/// list and refresh. The report itself is side-effect-free beyond
+/// `Utc::now()`: it never mutates a generation, never calls [`try_refresh`],
+/// and never reads a value.
+///
+/// Recorded state (generation number, resolved timestamp, actor) and live
+/// state (checked timestamp, per-key `live_holds`, provider `enumeration`)
+/// are kept as TWO sets of facts rather than merged, because the whole point
+/// of the report is their divergence.
+#[derive(Clone)]
+pub struct StalenessReport {
+    /// The recorded generation's number, from the snapshot.
+    pub generation_number: u64,
+    /// When the recorded generation was resolved.
+    pub resolved_at: DateTime<Utc>,
+    /// Who caused the recorded generation to be resolved (PMS-986). Carried
+    /// so the operator-facing surface can say who last refreshed it.
+    pub actor: RefreshActor,
+    /// When THIS live check ran. Kept separate from [`Self::resolved_at`] so
+    /// an operator can see the check itself is fresh even when the
+    /// generation is old.
+    pub checked_at: DateTime<Utc>,
+    /// One row per declared key, in [`REGISTRY`] order.
+    pub rows: Vec<StalenessRow>,
+    /// The provider's `list()` outcome for this deployment. `Unsupported`
+    /// and an empty `Supported` are different facts (`docs/providers.md`),
+    /// so the two never collapse.
+    pub enumeration: EnumerationStatus,
+}
+
+impl StalenessReport {
+    /// The subset of [`Self::rows`] whose recorded serving provider and live
+    /// presence disagree.
+    ///
+    /// This is the "flag divergence naming the keys" acceptance criterion:
+    /// the operator-facing surface (PMS-989 endpoint, future admin page)
+    /// reads it directly and names each key it returns. A pure function; no
+    /// I/O.
+    pub fn divergent_keys(&self) -> Vec<&StalenessRow> {
+        self.rows
+            .iter()
+            .filter(|row| row.state != StalenessState::Unchanged)
+            .collect()
+    }
+}
+
+/// Redaction-safe `Debug`: prints the generation number, the actor, the two
+/// timestamps, the per-key rows (which the row's own [`Debug`] redacts) and
+/// the enumeration shape. Never a value. Hand-rolled rather than derived so
+/// a future field cannot silently reach a log line.
+impl std::fmt::Debug for StalenessReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StalenessReport")
+            .field("generation_number", &self.generation_number)
+            .field("resolved_at", &self.resolved_at)
+            .field("actor", &self.actor)
+            .field("checked_at", &self.checked_at)
+            .field("rows", &self.rows)
+            .field("enumeration", &self.enumeration)
+            .finish()
+    }
+}
+
+/// Run a live presence check against every enabled provider and pair it with
+/// the recorded generation (PMS-984).
+///
+/// Side-effect-free beyond `Utc::now()`: reads only through
+/// [`snapshot()`](self::snapshot), [`Generation::served_by`],
+/// [`ConfigProvider::has`], [`ConfigProvider::list`] and
+/// [`ConfigProvider::name`]. Never calls
+/// [`Generation::value`](Generation::value), [`ConfigProvider::get`],
+/// [`try_refresh`], or [`refresh`]; the refresh CONTROL is a separate
+/// operator action.
+pub fn check_staleness() -> StalenessReport {
+    let recorded = snapshot();
+    let provider = provider();
+    check_staleness_against(&recorded, provider.as_ref())
+}
+
+/// The pure inner form of [`check_staleness`], taking the recorded
+/// generation and the live provider as arguments so the report's DERIVATION
+/// is testable without swapping the process-global `PROVIDER` slot.
+///
+/// [`check_staleness`] is the shipping caller; nothing outside `src/config/`
+/// reaches for this.
+fn check_staleness_against(
+    recorded: &Generation,
+    provider: &dyn ConfigProvider,
+) -> StalenessReport {
+    let live_provider_name = provider.name();
+    let rows = REGISTRY
+        .iter()
+        .map(|key| {
+            let recorded_served_by = recorded.served_by(key);
+            let live_holds = provider.has(key.name());
+            let state = derive_staleness_state(recorded_served_by, live_holds, live_provider_name);
+            StalenessRow {
+                key: key.name(),
+                feature: key.feature(),
+                recorded_served_by,
+                live_holds,
+                state,
+            }
+        })
+        .collect();
+    StalenessReport {
+        generation_number: recorded.number(),
+        resolved_at: recorded.resolved_at(),
+        actor: recorded.actor().clone(),
+        checked_at: Utc::now(),
+        rows,
+        enumeration: EnumerationStatus::from_enumeration(provider.list()),
+    }
+}
+
+/// Reduce a recorded serving provider and a live presence result to one of
+/// the four [`StalenessState`] variants.
+///
+/// The rules, in order:
+///
+/// - Nobody recorded, nobody holds -> `Unchanged`.
+/// - Nobody recorded, someone holds -> `AppearedSinceResolution`.
+/// - Someone recorded, nobody holds -> `DisappearedSinceResolution`.
+/// - Someone recorded, someone holds: the same provider is `Unchanged`; a
+///   different one is `ChangedProviderSinceResolution` (which today's
+///   single-provider slot cannot itself produce; the PMS-987 chain will).
+fn derive_staleness_state(
+    recorded_served_by: Option<&'static str>,
+    live_holds: bool,
+    live_provider_name: &'static str,
+) -> StalenessState {
+    match (recorded_served_by, live_holds) {
+        (None, false) => StalenessState::Unchanged,
+        (None, true) => StalenessState::AppearedSinceResolution,
+        (Some(_), false) => StalenessState::DisappearedSinceResolution,
+        (Some(recorded_provider), true) => {
+            if recorded_provider == live_provider_name {
+                StalenessState::Unchanged
+            } else {
+                StalenessState::ChangedProviderSinceResolution
+            }
+        }
+    }
+}
+
 /// Refuse a per-key refresh of a bootstrap-tier key (PMS-986).
 ///
 /// The helper an admin endpoint calls before threading a key into a
@@ -1838,6 +2108,274 @@ mod tests {
 
         // The current() Arc is the newly-installed one, not the snapshot.
         assert!(!Arc::ptr_eq(&snap, &generation));
+    }
+
+    // -- PMS-984: staleness report ---------------------------------------
+
+    /// Build a generation directly, bypassing [`Generation::resolve`], so a
+    /// test can seed a row's `served_by` independent of what any live
+    /// provider says. The registry-order invariant is preserved: the caller
+    /// hands one entry per declared key.
+    fn generation_with_entries(entries: Vec<Resolved>, actor: RefreshActor) -> Generation {
+        assert_eq!(
+            entries.len(),
+            REGISTRY.len(),
+            "a fabricated generation must hold one entry per declared key"
+        );
+        Generation {
+            number: 7,
+            resolved_at: Utc::now(),
+            entries,
+            actor,
+        }
+    }
+
+    /// Seed a resolved entry naming `served_by` for `target`, and `None` for
+    /// every other declared key.
+    fn one_key_recorded(target: &ConfigKey, served_by: Option<&'static str>) -> Vec<Resolved> {
+        REGISTRY
+            .iter()
+            .map(|key| {
+                if key.name() == target.name() {
+                    Resolved {
+                        value: None,
+                        served_by,
+                    }
+                } else {
+                    Resolved {
+                        value: None,
+                        served_by: None,
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Every declared key marked `served_by = Some(name)` and holding no
+    /// value: the "recorded generation served by X" baseline the redaction
+    /// and enumeration tests need.
+    fn all_keys_recorded_as(served_by: &'static str) -> Vec<Resolved> {
+        REGISTRY
+            .iter()
+            .map(|_| Resolved {
+                value: None,
+                served_by: Some(served_by),
+            })
+            .collect()
+    }
+
+    /// A key the recorded generation says the current provider served AND
+    /// that the live provider still holds resolves to
+    /// [`StalenessState::Unchanged`]: recorded and live agree, and the key
+    /// does NOT appear in [`StalenessReport::divergent_keys`].
+    #[test]
+    fn a_key_the_recorded_and_live_both_hold_is_unchanged() {
+        let provider = MapProvider::new("test", &[("SMTP_HOST", "relay.example.com")]);
+        let recorded = generation_with_entries(
+            one_key_recorded(&registry::SMTP_HOST, Some("test")),
+            RefreshActor::System,
+        );
+        let report = check_staleness_against(&recorded, &provider);
+
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.key == "SMTP_HOST")
+            .expect("SMTP_HOST must appear in the report");
+        assert_eq!(row.recorded_served_by, Some("test"));
+        assert!(row.live_holds);
+        assert_eq!(row.state, StalenessState::Unchanged);
+
+        assert!(
+            report
+                .divergent_keys()
+                .iter()
+                .all(|row| row.key != "SMTP_HOST"),
+            "an unchanged key must not appear in divergent_keys"
+        );
+    }
+
+    /// The recorded generation says nobody held the key; the live provider
+    /// does hold it now. That is [`StalenessState::AppearedSinceResolution`]
+    /// and the key appears in [`StalenessReport::divergent_keys`].
+    #[test]
+    fn a_key_that_appeared_since_resolution_is_flagged() {
+        let provider = MapProvider::new("test", &[("SMTP_HOST", "relay.example.com")]);
+        let recorded = generation_with_entries(
+            one_key_recorded(&registry::SMTP_HOST, None),
+            RefreshActor::System,
+        );
+        let report = check_staleness_against(&recorded, &provider);
+
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.key == "SMTP_HOST")
+            .expect("SMTP_HOST must appear in the report");
+        assert_eq!(row.recorded_served_by, None);
+        assert!(row.live_holds);
+        assert_eq!(row.state, StalenessState::AppearedSinceResolution);
+
+        let divergent: Vec<&str> = report.divergent_keys().iter().map(|row| row.key).collect();
+        assert!(
+            divergent.contains(&"SMTP_HOST"),
+            "an appeared key must be named in divergent_keys: {divergent:?}"
+        );
+    }
+
+    /// The recorded generation named a provider for the key; the live
+    /// provider no longer holds it. That is
+    /// [`StalenessState::DisappearedSinceResolution`] and the key appears in
+    /// [`StalenessReport::divergent_keys`].
+    #[test]
+    fn a_key_that_disappeared_since_resolution_is_flagged() {
+        let provider = MapProvider::new("test", &[]);
+        let recorded = generation_with_entries(
+            one_key_recorded(&registry::SMTP_HOST, Some("test")),
+            RefreshActor::System,
+        );
+        let report = check_staleness_against(&recorded, &provider);
+
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.key == "SMTP_HOST")
+            .expect("SMTP_HOST must appear in the report");
+        assert_eq!(row.recorded_served_by, Some("test"));
+        assert!(!row.live_holds);
+        assert_eq!(row.state, StalenessState::DisappearedSinceResolution);
+
+        let divergent: Vec<&str> = report.divergent_keys().iter().map(|row| row.key).collect();
+        assert!(
+            divergent.contains(&"SMTP_HOST"),
+            "a disappeared key must be named in divergent_keys: {divergent:?}"
+        );
+    }
+
+    /// A captured `Debug` of the whole report must never contain a value
+    /// the provider holds. Names, provider names, timestamps, booleans,
+    /// feature sentences and the actor are the only things allowed to
+    /// print; if a future field slipped through, this catches it.
+    #[test]
+    fn debug_output_never_carries_a_value() {
+        const PROBE: &str = "REDACTION-PROBE-value";
+        let provider = MapProvider::new("test", &[("SMTP_HOST", PROBE)]);
+        let recorded = generation_with_entries(
+            all_keys_recorded_as("test"),
+            RefreshActor::Operator("alice".to_string()),
+        );
+        let report = check_staleness_against(&recorded, &provider);
+
+        let printed = format!("{report:?}");
+        assert!(
+            !printed.contains(PROBE),
+            "a redaction-safe report must never print a stored value: \
+             {printed}"
+        );
+        // And a positive check that the redacted shape still says something
+        // useful: the actor and one key name have to be present, or the
+        // Debug impl has stopped showing what the operator needs.
+        assert!(
+            printed.contains("alice"),
+            "the actor login must reach the log: {printed}"
+        );
+        assert!(
+            printed.contains("SMTP_HOST"),
+            "at least one declared key name must reach the log: {printed}"
+        );
+    }
+
+    /// A provider that lists its keys yields [`EnumerationStatus::Supported`];
+    /// a provider that does not implement enumeration yields
+    /// [`EnumerationStatus::Unsupported`]. An empty `Supported` and an
+    /// `Unsupported` are DISTINCT: "I cannot see" is not "there is nothing
+    /// there".
+    #[test]
+    fn enumeration_status_supports_and_unsupported_are_distinct() {
+        let recorded = generation_with_entries(
+            REGISTRY
+                .iter()
+                .map(|_| Resolved {
+                    value: None,
+                    served_by: None,
+                })
+                .collect(),
+            RefreshActor::System,
+        );
+
+        let supported =
+            check_staleness_against(&recorded, &MapProvider::new("with", &[])).enumeration;
+        assert_eq!(supported, EnumerationStatus::Supported(Vec::new()));
+
+        let unsupported =
+            check_staleness_against(&recorded, &MapProvider::new("blind", &[]).blind()).enumeration;
+        assert_eq!(unsupported, EnumerationStatus::Unsupported);
+
+        assert_ne!(
+            supported, unsupported,
+            "an empty Supported and an Unsupported must not compare equal"
+        );
+
+        // And a Supported that names keys is different again.
+        let named = check_staleness_against(
+            &recorded,
+            &MapProvider::new("with", &[("SMTP_HOST", "x"), ("SMTP_PORT", "25")]),
+        )
+        .enumeration;
+        match named {
+            EnumerationStatus::Supported(keys) => {
+                assert!(keys.iter().any(|k| k == "SMTP_HOST"));
+                assert!(keys.iter().any(|k| k == "SMTP_PORT"));
+            }
+            EnumerationStatus::Unsupported => panic!("an enumerable provider must be Supported"),
+        }
+    }
+
+    /// The actor recorded on the generation reaches the report. An operator
+    /// login round-trips as [`RefreshActor::Operator`]; the boot generation
+    /// records [`RefreshActor::System`].
+    #[test]
+    fn the_report_carries_the_recorded_actor() {
+        let provider = MapProvider::new("test", &[]);
+        let recorded = generation_with_entries(
+            all_keys_recorded_as("test"),
+            RefreshActor::Operator("alice".to_string()),
+        );
+        let report = check_staleness_against(&recorded, &provider);
+        assert_eq!(
+            report.actor,
+            RefreshActor::Operator("alice".to_string()),
+            "the operator login must round-trip through the report"
+        );
+        assert_eq!(report.generation_number, recorded.number());
+        assert_eq!(report.resolved_at, recorded.resolved_at());
+    }
+
+    /// The source-scan half of the redaction rule (PMS-984, AC-shape).
+    ///
+    /// A future edit that added a `value:` or `resolved_value:` field to
+    /// [`StalenessRow`] would let a resolved value reach every logger of
+    /// the report; refuse it here, the way `finance_gate::UNGATED` scans
+    /// its own source. The stated reason is exactly what the ticket names,
+    /// so a future author has to argue with the sentence rather than
+    /// silently unglue the redaction contract.
+    #[test]
+    fn no_value_field_in_staleness_row() {
+        const SRC: &str = include_str!("mod.rs");
+        let (_, after) = SRC
+            .split_once("pub struct StalenessRow {")
+            .expect("StalenessRow must be declared in this file");
+        let (body, _) = after
+            .split_once('}')
+            .expect("StalenessRow declaration must be closed by a brace");
+        for forbidden in ["value:", "resolved_value:"] {
+            assert!(
+                !body.contains(forbidden),
+                "StalenessRow must not carry a `{forbidden}` field: PMS-984 \
+                 report is provenance only; a value belongs in the caller's \
+                 log at the point of read, never here"
+            );
+        }
     }
 
     /// A rejected refresh does NOT consume the generation number: the number
