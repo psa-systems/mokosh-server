@@ -112,6 +112,19 @@ pub fn validate_setting_value(
                 "expected one of \"off\", \"author_or_admin\", \"author_or_manager\"",
             )),
         },
+        // PMS-1145: who may correct a recorded work-day segment. The same
+        // closed-set shape as `tickets/note_editing` above and for the same
+        // reason: a value outside the set would be read as the default
+        // silently, so it is refused at the write.
+        ("timesheets", "segment_editing") => match value.as_str() {
+            Some(s) if crate::modules::time_tracking::SegmentEditPolicy::parse(s).is_some() => {
+                Ok(())
+            }
+            _ => Err(bad(
+                "value",
+                "expected one of \"off\", \"owner_or_admin\", \"owner_or_manager\"",
+            )),
+        },
         ("notifications", "default_locale") => match value.as_str() {
             Some(s) if !s.is_empty() && s.len() <= 10 => Ok(()),
             _ => Err(bad("value", "expected a non-empty locale string (max 10)")),
