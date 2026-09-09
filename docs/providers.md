@@ -16,9 +16,7 @@ without losing it.
 | Kind | Trait | Providers | Tier | Refreshable |
 |---|---|---|---|---|
 | Configuration | `ConfigProvider` | environment, file, database, Bunyip | bootstrap + application | application only |
-
-The file, database and Bunyip configuration providers landed dormant in PMS-987 (the seam only, wired but not resolving any read); the priority chain wiring lands with the migrate CLI (PMS-1012).
-| Secrets (deployment) | `SecretProvider` | environment, file, database, Infisical | application | yes |
+| Secrets (deployment) | `AppSecretProvider` | environment, file, database, Infisical | application | yes |
 | Secrets (tenant) | `SecretProvider` | database, Infisical | tenant | yes |
 | Storage | `ObjectProvider` | local, S3 | tenant | no |
 | Authentication | `AuthProvider` | Bunyip OIDC, local | application | no |
@@ -27,7 +25,10 @@ The file, database and Bunyip configuration providers landed dormant in PMS-987 
 Payment (`PaymentProvider`) and RMM (`RmmProvider`) are also providers, but they are chosen per tenant as an
 integration rather than per deployment as infrastructure, so they do not appear in the tables below.
 
-`src/config/`, `src/secrets/` and `src/storage/` each implement the kind of the same name.
+`src/config/`, `src/secrets/`, `src/storage/` and `src/app_secrets/` implement the kinds above. `src/app_secrets/`
+(PMS-988) is Mokosh's application-tier `AppSecretProvider`, with a `GovernedSecret` registry that starts at
+`SMTP_PASSWORD` and grows the day another deployment-wide secret joins it. Its selection variable is `SECRET_BACKEND`,
+the same variable the tenant tier reads: both tiers pick the same provider on purpose.
 [ROADMAP.md](ROADMAP.md) links the phase, and the issue, for every kind.
 
 ## The three tiers
@@ -120,22 +121,31 @@ This is what makes testing an SMTP change tolerable: change the value, refresh, 
 
 ## Moving a value to a different provider
 
-The order matters, and the tooling enforces the parts that are dangerous to get wrong.
+The order matters, and the tooling enforces the parts that are dangerous to get wrong. The three commands land
+in PMS-1012 as subcommands of `mokosh-server`, so an external migration tool cannot re-implement the providers.
 
 1. Enable the new provider at a higher priority. Leave the old one enabled and lower.
-2. `provider-migrate --from <old> --to <new>`. It writes, reads back, compares, and never deletes from the source.
-3. `provider-status`. Every key must be present in the new provider before going further.
+2. `mokosh-server provider-migrate --from <old> --to <new>`. It writes, reads back, compares, and never deletes
+   from the source. A key the target already holds is skipped and reported as `already-present`; a key the
+   source does not hold is silently skipped; a write or read-back failure is named with the key and the reason.
+3. `mokosh-server provider-status`. Every key must be present in the new provider before going further. The
+   report is a per-key, per-provider presence matrix plus the provider now serving each key; `--json` outputs
+   the same shape for a supervisor to aggregate across a fleet.
 4. Restart. Boot provenance now shows the new provider serving each key.
-5. Disable the old provider. Restart. Verify the application works.
-6. `provider-purge --provider <old>`. Dry run by default; confirmation required to write.
+5. Disable the old provider (unset its selection or drop it from `CONFIG_PROVIDERS`). Restart. Verify the
+   application works.
+6. `mokosh-server provider-purge --provider <old>`. Dry-run by default; `--confirm` is required to write.
 
-Step 6 refuses, per key, unless **both** the provider being purged is disabled **and** the key is verified present,
-live, in the provider now serving it. That interlock is why "I deleted the old copies and email broke" cannot
-happen. There is no force flag; a refused purge means the migration is not finished.
+Step 6 refuses, per key, unless **both** the provider being purged is disabled **and** the key is verified
+present, live, in the provider now serving it. That interlock is why "I deleted the old copies and email broke"
+cannot happen. There is no `--force` flag on any of the three commands; a refused purge is named with the
+reason and means the migration is not finished. See `docs/operator-provider-runbook.md` for the walk-through
+that turns the six steps into commands.
 
-Not every provider can purge. The environment provider cannot (a process cannot unset a variable for its own next
-boot, and mounted secret files are read-only), and neither can an object store the operator owns. Where purge is
-unsupported, the application reports what to delete and where, and claims nothing it did not do.
+Not every provider can purge. The environment provider cannot (a process cannot unset a variable for its own
+next boot, and mounted secret files are read-only), and neither can an object store the operator owns. Where
+purge is unsupported, the application reports what to delete and where (the `{NAME}_FILE` path, the object key)
+and claims nothing it did not do.
 
 ## Seeing what is in use
 
