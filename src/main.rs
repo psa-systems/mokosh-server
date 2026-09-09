@@ -720,6 +720,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::knowledge_base::KbAttachmentMover::new(db.clone());
     scheduler.register(kb_attachment_mover, std::time::Duration::from_secs(3600));
 
+    // One-shot move of the live tenant logo out of the shared `tenant-logos/`
+    // directory and under its own tenant, the same shape as the KB mover above
+    // and for the same reason: the layout changed, and the files already on the
+    // volume did not. `TenantLogoStore::read` falls back to the old location
+    // until this has reached them, so a logo keeps rendering in the meantime.
+    let tenant_logo_mover = mokosh_server::modules::tenants::TenantLogoMover::new(db.clone());
+    scheduler.register(tenant_logo_mover, std::time::Duration::from_secs(3600));
+
     // PMS-968: one-shot move of pre-existing gateway credentials into the
     // configured secret provider. The scheduler fires every job once at startup,
     // so an hour gives the one-shot behaviour plus a retry if the store was

@@ -26,12 +26,18 @@ pub mod organization;
 // `logo_mime` and `logo_url` against the same set the upload and the public
 // route use, and `branding` is reachable from the ungated settings validator.
 pub mod logo;
+// The one-shot move of the live logo out of the shared `tenant-logos/`
+// directory and under its own tenant. Ungated with `logo` itself: it is
+// registered from `main`, which is a server build, but it depends on nothing
+// the tenant CRUD routes gate on.
+pub mod logo_move;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
 mod routes;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
 mod service;
 
 pub use identity::OrgIdentity;
+pub use logo_move::TenantLogoMover;
 pub use models::*;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
 pub use routes::{public_tenant_routes, tenant_routes};
