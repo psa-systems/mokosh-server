@@ -158,6 +158,80 @@ async fn a_full_day_with_a_break_is_work_break_work(pool: PgPool) {
 
 /// The guard the ticket asks for by name: a second clock-in is refused the way
 /// a second active timer is, and a clock-out with nothing open is refused too.
+/// PMS-1146: the refusal a forgotten clock-out produces says which day is in
+/// the way and how long it has been running, and `GET /workday` says that the
+/// day it answered with is the open segment's rather than today.
+///
+/// Both halves are about the same silence. Before this the person was told
+/// "Already clocked in; clock out first" with nothing naming the day, and the
+/// day view answered with yesterday without saying so - so the cheapest
+/// reading was to clock out now, which records the whole night as worked.
+#[sqlx::test]
+async fn a_clock_left_running_says_which_day_is_in_the_way(pool: PgPool) {
+    let (_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // A clock-in on a day that is not today, left open.
+    let response = app
+        .client
+        .post(app.url("/api/v1/workday/clock-in"))
+        .bearer_auth(&token)
+        .json(&json!({ "date": DAY }))
+        .send()
+        .await
+        .expect("clock in");
+    assert_eq!(response.status(), 200, "{:?}", response.text().await);
+
+    // The day view, asked for nothing in particular, answers with THAT day
+    // and says why.
+    let today = day(&app, &token, "").await;
+    assert_eq!(today["date"], DAY, "the open segment's day, not today");
+    assert_eq!(
+        today["date_source"], "open_segment",
+        "and the answer says the server chose it"
+    );
+
+    // A second clock-in is still refused, and now the refusal is actionable.
+    let response = post(&app, &token, "/api/v1/workday/clock-in").await;
+    assert_eq!(response.status(), 409);
+    let body = response.text().await.expect("a body");
+    assert!(body.contains(DAY), "the blocking day is named: {body}");
+    assert!(
+        body.contains("correct that segment"),
+        "and the recovery that keeps the record honest is named: {body}"
+    );
+}
+
+/// The other two sources, so `date_source` is not a field that only ever says
+/// one thing.
+#[sqlx::test]
+async fn the_day_says_where_its_date_came_from(pool: PgPool) {
+    let (_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // Nothing open, nothing asked for: today.
+    let today = day(&app, &token, "").await;
+    assert_eq!(today["date_source"], "today");
+
+    // Asked for: requested, even when it is the same day the server would
+    // have picked anyway.
+    let named = day(&app, &token, &format!("?date={DAY}")).await;
+    assert_eq!(named["date"], DAY);
+    assert_eq!(named["date_source"], "requested");
+    let same = day(
+        &app,
+        &token,
+        &format!("?date={}", today["date"].as_str().expect("a date")),
+    )
+    .await;
+    assert_eq!(
+        same["date_source"], "requested",
+        "the caller named it, so the server did not choose it"
+    );
+}
+
 #[sqlx::test]
 async fn clocking_in_twice_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
