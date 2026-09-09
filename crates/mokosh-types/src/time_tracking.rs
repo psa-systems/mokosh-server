@@ -485,4 +485,28 @@ pub struct WorkDayResponse {
     /// resolved: eight hours clocked against six logged is the normal case.
     pub unlogged_minutes: i64,
     pub breakdown: WorkDayBreakdown,
+    /// PMS-1146: why this day and not another.
+    ///
+    /// `GET /workday` with no `date` does not always answer with today: when a
+    /// segment is still open it answers with THAT segment's day, so a clock
+    /// left running overnight reads back as yesterday. That is deliberate - a
+    /// reload finds the clock where it was left - and it was also invisible,
+    /// which is the half this names. A client cannot work it out by comparing
+    /// `date` against its own today, because it does not know whether the
+    /// server chose the day or was told it.
+    pub date_source: WorkDayDateSource,
+}
+
+/// Where the day in a [`WorkDayResponse`] came from (PMS-1146).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkDayDateSource {
+    /// The caller named it in the query.
+    Requested,
+    /// Nobody named one and a segment was open, so the day is that segment's.
+    /// The one case where the answer may not be today.
+    OpenSegment,
+    /// Nobody named one and nothing was open, so the day is today in the
+    /// relevant zone.
+    Today,
 }
