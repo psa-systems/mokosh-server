@@ -698,6 +698,16 @@ impl AuthService {
         let audit_ip = ip_address.clone();
         let audit_ua = user_agent.clone();
 
+        // PMS-981: refuse the local password path when the operator has
+        // excluded Local from `AUTH_PROVIDERS`. Same rejection message
+        // as an invalid credential, and the same `AppError::Unauthorized`
+        // shape, so nothing here discloses which providers are enabled.
+        if !crate::modules::auth::providers::is_enabled(
+            crate::modules::auth::providers::AuthProviderKind::Local,
+        ) {
+            return Err(AppError::Unauthorized);
+        }
+
         // PMS-138: bind the lookup to (tenant_id, email). Replaces
         // the prior email-only lookup with `ORDER BY created_at ASC
         // LIMIT 1` tiebreaker that silently routed multi-tenant
