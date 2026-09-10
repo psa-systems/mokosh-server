@@ -314,12 +314,12 @@ impl AppConfig {
             ip2proxy_db_path: config::get(&keys::IP2PROXY_DB_PATH)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
-            // PMS-658: opt-in switch for the suspicious-login notify-and-approve
-            // gate. Default false because it can withhold a login; enable per
-            // deployment for a staged rollout.
-            login_approval_enabled: config::get(&keys::LOGIN_APPROVAL_ENABLED)
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-                .unwrap_or(false),
+            // PMS-658 / PMS-983: opt-in switch for the suspicious-login
+            // notify-and-approve gate. Default false because it can withhold
+            // a login; enable per deployment for a staged rollout. Read
+            // through `config::flags::LOGIN_APPROVAL_ENABLED` so the parse
+            // rule and the default live with the flag rather than here.
+            login_approval_enabled: config::flags::LOGIN_APPROVAL_ENABLED.read(),
             // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS. Empty,
             // unset, unparseable, or non-positive -> None (uncapped). Positive
             // usize -> Some(N). The value is threaded into `TenantService` via
@@ -719,6 +719,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kb_attachment_mover =
         mokosh_server::modules::knowledge_base::KbAttachmentMover::new(db.clone());
     scheduler.register(kb_attachment_mover, std::time::Duration::from_secs(3600));
+
+    // One-shot move of the live tenant logo out of the shared `tenant-logos/`
+    // directory and under its own tenant, the same shape as the KB mover above
+    // and for the same reason: the layout changed, and the files already on the
+    // volume did not. `TenantLogoStore::read` falls back to the old location
+    // until this has reached them, so a logo keeps rendering in the meantime.
+    let tenant_logo_mover = mokosh_server::modules::tenants::TenantLogoMover::new(db.clone());
+    scheduler.register(tenant_logo_mover, std::time::Duration::from_secs(3600));
 
     // PMS-968: one-shot move of pre-existing gateway credentials into the
     // configured secret provider. The scheduler fires every job once at startup,

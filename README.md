@@ -2,13 +2,11 @@
 
 Professional Services Automation (PSA) platform for MSPs: a REST API server built on Rust, Axum, SQLx and PostgreSQL.
 
-<!--
-BUNYIP-587 records the shared Bunyip-to-Mokosh walkthrough GIF. When it lands,
-commit a copy at docs/assets/mokosh-walkthrough.gif (a cross-repo relative path
-to the Bunyip copy does not render on the mirrors, and hot-linking the raw asset
-URL is fragile) and replace this comment with:
+## Walkthrough
+
 ![Mokosh walkthrough](docs/assets/mokosh-walkthrough.gif)
--->
+
+The image above is a placeholder. BUNYIP-587 records the shared Bunyip-to-Mokosh walkthrough and replaces it at the same path.
 
 ## Try it
 

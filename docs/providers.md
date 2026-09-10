@@ -228,6 +228,28 @@ The environment variables `SECRET_BACKEND` and `STORAGE_BACKEND` still say "back
 Renaming them would break every running deployment for a vocabulary change. In code and in documentation the word
 is provider.
 
+## Feature flags
+
+Some application behaviour is gated on a plain switch rather than on the presence of a value. A **feature flag** is
+a declared application-tier registry key with an explicit default, read through a typed helper (`Flag<T>` in
+`src/config/flags.rs`) that itself goes through `config::get`. Reading through `Flag::read` is what makes a flag
+refreshable: the value comes from the current generation, so a `config::refresh` takes effect on the next read. The
+parse rule lives on the value type (`FlagValue::parse`) and a value that did not parse falls back to the flag's
+default rather than failing the boot, because a flag is never security-critical enough for a fatal boot on a typo.
+
+A flag declares a `FlagDefault<T>` beside its key: `Constant(value)` for one default in every deployment shape, or
+`PerProfile { self_hosted, saas }` when the default depends on the hosting profile. `PerProfile` reads
+`DeploymentMode` at read time, so a change to `MOKOSH_DEPLOYMENT_MODE` picks up on the next flag read.
+
+The current shipping flags:
+
+- `ORGANIZATIONS_ENABLED`: on by default for `saas`, off by default for `self-hosted`.
+- `LOGIN_APPROVAL_ENABLED`: off by default in both profiles (PMS-658 gates a login and stays opt-in).
+
+Existing consumers that cache the flag value at construction (`AuthService::login_approval_enabled`) still take a
+restart to pick up a change. Rewiring those consumers onto `Flag::read` per check is deferred to the admin endpoint
+work (PMS-1012); this file's contract is unchanged by that follow-up.
+
 ## Where this is going
 
 Sequencing and the issue for each phase are in [ROADMAP.md](ROADMAP.md).

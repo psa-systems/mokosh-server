@@ -245,6 +245,17 @@ declare_keys! {
     Application ADMIN_EMAIL = "ADMIN_EMAIL";
     Application ADMIN_PASSWORD = "ADMIN_PASSWORD";
     Application LOGIN_APPROVAL_ENABLED = "LOGIN_APPROVAL_ENABLED";
+
+    // -- Feature flags (PMS-983) ---------------------------------------------
+    // Reached through `crate::config::flags`, so the parse rule and the
+    // default live with the flag rather than at every read site. No feature
+    // annotation: an unset key is the flag's default and the boot log stays
+    // silent, matching the registry convention.
+
+    /// PMS-983: the organizations feature. Read through
+    /// `crate::config::flags::ORGANIZATIONS_ENABLED`, which defaults per
+    /// hosting profile (off on self-hosted, on for SaaS).
+    Application ORGANIZATIONS_ENABLED = "ORGANIZATIONS_ENABLED";
     Application IP2LOCATION_DB_PATH = "IP2LOCATION_DB_PATH";
     Application IP2PROXY_DB_PATH = "IP2PROXY_DB_PATH";
 
