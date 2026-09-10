@@ -265,7 +265,7 @@ pub enum ConfigProviderKind {
     Environment,
     /// A directory of one file per key, named by `CONFIG_FILE_DIR`.
     File,
-    /// The `app_config` table (migration 206). Cannot serve bootstrap-tier
+    /// The `app_config` table (migration 210). Cannot serve bootstrap-tier
     /// keys - the credential used to reach the database cannot come from
     /// the database.
     Database,
