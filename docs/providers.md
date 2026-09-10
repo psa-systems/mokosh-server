@@ -119,6 +119,20 @@ per-key record of which provider served it. A refresh builds a complete new gene
 
 This is what makes testing an SMTP change tolerable: change the value, refresh, verify, without a restart.
 
+**PMS-986** landed the atomic-swap-or-rollback contract as `config::try_refresh(RefreshRequest)` in code. The
+caller names the actor (`RefreshActor::System` for a boot resolution or a scheduled refresh,
+`RefreshActor::Operator(login)` for an admin-triggered one) and lists the keys that MUST resolve. A required key
+that no provider holds returns `RefreshOutcome::Rejected` naming the unresolved keys and the providers that were
+consulted (never a value), and the previous generation stays live: the generation-number counter is not consumed,
+because it counts installed generations rather than attempts. A required key whose tier is `Bootstrap` is refused
+before any I/O, because a provider is already built from it; `config::refuse_refresh_of_bootstrap(&key)` is the
+per-key helper an admin endpoint calls before threading a key into a request. Per-request stability is one call:
+a handler calls `config::snapshot()` once at entry and reads through the returned `Arc<Generation>` for the length
+of the request, so a refresh mid-request is invisible to that handler. `config::refresh()` keeps its previous
+signature and semantics: it is a thin wrapper around `try_refresh(RefreshRequest::system())` that ignores the
+outcome, so every existing best-effort caller behaves unchanged. The admin endpoint that calls `try_refresh` with
+required keys lands in a follow-up PR; PMS-986 is the seam it plugs into.
+
 ## Moving a value to a different provider
 
 The order matters, and the tooling enforces the parts that are dangerous to get wrong.
