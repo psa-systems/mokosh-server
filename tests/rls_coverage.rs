@@ -60,6 +60,14 @@ const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
 ///
 /// * `_sqlx_migrations` - sqlx's own ledger. Global schema state, written only
 ///   by the BYPASSRLS migrator role, holding no tenant data.
+/// * `app_config` - the application-tier configuration store (PMS-987, migration
+///   `210_app_config_table.sql`). Sibling of `app_secrets` with the same
+///   application-tier posture: one row per declared config key for the whole
+///   deployment, no tenant column, no parent to join through. Its only reader
+///   is `config::database::DatabaseProvider::build` (`src/config/database.rs`,
+///   carrying the `SAFETY (PMS-285)` note), which preloads every declared key
+///   at boot on the request-serving pool with no `app.current_tenant` GUC,
+///   because there is no tenant at that point and never will be.
 /// * `app_secrets` - the application-tier secret store (PMS-988, migration
 ///   `207_app_secrets_table.sql`). Application tier means process-wide by
 ///   definition: one row per governed secret for the whole deployment, so
@@ -92,6 +100,7 @@ const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
 /// and `128`). PMS-874.
 const TENANTLESS_WITHOUT_RLS: &[&str] = &[
     "_sqlx_migrations",
+    "app_config",
     "app_secrets",
     "identities",
     "platform_admins",
