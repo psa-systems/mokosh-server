@@ -522,6 +522,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // PMS-981: resolve the authentication provider selection from
+    // `AUTH_PROVIDERS` (falling back to the hosting profile's default,
+    // which enables both providers) and install it process-wide. Unset
+    // means byte-for-byte pre-PMS-981 behaviour. An explicit list that
+    // excludes a provider causes the two decision points (bearer verify
+    // in `auth_middleware`, password login in `AuthService::login`) to
+    // skip that provider as if its underlying capability were not
+    // configured, so a rejected credential reads exactly like an
+    // invalid one and never discloses the configured set.
+    let auth_profile_default = hosting_profile.default_providers_for(ProviderKind::Authentication);
+    let auth_chain = mokosh_server::modules::auth::providers::from_env_with(
+        auth_profile_default,
+        bunyip_verifier.is_some(),
+    )?;
+    auth_chain.record();
+    mokosh_server::modules::auth::providers::install_selection(auth_chain.selection().clone());
+
     // Notifications dispatcher worker. Drains the `notifications`
     // queue (status='pending' rows) and fires the right transport per
     // row. One worker per replica; concurrent workers SKIP LOCKED
