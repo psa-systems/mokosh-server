@@ -300,10 +300,24 @@ services:
       # Empty means the file provider is not built; the `:-` default reproduces
       # the code's own behaviour when APP_SECRETS_DIR is unset.
       APP_SECRETS_DIR: ${APP_SECRETS_DIR:-}
-      # PMS-982: `environment`, the only configuration provider today. The `:-`
-      # default reproduces the code's own fallback in ConfigSelection::from_env,
-      # so an unset variable behaves the same here as it does in production.
+      # PMS-982: `environment`, the only kind reachable via the SINGLE-provider
+      # slot today. The `:-` default reproduces the code's own fallback in
+      # ConfigSelection::from_env.
       CONFIG_BACKEND: ${CONFIG_BACKEND:-environment}
+      # PMS-987: comma-separated priority list of enabled configuration
+      # providers (e.g. `file,database,environment`). Empty means the
+      # hosting profile's default. The chain is DORMANT in PMS-987 - it
+      # builds but no read path resolves through it yet.
+      CONFIG_PROVIDERS: ${CONFIG_PROVIDERS:-}
+      # PMS-987: directory the file configuration provider reads (unset =
+      # not enabled, silent).
+      CONFIG_FILE_DIR: ${CONFIG_FILE_DIR:-}
+      # PMS-987: Bunyip API base and machine credential for the Bunyip
+      # configuration provider. Unset URL means the provider builds empty
+      # and issues no request.
+      BUNYIP_CONFIG_URL: ${BUNYIP_CONFIG_URL:-}
+      BUNYIP_CONFIG_CLIENT_ID: ${BUNYIP_CONFIG_CLIENT_ID:-}
+      BUNYIP_CONFIG_CLIENT_SECRET: ${BUNYIP_CONFIG_CLIENT_SECRET:-}
       INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
       INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:-}

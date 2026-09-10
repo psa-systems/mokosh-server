@@ -18,7 +18,10 @@
 
 use std::path::PathBuf;
 
+use async_trait::async_trait;
+
 use super::{AppSecretProvider, GovernedSecret};
+use crate::utils::error::{AppError, AppResult};
 
 /// A directory the operator points at with `APP_SECRETS_DIR`, one file per
 /// governed secret named after [`GovernedSecret::secret_file`].
@@ -43,6 +46,7 @@ impl FileProvider {
     }
 }
 
+#[async_trait]
 impl AppSecretProvider for FileProvider {
     fn name(&self) -> &'static str {
         "file"
@@ -75,6 +79,37 @@ impl AppSecretProvider for FileProvider {
                 );
                 None
             }
+        }
+    }
+
+    /// PMS-1012: write the value to the per-secret file inside the root.
+    ///
+    /// The root is trusted as configured: [`FileProvider::new`] is only
+    /// called when `APP_SECRETS_DIR` is set. `write` creates the file if it
+    /// is missing and replaces it atomically enough for the CLI's purposes
+    /// (a partial write is caught by the migrate command's read-back).
+    async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
+        let path = self.path_for(secret);
+        std::fs::write(&path, value).map_err(|e| {
+            AppError::Configuration(format!(
+                "file provider could not write {}: {e}",
+                path.display()
+            ))
+        })
+    }
+
+    /// PMS-1012: remove the per-secret file. A file that is already gone is
+    /// not an error, matching the tenant-tier delete contract and the
+    /// interlock in `provider-purge`.
+    async fn delete(&self, secret: GovernedSecret) -> AppResult<()> {
+        let path = self.path_for(secret);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AppError::Configuration(format!(
+                "file provider could not delete {}: {e}",
+                path.display()
+            ))),
         }
     }
 }

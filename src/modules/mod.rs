@@ -17,6 +17,10 @@ pub mod calendar;
 pub mod contact_portal;
 pub mod contacts;
 pub mod contracts;
+/// PMS-1012: the write-read-back-compare invariant, extracted from
+/// `billing::credential_move` so provider-migrate reuses it rather than
+/// re-implementing it beside a job the shape it named.
+pub mod credential_move;
 pub mod dashboards;
 pub mod data_transfer;
 pub mod email_intake;
