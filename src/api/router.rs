@@ -346,6 +346,13 @@ pub fn create_api_router(
         // latest published release and reports whether an upgrade is
         // available. Disabled (no outbound request) when the env var is unset.
         .route("/version/check", get(version_check))
+        // PMS-1144: outward provider-configuration summary. Unauthenticated
+        // by design, so BUNYIP-634's aggregator can read the identity per
+        // deployment-scoped kind without an admin bearer. Names only:
+        // hosting profile + enabled provider names per kind. Peer to
+        // /version, NOT to /admin/providers/status (the admin route stays
+        // admin-gated and continues to serve the full per-key report).
+        .merge(crate::providers::status::public_summary_route::provider_public_summary_routes())
         // Auth routes. MAPPS-493 (phase 4): share the AuthService Arc with
         // tenant_routes so `/tenants/self-serve` can decode identity_tokens
         // minted by /auth/login. AuthService derives Clone, so this is a
