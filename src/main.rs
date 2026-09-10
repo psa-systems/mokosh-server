@@ -314,12 +314,12 @@ impl AppConfig {
             ip2proxy_db_path: config::get(&keys::IP2PROXY_DB_PATH)
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
-            // PMS-658: opt-in switch for the suspicious-login notify-and-approve
-            // gate. Default false because it can withhold a login; enable per
-            // deployment for a staged rollout.
-            login_approval_enabled: config::get(&keys::LOGIN_APPROVAL_ENABLED)
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-                .unwrap_or(false),
+            // PMS-658 / PMS-983: opt-in switch for the suspicious-login
+            // notify-and-approve gate. Default false because it can withhold
+            // a login; enable per deployment for a staged rollout. Read
+            // through `config::flags::LOGIN_APPROVAL_ENABLED` so the parse
+            // rule and the default live with the flag rather than here.
+            login_approval_enabled: config::flags::LOGIN_APPROVAL_ENABLED.read(),
             // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS. Empty,
             // unset, unparseable, or non-positive -> None (uncapped). Positive
             // usize -> Some(N). The value is threaded into `TenantService` via
