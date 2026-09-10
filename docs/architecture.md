@@ -21,6 +21,24 @@ That list is illustrative, not a census: a hand-copied one goes stale within a m
 
 The dev host is a VPS on the public internet, and several developers share it. The `server` is reached only through the shared Traefik, which gives each developer their own `*.a8n.run` hostname with a real Let's Encrypt certificate instead of a port on a shared IP. Everything else that needs a host port (`postgres` for `sqlx-cli`, `mailpit` for the mail UI, `infisical` for its admin UI) publishes on `127.0.0.1` only, so it is reachable from the host's own tooling and from nowhere else. Sibling containers do not need a host port either: they reach each service by its compose DNS name on the `dev-mokosh-private-${USER}` network.
 
+## Stored file layout
+
+Every stored object is addressed by an `ObjectKey`: a tenant plus the object's identity, never a path. A caller cannot assemble one, so the layout is decided in exactly one file (`src/storage/mod.rs`) and pinned by a test there, because getting an arm wrong does not fail loudly - it serves a 404 for a file that is still sitting on disk.
+
+Under the storage root (`ATTACHMENT_DIR` for `local`, the bucket for `s3`, same string either way):
+
+| Path | What it is |
+|---|---|
+| `{tenant}/{id}` | ticket attachment |
+| `{tenant}/logo.{ext}` | the tenant's live logo, overwritten on replace |
+| `{tenant}/kb-articles/{id}` | image embedded in a KB article |
+| `{tenant}/documents/{id}` | issued invoice or credit-note PDF |
+| `{tenant}/branding/{digest}` | a logo frozen onto a sent invoice, content-addressed |
+
+Two of these arrived at that shape late, and both moved the same way. A KB attachment was a flat `kb-articles/{id}` with no tenant anywhere in it (PMS-960); the live logo was `tenant-logos/{tenant}.{ext}`, a shared directory with the tenant in the filename. Each old path stays addressable as its own `ObjectKind::Legacy*` variant rather than as a fallback inside the provider - a fallback applies to every read and is reachable from any tenant's key, which is the hole being closed - the read falls back to it so nothing disappears mid-deploy, and a `Scheduler` job (`KbAttachmentMover`, `TenantLogoMover`) walks the files over. Each mover moves the file first and updates the `files` ledger row second, because a row naming a path before the bytes are there is the one ordering that can lie, and it leaves an object whose bytes are at neither path completely alone.
+
+`{tenant}/logo.{ext}` and `{tenant}/branding/{digest}` are deliberately not the same directory: the first is one mutable object per tenant, the second is the content-addressed copies frozen onto documents, one per distinct logo rather than one per invoice.
+
 ## Database migrations
 
 Migrations live in `migrations/` and are embedded into the binary at compile time via `sqlx::migrate!`. They run automatically on server start when `RUN_MIGRATIONS=true`, which is the default whether or not the variable is set.

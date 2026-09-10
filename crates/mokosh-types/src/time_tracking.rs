@@ -391,6 +391,24 @@ pub struct ClockInRequest {
     pub date: Option<NaiveDate>,
 }
 
+/// PMS-1145: the body of a segment correction. Every field is optional and
+/// an absent one leaves that part of the segment alone, so a caller fixing a
+/// clock-out time does not have to restate the start.
+///
+/// `ended_at` is doubly optional on purpose and the two levels mean different
+/// things: absent leaves the end as it is, and an explicit `null` REOPENS the
+/// segment, which is how a clock-out entered by mistake is undone. The
+/// service refuses the reopen when the person already has another segment
+/// open, because the partial unique index would refuse it anyway and a 409
+/// naming the reason is better than a constraint violation.
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct UpdateWorkDaySegmentRequest {
+    pub date: Option<NaiveDate>,
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "crate::deserialize_double_option")]
+    pub ended_at: Option<Option<DateTime<Utc>>>,
+}
+
 /// `GET /workday`: which day, and whose. `date` absent means the day of the
 /// open segment if there is one, else today in the caller's own zone, so a
 /// reload finds the clock where it was left. `user_id` is honoured for an admin and ignored for
@@ -467,4 +485,28 @@ pub struct WorkDayResponse {
     /// resolved: eight hours clocked against six logged is the normal case.
     pub unlogged_minutes: i64,
     pub breakdown: WorkDayBreakdown,
+    /// PMS-1146: why this day and not another.
+    ///
+    /// `GET /workday` with no `date` does not always answer with today: when a
+    /// segment is still open it answers with THAT segment's day, so a clock
+    /// left running overnight reads back as yesterday. That is deliberate - a
+    /// reload finds the clock where it was left - and it was also invisible,
+    /// which is the half this names. A client cannot work it out by comparing
+    /// `date` against its own today, because it does not know whether the
+    /// server chose the day or was told it.
+    pub date_source: WorkDayDateSource,
+}
+
+/// Where the day in a [`WorkDayResponse`] came from (PMS-1146).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkDayDateSource {
+    /// The caller named it in the query.
+    Requested,
+    /// Nobody named one and a segment was open, so the day is that segment's.
+    /// The one case where the answer may not be today.
+    OpenSegment,
+    /// Nobody named one and nothing was open, so the day is today in the
+    /// relevant zone.
+    Today,
 }
