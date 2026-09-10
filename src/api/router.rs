@@ -546,6 +546,14 @@ pub fn create_api_router(
             db.clone(),
             seed_service.clone(),
         ))
+        // PMS-989: provider-status report. JSON (`/admin/providers/status`)
+        // for BUNYIP-634 to aggregate; HTML (`/admin/providers/status.html`)
+        // for standalone deployments with no Bunyip. Both go through the
+        // same collector (`crate::providers::status::collect`) so the two
+        // renderings cannot disagree, and both sit behind `RequireAdmin`.
+        // The Bunyip machine credential swap for the JSON endpoint is a
+        // follow-up when BUNYIP-634 lands (see the module doc).
+        .merge(crate::providers::status::route::provider_status_admin_routes())
         // PMS-275: the coarse per-request audit middleware (PMS-119) was
         // removed. It ran post-response with only the HTTP method + URL, so it
         // could never populate `entity_id` or the old/new value payload, and

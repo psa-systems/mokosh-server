@@ -42,6 +42,15 @@ mod models;
 // See docs/new-auth/mokosh/03-mokosh-server-rs-cutover.md.
 #[cfg(feature = "server")]
 pub mod oidc_rs;
+// PMS-981: nameable authentication providers. DORMANT in this change:
+// `create_api_router` continues to mount both middlewares directly, and no
+// non-test caller invokes the trait. What lands here is the trait, an
+// enum naming the two paths, the selection struct that reads
+// `AUTH_PROVIDERS`, and adapters over each existing path. Wiring the
+// trait into the request-authentication pipeline is a follow-up that
+// lands with the deprecation of the legacy path and its operator runbook.
+#[cfg(feature = "server")]
+pub mod providers;
 #[cfg(feature = "server")]
 pub mod rate_limit;
 #[cfg(feature = "server")]

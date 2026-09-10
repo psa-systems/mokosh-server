@@ -308,6 +308,23 @@ fn only_the_auth_service_and_the_startup_wiring_know_the_deployment_mode() {
         // `src/config/` asks which mode this is, which is why the module takes
         // a provider NAME rather than a `DeploymentMode`.
         "src/config/guard.rs",
+        // PMS-983: `FlagDefault::PerProfile` needs the hosting profile to
+        // resolve `ORGANIZATIONS_ENABLED` at read time. Not a mail gate, not a
+        // duplicated auth decision: the profile IS one input to the flag's
+        // default.
+        "src/config/flags.rs",
+        // PMS-981: the authentication provider selection reads the profile's
+        // default set. Adjacent to `AuthService` but distinct: this module
+        // OWNS the enable/available shape the profile drives.
+        "src/modules/auth/providers/mod.rs",
+        // PMS-989: the status collector reports the hosting profile in the
+        // presence matrix, and names every per-kind deviation from it. That
+        // reporting is what makes the profile visible to an operator.
+        "src/providers/status/mod.rs",
+        // PMS-1012: the operator CLI resolves the profile's default provider
+        // per kind when the caller does not name one, so `provider-status`
+        // and its siblings behave the same as the boot record.
+        "src/cli/providers.rs",
     ];
 
     let mut stack = vec![std::path::PathBuf::from("src")];

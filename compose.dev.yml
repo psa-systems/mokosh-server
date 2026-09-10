@@ -318,6 +318,14 @@ services:
       BUNYIP_CONFIG_URL: ${BUNYIP_CONFIG_URL:-}
       BUNYIP_CONFIG_CLIENT_ID: ${BUNYIP_CONFIG_CLIENT_ID:-}
       BUNYIP_CONFIG_CLIENT_SECRET: ${BUNYIP_CONFIG_CLIENT_SECRET:-}
+      # PMS-981: authentication provider enablement, comma-separated in
+      # priority order (`bunyip,local` on saas, `local` on self-hosted). The
+      # `:-` blank default reproduces the code's own fallback in
+      # AuthProviderSelection::from_env, which resolves an unset value to
+      # the hosting profile's default; the seam is DORMANT so this variable
+      # changes nothing today but is declared here (PMS-836) so a future
+      # wiring PR does not need a compose.dev.yml change.
+      AUTH_PROVIDERS: ${AUTH_PROVIDERS:-}
       INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-}
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
       INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:-}

@@ -19,7 +19,7 @@ without losing it.
 | Secrets (deployment) | `AppSecretProvider` | environment, file, database, Infisical | application | yes |
 | Secrets (tenant) | `SecretProvider` | database, Infisical | tenant | yes |
 | Storage | `ObjectProvider` | local, S3 | tenant | no |
-| Authentication | `AuthProvider` | Bunyip OIDC, local | application | no |
+| Authentication | `AuthProvider` | Bunyip OIDC, local | application | no (PMS-981: seam landed dormant; wiring lands with the deprecation of the legacy path) |
 | Email | `Mailer` | smtp, log, Bunyip relay | application | yes |
 
 Payment (`PaymentProvider`) and RMM (`RmmProvider`) are also providers, but they are chosen per tenant as an
@@ -132,6 +132,35 @@ of the request, so a refresh mid-request is invisible to that handler. `config::
 signature and semantics: it is a thin wrapper around `try_refresh(RefreshRequest::system())` that ignores the
 outcome, so every existing best-effort caller behaves unchanged. The admin endpoint that calls `try_refresh` with
 required keys lands in a follow-up PR; PMS-986 is the seam it plugs into.
+
+### Staleness report
+
+Refresh alone is not enough. An operator can change a value in a provider and the running process keeps serving the
+previous generation with nothing on screen saying so. The staleness report is the OBSERVATION half of that loop;
+`try_refresh` is the ACTION half. They live at the same URL when the admin endpoint lands (PMS-989 / PMS-1012),
+and the operator's job is to spot the divergent-keys list and refresh.
+
+`config::check_staleness()` returns a `StalenessReport` that pairs the recorded generation (number, resolved-at,
+actor) with a live presence probe (checked-at, one row per declared key, the provider's `list()` outcome). Each
+`StalenessRow` carries the RECORDED serving provider AND the LIVE presence result as two facts: `recorded_served_by`
+is what the current generation says served the key at resolution, `live_holds` is what the current provider says
+today, and `state` is derived from the two. `StalenessReport::divergent_keys()` returns the subset whose state is
+anything other than `Unchanged`, which is the list the admin surface names.
+
+The report is side-effect-free beyond `Utc::now()`: it never mutates a generation, never calls `try_refresh`, and
+never reads a value. Only `ConfigProvider::has`, `ConfigProvider::list`, `ConfigProvider::name` and
+`Generation::served_by` are consulted. `StalenessRow`, `StalenessReport` and `EnumerationStatus` have hand-rolled
+`Debug` implementations that print only names, provider names, booleans, timestamps and the recorded actor, so
+capturing a report to a log line cannot leak a value. A source-scan test in `src/config/mod.rs` refuses a `value:`
+or `resolved_value:` field on `StalenessRow` with a stated reason, the way `finance_gate::UNGATED` refuses an
+untagged financial route.
+
+An `EnumerationStatus::Unsupported` and an empty `EnumerationStatus::Supported(vec![])` are DIFFERENT facts and
+never collapse into each other, matching the "I cannot see is not there is nothing there" rule the presence
+matrix already follows. `StalenessState` carries a fourth variant, `ChangedProviderSinceResolution`, that today's
+single-provider slot cannot itself produce; it is derived from the shape so the PMS-987 chain wiring lights it up
+without another API-shape change. Wiring the report into an HTTP handler or CLI is the follow-up: PMS-989 renders
+the admin endpoint and PMS-1012 the CLI, and PMS-984 is the data model each of those calls into.
 
 ## Moving a value to a different provider
 
