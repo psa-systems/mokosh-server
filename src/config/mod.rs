@@ -485,6 +485,24 @@ fn build(kind: ConfigProviderKind) -> Arc<dyn ConfigProvider> {
 static PROVIDER: OnceLock<Arc<dyn ConfigProvider>> = OnceLock::new();
 static CURRENT: OnceLock<RwLock<Arc<Generation>>> = OnceLock::new();
 
+/// Serialises every test that mutates the process-global CURRENT slot or the
+/// environment variables the configuration provider reads. Any test that calls
+/// [`refresh`] or [`try_refresh`], or that writes an env var a config provider
+/// serves, takes this lock. Two lock instances would let a flags test race a
+/// config test and swap the generation the config assertion captured, and the
+/// counter delta observed on PMS-983's `abed75c4..ecea07f4` merge was that
+/// race. Tests that build a `MapProvider` and pass it to `Generation::resolve`
+/// directly do not need this lock and deliberately do not take it.
+#[cfg(test)]
+pub(crate) static REFRESH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn refresh_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    REFRESH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The process's provider, defaulting to the environment.
 ///
 /// A default rather than a panic when [`init_from_env`] has not run, because
@@ -720,21 +738,6 @@ pub fn init_from_env(profile_default: &str) -> AppResult<ConfigSelection> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
-
-    /// Serialises every test that touches the process-global CURRENT slot,
-    /// because the unit-test harness runs cases concurrently and a
-    /// try_refresh from a sibling case would swap the pointer the assertion
-    /// captured. The tests that build a `MapProvider` and pass it to
-    /// `Generation::resolve` directly do not need to take this lock and
-    /// deliberately do not.
-    static REFRESH_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn refresh_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        REFRESH_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     /// A provider driven from a map, so resolution is testable without
     /// touching process-global environment under a concurrent runner.

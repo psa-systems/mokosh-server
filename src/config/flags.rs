@@ -237,19 +237,7 @@ pub static LOGIN_APPROVAL_ENABLED: Flag<bool> = Flag::new(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Tier;
-    use std::sync::Mutex;
-
-    /// Serialise every test that mutates the process environment,
-    /// so two of them cannot race a `set_var` / `refresh` pair
-    /// against each other. The configuration provider is
-    /// process-global and shared between these tests; a
-    /// synchronous `Mutex` is enough because none of these tests
-    /// are async. No other test in this crate writes the variables
-    /// exercised here (`LOGIN_APPROVAL_ENABLED`,
-    /// `MOKOSH_DEPLOYMENT_MODE`), so serialising within the module
-    /// is sufficient.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::config::{refresh_test_lock, Tier};
 
     /// RAII: remove `keys` on construction and again on drop, then
     /// refresh the configuration generation. A test failure cannot
@@ -330,7 +318,7 @@ mod tests {
     /// a fresh deployment.
     #[test]
     fn a_constant_default_is_used_when_no_provider_holds_the_key() {
-        let _serial = ENV_LOCK.lock().expect("env lock is never poisoned");
+        let _serial = refresh_test_lock();
         let _cleanup = EnvGuard::new(&["LOGIN_APPROVAL_ENABLED"]);
 
         assert!(!LOGIN_APPROVAL_ENABLED.read());
@@ -341,7 +329,7 @@ mod tests {
     /// takes the `self_hosted` arm; `saas` takes the `saas` arm.
     #[test]
     fn a_per_profile_default_resolves_against_the_deployment_mode() {
-        let _serial = ENV_LOCK.lock().expect("env lock is never poisoned");
+        let _serial = refresh_test_lock();
         let _cleanup = EnvGuard::new(&["MOKOSH_DEPLOYMENT_MODE"]);
 
         assert!(
@@ -361,7 +349,7 @@ mod tests {
     /// false. This preserves the pre-PMS-983 shipping behaviour.
     #[test]
     fn an_explicit_raw_value_beats_the_default_for_true_and_for_false() {
-        let _serial = ENV_LOCK.lock().expect("env lock is never poisoned");
+        let _serial = refresh_test_lock();
         let _cleanup = EnvGuard::new(&["LOGIN_APPROVAL_ENABLED"]);
 
         for raw in ["1", "true", "yes"] {
@@ -383,7 +371,7 @@ mod tests {
     /// exactly as a truly-absent one.
     #[test]
     fn a_bogus_or_blank_value_falls_back_to_the_flag_default() {
-        let _serial = ENV_LOCK.lock().expect("env lock is never poisoned");
+        let _serial = refresh_test_lock();
         let _cleanup = EnvGuard::new(&["LOGIN_APPROVAL_ENABLED"]);
 
         std::env::set_var("LOGIN_APPROVAL_ENABLED", "maybe");
@@ -402,7 +390,7 @@ mod tests {
     /// PMS-1012.
     #[test]
     fn a_refresh_makes_a_new_value_visible_to_flag_read() {
-        let _serial = ENV_LOCK.lock().expect("env lock is never poisoned");
+        let _serial = refresh_test_lock();
         let _cleanup = EnvGuard::new(&["LOGIN_APPROVAL_ENABLED"]);
 
         assert!(!LOGIN_APPROVAL_ENABLED.read());
@@ -419,7 +407,7 @@ mod tests {
     /// provider at all.
     #[test]
     fn served_by_names_the_provider_that_held_the_key() {
-        let _serial = ENV_LOCK.lock().expect("env lock is never poisoned");
+        let _serial = refresh_test_lock();
         let _cleanup = EnvGuard::new(&["LOGIN_APPROVAL_ENABLED"]);
 
         std::env::set_var("LOGIN_APPROVAL_ENABLED", "true");
