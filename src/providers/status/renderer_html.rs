@@ -42,6 +42,15 @@ pub fn render_html(report: &ProviderStatusReport) -> String {
     push_kv(&mut out, "Actor", &report.configuration_generation.actor);
     push_kv(&mut out, "Collected at", &report.collected_at.to_rfc3339());
     out.push_str("</dl>\n");
+    // PMS-984: refresh control from the report. The action posts to the
+    // sibling endpoint under the same admin gate; the returned envelope is
+    // JSON with a `refresh_outcome` field. Deliberately no confirmation
+    // dialog: a best-effort refresh is idempotent and its actor is recorded.
+    out.push_str(
+        "<form method=\"post\" action=\"/api/v1/admin/providers/status/refresh\" class=\"refresh\">\n\
+         <button type=\"submit\">Refresh configuration</button>\n\
+         </form>\n",
+    );
 
     // -- Deviations ------------------------------------------------------
     if report.deviations.is_empty() {
