@@ -42,6 +42,118 @@ const MIGRATOR_PASSWORD_VAR: &str = "MOKOSH_MIGRATOR_PASSWORD";
 /// Password set on the `mokosh_app` role when it is created.
 const APP_PASSWORD_VAR: &str = "MOKOSH_APP_PASSWORD";
 
+/// PMS-1153: the roles a migration names, which therefore have to exist before
+/// migrations run on every deployment shape.
+///
+/// `mokosh_app` alone, and on purpose. Migrations 207 and 210 grant to it;
+/// nothing in `migrations/` references `mokosh_migrator`, and a deployment
+/// that connects as a single role of its own does not use it, so requiring it
+/// here would break exactly the deployments this exists for. This is the same
+/// list `scripts/test-db-roles.sql` creates for CI, and a migration granting
+/// to a new role means adding it to both.
+pub const ROLES_REQUIRED_BY_MIGRATIONS: &[&str] = &["mokosh_app"];
+
+/// What the probe connection learned about the database it reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleProbe {
+    /// The role `DATABASE_URL` actually logged in as. Reported because the old
+    /// log line claimed `mokosh_migrator` whenever anything connected.
+    pub connected_as: String,
+    /// Required roles that do not exist.
+    pub missing: Vec<String>,
+    /// Whether the connected role may create roles (`rolsuper` or
+    /// `rolcreaterole`). A single-role deployment's role is usually the
+    /// database superuser, which is what lets the fast path heal it.
+    pub can_create_roles: bool,
+}
+
+/// PMS-1153: what to do in #746's [`RolesProbe::MigratorConnectsAppMissing`]
+/// state - the migrator URL connected, `mokosh_app` does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppRoleMissing {
+    /// The admin credentials are there: #746's full provisioning path,
+    /// unchanged. Preferred when available, because it creates the roles
+    /// properly - a login, a password, the default privileges - where the
+    /// branch below can only create a bare name.
+    UseAdmin,
+    /// No admin URL, but the role that connected may create roles (staging's
+    /// single role is the database superuser): create the missing role
+    /// `NOLOGIN` and carry on.
+    CreateNoLogin,
+    /// Neither. Refuse before migrations with a message that is TRUE for this
+    /// state - the fall-through #746 routed here said "mokosh_migrator cannot
+    /// connect", which is exactly what did not happen.
+    Refuse(String),
+}
+
+/// PMS-1153: the whole decision for the app-role-missing state, as a pure
+/// function so each branch is tested without a database.
+pub fn decide_app_role_missing(
+    admin_url_set: bool,
+    can_create_roles: bool,
+    connected_as: &str,
+) -> AppRoleMissing {
+    if admin_url_set {
+        return AppRoleMissing::UseAdmin;
+    }
+    if can_create_roles {
+        return AppRoleMissing::CreateNoLogin;
+    }
+    AppRoleMissing::Refuse(format!(
+        "mokosh_app does not exist, and migrations grant to it (207, 210), so they would fail. \
+         DATABASE_URL connects as `{connected_as}`, which cannot create roles, and \
+         {ADMIN_DATABASE_URL_VAR} is unset. Either set {ADMIN_DATABASE_URL_VAR} to a superuser \
+         connection string and restart, or run as a superuser: CREATE ROLE mokosh_app NOLOGIN;"
+    ))
+}
+
+/// Ask the database the probe reached which role it is and which required
+/// roles are missing. `required` is a parameter rather than the constant so a
+/// test can probe for a role name nothing else uses.
+pub async fn probe_roles(pool: &sqlx::PgPool, required: &[&str]) -> Result<RoleProbe, sqlx::Error> {
+    let (connected_as, can_create_roles): (String, bool) = sqlx::query_as(
+        "SELECT current_user::text, (rolsuper OR rolcreaterole) \
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(pool)
+    .await?;
+    let present: Vec<String> =
+        sqlx::query_scalar("SELECT rolname::text FROM pg_roles WHERE rolname = ANY($1)")
+            .bind(required)
+            .fetch_all(pool)
+            .await?;
+    let missing = required
+        .iter()
+        .filter(|r| !present.iter().any(|p| p == *r))
+        .map(|r| r.to_string())
+        .collect();
+    Ok(RoleProbe {
+        connected_as,
+        missing,
+        can_create_roles,
+    })
+}
+
+/// Create each role `NOLOGIN` if it is still absent. Idempotent: two replicas
+/// booting at once may both decide to create it, and the loser's `CREATE`
+/// must be a no-op rather than an error that stops its boot.
+pub async fn create_nologin_roles(
+    pool: &sqlx::PgPool,
+    roles: &[String],
+) -> Result<(), sqlx::Error> {
+    for role in roles {
+        let literal = sql_quote(role);
+        let ident = quote_ident(role);
+        sqlx::query(&format!(
+            "DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {literal}) \
+             THEN CREATE ROLE {ident} NOLOGIN; END IF; END $do$"
+        ))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Create the `mokosh_migrator` / `mokosh_app` roles if they do not yet exist.
 ///
 /// `migrator_url` is the migrator connection string (`DATABASE_URL`). When a
@@ -61,19 +173,67 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     // routes it to the full provision path, which needs
     // MOKOSH_ADMIN_DATABASE_URL to recreate what is missing.
     match roles_probe(migrator_url).await {
-        RolesProbe::BothExist => {
+        RolesProbe::BothExist { connected_as } => {
             tracing::info!(
-                "DB roles already provisioned (mokosh_migrator + mokosh_app present); skipping role provisioning"
+                connected_as = %connected_as,
+                "DB roles present (mokosh_app exists); skipping role provisioning"
             );
             return Ok(());
         }
-        RolesProbe::MigratorConnectsAppMissing => {
-            tracing::warn!(
-                "mokosh_migrator can connect but mokosh_app is missing; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
-            );
+        RolesProbe::MigratorConnectsAppMissing {
+            connected_as,
+            can_create_roles,
+        } => {
+            let admin_url_set = std::env::var(ADMIN_DATABASE_URL_VAR)
+                .map(|url| !url.is_empty())
+                .unwrap_or(false);
+            match decide_app_role_missing(admin_url_set, can_create_roles, &connected_as) {
+                AppRoleMissing::UseAdmin => {
+                    tracing::warn!(
+                        connected_as = %connected_as,
+                        "mokosh_app is missing; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
+                    );
+                }
+                AppRoleMissing::CreateNoLogin => {
+                    // PMS-1153: a single-role deployment heals itself. The
+                    // role is created NOLOGIN because a GRANT needs only that
+                    // it exists, and nothing should be able to log in as a
+                    // role an automatic step made.
+                    tracing::warn!(
+                        connected_as = %connected_as,
+                        "mokosh_app is missing and {ADMIN_DATABASE_URL_VAR} is unset; creating it \
+                         NOLOGIN so migrations that grant to it can run"
+                    );
+                    let pool = PgPoolOptions::new()
+                        .max_connections(1)
+                        .acquire_timeout(Duration::from_secs(10))
+                        .connect(migrator_url)
+                        .await
+                        .map_err(|e| {
+                            AppError::Database(format!("reconnect to create mokosh_app: {e}"))
+                        })?;
+                    let created = create_nologin_roles(
+                        &pool,
+                        &ROLES_REQUIRED_BY_MIGRATIONS
+                            .iter()
+                            .map(|r| r.to_string())
+                            .collect::<Vec<_>>(),
+                    )
+                    .await;
+                    pool.close().await;
+                    created.map_err(|e| {
+                        AppError::Database(format!("failed to create mokosh_app NOLOGIN: {e}"))
+                    })?;
+                    return Ok(());
+                }
+                AppRoleMissing::Refuse(message) => return Err(AppError::Database(message)),
+            }
         }
         RolesProbe::MigratorCannotConnect => {
-            // Fall through to the full provision path.
+            // Fall through to the full provision path. With the app-missing
+            // state now decided above, the admin-unset error below is only
+            // reached from here, where "mokosh_migrator cannot connect" is
+            // true again.
         }
     }
 
@@ -182,9 +342,19 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
 /// GRANT to `mokosh_app` in a new migration failed. [`RolesProbe::MigratorCannotConnect`]
 /// is the first-boot state, or a deployment that has never provisioned the
 /// split roles.
+///
+/// PMS-1153 added what each connected state learned: the role that ACTUALLY
+/// logged in (staging's `DATABASE_URL` is a single role of its own, not
+/// `mokosh_migrator`, and the log used to claim otherwise) and whether that
+/// role may create roles.
 enum RolesProbe {
-    BothExist,
-    MigratorConnectsAppMissing,
+    BothExist {
+        connected_as: String,
+    },
+    MigratorConnectsAppMissing {
+        connected_as: String,
+        can_create_roles: bool,
+    },
     MigratorCannotConnect,
 }
 
@@ -205,23 +375,27 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
     // pg_roles is a public view of pg_authid: readable by every logged-in
     // role without extra grants, so the migrator can answer this without
     // needing admin credentials.
-    let app_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mokosh_app')")
-            .fetch_one(&pool)
-            .await
-            .unwrap_or_else(|e| {
-                // If the probe query itself fails, treat it as "we cannot confirm"
-                // and fall through to full provision, which will name the underlying
-                // error if the admin URL is unset.
-                tracing::warn!("mokosh_app existence probe failed: {e}");
-                false
-            });
+    let probe = probe_roles(&pool, ROLES_REQUIRED_BY_MIGRATIONS).await;
     pool.close().await;
 
-    if app_exists {
-        RolesProbe::BothExist
-    } else {
-        RolesProbe::MigratorConnectsAppMissing
+    match probe {
+        Ok(probe) if probe.missing.is_empty() => RolesProbe::BothExist {
+            connected_as: probe.connected_as,
+        },
+        Ok(probe) => RolesProbe::MigratorConnectsAppMissing {
+            connected_as: probe.connected_as,
+            can_create_roles: probe.can_create_roles,
+        },
+        Err(e) => {
+            // #746's rule, kept: a probe that cannot answer is "we cannot
+            // confirm", never "the role is there". It cannot vouch for being
+            // able to create roles either, so the self-heal is off for it.
+            tracing::warn!("mokosh_app existence probe failed: {e}");
+            RolesProbe::MigratorConnectsAppMissing {
+                connected_as: "unknown (probe failed)".to_string(),
+                can_create_roles: false,
+            }
+        }
     }
 }
 
@@ -253,6 +427,71 @@ mod tests {
         assert_eq!(sql_quote("plain"), "'plain'");
         assert_eq!(sql_quote("o'brien"), "'o''brien'");
         assert_eq!(sql_quote("'; DROP ROLE --"), "'''; DROP ROLE --'");
+    }
+
+    /// PMS-1153: #746's admin path stays the first choice when it is
+    /// available, because it creates the roles properly - a login, a
+    /// password, the default privileges.
+    #[test]
+    fn the_admin_path_wins_when_it_is_available() {
+        assert_eq!(
+            decide_app_role_missing(true, true, "mokosh"),
+            AppRoleMissing::UseAdmin
+        );
+        assert_eq!(
+            decide_app_role_missing(true, false, "mokosh"),
+            AppRoleMissing::UseAdmin
+        );
+    }
+
+    /// Staging's shape: a single role of its own that is the database
+    /// superuser, and no admin URL. It heals by creating the role NOLOGIN,
+    /// where #746 alone would have stopped boot and asked for credentials.
+    #[test]
+    fn a_role_that_may_create_roles_heals_the_deployment() {
+        assert_eq!(
+            decide_app_role_missing(false, true, "mokosh"),
+            AppRoleMissing::CreateNoLogin
+        );
+    }
+
+    /// Nothing can create it: refuse, and say what is TRUE. The fall-through
+    /// this state used to reach claimed "mokosh_migrator cannot connect",
+    /// which is exactly what had not happened.
+    #[test]
+    fn a_role_that_cannot_create_roles_is_refused_truthfully() {
+        let AppRoleMissing::Refuse(message) = decide_app_role_missing(false, false, "mokosh")
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("mokosh_app does not exist"), "{message}");
+        assert!(
+            message.contains("`mokosh`"),
+            "names who connected: {message}"
+        );
+        assert!(
+            message.contains("CREATE ROLE mokosh_app NOLOGIN;"),
+            "gives the SQL: {message}"
+        );
+        assert!(
+            !message.contains("cannot connect"),
+            "the connection succeeded, so the message must not say it failed: {message}"
+        );
+    }
+
+    /// The roles the fast path guarantees are the ones CI creates for the
+    /// Postgres-backed suite, and `mokosh_migrator` is deliberately not one:
+    /// no migration names it and a single-role deployment does not use it.
+    #[test]
+    fn the_required_roles_are_the_ones_migrations_grant_to() {
+        assert_eq!(ROLES_REQUIRED_BY_MIGRATIONS, &["mokosh_app"]);
+        let ci = include_str!("../../scripts/test-db-roles.sql");
+        for role in ROLES_REQUIRED_BY_MIGRATIONS {
+            assert!(
+                ci.contains(&format!("CREATE ROLE {role}")),
+                "CI's role list and the provisioner's must agree on {role}"
+            );
+        }
     }
 
     #[test]
