@@ -274,9 +274,19 @@ pub async fn auth_middleware(
             // the EdDSA header, which is the line that misdirected the
             // 2026-09-07 staging triage.
             let mut bunyip_verified = false;
+            // PMS-981: skip the Bunyip verify entirely when the operator
+            // has excluded Bunyip from `AUTH_PROVIDERS`. The token still
+            // falls through to the legacy branch below (which is the only
+            // other credential path) and, if THAT one is disabled too or
+            // rejects, the caller sees the same 401 an invalid token gets.
+            // Never a log line naming Bunyip as "disabled": that would
+            // disclose the configured set.
+            let bunyip_enabled = crate::modules::auth::providers::is_enabled(
+                crate::modules::auth::providers::AuthProviderKind::Bunyip,
+            );
             // 1. Bunyip-as-OP Resource-Server path (new). Tokens minted by
             //    bunyip-api carry typ=at+jwt + iss=bunyip's OIDC_ISSUER.
-            let from_bunyip = match auth_middleware.bunyip.as_ref() {
+            let from_bunyip = match auth_middleware.bunyip.as_ref().filter(|_| bunyip_enabled) {
                 Some(v) => match v.verify_at_jwt(token).await {
                     Ok(claims) => {
                         bunyip_verified = true;

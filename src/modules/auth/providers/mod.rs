@@ -10,27 +10,38 @@
 //! kind, matching what [`crate::config`], [`crate::secrets`] and
 //! [`crate::storage`] already did for their own kinds.
 //!
-//! # Dormant
+//! # Enforcement
 //!
-//! The seam lands DORMANT. `create_api_router` continues to mount both
-//! authentication middlewares exactly as it did before, and no request is
-//! routed through an [`AuthProvider`] in this change. What lands is:
+//! The trait's SELECTION is installed at boot and read at two decision
+//! points: the Bunyip verifier entry (bearer path in
+//! [`super::middleware::auth_middleware`]) and password login
+//! ([`super::service::AuthService::login`]). A provider that the operator
+//! did NOT put in `AUTH_PROVIDERS` is skipped at those two points as if
+//! the underlying capability were not configured: a bearer arriving under
+//! Bunyip-disabled reads exactly the same 401 an invalid token does, and
+//! a password arriving under Local-disabled reads exactly the same 401
+//! an invalid password does. Neither response discloses which providers
+//! are configured, which is the PMS-981 AC.
+//!
+//! Unset `AUTH_PROVIDERS` resolves to the hosting profile's default,
+//! which enables both, so a deployment that configures nothing sees the
+//! exact byte-for-byte behaviour it had before. The enforcement fires
+//! only when the operator explicitly excludes one from the list.
+//!
+//! What lands in the module:
 //!
 //! - the trait,
 //! - a [`AuthProviderKind`] naming the two implementations an operator can
 //!   ask for,
 //! - a [`AuthProviderSelection`] that resolves `AUTH_PROVIDERS` against the
 //!   hosting profile's default and records which of the two decided the
-//!   list, and
+//!   list,
 //! - adapters ([`bunyip::BunyipOidcProvider`] and [`local::LocalProvider`])
-//!   that HOLD their underlying path rather than reimplementing it.
-//!
-//! Wiring the trait into the request-authentication pipeline is a follow-up
-//! that lands with the deprecation of the legacy path and the operator
-//! runbook for it. That order is deliberate: this change ships the
-//! NAMEABILITY surface, so a later change can flip the switch in one place
-//! without changing what "byte-for-byte behaviour identical to today's"
-//! means today. Every non-test caller of the chain is deliberately absent.
+//!   that HOLD their underlying path rather than reimplementing it, and
+//! - [`install_selection`] / [`current_selection`], the process-wide slot
+//!   the two decision points read from. Tests that do not call
+//!   [`install_selection`] read the default-open selection (both providers
+//!   enabled), which reproduces the pre-PMS-981 shipping behaviour.
 //!
 //! # The trait is a NAMEABILITY and ENABLEMENT surface, not a pipeline
 //!
@@ -50,6 +61,8 @@
 //! underlying credential path is reachable. The boot log records
 //! `enabled AND !available` as a configuration hazard.
 
+use std::sync::OnceLock;
+
 use crate::utils::deployment::{provider, EnablementSource};
 use crate::utils::error::{AppError, AppResult};
 
@@ -58,6 +71,46 @@ pub mod local;
 
 pub use bunyip::BunyipOidcProvider;
 pub use local::LocalProvider;
+
+/// The process's resolved authentication selection.
+///
+/// Written once by [`install_selection`] on the boot path, read every
+/// request through [`current_selection`]. Unset (test binaries that never
+/// call `install_selection`) reads as the default-open selection: both
+/// providers enabled, `EnablementSource::Profile`. That reproduces the
+/// pre-PMS-981 shipping behaviour, so a test that boots its own router
+/// and never touches this slot sees exactly what it did before.
+static CURRENT_SELECTION: OnceLock<AuthProviderSelection> = OnceLock::new();
+
+/// Install the process-wide selection. Called once on the boot path in
+/// `src/main.rs`. A second call is a no-op that keeps the first install,
+/// which is what makes it safe for test binaries that boot more than once
+/// in one process.
+pub fn install_selection(selection: AuthProviderSelection) {
+    let _ = CURRENT_SELECTION.set(selection);
+}
+
+/// Read the process's resolved selection. Falls back to a default-open
+/// selection (both providers enabled) when `install_selection` has never
+/// run, so a test that boots its own router without threading a selection
+/// through sees the pre-PMS-981 behaviour rather than a blanket 401.
+pub fn current_selection() -> AuthProviderSelection {
+    CURRENT_SELECTION
+        .get()
+        .cloned()
+        .unwrap_or_else(|| AuthProviderSelection {
+            providers: AuthProviderKind::ALL.to_vec(),
+            source: EnablementSource::Profile,
+        })
+}
+
+/// Whether the given provider is enabled in the process's current
+/// selection. The gate at the two decision points reads through this
+/// helper so the disclosure rule (an off provider looks exactly like an
+/// invalid credential) is enforced identically on both.
+pub fn is_enabled(kind: AuthProviderKind) -> bool {
+    current_selection().contains(kind)
+}
 
 /// A named authentication provider.
 ///
@@ -289,7 +342,7 @@ impl AuthProviderChain {
     }
 }
 
-/// Build the resolved chain for this process (PMS-981, dormant).
+/// Build the resolved chain for this process (PMS-981).
 ///
 /// `bunyip_verifier_present` is the boolean the startup wiring already
 /// knows from `create_api_router` (`bunyip_verifier.is_some()`), threaded
@@ -297,9 +350,10 @@ impl AuthProviderChain {
 /// axum / http / verifier state. It is what
 /// [`BunyipOidcProvider::is_available`] returns.
 ///
-/// NOTHING INSTALLS THIS. `create_api_router` does not call it, and
-/// `src/main.rs` does not call it. It is the API a future wiring PR calls
-/// so the switch flips in one place. Tests here exercise the shape.
+/// The startup wiring in `src/main.rs` calls this once, hands the returned
+/// chain's selection to [`install_selection`], and calls
+/// [`AuthProviderChain::record`] for the boot log. From then on the two
+/// decision points read [`current_selection`] directly.
 pub fn from_env_with(
     profile_default: &[&str],
     bunyip_verifier_present: bool,
@@ -605,6 +659,45 @@ mod tests {
         AuthProviderChain {
             providers,
             selection,
+        }
+    }
+
+    /// PMS-981: `current_selection` falls back to a default-open selection
+    /// when nothing has installed one. A test binary that never boots main
+    /// therefore reads exactly the pre-PMS-981 shape (both providers
+    /// enabled, source=Profile), so a suite that never asks about
+    /// selection sees no behaviour change.
+    ///
+    /// Cannot assert on `is_enabled(...)` after installing anything,
+    /// because `install_selection` writes to a process-wide `OnceLock`
+    /// shared with sibling tests: reading here is the only safe order,
+    /// and it either lands before any install (the default) or after some
+    /// other test's install (which must ALSO produce a selection that
+    /// includes at least one provider - `AuthProviderSelection::from_env`
+    /// refuses to build an empty one). Either way, both should read as
+    /// enabled in the default configuration.
+    #[test]
+    fn current_selection_defaults_to_both_providers_when_uninstalled() {
+        let selection = current_selection();
+        assert!(
+            selection.contains(AuthProviderKind::Bunyip)
+                || selection.contains(AuthProviderKind::Local),
+            "the default selection must include at least one provider, got {selection:?}"
+        );
+    }
+
+    /// PMS-981: `is_enabled` and `current_selection().contains(_)` return
+    /// the same answer. Callers use both spellings; a divergence would let
+    /// one gate wire refuse a credential the other one accepts.
+    #[test]
+    fn is_enabled_agrees_with_current_selection_contains() {
+        let selection = current_selection();
+        for kind in AuthProviderKind::ALL {
+            assert_eq!(
+                is_enabled(kind),
+                selection.contains(kind),
+                "is_enabled({kind:?}) must agree with current_selection().contains(...)",
+            );
         }
     }
 }
