@@ -176,6 +176,10 @@ declare_keys! {
     /// AES-256-GCM key for at-rest encryption, which a database-backed
     /// provider would need in order to read anything it stored.
     Bootstrap ENCRYPTION_KEY = "ENCRYPTION_KEY";
+    /// PMS-988: directory the file-backed application-tier secret provider
+    /// reads. A provider is built from this at boot, so it is bootstrap; unset
+    /// means the file provider is not enabled and holds nothing.
+    Bootstrap APP_SECRETS_DIR = "APP_SECRETS_DIR";
 
     // PMS-987: the configuration chain and the two providers whose
     // construction values themselves live under Configuration. Bootstrap
@@ -234,6 +238,17 @@ declare_keys! {
     Application ADMIN_EMAIL = "ADMIN_EMAIL";
     Application ADMIN_PASSWORD = "ADMIN_PASSWORD";
     Application LOGIN_APPROVAL_ENABLED = "LOGIN_APPROVAL_ENABLED";
+
+    // -- Feature flags (PMS-983) ---------------------------------------------
+    // Reached through `crate::config::flags`, so the parse rule and the
+    // default live with the flag rather than at every read site. No feature
+    // annotation: an unset key is the flag's default and the boot log stays
+    // silent, matching the registry convention.
+
+    /// PMS-983: the organizations feature. Read through
+    /// `crate::config::flags::ORGANIZATIONS_ENABLED`, which defaults per
+    /// hosting profile (off on self-hosted, on for SaaS).
+    Application ORGANIZATIONS_ENABLED = "ORGANIZATIONS_ENABLED";
     Application IP2LOCATION_DB_PATH = "IP2LOCATION_DB_PATH";
     Application IP2PROXY_DB_PATH = "IP2PROXY_DB_PATH";
 
@@ -331,6 +346,7 @@ mod tests {
                 "DATABASE_URL",
                 "MOKOSH_APP_DATABASE_URL",
                 "ENCRYPTION_KEY",
+                "APP_SECRETS_DIR",
                 "CONFIG_FILE_DIR",
                 "CONFIG_PROVIDERS",
                 "BUNYIP_CONFIG_URL",

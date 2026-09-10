@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     routing::{get, post, put},
     Json, Router,
 };
@@ -75,6 +76,12 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
         .route("/workday/clock-out", post(clock_out))
         .route("/workday/break/start", post(start_break))
         .route("/workday/break/end", post(end_break))
+        // PMS-1145: correct or remove a recorded segment. Same two gates as
+        // every other workday route, plus a tenant policy inside the service.
+        .route(
+            "/workday/segments/{id}",
+            put(update_segment).delete(delete_segment),
+        )
         // PMS-49 time rounding rules
         .route(
             "/time-rounding-rules",
@@ -445,6 +452,43 @@ async fn end_break(
     _timesheets: RequireTimesheets,
 ) -> AppResult<Json<WorkDaySegmentResponse>> {
     Ok(Json(state.service.end_break(user.tenant(), user.id).await?))
+}
+
+/// PMS-1145: correct a recorded segment. Who may is
+/// `timesheets/segment_editing`, read in the service, so the answer is the
+/// tenant's rather than this route's.
+async fn update_segment(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    _timesheets: RequireTimesheets,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpdateWorkDaySegmentRequest>,
+) -> AppResult<Json<WorkDaySegmentResponse>> {
+    request.validate()?;
+    Ok(Json(
+        state
+            .service
+            .update_segment(user.tenant(), &user, &ctx, id, &request)
+            .await?,
+    ))
+}
+
+/// PMS-1145: remove a recorded segment, the same gate as the correction
+/// above. 204 rather than the removed row: there is nothing left to return
+/// and the day it belonged to is re-read from `GET /workday`.
+async fn delete_segment(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    _timesheets: RequireTimesheets,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .delete_segment(user.tenant(), &user, &ctx, id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// A non-admin sees their own day; an admin may name whose. The same rule as
