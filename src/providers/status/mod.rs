@@ -10,6 +10,15 @@
 //! accident. The `debug_output_never_carries_a_value` shape from PMS-984
 //! is applied here to the whole report.
 //!
+//! # Wire types come from `dunite_provider_status`
+//!
+//! PMS-1014 extracted the report shape into the shared
+//! [`dunite_provider_status`] crate so BUNYIP-634's aggregator binds to one
+//! definition rather than a copy per producer. The re-exports below name
+//! the types by their local paths so the callers here (and the sibling
+//! renderer / route / public-summary modules) do not have to learn a second
+//! import path; the wire format itself is defined there.
+//!
 //! # Two renderings, one collector
 //!
 //! [`collect`] is the one function that reads process-global state. Two
@@ -30,7 +39,12 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
+
+pub use dunite_provider_status::report::{
+    EnabledProviderReport, GenerationHeader, HostingProfileDeviation, KeyReport,
+    KindEnumerationStatus, ProviderKindReport, ProviderStatusReport,
+};
 
 use crate::app_secrets::{AppSecretProviderKind, AppSecrets, GovernedSecret};
 use crate::config::{
@@ -52,122 +66,20 @@ pub mod renderer_html;
 pub mod renderer_json;
 pub mod route;
 
-/// The whole report, rendered by [`renderer_json::render_json`] and
-/// [`renderer_html::render_html`].
-///
-/// Only names, booleans, small integers, timestamps and statuses. No values,
-/// no credentials, no URLs beyond an unreachability message that may name a
-/// host and a status code.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ProviderStatusReport {
-    /// Which hosting profile is active (`self-hosted` or `saas`).
-    pub hosting_profile: &'static str,
-    /// Every kind whose selection differs from the hosting profile's default.
-    /// A deviation is worth naming; the defaults themselves are not.
-    pub deviations: Vec<HostingProfileDeviation>,
-    /// The application-tier configuration generation the process is serving.
-    pub configuration_generation: GenerationHeader,
-    /// Per-kind reports, in a stable order.
-    pub kinds: Vec<ProviderKindReport>,
-    /// UTC timestamp when this collection ran.
-    pub collected_at: DateTime<Utc>,
-}
-
-/// A generation identity for the report: number, when it resolved, and who.
-///
-/// `actor` is a human-readable string, never credential material.
-/// [`RefreshActor::System`] renders as `"System"`, an
-/// [`RefreshActor::Operator`] as `"Operator(<login>)"`.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct GenerationHeader {
-    pub number: u64,
-    pub resolved_at: DateTime<Utc>,
-    pub actor: String,
-}
-
-impl GenerationHeader {
-    fn from_generation(generation: &Generation) -> Self {
-        let actor = match generation.actor() {
-            RefreshActor::System => "System".to_string(),
-            RefreshActor::Operator(login) => format!("Operator({login})"),
-        };
-        Self {
-            number: generation.number(),
-            resolved_at: generation.resolved_at(),
-            actor,
-        }
+/// Build a [`GenerationHeader`] from a [`Generation`]. The actor is a
+/// human-readable string, never credential material: [`RefreshActor::System`]
+/// renders as `"System"`, an [`RefreshActor::Operator`] as
+/// `"Operator(<login>)"`.
+fn generation_header_from(generation: &Generation) -> GenerationHeader {
+    let actor = match generation.actor() {
+        RefreshActor::System => "System".to_string(),
+        RefreshActor::Operator(login) => format!("Operator({login})"),
+    };
+    GenerationHeader {
+        number: generation.number(),
+        resolved_at: generation.resolved_at(),
+        actor,
     }
-}
-
-/// One kind's selection differs from the profile's default.
-///
-/// Deliberately shaped after `ProviderChoice`: the row a caller renders as
-/// "the operator asked for X here, the profile would have said Y".
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HostingProfileDeviation {
-    pub kind: &'static str,
-    pub profile_default: Vec<&'static str>,
-    pub explicit: Vec<&'static str>,
-}
-
-/// One row per provider kind. Kinds whose providers cannot enumerate keep
-/// `keys` empty and `enumeration` `None`; kinds a caller cannot inspect at
-/// process scope (tenant-tier secrets) keep both empty.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ProviderKindReport {
-    /// One of: `configuration`, `secrets_application`, `secrets_tenant`,
-    /// `storage`, `authentication`, `email`.
-    pub kind: &'static str,
-    /// Every provider enabled for this kind, in priority order.
-    pub enabled: Vec<EnabledProviderReport>,
-    /// The provider serving this kind at collection time, if any.
-    pub serving: Option<&'static str>,
-    /// Per-key provenance and live presence (populated for `configuration`
-    /// and `secrets_application` only; other kinds carry an empty vec).
-    pub keys: Vec<KeyReport>,
-    /// Enumeration outcome for kinds whose providers can list. `None` when
-    /// enumeration is not a concept for the kind (authentication, email).
-    pub enumeration: Option<KindEnumerationStatus>,
-}
-
-/// One enabled provider on a kind.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct EnabledProviderReport {
-    pub name: &'static str,
-    /// 0 is highest priority.
-    pub priority: usize,
-    pub reachable: bool,
-    /// If unreachable, the human message. Never a URL, credential or value;
-    /// naming a host and a status code is fine.
-    pub unreachable_reason: Option<String>,
-}
-
-/// One declared key's provenance and live presence for the report.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct KeyReport {
-    pub key: &'static str,
-    /// PMS-1075: the sentence describing what stops working when nobody
-    /// holds this key. `None` when the key is legitimately optional.
-    pub feature: Option<&'static str>,
-    /// The provider recorded in the current generation. `None` when nobody
-    /// held it at the last resolve.
-    pub recorded_served_by: Option<&'static str>,
-    /// Live presence at collection time, from the provider's `has()`.
-    pub live_holds: bool,
-    /// One of `unchanged`, `appeared`, `disappeared`, `changed_provider`
-    /// (PMS-984 divergence classification).
-    pub state: &'static str,
-}
-
-/// The `list()` outcome for a kind that supports enumeration.
-///
-/// An empty `Supported(Vec::new())` and an `Unsupported` are DIFFERENT facts
-/// and never collapse into each other, the way `Enumeration` and
-/// `EnumerationStatus` already keep them apart in `crate::config`.
-#[derive(Debug, Clone, serde::Serialize)]
-pub enum KindEnumerationStatus {
-    Supported(Vec<String>),
-    Unsupported,
 }
 
 /// Collect the whole report. Side-effect-free except for `Utc::now()` and
@@ -204,11 +116,11 @@ pub fn collect() -> ProviderStatusReport {
 
     ProviderStatusReport {
         hosting_profile: match hosting_profile {
-            DeploymentMode::SelfHosted => "self-hosted",
-            DeploymentMode::Saas => "saas",
+            DeploymentMode::SelfHosted => "self-hosted".to_string(),
+            DeploymentMode::Saas => "saas".to_string(),
         },
         deviations,
-        configuration_generation: GenerationHeader::from_generation(&generation),
+        configuration_generation: generation_header_from(&generation),
         kinds: vec![
             configuration,
             secrets_app,
@@ -239,14 +151,14 @@ fn collect_configuration_kind(
             .into_iter()
             .enumerate()
             .map(|(priority, kind)| EnabledProviderReport {
-                name: kind.as_str(),
+                name: kind.as_str().to_string(),
                 priority,
                 reachable: true,
                 unreachable_reason: None,
             })
             .collect(),
         None => vec![EnabledProviderReport {
-            name: ConfigProviderKind::Environment.as_str(),
+            name: ConfigProviderKind::Environment.as_str().to_string(),
             priority: 0,
             reachable: true,
             unreachable_reason: None,
@@ -257,7 +169,7 @@ fn collect_configuration_kind(
     // `served_by` on the first held key gives the answer for the
     // single-provider slot; a PMS-987 chain answers per-key and the field
     // here reports the first non-None seen.
-    let serving = resolve_serving_provider(generation);
+    let serving = resolve_serving_provider(generation).map(str::to_string);
 
     // Per-key rows come from `config::check_staleness`, which is what
     // PMS-984 built for exactly this purpose. Not calling that would mean a
@@ -267,11 +179,11 @@ fn collect_configuration_kind(
         .rows
         .iter()
         .map(|row| KeyReport {
-            key: row.key,
-            feature: row.feature,
-            recorded_served_by: row.recorded_served_by,
+            key: row.key.to_string(),
+            feature: row.feature.map(str::to_string),
+            recorded_served_by: row.recorded_served_by.map(str::to_string),
             live_holds: row.live_holds,
-            state: staleness_state_name(row.state),
+            state: staleness_state_name(row.state).to_string(),
         })
         .collect();
 
@@ -283,7 +195,7 @@ fn collect_configuration_kind(
     };
 
     ProviderKindReport {
-        kind: "configuration",
+        kind: "configuration".to_string(),
         enabled,
         serving,
         keys,
@@ -319,7 +231,7 @@ fn staleness_state_name(state: config::StalenessState) -> &'static str {
 fn collect_secrets_application_kind(secrets: Option<Arc<AppSecrets>>) -> ProviderKindReport {
     let Some(secrets) = secrets else {
         return ProviderKindReport {
-            kind: "secrets_application",
+            kind: "secrets_application".to_string(),
             enabled: Vec::new(),
             serving: None,
             keys: Vec::new(),
@@ -335,7 +247,7 @@ fn collect_secrets_application_kind(secrets: Option<Arc<AppSecrets>>) -> Provide
         .enumerate()
         .filter_map(|(priority, kind)| {
             secrets.provider(*kind).map(|_| EnabledProviderReport {
-                name: kind.as_str(),
+                name: kind.as_str().to_string(),
                 // Priority is declaration order in ALL; the declared
                 // provider is what serves, regardless of position.
                 priority,
@@ -350,25 +262,25 @@ fn collect_secrets_application_kind(secrets: Option<Arc<AppSecrets>>) -> Provide
         .map(|secret| {
             // NEVER `provider.get()`; only `provider.has()`.
             let live_holds = secrets.provider(declared).is_some_and(|p| p.has(*secret));
-            let recorded_served_by = live_holds.then(|| declared.as_str());
+            let recorded_served_by = live_holds.then(|| declared.as_str().to_string());
             KeyReport {
-                key: secret.name(),
-                feature: Some(secret.feature()),
+                key: secret.name().to_string(),
+                feature: Some(secret.feature().to_string()),
                 recorded_served_by,
                 live_holds,
                 state: if live_holds {
-                    "unchanged"
+                    "unchanged".to_string()
                 } else {
-                    "disappeared"
+                    "disappeared".to_string()
                 },
             }
         })
         .collect();
 
     ProviderKindReport {
-        kind: "secrets_application",
+        kind: "secrets_application".to_string(),
         enabled,
-        serving: Some(declared.as_str()),
+        serving: Some(declared.as_str().to_string()),
         keys,
         enumeration: None,
     }
@@ -397,14 +309,14 @@ fn collect_secrets_tenant_kind(
     };
     (
         ProviderKindReport {
-            kind: "secrets_tenant",
+            kind: "secrets_tenant".to_string(),
             enabled: vec![EnabledProviderReport {
-                name,
+                name: name.to_string(),
                 priority: 0,
                 reachable: true,
                 unreachable_reason: None,
             }],
-            serving: Some(name),
+            serving: Some(name.to_string()),
             // Enumerating a tenant secret needs a tenant scope this
             // collector does not hold; the row exists to name the provider.
             keys: Vec::new(),
@@ -429,14 +341,14 @@ fn collect_storage_kind(
     let explicit = (source == EnablementSource::Explicit).then(|| vec![name]);
     (
         ProviderKindReport {
-            kind: "storage",
+            kind: "storage".to_string(),
             enabled: vec![EnabledProviderReport {
-                name,
+                name: name.to_string(),
                 priority: 0,
                 reachable: true,
                 unreachable_reason: None,
             }],
-            serving: Some(name),
+            serving: Some(name.to_string()),
             keys: Vec::new(),
             enumeration: None,
         },
@@ -463,16 +375,16 @@ fn collect_authentication_kind(
                 .iter()
                 .enumerate()
                 .map(|(priority, name)| EnabledProviderReport {
-                    name,
+                    name: (*name).to_string(),
                     priority,
                     reachable: true,
                     unreachable_reason: None,
                 })
                 .collect();
-            let serving = profile_default.first().copied();
+            let serving = profile_default.first().copied().map(str::to_string);
             return (
                 ProviderKindReport {
-                    kind: "authentication",
+                    kind: "authentication".to_string(),
                     enabled,
                     serving,
                     keys: Vec::new(),
@@ -516,7 +428,7 @@ fn collect_authentication_kind(
                 }
             };
             EnabledProviderReport {
-                name: kind.as_str(),
+                name: kind.as_str().to_string(),
                 priority,
                 reachable,
                 unreachable_reason: reason,
@@ -524,11 +436,11 @@ fn collect_authentication_kind(
         })
         .collect();
 
-    let serving = selection.providers.first().map(|k| k.as_str());
+    let serving = selection.providers.first().map(|k| k.as_str().to_string());
     let explicit = selection.explicit_providers();
     (
         ProviderKindReport {
-            kind: "authentication",
+            kind: "authentication".to_string(),
             enabled,
             serving,
             keys: Vec::new(),
@@ -551,14 +463,14 @@ fn collect_email_kind() -> (ProviderKindReport, Option<Vec<&'static str>>) {
             };
             (
                 ProviderKindReport {
-                    kind: "email",
+                    kind: "email".to_string(),
                     enabled: vec![EnabledProviderReport {
-                        name,
+                        name: name.to_string(),
                         priority: 0,
                         reachable: true,
                         unreachable_reason: None,
                     }],
-                    serving: Some(name),
+                    serving: Some(name.to_string()),
                     keys: Vec::new(),
                     enumeration: None,
                 },
@@ -567,7 +479,7 @@ fn collect_email_kind() -> (ProviderKindReport, Option<Vec<&'static str>>) {
         }
         Err(_) => (
             ProviderKindReport {
-                kind: "email",
+                kind: "email".to_string(),
                 enabled: Vec::new(),
                 serving: None,
                 keys: Vec::new(),
@@ -595,9 +507,14 @@ fn collect_deviations(selection: &ProviderSelection) -> Vec<HostingProfileDeviat
     selection
         .deviations()
         .map(|choice| HostingProfileDeviation {
-            kind: choice.kind.as_str(),
-            profile_default: selection.mode().default_providers_for(choice.kind).to_vec(),
-            explicit: choice.providers.clone(),
+            kind: choice.kind.as_str().to_string(),
+            profile_default: selection
+                .mode()
+                .default_providers_for(choice.kind)
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            explicit: choice.providers.iter().map(|s| (*s).to_string()).collect(),
         })
         .collect()
 }
@@ -641,7 +558,7 @@ mod tests {
     #[test]
     fn collect_returns_one_report_per_kind_in_a_stable_order() {
         let report = collect();
-        let kinds: Vec<&str> = report.kinds.iter().map(|k| k.kind).collect();
+        let kinds: Vec<&str> = report.kinds.iter().map(|k| k.kind.as_str()).collect();
         assert_eq!(
             kinds,
             vec![
@@ -660,7 +577,7 @@ mod tests {
     fn collect_names_a_known_hosting_profile() {
         let report = collect();
         assert!(
-            matches!(report.hosting_profile, "self-hosted" | "saas"),
+            matches!(report.hosting_profile.as_str(), "self-hosted" | "saas"),
             "unknown hosting profile: {}",
             report.hosting_profile
         );
@@ -707,8 +624,11 @@ mod tests {
         let deviations = collect_deviations(&selection);
         assert_eq!(deviations.len(), 1);
         assert_eq!(deviations[0].kind, "storage");
-        assert_eq!(deviations[0].profile_default, vec![provider_name::LOCAL]);
-        assert_eq!(deviations[0].explicit, vec![provider_name::S3]);
+        assert_eq!(
+            deviations[0].profile_default,
+            vec![provider_name::LOCAL.to_string()]
+        );
+        assert_eq!(deviations[0].explicit, vec![provider_name::S3.to_string()]);
     }
 
     /// The staleness state names are exactly the four PMS-984 defined.
@@ -750,7 +670,7 @@ mod tests {
         let provider = MapProvider(BTreeMap::new());
 
         let system = Generation::resolve(&provider, None, 1, RefreshActor::System);
-        assert_eq!(GenerationHeader::from_generation(&system).actor, "System");
+        assert_eq!(generation_header_from(&system).actor, "System");
 
         let operator = Generation::resolve(
             &provider,
@@ -758,10 +678,7 @@ mod tests {
             1,
             RefreshActor::Operator("alice".to_string()),
         );
-        assert_eq!(
-            GenerationHeader::from_generation(&operator).actor,
-            "Operator(alice)"
-        );
+        assert_eq!(generation_header_from(&operator).actor, "Operator(alice)");
     }
 
     /// Application-secret report when `AppSecrets::current()` is `None`:
@@ -835,7 +752,7 @@ mod tests {
     fn html_escapes_inserted_strings() {
         let mut report = collect();
         report.kinds[0].enabled.push(EnabledProviderReport {
-            name: "safe", // static; the escape is exercised on dynamic values
+            name: "safe".to_string(), // static; the escape is exercised on dynamic values
             priority: 99,
             reachable: false,
             unreachable_reason: Some("<script>alert(1)</script>".to_string()),

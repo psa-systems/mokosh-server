@@ -12,15 +12,21 @@
 //! the standup question "which auth path is this instance using?" without
 //! asking an operator to log in and read the admin page.
 //!
+//! PMS-1014 moved the summary types into the shared
+//! [`dunite_provider_status`] crate; the [`summarize`] reduction stays here
+//! because it is Mokosh-specific (it walks the local [`ProviderStatusReport`]
+//! and picks the deployment-scoped kinds), and the re-exports below keep
+//! the local import path callers already use.
+//!
 //! The rules that make an unauthenticated endpoint safe:
 //!
-//! - **Identity only.** Only the [`&'static str`] provider name per kind,
-//!   the hosting-profile name, and a schema version. No values, no
-//!   credentials, no URLs, no reachability strings, no per-key rows, no
-//!   generation actor. Everything else the report holds is a NON-goal here
-//!   and must never leak in from a later [`super::ProviderStatusReport`]
-//!   field addition, which is what
-//!   [`super::tests::public_summary_carries_no_secret_looking_strings`]
+//! - **Identity only.** Only the provider name per kind, the hosting-profile
+//!   name, and a schema version. No values, no credentials, no URLs, no
+//!   reachability strings, no per-key rows, no generation actor.
+//!   Everything else the report holds is a NON-goal here and must never
+//!   leak in from a later [`super::ProviderStatusReport`] field addition,
+//!   which is what
+//!   [`super::public_summary::tests::public_summary_carries_no_secret_looking_strings`]
 //!   asserts.
 //! - **Deployment-scoped kinds only.** `configuration`, `secrets_application`,
 //!   `storage`, `authentication`, `email`. The tenant tier
@@ -30,54 +36,27 @@
 //!
 //! Both halves are pinned by tests below.
 
-use serde::Serialize;
+pub use dunite_provider_status::summary::{
+    PublicProviderSummary, PublicProviders, SUMMARY_SCHEMA_VERSION as SCHEMA_VERSION,
+};
 
 use super::ProviderStatusReport;
-
-/// The schema version of the public summary envelope. Bumped when the
-/// envelope's shape changes; adding a new kind (a new provider capability
-/// the deployment configures) is a shape change and requires a bump.
-pub const SCHEMA_VERSION: &str = "1";
-
-/// The public summary: hosting profile + enabled provider names per
-/// deployment-scoped kind. See the module doc for what deliberately does
-/// NOT appear here.
-#[derive(Debug, Clone, Serialize)]
-pub struct PublicProviderSummary {
-    pub schema_version: &'static str,
-    pub hosting_profile: &'static str,
-    pub providers: PublicProviders,
-}
-
-/// Enabled provider names per deployment-scoped kind, in priority order.
-///
-/// A concrete struct rather than a map because the SHAPE is fixed - a
-/// consumer can bind types to it - and because a map with `&'static str`
-/// keys reads less well on the wire.
-#[derive(Debug, Clone, Serialize)]
-pub struct PublicProviders {
-    pub configuration: Vec<&'static str>,
-    pub secrets_application: Vec<&'static str>,
-    pub storage: Vec<&'static str>,
-    pub authentication: Vec<&'static str>,
-    pub email: Vec<&'static str>,
-}
 
 /// Reduce a [`ProviderStatusReport`] to the outward summary. Pure over its
 /// input, so the endpoint that calls `super::collect().summarize()` and the
 /// tests that build a report by hand share one derivation.
 pub fn summarize(report: &ProviderStatusReport) -> PublicProviderSummary {
-    let names_for = |kind: &'static str| -> Vec<&'static str> {
+    let names_for = |kind: &str| -> Vec<String> {
         report
             .kinds
             .iter()
             .find(|k| k.kind == kind)
-            .map(|k| k.enabled.iter().map(|e| e.name).collect())
+            .map(|k| k.enabled.iter().map(|e| e.name.clone()).collect())
             .unwrap_or_default()
     };
     PublicProviderSummary {
-        schema_version: SCHEMA_VERSION,
-        hosting_profile: report.hosting_profile,
+        schema_version: SCHEMA_VERSION.to_string(),
+        hosting_profile: report.hosting_profile.clone(),
         providers: PublicProviders {
             configuration: names_for("configuration"),
             secrets_application: names_for("secrets_application"),
@@ -142,7 +121,7 @@ mod tests {
         };
 
         let report = ProviderStatusReport {
-            hosting_profile: "self-hosted",
+            hosting_profile: "self-hosted".to_string(),
             deviations: Vec::new(),
             configuration_generation: GenerationHeader {
                 number: 1,
@@ -150,7 +129,7 @@ mod tests {
                 actor: "System".to_string(),
             },
             kinds: vec![ProviderKindReport {
-                kind: "authentication",
+                kind: "authentication".to_string(),
                 enabled: Vec::new(),
                 serving: None,
                 keys: Vec::new(),
