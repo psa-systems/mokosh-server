@@ -28,7 +28,7 @@ pub fn render_html(report: &ProviderStatusReport) -> String {
 
     // -- Overview --------------------------------------------------------
     out.push_str("<section id=\"overview\">\n<h2>Overview</h2>\n<dl>\n");
-    push_kv(&mut out, "Hosting profile", report.hosting_profile);
+    push_kv(&mut out, "Hosting profile", &report.hosting_profile);
     push_kv(
         &mut out,
         "Generation number",
@@ -62,7 +62,7 @@ pub fn render_html(report: &ProviderStatusReport) -> String {
         );
         for deviation in &report.deviations {
             out.push_str("<tr>");
-            push_td(&mut out, deviation.kind);
+            push_td(&mut out, &deviation.kind);
             push_td(&mut out, &deviation.profile_default.join(", "));
             push_td(&mut out, &deviation.explicit.join(", "));
             out.push_str("</tr>\n");
@@ -73,9 +73,9 @@ pub fn render_html(report: &ProviderStatusReport) -> String {
 
     // -- Kinds ----------------------------------------------------------
     for kind in &report.kinds {
-        out.push_str(&format!("<section id=\"{}\">\n", html_escape(kind.kind)));
-        out.push_str(&format!("<h2>{}</h2>\n", html_escape(kind.kind)));
-        if let Some(name) = kind.serving {
+        out.push_str(&format!("<section id=\"{}\">\n", html_escape(&kind.kind)));
+        out.push_str(&format!("<h2>{}</h2>\n", html_escape(&kind.kind)));
+        if let Some(name) = &kind.serving {
             out.push_str(&format!(
                 "<p><strong>Serving:</strong> {}</p>\n",
                 html_escape(name)
@@ -91,7 +91,7 @@ pub fn render_html(report: &ProviderStatusReport) -> String {
             );
             for enabled in &kind.enabled {
                 out.push_str("<tr>");
-                push_td(&mut out, enabled.name);
+                push_td(&mut out, &enabled.name);
                 push_td(&mut out, &enabled.priority.to_string());
                 push_td(&mut out, if enabled.reachable { "yes" } else { "no" });
                 push_td(
@@ -110,11 +110,11 @@ pub fn render_html(report: &ProviderStatusReport) -> String {
             );
             for key in &kind.keys {
                 out.push_str("<tr>");
-                push_td(&mut out, key.key);
-                push_td(&mut out, key.feature.unwrap_or(""));
-                push_td(&mut out, key.recorded_served_by.unwrap_or(""));
+                push_td(&mut out, &key.key);
+                push_td(&mut out, key.feature.as_deref().unwrap_or(""));
+                push_td(&mut out, key.recorded_served_by.as_deref().unwrap_or(""));
                 push_td(&mut out, if key.live_holds { "yes" } else { "no" });
-                push_state_td(&mut out, key.state);
+                push_state_td(&mut out, &key.state);
                 out.push_str("</tr>\n");
             }
             out.push_str("</tbody></table>\n");

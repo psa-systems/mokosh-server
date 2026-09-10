@@ -976,6 +976,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunite-provider-status"
+version = "0.1.0"
+source = "git+https://dev.a8n.run/psa-systems/dunite?rev=f3d31295e98ef716ec9f2a6d49f4c16c7dca994a#f3d31295e98ef716ec9f2a6d49f4c16c7dca994a"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dunite-stripe-core"
 version = "0.1.0"
 source = "git+https://dev.a8n.run/psa-systems/dunite?rev=cc10e8358a6f21160544a415a9488c16827af699#cc10e8358a6f21160544a415a9488c16827af699"
@@ -2164,6 +2174,7 @@ dependencies = [
  "cron",
  "dotenvy",
  "dunite-ipenrich",
+ "dunite-provider-status",
  "dunite-stripe-core",
  "governor",
  "hmac 0.12.1",
