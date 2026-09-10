@@ -50,14 +50,31 @@ const APP_PASSWORD_VAR: &str = "MOKOSH_APP_PASSWORD";
 /// roles idempotently, then closes the admin pool. Call this once at startup,
 /// before [`super::Database::new`] and migrations.
 pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
-    // Fast path: if the migrator role can already log in the roles exist and
-    // there is nothing to do. This lets prod unset MOKOSH_ADMIN_DATABASE_URL
-    // after the first boot.
-    if migrator_can_connect(migrator_url).await {
-        tracing::info!(
-            "DB roles already provisioned (mokosh_migrator can connect); skipping role provisioning"
-        );
-        return Ok(());
+    // Fast path: the migrator role can log in AND `mokosh_app` exists. Both
+    // halves matter: staging on 2026-09-10 hit "role \"mokosh_app\" does not
+    // exist" on migration 207's closing GRANT because the fast path had
+    // returned early on migrator-can-connect alone. The migrator being there
+    // does not imply the app role is - a database provisioned before the
+    // PMS-489 split, or one where the app role was manually dropped, leaves
+    // the migrator functional while every future GRANT to mokosh_app fails.
+    // Checking both here catches that state before migrations run and
+    // routes it to the full provision path, which needs
+    // MOKOSH_ADMIN_DATABASE_URL to recreate what is missing.
+    match roles_probe(migrator_url).await {
+        RolesProbe::BothExist => {
+            tracing::info!(
+                "DB roles already provisioned (mokosh_migrator + mokosh_app present); skipping role provisioning"
+            );
+            return Ok(());
+        }
+        RolesProbe::MigratorConnectsAppMissing => {
+            tracing::warn!(
+                "mokosh_migrator can connect but mokosh_app is missing; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
+            );
+        }
+        RolesProbe::MigratorCannotConnect => {
+            // Fall through to the full provision path.
+        }
     }
 
     let admin_url = match std::env::var(ADMIN_DATABASE_URL_VAR) {
@@ -156,24 +173,55 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Probe whether the migrator role can establish a login. Returns `false` on
-/// any connection error (role absent, wrong password, or the DB being
-/// unreachable - in which case the subsequent admin connect fails loudly too).
-async fn migrator_can_connect(migrator_url: &str) -> bool {
-    match PgPoolOptions::new()
+/// The result of the boot-time role probe: does the migrator role log in,
+/// and does the `mokosh_app` role exist in `pg_roles`?
+///
+/// [`RolesProbe::BothExist`] is the fast path a healthy deployment takes on
+/// every subsequent boot. [`RolesProbe::MigratorConnectsAppMissing`] is the
+/// state staging hit on 2026-09-10, where the migrator was fine but every
+/// GRANT to `mokosh_app` in a new migration failed. [`RolesProbe::MigratorCannotConnect`]
+/// is the first-boot state, or a deployment that has never provisioned the
+/// split roles.
+enum RolesProbe {
+    BothExist,
+    MigratorConnectsAppMissing,
+    MigratorCannotConnect,
+}
+
+async fn roles_probe(migrator_url: &str) -> RolesProbe {
+    let pool = match PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(10))
         .connect(migrator_url)
         .await
     {
-        Ok(pool) => {
-            pool.close().await;
-            true
-        }
+        Ok(pool) => pool,
         Err(e) => {
             tracing::debug!("mokosh_migrator probe connection failed: {e}");
-            false
+            return RolesProbe::MigratorCannotConnect;
         }
+    };
+
+    // pg_roles is a public view of pg_authid: readable by every logged-in
+    // role without extra grants, so the migrator can answer this without
+    // needing admin credentials.
+    let app_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mokosh_app')")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| {
+                // If the probe query itself fails, treat it as "we cannot confirm"
+                // and fall through to full provision, which will name the underlying
+                // error if the admin URL is unset.
+                tracing::warn!("mokosh_app existence probe failed: {e}");
+                false
+            });
+    pool.close().await;
+
+    if app_exists {
+        RolesProbe::BothExist
+    } else {
+        RolesProbe::MigratorConnectsAppMissing
     }
 }
 
