@@ -37,9 +37,17 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
                  would resolve configuration, and reads .env.infisical directly",
     },
     EntryPoint {
-        path: "src/cli.rs",
+        path: "src/cli/mod.rs",
         reason: "the same operator subcommands folded into the server binary (PMS-494), \
                  dispatched before a port is bound or a provider is chosen",
+    },
+    EntryPoint {
+        path: "src/cli/providers.rs",
+        reason: "the provider-status / provider-migrate / provider-purge subcommands (PMS-1012) \
+                 read SECRET_BACKEND and INFISICAL_ADDRESS directly, the same way \
+                 src/app_secrets/mod.rs and src/config/mod.rs do: they build providers ahead of \
+                 any read path, so the machinery a provider is chosen and constructed FROM \
+                 cannot itself be provider-served",
     },
     EntryPoint {
         path: "src/db/provision.rs",

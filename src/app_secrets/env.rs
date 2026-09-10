@@ -14,12 +14,15 @@
 //! property of the provider, not a policy on top of it, so the admin surface
 //! that later renders a save form reads the flag and gets a natural 409.
 
+use async_trait::async_trait;
+
 use super::{AppSecretProvider, GovernedSecret};
 
 /// The environment provider. Zero state: every read consults the current
 /// process environment directly, and every write is refused by `is_writable`.
 pub struct EnvironmentProvider;
 
+#[async_trait]
 impl AppSecretProvider for EnvironmentProvider {
     fn name(&self) -> &'static str {
         "environment"

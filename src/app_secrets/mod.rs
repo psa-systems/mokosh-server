@@ -39,6 +39,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+use async_trait::async_trait;
+
 use crate::db::Database;
 use crate::utils::deployment::{provider, EnablementSource};
 use crate::utils::error::{AppError, AppResult};
@@ -115,10 +117,16 @@ impl std::fmt::Display for GovernedSecret {
 /// not. Sharing one trait would let a caller pass one kind of key where the
 /// other is required, which is exactly the boundary this seam exists to keep.
 ///
-/// Sync on purpose: every implementation resolves its value at boot (either
-/// by reading a file, an env var, or a decrypted database column loaded
-/// once), so the read paths that ask "what is the SMTP password" answer from
-/// memory without an async hop.
+/// The `get` / `has` read paths are sync on purpose: every implementation
+/// resolves its value at boot (either by reading a file, an env var, or a
+/// decrypted database column loaded once), so the read paths that ask "what is
+/// the SMTP password" answer from memory without an async hop.
+///
+/// `set` and `delete` are async because the writable providers reach out over
+/// the wire or into the pool. PMS-1012 added them: the provider-migrate CLI is
+/// what needs them, and the trait not carrying them is what made an external
+/// migration tool the operator's only option.
+#[async_trait]
 pub trait AppSecretProvider: Send + Sync {
     /// The provider's canonical name, as an operator writes it and as the
     /// boot record reports it.
@@ -145,6 +153,30 @@ pub trait AppSecretProvider: Send + Sync {
     /// secret files are mounted read-only.
     fn is_writable(&self) -> bool {
         true
+    }
+
+    /// PMS-1012: write one governed secret. The default returns
+    /// `AppError::Configuration` naming the provider, so an existing
+    /// implementation that has not been updated for a write path refuses
+    /// loudly rather than silently no-oping.
+    async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
+        let _ = (secret, value);
+        Err(AppError::Configuration(format!(
+            "{} provider does not support writes",
+            self.name()
+        )))
+    }
+
+    /// PMS-1012: delete one governed secret. Same default posture as
+    /// [`AppSecretProvider::set`]: a provider that cannot delete refuses the
+    /// call, and the caller (the CLI) reports "cannot purge <provider>" with
+    /// what an operator would have to do by hand.
+    async fn delete(&self, secret: GovernedSecret) -> AppResult<()> {
+        let _ = secret;
+        Err(AppError::Configuration(format!(
+            "{} provider does not support deletes",
+            self.name()
+        )))
     }
 }
 
@@ -212,7 +244,10 @@ impl AppSecretProviderKind {
         }
     }
 
-    fn index(self) -> usize {
+    /// The kind's slot in a `Vec<Option<Arc<dyn AppSecretProvider>>>` of
+    /// length [`Self::ALL`]`.len()`. Made `pub(crate)` so the PMS-1012 CLI can
+    /// index a slot without reimplementing the mapping.
+    pub(crate) fn index(self) -> usize {
         match self {
             Self::Environment => 0,
             Self::File => 1,
@@ -622,6 +657,7 @@ mod tests {
         value: Option<String>,
     }
 
+    #[async_trait]
     impl AppSecretProvider for FixedProvider {
         fn name(&self) -> &'static str {
             self.name

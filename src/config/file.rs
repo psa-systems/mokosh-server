@@ -28,8 +28,12 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::RwLock;
+
+use async_trait::async_trait;
 
 use super::{ConfigProvider, Enumeration, REGISTRY};
+use crate::utils::error::{AppError, AppResult};
 
 /// A directory the operator points at with `CONFIG_FILE_DIR`, holding one
 /// file per declared configuration key.
@@ -40,9 +44,14 @@ use super::{ConfigProvider, Enumeration, REGISTRY};
 /// next chain rebuild.
 #[derive(Debug)]
 pub struct FileProvider {
+    /// Root directory holding one file per key. `None` when the provider is
+    /// enabled but the directory is unreadable or was never set; write and
+    /// delete calls refuse in that state, because there is no path to write.
+    root: Option<PathBuf>,
     /// Values keyed by declared key name. Empty when the directory is
-    /// unreadable or holds no declared key.
-    values: BTreeMap<String, String>,
+    /// unreadable or holds no declared key. Interior mutability so
+    /// [`Self::set`] and [`Self::delete`] keep the cache in step with disk.
+    values: RwLock<BTreeMap<String, String>>,
 }
 
 impl FileProvider {
@@ -63,7 +72,8 @@ impl FileProvider {
         match dir {
             Some(dir) => Self::load(PathBuf::from(dir)),
             None => Self {
-                values: BTreeMap::new(),
+                root: None,
+                values: RwLock::new(BTreeMap::new()),
             },
         }
     }
@@ -84,10 +94,16 @@ impl FileProvider {
                     "CONFIG_FILE_DIR names a path that is not a directory; the file \
                      configuration provider holds nothing"
                 );
-                return Self { values };
+                return Self {
+                    root: None,
+                    values: RwLock::new(values),
+                };
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Self { values };
+                return Self {
+                    root: Some(dir),
+                    values: RwLock::new(values),
+                };
             }
             Err(err) => {
                 tracing::error!(
@@ -96,7 +112,10 @@ impl FileProvider {
                     "CONFIG_FILE_DIR could not be read; the file configuration provider \
                      holds nothing"
                 );
-                return Self { values };
+                return Self {
+                    root: None,
+                    values: RwLock::new(values),
+                };
             }
         }
 
@@ -124,25 +143,102 @@ impl FileProvider {
             }
         }
 
-        Self { values }
+        Self {
+            root: Some(dir),
+            values: RwLock::new(values),
+        }
     }
 }
 
+#[async_trait]
 impl ConfigProvider for FileProvider {
     fn name(&self) -> &'static str {
         "file"
     }
 
     fn get(&self, key: &str) -> Option<String> {
-        self.values.get(key).cloned()
+        self.values
+            .read()
+            .expect("the file configuration cache lock is never held across a panic")
+            .get(key)
+            .cloned()
     }
 
     fn has(&self, key: &str) -> bool {
-        self.values.contains_key(key)
+        self.values
+            .read()
+            .expect("the file configuration cache lock is never held across a panic")
+            .contains_key(key)
     }
 
     fn list(&self) -> Enumeration {
-        Enumeration::Keys(self.values.keys().cloned().collect())
+        Enumeration::Keys(
+            self.values
+                .read()
+                .expect("the file configuration cache lock is never held across a panic")
+                .keys()
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// PMS-1012: write `value` into the per-key file under the root.
+    ///
+    /// The root has to exist for a write to have anywhere to go. A file
+    /// provider built from an unset or non-directory `CONFIG_FILE_DIR`
+    /// refuses the write with a named `AppError::Configuration`, so an
+    /// operator asking to migrate TO the file provider without pointing it
+    /// anywhere gets a clear message rather than a silent success.
+    async fn set(&self, key: &str, value: &str) -> AppResult<()> {
+        let root = self.root.as_ref().ok_or_else(|| {
+            AppError::Configuration(
+                "file configuration provider has no directory; set CONFIG_FILE_DIR to enable \
+                 writes"
+                    .to_string(),
+            )
+        })?;
+        if !root.exists() {
+            std::fs::create_dir_all(root).map_err(|e| {
+                AppError::Configuration(format!(
+                    "file configuration provider could not create {}: {e}",
+                    root.display()
+                ))
+            })?;
+        }
+        let path = root.join(key);
+        std::fs::write(&path, value).map_err(|e| {
+            AppError::Configuration(format!(
+                "file configuration provider could not write {}: {e}",
+                path.display()
+            ))
+        })?;
+        self.values
+            .write()
+            .expect("the file configuration cache lock is never held across a panic")
+            .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    /// PMS-1012: remove the per-key file. Absence is not an error.
+    async fn delete(&self, key: &str) -> AppResult<()> {
+        if let Some(root) = self.root.as_ref() {
+            let path = root.join(key);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(AppError::Configuration(format!(
+                        "file configuration provider could not delete {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        self.values
+            .write()
+            .expect("the file configuration cache lock is never held across a panic")
+            .remove(key);
+        Ok(())
     }
 }
 
