@@ -10,6 +10,7 @@ pub mod db;
 pub mod infisical;
 pub mod modules;
 pub mod pdf;
+pub mod providers;
 pub mod scheduler;
 pub mod secrets;
 pub mod storage;
