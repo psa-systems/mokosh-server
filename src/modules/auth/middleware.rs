@@ -1473,9 +1473,11 @@ async fn place_bunyip_caller(
         }
     }
 
-    // Mark the invite accepted now the user is placed (best-effort).
+    // Mark the invite accepted now the user is placed (best-effort). PMS-1161:
+    // when the invite named a team, `accept` adds the user to it in the same
+    // transaction as the invite mark.
     if let (Some(invs), Some(inv)) = (invitations, invite.as_ref()) {
-        let _ = invs.accept(inv.id, sub).await;
+        let _ = invs.accept(inv, sub).await;
     }
 
     // PMS-172: Bunyip governs the top role. Translate the `bunyip_role` claim
