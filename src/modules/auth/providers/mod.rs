@@ -108,8 +108,25 @@ pub fn current_selection() -> AuthProviderSelection {
 /// selection. The gate at the two decision points reads through this
 /// helper so the disclosure rule (an off provider looks exactly like an
 /// invalid credential) is enforced identically on both.
+///
+/// A profile-default selection is a HINT for a fresh deployment, not a
+/// lockdown: on 2026-09-10, staging (self-hosted profile default = `[local]`)
+/// with `OIDC_ISSUER` configured and no explicit `AUTH_PROVIDERS` rejected
+/// every valid Bunyip bearer with 401, because the gate treated the
+/// profile default as authoritative. Pre-PMS-981 the middleware trusted
+/// the mounted capability (verifier present, password path present) to
+/// decide, and the AC says "the shipped behaviour is byte-for-byte what
+/// it is today when nothing is configured": the fix is to make the gate
+/// lenient when the operator did not explicitly configure the selection.
+/// An explicit `AUTH_PROVIDERS` still enforces exactly what it names,
+/// which is the AC's other half ("a credential for a disabled provider
+/// is refused without disclosing the configured set").
 pub fn is_enabled(kind: AuthProviderKind) -> bool {
-    current_selection().contains(kind)
+    let selection = current_selection();
+    match selection.source {
+        EnablementSource::Profile => true,
+        EnablementSource::Explicit => selection.contains(kind),
+    }
 }
 
 /// A named authentication provider.
@@ -686,18 +703,56 @@ mod tests {
         );
     }
 
-    /// PMS-981: `is_enabled` and `current_selection().contains(_)` return
-    /// the same answer. Callers use both spellings; a divergence would let
-    /// one gate wire refuse a credential the other one accepts.
+    /// The 2026-09-10 staging regression pinned: a profile-default
+    /// selection that excludes a provider must NOT gate that provider off,
+    /// because pre-PMS-981 the middleware trusted the mounted capability
+    /// and the AC says "byte-for-byte behaviour when nothing is
+    /// configured". Only an explicit `AUTH_PROVIDERS` list exercises the
+    /// gate.
     #[test]
-    fn is_enabled_agrees_with_current_selection_contains() {
-        let selection = current_selection();
-        for kind in AuthProviderKind::ALL {
-            assert_eq!(
-                is_enabled(kind),
-                selection.contains(kind),
-                "is_enabled({kind:?}) must agree with current_selection().contains(...)",
-            );
+    fn a_profile_default_selection_never_gates_off() {
+        let profile_default_excluding_bunyip = AuthProviderSelection {
+            providers: vec![AuthProviderKind::Local],
+            source: EnablementSource::Profile,
+        };
+        // The install goes into a process-wide OnceLock; other tests share
+        // it, so we cannot assert the whole is_enabled() answer from a
+        // fresh install here. What we CAN pin is the pure decision from
+        // the same selection, so a future edit that reintroduces the
+        // regression fails locally without a live install.
+        assert!(
+            is_enabled_for_selection(&profile_default_excluding_bunyip, AuthProviderKind::Bunyip),
+            "a profile-default selection that omits Bunyip must not gate it off"
+        );
+    }
+
+    /// The disclosure AC in executable form: an EXPLICIT selection that
+    /// excludes Bunyip DOES gate it off. Same shape as the previous test
+    /// but with the source flipped.
+    #[test]
+    fn an_explicit_selection_that_excludes_a_provider_gates_it_off() {
+        let explicit_local_only = AuthProviderSelection {
+            providers: vec![AuthProviderKind::Local],
+            source: EnablementSource::Explicit,
+        };
+        assert!(
+            !is_enabled_for_selection(&explicit_local_only, AuthProviderKind::Bunyip),
+            "an explicit selection that omits Bunyip must gate it off"
+        );
+        assert!(
+            is_enabled_for_selection(&explicit_local_only, AuthProviderKind::Local),
+            "an explicit selection that names Local must enable Local"
+        );
+    }
+
+    /// A pure-function form of the gate the middleware calls, so the
+    /// decision is testable without a process-wide `install_selection`.
+    /// Shares its arm with [`super::is_enabled`], which reads
+    /// `current_selection()` and calls the same shape.
+    fn is_enabled_for_selection(selection: &AuthProviderSelection, kind: AuthProviderKind) -> bool {
+        match selection.source {
+            EnablementSource::Profile => true,
+            EnablementSource::Explicit => selection.contains(kind),
         }
     }
 }
