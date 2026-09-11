@@ -345,3 +345,74 @@ async fn contact_with_invoices_pay_refuses_draft_400(pool: PgPool) {
         "MAPPS-667: refusal message must name the status, got {body}"
     );
 }
+
+/// MAPPS-677: the pay-mint rate limiter is wired on the route with the
+/// production 20/min-per-caller + 10/min-per-invoice quotas. This
+/// integration test proves the WIRING: an 11th mint on one invoice, from
+/// one contact, trips the invoice bucket and answers 429 with a
+/// `Retry-After` header. The limiter LOGIC (per-caller cap, per-invoice
+/// cap across mixed callers, charge-on-every-call) is covered end-to-end
+/// by the unit tests in `src/modules/auth/rate_limit.rs`; running the
+/// same shapes here would multiply the 10-11 request round-trips by
+/// three for no new coverage of anything the unit tests do not already
+/// pin. The invoice bucket trips at 10 vs 20 for the caller bucket, so
+/// hitting the invoice bucket is the cheapest way to observe the 429
+/// shape without seeding twenty-plus unique invoices.
+#[sqlx::test]
+async fn eleventh_pay_attempt_on_one_invoice_is_429_with_retry_after(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "pay-rate", &["Billing Contact"]).await;
+    let invoice_id = seed_invoice_on_company(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+
+    // The first 10 mints on this invoice all pass the limiter and hit the
+    // service's no-gateway 400 (the test app has no Stripe configured).
+    // Nothing here asserts on their body: the point is the count.
+    for i in 0..10 {
+        let resp = app
+            .client
+            .post(app.url(&format!("/api/v1/invoices/{invoice_id}/pay")))
+            .bearer_auth(&token)
+            .json(&pay_body())
+            .send()
+            .await
+            .expect("pay");
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "MAPPS-677: request #{} of 10 must clear the invoice bucket",
+            i + 1
+        );
+    }
+
+    // The 11th mint on the same invoice trips the invoice bucket
+    // regardless of whether the caller bucket still has headroom.
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/invoices/{invoice_id}/pay")))
+        .bearer_auth(&token)
+        .json(&pay_body())
+        .send()
+        .await
+        .expect("pay");
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "MAPPS-677: the 11th mint on one invoice must be refused with 429"
+    );
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .expect("MAPPS-677: 429 must carry a numeric Retry-After header");
+    assert!(
+        retry_after >= 1,
+        "MAPPS-677: Retry-After is at least one second, got {retry_after}"
+    );
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["error"], "rate_limited",
+        "MAPPS-677: the 429 body uses the rate_limited envelope shape shared with the auth limiters"
+    );
+}

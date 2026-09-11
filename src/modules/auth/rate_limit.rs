@@ -92,6 +92,75 @@ fn seconds_until(
     secs.max(1)
 }
 
+/// MAPPS-677: bound how many `POST /invoices/{id}/pay` mints one caller (or
+/// one invoice) can trigger per window.
+///
+/// The SPA already disables the Pay Now button while a mint round-trip is in
+/// flight (MAPPS-668 `pay_saving`), so a normal user cannot double-click into
+/// two checkout sessions. This limiter is the server side of the same posture,
+/// against a caller who bypasses the button (curl, dev tools, a stolen
+/// bearer): a runaway loop hits 429 before it hits the payment provider
+/// hundreds of times.
+///
+/// Two keyed buckets are consulted on every attempt: one keyed by the
+/// caller's id (staff `users.id` or portal `contacts.id`), one keyed by the
+/// invoice's id. Either being over-quota returns 429 with a `Retry-After`
+/// header carrying the longer of the two remaining waits. Same in-memory,
+/// per-replica caveat as the sibling limiters: the counters do not survive
+/// a restart and do not coordinate across replicas.
+///
+/// The FINANCIAL correctness backstop is unchanged and lives elsewhere: the
+/// PMS-711 webhook idempotency (`gateway_transaction_id` UNIQUE) prevents a
+/// double-recorded payment. This limiter is abuse resistance, not
+/// idempotency.
+pub type UuidLimiter = RateLimiter<Uuid, DefaultKeyedStateStore<Uuid>, DefaultClock>;
+
+pub struct PayInvoiceRateLimiter {
+    by_caller: UuidLimiter,
+    by_invoice: UuidLimiter,
+    clock: DefaultClock,
+}
+
+impl PayInvoiceRateLimiter {
+    /// Build a limiter that allows `caller_per_min` mints per caller id and
+    /// `invoice_per_min` mints per invoice id each minute. Both must be
+    /// non-zero (callers pass compile-time literals).
+    pub fn new(caller_per_min: u32, invoice_per_min: u32) -> Arc<Self> {
+        let caller_quota = Quota::per_minute(
+            NonZeroU32::new(caller_per_min).expect("caller quota must be non-zero"),
+        );
+        let invoice_quota = Quota::per_minute(
+            NonZeroU32::new(invoice_per_min).expect("invoice quota must be non-zero"),
+        );
+        Arc::new(Self {
+            by_caller: RateLimiter::keyed(caller_quota),
+            by_invoice: RateLimiter::keyed(invoice_quota),
+            clock: DefaultClock::default(),
+        })
+    }
+
+    /// Returns `Err(retry_after_seconds)` when either bucket is empty. The
+    /// seconds value is the larger of the two refill waits and is always at
+    /// least 1, so a client honouring `Retry-After` never retries too soon.
+    /// Charges both buckets on every call regardless of whether the mint that
+    /// follows succeeds - the goal is bounding mints, and a mint the caller
+    /// starts is a mint they attempted even if the provider then refused it.
+    pub fn check(&self, caller: Uuid, invoice: Uuid) -> Result<(), u64> {
+        let mut wait: Option<u64> = None;
+        if let Err(neg) = self.by_caller.check_key(&caller) {
+            wait = Some(seconds_until(&neg, &self.clock));
+        }
+        if let Err(neg) = self.by_invoice.check_key(&invoice) {
+            let secs = seconds_until(&neg, &self.clock);
+            wait = Some(wait.map(|w| w.max(secs)).unwrap_or(secs));
+        }
+        match wait {
+            Some(w) => Err(w),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Fixed one-minute window for [`ReauthRateLimiter`], the unit its quotas are
 /// stated in.
 const REAUTH_WINDOW: Duration = Duration::from_secs(60);
@@ -293,6 +362,62 @@ mod tests {
         assert!(
             limiter.check(peer, user).is_ok(),
             "the window has passed, so the budget is back"
+        );
+    }
+
+    /// MAPPS-677: the per-caller bucket blocks once a single caller has spent
+    /// its quota, so a bot hammering `/pay` from one bearer hits 429 before
+    /// it hits the payment provider.
+    #[test]
+    fn pay_caller_bucket_blocks_after_quota() {
+        let limiter = PayInvoiceRateLimiter::new(3, 100);
+        let caller = Uuid::new_v4();
+        for _ in 0..3 {
+            let invoice = Uuid::new_v4();
+            assert!(limiter.check(caller, invoice).is_ok());
+        }
+        let retry_after = limiter
+            .check(caller, Uuid::new_v4())
+            .expect_err("the fourth call from one caller is over the 3/min caller quota");
+        assert!(retry_after >= 1, "Retry-After is at least one second");
+        // A different caller still has budget.
+        assert!(limiter.check(Uuid::new_v4(), Uuid::new_v4()).is_ok());
+    }
+
+    /// MAPPS-677: the per-invoice bucket blocks once ONE invoice has been
+    /// minted enough times, even when the calls come from many callers, so a
+    /// coordinated grind on one invoice's checkout still trips.
+    #[test]
+    fn pay_invoice_bucket_blocks_across_callers() {
+        // Caller quota high enough that only the invoice bucket can trip.
+        let limiter = PayInvoiceRateLimiter::new(100, 3);
+        let invoice = Uuid::new_v4();
+        for _ in 0..3 {
+            let caller = Uuid::new_v4();
+            assert!(limiter.check(caller, invoice).is_ok());
+        }
+        assert!(
+            limiter.check(Uuid::new_v4(), invoice).is_err(),
+            "a fourth mint against one invoice from any caller is over the 3/min invoice quota"
+        );
+        // Another invoice is unaffected.
+        assert!(limiter.check(Uuid::new_v4(), Uuid::new_v4()).is_ok());
+    }
+
+    /// MAPPS-677: `check` is charged on every call regardless of downstream
+    /// success. There is no `record_failure` split like [`ReauthRateLimiter`]
+    /// has, because the goal is bounding MINTS, not bounding failed mints -
+    /// a provider that refuses one still cost latency + log volume.
+    #[test]
+    fn pay_check_charges_on_every_call() {
+        // Quota 1 for both buckets so the second call must trip.
+        let limiter = PayInvoiceRateLimiter::new(1, 1);
+        let caller = Uuid::new_v4();
+        let invoice = Uuid::new_v4();
+        assert!(limiter.check(caller, invoice).is_ok());
+        assert!(
+            limiter.check(caller, invoice).is_err(),
+            "quota of 1 must be spent by the successful first call"
         );
     }
 }
