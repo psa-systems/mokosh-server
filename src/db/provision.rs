@@ -60,16 +60,19 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     // Checking both here catches that state before migrations run and
     // routes it to the full provision path, which needs
     // MOKOSH_ADMIN_DATABASE_URL to recreate what is missing.
-    match roles_probe(migrator_url).await {
+    // PMS-1153: the messages below say what happened, not what was assumed.
+    // `DATABASE_URL` is not necessarily `mokosh_migrator` - staging connected
+    // as a single role of its own - so no line claims the migrator connected,
+    // and the probe logs which role actually did.
+    let probe = roles_probe(migrator_url).await;
+    match probe {
         RolesProbe::BothExist => {
-            tracing::info!(
-                "DB roles already provisioned (mokosh_migrator + mokosh_app present); skipping role provisioning"
-            );
+            tracing::info!("mokosh_app present and able to log in; skipping role provisioning");
             return Ok(());
         }
         RolesProbe::MigratorConnectsAppMissing => {
             tracing::warn!(
-                "mokosh_migrator can connect but mokosh_app is missing; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
+                "DATABASE_URL connects but mokosh_app is missing or cannot log in; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
             );
         }
         RolesProbe::MigratorCannotConnect => {
@@ -80,14 +83,13 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     let admin_url = match std::env::var(ADMIN_DATABASE_URL_VAR) {
         Ok(url) if !url.is_empty() => url,
         _ => {
-            // The migrator role does not connect and there are no admin
-            // credentials to create it with. Fail loud now rather than let the
-            // later request-pool connect fail with a bare auth error.
-            return Err(AppError::Database(format!(
-                "mokosh_migrator cannot connect and {ADMIN_DATABASE_URL_VAR} is unset; set \
-                 {ADMIN_DATABASE_URL_VAR} to a privileged (superuser) connection string so the \
-                 server can create the mokosh_migrator / mokosh_app roles on first boot"
-            )));
+            // No admin credentials to create or reconcile the roles with. Fail
+            // loud now rather than let the later request-pool connect fail with
+            // a bare auth error.
+            return Err(AppError::Database(admin_unset_message(matches!(
+                probe,
+                RolesProbe::MigratorConnectsAppMissing
+            ))));
         }
     };
 
@@ -211,6 +213,17 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
         }
     };
 
+    // PMS-1153: say which role DATABASE_URL actually logged in as. Staging's
+    // was a single role of its own, and the boot log used to name
+    // `mokosh_migrator` regardless. Best-effort: a probe that cannot read
+    // `current_user` still goes on to answer the question it exists for.
+    if let Ok(connected_as) = sqlx::query_scalar::<_, String>("SELECT current_user::text")
+        .fetch_one(&pool)
+        .await
+    {
+        tracing::info!(connected_as = %connected_as, "DB role probe connected with DATABASE_URL");
+    }
+
     // pg_roles is a public view of pg_authid: readable by every logged-in
     // role without extra grants, so the migrator can answer this without
     // needing admin credentials. PMS-1163: the predicate carries
@@ -247,6 +260,32 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
     }
 }
 
+/// PMS-1153: the error when role provisioning is needed and
+/// `MOKOSH_ADMIN_DATABASE_URL` is unset, told truthfully for each state.
+///
+/// Before this there was one message for both, and it said "mokosh_migrator
+/// cannot connect" - true on first boot, and false in exactly the state
+/// staging reached in September 2026, where `DATABASE_URL` connected fine and
+/// `mokosh_app` was the thing missing (and, after PMS-1163, present but
+/// `NOLOGIN`). An operator told the wrong problem fixes the wrong thing.
+fn admin_unset_message(database_url_connected: bool) -> String {
+    if database_url_connected {
+        format!(
+            "DATABASE_URL connects, but mokosh_app is missing or cannot log in, and \
+             {ADMIN_DATABASE_URL_VAR} is unset; set {ADMIN_DATABASE_URL_VAR} to a privileged \
+             (superuser) connection string so the server can create mokosh_app, or reconcile \
+             an existing one to LOGIN with MOKOSH_APP_PASSWORD. A hand-created NOLOGIN \
+             mokosh_app is not enough when MOKOSH_APP_DATABASE_URL logs in as it."
+        )
+    } else {
+        format!(
+            "mokosh_migrator cannot connect and {ADMIN_DATABASE_URL_VAR} is unset; set \
+             {ADMIN_DATABASE_URL_VAR} to a privileged (superuser) connection string so the \
+             server can create the mokosh_migrator / mokosh_app roles on first boot"
+        )
+    }
+}
+
 fn require_env(key: &str) -> AppResult<String> {
     match std::env::var(key) {
         Ok(v) if !v.is_empty() => Ok(v),
@@ -275,6 +314,27 @@ mod tests {
         assert_eq!(sql_quote("plain"), "'plain'");
         assert_eq!(sql_quote("o'brien"), "'o''brien'");
         assert_eq!(sql_quote("'; DROP ROLE --"), "'''; DROP ROLE --'");
+    }
+
+    /// PMS-1153: the admin-unset error tells the truth for each probe state.
+    /// The state where DATABASE_URL connected used to be told it had not,
+    /// which is exactly the state staging reached.
+    #[test]
+    fn the_admin_unset_error_does_not_say_a_connection_failed_when_it_did_not() {
+        let connected = admin_unset_message(true);
+        assert!(!connected.contains("cannot connect"), "{connected}");
+        assert!(
+            connected.contains("mokosh_app is missing or cannot log in"),
+            "{connected}"
+        );
+        assert!(connected.contains("NOLOGIN"), "names the trap: {connected}");
+        assert!(connected.contains(ADMIN_DATABASE_URL_VAR), "{connected}");
+
+        let first_boot = admin_unset_message(false);
+        assert!(
+            first_boot.contains("mokosh_migrator cannot connect"),
+            "{first_boot}"
+        );
     }
 
     #[test]
