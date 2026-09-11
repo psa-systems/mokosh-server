@@ -1,8 +1,16 @@
 //! Team API routes (PMS-791 / MAPPS-461).
 //!
-//! All write endpoints gate on `RequireAdmin` (per open-questions Q1 + Q2
-//! default = A). Read endpoints gate on `RequireAuth`. `RequireAdmin` is
-//! `[super_admin, admin]`; anything else 403s.
+//! PMS-1162 (2026-09-11): the role-projection reconciliation. Team creation
+//! keeps `RequireAdmin` because there is no team row for a manager id to
+//! hang off yet. Every OTHER write endpoint (`update_team`,
+//! `soft_delete_team`, `add_member`, `update_member_role`, `remove_member`)
+//! widens to `RequireAuth` plus a `TeamManagementGuard` that admits either an
+//! app-role admin (super_admin | admin) OR the row's own `manager_id`. The
+//! guard runs in the handler because it needs the team row's `manager_id`,
+//! which lives in the service. See `docs/dev-docs/teams.md` for the settled
+//! model.
+//!
+//! Read endpoints gate on `RequireAuth`.
 
 use axum::{
     extract::{Path, Query, State},
@@ -20,7 +28,8 @@ use super::{
     TeamWithMembers, TeamsService, UpdateTeamMemberRoleRequest, UpdateTeamRequest,
 };
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
+use mokosh_types::auth::CurrentUser;
 
 #[derive(Clone)]
 pub struct TeamsRouterState {
@@ -152,32 +161,64 @@ async fn get_team(
     }
 }
 
-/// `PUT /api/v1/teams/{team_id}` — RequireAdmin. Partial update.
+/// PMS-1162: the team-management projection guard. Admits an app-role admin
+/// (super_admin | admin) unconditionally OR the row's own `manager_id`, so
+/// the accountable owner of a team can self-manage it without needing an
+/// admin role at the tenant level. Every other user, including a
+/// `UserRole::Manager` whose row's `manager_id` is set to somebody else, is
+/// refused with 403 (leaked as the same generic message so a non-owner
+/// probing the team_id cannot tell a real team from a wrong role).
+///
+/// Called INLINE from each write handler that needs it, not as an extractor,
+/// because the check needs the team row's `manager_id`, and reading the row
+/// lives on the service, not the extractor stack.
+async fn assert_can_manage_team(
+    state: &TeamsRouterState,
+    user: &CurrentUser,
+    team_id: Uuid,
+) -> AppResult<()> {
+    if user.role.is_admin() {
+        return Ok(());
+    }
+    let team = state.teams_service.get_team(user.tenant(), team_id).await?;
+    if team.manager_id == Some(user.id) {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(
+        "Only an administrator or this team's manager may make this change.".to_string(),
+    ))
+}
+
+/// `PUT /api/v1/teams/{team_id}` — PMS-1162 projection guard. Admin or the
+/// team's own `manager_id` may edit.
 async fn update_team(
     State(state): State<TeamsRouterState>,
-    admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
     ctx: crate::modules::audit::AuditCtx,
     Path(team_id): Path<Uuid>,
     Json(request): Json<UpdateTeamRequest>,
 ) -> AppResult<Json<Team>> {
+    assert_can_manage_team(&state, &user, team_id).await?;
     request.validate()?;
     let team = state
         .teams_service
-        .update_team(admin.0.tenant(), team_id, &request, &ctx)
+        .update_team(user.tenant(), team_id, &request, &ctx)
         .await?;
     Ok(Json(team))
 }
 
-/// `DELETE /api/v1/teams/{team_id}` — RequireAdmin. Soft delete only.
+/// `DELETE /api/v1/teams/{team_id}` — PMS-1162 projection guard. Admin or the
+/// team's own `manager_id` may soft-delete.
 async fn soft_delete_team(
     State(state): State<TeamsRouterState>,
-    admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
     ctx: crate::modules::audit::AuditCtx,
     Path(team_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
+    assert_can_manage_team(&state, &user, team_id).await?;
     state
         .teams_service
-        .soft_delete_team(admin.0.tenant(), team_id, &ctx)
+        .soft_delete_team(user.tenant(), team_id, &ctx)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -195,49 +236,53 @@ async fn list_members(
     Ok(Json(members))
 }
 
-/// `POST /api/v1/teams/{team_id}/members` — RequireAdmin. Add a member.
+/// `POST /api/v1/teams/{team_id}/members` — PMS-1162 projection guard.
 async fn add_member(
     State(state): State<TeamsRouterState>,
-    admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
     ctx: crate::modules::audit::AuditCtx,
     Path(team_id): Path<Uuid>,
     Json(request): Json<AddTeamMemberRequest>,
 ) -> AppResult<(StatusCode, Json<TeamMember>)> {
+    assert_can_manage_team(&state, &user, team_id).await?;
     request.validate()?;
     let member = state
         .teams_service
-        .add_member(admin.0.tenant(), team_id, &request, &ctx)
+        .add_member(user.tenant(), team_id, &request, &ctx)
         .await?;
     Ok((StatusCode::CREATED, Json(member)))
 }
 
-/// `PUT /api/v1/teams/{team_id}/members/{user_id}` — RequireAdmin.
+/// `PUT /api/v1/teams/{team_id}/members/{user_id}` — PMS-1162 projection
+/// guard.
 async fn update_member_role(
     State(state): State<TeamsRouterState>,
-    admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
     ctx: crate::modules::audit::AuditCtx,
     Path((team_id, user_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<UpdateTeamMemberRoleRequest>,
 ) -> AppResult<Json<TeamMember>> {
+    assert_can_manage_team(&state, &user, team_id).await?;
     request.validate()?;
     let member = state
         .teams_service
-        .update_member_role(admin.0.tenant(), team_id, user_id, &request, &ctx)
+        .update_member_role(user.tenant(), team_id, user_id, &request, &ctx)
         .await?;
     Ok(Json(member))
 }
 
-/// `DELETE /api/v1/teams/{team_id}/members/{user_id}` — RequireAdmin.
-/// Idempotent: a repeat delete returns 204, not 404.
+/// `DELETE /api/v1/teams/{team_id}/members/{user_id}` — PMS-1162 projection
+/// guard. Idempotent: a repeat delete returns 204, not 404.
 async fn remove_member(
     State(state): State<TeamsRouterState>,
-    admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
     ctx: crate::modules::audit::AuditCtx,
     Path((team_id, user_id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<StatusCode> {
+    assert_can_manage_team(&state, &user, team_id).await?;
     state
         .teams_service
-        .remove_member(admin.0.tenant(), team_id, user_id, &ctx)
+        .remove_member(user.tenant(), team_id, user_id, &ctx)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
