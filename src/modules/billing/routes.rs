@@ -15,16 +15,21 @@ use super::models::*;
 use super::service::BillingService;
 use crate::db::Database;
 use crate::modules::auth::{
-    CallerContext, RequireBilling, RequireCallerContext, RequireFinance, TenantScoped,
+    rate_limit, CallerContext, RequireBilling, RequireCallerContext, RequireFinance, TenantScoped,
 };
 use crate::modules::contact_portal::capabilities as caps;
 use crate::modules::settings::SettingsService;
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::{rate_limited_response, AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 #[derive(Clone)]
 pub struct BillingRouterState {
     pub service: Arc<BillingService>,
+    /// MAPPS-677: abuse-resistance bound on `POST /invoices/{id}/pay`. Not
+    /// financial correctness (the PMS-711 webhook idempotency covers that);
+    /// bounds runaway mint loops so a bot hammering `/pay` hits 429 before
+    /// it hits the payment provider hundreds of times.
+    pub pay_limiter: Arc<rate_limit::PayInvoiceRateLimiter>,
 }
 
 /// Build the billing router. URLs are absolute (`/invoices`, etc.) so
@@ -32,6 +37,10 @@ pub struct BillingRouterState {
 pub fn billing_routes(service: BillingService) -> Router {
     let state = BillingRouterState {
         service: Arc::new(service),
+        // MAPPS-677: 20 mints per minute per caller (staff `users.id` or
+        // portal `contacts.id`) and 10 per minute per invoice, mirroring
+        // the AuthRateLimiter quotas the auth endpoints already use.
+        pay_limiter: rate_limit::PayInvoiceRateLimiter::new(20, 10),
     };
     Router::new()
         .route("/invoices", get(list_invoices).post(create_invoice))
@@ -775,7 +784,7 @@ async fn pay_invoice(
     axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Path(invoice_id): Path<Uuid>,
     Json(request): Json<PayInvoiceRequest>,
-) -> AppResult<Json<PayInvoiceResponse>> {
+) -> Result<Response, AppError> {
     request.validate()?;
     let tenant = caller.tenant();
     match &caller {
@@ -785,6 +794,19 @@ async fn pay_invoice(
         CallerContext::Contact(_) => {
             caller.require_capability(caps::INVOICES_PAY, &db).await?;
         }
+    }
+    // MAPPS-677: bound how many mints one caller (or one invoice) can trigger
+    // per minute. Consulted AFTER the auth + capability + module gates so a
+    // rate-limit hit means the caller was actually allowed to try - a caller
+    // whose grants would 403 anyway spends nothing from the pay budget.
+    // Consulted BEFORE the company-scope check and the mint so a foreign
+    // invoice grinder cannot exhaust their bucket enumerating ids.
+    let caller_id = caller_id_for_rate_limit(&caller);
+    if let Err(retry_after) = state.pay_limiter.check(caller_id, invoice_id) {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many payment attempts. Please wait a moment before trying again.",
+        ));
     }
     if let CallerContext::Contact(session) = &caller {
         let inv = state.service.get_invoice(tenant, invoice_id).await?;
@@ -803,7 +825,21 @@ async fn pay_invoice(
         .await?;
     Ok(Json(PayInvoiceResponse {
         checkout_url: session.url,
-    }))
+    })
+    .into_response())
+}
+
+/// MAPPS-677: caller id for the pay-mint bucket. A contact uses their
+/// `contacts.id`; a staff caller uses their `users.id`. `Uuid::nil()` is the
+/// fallback when a staff bearer somehow arrives without a `user` (an
+/// unauthenticated path could not reach this handler, so the fallback is
+/// defensive rather than reachable); an all-nil caller still shares the
+/// per-invoice bucket, so the second half of the pair still bounds abuse.
+fn caller_id_for_rate_limit(caller: &CallerContext) -> Uuid {
+    match caller {
+        CallerContext::Staff(auth) => auth.user.as_ref().map(|u| u.id).unwrap_or_else(Uuid::nil),
+        CallerContext::Contact(session) => session.id,
+    }
 }
 
 /// MAPPS-666 (mokosh-invoices P1a): the SPA fires this once on invoice-
