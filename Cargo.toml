@@ -191,6 +191,11 @@ dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "cc
 # ip2location), so it is pinned to the dunite rev that introduced it independently
 # of dunite-stripe-core above.
 dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "ae62c276ab187852578daad1c4b9c823579b194a" }
+# PMS-1014: the shared provider-status contract (report, summary, envelope).
+# Extracted from mokosh's local types so BUNYIP-634's aggregator binds to one
+# definition instead of a copy per producer. Leaf crate, pinned to the dunite
+# rev that introduced it independently of the dunite-* deps above.
+dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "f3d31295e98ef716ec9f2a6d49f4c16c7dca994a" }
 # PMS-876 took no default features (they carry HTML rendering and hyphenation
 # dictionaries nothing here uses). PMS-911 adds the image codecs, and exactly
 # the four `utils::inline_image` already accepts for an uploaded logo: a

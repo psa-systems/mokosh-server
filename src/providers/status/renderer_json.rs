@@ -1,32 +1,26 @@
 //! JSON renderer for [`super::ProviderStatusReport`].
 //!
-//! Pure function of the report. The envelope carries a schema version so
-//! BUNYIP-634's aggregator has a stable shape to bind to, plus a
-//! `generated_at` distinct from the report's own `collected_at`: the two
-//! are almost always the same, but a caller that renders a cached report
-//! will differ, and a consumer that spots the drift can act on it.
+//! Pure function of the report. PMS-1014 moved the envelope shape into the
+//! shared [`dunite_provider_status`] crate; this module keeps the public
+//! entry point so the route mount site is unchanged, and delegates to
+//! [`envelope::envelope`] for the byte-identical
+//! `{schema_version, report, generated_at}` shape.
 
 use chrono::Utc;
-use serde_json::{json, Value};
+use dunite_provider_status::envelope;
+use serde_json::Value;
 
 use super::ProviderStatusReport;
 
-/// The schema version of the JSON envelope. Bump when the envelope's shape
-/// changes; the nested report shape is versioned by its own serialisation.
-pub const SCHEMA_VERSION: &str = "1";
+/// The schema version of the JSON envelope. Re-exported from the shared
+/// contract so a caller that reads `SCHEMA_VERSION` here still gets one
+/// answer for every producer.
+pub use dunite_provider_status::envelope::SCHEMA_VERSION;
 
-/// Render the JSON envelope. `serde_json::to_value` produces the nested
-/// report from its derives, so adding a field to `ProviderStatusReport`
-/// automatically reaches the wire without a second serialiser to keep in
-/// step.
+/// Render the JSON envelope. The nested report shape comes from serialising
+/// [`ProviderStatusReport`] through its derives, so adding a field to the
+/// report automatically reaches the wire without a second serialiser to
+/// keep in step.
 pub fn render_json(report: &ProviderStatusReport) -> Value {
-    let inner = serde_json::to_value(report).expect(
-        "ProviderStatusReport is derive-Serialize and holds only \
-         serialisable primitives; conversion is infallible",
-    );
-    json!({
-        "schema_version": SCHEMA_VERSION,
-        "report": inner,
-        "generated_at": Utc::now().to_rfc3339(),
-    })
+    envelope::envelope(report, Utc::now())
 }
