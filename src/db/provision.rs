@@ -174,7 +174,7 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
 }
 
 /// The result of the boot-time role probe: does the migrator role log in,
-/// and does the `mokosh_app` role exist in `pg_roles`?
+/// and can the `mokosh_app` role log in?
 ///
 /// [`RolesProbe::BothExist`] is the fast path a healthy deployment takes on
 /// every subsequent boot. [`RolesProbe::MigratorConnectsAppMissing`] is the
@@ -182,6 +182,15 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
 /// GRANT to `mokosh_app` in a new migration failed. [`RolesProbe::MigratorCannotConnect`]
 /// is the first-boot state, or a deployment that has never provisioned the
 /// split roles.
+///
+/// PMS-1163: `MigratorConnectsAppMissing` also fires when the `mokosh_app`
+/// row exists but is `NOLOGIN`. That is what staging landed in after
+/// PMS-1152 hand-created the role to unblock migration 207's GRANT: the
+/// row was present so the pre-PMS-1163 probe returned `BothExist` and the
+/// fast path skipped the `ALTER ROLE ... LOGIN ... PASSWORD` at line 133,
+/// leaving the app pool unable to authenticate on the very next boot step.
+/// Falling through when `rolcanlogin` is false routes to the full provision
+/// path, whose ALTER heals the LOGIN + password state in one pass.
 enum RolesProbe {
     BothExist,
     MigratorConnectsAppMissing,
@@ -204,23 +213,36 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
 
     // pg_roles is a public view of pg_authid: readable by every logged-in
     // role without extra grants, so the migrator can answer this without
-    // needing admin credentials.
-    let app_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mokosh_app')")
-            .fetch_one(&pool)
-            .await
-            .unwrap_or_else(|e| {
-                // If the probe query itself fails, treat it as "we cannot confirm"
-                // and fall through to full provision, which will name the underlying
-                // error if the admin URL is unset.
-                tracing::warn!("mokosh_app existence probe failed: {e}");
-                false
-            });
+    // needing admin credentials. PMS-1163: the predicate carries
+    // `rolcanlogin = TRUE` alongside the name check so a hand-created
+    // NOLOGIN mokosh_app falls through to the full provision path (whose
+    // ALTER ROLE reconciles both attributes and the stored password with
+    // MOKOSH_APP_PASSWORD in one pass), rather than tripping the fast
+    // path and failing the app pool's auth attempt on the next boot step.
+    let app_can_login: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mokosh_app' AND rolcanlogin = TRUE)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or_else(|e| {
+        // If the probe query itself fails, treat it as "we cannot confirm"
+        // and fall through to full provision, which will name the underlying
+        // error if the admin URL is unset.
+        tracing::warn!("mokosh_app existence probe failed: {e}");
+        false
+    });
     pool.close().await;
 
-    if app_exists {
+    if app_can_login {
         RolesProbe::BothExist
     } else {
+        // Covers both "row missing" and "row exists but NOLOGIN". The
+        // downstream branch runs the same ALTER either way, so one variant
+        // covers both, but log the reason so an operator reading the boot
+        // log knows which state the deployment was in.
+        tracing::info!(
+            "mokosh_app row missing or cannot log in; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
+        );
         RolesProbe::MigratorConnectsAppMissing
     }
 }
