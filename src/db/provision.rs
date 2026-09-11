@@ -60,16 +60,19 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     // Checking both here catches that state before migrations run and
     // routes it to the full provision path, which needs
     // MOKOSH_ADMIN_DATABASE_URL to recreate what is missing.
-    match roles_probe(migrator_url).await {
+    // PMS-1153: the messages below say what happened, not what was assumed.
+    // `DATABASE_URL` is not necessarily `mokosh_migrator` - staging connected
+    // as a single role of its own - so no line claims the migrator connected,
+    // and the probe logs which role actually did.
+    let probe = roles_probe(migrator_url).await;
+    match probe {
         RolesProbe::BothExist => {
-            tracing::info!(
-                "DB roles already provisioned (mokosh_migrator + mokosh_app present); skipping role provisioning"
-            );
+            tracing::info!("mokosh_app present and able to log in; skipping role provisioning");
             return Ok(());
         }
         RolesProbe::MigratorConnectsAppMissing => {
             tracing::warn!(
-                "mokosh_migrator can connect but mokosh_app is missing; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
+                "DATABASE_URL connects but mokosh_app is missing or cannot log in; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
             );
         }
         RolesProbe::MigratorCannotConnect => {
@@ -80,14 +83,13 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     let admin_url = match std::env::var(ADMIN_DATABASE_URL_VAR) {
         Ok(url) if !url.is_empty() => url,
         _ => {
-            // The migrator role does not connect and there are no admin
-            // credentials to create it with. Fail loud now rather than let the
-            // later request-pool connect fail with a bare auth error.
-            return Err(AppError::Database(format!(
-                "mokosh_migrator cannot connect and {ADMIN_DATABASE_URL_VAR} is unset; set \
-                 {ADMIN_DATABASE_URL_VAR} to a privileged (superuser) connection string so the \
-                 server can create the mokosh_migrator / mokosh_app roles on first boot"
-            )));
+            // No admin credentials to create or reconcile the roles with. Fail
+            // loud now rather than let the later request-pool connect fail with
+            // a bare auth error.
+            return Err(AppError::Database(admin_unset_message(matches!(
+                probe,
+                RolesProbe::MigratorConnectsAppMissing
+            ))));
         }
     };
 
@@ -174,7 +176,7 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
 }
 
 /// The result of the boot-time role probe: does the migrator role log in,
-/// and does the `mokosh_app` role exist in `pg_roles`?
+/// and can the `mokosh_app` role log in?
 ///
 /// [`RolesProbe::BothExist`] is the fast path a healthy deployment takes on
 /// every subsequent boot. [`RolesProbe::MigratorConnectsAppMissing`] is the
@@ -182,6 +184,15 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
 /// GRANT to `mokosh_app` in a new migration failed. [`RolesProbe::MigratorCannotConnect`]
 /// is the first-boot state, or a deployment that has never provisioned the
 /// split roles.
+///
+/// PMS-1163: `MigratorConnectsAppMissing` also fires when the `mokosh_app`
+/// row exists but is `NOLOGIN`. That is what staging landed in after
+/// PMS-1152 hand-created the role to unblock migration 207's GRANT: the
+/// row was present so the pre-PMS-1163 probe returned `BothExist` and the
+/// fast path skipped the `ALTER ROLE ... LOGIN ... PASSWORD` at line 133,
+/// leaving the app pool unable to authenticate on the very next boot step.
+/// Falling through when `rolcanlogin` is false routes to the full provision
+/// path, whose ALTER heals the LOGIN + password state in one pass.
 enum RolesProbe {
     BothExist,
     MigratorConnectsAppMissing,
@@ -202,26 +213,76 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
         }
     };
 
+    // PMS-1153: say which role DATABASE_URL actually logged in as. Staging's
+    // was a single role of its own, and the boot log used to name
+    // `mokosh_migrator` regardless. Best-effort: a probe that cannot read
+    // `current_user` still goes on to answer the question it exists for.
+    if let Ok(connected_as) = sqlx::query_scalar::<_, String>("SELECT current_user::text")
+        .fetch_one(&pool)
+        .await
+    {
+        tracing::info!(connected_as = %connected_as, "DB role probe connected with DATABASE_URL");
+    }
+
     // pg_roles is a public view of pg_authid: readable by every logged-in
     // role without extra grants, so the migrator can answer this without
-    // needing admin credentials.
-    let app_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mokosh_app')")
-            .fetch_one(&pool)
-            .await
-            .unwrap_or_else(|e| {
-                // If the probe query itself fails, treat it as "we cannot confirm"
-                // and fall through to full provision, which will name the underlying
-                // error if the admin URL is unset.
-                tracing::warn!("mokosh_app existence probe failed: {e}");
-                false
-            });
+    // needing admin credentials. PMS-1163: the predicate carries
+    // `rolcanlogin = TRUE` alongside the name check so a hand-created
+    // NOLOGIN mokosh_app falls through to the full provision path (whose
+    // ALTER ROLE reconciles both attributes and the stored password with
+    // MOKOSH_APP_PASSWORD in one pass), rather than tripping the fast
+    // path and failing the app pool's auth attempt on the next boot step.
+    let app_can_login: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mokosh_app' AND rolcanlogin = TRUE)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or_else(|e| {
+        // If the probe query itself fails, treat it as "we cannot confirm"
+        // and fall through to full provision, which will name the underlying
+        // error if the admin URL is unset.
+        tracing::warn!("mokosh_app existence probe failed: {e}");
+        false
+    });
     pool.close().await;
 
-    if app_exists {
+    if app_can_login {
         RolesProbe::BothExist
     } else {
+        // Covers both "row missing" and "row exists but NOLOGIN". The
+        // downstream branch runs the same ALTER either way, so one variant
+        // covers both, but log the reason so an operator reading the boot
+        // log knows which state the deployment was in.
+        tracing::info!(
+            "mokosh_app row missing or cannot log in; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
+        );
         RolesProbe::MigratorConnectsAppMissing
+    }
+}
+
+/// PMS-1153: the error when role provisioning is needed and
+/// `MOKOSH_ADMIN_DATABASE_URL` is unset, told truthfully for each state.
+///
+/// Before this there was one message for both, and it said "mokosh_migrator
+/// cannot connect" - true on first boot, and false in exactly the state
+/// staging reached in September 2026, where `DATABASE_URL` connected fine and
+/// `mokosh_app` was the thing missing (and, after PMS-1163, present but
+/// `NOLOGIN`). An operator told the wrong problem fixes the wrong thing.
+fn admin_unset_message(database_url_connected: bool) -> String {
+    if database_url_connected {
+        format!(
+            "DATABASE_URL connects, but mokosh_app is missing or cannot log in, and \
+             {ADMIN_DATABASE_URL_VAR} is unset; set {ADMIN_DATABASE_URL_VAR} to a privileged \
+             (superuser) connection string so the server can create mokosh_app, or reconcile \
+             an existing one to LOGIN with MOKOSH_APP_PASSWORD. A hand-created NOLOGIN \
+             mokosh_app is not enough when MOKOSH_APP_DATABASE_URL logs in as it."
+        )
+    } else {
+        format!(
+            "mokosh_migrator cannot connect and {ADMIN_DATABASE_URL_VAR} is unset; set \
+             {ADMIN_DATABASE_URL_VAR} to a privileged (superuser) connection string so the \
+             server can create the mokosh_migrator / mokosh_app roles on first boot"
+        )
     }
 }
 
@@ -253,6 +314,27 @@ mod tests {
         assert_eq!(sql_quote("plain"), "'plain'");
         assert_eq!(sql_quote("o'brien"), "'o''brien'");
         assert_eq!(sql_quote("'; DROP ROLE --"), "'''; DROP ROLE --'");
+    }
+
+    /// PMS-1153: the admin-unset error tells the truth for each probe state.
+    /// The state where DATABASE_URL connected used to be told it had not,
+    /// which is exactly the state staging reached.
+    #[test]
+    fn the_admin_unset_error_does_not_say_a_connection_failed_when_it_did_not() {
+        let connected = admin_unset_message(true);
+        assert!(!connected.contains("cannot connect"), "{connected}");
+        assert!(
+            connected.contains("mokosh_app is missing or cannot log in"),
+            "{connected}"
+        );
+        assert!(connected.contains("NOLOGIN"), "names the trap: {connected}");
+        assert!(connected.contains(ADMIN_DATABASE_URL_VAR), "{connected}");
+
+        let first_boot = admin_unset_message(false);
+        assert!(
+            first_boot.contains("mokosh_migrator cannot connect"),
+            "{first_boot}"
+        );
     }
 
     #[test]
