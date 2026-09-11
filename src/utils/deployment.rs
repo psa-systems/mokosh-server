@@ -232,6 +232,24 @@ fn raw_from_env() -> String {
     std::env::var("MOKOSH_DEPLOYMENT_MODE").unwrap_or_default()
 }
 
+/// PMS-1160: the raw `MOKOSH_DEPLOYMENT_MODE` value, exposed for the fail-loud
+/// boot check that refuses to start when an essential deployment-shape var is
+/// unset. `main.rs` is deliberately not in the config-provider `ENTRY_POINTS`,
+/// so the check reaches through this module (which IS an entry point, because
+/// the deployment mode chooses the configuration provider and cannot be
+/// resolved through one) instead of reading the environment itself.
+///
+/// Returns `None` for both an unset variable and a blank one, the same "not
+/// configured" shape [`raw_from_env`] already collapses them into.
+pub fn raw_deployment_mode() -> Option<String> {
+    let raw = raw_from_env();
+    if raw.trim().is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
 /// A capability with exactly one selected provider per deployment.
 ///
 /// One variant per capability named by PMS-1009. The kind is the trait, a

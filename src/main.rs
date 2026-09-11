@@ -156,6 +156,159 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// One essential deployment-shape variable's boot-check contract.
+///
+/// Every field is a `&'static str` or a `fn` pointer because the set is closed
+/// and known at compile time: five vars whose "wrong default" is silent-but-
+/// consequential on a real deployment (`MOKOSH_DEPLOYMENT_MODE` selects the
+/// hosting profile defaults per capability, `MOKOSH_APP_DATABASE_URL` decides
+/// whether RLS bites at all, and the three URLs decide where emailed and
+/// browser links land). See PMS-1160.
+///
+/// The reader is a `fn` rather than a `&'static ConfigKey` because
+/// `MOKOSH_DEPLOYMENT_MODE` is deliberately NOT in the config-provider
+/// registry: it selects which providers exist and so cannot itself be read
+/// through one (see `src/config/guard.rs::ENTRY_POINTS`, which lists
+/// `src/utils/deployment.rs` for exactly this reason). Every other requirement
+/// here IS in the registry and its reader delegates to `config::get`.
+struct DeploymentRequirement {
+    /// The env var name as an operator writes it and as the failure message
+    /// prints it.
+    name: &'static str,
+    /// Reads the current value of this variable. Returns `None` when the
+    /// variable is unset OR when its value is a blank string (a
+    /// forwarded-but-unset compose key arrives as `""`, PMS-836).
+    reader: fn() -> Option<String>,
+    /// One-sentence reason the operator gets in the failure message.
+    purpose: &'static str,
+    /// Closed set of legal values when the shape is enumerated; empty when the
+    /// shape is a URL or other open-set value.
+    options: &'static [&'static str],
+    /// A shape example an operator can copy; the failure message names it so
+    /// an operator can act without a second doc lookup.
+    example: &'static str,
+}
+
+/// The five deployment-shape variables mokosh-server refuses to start without
+/// outside dev/test (PMS-1160). The list is ORDERED by consequence: the first
+/// one that fails at boot is the first one printed, so an operator who lands
+/// on a fresh compose fills them in top-to-bottom.
+///
+/// This list is not the same as `.env.example`: `.env.example` shows every
+/// variable the code reads, while this list is the closed subset whose
+/// absence in a real deployment is silent-and-wrong rather than
+/// silent-and-defaulted. Provision-time secrets (`MOKOSH_ADMIN_DATABASE_URL`,
+/// `MOKOSH_MIGRATOR_PASSWORD`, `MOKOSH_APP_PASSWORD`) stay out of this list
+/// because `db::provision::provision_roles` refuses them at exactly the
+/// moment they are needed, which is the first boot on a database that has
+/// never been provisioned.
+const ESSENTIAL_DEPLOYMENT_REQUIREMENTS: &[DeploymentRequirement] = &[
+    DeploymentRequirement {
+        name: "MOKOSH_DEPLOYMENT_MODE",
+        reader: mokosh_server::utils::deployment::raw_deployment_mode,
+        purpose: "selects hosting-profile defaults for every capability \
+                  (authentication, secrets, storage, email). Silently defaulting to \
+                  self-hosted on the SaaS deployment on 2026-09-10 rejected every \
+                  Bunyip bearer with 401.",
+        options: &["self-hosted", "saas"],
+        example: "MOKOSH_DEPLOYMENT_MODE=saas",
+    },
+    DeploymentRequirement {
+        name: "MOKOSH_APP_DATABASE_URL",
+        reader: || config::get(&keys::MOKOSH_APP_DATABASE_URL),
+        purpose: "the NOBYPASSRLS request-serving pool connection string. Unset \
+                  makes the request pool fall back to DATABASE_URL (BYPASSRLS \
+                  mokosh_migrator), so every RLS tenant_isolation policy is inert \
+                  and tenant isolation depends entirely on the service layer. \
+                  PMS-1158 is the discovery of this state on production.",
+        options: &[],
+        example: "MOKOSH_APP_DATABASE_URL=postgres://mokosh_app:<pw>@<host>:5432/mokosh",
+    },
+    DeploymentRequirement {
+        name: "BASE_URL",
+        reader: || config::get(&keys::BASE_URL),
+        purpose: "base of platform-owned email links (password reset, portal grant, \
+                  invoice pay). An unset value falls to localhost and every emailed \
+                  link lands nowhere.",
+        options: &[],
+        example: "BASE_URL=https://a8n.systems",
+    },
+    DeploymentRequirement {
+        name: "CLIENT_ORIGIN",
+        reader: || config::get(&keys::CLIENT_ORIGIN),
+        purpose: "the browser-visible origin of the SPA host that talks to this API. \
+                  Used as the CORS_ORIGIN default and the OAuth popup postMessage \
+                  origin check. Silently defaulting to localhost lets the popup \
+                  round-trip fail in a way that reads as a login bug.",
+        options: &[],
+        example: "CLIENT_ORIGIN=https://a8n.systems",
+    },
+    DeploymentRequirement {
+        name: "SPA_BASE_URL",
+        reader: || config::get(&keys::SPA_BASE_URL),
+        purpose: "base for emailed links to pages served ONLY by mokosh-apps \
+                  (request forms, portal set-password, invoice Pay Now). Falls back \
+                  to CLIENT_ORIGIN, which on a deployed environment is the apex \
+                  where bunyip serves - not mokosh-apps - so every one of these \
+                  links lands on bunyip's 404.",
+        options: &[],
+        example: "SPA_BASE_URL=https://msp.a8n.systems",
+    },
+];
+
+/// Refuse to start when any essential deployment-shape variable is unset
+/// outside dev/test (PMS-1160). Runs after `AppConfig::from_env` returns so
+/// the resolved `ENVIRONMENT` decides whether the check gates.
+///
+/// Collects every missing variable and returns one combined error, so an
+/// operator who is missing three does not have to iterate three times. The
+/// error names each missing variable, its purpose, its options (when the set
+/// is closed) and an example an operator can copy verbatim.
+fn check_deployment_requirements(environment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if env_allows_dev_secrets(environment) {
+        return Ok(());
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    for req in ESSENTIAL_DEPLOYMENT_REQUIREMENTS {
+        let value = (req.reader)().unwrap_or_default();
+        if value.trim().is_empty() {
+            missing.push(format_missing_requirement(req, environment));
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "boot refused: {} essential deployment-shape variable(s) unset in the \
+             '{environment}' environment. Only development/dev/test accept unset \
+             values here; every other environment must declare the shape.\n\n{}",
+            missing.len(),
+            missing.join("\n\n")
+        )
+        .into())
+    }
+}
+
+/// One requirement's failure block. Named to match the shape `resolve_secret`
+/// uses so operators reading two different startup errors see the same layout.
+fn format_missing_requirement(req: &DeploymentRequirement, environment: &str) -> String {
+    let options = if req.options.is_empty() {
+        String::new()
+    } else {
+        format!("\n       Available options: {}", req.options.join(" | "))
+    };
+    format!(
+        "FATAL: {name} is unset in the '{environment}' environment.\n       \
+         Purpose: {purpose}{options}\n       Example: {example}",
+        name = req.name,
+        purpose = req.purpose,
+        options = options,
+        example = req.example,
+    )
+}
+
 /// Resolve a secret, refusing the dev fallback outside dev/test.
 /// In dev/test an unset value falls back to `dev_value`. In every other
 /// environment an unset value - or one explicitly set to `dev_value` - is a
@@ -404,6 +557,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config::init_from_env(hosting_profile.default_provider_for(ProviderKind::Configuration)?)?;
 
     let config = AppConfig::from_env().expect("Failed to load configuration");
+
+    // PMS-1160: refuse to start when an essential deployment-shape variable
+    // is unset outside dev/test. Two incidents in 48 hours came from this
+    // class: MOKOSH_DEPLOYMENT_MODE unset (staging, 2026-09-10) rejected
+    // every Bunyip bearer, and MOKOSH_APP_DATABASE_URL unset (both
+    // deployments, 2026-09-11) leaves the request pool falling back to the
+    // BYPASSRLS migrator role so every RLS policy is inert. Runs after
+    // AppConfig::from_env so ENVIRONMENT decides whether the check gates.
+    check_deployment_requirements(&config.environment)?;
 
     // PMS-489: self-provision the split DB roles (mokosh_migrator / mokosh_app)
     // from MOKOSH_ADMIN_DATABASE_URL on first boot, before connecting the
@@ -1000,5 +1162,93 @@ mod tests {
     fn jwt_secret_len_prod_accepts_long_enough() {
         let ok = "a".repeat(MIN_JWT_SECRET_LEN);
         assert!(check_jwt_secret_len(&ok, "production").is_ok());
+    }
+
+    // PMS-1160: the essential deployment-shape variables list is closed and
+    // ordered. Its shape is source-tested here rather than at boot so the
+    // gates below cannot be circumvented by adding a sixth entry that fails
+    // to name its purpose or example.
+    #[test]
+    fn every_essential_requirement_names_its_options_or_shows_an_example() {
+        for req in ESSENTIAL_DEPLOYMENT_REQUIREMENTS {
+            assert!(
+                !req.purpose.is_empty(),
+                "{}: purpose must not be empty",
+                req.name
+            );
+            assert!(
+                !req.example.is_empty(),
+                "{}: example must not be empty",
+                req.name
+            );
+            assert!(
+                req.example.contains(req.name),
+                "{}: example must show the variable being set (name found in example)",
+                req.name
+            );
+        }
+    }
+
+    // PMS-1160: the five variables named by the ticket are the exact ones the
+    // list carries. A sixth entry added without moving the ticket is a change
+    // the list intends to refuse; adding one deliberately means updating this
+    // test and the ticket in the same PR.
+    #[test]
+    fn the_essential_set_is_exactly_the_pms_1160_five() {
+        let names: Vec<&str> = ESSENTIAL_DEPLOYMENT_REQUIREMENTS
+            .iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "MOKOSH_DEPLOYMENT_MODE",
+                "MOKOSH_APP_DATABASE_URL",
+                "BASE_URL",
+                "CLIENT_ORIGIN",
+                "SPA_BASE_URL",
+            ],
+            "the essential requirements list must match PMS-1160 exactly; \
+             adding a new entry means updating this assertion and the ticket \
+             in the same PR"
+        );
+    }
+
+    // PMS-1160: a `MOKOSH_DEPLOYMENT_MODE` failure names both legal values so
+    // an operator does not have to look up `.env.example` to know what to
+    // write. The two open-set URL requirements do not print an "Available
+    // options" line at all.
+    #[test]
+    fn format_missing_requirement_names_options_when_closed() {
+        let mode = &ESSENTIAL_DEPLOYMENT_REQUIREMENTS[0];
+        assert_eq!(mode.name, "MOKOSH_DEPLOYMENT_MODE");
+        let msg = format_missing_requirement(mode, "staging");
+        assert!(
+            msg.contains("Available options: self-hosted | saas"),
+            "{msg}"
+        );
+        assert!(msg.contains("MOKOSH_DEPLOYMENT_MODE=saas"), "{msg}");
+        assert!(msg.contains("'staging' environment"), "{msg}");
+
+        let app_db = &ESSENTIAL_DEPLOYMENT_REQUIREMENTS[1];
+        assert_eq!(app_db.name, "MOKOSH_APP_DATABASE_URL");
+        let msg = format_missing_requirement(app_db, "production");
+        assert!(
+            !msg.contains("Available options:"),
+            "an open-set requirement must not print an Available options line: {msg}"
+        );
+        assert!(msg.contains("postgres://mokosh_app"), "{msg}");
+    }
+
+    // PMS-1160: the gate is off in dev/test. A dev box that never touches
+    // these variables must still boot, or `just dev` breaks for everyone.
+    #[test]
+    fn check_deployment_requirements_no_op_in_dev_and_test() {
+        for env in ["development", "dev", "test"] {
+            assert!(
+                check_deployment_requirements(env).is_ok(),
+                "{env}: the gate must not fire in dev/test"
+            );
+        }
     }
 }
