@@ -20,6 +20,50 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+/// PMS-1171: the footer sentence, composed whole.
+///
+/// The templates wrote it out with the address interpolated inline (`Sent on
+/// behalf of {{msp_name}}. Questions? Reply to {{msp_support_email}}.`), so a
+/// tenant that never set a support address got `Reply to .` in every
+/// transactional mail - and an empty anchor in the HTML half, which renders as
+/// a bare full stop.
+///
+/// `render_template` is a flat `{{key}}` replacer with no conditionals
+/// (PMS-1140), so a value that can legitimately be absent CANNOT be
+/// interpolated into prose: the punctuation around it has nowhere to go. The
+/// sentence has to be composed where a condition can be expressed, which is
+/// here - exactly as `OrgIdentity::contact_line` and `logo_html` already do,
+/// for exactly this reason.
+///
+/// Two forms, because the two bodies differ: the HTML one makes the address a
+/// `mailto:` link. Both are always complete sentences.
+fn footer_line(msp_name: &str, support_email: &str) -> String {
+    let support_email = support_email.trim();
+    if support_email.is_empty() {
+        format!("Sent on behalf of {msp_name}.")
+    } else {
+        format!("Sent on behalf of {msp_name}. Questions? Reply to {support_email}.")
+    }
+}
+
+/// The HTML twin of [`footer_line`].
+///
+/// Everything interpolated is escaped: the name and the address come from
+/// `tenants.branding`, which is operator input, and this value is substituted
+/// into a body that is already HTML.
+fn footer_line_html(msp_name: &str, support_email: &str) -> String {
+    let name = crate::utils::html::html_escape(msp_name);
+    let support_email = support_email.trim();
+    if support_email.is_empty() {
+        format!("Sent on behalf of {name}.")
+    } else {
+        let address = crate::utils::html::html_escape(support_email);
+        format!(
+            "Sent on behalf of {name}. Questions? Reply to <a href=\"mailto:{address}\">{address}</a>."
+        )
+    }
+}
+
 /// PMS-1172: what `{{msp_primary_color}}` is when the tenant set none.
 ///
 /// A colour, never an empty string: the templates put this inside CSS
@@ -872,6 +916,21 @@ impl NotificationsService {
 
         let obj = context.as_object_mut().expect("guarded above");
 
+        let msp_name = if name.is_empty() {
+            "Mokosh Platform".to_string()
+        } else {
+            name
+        };
+        // PMS-1171: the name the footer sentence will use, resolved BEFORE the
+        // closure below borrows `obj`. A caller-supplied `msp_name` wins here
+        // too, or a test that passes one would see it in every key except the
+        // composed sentence.
+        let effective_name = obj
+            .get("msp_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| msp_name.clone());
+
         // helper: only set the key if the caller did not.
         let mut ensure_key = |k: &str, v: serde_json::Value| {
             if !obj.contains_key(k) {
@@ -879,11 +938,6 @@ impl NotificationsService {
             }
         };
 
-        let msp_name = if name.is_empty() {
-            "Mokosh Platform".to_string()
-        } else {
-            name
-        };
         ensure_key("msp_name", serde_json::Value::String(msp_name));
 
         let branding_str = |field: &str| -> String {
@@ -914,9 +968,21 @@ impl NotificationsService {
                 color
             }),
         );
+        let support_email = branding_str("support_email");
         ensure_key(
             "msp_support_email",
-            serde_json::Value::String(branding_str("support_email")),
+            serde_json::Value::String(support_email.clone()),
+        );
+        // PMS-1171: the whole sentence, because the renderer cannot express
+        // "only if there is an address". `msp_support_email` stays supplied
+        // for a tenant who has customised their own template around it.
+        ensure_key(
+            "msp_footer_line",
+            serde_json::Value::String(footer_line(&effective_name, &support_email)),
+        );
+        ensure_key(
+            "msp_footer_line_html",
+            serde_json::Value::String(footer_line_html(&effective_name, &support_email)),
         );
 
         Ok(context)
@@ -1946,7 +2012,7 @@ mod one_transaction_per_dispatch {
 /// PMS-1172: a branding key has to be usable where its template puts it.
 #[cfg(test)]
 mod branding_context {
-    use super::{absolute_logo_url, DEFAULT_PRIMARY_COLOR};
+    use super::{absolute_logo_url, footer_line, footer_line_html, DEFAULT_PRIMARY_COLOR};
 
     /// The stored value is a PATH (the write validator pins it to
     /// `/api/v1/public/tenants/`), and a mail client cannot resolve one. This
@@ -2004,6 +2070,51 @@ mod branding_context {
                 stored
             );
         }
+    }
+
+    /// PMS-1171: the sentence is complete with an address and complete
+    /// without one. `Reply to .` is what the templates shipped for months.
+    #[test]
+    fn the_footer_is_a_sentence_either_way() {
+        assert_eq!(
+            footer_line("Niceguy IT", "help@niceguyit.example"),
+            "Sent on behalf of Niceguy IT. Questions? Reply to help@niceguyit.example."
+        );
+        assert_eq!(
+            footer_line("Niceguy IT", ""),
+            "Sent on behalf of Niceguy IT.",
+            "no address means no sentence about replying, not a sentence with a hole"
+        );
+        for blank in ["", "   ", "\t"] {
+            let line = footer_line("Niceguy IT", blank);
+            assert!(!line.contains("Reply to"), "{line}");
+            assert!(!line.ends_with(" ."), "{line}");
+        }
+    }
+
+    /// The HTML twin, where the empty case was worse: an empty `mailto:`
+    /// anchor renders as nothing, leaving a bare full stop.
+    #[test]
+    fn the_html_footer_links_the_address_or_omits_the_clause() {
+        assert_eq!(
+            footer_line_html("Niceguy IT", "help@niceguyit.example"),
+            "Sent on behalf of Niceguy IT. Questions? Reply to \
+             <a href=\"mailto:help@niceguyit.example\">help@niceguyit.example</a>."
+                .replace("             ", "")
+        );
+        let empty = footer_line_html("Niceguy IT", "  ");
+        assert_eq!(empty, "Sent on behalf of Niceguy IT.");
+        assert!(!empty.contains("mailto:"), "{empty}");
+    }
+
+    /// Both values come from `tenants.branding`, which is operator input, and
+    /// land in a body that is already HTML.
+    #[test]
+    fn the_html_footer_escapes_what_it_interpolates() {
+        let line = footer_line_html("Acme <script>", "a\"b@example.com");
+        assert!(!line.contains("<script>"), "{line}");
+        assert!(line.contains("&lt;script&gt;"), "{line}");
+        assert!(!line.contains("\"b@example.com\">"), "{line}");
     }
 
     /// The colour lands inside CSS, so it is never empty: an empty value left
