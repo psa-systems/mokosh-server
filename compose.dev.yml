@@ -273,6 +273,12 @@ services:
       # Production deploys override these via secrets; setting
       # SMTP_HOST empty drops back to LogMailer (links go to docker
       # logs). The .env.example block above these keys is the reference.
+      #
+      # PMS-1013: MAIL_PROVIDER=smtp is inferred here from SMTP_HOST
+      # (mailpit); leave the variable empty so the .env.example default
+      # applies. Set MAIL_PROVIDER=log explicitly to force the LogMailer
+      # while the dev mailpit is reachable.
+      MAIL_PROVIDER: ${MAIL_PROVIDER:-}
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_USERNAME: ${SMTP_USERNAME:-}

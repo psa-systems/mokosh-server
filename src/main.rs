@@ -648,22 +648,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // email-settings endpoint can rebuild and swap it live. Hard-fail on
     // misconfiguration so an operator does not learn at 3am that a bad config
     // silently degraded to LogMailer.
+    //
+    // PMS-1013: the email provider selection is named through `MAIL_PROVIDER`
+    // (`log` or `smtp`), matching `SECRET_BACKEND` / `STORAGE_BACKEND` for the
+    // adjacent seams. The hosting profile supplies the default; an explicit
+    // choice overrides. `MAIL_PROVIDER=smtp` with no `SMTP_HOST` refuses to
+    // boot (the class of misconfiguration this seam exists to catch), and the
+    // selected kind is recorded so `rebuild_and_swap` cannot silently change
+    // it at runtime.
+    let mail_profile_default = hosting_profile.default_provider_for(ProviderKind::Email)?;
+    let mail_config = mokosh_server::utils::email::EmailConfig::from_env(mail_profile_default)?;
+    let mail_provider_explicit = mail_config.explicit_providers();
+    mokosh_server::utils::email::init_selected_kind(mail_config.provider);
+    tracing::info!(
+        provider = mail_config.provider.as_str(),
+        source = mail_config.source.as_str(),
+        "email provider selected"
+    );
     let mailer_config =
         mokosh_server::modules::settings::email::resolve_mailer_config(&db, &encryption_key)
             .await
             .expect(
                 "Failed to load Mailer config from DB settings / SMTP_* env (see .env.example)",
             );
-    // PMS-1011: the mail provider for the boot record, read before `build`
-    // consumes the config. A relay host means `SmtpMailer`; no host means
-    // `LogMailer`, which is the hosting profile's default in both modes.
-    let mail_provider_explicit = mailer_config
-        .host
-        .is_some()
-        .then(|| vec![mokosh_server::utils::deployment::provider::SMTP]);
-    let initial_mailer = mailer_config
-        .build()
-        .expect("Failed to build Mailer from DB settings / SMTP_* env (see .env.example)");
+    let initial_mailer =
+        mokosh_server::utils::email::build_mailer(mail_config.provider, mailer_config).expect(
+            "Failed to build Mailer for the selected MAIL_PROVIDER; see the error above and \
+             either set SMTP_HOST for MAIL_PROVIDER=smtp or MAIL_PROVIDER=log to opt out",
+        );
+    // Verify the transport now, not on the first outbound: an unreachable
+    // relay at 3am is a mail we never sent, and pushing the discovery to the
+    // first send is the failure mode PMS-1013 exists to remove. `LogMailer`'s
+    // verify is trivially Ok(()), so this line adds a NOOP round-trip on the
+    // SMTP path and nothing otherwise.
+    if let Err(e) = initial_mailer.verify().await {
+        tracing::error!(error = %e, "email provider verify failed");
+        return Err(e.into());
+    }
     let shared_mailer = std::sync::Arc::new(mokosh_server::utils::email::SharedMailer::new(
         initial_mailer,
     ));
