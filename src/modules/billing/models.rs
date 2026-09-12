@@ -140,6 +140,16 @@ pub struct InvoiceResponse {
     /// missing (e.g. deleted).
     pub company_name: Option<String>,
     pub billing_contact_id: Option<Uuid>,
+    /// PMS-1173: the billing contact's name, resolved the way `company_name`
+    /// is. The id alone told a portal customer nothing, and on their plane
+    /// every invoice belongs to the same company, so "who is this addressed
+    /// to" is the only thing that distinguishes one row from another.
+    ///
+    /// `None` when the invoice names no billing contact - one created before
+    /// PMS-1001, or sent with `skip_email` and no contact resolved - so a
+    /// client can say that rather than invent a name.
+    #[serde(default)]
+    pub billing_contact_name: Option<String>,
     pub contract_id: Option<Uuid>,
     pub status: InvoiceStatus,
     pub invoice_date: NaiveDate,

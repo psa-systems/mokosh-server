@@ -449,3 +449,67 @@ async fn a_refused_send_leaves_the_invoice_a_draft(pool: PgPool) {
         "a draft still previews live"
     );
 }
+
+/// PMS-1173: an invoice says who it is billed to by name, on the list and on
+/// the detail.
+///
+/// A portal customer sees every invoice belonging to their company, which is
+/// the intended model, and on that plane every row carries the same company -
+/// so "who is this addressed to" is the only thing that tells one row from
+/// another. The id alone told them nothing.
+///
+/// Both paths are asserted because they resolve the name in different places:
+/// the list batches it through `enrich_invoices`, the detail resolves it in
+/// `load_invoice`, and a field filled by only one of them would make the same
+/// invoice read differently depending on how it was fetched.
+#[sqlx::test]
+async fn an_invoice_names_the_contact_it_is_billed_to(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let contact = seed_contact(&pool, company_id, Some("ap@client.example")).await;
+    let (app, _mailer) = boot_capturing(pool.clone(), CapturingMailer::default()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let draft = create_draft(&app, &token, company_id, Some(contact)).await;
+    let id = draft["id"].as_str().unwrap().to_string();
+    send(&app, &token, &id, json!({ "status": "sent" })).await;
+
+    let detail: Value = app
+        .client
+        .get(app.url(&format!("/api/v1/invoices/{id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("detail")
+        .json()
+        .await
+        .expect("detail body");
+    let name = detail["billing_contact_name"]
+        .as_str()
+        .expect("the detail names the billing contact");
+    assert!(!name.trim().is_empty(), "{detail}");
+    assert!(
+        !name.contains('-') || !name.contains("0000"),
+        "a name, not a uuid: {name}"
+    );
+
+    let listed: Value = app
+        .client
+        .get(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("list body");
+    let row = listed["data"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["id"] == id.as_str()))
+        .expect("the invoice is listed");
+    assert_eq!(
+        row["billing_contact_name"].as_str(),
+        Some(name),
+        "the list and the detail must agree about who the invoice is billed to"
+    );
+}
