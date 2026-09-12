@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use crate::infisical::{run_dev_bootstrap, BootstrapInput, DevBootstrapConfig};
 
 pub mod providers;
+pub mod verify;
 
 const DEFAULT_URL: &str = "http://localhost:28002";
 const DEFAULT_PROJECT_NAME: &str = "mokosh";
@@ -55,6 +56,7 @@ pub fn is_subcommand(name: &str) -> bool {
             | "provider-status"
             | "provider-migrate"
             | "provider-purge"
+            | "verify-providers"
     )
 }
 
@@ -78,6 +80,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         Some("provider-purge") => providers::run_provider_purge(args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
+        Some("verify-providers") => verify::run(args).await.map_err(|e| anyhow::anyhow!("{e}")),
         other => anyhow::bail!("not an operator subcommand: {other:?}"),
     }
 }

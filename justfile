@@ -285,6 +285,23 @@ ensure-test-db-roles: ensure-env
 test-integration: ensure-env ensure-test-db-roles
     docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --tests --no-fail-fast -- --test-threads=4'
 
+# Exercise every provider seam - configuration, application-tier secrets,
+# tenant-tier secrets, storage, authentication, email - against the running
+# dev stack, and fail non-zero on any red row. Runs INSIDE the server
+# container so `MAIL_PROVIDER`, `SECRET_BACKEND`, `STORAGE_BACKEND` and
+# every SMTP_* it consults are exactly the ones a request would see. The
+# email row issues an SMTP NOOP against the relay (`LogMailer` trivially
+# passes), so this is safe to schedule (no test messages sent). Requires
+# `just dev` (or `just dev-infisical` / `just dev-s3` for the profile-gated
+# providers) to be running. PMS-1013.
+#
+# Trailing args pass through, so `--json` renders one JSON envelope for CI
+# and `--text` (the default) prints the operator table.
+[doc("Boot every provider seam and report per-capability pass/fail (PMS-1013).")]
+[group: 'test']
+verify-providers *args:
+    docker compose --file {{ compose_file }} exec -T server mokosh-server verify-providers {{ args }}
+
 # Verify the demo-critical path only: demo-data seeding (seed_demo) and the
 # tenant import/export round-trip (data_transfer). A fast, targeted subset of
 # `test-integration` for re-checking before building the demo (PMS-677). Same

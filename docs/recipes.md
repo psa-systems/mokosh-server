@@ -50,6 +50,7 @@ just test                   # cargo test
 just ensure-test-db-roles   # create the DB roles the migrations grant to, before the Postgres-backed suite
 just test-integration       # Postgres-backed tests/*.rs suite in the dev `server` container (mirrors CI integration.yml)
 just verify-demo            # the demo-critical subset of the integration suite (seed_demo + data_transfer)
+just verify-providers       # boot every provider seam against the running dev stack, report pass/fail per capability
 just test-e2e [args]        # Playwright E2E suite against staging or $E2E_BASE_URL (args go to `playwright test`)
 just build                  # cargo build --release --bins
 just build-docker           # build the production OCI image (oci-build/Dockerfile)
