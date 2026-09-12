@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::utils::crypto;
-use crate::utils::email::{MailerConfig, SharedMailer, SmtpTls};
+use crate::utils::email::{
+    build_mailer, selected_kind, EmailProviderKind, MailerConfig, SharedMailer, SmtpTls,
+};
 use crate::utils::error::{AppError, AppResult};
 
 /// System tenant that owns the single deployment-wide email config. Matches
@@ -166,12 +168,32 @@ pub async fn resolve_mailer_config(db: &Database, enc_key: &[u8; 32]) -> AppResu
 
 /// Rebuild the mailer from current settings and swap it into the shared handle,
 /// so the change takes effect on every consumer without a restart.
+///
+/// PMS-1013: the process's selected [`EmailProviderKind`] decides which mailer
+/// implementation the rebuild produces. The DB settings shape the SMTP
+/// transport ONLY; a deployment on `log` cannot swap to SMTP through a settings
+/// write, and a deployment on `smtp` cannot silently degrade to `log` when the
+/// DB clears the host. Changing the provider itself is a boot decision (see
+/// [`EmailConfig::from_env`]), matching how the bootstrap tier keys in
+/// [`crate::config::registry::Tier::Bootstrap`] behave.
 pub async fn rebuild_and_swap(
     db: &Database,
     enc_key: &[u8; 32],
     shared: &SharedMailer,
 ) -> AppResult<()> {
-    let mailer = resolve_mailer_config(db, enc_key).await?.build()?;
+    let cfg = resolve_mailer_config(db, enc_key).await?;
+    let kind = selected_kind().unwrap_or({
+        // Nothing recorded the kind - the test suites reach here, and the
+        // pre-PMS-1013 shape has to keep working: infer smtp when the resolved
+        // config has a host and log when it does not, then swap the same
+        // mailer the operator would have seen before.
+        if cfg.host.is_some() {
+            EmailProviderKind::Smtp
+        } else {
+            EmailProviderKind::Log
+        }
+    });
+    let mailer = build_mailer(kind, cfg)?;
     shared.swap(mailer);
     Ok(())
 }
@@ -227,10 +249,25 @@ pub async fn put_email_settings(
 
     // Prove the FULL effective config builds a mailer BEFORE persisting it.
     // Otherwise a bad value (an unparseable host, or a username with no
-    // password) would be saved and then panic the next boot, where
-    // `resolve_mailer_config(..).build()` is `.expect`-ed in main. Building is
-    // cheap (no network) and rejects the write with the underlying error.
-    config_from_stored(&stored, enc_key)?.build()?;
+    // password) would be saved and then panic the next boot, where the
+    // rebuild is `.expect`-ed in main.
+    //
+    // PMS-1013: validate against the process's selected provider kind. On a
+    // deployment with `MAIL_PROVIDER=smtp`, a settings write that clears the
+    // host is refused now instead of appearing to succeed and then failing
+    // the rebuild it triggers. Falls back to the pre-PMS-1013 shape when no
+    // kind is recorded (the test suites, or a code path that skips boot
+    // wiring). Building is cheap (no network) and rejects the write with the
+    // underlying error.
+    let effective = config_from_stored(&stored, enc_key)?;
+    let kind = selected_kind().unwrap_or({
+        if effective.host.is_some() {
+            EmailProviderKind::Smtp
+        } else {
+            EmailProviderKind::Log
+        }
+    });
+    build_mailer(kind, effective)?;
 
     let value = serde_json::to_value(&stored)
         .map_err(|e| AppError::Internal(format!("failed to serialise email config: {e}")))?;

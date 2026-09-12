@@ -137,6 +137,20 @@ pub trait Mailer: Send + Sync {
         self.send_multipart(to, subject, text, None).await
     }
 
+    /// PMS-1013: exercise the mailer's transport without an unsolicited send.
+    ///
+    /// The default is `Ok(())`: a mailer that carries no bytes off the box
+    /// (`LogMailer`) cannot fail to reach anything, so the verify is trivially
+    /// true. `SmtpMailer` overrides this with a `NOOP` against the relay so an
+    /// unreachable host, a wrong port or a rejected credential surfaces without
+    /// asking somebody to send themselves a test message. Callers use it at
+    /// boot (when the operator selected `smtp` and the deployment must fail
+    /// loud, not on the first outbound), and behind the admin
+    /// `POST /settings/email/verify` action.
+    async fn verify(&self) -> AppResult<()> {
+        Ok(())
+    }
+
     /// PMS-673: tell a client contact that a quote is ready for their
     /// sign-off, linking them to the portal where they accept or decline.
     /// The default composes a plain-text body and routes it through
@@ -675,6 +689,23 @@ impl Mailer for SmtpMailer {
         self.transport.send(msg).await?;
         Ok(())
     }
+
+    /// PMS-1013: connect to the relay and send a NOOP. A refusal is an
+    /// [`AppError::Configuration`] the caller reports the way `MailerConfig::build`
+    /// does, so a boot-time verify fails loudly on the same class of error a
+    /// live send would - just without asking somebody to receive a test message.
+    async fn verify(&self) -> AppResult<()> {
+        match self.transport.test_connection().await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(AppError::Configuration(
+                "SMTP relay refused the NOOP; the server is reachable but not accepting mail"
+                    .to_string(),
+            )),
+            Err(e) => Err(AppError::Configuration(format!(
+                "SMTP relay unreachable: {e}"
+            ))),
+        }
+    }
 }
 
 /// SMTP / mailer configuration sourced from env. `from_env` returns the
@@ -809,6 +840,198 @@ impl Mailer for SharedMailer {
             .send_with_attachments(to, subject, text, attachments)
             .await
     }
+
+    async fn verify(&self) -> AppResult<()> {
+        self.current().verify().await
+    }
+}
+
+/// Which provider carries outbound mail for this deployment (PMS-1013).
+///
+/// The two are the strings the `deployment::provider` module already spells:
+/// `log` for [`LogMailer`], `smtp` for [`SmtpMailer`]. A new provider is a
+/// third variant here, its own [`EmailProviderKind::parse_name`] arm, and its
+/// own construction branch in [`build_mailer`] - so the enum, the string
+/// table and the construction site cannot drift out of step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmailProviderKind {
+    /// Writes the message to `tracing`; no bytes leave the box. The hosting
+    /// profile's default in `self-hosted`, because no relay is available in a
+    /// fresh customer image.
+    Log,
+    /// SMTP relay via [`SmtpMailer`]. The hosting profile's default in `saas`,
+    /// because the deployed instance sets `SMTP_HOST` explicitly.
+    Smtp,
+}
+
+impl EmailProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EmailProviderKind::Log => crate::utils::deployment::provider::LOG,
+            EmailProviderKind::Smtp => crate::utils::deployment::provider::SMTP,
+        }
+    }
+
+    /// A provider name to a kind. Blank is not a name here: [`EmailConfig::resolve`]
+    /// settles an unset `MAIL_PROVIDER` against the profile default before it
+    /// reaches this arm, so this cannot become a second place that knows the
+    /// default and quietly falls back.
+    pub fn parse_name(raw: &str) -> AppResult<Self> {
+        use crate::utils::deployment::provider;
+        match raw.trim() {
+            s if s == provider::LOG => Ok(EmailProviderKind::Log),
+            s if s == provider::SMTP => Ok(EmailProviderKind::Smtp),
+            other => Err(AppError::Configuration(format!(
+                "MAIL_PROVIDER {other:?} is not a known provider; expected 'log' or 'smtp'"
+            ))),
+        }
+    }
+}
+
+/// The email provider selection for this process, and which of the two
+/// mechanisms decided it: [`crate::utils::deployment::EnablementSource`].
+///
+/// PMS-1013 makes the choice deliberate. Log is never a silent fallback: it is
+/// either the hosting profile's default (self-hosted with nothing set) or an
+/// explicit `MAIL_PROVIDER=log` from the operator. An unusable `smtp` (no
+/// `SMTP_HOST`) is a boot error rather than a silent degrade to Log.
+#[derive(Clone, Copy, Debug)]
+pub struct EmailConfig {
+    pub provider: EmailProviderKind,
+    pub source: crate::utils::deployment::EnablementSource,
+}
+
+impl EmailConfig {
+    /// The ONE reader of `MAIL_PROVIDER`, matching the shape
+    /// [`crate::secrets::SecretsConfig::from_env`] and
+    /// [`crate::storage::StorageProviderKind::from_env`] follow. Reads through
+    /// [`crate::config::get`], so the value goes through the same seam as
+    /// every other declared key (PMS-982): the key is registered in
+    /// `src/config/registry.rs` and cannot be read outside it.
+    pub fn from_env(profile_default: &str) -> AppResult<Self> {
+        let raw = crate::config::get(&crate::config::registry::MAIL_PROVIDER).unwrap_or_default();
+        let smtp_host = crate::config::get(&crate::config::registry::SMTP_HOST)
+            .filter(|s| !s.trim().is_empty());
+        Self::resolve(profile_default, &raw, smtp_host.is_some())
+    }
+
+    /// The rule itself, split out so it can be tested without writing to
+    /// process-global env under a concurrent test runner.
+    ///
+    /// Priority, from strongest to weakest:
+    /// 1. An explicit `MAIL_PROVIDER=log|smtp` wins outright.
+    /// 2. An unset `MAIL_PROVIDER` with `SMTP_HOST` set infers `smtp` as an
+    ///    Explicit choice, so pre-PMS-1013 deployments that never named a
+    ///    provider keep the SMTP mailer they had.
+    /// 3. Otherwise the hosting profile's default stands.
+    ///
+    /// `profile_default` is the resolved provider NAME from `utils::deployment`
+    /// (`log` in self-hosted, `smtp` in saas). This module never holds the
+    /// deployment shape - PMS-904's `only_the_auth_service_and_the_startup_wiring_know_the_deployment_mode`
+    /// guard covers that - it only needs a resolved name.
+    pub fn resolve(profile_default: &str, raw: &str, smtp_host_set: bool) -> AppResult<Self> {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            return Ok(Self {
+                provider: EmailProviderKind::parse_name(raw)?,
+                source: crate::utils::deployment::EnablementSource::Explicit,
+            });
+        }
+        if smtp_host_set {
+            return Ok(Self {
+                provider: EmailProviderKind::Smtp,
+                source: crate::utils::deployment::EnablementSource::Explicit,
+            });
+        }
+        Ok(Self {
+            provider: EmailProviderKind::parse_name(profile_default)?,
+            source: crate::utils::deployment::EnablementSource::Profile,
+        })
+    }
+
+    /// What this deployment explicitly configured, for the boot record and
+    /// [`crate::providers::status`]. `None` when the profile's default stands.
+    pub fn explicit_providers(&self) -> Option<Vec<&'static str>> {
+        match self.source {
+            crate::utils::deployment::EnablementSource::Explicit => {
+                Some(vec![self.provider.as_str()])
+            }
+            crate::utils::deployment::EnablementSource::Profile => None,
+        }
+    }
+}
+
+/// Build a mailer for the selected provider, or refuse.
+///
+/// The ONE place an [`EmailProviderKind`] becomes an `Arc<dyn Mailer>`, so no
+/// callsite can pick a provider of its own. Failure semantics match
+/// [`crate::secrets::provider_from_env`] and
+/// [`crate::storage::provider_from_env`]:
+///
+/// - `smtp` with no `SMTP_HOST` is refused, and a boot-time verify is expected
+///   from the caller. The refusal message names the missing key so an operator
+///   who typoed `MAIL_PROVIDER` learns which environment variable is empty.
+/// - `log` with `SMTP_HOST` set is allowed but warns once, because a relay
+///   configuration the operator entered and this seam will not use is more
+///   often a mistake than a deliberate suppression.
+/// - Building an [`SmtpMailer`] can still fail on a bad `SMTP_FROM` or a broken
+///   TLS mode; the caller surfaces those the same way it does for the DB
+///   override (`MailerConfig::build`).
+///
+/// Verifying that the relay actually answers is a separate step
+/// ([`Mailer::verify`]), so the boot log is one call per capability: build
+/// first, verify second.
+pub fn build_mailer(
+    kind: EmailProviderKind,
+    mailer_config: MailerConfig,
+) -> AppResult<Arc<dyn Mailer>> {
+    match kind {
+        EmailProviderKind::Log => {
+            if mailer_config.host.is_some() {
+                tracing::warn!(
+                    "MAIL_PROVIDER=log but SMTP_HOST is set; the relay configuration is ignored. \
+                     Set MAIL_PROVIDER=smtp to use it, or clear SMTP_HOST to remove the warning."
+                );
+            }
+            Ok(Arc::new(LogMailer))
+        }
+        EmailProviderKind::Smtp => {
+            if mailer_config.host.is_none() {
+                return Err(AppError::Configuration(
+                    "MAIL_PROVIDER=smtp requires SMTP_HOST; the selected provider has no relay to \
+                     send through"
+                        .to_string(),
+                ));
+            }
+            mailer_config.build()
+        }
+    }
+}
+
+/// Process-wide record of the selected [`EmailProviderKind`], set by `main` at
+/// boot after [`EmailConfig::from_env`] resolves. Every rebuild after that
+/// point ([`crate::modules::settings::email::rebuild_and_swap`], the admin
+/// verify action) reads this rather than re-resolving the provider from
+/// process-global env under whatever the running settings request is holding,
+/// so a runtime `MAIL_PROVIDER` swap is impossible: changing the selection
+/// needs a restart, exactly like [`crate::config::registry::Tier::Bootstrap`]
+/// keys do. Tests set it directly and callers read it through
+/// [`selected_kind`].
+static SELECTED_KIND: std::sync::OnceLock<EmailProviderKind> = std::sync::OnceLock::new();
+
+/// Record the selection at boot. A second call from the same process is
+/// silently ignored, matching [`crate::storage::init_from_env`]'s once-per-
+/// process guarantee.
+pub fn init_selected_kind(kind: EmailProviderKind) {
+    let _ = SELECTED_KIND.set(kind);
+}
+
+/// The provider chosen at boot. `None` until [`init_selected_kind`] runs -
+/// tests without a boot-wiring call reach this arm and treat it as SMTP-
+/// compatible (the mailer built from `MailerConfig` decides), matching the
+/// pre-PMS-1013 behaviour where nothing recorded a kind at all.
+pub fn selected_kind() -> Option<EmailProviderKind> {
+    SELECTED_KIND.get().copied()
 }
 
 #[cfg(test)]
@@ -1323,5 +1546,153 @@ mod tests {
         let (_, subject, body) = mailer.taken();
         assert_eq!(subject, "New sign-in to your account");
         assert!(!body.contains("Contoso"), "{body}");
+    }
+
+    /// PMS-1013: a provider name to a kind, and the two enum names match the
+    /// strings the `deployment::provider` table already spells. The parse
+    /// refuses anything else - a typo does not silently become one of the two.
+    #[test]
+    fn email_provider_kind_parses_the_known_names_only() {
+        assert_eq!(
+            EmailProviderKind::parse_name("log").unwrap(),
+            EmailProviderKind::Log
+        );
+        assert_eq!(
+            EmailProviderKind::parse_name(" smtp ").unwrap(),
+            EmailProviderKind::Smtp
+        );
+        assert_eq!(
+            EmailProviderKind::Log.as_str(),
+            crate::utils::deployment::provider::LOG
+        );
+        assert_eq!(
+            EmailProviderKind::Smtp.as_str(),
+            crate::utils::deployment::provider::SMTP
+        );
+        for hostile in ["", "LOG", "SMTP", "logmailer", "smtps", "sendgrid"] {
+            assert!(
+                EmailProviderKind::parse_name(hostile).is_err(),
+                "{hostile:?} must be refused"
+            );
+        }
+    }
+
+    /// PMS-1013: unset MAIL_PROVIDER with SMTP_HOST set infers smtp
+    /// (backward compat with the pre-PMS-1013 implicit rule) and marks the
+    /// source Explicit; unset with no host takes the profile default and
+    /// marks it Profile; an explicit value wins over both regardless of the
+    /// host, and an unrecognised value is refused.
+    #[test]
+    fn email_config_resolve_covers_the_priority_ladder() {
+        use crate::utils::deployment::provider;
+
+        // Explicit MAIL_PROVIDER wins.
+        let explicit_log = EmailConfig::resolve(provider::SMTP, "log", true).unwrap();
+        assert_eq!(explicit_log.provider, EmailProviderKind::Log);
+        assert_eq!(
+            explicit_log.source,
+            crate::utils::deployment::EnablementSource::Explicit
+        );
+        let explicit_smtp = EmailConfig::resolve(provider::LOG, "smtp", false);
+        // MAIL_PROVIDER=smtp is valid even with no SMTP_HOST at the parse
+        // step; the boot-time check in `build_mailer` is what refuses.
+        assert!(explicit_smtp.is_ok());
+
+        // Unset MAIL_PROVIDER + SMTP_HOST present infers smtp Explicit.
+        let inferred = EmailConfig::resolve(provider::LOG, "", true).unwrap();
+        assert_eq!(inferred.provider, EmailProviderKind::Smtp);
+        assert_eq!(
+            inferred.source,
+            crate::utils::deployment::EnablementSource::Explicit,
+            "SMTP_HOST is the pre-PMS-1013 explicit signal; keeping that shape means \
+             existing deployments do not silently switch to LogMailer"
+        );
+
+        // Unset MAIL_PROVIDER + no host takes the profile default (Profile).
+        let profile_log = EmailConfig::resolve(provider::LOG, "", false).unwrap();
+        assert_eq!(profile_log.provider, EmailProviderKind::Log);
+        assert_eq!(
+            profile_log.source,
+            crate::utils::deployment::EnablementSource::Profile
+        );
+        let profile_smtp = EmailConfig::resolve(provider::SMTP, "", false).unwrap();
+        assert_eq!(profile_smtp.provider, EmailProviderKind::Smtp);
+        assert_eq!(
+            profile_smtp.source,
+            crate::utils::deployment::EnablementSource::Profile
+        );
+
+        // A typo refuses to resolve rather than falling through to a default.
+        assert!(EmailConfig::resolve(provider::LOG, "smpt", true).is_err());
+        assert!(EmailConfig::resolve(provider::LOG, "quiet", false).is_err());
+    }
+
+    /// PMS-1013: `explicit_providers` reports only what the operator chose
+    /// (or the inferred smtp signal), so the boot record can distinguish a
+    /// provider left on by the profile from one the operator selected. This
+    /// is what the status collector's `ProviderOverrides` reads.
+    #[test]
+    fn email_config_explicit_providers_matches_the_source() {
+        use crate::utils::deployment::provider;
+
+        assert_eq!(
+            EmailConfig::resolve(provider::LOG, "smtp", false)
+                .unwrap()
+                .explicit_providers()
+                .unwrap(),
+            vec![provider::SMTP]
+        );
+        assert!(EmailConfig::resolve(provider::LOG, "", false)
+            .unwrap()
+            .explicit_providers()
+            .is_none());
+    }
+
+    /// PMS-1013: `build_mailer` is fail-loud on `smtp` with no host, and it
+    /// warns rather than refusing on `log` with a host so a mistaken relay
+    /// configuration surfaces without stopping a deployment that deliberately
+    /// suppressed outbound mail.
+    #[test]
+    fn build_mailer_refuses_smtp_without_a_host_and_allows_log_regardless() {
+        let cfg = MailerConfig {
+            host: None,
+            port: 587,
+            username: None,
+            password: None,
+            from: "Mokosh <noreply@example.com>".to_string(),
+            tls: SmtpTls::Starttls,
+        };
+        match build_mailer(EmailProviderKind::Smtp, cfg) {
+            Err(AppError::Configuration(msg)) => {
+                assert!(msg.contains("SMTP_HOST"), "{msg}");
+                assert!(msg.contains("MAIL_PROVIDER=smtp"), "{msg}");
+            }
+            Err(other) => panic!("expected Configuration error, got {other}"),
+            Ok(_) => panic!("smtp without host must refuse"),
+        }
+
+        let log_cfg = MailerConfig {
+            host: Some("smtp.example".to_string()),
+            port: 587,
+            username: None,
+            password: None,
+            from: "Mokosh <noreply@example.com>".to_string(),
+            tls: SmtpTls::Starttls,
+        };
+        assert!(
+            build_mailer(EmailProviderKind::Log, log_cfg).is_ok(),
+            "MAIL_PROVIDER=log must build LogMailer regardless of SMTP_HOST; the warning \
+             is the operator signal"
+        );
+    }
+
+    /// PMS-1013: LogMailer's default verify is trivially Ok. SmtpMailer's
+    /// verify is tested against a live relay in integration; the unit test
+    /// pins that a mailer with no transport reports success without a network
+    /// call, so the boot verify is safe on `log` deployments.
+    #[tokio::test]
+    async fn log_mailer_verify_is_ok() {
+        let mailer: Arc<dyn Mailer> = Arc::new(LogMailer);
+        mailer.verify().await.expect("LogMailer verify is trivial");
     }
 }

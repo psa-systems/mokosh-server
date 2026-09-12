@@ -67,6 +67,10 @@ pub fn settings_routes(
         // /settings/{category}/{key} matcher). Lets an operator exercise email
         // without a password reset.
         .route("/settings/email/test-send", post(post_email_test_send))
+        // PMS-1013: verify the live mailer's transport without an unsolicited
+        // send. Behind RequireAdmin; SMTP issues a NOOP against the relay and
+        // returns the failure verbatim, LogMailer's verify is trivially Ok.
+        .route("/settings/email/verify", post(post_email_verify))
         // PMS-789: the deployment-wide product name. Literal, so it is matched
         // before the generic `/settings/{category}` below - which writes the
         // CALLER's tenant and is therefore not a way to set a system value.
@@ -126,6 +130,19 @@ async fn post_email_test_send(
             ),
         )
         .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// PMS-1013: exercise the live mailer's transport with no unsolicited send.
+/// SmtpMailer's `verify` issues a NOOP against the relay so an unreachable
+/// host or a rejected credential surfaces without asking an operator to
+/// receive a test message; LogMailer's `verify` is trivially Ok.
+async fn post_email_verify(
+    State(s): State<SettingsRouterState>,
+    _admin: RequireAdmin,
+) -> AppResult<axum::http::StatusCode> {
+    use crate::utils::email::Mailer;
+    s.shared_mailer.verify().await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
