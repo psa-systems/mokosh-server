@@ -1040,3 +1040,105 @@ async fn a_stale_claim_is_retried_and_a_live_one_is_left_alone(pool: PgPool) {
         "a claim that has not expired must not be stolen",
     );
 }
+
+/// PMS-1171: the footer sentence is complete whether or not the tenant set a
+/// support address.
+///
+/// Asserted on the RENDERED row rather than on the template, because a
+/// template cannot show you the key nobody supplied: the broken output shipped
+/// for months while the template read exactly as its author intended
+/// (`Questions? Reply to {{msp_support_email}}.`), and only what reached the
+/// customer showed `Questions? Reply to .`
+///
+/// Both halves are checked, because the HTML one failed differently and worse:
+/// an empty `mailto:` anchor renders as nothing at all, so the sentence ended
+/// in a bare full stop with no clue why.
+#[sqlx::test]
+async fn a_tenant_with_no_support_address_gets_a_whole_footer_sentence(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let event_type = "test.footer_composition";
+
+    // The tenant has a name and NO support address, which is the shape that
+    // produced `Reply to .` in a delivered message.
+    sqlx::query("UPDATE tenants SET name = $2, branding = '{}'::jsonb WHERE id = $1")
+        .bind(tenant_id)
+        .bind("Niceguy IT")
+        .execute(&pool)
+        .await
+        .expect("clear branding");
+
+    let template_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO notification_templates
+            (id, tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+        VALUES ($1, $2, 'Footer Test - In App', $3, 'in_app', 'Footer', $4, $5, TRUE)
+        "#,
+    )
+    .bind(template_id)
+    .bind(tenant_id)
+    .bind(event_type)
+    .bind("Body.\n\n-- \n{{msp_footer_line}}\n")
+    .bind("<p>Body.</p><p>{{msp_footer_line_html}}</p>")
+    .execute(&pool)
+    .await
+    .expect("seed template");
+
+    sqlx::query(
+        r#"
+        INSERT INTO notification_rules
+            (id, tenant_id, name, event_type, channels, recipients, template_id, is_active)
+        VALUES ($1, $2, 'Footer Test Rule', $3, ARRAY['in_app']::VARCHAR(20)[],
+                '{"user_ids": [], "emails": []}'::jsonb, $4, TRUE)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(event_type)
+    .bind(template_id)
+    .execute(&pool)
+    .await
+    .expect("seed rule");
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/notifications/dispatch"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "event_type": event_type,
+            "context": { "recipient_user_id": admin_id.to_string() },
+        }))
+        .send()
+        .await
+        .expect("send dispatch");
+    assert!(resp.status().is_success(), "{}", resp.status());
+
+    let body: String = sqlx::query_scalar(
+        "SELECT body FROM notifications WHERE tenant_id = $1 AND template_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(template_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch rendered row");
+
+    assert!(
+        body.contains("Sent on behalf of Niceguy IT."),
+        "the footer must name the MSP: {body}"
+    );
+    assert!(
+        !body.contains("Reply to ."),
+        "the sentence that shipped for months: {body}"
+    );
+    assert!(
+        !body.contains("mailto:\""),
+        "an empty mailto anchor renders as nothing: {body}"
+    );
+    assert!(
+        !body.contains("{{"),
+        "no unresolved placeholder reaches a recipient: {body}"
+    );
+}
