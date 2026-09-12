@@ -615,7 +615,8 @@ impl BillingService {
         Ok(default_contact.flatten())
     }
 
-    /// Fill in `company_name` on a batch of invoice responses (PMS-186).
+    /// Fill in `company_name` on a batch of invoice responses (PMS-186), and
+    /// `billing_contact_name` beside it (PMS-1173).
     async fn enrich_invoices(
         &self,
         tenant_id: TenantId,
@@ -625,13 +626,58 @@ impl BillingService {
         let names = self.company_name_map(tenant_id, &ids).await?;
         let term_ids: Vec<Uuid> = resp.iter().filter_map(|r| r.payment_term_id).collect();
         let term_names = self.payment_term_name_map(tenant_id, &term_ids).await?;
+        let contact_ids: Vec<Uuid> = resp.iter().filter_map(|r| r.billing_contact_id).collect();
+        let contact_names = self.contact_name_map(tenant_id, &contact_ids).await?;
         for r in resp.iter_mut() {
             r.company_name = names.get(&r.company_id).cloned();
             r.payment_term_name = r
                 .payment_term_id
                 .and_then(|id| term_names.get(&id).cloned());
+            r.billing_contact_name = r
+                .billing_contact_id
+                .and_then(|id| contact_names.get(&id).cloned());
         }
         Ok(())
+    }
+
+    /// PMS-1173: resolve a set of contact ids to display names, tenant-scoped.
+    ///
+    /// The batch shape of `company_name_map` beside it, for the same reason: a
+    /// list of invoices must cost one query for the set, never one per row.
+    /// Tenant-bound, so an id from another tenant resolves to nothing rather
+    /// than leaking a name.
+    ///
+    /// A contact with no last name (an intake-created row often has only one)
+    /// yields the first name alone rather than a trailing space, and a contact
+    /// with neither yields nothing, which reads the same as having no billing
+    /// contact at all - the honest answer, since a nameless row names nobody.
+    async fn contact_name_map(
+        &self,
+        tenant_id: TenantId,
+        ids: &[Uuid],
+    ) -> AppResult<std::collections::HashMap<Uuid, String>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, first_name, last_name FROM contacts \
+             WHERE tenant_id = $1 AND id = ANY($2)",
+        )
+        .bind(tenant_id)
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, first, last)| {
+                let name = [first.unwrap_or_default(), last.unwrap_or_default()]
+                    .join(" ")
+                    .trim()
+                    .to_string();
+                (!name.is_empty()).then_some((id, name))
+            })
+            .collect())
     }
 
     /// Fill in `company_name` and `invoice_number` on a batch of payment
@@ -4313,6 +4359,22 @@ impl BillingService {
             .fetch_optional(&mut **tx)
             .await?;
         }
+        // PMS-1173: the billing contact's name, the same value
+        // `enrich_invoices` resolves in a batch for the list paths. Resolved
+        // here too rather than only there, because this loader exists to be
+        // the ONE assembly of what an invoice contains and a field it left
+        // unfilled would differ between the list and the detail.
+        if let Some(contact_id) = resp.billing_contact_id {
+            resp.billing_contact_name = sqlx::query_scalar(
+                "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
+                 FROM contacts WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+        }
         // MAPPS-727: name the finance user who wrote the invoice off, the
         // shape `decided_by_name` has on an approval; a deleted user reads
         // as no name rather than an error.
@@ -5897,6 +5959,10 @@ impl From<InvoiceRow> for InvoiceResponse {
             company_id: r.company_id,
             company_name: None,
             billing_contact_id: r.billing_contact_id,
+            // PMS-1173: filled by `enrich_invoices`, the one place an invoice
+            // response is decorated, so it is resolved once per response set
+            // rather than once per row.
+            billing_contact_name: None,
             contract_id: r.contract_id,
             status: InvoiceStatus::from_str(&r.status).unwrap_or(InvoiceStatus::Draft),
             invoice_date: r.invoice_date,
