@@ -478,7 +478,7 @@ pub fn create_api_router(
         // Billing: invoices + payments + payment-gateways + tax-rates.
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
-        .merge(billing_routes(billing_service))
+        .merge(billing_routes(billing_service, public_api_base_url.clone()))
         // Quotes: the sales document that precedes a Project, plus its
         // line items. Shares the billing module gate + finance role with
         // invoices. PMS-672.

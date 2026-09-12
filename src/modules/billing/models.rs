@@ -504,6 +504,29 @@ pub struct PaymentGatewayConfigResponse {
     pub client_display_name: Option<String>,
 }
 
+/// PMS-1165: where this deployment receives one provider's webhooks for the
+/// calling tenant.
+///
+/// Its own endpoint rather than a field on the gateway row, and the reason is
+/// the case that matters. Setting Stripe up runs: learn the URL, create the
+/// endpoint in Stripe, copy the `whsec_` it gives you, THEN fill the form in
+/// (which requires that secret). So the admin needs this before any row
+/// exists, and a value hanging off a stored row would be available only after
+/// the save it is needed for. It is a property of the deployment, the tenant
+/// and the provider - never of a configuration - so it is answered once, for
+/// every provider that has a receiver, whether or not one is configured.
+///
+/// `url` is `None` when the deployment set no `PUBLIC_API_BASE_URL`. The
+/// client says which of those it is rather than rendering a blank, because an
+/// admin being asked for a webhook signing secret cannot act without it.
+#[derive(Debug, Clone, Serialize)]
+pub struct GatewayWebhookEndpoint {
+    /// The provider discriminator, as `payment_gateway_configs.provider`
+    /// stores it.
+    pub provider: String,
+    pub url: Option<String>,
+}
+
 /// PMS-711: response to the portal "Pay Now" action. The SPA redirects the
 /// browser to `checkout_url` (the provider's hosted checkout page).
 #[derive(Debug, Clone, Serialize)]
