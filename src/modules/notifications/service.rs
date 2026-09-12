@@ -20,10 +20,48 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+/// PMS-1172: what `{{msp_primary_color}}` is when the tenant set none.
+///
+/// A colour, never an empty string: the templates put this inside CSS
+/// (`border-bottom:3px solid {{msp_primary_color}}`, `background:...`), where
+/// an empty value leaves a declaration the client discards, and the sign-in
+/// button stops looking like a button.
+const DEFAULT_PRIMARY_COLOR: &str = "#111827";
+
+/// PMS-1172: the emailed logo `src`, absolute or empty.
+///
+/// `tenants.branding->>'logo_url'` is a PATH by design - the write validator
+/// pins it to `PUBLIC_TENANT_PATH_PREFIX` - so it needs the deployment's
+/// public base in front of it before a mail client can fetch it. Empty when
+/// the tenant has no logo or the deployment has no public base, because a
+/// template rendering an empty `src` shows nothing while a relative one shows
+/// a broken image, and nothing is the better of the two.
+///
+/// A value that is already absolute is passed through: a tenant whose branding
+/// points at an externally hosted mark is not this function's business.
+fn absolute_logo_url(public_api_base: Option<&str>, stored: &str) -> String {
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return String::new();
+    }
+    if stored.starts_with("http://") || stored.starts_with("https://") {
+        return stored.to_string();
+    }
+    match public_api_base.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(base) => format!("{}{}", base.trim_end_matches('/'), stored),
+        None => String::new(),
+    }
+}
+
 #[derive(Clone)]
 pub struct NotificationsService {
     db: Database,
     encryption_key: [u8; 32],
+    /// PMS-1172: `PUBLIC_API_BASE_URL`, the origin a third party reaches this
+    /// deployment at, used to make `{{msp_logo_url}}` absolute. `None` means
+    /// the deployment never set one, and the logo key is then empty rather
+    /// than a relative path no mail client can resolve.
+    public_api_base: Option<String>,
 }
 
 impl NotificationsService {
@@ -39,7 +77,20 @@ impl NotificationsService {
     /// pass the key (see PMS-92). Forcing the key through this
     /// constructor makes that mistake impossible.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
-        Self { db, encryption_key }
+        Self {
+            db,
+            encryption_key,
+            public_api_base: None,
+        }
+    }
+
+    /// PMS-1172: tell this service where a third party reaches the API, so the
+    /// emailed logo can be an absolute URL. Same shape as
+    /// `FormsService::with_public_api_base`, and blank counts as unset because
+    /// a forwarded-but-unset variable arrives as an empty string (PMS-836).
+    pub fn with_public_api_base(mut self, base: Option<String>) -> Self {
+        self.public_api_base = base.filter(|b| !b.trim().is_empty());
+        self
     }
 
     // PMS-87 channels CRUD ----------------------------------------------------
@@ -768,11 +819,22 @@ impl NotificationsService {
     /// template gets tenant-branded output without the dispatch caller
     /// having to thread the fields in by hand.
     ///
-    /// Missing branding fields degrade to empty strings so a template
-    /// that references `{{msp_support_email}}` on a tenant that never
-    /// set one renders `""` (empty) rather than a literal placeholder;
-    /// this matches what `render_template` already does for absent
-    /// keys but is more graceful for user-visible copy.
+    /// PMS-1172: a key has to be safe IN THE POSITION THE TEMPLATE USES IT,
+    /// and "degrade to an empty string" is not that. The renderer is a flat
+    /// `{{key}}` replacer with no conditionals (PMS-1140), so an empty value
+    /// leaves whatever wraps it standing: the portal sign-in mail shipped
+    /// `Reply to .`, `border-bottom:3px solid ;` and `background:;` - the last
+    /// of which renders the only call to action as plain text rather than a
+    /// button. A relative value is the same defect one step further on: the
+    /// logo key held `/api/v1/public/tenants/{id}/logo` verbatim out of
+    /// branding, and a mail client cannot resolve a relative `src`, which is
+    /// why `OrgIdentity::logo_html` prefixes the public base and why this now
+    /// does too.
+    ///
+    /// So each key is emitted in a form its template can use unchanged: the
+    /// logo absolute or absent, the colour always a real colour. The support
+    /// address is the one that cannot be fixed here, because what wraps it is
+    /// prose and markup; PMS-1171 composes that sentence whole.
     /// `{{msp_name}}` defaults to "Mokosh Platform" so subject lines
     /// like "{{msp_name}} - Reset your password" stay readable even for
     /// the default/system tenant.
@@ -831,13 +893,26 @@ impl NotificationsService {
                 .map(|s| s.to_string())
                 .unwrap_or_default()
         };
+        // PMS-1172: absolute, or empty. A relative path renders as a broken
+        // image in every client, which is worse than no logo at all, and the
+        // stored value is deliberately relative (`PUBLIC_TENANT_PATH_PREFIX`).
         ensure_key(
             "msp_logo_url",
-            serde_json::Value::String(branding_str("logo_url")),
+            serde_json::Value::String(absolute_logo_url(
+                self.public_api_base.as_deref(),
+                &branding_str("logo_url"),
+            )),
         );
+        // PMS-1172: always a real colour. This one lands inside CSS, where an
+        // empty value leaves `background:;` and the button disappears.
+        let color = branding_str("primary_color");
         ensure_key(
             "msp_primary_color",
-            serde_json::Value::String(branding_str("primary_color")),
+            serde_json::Value::String(if color.trim().is_empty() {
+                DEFAULT_PRIMARY_COLOR.to_string()
+            } else {
+                color
+            }),
         );
         ensure_key(
             "msp_support_email",
@@ -1865,5 +1940,81 @@ mod one_transaction_per_dispatch {
             "these run on the caller's connection and must not open a transaction \
              of their own (PMS-1068); read on the `conn` argument instead: {offenders:?}",
         );
+    }
+}
+
+/// PMS-1172: a branding key has to be usable where its template puts it.
+#[cfg(test)]
+mod branding_context {
+    use super::{absolute_logo_url, DEFAULT_PRIMARY_COLOR};
+
+    /// The stored value is a PATH (the write validator pins it to
+    /// `/api/v1/public/tenants/`), and a mail client cannot resolve one. This
+    /// is the whole reason the portal sign-in mail showed a broken image.
+    #[test]
+    fn a_stored_path_is_made_absolute() {
+        assert_eq!(
+            absolute_logo_url(
+                Some("https://api.msp.example"),
+                "/api/v1/public/tenants/4a870d0c-637a-4ba1-b230-abb8b65b2ba1/logo"
+            ),
+            "https://api.msp.example/api/v1/public/tenants/4a870d0c-637a-4ba1-b230-abb8b65b2ba1/logo"
+        );
+    }
+
+    /// A trailing slash on the configured base does not double up.
+    #[test]
+    fn the_base_joins_cleanly() {
+        assert_eq!(
+            absolute_logo_url(Some("https://api.msp.example/"), "/logo"),
+            "https://api.msp.example/logo"
+        );
+    }
+
+    /// No logo, or no public base, means NO image - never a relative `src`.
+    /// An empty `src` renders nothing; a relative one renders a broken image,
+    /// and nothing is the better of the two.
+    #[test]
+    fn absent_inputs_yield_no_url_rather_than_a_relative_one() {
+        assert_eq!(absolute_logo_url(Some("https://api.msp.example"), ""), "");
+        assert_eq!(
+            absolute_logo_url(Some("https://api.msp.example"), "   "),
+            ""
+        );
+        assert_eq!(absolute_logo_url(None, "/api/v1/public/tenants/x/logo"), "");
+        assert_eq!(
+            absolute_logo_url(Some(""), "/api/v1/public/tenants/x/logo"),
+            ""
+        );
+        assert_eq!(
+            absolute_logo_url(Some("  "), "/api/v1/public/tenants/x/logo"),
+            ""
+        );
+    }
+
+    /// A tenant pointing at an externally hosted mark is left alone.
+    #[test]
+    fn an_absolute_stored_value_is_passed_through() {
+        for stored in [
+            "https://cdn.example/logo.png",
+            "http://cdn.example/logo.png",
+        ] {
+            assert_eq!(
+                absolute_logo_url(Some("https://api.msp.example"), stored),
+                stored
+            );
+        }
+    }
+
+    /// The colour lands inside CSS, so it is never empty: an empty value left
+    /// `background:;` on the sign-in button, which a client discards, and the
+    /// only call to action in the message rendered as plain text.
+    #[test]
+    fn the_default_colour_is_a_colour() {
+        assert!(DEFAULT_PRIMARY_COLOR.starts_with('#'));
+        assert_eq!(DEFAULT_PRIMARY_COLOR.len(), 7);
+        assert!(DEFAULT_PRIMARY_COLOR[1..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
     }
 }
