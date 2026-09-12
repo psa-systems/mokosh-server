@@ -12,6 +12,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::models::*;
+use super::provider;
 use super::service::BillingService;
 use crate::db::Database;
 use crate::modules::auth::{
@@ -30,13 +31,20 @@ pub struct BillingRouterState {
     /// bounds runaway mint loops so a bot hammering `/pay` hits 429 before
     /// it hits the payment provider hundreds of times.
     pub pay_limiter: Arc<rate_limit::PayInvoiceRateLimiter>,
+    /// PMS-1165: `PUBLIC_API_BASE_URL`, the origin a THIRD PARTY reaches this
+    /// deployment at, used to tell an admin where their provider should send
+    /// webhooks. Held here rather than on `BillingService` because it
+    /// describes this deployment's HTTP surface, which is this layer's
+    /// business and not billing's.
+    pub public_api_base: Option<String>,
 }
 
 /// Build the billing router. URLs are absolute (`/invoices`, etc.) so
 /// the call site `merge`s rather than `nest`s.
-pub fn billing_routes(service: BillingService) -> Router {
+pub fn billing_routes(service: BillingService, public_api_base: Option<String>) -> Router {
     let state = BillingRouterState {
         service: Arc::new(service),
+        public_api_base,
         // MAPPS-677: 20 mints per minute per caller (staff `users.id` or
         // portal `contacts.id`) and 10 per minute per invoice, mirroring
         // the AuthRateLimiter quotas the auth endpoints already use.
@@ -136,6 +144,13 @@ pub fn billing_routes(service: BillingService) -> Router {
         .route(
             "/payment-gateways",
             get(list_payment_gateways).put(upsert_payment_gateway),
+        )
+        // PMS-1165: a static segment, declared before the `{provider}` route
+        // below so it can never be read as a provider named
+        // "webhook-endpoints".
+        .route(
+            "/payment-gateways/webhook-endpoints",
+            get(list_gateway_webhook_endpoints),
         )
         .route(
             "/payment-gateways/{provider}",
@@ -293,6 +308,32 @@ async fn lookup_tax_rate(
         .lookup_tax_rate(user.tenant(), &q.name)
         .await?;
     Ok(Json(r))
+}
+
+/// PMS-1165: where each provider should deliver this tenant's webhooks.
+///
+/// Answered for every provider that has a receiver, configured or not,
+/// because an admin needs the URL BEFORE the first save: creating the endpoint
+/// in the provider's dashboard is what produces the signing secret the form
+/// then requires. Without this, setting a gateway up for the first time meant
+/// digging the tenant's UUID out of developer tools, which is the gap this
+/// closes.
+///
+/// The tenant is the CALLER's, never a value off the request.
+async fn list_gateway_webhook_endpoints(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+) -> AppResult<Json<Vec<GatewayWebhookEndpoint>>> {
+    let tenant_id = user.tenant().get();
+    let endpoints = provider::SUPPORTED
+        .iter()
+        .map(|id| GatewayWebhookEndpoint {
+            provider: (*id).to_string(),
+            url: provider::webhook_url(state.public_api_base.as_deref(), id, tenant_id),
+        })
+        .collect();
+    Ok(Json(endpoints))
 }
 
 async fn list_payment_gateways(
