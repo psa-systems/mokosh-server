@@ -114,14 +114,35 @@ jobs:
         # it: the MinIO image carries no command, `server /data` has to be
         # passed, and Forgejo (like GitHub) service containers have no
         # `command` key and `--entrypoint` takes a binary without arguments.
-        # So the pinned release binary runs in the job, verified against the
-        # checksum MinIO publishes beside it. Bump both lines together.
+        # So the pinned release binary runs in the job.
+        #
+        # The binary comes OUT OF THE IMAGE rather than from a download.
+        # MinIO archived the open-source server, and dl.min.io now answers 410
+        # Gone for every community release and hotfix, the pinned one included
+        # ("These files are no longer served from this site"), which broke this
+        # job on every branch at once. The GitHub release assets are gone too.
+        # The container image is still published, and it is the same artefact:
+        # the binary extracted below hashes to exactly the MINIO_SHA256 the
+        # withdrawn URL used to serve, which is why that line is unchanged.
+        #
+        # Pinned by IMAGE DIGEST, not by tag, so a re-push under the same tag
+        # cannot change what runs here; the checksum stays as the second belt.
+        # `docker create` + `docker cp` rather than `docker run`, because the
+        # job container and a sibling container are not on the same network by
+        # default, and taking the binary out keeps the health check on
+        # 127.0.0.1 where the rest of this step already expects it. Jobs reach
+        # the runner's daemon (`container.docker_host: "-"`), which is the same
+        # access `build-oci-image.yml` uses.
+        #
+        # `compose.dev.yml` already runs this image for `just dev-s3`, so dev
+        # and CI now take MinIO from one place. Bump the digest and the
+        # checksum together, and the compose tag with them.
         #
         # Only this suite sets STORAGE_BACKEND=s3, in its own process; the
         # variables below are read by nothing else, so every other suite
         # keeps exercising the local backend.
         env:
-          MINIO_RELEASE: RELEASE.2025-09-07T16-13-09Z
+          MINIO_IMAGE: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
           MINIO_SHA256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
         run: |
           set -euo pipefail
@@ -129,9 +150,12 @@ jobs:
             echo "::error::MinIO pin is for linux-amd64; runner is $(uname -m)"
             exit 1
           fi
-          curl --fail --location --silent --show-error \
-            --output /tmp/minio \
-            "https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_RELEASE}"
+          docker pull --quiet "${MINIO_IMAGE}"
+          container="$(docker create "${MINIO_IMAGE}")"
+          # Removed even when the copy fails, or a retried job leaks a
+          # container per attempt onto the shared runner daemon.
+          trap 'docker rm --volumes "${container}" > /dev/null 2>&1 || true' EXIT
+          docker cp "${container}":/usr/bin/minio /tmp/minio
           echo "${MINIO_SHA256}  /tmp/minio" | sha256sum --check --strict
           chmod +x /tmp/minio
           mkdir -p /tmp/minio-data
