@@ -1072,12 +1072,12 @@ mod tests {
                 amount_due: "1.00 USD",
                 due_date: "2026-08-01",
                 days_overdue: 1,
-                portal_link: Some("https://portal.example/portal/invoices/x"),
+                portal_link: Some("https://portal.example/portal/123456789/login"),
                 pdf: None,
             },
         );
         assert!(subject.ends_with("is 1 day overdue"), "{subject}");
-        assert!(body.contains("https://portal.example/portal/invoices/x"));
+        assert!(body.contains("https://portal.example/portal/123456789/login"));
         assert!(!body.contains("attached"), "{body}");
     }
 
@@ -1427,7 +1427,7 @@ mod tests {
                     invoice_number: "INV-2050",
                     amount_due: "1200.00 USD",
                     due_date: "2026-09-30",
-                    portal_link: Some("http://portal.example/portal/invoices/1"),
+                    portal_link: Some("http://portal.example/portal/login"),
                     pdf: None,
                 },
             )
@@ -1469,13 +1469,13 @@ mod tests {
             "INV-1",
             "50.00 USD",
             "2026-09-30",
-            Some("http://portal.example/portal/invoices/1"),
+            Some("http://portal.example/portal/login"),
             true,
         );
         assert_eq!(subject, "Invoice INV-1 from Contoso IT is ready to pay");
         assert!(body.contains("attached as INV-1.pdf"), "{body}");
         assert!(
-            body.contains("pay online here:\n\nhttp://portal.example/portal/invoices/1"),
+            body.contains("pay online here:\n\nhttp://portal.example/portal/login"),
             "{body}"
         );
     }
