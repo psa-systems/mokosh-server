@@ -149,7 +149,9 @@ pub fn create_api_router(
     // instead of calling the Mailer directly. The dispatcher worker
     // spawned from main.rs drains those rows.
     let notifications_service =
-        NotificationsService::with_encryption_key(db.clone(), encryption_key);
+        NotificationsService::with_encryption_key(db.clone(), encryption_key)
+            // PMS-1172: the emailed logo has to be an absolute URL.
+            .with_public_api_base(public_api_base_url.clone());
     let auth_service = AuthService::with_dispatcher(
         db.clone(),
         jwt_secret.clone(),

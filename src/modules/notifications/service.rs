@@ -20,10 +20,92 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+/// PMS-1171: the footer sentence, composed whole.
+///
+/// The templates wrote it out with the address interpolated inline (`Sent on
+/// behalf of {{msp_name}}. Questions? Reply to {{msp_support_email}}.`), so a
+/// tenant that never set a support address got `Reply to .` in every
+/// transactional mail - and an empty anchor in the HTML half, which renders as
+/// a bare full stop.
+///
+/// `render_template` is a flat `{{key}}` replacer with no conditionals
+/// (PMS-1140), so a value that can legitimately be absent CANNOT be
+/// interpolated into prose: the punctuation around it has nowhere to go. The
+/// sentence has to be composed where a condition can be expressed, which is
+/// here - exactly as `OrgIdentity::contact_line` and `logo_html` already do,
+/// for exactly this reason.
+///
+/// Two forms, because the two bodies differ: the HTML one makes the address a
+/// `mailto:` link. Both are always complete sentences.
+fn footer_line(msp_name: &str, support_email: &str) -> String {
+    let support_email = support_email.trim();
+    if support_email.is_empty() {
+        format!("Sent on behalf of {msp_name}.")
+    } else {
+        format!("Sent on behalf of {msp_name}. Questions? Reply to {support_email}.")
+    }
+}
+
+/// The HTML twin of [`footer_line`].
+///
+/// Everything interpolated is escaped: the name and the address come from
+/// `tenants.branding`, which is operator input, and this value is substituted
+/// into a body that is already HTML.
+fn footer_line_html(msp_name: &str, support_email: &str) -> String {
+    let name = crate::utils::html::html_escape(msp_name);
+    let support_email = support_email.trim();
+    if support_email.is_empty() {
+        format!("Sent on behalf of {name}.")
+    } else {
+        let address = crate::utils::html::html_escape(support_email);
+        format!(
+            "Sent on behalf of {name}. Questions? Reply to <a href=\"mailto:{address}\">{address}</a>."
+        )
+    }
+}
+
+/// PMS-1172: what `{{msp_primary_color}}` is when the tenant set none.
+///
+/// A colour, never an empty string: the templates put this inside CSS
+/// (`border-bottom:3px solid {{msp_primary_color}}`, `background:...`), where
+/// an empty value leaves a declaration the client discards, and the sign-in
+/// button stops looking like a button.
+const DEFAULT_PRIMARY_COLOR: &str = "#111827";
+
+/// PMS-1172: the emailed logo `src`, absolute or empty.
+///
+/// `tenants.branding->>'logo_url'` is a PATH by design - the write validator
+/// pins it to `PUBLIC_TENANT_PATH_PREFIX` - so it needs the deployment's
+/// public base in front of it before a mail client can fetch it. Empty when
+/// the tenant has no logo or the deployment has no public base, because a
+/// template rendering an empty `src` shows nothing while a relative one shows
+/// a broken image, and nothing is the better of the two.
+///
+/// A value that is already absolute is passed through: a tenant whose branding
+/// points at an externally hosted mark is not this function's business.
+fn absolute_logo_url(public_api_base: Option<&str>, stored: &str) -> String {
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return String::new();
+    }
+    if stored.starts_with("http://") || stored.starts_with("https://") {
+        return stored.to_string();
+    }
+    match public_api_base.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(base) => format!("{}{}", base.trim_end_matches('/'), stored),
+        None => String::new(),
+    }
+}
+
 #[derive(Clone)]
 pub struct NotificationsService {
     db: Database,
     encryption_key: [u8; 32],
+    /// PMS-1172: `PUBLIC_API_BASE_URL`, the origin a third party reaches this
+    /// deployment at, used to make `{{msp_logo_url}}` absolute. `None` means
+    /// the deployment never set one, and the logo key is then empty rather
+    /// than a relative path no mail client can resolve.
+    public_api_base: Option<String>,
 }
 
 impl NotificationsService {
@@ -39,7 +121,20 @@ impl NotificationsService {
     /// pass the key (see PMS-92). Forcing the key through this
     /// constructor makes that mistake impossible.
     pub fn with_encryption_key(db: Database, encryption_key: [u8; 32]) -> Self {
-        Self { db, encryption_key }
+        Self {
+            db,
+            encryption_key,
+            public_api_base: None,
+        }
+    }
+
+    /// PMS-1172: tell this service where a third party reaches the API, so the
+    /// emailed logo can be an absolute URL. Same shape as
+    /// `FormsService::with_public_api_base`, and blank counts as unset because
+    /// a forwarded-but-unset variable arrives as an empty string (PMS-836).
+    pub fn with_public_api_base(mut self, base: Option<String>) -> Self {
+        self.public_api_base = base.filter(|b| !b.trim().is_empty());
+        self
     }
 
     // PMS-87 channels CRUD ----------------------------------------------------
@@ -768,11 +863,22 @@ impl NotificationsService {
     /// template gets tenant-branded output without the dispatch caller
     /// having to thread the fields in by hand.
     ///
-    /// Missing branding fields degrade to empty strings so a template
-    /// that references `{{msp_support_email}}` on a tenant that never
-    /// set one renders `""` (empty) rather than a literal placeholder;
-    /// this matches what `render_template` already does for absent
-    /// keys but is more graceful for user-visible copy.
+    /// PMS-1172: a key has to be safe IN THE POSITION THE TEMPLATE USES IT,
+    /// and "degrade to an empty string" is not that. The renderer is a flat
+    /// `{{key}}` replacer with no conditionals (PMS-1140), so an empty value
+    /// leaves whatever wraps it standing: the portal sign-in mail shipped
+    /// `Reply to .`, `border-bottom:3px solid ;` and `background:;` - the last
+    /// of which renders the only call to action as plain text rather than a
+    /// button. A relative value is the same defect one step further on: the
+    /// logo key held `/api/v1/public/tenants/{id}/logo` verbatim out of
+    /// branding, and a mail client cannot resolve a relative `src`, which is
+    /// why `OrgIdentity::logo_html` prefixes the public base and why this now
+    /// does too.
+    ///
+    /// So each key is emitted in a form its template can use unchanged: the
+    /// logo absolute or absent, the colour always a real colour. The support
+    /// address is the one that cannot be fixed here, because what wraps it is
+    /// prose and markup; PMS-1171 composes that sentence whole.
     /// `{{msp_name}}` defaults to "Mokosh Platform" so subject lines
     /// like "{{msp_name}} - Reset your password" stay readable even for
     /// the default/system tenant.
@@ -810,6 +916,21 @@ impl NotificationsService {
 
         let obj = context.as_object_mut().expect("guarded above");
 
+        let msp_name = if name.is_empty() {
+            "Mokosh Platform".to_string()
+        } else {
+            name
+        };
+        // PMS-1171: the name the footer sentence will use, resolved BEFORE the
+        // closure below borrows `obj`. A caller-supplied `msp_name` wins here
+        // too, or a test that passes one would see it in every key except the
+        // composed sentence.
+        let effective_name = obj
+            .get("msp_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| msp_name.clone());
+
         // helper: only set the key if the caller did not.
         let mut ensure_key = |k: &str, v: serde_json::Value| {
             if !obj.contains_key(k) {
@@ -817,11 +938,6 @@ impl NotificationsService {
             }
         };
 
-        let msp_name = if name.is_empty() {
-            "Mokosh Platform".to_string()
-        } else {
-            name
-        };
         ensure_key("msp_name", serde_json::Value::String(msp_name));
 
         let branding_str = |field: &str| -> String {
@@ -831,17 +947,42 @@ impl NotificationsService {
                 .map(|s| s.to_string())
                 .unwrap_or_default()
         };
+        // PMS-1172: absolute, or empty. A relative path renders as a broken
+        // image in every client, which is worse than no logo at all, and the
+        // stored value is deliberately relative (`PUBLIC_TENANT_PATH_PREFIX`).
         ensure_key(
             "msp_logo_url",
-            serde_json::Value::String(branding_str("logo_url")),
+            serde_json::Value::String(absolute_logo_url(
+                self.public_api_base.as_deref(),
+                &branding_str("logo_url"),
+            )),
         );
+        // PMS-1172: always a real colour. This one lands inside CSS, where an
+        // empty value leaves `background:;` and the button disappears.
+        let color = branding_str("primary_color");
         ensure_key(
             "msp_primary_color",
-            serde_json::Value::String(branding_str("primary_color")),
+            serde_json::Value::String(if color.trim().is_empty() {
+                DEFAULT_PRIMARY_COLOR.to_string()
+            } else {
+                color
+            }),
         );
+        let support_email = branding_str("support_email");
         ensure_key(
             "msp_support_email",
-            serde_json::Value::String(branding_str("support_email")),
+            serde_json::Value::String(support_email.clone()),
+        );
+        // PMS-1171: the whole sentence, because the renderer cannot express
+        // "only if there is an address". `msp_support_email` stays supplied
+        // for a tenant who has customised their own template around it.
+        ensure_key(
+            "msp_footer_line",
+            serde_json::Value::String(footer_line(&effective_name, &support_email)),
+        );
+        ensure_key(
+            "msp_footer_line_html",
+            serde_json::Value::String(footer_line_html(&effective_name, &support_email)),
         );
 
         Ok(context)
@@ -1865,5 +2006,126 @@ mod one_transaction_per_dispatch {
             "these run on the caller's connection and must not open a transaction \
              of their own (PMS-1068); read on the `conn` argument instead: {offenders:?}",
         );
+    }
+}
+
+/// PMS-1172: a branding key has to be usable where its template puts it.
+#[cfg(test)]
+mod branding_context {
+    use super::{absolute_logo_url, footer_line, footer_line_html, DEFAULT_PRIMARY_COLOR};
+
+    /// The stored value is a PATH (the write validator pins it to
+    /// `/api/v1/public/tenants/`), and a mail client cannot resolve one. This
+    /// is the whole reason the portal sign-in mail showed a broken image.
+    #[test]
+    fn a_stored_path_is_made_absolute() {
+        assert_eq!(
+            absolute_logo_url(
+                Some("https://api.msp.example"),
+                "/api/v1/public/tenants/4a870d0c-637a-4ba1-b230-abb8b65b2ba1/logo"
+            ),
+            "https://api.msp.example/api/v1/public/tenants/4a870d0c-637a-4ba1-b230-abb8b65b2ba1/logo"
+        );
+    }
+
+    /// A trailing slash on the configured base does not double up.
+    #[test]
+    fn the_base_joins_cleanly() {
+        assert_eq!(
+            absolute_logo_url(Some("https://api.msp.example/"), "/logo"),
+            "https://api.msp.example/logo"
+        );
+    }
+
+    /// No logo, or no public base, means NO image - never a relative `src`.
+    /// An empty `src` renders nothing; a relative one renders a broken image,
+    /// and nothing is the better of the two.
+    #[test]
+    fn absent_inputs_yield_no_url_rather_than_a_relative_one() {
+        assert_eq!(absolute_logo_url(Some("https://api.msp.example"), ""), "");
+        assert_eq!(
+            absolute_logo_url(Some("https://api.msp.example"), "   "),
+            ""
+        );
+        assert_eq!(absolute_logo_url(None, "/api/v1/public/tenants/x/logo"), "");
+        assert_eq!(
+            absolute_logo_url(Some(""), "/api/v1/public/tenants/x/logo"),
+            ""
+        );
+        assert_eq!(
+            absolute_logo_url(Some("  "), "/api/v1/public/tenants/x/logo"),
+            ""
+        );
+    }
+
+    /// A tenant pointing at an externally hosted mark is left alone.
+    #[test]
+    fn an_absolute_stored_value_is_passed_through() {
+        for stored in [
+            "https://cdn.example/logo.png",
+            "http://cdn.example/logo.png",
+        ] {
+            assert_eq!(
+                absolute_logo_url(Some("https://api.msp.example"), stored),
+                stored
+            );
+        }
+    }
+
+    /// PMS-1171: the sentence is complete with an address and complete
+    /// without one. `Reply to .` is what the templates shipped for months.
+    #[test]
+    fn the_footer_is_a_sentence_either_way() {
+        assert_eq!(
+            footer_line("Niceguy IT", "help@niceguyit.example"),
+            "Sent on behalf of Niceguy IT. Questions? Reply to help@niceguyit.example."
+        );
+        assert_eq!(
+            footer_line("Niceguy IT", ""),
+            "Sent on behalf of Niceguy IT.",
+            "no address means no sentence about replying, not a sentence with a hole"
+        );
+        for blank in ["", "   ", "\t"] {
+            let line = footer_line("Niceguy IT", blank);
+            assert!(!line.contains("Reply to"), "{line}");
+            assert!(!line.ends_with(" ."), "{line}");
+        }
+    }
+
+    /// The HTML twin, where the empty case was worse: an empty `mailto:`
+    /// anchor renders as nothing, leaving a bare full stop.
+    #[test]
+    fn the_html_footer_links_the_address_or_omits_the_clause() {
+        assert_eq!(
+            footer_line_html("Niceguy IT", "help@niceguyit.example"),
+            "Sent on behalf of Niceguy IT. Questions? Reply to \
+             <a href=\"mailto:help@niceguyit.example\">help@niceguyit.example</a>."
+                .replace("             ", "")
+        );
+        let empty = footer_line_html("Niceguy IT", "  ");
+        assert_eq!(empty, "Sent on behalf of Niceguy IT.");
+        assert!(!empty.contains("mailto:"), "{empty}");
+    }
+
+    /// Both values come from `tenants.branding`, which is operator input, and
+    /// land in a body that is already HTML.
+    #[test]
+    fn the_html_footer_escapes_what_it_interpolates() {
+        let line = footer_line_html("Acme <script>", "a\"b@example.com");
+        assert!(!line.contains("<script>"), "{line}");
+        assert!(line.contains("&lt;script&gt;"), "{line}");
+        assert!(!line.contains("\"b@example.com\">"), "{line}");
+    }
+
+    /// The colour lands inside CSS, so it is never empty: an empty value left
+    /// `background:;` on the sign-in button, which a client discards, and the
+    /// only call to action in the message rendered as plain text.
+    #[test]
+    fn the_default_colour_is_a_colour() {
+        assert!(DEFAULT_PRIMARY_COLOR.starts_with('#'));
+        assert_eq!(DEFAULT_PRIMARY_COLOR.len(), 7);
+        assert!(DEFAULT_PRIMARY_COLOR[1..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
     }
 }

@@ -629,6 +629,52 @@ pub(crate) fn refresh_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Takes a variable OUT of the process environment for the life of the guard,
+/// and puts back whatever was there.
+///
+/// PMS-1166: a test that needs a key nothing holds cannot get one by picking a
+/// key it believes nobody sets. `compose.dev.yml` enumerates the dev
+/// container's environment as an explicit per-key map, which PMS-836 REQUIRES
+/// it to - a variable the code reads with no line there cannot be set in dev at
+/// all - and an optional key's line is `KEY: ${KEY:-}`. A forwarded-but-unset
+/// variable arrives as an empty string, and `get` answers `Some("")` for a
+/// blank value by design, so inside that container the key IS held. That is
+/// how `just pre-commit` came to fail on `main` for every developer while CI
+/// stayed green: `check.yml` runs the tests on the runner, where no such
+/// variable exists.
+///
+/// So absence is something a test must MAKE, not assume. Picking a different
+/// key would only move the problem to the next key that earns a compose line.
+///
+/// Callers must already hold [`refresh_test_lock`], which is what serialises
+/// this mutation against every other test reading the environment.
+#[cfg(test)]
+pub(crate) struct EnvVarRemoved {
+    name: &'static str,
+    previous: Option<String>,
+}
+
+#[cfg(test)]
+impl EnvVarRemoved {
+    pub(crate) fn new(name: &'static str) -> Self {
+        let previous = std::env::var(name).ok();
+        std::env::remove_var(name);
+        Self { name, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarRemoved {
+    fn drop(&mut self) {
+        // Restored on unwind too, so one failing assertion cannot leave the
+        // rest of the binary running against an environment it did not expect.
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 /// The process's provider, defaulting to the environment.
 ///
 /// A default rather than a panic when [`init_from_env`] has not run, because
@@ -2038,8 +2084,11 @@ mod tests {
     #[test]
     fn try_refresh_rejected_when_a_required_key_is_unresolved() {
         let _guard = refresh_test_lock();
-        // A key nothing in unit tests configures; boot never fatal-fails on
-        // it (PMS-658), so the process environment reliably does not hold it.
+        // PMS-1166: the absence is MADE, not assumed. This test used to pick
+        // `IP2LOCATION_DB_PATH` believing nothing sets it; `compose.dev.yml`
+        // forwards it as `${IP2LOCATION_DB_PATH:-}`, so in the dev container
+        // it arrives as `""` and IS held. See `EnvVarRemoved`.
+        let _absent = EnvVarRemoved::new(registry::IP2LOCATION_DB_PATH.name());
         let request = RefreshRequest::system().requiring(&registry::IP2LOCATION_DB_PATH);
 
         let outcome = try_refresh(request);
@@ -2429,12 +2478,75 @@ mod tests {
         }
     }
 
+    /// PMS-1166: the guard has to put back exactly what it found, blank
+    /// included.
+    ///
+    /// The blank case is the one that caused this: `compose.dev.yml` forwards
+    /// an optional key as `${KEY:-}`, so the dev container holds it as `""`,
+    /// and a guard that restored "nothing" would leave the rest of the binary
+    /// running against an environment the container did not hand it.
+    ///
+    /// Run against the REAL key the two refresh tests below depend on, rather
+    /// than a fixture name invented here. Two reasons, and the second is the
+    /// better one. A fixture name is a variable the code reads that has no
+    /// `.env.example` key and no compose line, which `check-env-example.nu`
+    /// fails the build over - correctly, since it cannot tell a test's name
+    /// from a configuration key, and allowlisting one would put a permanent
+    /// exception in that script for something that is not configuration. And
+    /// this is the key whose restoration actually matters: get it wrong and
+    /// the rest of the binary runs against an environment the container did
+    /// not hand it.
+    #[test]
+    fn the_env_guard_restores_what_it_found() {
+        let _lock = refresh_test_lock();
+        let name = registry::IP2LOCATION_DB_PATH.name();
+        let original = std::env::var(name).ok();
+
+        // Absent stays absent.
+        std::env::remove_var(name);
+        {
+            let _absent = EnvVarRemoved::new(name);
+            assert!(std::env::var(name).is_err());
+        }
+        assert!(std::env::var(name).is_err());
+
+        // A blank value is restored AS blank, not dropped. This is the shape
+        // the dev container actually hands the process.
+        std::env::set_var(name, "");
+        {
+            let _absent = EnvVarRemoved::new(name);
+            assert!(
+                std::env::var(name).is_err(),
+                "the guard has to make the key genuinely absent, not blank"
+            );
+        }
+        assert_eq!(std::env::var(name).as_deref(), Ok(""));
+
+        // And so is a real one.
+        std::env::set_var(name, "/data/ip2location.bin");
+        {
+            let _absent = EnvVarRemoved::new(name);
+            assert!(std::env::var(name).is_err());
+        }
+        assert_eq!(std::env::var(name).as_deref(), Ok("/data/ip2location.bin"));
+
+        // Leave the process as this test found it, for the same reason the
+        // guard itself does.
+        match original {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
     /// A rejected refresh does NOT consume the generation number: the number
     /// counts generations that were INSTALLED, not attempts. Two consecutive
     /// rejections see the same pre-attempt number.
     #[test]
     fn a_rejected_refresh_does_not_advance_the_number() {
         let _guard = refresh_test_lock();
+        // PMS-1166: as above - the key has to be absent for the refresh to be
+        // rejected at all, and the dev container holds it as an empty string.
+        let _absent = EnvVarRemoved::new(registry::IP2LOCATION_DB_PATH.name());
         let request = || RefreshRequest::system().requiring(&registry::IP2LOCATION_DB_PATH);
 
         let outcome_a = try_refresh(request());
