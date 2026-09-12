@@ -1712,11 +1712,18 @@ impl BillingService {
 
             let pdf = super::documents::read_issued(tenant_id.get(), invoice.id).await;
             let portal_link = match (self.portal_origin.as_ref(), gateway) {
-                (Some(origin), true) => Some(format!(
-                    "{}/portal/invoices/{}",
-                    origin.trim_end_matches('/'),
-                    invoice.id
-                )),
+                (Some(origin), true) => {
+                    // PMS-1168: same builder as the send path, so the two
+                    // cannot drift from the router separately again.
+                    let portal_id = self
+                        .company_portal_id(tenant_id, invoice.company_id)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(target: "mokosh_server.billing", invoice_id = %invoice.id, error = %e, "invoice reminder: portal id lookup failed, linking the generic login");
+                            None
+                        });
+                    Self::portal_pay_link(origin, portal_id)
+                }
                 _ => None,
             };
             let currency = invoice.currency.as_deref().unwrap_or("USD");
@@ -2698,6 +2705,61 @@ impl BillingService {
     /// unserveable gateway is a link to a 400, sent to the customer being asked
     /// to pay. It reads the same set `active_provider` resolves from, so the
     /// button and the checkout it leads to cannot disagree.
+    /// Where to send a customer who followed a pay link in an emailed invoice.
+    ///
+    /// PMS-1168: this used to be `{origin}/portal/invoices/{id}`, formatted at
+    /// each of the two mint sites. mokosh-apps retired that whole `/portal/*`
+    /// customer-portal route family in the contact-login work, so every
+    /// invoice sent with a gateway connected, and every overdue reminder, has
+    /// emailed a link to the SPA's 404 page since. Nothing could catch it: the
+    /// URL is built by string formatting here, so no compiler or test on
+    /// either side saw the route go.
+    ///
+    /// So it is ONE function now rather than a `format!` per caller, which is
+    /// what let the two copies drift from the router together and is the only
+    /// part of this that stops it happening again.
+    ///
+    /// `/portal/{handle}/login` takes the company's 9-digit `portal_id`
+    /// (migration 174). A company without one falls back to `/portal/login`,
+    /// which asks for the Company ID: the honest landing spot for a contact
+    /// whose company was never given a portal handle, and better than a
+    /// `/portal//login` that matches nothing.
+    ///
+    /// It is the LOGIN page and not the invoice, because `/invoices/{id}`
+    /// sits behind the SPA's guard and an unauthenticated visitor there is
+    /// bounced to the STAFF login, which is the wrong plane for a customer. A
+    /// link that survives the sign-in it requires needs `?next=` support in
+    /// the client and is MAPPS-761.
+    pub(crate) fn portal_pay_link(origin: &str, portal_id: Option<i64>) -> Option<String> {
+        let origin = origin.trim().trim_end_matches('/');
+        if origin.is_empty() {
+            return None;
+        }
+        Some(match portal_id {
+            Some(handle) => format!("{origin}/portal/{handle}/login"),
+            None => format!("{origin}/portal/login"),
+        })
+    }
+
+    /// The company's portal handle, for [`portal_pay_link`].
+    ///
+    /// `None` when the company has none, which is not an error: a billing
+    /// contact can be emailed an invoice without anyone ever having been
+    /// invited to the portal, and the generic login is the answer for them.
+    async fn company_portal_id(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<Option<i64>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let portal_id: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT portal_id FROM companies WHERE id = $1")
+                .bind(company_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        Ok(portal_id.flatten())
+    }
+
     pub async fn has_active_gateway(&self, tenant_id: TenantId) -> AppResult<bool> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let providers: Vec<String> = sqlx::query_scalar(
@@ -3947,11 +4009,19 @@ impl BillingService {
             self.portal_origin.as_ref(),
             self.has_active_gateway(tenant_id).await,
         ) {
-            (Some(origin), Ok(true)) => Some(format!(
-                "{}/portal/invoices/{}",
-                origin.trim_end_matches('/'),
-                invoice.id
-            )),
+            (Some(origin), Ok(true)) => {
+                // PMS-1168: a failed handle lookup costs the customer one
+                // extra step (the generic login asks for the Company ID); it
+                // must not cost them the mail, which is the invoice itself.
+                let portal_id = self
+                    .company_portal_id(tenant_id, invoice.company_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(target: "mokosh_server.billing", invoice_id = %invoice.id, error = %e, "invoice email: portal id lookup failed, linking the generic login");
+                        None
+                    });
+                Self::portal_pay_link(origin, portal_id)
+            }
             (_, Err(e)) => {
                 tracing::warn!(target: "mokosh_server.billing", invoice_id = %invoice.id, error = %e, "invoice email: gateway check failed, sending without a pay link");
                 None
@@ -6328,6 +6398,77 @@ impl From<ProductRow> for ProductResponse {
             in_use: r.in_use,
             created_at: r.created_at,
             updated_at: r.updated_at,
+        }
+    }
+}
+
+/// PMS-1168: the emailed pay link has to name a route mokosh-apps serves.
+#[cfg(test)]
+mod portal_pay_link {
+    use super::*;
+
+    /// A company with a portal handle gets the company-scoped login, which is
+    /// the `/portal/{handle}/login` route in mokosh-apps. The handle is the
+    /// 9-digit `companies.portal_id`, which that route accepts alongside a
+    /// slug.
+    #[test]
+    fn a_company_with_a_portal_id_gets_its_own_login() {
+        assert_eq!(
+            BillingService::portal_pay_link("https://msp.example", Some(123456789)).as_deref(),
+            Some("https://msp.example/portal/123456789/login")
+        );
+    }
+
+    /// And one without falls back to the generic login, which asks for the
+    /// Company ID. A billing contact can be emailed an invoice without anyone
+    /// ever having been invited to the portal, so this is an ordinary case and
+    /// not an edge one.
+    #[test]
+    fn a_company_without_one_gets_the_generic_login() {
+        assert_eq!(
+            BillingService::portal_pay_link("https://msp.example", None).as_deref(),
+            Some("https://msp.example/portal/login")
+        );
+    }
+
+    /// The origin is operator configuration and can arrive with a trailing
+    /// slash. A doubled slash is a path the SPA router does not match, which
+    /// is the same 404 this issue exists to remove.
+    #[test]
+    fn a_trailing_slash_on_the_origin_does_not_double_up() {
+        for origin in ["https://msp.example/", "https://msp.example//"] {
+            assert_eq!(
+                BillingService::portal_pay_link(origin, Some(1)).as_deref(),
+                Some("https://msp.example/portal/1/login"),
+                "{origin}"
+            );
+        }
+    }
+
+    /// A blank origin yields no link rather than a relative one. A
+    /// forwarded-but-unset variable arrives as an empty string (PMS-836), and
+    /// `/portal/login` in an email goes nowhere.
+    #[test]
+    fn a_blank_origin_yields_no_link() {
+        assert_eq!(BillingService::portal_pay_link("", Some(1)), None);
+        assert_eq!(BillingService::portal_pay_link("   ", None), None);
+    }
+
+    /// The shape that was shipped for months. `/portal/invoices/{id}` was
+    /// retired with the rest of the customer-portal route family in
+    /// mokosh-apps, and nothing here could see it go, because the URL is
+    /// built by string formatting rather than by anything the compiler
+    /// checks. This is the closest thing to a guard that lives in this repo.
+    #[test]
+    fn the_retired_invoice_route_is_never_emitted() {
+        for portal_id in [None, Some(123456789)] {
+            let link = BillingService::portal_pay_link("https://msp.example", portal_id)
+                .expect("an origin was given");
+            assert!(
+                !link.contains("/portal/invoices/"),
+                "mokosh-apps serves no such route: {link}"
+            );
+            assert!(link.ends_with("/login"), "{link}");
         }
     }
 }

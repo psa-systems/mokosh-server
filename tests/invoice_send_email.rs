@@ -251,11 +251,19 @@ async fn a_send_with_a_gateway_adds_the_pay_link(pool: PgPool) {
         "{}",
         mails[0].subject
     );
+    // PMS-1168: this used to assert `/portal/invoices/{id}`, and passed for
+    // months while every customer who clicked the link got mokosh-apps' 404
+    // page: the route was retired with the rest of the customer-portal family
+    // and this assertion only ever proved the server emitted what the server
+    // emitted. The seeded company has no `portal_id`, so the link is the
+    // generic login, which asks for the Company ID.
+    assert!(mails[0].text.contains("/portal/login"), "{}", mails[0].text);
     assert!(
-        mails[0].text.contains(&format!("/portal/invoices/{id}")),
-        "{}",
+        !mails[0].text.contains("/portal/invoices/"),
+        "the retired route must never be emailed again: {}",
         mails[0].text
     );
+    let _ = id;
 }
 
 /// The invoice names no contact, but the company does: the company's default
