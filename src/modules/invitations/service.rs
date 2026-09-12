@@ -62,14 +62,19 @@ impl InvitationsService {
         // PMS-1161: an invite may name a team the invitee should join on
         // accept. Verify the team belongs to THIS tenant before writing the
         // row; foreign-tenant team is a 422 with `field: "team_id"` so the
-        // invite cannot silently drop its team association. Runs on the
-        // tenant transaction, so teams RLS confines the lookup to the
-        // caller's tenant even without an explicit AND tenant_id = $2.
+        // invite cannot silently drop its team association. Filtered
+        // explicitly on `tenant_id = $2` (the `assert_product_sellable` /
+        // `payment_term_id` shape) rather than left to RLS alone: RLS is a
+        // property of the connection's role, and a caller on a pool that
+        // bypasses it (the migrator pool, or a test harness pool built with
+        // `Database::from_pool`, which points both halves at one connection)
+        // would otherwise see a foreign tenant's team as present.
         if let Some(team_id) = request.team_id {
             let team_exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM teams WHERE id = $1 AND is_active = TRUE)",
+                "SELECT EXISTS (SELECT 1 FROM teams WHERE id = $1 AND tenant_id = $2 AND is_active = TRUE)",
             )
             .bind(team_id)
+            .bind(tenant_id)
             .fetch_one(&mut *tx)
             .await?;
             if !team_exists {
@@ -303,7 +308,7 @@ impl InvitationsService {
                    SELECT $1, $2, $3, 'member'
                    FROM teams
                    WHERE id = $2 AND tenant_id = $1 AND is_active = TRUE
-                   ON CONFLICT (tenant_id, team_id, user_id) DO NOTHING"#,
+                   ON CONFLICT (team_id, user_id) DO NOTHING"#,
             )
             .bind(invite.tenant_id)
             .bind(team_id)

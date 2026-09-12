@@ -279,10 +279,11 @@ async fn dispatch_renders_cleanly_when_branding_absent(pool: PgPool) {
 
     let subject = subject.expect("subject rendered");
     assert_eq!(subject, "Bare MSP says hi", "unexpected: {subject}");
-    // Body renders `""` for every unset branding key; no `{{...}}`
-    // leaks through.
+    // Body renders `""` for every unset branding key except the colour
+    // (PMS-1172: the colour lands inside CSS, so it is always a real
+    // colour, never an empty string); no `{{...}}` leaks through.
     assert_eq!(
-        body, "name=Bare MSP, logo=, color=, help=",
+        body, "name=Bare MSP, logo=, color=#111827, help=",
         "unexpected body: {body}"
     );
 }
