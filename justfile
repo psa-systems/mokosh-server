@@ -295,12 +295,20 @@ test-integration: ensure-env ensure-test-db-roles
 # `just dev` (or `just dev-infisical` / `just dev-s3` for the profile-gated
 # providers) to be running. PMS-1013.
 #
+# `/app/target/debug/mokosh-server` rather than `mokosh-server`: the dev
+# image's CMD (see Dockerfile) is `cargo run --bin mokosh-server`, so
+# there is no compiled `mokosh-server` on `$PATH` inside the container.
+# The binary the running server built lives at that path (the named
+# `mokosh-server-target` volume compose mounts on /app/target), so this
+# exec runs the same binary the server is running - no second cargo
+# build, no target-lock contention with the primary process.
+#
 # Trailing args pass through, so `--json` renders one JSON envelope for CI
 # and `--text` (the default) prints the operator table.
 [doc("Boot every provider seam and report per-capability pass/fail (PMS-1013).")]
 [group: 'test']
 verify-providers *args:
-    docker compose --file {{ compose_file }} exec -T server mokosh-server verify-providers {{ args }}
+    docker compose --file {{ compose_file }} exec -T server /app/target/debug/mokosh-server verify-providers {{ args }}
 
 # Verify the demo-critical path only: demo-data seeding (seed_demo) and the
 # tenant import/export round-trip (data_transfer). A fast, targeted subset of
