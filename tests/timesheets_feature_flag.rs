@@ -250,6 +250,7 @@ async fn the_first_invitation_turns_timesheets_on(pool: PgPool) {
             &CreateInvitationRequest {
                 email: "colleague@example.com".to_string(),
                 role: "technician".to_string(),
+                team_id: None,
             },
             &AuditCtx {
                 tenant_id: Some(tenant_id),
@@ -285,6 +286,7 @@ async fn a_later_invitation_does_not_re_enable_a_deliberate_off(pool: PgPool) {
             &CreateInvitationRequest {
                 email: "second-hire@example.com".to_string(),
                 role: "technician".to_string(),
+                team_id: None,
             },
             &AuditCtx {
                 tenant_id: Some(common::DEFAULT_TENANT_ID),

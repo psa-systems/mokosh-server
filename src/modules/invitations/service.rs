@@ -59,21 +59,44 @@ impl InvitationsService {
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
+        // PMS-1161: an invite may name a team the invitee should join on
+        // accept. Verify the team belongs to THIS tenant before writing the
+        // row; foreign-tenant team is a 422 with `field: "team_id"` so the
+        // invite cannot silently drop its team association. Runs on the
+        // tenant transaction, so teams RLS confines the lookup to the
+        // caller's tenant even without an explicit AND tenant_id = $2.
+        if let Some(team_id) = request.team_id {
+            let team_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM teams WHERE id = $1 AND is_active = TRUE)",
+            )
+            .bind(team_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !team_exists {
+                return Err(AppError::validation_field(
+                    "team_id",
+                    "Team not found in this tenant.",
+                ));
+            }
+        }
+
         let invite = sqlx::query_as::<_, InvitationResponse>(
-            r#"INSERT INTO tenant_invitations (tenant_id, email, role, invited_by, expires_at)
-               VALUES ($1, $2, $3, $4, $5)
+            r#"INSERT INTO tenant_invitations (tenant_id, email, role, invited_by, expires_at, team_id)
+               VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT (tenant_id, lower(email)) WHERE status = 'pending'
                DO UPDATE SET role = EXCLUDED.role,
                              invited_by = EXCLUDED.invited_by,
                              expires_at = EXCLUDED.expires_at,
+                             team_id = EXCLUDED.team_id,
                              updated_at = NOW()
-               RETURNING id, email, role, status, invited_by, expires_at, created_at"#,
+               RETURNING id, email, role, status, invited_by, expires_at, created_at, team_id"#,
         )
         .bind(tenant_id)
         .bind(&email)
         .bind(&request.role)
         .bind(invited_by)
         .bind(expires_at)
+        .bind(request.team_id)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -219,7 +242,7 @@ impl InvitationsService {
         // pool with no GUC this would fail closed to `None` and break invite
         // acceptance entirely - hence the privileged pool here, not a reshape.
         Ok(sqlx::query_as::<_, PendingInvite>(
-            r#"SELECT id, tenant_id, role
+            r#"SELECT id, tenant_id, role, team_id
                FROM tenant_invitations
                WHERE lower(email) = $1 AND status = 'pending' AND expires_at > NOW()
                ORDER BY created_at DESC
@@ -230,24 +253,66 @@ impl InvitationsService {
         .await?)
     }
 
-    /// Mark an invite accepted by `accepted_by`. Best-effort: a no-op if it is
-    /// no longer pending (it was revoked or accepted in a concurrent login).
-    pub async fn accept(&self, id: Uuid, accepted_by: Uuid) -> AppResult<()> {
+    /// Mark the invite accepted by `accepted_by`, and, when the invite named
+    /// a team (PMS-1161), add the newly-placed user to it in the same
+    /// transaction. Best-effort: no-op if the invite is no longer pending (a
+    /// concurrent login already claimed it) or if the team was soft-deleted
+    /// between create and accept.
+    pub async fn accept(&self, invite: &PendingInvite, accepted_by: Uuid) -> AppResult<()> {
         // SAFETY (PMS-285): the companion write to `newest_pending_for`, on the
         // same pre-session invite-acceptance path. The accepting user is not yet
         // placed in the invited tenant, so there is no GUC to set; the migrator
-        // pool is required because `tenant_invitations` is RLS-covered. The
-        // `id` + `status = 'pending'` predicate confines it to the single invite
-        // just resolved for this email.
-        sqlx::query(
+        // pool is required because `tenant_invitations` and `team_members` are
+        // both RLS-covered. The `id` + `status = 'pending'` predicate confines
+        // the UPDATE to the single invite just resolved for this email, and the
+        // team INSERT is bound to that invite's own `tenant_id` and `team_id`.
+        let pool = self.db.migrator_pool();
+        let mut tx = pool.begin().await?;
+
+        let updated = sqlx::query(
             "UPDATE tenant_invitations
              SET status = 'accepted', accepted_at = NOW(), accepted_by = $2, updated_at = NOW()
              WHERE id = $1 AND status = 'pending'",
         )
-        .bind(id)
+        .bind(invite.id)
         .bind(accepted_by)
-        .execute(self.db.migrator_pool())
-        .await?;
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // The row was already accepted / revoked by a concurrent login; nothing
+        // to add. Rolling back keeps the transaction hygiene clean even though
+        // no side effect fired.
+        if updated == 0 {
+            tx.rollback().await?;
+            return Ok(());
+        }
+
+        // PMS-1161: enrol the new user in the invite's team. `ON CONFLICT
+        // DO NOTHING` because a concurrent path could have added them
+        // already (e.g. an operator manually added the user to the team
+        // between create and accept). A team that was soft-deleted after
+        // the invite created loses `is_active = TRUE`, so the INSERT
+        // guarded on that predicate matches zero rows and the invite still
+        // accepts cleanly; the row survives (ON DELETE SET NULL on the FK
+        // covers a hard delete, and `is_active = FALSE` covers a soft
+        // delete).
+        if let Some(team_id) = invite.team_id {
+            sqlx::query(
+                r#"INSERT INTO team_members (tenant_id, team_id, user_id, role)
+                   SELECT $1, $2, $3, 'member'
+                   FROM teams
+                   WHERE id = $2 AND tenant_id = $1 AND is_active = TRUE
+                   ON CONFLICT (tenant_id, team_id, user_id) DO NOTHING"#,
+            )
+            .bind(invite.tenant_id)
+            .bind(team_id)
+            .bind(accepted_by)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 

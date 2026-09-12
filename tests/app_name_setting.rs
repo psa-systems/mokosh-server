@@ -122,6 +122,7 @@ async fn invite_subject(pool: &PgPool, admin_id: Uuid, email: &str) -> String {
             &CreateInvitationRequest {
                 email: email.to_string(),
                 role: "technician".to_string(),
+                team_id: None,
             },
             &actx(),
         )

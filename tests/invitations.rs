@@ -37,6 +37,7 @@ fn req(email: &str, role: &str) -> CreateInvitationRequest {
     CreateInvitationRequest {
         email: email.to_string(),
         role: role.to_string(),
+        team_id: None,
     }
 }
 
@@ -204,7 +205,7 @@ async fn newest_pending_lookup_then_accept(pool: PgPool) {
     assert_eq!(found.tenant_id, common::DEFAULT_TENANT_ID);
     assert_eq!(found.role, "manager");
 
-    s.accept(inv.id, admin_id).await.expect("accept");
+    s.accept(&found, admin_id).await.expect("accept");
 
     assert!(
         s.newest_pending_for("joiner@example.com")

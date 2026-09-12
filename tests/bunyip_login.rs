@@ -62,6 +62,7 @@ fn invite(email: &str, role: &str) -> CreateInvitationRequest {
     CreateInvitationRequest {
         email: email.to_string(),
         role: role.to_string(),
+        team_id: None,
     }
 }
 
