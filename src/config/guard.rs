@@ -50,6 +50,13 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
                  cannot itself be provider-served",
     },
     EntryPoint {
+        path: "src/cli/verify.rs",
+        reason: "the verify-providers subcommand (PMS-1013 follow-up) reproduces main's boot \
+                 wiring for every capability, so it reads DATABASE_URL, MOKOSH_APP_DATABASE_URL \
+                 and ENCRYPTION_KEY at construction the same way src/cli/providers.rs does: it \
+                 is BUILDING the shared state a provider is chosen from",
+    },
+    EntryPoint {
         path: "src/db/provision.rs",
         reason: "self-provisions the split database roles from MOKOSH_ADMIN_DATABASE_URL before \
                  the pools exist (PMS-489), so it runs ahead of anything a provider needs",

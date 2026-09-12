@@ -325,6 +325,12 @@ fn only_the_auth_service_and_the_startup_wiring_know_the_deployment_mode() {
         // per kind when the caller does not name one, so `provider-status`
         // and its siblings behave the same as the boot record.
         "src/cli/providers.rs",
+        // PMS-1013 follow-up: `verify-providers` reproduces main's boot
+        // wiring per capability, so it takes the same profile default and
+        // resolves it exactly as the startup wiring does. Not a duplicated
+        // auth decision, not a mail gate: it is the startup wiring reused
+        // in a one-shot the operator runs.
+        "src/cli/verify.rs",
     ];
 
     let mut stack = vec![std::path::PathBuf::from("src")];
