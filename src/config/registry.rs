@@ -228,6 +228,15 @@ declare_keys! {
 
     // -- Mail ----------------------------------------------------------------
 
+    /// PMS-1013: named email provider selection. Explicit `log` or `smtp` wins
+    /// over the hosting profile's default and over the implicit `SMTP_HOST`
+    /// signal; unset falls back to the profile default (self-hosted: `log`,
+    /// saas: `smtp`), or to `smtp` when the operator set `SMTP_HOST` but chose
+    /// no provider name (backward compat with the pre-PMS-1013 implicit rule).
+    /// An unusable `smtp` selection (no host) is a boot error, and an explicit
+    /// `log` while `SMTP_HOST` is set warns rather than silently discarding
+    /// the operator's relay configuration.
+    Application MAIL_PROVIDER = "MAIL_PROVIDER";
     Application SMTP_HOST = "SMTP_HOST";
     Application SMTP_PORT = "SMTP_PORT";
     Application SMTP_USERNAME = "SMTP_USERNAME";
