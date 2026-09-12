@@ -48,6 +48,42 @@ pub fn is_supported(provider: &str) -> bool {
     SUPPORTED.contains(&provider)
 }
 
+/// Where this deployment receives `provider`'s webhooks for `tenant_id`.
+///
+/// PMS-1165: the tenant's gateway response carries this so the admin can
+/// finish the setup in the provider's dashboard. It was the one value the
+/// configuration needed and nothing gave out: the path carries the tenant's
+/// UUID, and that id is deliberately not rendered anywhere in the SPA, so an
+/// admin could fill in a correct webhook signing secret with no supported way
+/// to learn what endpoint it belonged to. The failure was quiet - the key
+/// works, the customer pays, and the invoice is never marked paid.
+///
+/// `base` is `PUBLIC_API_BASE_URL`, which is the origin a THIRD PARTY reaches
+/// this deployment at. That is why this is answered by the server rather than
+/// assembled by the client from the origin its own browser happens to be
+/// calling: where a deployment separates the two, a client-built URL would
+/// look right and receive nothing.
+///
+/// `None` in two cases. The deployment sets no base, so there is no honest
+/// answer and a guess would be worse than a gap. And a provider with no
+/// receiver mounted, which is exactly [`SUPPORTED`]: `authorize_net` is in the
+/// `payment_gateway_configs.provider` CHECK constraint and in nothing else, so
+/// naming a URL for it would promise an endpoint that answers 404.
+///
+/// The path is `/api/v1/{provider}/webhooks/{tenant_id}` and must stay in step
+/// with where `create_api_router` nests the two receivers;
+/// `the_url_matches_the_route_the_receiver_is_mounted_at` is the guard.
+pub fn webhook_url(base: Option<&str>, provider: &str, tenant_id: Uuid) -> Option<String> {
+    let base = base.map(str::trim).filter(|b| !b.is_empty())?;
+    if !is_supported(provider) {
+        return None;
+    }
+    Some(format!(
+        "{}/api/v1/{provider}/webhooks/{tenant_id}",
+        base.trim_end_matches('/')
+    ))
+}
+
 /// Turn a stored `(provider, decrypted config)` pair into a provider.
 ///
 /// The ONE place a discriminator becomes an implementation. Every caller that
@@ -250,5 +286,61 @@ mod tests {
         let config = r#"{"secret_key":"sk_test","webhook_secret":"whsec_test"}"#;
         let p = build("stripe", config, http).expect("stripe builds");
         assert_eq!(p.id(), "stripe");
+    }
+
+    /// PMS-1165: the URL handed to an admin has to be the one the receiver is
+    /// mounted at. `create_api_router` nests both receivers at
+    /// `/api/v1/{provider}` with a `/webhooks/{tenant_id}` route, so a change
+    /// there without a change here would hand out an endpoint that 404s, and
+    /// the admin would have no way to tell that from a signature problem.
+    #[test]
+    fn the_url_matches_the_route_the_receiver_is_mounted_at() {
+        let tenant = Uuid::from_u128(7);
+        assert_eq!(
+            webhook_url(Some("https://api.example.com"), "stripe", tenant).as_deref(),
+            Some(format!("https://api.example.com/api/v1/stripe/webhooks/{tenant}").as_str())
+        );
+        assert_eq!(
+            webhook_url(Some("https://api.example.com"), "paypal", tenant).as_deref(),
+            Some(format!("https://api.example.com/api/v1/paypal/webhooks/{tenant}").as_str())
+        );
+    }
+
+    /// An operator who wrote the base with a trailing slash gets the same URL
+    /// as one who did not. A doubled slash is a path a router does not match,
+    /// and the admin pasting it would see deliveries fail with nothing saying
+    /// why.
+    #[test]
+    fn a_trailing_slash_on_the_base_does_not_double_up() {
+        let tenant = Uuid::from_u128(7);
+        let plain = webhook_url(Some("https://api.example.com"), "stripe", tenant);
+        for written in ["https://api.example.com/", "https://api.example.com//"] {
+            assert_eq!(
+                webhook_url(Some(written), "stripe", tenant),
+                plain,
+                "{written}"
+            );
+        }
+    }
+
+    /// Two absences, both deliberate: a deployment that never set
+    /// `PUBLIC_API_BASE_URL` has no honest answer, and a provider with no
+    /// receiver would be handed a URL that answers 404.
+    #[test]
+    fn no_base_and_no_receiver_both_answer_nothing() {
+        let tenant = Uuid::from_u128(7);
+        assert_eq!(webhook_url(None, "stripe", tenant), None);
+        // A forwarded-but-unset variable arrives as an empty string (PMS-836),
+        // so blank has to read as unset rather than as an origin of "".
+        assert_eq!(webhook_url(Some(""), "stripe", tenant), None);
+        assert_eq!(webhook_url(Some("   "), "stripe", tenant), None);
+        assert_eq!(
+            webhook_url(Some("https://api.example.com"), "authorize_net", tenant),
+            None,
+            "in the column's CHECK constraint and in nothing else"
+        );
+        for provider in SUPPORTED {
+            assert!(webhook_url(Some("https://api.example.com"), provider, tenant).is_some());
+        }
     }
 }

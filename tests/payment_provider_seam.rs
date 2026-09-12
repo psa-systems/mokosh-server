@@ -224,3 +224,92 @@ async fn a_tenant_with_only_an_unserveable_gateway_answers_like_an_unconfigured_
         "an unserveable gateway must answer as no gateway, not as a server error"
     );
 }
+
+/// PMS-1165: the app says where each provider should deliver webhooks.
+///
+/// The endpoint carries the tenant's UUID, and that id is deliberately never
+/// rendered in the SPA, so before this an admin was asked for a webhook
+/// signing secret with no supported way to learn what endpoint it belonged to.
+/// The failure was quiet: the secret key works, the customer pays, and the
+/// invoice is never marked paid, because no webhook was ever configured.
+///
+/// Answered with NO gateway configured, which is the case that matters: the
+/// admin needs the URL to create the endpoint in Stripe, and that is what
+/// produces the signing secret the form then demands. A value that only
+/// appeared once a gateway was saved would arrive after the save it is needed
+/// for.
+#[sqlx::test]
+async fn the_webhook_endpoints_are_known_before_any_gateway_exists(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let endpoints: Value = app
+        .client
+        .get(app.url("/api/v1/payment-gateways/webhook-endpoints"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("endpoints")
+        .json()
+        .await
+        .expect("endpoints body");
+    let rows = endpoints.as_array().expect("an array");
+
+    let expect = |provider: &str| {
+        format!(
+            "http://api.localhost/api/v1/{provider}/webhooks/{}",
+            common::DEFAULT_TENANT_ID
+        )
+    };
+    let url_for = |provider: &str| {
+        rows.iter()
+            .find(|r| r["provider"] == provider)
+            .and_then(|r| r["url"].as_str())
+            .map(str::to_string)
+    };
+    assert_eq!(url_for("stripe"), Some(expect("stripe")));
+    assert_eq!(url_for("paypal"), Some(expect("paypal")));
+    assert_eq!(
+        rows.len(),
+        2,
+        "every provider with a receiver and nothing else: {endpoints}"
+    );
+    assert!(
+        url_for("authorize_net").is_none(),
+        "a provider with no receiver would be handed a URL that answers 404"
+    );
+}
+
+/// The static segment must not be read as a provider id. `{provider}` sits on
+/// the same prefix for the DELETE, so a router that ordered these the other
+/// way would answer this path by trying to delete a gateway.
+#[sqlx::test]
+async fn the_endpoints_path_is_not_read_as_a_provider(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    put_gateway(&app, &token, "stripe", true).await;
+    let resp = app
+        .client
+        .get(app.url("/api/v1/payment-gateways/webhook-endpoints"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("endpoints");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // And the gateway it might have deleted is still there.
+    let listed: Value = app
+        .client
+        .get(app.url("/api/v1/payment-gateways"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("list body");
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(1));
+}
