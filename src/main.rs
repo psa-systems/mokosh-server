@@ -766,7 +766,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
             db.clone(),
             encryption_key,
-        );
+        )
+        // PMS-1172: a worker's mail carries the same branded header as a
+        // request-path one, so it needs the same absolute logo URL.
+        .with_public_api_base(config.public_api_base_url.clone());
     let sla_worker = mokosh_server::modules::sla::SlaSweepWorker::new(
         mokosh_server::modules::sla::SlaService::with_dispatcher(db.clone(), sla_notifications),
     );
@@ -878,7 +881,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
             db.clone(),
             encryption_key,
-        );
+        )
+        // PMS-1172: a worker's mail carries the same branded header as a
+        // request-path one, so it needs the same absolute logo URL.
+        .with_public_api_base(config.public_api_base_url.clone());
     let calendar_reminder_worker = mokosh_server::modules::calendar::CalendarReminderWorker::new(
         mokosh_server::modules::calendar::CalendarService::with_dispatcher(
             db.clone(),
