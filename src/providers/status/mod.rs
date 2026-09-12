@@ -102,7 +102,10 @@ pub fn collect() -> ProviderStatusReport {
     let (secrets_tenant, secrets_tenant_override) = collect_secrets_tenant_kind(hosting_profile);
     let (storage, storage_override) = collect_storage_kind(hosting_profile);
     let (authentication, auth_override) = collect_authentication_kind(hosting_profile);
-    let (email, email_override) = collect_email_kind();
+    let email_profile_default = hosting_profile
+        .default_provider_for(ProviderKind::Email)
+        .unwrap_or(provider_name::LOG);
+    let (email, email_override) = collect_email_kind(email_profile_default);
     let config_override = collect_configuration_override();
 
     let overrides = ProviderOverrides::new()
@@ -450,44 +453,61 @@ fn collect_authentication_kind(
     )
 }
 
-/// Email kind. `MailerConfig::from_env` reads through the configuration
-/// provider, so no direct env read is needed here. `.build()` is NOT called;
-/// a status page must not try to open an SMTP connection.
-fn collect_email_kind() -> (ProviderKindReport, Option<Vec<&'static str>>) {
-    match MailerConfig::from_env() {
-        Ok(cfg) => {
-            let (name, explicit) = if cfg.host.is_some() {
-                (provider_name::SMTP, Some(vec![provider_name::SMTP]))
-            } else {
-                (provider_name::LOG, None)
-            };
-            (
-                ProviderKindReport {
-                    kind: "email".to_string(),
-                    enabled: vec![EnabledProviderReport {
-                        name: name.to_string(),
-                        priority: 0,
-                        reachable: true,
-                        unreachable_reason: None,
-                    }],
-                    serving: Some(name.to_string()),
-                    keys: Vec::new(),
-                    enumeration: None,
-                },
-                explicit,
-            )
-        }
-        Err(_) => (
-            ProviderKindReport {
-                kind: "email".to_string(),
-                enabled: Vec::new(),
-                serving: None,
-                keys: Vec::new(),
-                enumeration: None,
-            },
-            None,
-        ),
-    }
+/// Email kind. PMS-1013: the collector reports the SELECTION recorded at boot
+/// through `email::selected_kind`, so a page a settings request happens to be
+/// holding cannot report a different provider than the one the process is
+/// actually running. When boot did not record a kind (test paths without the
+/// startup wiring) the reader falls back to the current-behaviour rule
+/// (`SMTP_HOST` presence infers smtp; otherwise the profile default), matching
+/// what `EmailConfig::resolve` would return for the same environment. Neither
+/// path opens an SMTP connection; the verify action is a separate route.
+fn collect_email_kind(profile_default: &str) -> (ProviderKindReport, Option<Vec<&'static str>>) {
+    let (kind, source) = match crate::utils::email::selected_kind() {
+        Some(kind) => (kind, EnablementSource::Explicit),
+        None => match MailerConfig::from_env() {
+            Ok(cfg) if cfg.host.is_some() => (
+                crate::utils::email::EmailProviderKind::Smtp,
+                EnablementSource::Explicit,
+            ),
+            Ok(_) => {
+                let profile = crate::utils::email::EmailProviderKind::parse_name(profile_default)
+                    .unwrap_or(crate::utils::email::EmailProviderKind::Log);
+                (profile, EnablementSource::Profile)
+            }
+            Err(_) => {
+                return (
+                    ProviderKindReport {
+                        kind: "email".to_string(),
+                        enabled: Vec::new(),
+                        serving: None,
+                        keys: Vec::new(),
+                        enumeration: None,
+                    },
+                    None,
+                );
+            }
+        },
+    };
+    let name = kind.as_str();
+    let explicit = match source {
+        EnablementSource::Explicit => Some(vec![name]),
+        EnablementSource::Profile => None,
+    };
+    (
+        ProviderKindReport {
+            kind: "email".to_string(),
+            enabled: vec![EnabledProviderReport {
+                name: name.to_string(),
+                priority: 0,
+                reachable: true,
+                unreachable_reason: None,
+            }],
+            serving: Some(name.to_string()),
+            keys: Vec::new(),
+            enumeration: None,
+        },
+        explicit,
+    )
 }
 
 /// The configuration override, if any. `ConfigSelection::from_env` reads
