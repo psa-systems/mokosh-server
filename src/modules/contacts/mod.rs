@@ -5,6 +5,7 @@
 #[cfg(feature = "server")]
 mod industry_backfill;
 mod models;
+pub(crate) mod portal_access;
 #[cfg(feature = "server")]
 mod routes;
 #[cfg(feature = "server")]
