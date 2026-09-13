@@ -23,13 +23,13 @@ jobs:
     # fails at `linker cc not found` (PMS-706, same cause as check.yml).
     runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
 
-    # Outer backstop (PMS-823). The inner `timeout` around the test run is
-    # what produces a diagnostic; this only stops a wedge elsewhere in the
-    # job (the compile step included, PMS-1100) from running until the
-    # runner's own limit. It has to clear the worst measured build (584s on a
-    # missed rust-cache) plus the whole inner budget plus checkout and cache
-    # upload, or it fires first and the inner diagnostic never prints.
-    timeout-minutes: 70
+    # Outer backstop. nextest's own `slow-timeout`/`terminate-after`
+    # (`.config/nextest.toml`) is what produces a diagnostic for a stuck
+    # case now (PMS-1177); this only stops a wedge elsewhere in the job (a
+    # cold-cache compile included) from running until the runner's own
+    # limit. 30m clears the worst measured cold build (1017s) plus the
+    # 10-minute run target plus checkout and cache upload with headroom.
+    timeout-minutes: 30
 
     # Postgres service for `cargo test --tests`. `#[sqlx::test]` creates a
     # fresh database per invocation against the URL in DATABASE_URL, so
@@ -55,6 +55,12 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+      # Job-level rather than step-level (PMS-1177): the build step and the
+      # test step used to see different environments (only the test step set
+      # this), which was the leading suspect for the dirty cargo fingerprint
+      # that made the test step recompile the binaries the build step had
+      # just built. Both steps now build/run under the identical environment.
+      RUST_BACKTRACE: 1
 
     steps:
       - name: Clone the repository
@@ -99,6 +105,15 @@ jobs:
         uses: https://github.com/Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+
+      - name: Install cargo-nextest
+        # PMS-1177: nextest schedules test CASES from every archived binary
+        # concurrently instead of running one `tests/*.rs` binary to
+        # completion before starting the next, which is where most of the
+        # previous wall clock went. Same pattern check.yml uses for
+        # cargo-machete: `cargo install` is a no-op once `rust-cache`
+        # restores the binary.
+        run: cargo install --locked cargo-nextest
 
       - name: Cap build parallelism
         # nproc/2 cap: never claim more than half the host (see "Concurrency
@@ -200,14 +215,14 @@ jobs:
         run: psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --file scripts/test-db-roles.sql
 
       - name: Build the integration test binaries
-        # PMS-1100: compile every `tests/*.rs` binary BEFORE the timed step,
-        # under only the job's outer budget. The 25 minute `timeout` below
-        # used to wrap `cargo test --tests`, which compiles first, so on a
-        # cold or missed rust-cache the build ate most of the budget and the
-        # step died at the second suite reporting a "test hang" that never
-        # happened (three runs on 2026-09-06 alone). The same command with
-        # `--no-run` leaves the binaries in the target dir the next step
-        # reuses, so the timer measures the tests and nothing else.
+        # PMS-1177: `cargo nextest archive` compiles every `tests/*.rs`
+        # binary plus the lib unit tests BEFORE the timed step, under only
+        # the job's outer budget, the same reason PMS-1100 split the compile
+        # out of the timed step in the first place. The archive is what the
+        # next step runs from with `--archive-file`, which cannot recompile,
+        # so a dirty fingerprint (this step and the next used to see
+        # different environments) can no longer make the timed step start
+        # with a `Compiling mokosh-server` line.
         #
         # The sampler records free space every 5s for the life of the build so
         # a failure has evidence from DURING the link rather than from after
@@ -219,7 +234,7 @@ jobs:
           sampler=$!
           started=$(date +%s)
           set +e
-          cargo test --tests --no-run
+          cargo nextest archive --archive-file /tmp/nextest-archive.tar.zst
           status=$?
           set -e
           kill "${sampler}" 2>/dev/null || true
@@ -234,73 +249,29 @@ jobs:
           exit "${status}"
 
       - name: Integration tests
-        # cargo test --tests runs every integration suite (all `tests/*.rs`
-        # binaries) plus the lib unit tests, so new suites are picked up
-        # automatically instead of via a hand-maintained --test allowlist,
-        # which at the time it was removed silently dropped 13 of the 22
-        # suites that then existed. That count is history, not a description
-        # of the tree; the suite count is printed by the disk-headroom step.
-        # The binaries were built by the step above; this invocation finds
-        # them fresh and only runs them (PMS-1100).
+        # PMS-1177: `cargo nextest run --archive-file` runs every case from
+        # every archived binary (all `tests/*.rs` suites plus the lib unit
+        # tests) at once, scheduled across `test-threads` from the `ci`
+        # profile in `.config/nextest.toml`, instead of one binary running
+        # to completion before the next starts. That cross-suite parallelism
+        # is where the wall clock the old `cargo test --tests` invocation
+        # spent waiting is recovered; new suites are still picked up
+        # automatically because the archive holds every binary cargo built.
         #
-        # --test-threads=4 caps in-flight `#[sqlx::test]` cases per binary.
-        # Each test creates a per-test database AND holds the sqlx-test
-        # maintenance pool; at default per-cpu parallelism on a 16-core
-        # runner the maintenance pool was timing out with PoolTimedOut on
-        # tests/auth.rs (14 tests). 4 in-flight is well within the
-        # postgres default max_connections (100); slight wall-clock cost,
-        # full reliability.
+        # `fail-fast = false` in the profile is the `--no-fail-fast`
+        # replacement (PMS-1031): every case runs and the summary names each
+        # red one; the step still fails on any failure.
         #
-        # --no-fail-fast (PMS-1031): without it `cargo test --tests` stops at the
-        # first failing binary, so one broken suite reports as "everything
-        # that sorts after it did not run" and 40 non-portal failures on main
-        # were invisible even to someone looking at the area. With it every
-        # binary runs and the summary names each red one; the step still fails.
-        #
-        # The inner `timeout` bounds the harness itself (PMS-823). Run #4017
-        # wedged mid-suite, so `status=$?` never ran and none of the reporting
-        # below it did either; the log just stopped. SIGQUIT gives the Rust
-        # process a chance to dump state before --kill-after escalates to
-        # SIGKILL.
-        #
-        # The budget is 40m because the suite has outgrown the 25m it was
-        # given. That number was chosen when a healthy run reached its last
-        # suite about four minutes in; the tree now holds 167 test binaries
-        # and a healthy run takes 1036s (17m), so 25m was 1.45x the healthy
-        # time, not "several times" it. Two runs on the same tree, one hour
-        # apart, measured the gap that closes: every suite in the slower one
-        # ran 1.38x longer than in the faster one (871s of common suites
-        # against 1205s), with no test over the harness's own 60s report
-        # threshold, so the whole run is uniformly slower when the runner is
-        # shared and nothing is hanging. 1.45x headroom does not survive a
-        # 1.38x slowdown, which is how run #5568 was killed at 1501s with 152
-        # of 167 suites done. 40m is 2.3x the healthy time, so a genuine hang
-        # still fires it.
-        env:
-          RUST_BACKTRACE: 1
+        # There is no shell `timeout` wrapper here (PMS-823, PMS-1177):
+        # nextest's own `slow-timeout`/`terminate-after` in the `ci` profile
+        # reports and terminates a stuck case BY NAME, so there is no
+        # grep-based diagnostic to get wrong and no separate hang message to
+        # keep in sync with the harness's own report.
         run: |
           started=$(date +%s)
           set +e
-          timeout --signal=QUIT --kill-after=30s 40m \
-            cargo test --tests --no-fail-fast -- --test-threads=4 2>&1 \
-            | tee /tmp/integration-tests.log
-          status=${PIPESTATUS[0]}
+          cargo nextest run --archive-file /tmp/nextest-archive.tar.zst --profile ci
+          status=$?
           set -e
           echo "Test run took $(( $(date +%s) - started ))s"
-          # 124 = SIGQUIT ended it, 137 = it ignored SIGQUIT and --kill-after
-          # escalated. Both mean the bound fired, not an assertion failure.
-          #
-          # Which of the two things it means is read out of the log rather than
-          # asserted. The harness prints "has been running for over 60 seconds"
-          # for a case that is actually stuck; with no such line the run was
-          # not hung, it was uniformly slow, and calling that a hang sends the
-          # reader hunting for a blocking test that does not exist (it did,
-          # on run #5568).
-          if [ "${status}" -eq 124 ] || [ "${status}" -eq 137 ]; then
-            if grep -q 'has been running for over' /tmp/integration-tests.log; then
-              echo "::error::The test run did not finish within 40m and was killed (exit ${status}). The harness reported at least one case running over 60 seconds, so this is the PMS-823 hang signature: the last such line above names the blocking case."
-            else
-              echo "::error::The test run did not finish within 40m and was killed (exit ${status}), and NO case was reported running over 60 seconds, so nothing hung: the whole run was slower than the budget. A healthy run is about 17m; a shared runner has been measured making every suite 1.38x slower. Check whether other jobs shared this runner before treating it as a code failure."
-            fi
-          fi
           exit "${status}"

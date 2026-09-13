@@ -281,9 +281,17 @@ ensure-test-db-roles: ensure-env
 # override is expanded inside the container so the credential stays in the
 # compose environment rather than reaching the host shell.
 # Run the Postgres-backed integration suite in the dev compose `server` container.
+#
+# cargo-nextest run --profile ci (PMS-1177): the `ci` profile in
+# `.config/nextest.toml` is what `integration.yml` runs too, so a local run
+# and the CI gate mean the same thing. The dev image installs no cargo
+# subcommands at build time, so the recipe installs nextest in the container
+# on each run; it is a fast no-op once `/root/.cargo/bin` already has it in a
+# session that reused the container's filesystem, and a normal `cargo
+# install` otherwise, unlike CI where `rust-cache` restores it.
 [group: 'test']
 test-integration: ensure-env ensure-test-db-roles
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --tests --no-fail-fast -- --test-threads=4'
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
 
 # Exercise every provider seam - configuration, application-tier secrets,
 # tenant-tier secrets, storage, authentication, email - against the running
