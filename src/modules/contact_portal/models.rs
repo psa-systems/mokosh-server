@@ -446,3 +446,27 @@ pub struct ContactPortalHostHint {
     /// the SPA supplies the coded default.
     pub effective_branding: mokosh_types::tenants::EffectiveBranding,
 }
+
+/// PMS-1187: a contact's request for access to an area of their portal.
+#[derive(Debug, Clone, Serialize)]
+pub struct PortalAccessRequestResponse {
+    pub id: Uuid,
+    pub area: String,
+    /// `open`, `granted`, `declined` or `withdrawn`.
+    pub status: String,
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// PMS-1187: what the contact sends to ask for access.
+///
+/// `area` is the portal area in the customer's terms, validated against the
+/// closed `ACCESS_AREAS` set: a customer asking for "invoices" should not have
+/// to know that `invoices:pay` and `invoices:download_pdf` are separate
+/// capability strings, and the column must never hold free text an MSP has to
+/// interpret.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PortalAccessRequest {
+    pub area: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}

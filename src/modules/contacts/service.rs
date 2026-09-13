@@ -992,6 +992,136 @@ impl ContactService {
 
     /// Delete company
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// PMS-1187: the access requests a contact has open, newest first.
+    ///
+    /// Resolved ones are kept and returned too: an MSP looking at a contact
+    /// wants to see that they asked for invoices last month and it was
+    /// granted, not just what is outstanding today.
+    pub async fn list_access_requests(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<Vec<PortalAccessRequestRow>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = sqlx::query_as::<_, PortalAccessRequestRow>(
+            "SELECT id, contact_id, company_id, area, note, status, requested_at, \
+                    resolved_by_id, resolved_at \
+             FROM portal_access_requests \
+             WHERE tenant_id = $1 AND contact_id = $2 \
+             ORDER BY requested_at DESC",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows)
+    }
+
+    /// PMS-1187: answer one request.
+    ///
+    /// Granting assigns the area's built-in role AND closes the request in one
+    /// transaction, which is the point of the endpoint: the alternative is
+    /// "read the mail, find the contact, remember which role, edit it", and
+    /// the step most likely to be skipped is the one that tells the customer
+    /// anything happened.
+    ///
+    /// Declining closes it without granting. Both record who answered, so a
+    /// request cannot be quietly disposed of.
+    pub async fn resolve_access_request(
+        &self,
+        tenant_id: TenantId,
+        request_id: Uuid,
+        grant: bool,
+        resolved_by: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<PortalAccessRequestRow> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let existing: Option<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT contact_id, area, status FROM portal_access_requests \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((contact_id, area_key, status)) = existing else {
+            return Err(AppError::NotFound("access request".to_string()));
+        };
+        if status != "open" {
+            return Err(AppError::Conflict(format!(
+                "This request was already {status}."
+            )));
+        }
+
+        if grant {
+            let Some(area) = crate::modules::contact_portal::capabilities::access_area(&area_key)
+            else {
+                // A row whose area left the closed set, which only a code
+                // change can produce. Refused rather than granting some other
+                // role, because the one thing worse than not granting access
+                // is granting the wrong access.
+                return Err(AppError::Configuration(format!(
+                    "The portal area {area_key:?} no longer exists, so this request cannot be granted."
+                )));
+            };
+            let role_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM portal_roles \
+                 WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE AND name = $2",
+            )
+            .bind(tenant_id)
+            .bind(area.granting_role)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(role_id) = role_id else {
+                return Err(AppError::Configuration(format!(
+                    "This tenant has no built-in {} role to grant.",
+                    area.granting_role
+                )));
+            };
+            sqlx::query(
+                "INSERT INTO contact_role_assignments (contact_id, role_id, tenant_id) \
+                 VALUES ($1, $2, $3) ON CONFLICT (contact_id, role_id) DO NOTHING",
+            )
+            .bind(contact_id)
+            .bind(role_id)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let row = sqlx::query_as::<_, PortalAccessRequestRow>(
+            "UPDATE portal_access_requests \
+             SET status = $3, resolved_by_id = $4, resolved_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2 \
+             RETURNING id, contact_id, company_id, area, note, status, requested_at, \
+                       resolved_by_id, resolved_at",
+        )
+        .bind(tenant_id)
+        .bind(request_id)
+        .bind(if grant { "granted" } else { "declined" })
+        .bind(resolved_by)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contacts",
+            Some(contact_id),
+            None,
+            Some(serde_json::json!({
+                "portal_access_request": request_id,
+                "area": area_key,
+                "resolution": row.status,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
     /// PMS-926: what deleting this company would do, without doing it.
     ///
     /// Exists because the CLIENT was keeping its own English copy of these
