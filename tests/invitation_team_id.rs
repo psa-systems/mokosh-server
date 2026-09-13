@@ -19,6 +19,7 @@ use uuid::Uuid;
 use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::invitations::{CreateInvitationRequest, InvitationsService};
+use mokosh_server::utils::error::AppError;
 use mokosh_server::Database;
 
 fn svc(pool: PgPool) -> InvitationsService {
@@ -120,11 +121,15 @@ async fn create_refuses_a_foreign_tenant_team(pool: PgPool) {
         .await
         .expect_err("PMS-1161: foreign-tenant team must refuse");
 
-    let msg = format!("{err}");
-    assert!(
-        msg.to_ascii_lowercase().contains("team"),
-        "PMS-1161: the error must name the team_id field: {msg}"
-    );
+    match err {
+        AppError::Validation { errors, .. } => {
+            assert!(
+                errors.iter().any(|e| e.field == "team_id"),
+                "PMS-1161: the error must name the team_id field: {errors:?}"
+            );
+        }
+        other => panic!("expected AppError::Validation, got {other:?}"),
+    }
 }
 
 #[sqlx::test]
