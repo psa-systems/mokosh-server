@@ -167,7 +167,11 @@ pub fn shown_value(spec: &CredentialSpec, value: &str) -> Option<String> {
     if !spec.secret {
         return Some(value.to_string());
     }
-    let tail: String = value.chars().rev().take(4).collect::<Vec<char>>()
+    let tail: String = value
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<char>>()
         .into_iter()
         .rev()
         .collect();
@@ -510,7 +514,10 @@ mod tests {
                     message.contains(expected),
                     "{id}: {message:?} does not name {expected}"
                 ),
-                other => panic!("{id} with a blank {expected} must not build: {:?}", other.is_ok()),
+                other => panic!(
+                    "{id} with a blank {expected} must not build: {:?}",
+                    other.is_ok()
+                ),
             }
         }
     }
@@ -536,7 +543,10 @@ mod tests {
             shown_value(&id, "3WL54026PT222181E").as_deref(),
             Some("3WL54026PT222181E")
         );
-        assert_eq!(shown_value(&secret, "EEynpmak2i66ZGeHZRj").as_deref(), Some("HZRj"));
+        assert_eq!(
+            shown_value(&secret, "EEynpmak2i66ZGeHZRj").as_deref(),
+            Some("HZRj")
+        );
         // A short secret is nearly all tail, so it is reported as present and
         // shown as nothing.
         assert_eq!(shown_value(&secret, "sk_test"), None);

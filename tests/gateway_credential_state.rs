@@ -20,8 +20,7 @@ const TEST_KEY: [u8; 32] = [0u8; 32];
 /// which is the state a deployment the credential mover has not finished is
 /// in, and the one a test can produce without a secret provider.
 async fn seed_gateway(pool: &PgPool, provider: &str, is_active: bool, config: Value) {
-    let encrypted =
-        mokosh_server::utils::crypto::encrypt(&config.to_string(), &TEST_KEY).unwrap();
+    let encrypted = mokosh_server::utils::crypto::encrypt(&config.to_string(), &TEST_KEY).unwrap();
     sqlx::query(
         "INSERT INTO payment_gateway_configs \
          (tenant_id, provider, is_active, is_test_mode, config_encrypted) \
@@ -232,9 +231,7 @@ async fn an_unusable_credential_is_not_reported_as_ready(pool: PgPool) {
     let invoice_id = seed_sent_invoice(&pool, company_id).await;
     let resp = app
         .client
-        .get(app.url(&format!(
-            "/api/v1/invoices/{invoice_id}/payment-readiness"
-        )))
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
         .bearer_auth(&token)
         .send()
         .await

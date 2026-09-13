@@ -398,7 +398,11 @@ impl PaymentProvider for PaypalProvider {
             }
         };
         let mut checks = vec![GatewayCheck::passed("Client ID and secret")];
-        let url = format!("{}/v1/notifications/webhooks/{}", self.base(), self.webhook_id);
+        let url = format!(
+            "{}/v1/notifications/webhooks/{}",
+            self.base(),
+            self.webhook_id
+        );
         let resp = self
             .http
             .get(&url)
@@ -407,8 +411,8 @@ impl PaymentProvider for PaypalProvider {
             .await
             .map_err(|e| AppError::external_service("paypal", format!("request failed: {e}")))?;
         let status = resp.status();
-        let body: Value = serde_json::from_str(&resp.text().await.unwrap_or_default())
-            .unwrap_or(Value::Null);
+        let body: Value =
+            serde_json::from_str(&resp.text().await.unwrap_or_default()).unwrap_or(Value::Null);
         if status.is_success() {
             checks.push(GatewayCheck::passed("Webhook ID"));
         } else {
