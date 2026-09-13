@@ -3052,6 +3052,93 @@ impl BillingService {
         self.usable_providers(tenant_id).await
     }
 
+    /// PMS-1182: record one inbound webhook delivery, whatever became of it.
+    ///
+    /// Best-effort, and that is load-bearing rather than lazy: the provider
+    /// retries on a 5xx, so a failure to write this row must never change the
+    /// response. A logging failure that turned an accepted payment into a
+    /// retry would be worse than the blind spot it replaces. Same shape as
+    /// `audit_portal_event` (PMS-1089): a warning, and the caller carries on.
+    ///
+    /// It runs on the migrator pool because a REFUSED delivery is the row that
+    /// matters most and there is no verified tenant to scope a connection to
+    /// at that point - the tenant id is the URL's claim, not a credential. The
+    /// write names the tenant explicitly, which is what the tenant-scoped read
+    /// below then sees through RLS.
+    ///
+    /// Nothing is recorded when the route resolved no gateway for the tenant,
+    /// and that is deliberate: the endpoint is a URL a tenant hands to a
+    /// provider, so anyone who learns it could otherwise write rows into
+    /// somebody's delivery history by posting to it. Requiring a configured,
+    /// active gateway for the named provider bounds that to tenants who have
+    /// one. The cost is that a delivery from a provider a tenant has switched
+    /// away from is refused with no row; it is stated here rather than
+    /// discovered. Trimming old rows on insert was considered and rejected for
+    /// the same reason: it would let noise evict the history this exists for.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_webhook_delivery(
+        &self,
+        tenant_id: Uuid,
+        provider_id: &str,
+        outcome: &str,
+        event_type: Option<&str>,
+        event_id: Option<&str>,
+        invoice_id: Option<Uuid>,
+        detail: Option<&str>,
+    ) {
+        let written = sqlx::query(
+            "INSERT INTO payment_webhook_deliveries \
+             (tenant_id, provider, outcome, event_type, event_id, invoice_id, detail) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(tenant_id)
+        .bind(provider_id)
+        .bind(outcome)
+        .bind(event_type)
+        .bind(event_id)
+        .bind(invoice_id)
+        .bind(detail)
+        .execute(self.db.migrator_pool())
+        .await;
+        if let Err(e) = written {
+            tracing::warn!(
+                target: "mokosh_server.billing",
+                provider = provider_id,
+                %outcome,
+                "could not record the webhook delivery: {e}"
+            );
+        }
+    }
+
+    /// PMS-1182: the tenant's most recent webhook deliveries.
+    ///
+    /// The empty answer is the useful one: "this provider has never called
+    /// this endpoint" is the single most informative sentence on the page when
+    /// a payment did not record, and it is the one the application could not
+    /// say before.
+    pub async fn list_webhook_deliveries(
+        &self,
+        tenant_id: TenantId,
+        provider_id: Option<&str>,
+        limit: i64,
+    ) -> AppResult<Vec<WebhookDeliveryResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = sqlx::query_as::<_, WebhookDeliveryResponse>(
+            "SELECT id, provider, received_at, outcome, event_type, event_id, \
+                    invoice_id, detail \
+             FROM payment_webhook_deliveries \
+             WHERE tenant_id = $1 AND ($2::text IS NULL OR provider = $2) \
+             ORDER BY received_at DESC \
+             LIMIT $3",
+        )
+        .bind(tenant_id)
+        .bind(provider_id)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows)
+    }
+
     /// Build a Stripe provider scoped to the tenant's ACTIVE gateway for the
     /// inbound-webhook path. Returns `None` when the tenant has no active Stripe
     /// config (so the handler answers 404 without confirming a tenant exists).

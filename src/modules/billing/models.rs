@@ -554,6 +554,27 @@ pub struct GatewayCheckResponse {
     pub detail: String,
 }
 
+/// PMS-1182: one inbound webhook delivery, as this deployment saw it.
+///
+/// The MSP-facing answer to "did the provider ever call us, and what did we
+/// do". No body and no headers: see migration 213 for why.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct WebhookDeliveryResponse {
+    pub id: Uuid,
+    pub provider: String,
+    pub received_at: DateTime<Utc>,
+    /// `accepted`, `refused`, `ignored` or `failed`.
+    pub outcome: String,
+    /// The provider's own event type, present only once the delivery verified.
+    pub event_type: Option<String>,
+    /// The provider's own event id, which is what their dashboard keys its log
+    /// on, so an admin can find the same delivery on their side.
+    pub event_id: Option<String>,
+    pub invoice_id: Option<Uuid>,
+    /// Why it was refused, or what failed. Absent when nothing went wrong.
+    pub detail: Option<String>,
+}
+
 /// PMS-1165: where this deployment receives one provider's webhooks for the
 /// calling tenant.
 ///
