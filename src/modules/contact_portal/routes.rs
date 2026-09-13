@@ -94,6 +94,10 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
             "/companies/self/branding",
             get(get_own_company_branding).patch(update_own_company_branding),
         )
+        // PMS-1187: ask the MSP for access to an area of the portal. The
+        // contact is the caller, so nothing about whose request it is comes
+        // off the body.
+        .route("/access-requests", post(request_access))
         // PMS-935: contact-only dashboard aggregate. Staff have their
         // own workspace dashboards; this endpoint is deliberately
         // scoped to `RequireContactAuth`.
@@ -122,6 +126,24 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
 // ============================================================================
 // HANDLERS
 // ============================================================================
+
+/// PMS-1187: `POST /api/v1/contact/access-requests`.
+///
+/// A contact who meets an empty screen can say so, and the MSP is told. The
+/// area is validated against the closed set and refused if the caller can
+/// already reach it; a second request for the same area answers the first one
+/// rather than opening another.
+async fn request_access(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Json(request): Json<PortalAccessRequest>,
+) -> AppResult<Json<PortalAccessRequestResponse>> {
+    let response = state
+        .service
+        .request_access(&session, &request.area, request.note.as_deref())
+        .await?;
+    Ok(Json(response))
+}
 
 async fn login(
     State(state): State<ContactRouterState>,

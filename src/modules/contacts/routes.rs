@@ -21,9 +21,10 @@ use crate::utils::error::AppError;
 use super::{
     CompanyFilter, CompanyIndustryResponse, CompanyResponse, ContactFieldValuesQuery,
     ContactFilter, ContactResponse, ContactService, CreateCompanyRequest, CreateContactRequest,
-    CreateSiteRequest, GrantPortalAccessRequest, PortalGrantOutcome, PortalRoleSummary,
-    SiteResponse, UpdateCompanyRequest, UpdateContactRequest, UpdateSiteRequest,
-    UpsertCompanyIndustryRequest, WebsiteProbeLimiter, WebsiteProbeService,
+    CreateSiteRequest, GrantPortalAccessRequest, PortalAccessRequestRow, PortalGrantOutcome,
+    PortalRoleSummary, ResolveAccessRequest, SiteResponse, UpdateCompanyRequest,
+    UpdateContactRequest, UpdateSiteRequest, UpsertCompanyIndustryRequest, WebsiteProbeLimiter,
+    WebsiteProbeService,
 };
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::modules::portal_roles::{
@@ -141,6 +142,15 @@ pub fn contact_routes(
         .route(
             "/contacts/{contact_id}/portal-roles",
             get(get_contact_portal_role_ids).put(replace_contact_portal_role_ids),
+        )
+        // PMS-1187: what this contact has asked for, and how staff answer it.
+        .route(
+            "/contacts/{contact_id}/access-requests",
+            get(list_access_requests),
+        )
+        .route(
+            "/contacts/access-requests/{request_id}/resolve",
+            post(resolve_access_request),
         )
         // Company industries lookup (PMS-601). Reads are open to any authed
         // user (the company form's combobox needs them); writes are admin-only.
@@ -670,6 +680,42 @@ async fn replace_contact_portal_role_ids(
         .replace_portal_role_assignments(user.tenant(), contact_id, &request.role_ids, &ctx)
         .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// PMS-1187: the access requests this contact has made.
+///
+/// Any authenticated staff member may read them; granting is the manager gate
+/// below. A technician looking at a contact should be able to see that the
+/// customer asked for something, even if answering it is not theirs to do.
+async fn list_access_requests(
+    State(state): State<ContactRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(contact_id): Path<Uuid>,
+) -> AppResult<Json<Vec<PortalAccessRequestRow>>> {
+    let rows = state
+        .contact_service
+        .list_access_requests(user.tenant(), contact_id)
+        .await?;
+    Ok(Json(rows))
+}
+
+/// PMS-1187: answer one request, granting the area's role or declining it.
+///
+/// `RequireManager`, the same gate as assigning roles by hand, because that is
+/// what granting does.
+async fn resolve_access_request(
+    State(state): State<ContactRouterState>,
+    _manager: crate::modules::auth::RequireManager,
+    RequireAuth(user): RequireAuth,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(request_id): Path<Uuid>,
+    Json(request): Json<ResolveAccessRequest>,
+) -> AppResult<Json<PortalAccessRequestRow>> {
+    let row = state
+        .contact_service
+        .resolve_access_request(user.tenant(), request_id, request.grant, user.id, &ctx)
+        .await?;
+    Ok(Json(row))
 }
 
 async fn revoke_portal_access(

@@ -2234,7 +2234,14 @@ impl TenantService {
                                  -- tenants; copied here so a tenant created
                                  -- from now on can send either at all.
                                  'auth.portal_password_reset',
-                                 'auth.portal_welcome')
+                                 'auth.portal_welcome',
+                                 -- PMS-1187: the mail that tells the MSP a
+                                 -- customer asked for access to part of their
+                                 -- portal. Seeded for the default tenant by
+                                 -- migration 215, which also backfills older
+                                 -- tenants; copied here so a tenant created
+                                 -- from now on hears about a request at all.
+                                 'portal.access_requested')
             "#,
         )
         .bind(new_tenant_id)

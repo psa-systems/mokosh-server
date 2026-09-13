@@ -60,3 +60,30 @@ pub struct PortalRoleSummary {
     #[serde(default)]
     pub contacts_count: i64,
 }
+
+/// PMS-1187: one access request, as staff read it.
+///
+/// Carries the note the contact wrote, because the whole point of asking is to
+/// say why, and the MSP deciding needs it.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct PortalAccessRequestRow {
+    pub id: uuid::Uuid,
+    pub contact_id: uuid::Uuid,
+    pub company_id: Option<uuid::Uuid>,
+    pub area: String,
+    pub note: Option<String>,
+    /// `open`, `granted`, `declined` or `withdrawn`.
+    pub status: String,
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+    pub resolved_by_id: Option<uuid::Uuid>,
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// PMS-1187: how staff answer one.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ResolveAccessRequest {
+    /// `true` grants the area's built-in role and closes the request; `false`
+    /// closes it without granting. No third value: a request left open is left
+    /// open by not calling this.
+    pub grant: bool,
+}

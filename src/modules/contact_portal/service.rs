@@ -1722,6 +1722,189 @@ impl ContactAuthService {
     /// PMS-935: `pub(crate)` so the contact-plane routes (which do
     /// not go through `CallerContext::require_capability`) can gate
     /// on `settings:manage_own` for the profile self-edit path.
+    /// PMS-1187: ask the MSP for access to an area of the portal.
+    ///
+    /// A contact who lacks a capability meets an empty screen and has no way
+    /// to say so; the MSP hears nothing, because nothing records that a
+    /// customer tried to reach something and could not. This is that record,
+    /// and the mail that goes with it.
+    ///
+    /// Three refusals, each for its own reason. An area outside the closed set
+    /// is a client bug and is refused rather than stored, so the column never
+    /// holds free text an MSP has to interpret. An area the contact can
+    /// already reach is refused, because asking for what you hold produces a
+    /// task with nothing to do. And a second request for an area that already
+    /// has one open is the SAME row: the partial unique index is what makes
+    /// that true under a double click, and it is also what bounds this - a
+    /// contact can hold at most one open request per area, so the whole
+    /// surface is a handful of rows and a handful of mails, which is why there
+    /// is no rate limiter beyond it.
+    ///
+    /// The notification is best effort, after the row commits. A mail relay
+    /// that is down must not lose the request: the row is what the MSP answers
+    /// from, and the mail is how they find out to look.
+    pub async fn request_access(
+        &self,
+        session: &ContactSession,
+        area_key: &str,
+        note: Option<&str>,
+    ) -> AppResult<PortalAccessRequestResponse> {
+        let Some(area) = crate::modules::contact_portal::capabilities::access_area(area_key) else {
+            return Err(AppError::BadRequest(format!(
+                "There is no portal area called {area_key}."
+            )));
+        };
+        let capabilities = self
+            .load_capabilities(session.tenant_id, session.id)
+            .await?;
+        if capabilities.iter().any(|c| c == area.read_capability) {
+            return Err(AppError::BadRequest(format!(
+                "You can already see {}.",
+                area.label
+            )));
+        }
+
+        let note = note.map(str::trim).filter(|n| !n.is_empty());
+        let tenant = TenantId::from_trusted(session.tenant_id);
+        let mut tx = self.db.begin_with_tenant(tenant).await?;
+        // ON CONFLICT over the partial index, so a second press of the button
+        // finds the first request rather than opening a second one. The
+        // RETURNING is empty in that case, which is what the follow-up SELECT
+        // is for.
+        let inserted: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+            "INSERT INTO portal_access_requests \
+               (tenant_id, contact_id, company_id, area, note) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT DO NOTHING \
+             RETURNING id, requested_at",
+        )
+        .bind(session.tenant_id)
+        .bind(session.id)
+        .bind(session.company_id)
+        .bind(area.key)
+        .bind(note)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (id, requested_at, is_new) = match inserted {
+            Some((id, at)) => (id, at, true),
+            None => {
+                let existing: (Uuid, DateTime<Utc>) = sqlx::query_as(
+                    "SELECT id, requested_at FROM portal_access_requests \
+                     WHERE tenant_id = $1 AND contact_id = $2 AND area = $3 AND status = 'open'",
+                )
+                .bind(session.tenant_id)
+                .bind(session.id)
+                .bind(area.key)
+                .fetch_one(&mut *tx)
+                .await?;
+                (existing.0, existing.1, false)
+            }
+        };
+        tx.commit().await?;
+
+        if is_new {
+            self.audit(
+                session.tenant_id,
+                Some(session.id),
+                AuditAction::Create,
+                "portal.access_requested",
+                None,
+                None,
+            )
+            .await;
+            self.notify_access_requested(session, area, note, id).await;
+        }
+
+        Ok(PortalAccessRequestResponse {
+            id,
+            area: area.key.to_string(),
+            status: "open".to_string(),
+            requested_at,
+        })
+    }
+
+    /// PMS-1187: tell the MSP. Best effort, and never the caller's problem.
+    ///
+    /// The recipient is the company's account manager, supplied as
+    /// `recipient_user_id` the way every other staff-facing event names one;
+    /// whoever else should hear about it is the tenant's to configure on the
+    /// rule. A company with no account manager and an unconfigured rule mails
+    /// nobody, and the request is still on the contact record where staff
+    /// answer it - a gap that is stated rather than papered over with a guess
+    /// at who the right person is.
+    async fn notify_access_requested(
+        &self,
+        session: &ContactSession,
+        area: &'static crate::modules::contact_portal::capabilities::AccessArea,
+        note: Option<&str>,
+        request_id: Uuid,
+    ) {
+        let Some(notifications) = self.notifications.as_ref() else {
+            return;
+        };
+        let row: Option<(String, Option<String>, String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT TRIM(c.first_name || ' ' || c.last_name), c.email, co.name, \
+                    co.account_manager_id \
+             FROM contacts c INNER JOIN companies co ON co.id = $3 \
+             WHERE c.tenant_id = $1 AND c.id = $2",
+        )
+        .bind(session.tenant_id)
+        .bind(session.id)
+        .bind(session.company_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await
+        .unwrap_or(None);
+        let Some((contact_name, contact_email, company_name, account_manager_id)) = row else {
+            tracing::warn!(
+                contact_id = %session.id,
+                "portal access request notified nobody: the contact or company could not be read"
+            );
+            return;
+        };
+
+        // PMS-1140: the renderer is a flat `{{key}}` replacer with no
+        // conditionals, so a value that can be absent is composed HERE or it
+        // ships as literal braces to a real person.
+        let note_line = match note {
+            Some(note) => format!("They said: {note}"),
+            None => "They left no note.".to_string(),
+        };
+        let contact_url = format!(
+            "{}/contacts/{}",
+            self.spa_base_url.trim_end_matches('/'),
+            session.id
+        );
+        let mut context = serde_json::json!({
+            "contact_name": contact_name,
+            "contact_email": contact_email.unwrap_or_default(),
+            "company_name": company_name,
+            "area": area.label,
+            "note": note_line,
+            "contact_url": contact_url,
+            "request_id": request_id.to_string(),
+        });
+        if let (Some(manager), Some(obj)) = (account_manager_id, context.as_object_mut()) {
+            obj.insert(
+                "recipient_user_id".to_string(),
+                serde_json::Value::String(manager.to_string()),
+            );
+        }
+        if let Err(e) = notifications
+            .dispatch(
+                TenantId::from_trusted(session.tenant_id),
+                "portal.access_requested",
+                &context,
+            )
+            .await
+        {
+            tracing::warn!(
+                contact_id = %session.id,
+                area = area.key,
+                "portal access request mail failed: {e}"
+            );
+        }
+    }
+
     pub(crate) async fn load_capabilities(
         &self,
         tenant_id: Uuid,

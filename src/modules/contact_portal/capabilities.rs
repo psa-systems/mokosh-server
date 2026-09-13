@@ -263,6 +263,77 @@ pub const BUILTIN_ROLES: &[(&str, &[&str])] = &[
     ("Read-Only", BUILTIN_READ_ONLY),
 ];
 
+/// PMS-1187: one area a contact can ask for access to.
+///
+/// The AREA is what a customer asks for, and it is deliberately not a
+/// capability: somebody who wants to see their invoices should not have to
+/// know that `invoices:pay` and `invoices:download_pdf` are separate strings.
+/// It is the `<domain>` half of the capability naming convention, so the set
+/// is closed and a request naming anything else is refused rather than stored.
+///
+/// Each area carries the capability that proves a contact ALREADY has it (so
+/// asking for what you hold is refused), and the built-in role an MSP grants
+/// to answer the request.
+pub struct AccessArea {
+    /// As the customer's client sends it, and as the row stores it.
+    pub key: &'static str,
+    /// What the customer calls it, for the mail the MSP reads.
+    pub label: &'static str,
+    /// Holding this means the area is already reachable.
+    pub read_capability: &'static str,
+    /// The built-in role that grants it.
+    pub granting_role: &'static str,
+}
+
+/// Every area a contact can ask for, which is every tab a capability gates.
+///
+/// `kb` is deliberately absent: a contact holding any role reaches the
+/// knowledge base through `Read-Only` and `Support Contact` alike, so an
+/// access request for it would be a question nobody needs to answer.
+pub const ACCESS_AREAS: &[AccessArea] = &[
+    AccessArea {
+        key: "invoices",
+        label: "invoices",
+        read_capability: INVOICES_READ,
+        granting_role: "Billing Contact",
+    },
+    AccessArea {
+        key: "tickets",
+        label: "tickets",
+        read_capability: TICKETS_READ,
+        granting_role: "Support Contact",
+    },
+    AccessArea {
+        key: "quotes",
+        label: "quotes",
+        read_capability: QUOTES_READ,
+        granting_role: "Billing Contact",
+    },
+    AccessArea {
+        key: "contracts",
+        label: "contracts",
+        read_capability: CONTRACTS_READ,
+        granting_role: "Read-Only",
+    },
+    AccessArea {
+        key: "assets",
+        label: "assets",
+        read_capability: ASSETS_READ,
+        granting_role: "Read-Only",
+    },
+    AccessArea {
+        key: "projects",
+        label: "projects",
+        read_capability: PROJECTS_READ,
+        granting_role: "Read-Only",
+    },
+];
+
+/// The area `key` names, or `None` for anything outside the closed set.
+pub fn access_area(key: &str) -> Option<&'static AccessArea> {
+    ACCESS_AREAS.iter().find(|a| a.key == key)
+}
+
 /// Predicate for validating a role's capability set at write time.
 /// Returns `Ok(())` when every entry in `caps` appears in
 /// [`ALL_CAPABILITIES`]; returns the first offending value otherwise.
