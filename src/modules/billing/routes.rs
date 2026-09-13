@@ -23,6 +23,13 @@ use crate::modules::settings::SettingsService;
 use crate::utils::error::{rate_limited_response, AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
+/// PMS-1182: narrow the delivery list to one provider, and cap it.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct WebhookDeliveryQuery {
+    pub provider: Option<String>,
+    pub limit: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct BillingRouterState {
     pub service: Arc<BillingService>,
@@ -151,6 +158,12 @@ pub fn billing_routes(service: BillingService, public_api_base: Option<String>) 
         .route(
             "/payment-gateways/webhook-endpoints",
             get(list_gateway_webhook_endpoints),
+        )
+        // PMS-1182: static too, and declared above `{provider}` for the same
+        // reason.
+        .route(
+            "/payment-gateways/webhook-deliveries",
+            get(list_gateway_webhook_deliveries),
         )
         .route(
             "/payment-gateways/{provider}",
@@ -334,6 +347,38 @@ async fn list_gateway_webhook_endpoints(
         })
         .collect();
     Ok(Json(endpoints))
+}
+
+/// PMS-1182: what each provider has actually delivered to this tenant.
+///
+/// The empty answer is the useful one. "PayPal has never called this endpoint"
+/// is the single most informative sentence available when a payment did not
+/// record, and it is the one this application could not say: a refused
+/// delivery left no trace, so an MSP's only recourse was their provider's own
+/// dashboard.
+async fn list_gateway_webhook_deliveries(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Query(q): Query<WebhookDeliveryQuery>,
+) -> AppResult<Json<Vec<WebhookDeliveryResponse>>> {
+    // A provider this build cannot serve has no receiver mounted, so it can
+    // have delivered nothing; naming one is a request for an empty list rather
+    // than an error.
+    let provider = q
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    // Bounded rather than paginated: this is a recent-activity list, and the
+    // question it answers ("did they call, and what did we do") is answered by
+    // the newest handful. Retention is deliberately not decided here.
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    let deliveries = state
+        .service
+        .list_webhook_deliveries(user.tenant(), provider, limit)
+        .await?;
+    Ok(Json(deliveries))
 }
 
 async fn list_payment_gateways(
