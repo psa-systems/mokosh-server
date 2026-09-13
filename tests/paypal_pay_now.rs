@@ -382,10 +382,15 @@ async fn a_delivery_on_the_wrong_providers_route_is_refused(pool: sqlx::PgPool) 
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-/// One active gateway per tenant, through the API. Activating PayPal turns
-/// Stripe off in the same transaction, so `select_serveable` never sees two.
+/// PMS-1179: activating PayPal leaves Stripe active, and the invoice offers
+/// both.
+///
+/// This test asserted the opposite until PMS-1179. One active gateway per
+/// tenant was the placeholder PMS-969 left while only one provider was
+/// serveable and nobody could name which one a payment should use; the pay
+/// request names it now, so two actives is a tenant offering a choice.
 #[sqlx::test]
-async fn activating_paypal_deactivates_stripe(pool: sqlx::PgPool) {
+async fn activating_paypal_leaves_stripe_active_and_both_are_offered(pool: sqlx::PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
@@ -427,7 +432,41 @@ async fn activating_paypal_deactivates_stripe(pool: sqlx::PgPool) {
     .unwrap();
     assert_eq!(
         active,
-        vec!["paypal".to_string()],
-        "activating one deactivates the other"
+        vec!["paypal".to_string(), "stripe".to_string()],
+        "activating one must no longer switch the other off"
+    );
+
+    // And the readiness endpoint offers both, each with the label a client
+    // prints, so the customer can choose rather than being handed one.
+    let company = seed_company(&pool).await;
+    let invoice = seed_sent_invoice(&pool, company, dec("3.00")).await;
+    let readiness: Value = app
+        .client
+        .get(app.url(&format!("/api/v1/invoices/{invoice}/payment-readiness")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("readiness")
+        .json()
+        .await
+        .expect("readiness body");
+    let offered: Vec<&str> = readiness["providers"]
+        .as_array()
+        .expect("providers is a list")
+        .iter()
+        .filter_map(|p| p["provider"].as_str())
+        .collect();
+    assert_eq!(offered, vec!["paypal", "stripe"], "{readiness}");
+    for option in readiness["providers"].as_array().expect("list") {
+        let label = option["label"].as_str().unwrap_or_default();
+        assert!(!label.is_empty(), "every option needs a label: {readiness}");
+    }
+    // The legacy single label stays populated, so a client that predates the
+    // choice still renders one working button rather than none.
+    assert!(
+        readiness["button_label"]
+            .as_str()
+            .is_some_and(|l| !l.is_empty()),
+        "{readiness}"
     );
 }

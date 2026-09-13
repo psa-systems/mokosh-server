@@ -544,6 +544,17 @@ pub struct PayInvoiceResponse {
     pub checkout_url: String,
 }
 
+/// PMS-1179: one way a customer can pay this invoice.
+///
+/// The label is the server's to compose (the admin's `client_display_name`
+/// override, else a provider default), so a client renders the button without
+/// knowing any provider by name.
+#[derive(Debug, Clone, Serialize)]
+pub struct PaymentProviderOption {
+    pub provider: String,
+    pub label: String,
+}
+
 /// MAPPS-666 (mokosh-invoices P1a): what the SPA reads to decide whether
 /// to render the Pay Now button + what label to put on it. Fires once on
 /// invoice-detail mount alongside the existing invoice fetch so the
@@ -568,7 +579,14 @@ pub struct InvoicePaymentReadinessResponse {
     /// `payment_gateway_configs.client_display_name` column. `None`
     /// when `gateway_ready = false`, since there is no gateway to
     /// name.
+    ///
+    /// PMS-1179: the FIRST of `providers`, kept so a client that predates the
+    /// choice still renders one working button. New clients read `providers`.
     pub button_label: Option<String>,
+    /// PMS-1179: every way this invoice can be paid. Empty when no gateway is
+    /// connected; one entry is the ordinary case; two is a tenant offering a
+    /// choice, and the client renders one button each.
+    pub providers: Vec<PaymentProviderOption>,
     /// True iff `invoice.status` is `pending | sent | partially_paid`
     /// AND `balance_due > 0`. Draft, void, written_off, and paid
     /// invoices are not payable.
@@ -593,6 +611,13 @@ pub struct PayInvoiceRequest {
     pub success_url: String,
     #[validate(url)]
     pub cancel_url: String,
+    /// PMS-1179: which connected provider the customer chose, when the tenant
+    /// has more than one. Omitted resolves a single active provider, which is
+    /// what every client sent before the choice existed; omitted with two
+    /// active is refused rather than guessed, because the answer decides where
+    /// a customer's money goes.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]

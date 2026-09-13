@@ -2413,39 +2413,15 @@ impl BillingService {
             AuditAction::Create
         };
 
-        // PMS-969: one active gateway per tenant, enforced here rather than
-        // resolved later. `payment_gateway_configs` is UNIQUE on (tenant,
-        // provider) and not on the tenant, so nothing in the schema stops two
-        // rows being active at once, and `select_serveable` refuses a tenant
-        // in that state outright rather than guessing which one a customer's
-        // money should go to. PMS-966 deferred this to the change that makes
-        // two serveable actives possible, which is the second provider.
-        //
-        // Activating this provider deactivates the others in the same
-        // transaction; deactivating it touches nothing else. The rows that
-        // flip are logged by provider, not audited row-by-row: the audit entry
-        // below is for the row the caller named, and a per-sibling entry is a
-        // follow-up if it turns out to be wanted.
-        if request.is_active {
-            let flipped: Vec<String> = sqlx::query_scalar(
-                "UPDATE payment_gateway_configs \
-                 SET is_active = FALSE, updated_at = NOW() \
-                 WHERE tenant_id = $1 AND provider <> $2 AND is_active = TRUE \
-                 RETURNING provider",
-            )
-            .bind(tenant_id)
-            .bind(request.provider.as_str())
-            .fetch_all(&mut *tx)
-            .await?;
-            if !flipped.is_empty() {
-                tracing::info!(
-                    target: "mokosh_server.billing",
-                    activated = request.provider.as_str(),
-                    deactivated = ?flipped,
-                    "one active payment gateway per tenant: siblings deactivated"
-                );
-            }
-        }
+        // PMS-1179: activating a provider no longer deactivates the others.
+        // PMS-969 enforced one active gateway per tenant as a placeholder:
+        // `payment_gateway_configs` is UNIQUE on (tenant, provider) and not on
+        // the tenant, so nothing in the schema stopped two rows being active,
+        // and with only one serveable provider nobody could say which one a
+        // customer's money should go to. The second provider is what that was
+        // waiting for. The pay request names its provider now, so two actives
+        // is a tenant offering a choice rather than a tenant nobody can
+        // resolve.
 
         // MAPPS-671: three-state client_display_name, with the "clear"
         // signal riding on an empty string rather than a distinct null,
@@ -2699,23 +2675,56 @@ impl BillingService {
     /// from, so it is refused. It is unreachable today, because `SUPPORTED`
     /// holds one entry; PMS-969 is what makes it reachable, and enforcing one
     /// active gateway per tenant at write time belongs with that change.
-    fn select_serveable(
-        rows: Vec<(String, Option<String>)>,
-    ) -> AppResult<Option<(String, Option<String>)>> {
+    fn serveable(rows: Vec<(String, Option<String>)>) -> Vec<(String, Option<String>)> {
         let mut serveable: Vec<(String, Option<String>)> = rows
             .into_iter()
             .filter(|(id, _)| provider::is_supported(id))
             .collect();
-        match serveable.len() {
-            0 => Ok(None),
-            1 => Ok(Some(serveable.remove(0))),
-            _ => {
-                serveable.sort_by(|a, b| a.0.cmp(&b.0));
+        // Sorted, so the order a customer sees is the order every read gives
+        // rather than whatever order the rows came back in.
+        serveable.sort_by(|a, b| a.0.cmp(&b.0));
+        serveable
+    }
+
+    /// PMS-1179: which of the tenant's active providers this payment uses.
+    ///
+    /// This was `select_serveable`, which answered one provider or refused a
+    /// tenant with two as misconfigured. That refusal was the placeholder
+    /// PMS-969 left while only one provider was serveable and therefore nobody
+    /// could say which one a customer's money should go to. PayPal is the
+    /// second provider, so saying which is the caller's job now and two actives
+    /// is an ordinary state.
+    ///
+    /// `requested` names one. Absent, a single active provider still resolves
+    /// without it - what every existing caller sends - and absent with several
+    /// active is a request the server cannot answer, so it says so with the
+    /// choices in the message rather than picking for the customer.
+    fn pick_serveable(
+        rows: Vec<(String, Option<String>)>,
+        requested: Option<&str>,
+    ) -> AppResult<Option<(String, Option<String>)>> {
+        let mut serveable = Self::serveable(rows);
+        let Some(requested) = requested else {
+            return match serveable.len() {
+                0 => Ok(None),
+                1 => Ok(Some(serveable.remove(0))),
+                _ => {
+                    let names: Vec<&str> = serveable.iter().map(|(id, _)| id.as_str()).collect();
+                    Err(AppError::BadRequest(format!(
+                        "This invoice can be paid with {}. Say which one to use.",
+                        names.join(" or ")
+                    )))
+                }
+            };
+        };
+        match serveable.iter().position(|(id, _)| id == requested) {
+            Some(at) => Ok(Some(serveable.remove(at))),
+            None if serveable.is_empty() => Ok(None),
+            None => {
                 let names: Vec<&str> = serveable.iter().map(|(id, _)| id.as_str()).collect();
-                Err(AppError::Configuration(format!(
-                    "tenant has {} active payment gateways ({}); exactly one may be active",
-                    names.len(),
-                    names.join(", ")
+                Err(AppError::BadRequest(format!(
+                    "{requested} is not connected for this invoice. It can be paid with {}.",
+                    names.join(" or ")
                 )))
             }
         }
@@ -2728,6 +2737,7 @@ impl BillingService {
     async fn active_provider(
         &self,
         tenant_id: TenantId,
+        requested: Option<&str>,
     ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
@@ -2737,7 +2747,7 @@ impl BillingService {
         .bind(tenant_id)
         .fetch_all(&mut *tx)
         .await?;
-        match Self::select_serveable(rows)? {
+        match Self::pick_serveable(rows, requested)? {
             Some((id, enc)) => Ok(Some(self.build_provider(tenant_id.into(), &id, enc).await?)),
             None => Ok(None),
         }
@@ -2829,7 +2839,7 @@ impl BillingService {
     pub async fn active_provider_display(
         &self,
         tenant_id: TenantId,
-    ) -> AppResult<Option<(String, Option<String>)>> {
+    ) -> AppResult<Vec<(String, Option<String>)>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT provider, client_display_name FROM payment_gateway_configs \
@@ -2838,7 +2848,9 @@ impl BillingService {
         .bind(tenant_id)
         .fetch_all(&mut *tx)
         .await?;
-        Ok(rows.into_iter().find(|(id, _)| provider::is_supported(id)))
+        // PMS-1179: every payable option, not the first one found. A tenant
+        // with both connected offers both, and the customer chooses.
+        Ok(Self::serveable(rows))
     }
 
     /// Build a Stripe provider scoped to the tenant's ACTIVE gateway for the
@@ -2855,6 +2867,7 @@ impl BillingService {
     pub async fn provider_for_webhook(
         &self,
         tenant_id: Uuid,
+        provider_id: &str,
     ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT provider, config_encrypted FROM payment_gateway_configs \
@@ -2863,7 +2876,17 @@ impl BillingService {
         .bind(tenant_id)
         .fetch_all(self.db.migrator_pool())
         .await?;
-        match Self::select_serveable(rows)? {
+        // PMS-1179: resolve the provider THIS ROUTE names, never "the
+        // tenant's active one". With two gateways active that question has no
+        // answer, and this receiver would have begun refusing every delivery
+        // from both - a payment taken and never recorded, the exact failure
+        // this area exists to prevent. Looking it up by the route's own id
+        // also gives the module doc's guarantee directly: a delivery from a
+        // provider the tenant is no longer active on finds nothing.
+        match Self::serveable(rows)
+            .into_iter()
+            .find(|(id, _)| id == provider_id)
+        {
             Some((id, enc)) => Ok(Some(self.build_provider(tenant_id, &id, enc).await?)),
             None => Ok(None),
         }
@@ -2880,6 +2903,10 @@ impl BillingService {
         invoice_id: Uuid,
         success_url: &str,
         cancel_url: &str,
+        // PMS-1179: which connected provider the customer chose. `None` keeps
+        // the pre-1179 behaviour: resolve a single active provider, and refuse
+        // to guess between two.
+        requested_provider: Option<&str>,
     ) -> AppResult<CheckoutSession> {
         let invoice = self.get_invoice(tenant_id, invoice_id).await?;
         // MAPPS-667 (mokosh-invoices P1b): refuse Draft too. A draft is
@@ -2903,7 +2930,7 @@ impl BillingService {
                 "Invoice has no outstanding balance to pay".to_string(),
             ));
         }
-        let Some(provider) = self.active_provider(tenant_id).await? else {
+        let Some(provider) = self.active_provider(tenant_id, requested_provider).await? else {
             return Err(AppError::BadRequest(
                 "No active payment provider is configured for this account".to_string(),
             ));
@@ -6553,16 +6580,15 @@ mod gateway_resolution {
     /// The property that makes PMS-966 a refactor rather than a change: a
     /// tenant with a stored `authorize_net` row was invisible behind the old
     /// `provider = 'stripe'` literal, and must stay invisible now that the
-    /// literal is gone. (PMS-966 used `paypal` as the example; PMS-969 made
-    /// that one serveable, so the example moved to the provider that still is
-    /// not.)
+    /// literal is gone.
     #[test]
     fn an_unserveable_row_is_skipped_exactly_as_the_literal_skipped_it() {
-        let picked = BillingService::select_serveable(vec![row("authorize_net"), row("stripe")])
-            .expect("one serveable row resolves");
+        let picked =
+            BillingService::pick_serveable(vec![row("authorize_net"), row("stripe")], None)
+                .expect("one serveable row resolves");
         assert_eq!(picked.map(|(id, _)| id), Some("stripe".to_string()));
 
-        let none = BillingService::select_serveable(vec![row("authorize_net")])
+        let none = BillingService::pick_serveable(vec![row("authorize_net")], None)
             .expect("no serveable row is not an error");
         assert!(
             none.is_none(),
@@ -6573,35 +6599,75 @@ mod gateway_resolution {
     /// No active rows at all is the ordinary unconfigured tenant.
     #[test]
     fn no_rows_resolves_to_none() {
-        let none = BillingService::select_serveable(Vec::new()).expect("no rows is fine");
+        let none = BillingService::pick_serveable(Vec::new(), None).expect("no rows is fine");
         assert!(none.is_none());
     }
 
-    /// Two serveable gateways is a question the database cannot answer, so it
-    /// is refused rather than resolved. `UNIQUE (tenant_id, provider)` permits
-    /// one active row per provider, so this becomes reachable the moment a
-    /// second provider is implemented (PMS-969); picking one would route a
-    /// customer's payment at whichever row the planner happened to return.
+    /// PMS-1179: two serveable gateways is now an ordinary state, and the
+    /// caller says which one. This replaces the PMS-969 test that asserted the
+    /// pair was REFUSED - that refusal was the placeholder held while nobody
+    /// could name a provider, and naming one is exactly what changed.
     #[test]
-    fn two_serveable_gateways_is_refused_and_not_picked_between() {
-        // Constructed from `SUPPORTED` rather than from two hard-coded names,
-        // so this keeps testing the ambiguity once a second provider lands
-        // instead of quietly becoming unreachable.
-        let mut rows: Vec<(String, Option<String>)> =
-            provider::SUPPORTED.iter().map(|p| row(p)).collect();
-        if rows.len() < 2 {
-            rows.push(row(provider::SUPPORTED[0]));
+    fn a_named_provider_is_the_one_resolved() {
+        let rows = || vec![row("stripe"), row("paypal")];
+        for want in provider::SUPPORTED {
+            let picked = BillingService::pick_serveable(rows(), Some(want))
+                .unwrap_or_else(|e| panic!("{want} should resolve: {e:?}"))
+                .expect("a serveable row");
+            assert_eq!(&picked.0, want);
         }
-        match BillingService::select_serveable(rows) {
-            Err(AppError::Configuration(message)) => {
-                assert!(
-                    message.contains("exactly one may be active"),
-                    "refused for the wrong reason: {message}"
-                );
+    }
+
+    /// Naming a provider the tenant has not activated is the caller's mistake,
+    /// and the refusal names what IS available so a client can recover without
+    /// a second round trip.
+    #[test]
+    fn an_unavailable_provider_is_refused_with_the_alternatives() {
+        match BillingService::pick_serveable(vec![row("stripe")], Some("paypal")) {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("paypal"), "{message}");
+                assert!(message.contains("stripe"), "{message}");
             }
-            Err(other) => panic!("expected a Configuration error, got {other:?}"),
-            Ok(_) => panic!("two serveable gateways must not resolve to one"),
+            other => panic!("expected a BadRequest naming the alternatives, got {other:?}"),
         }
+    }
+
+    /// A tenant with nothing connected answers None rather than refusing, so
+    /// the caller reports "no gateway" instead of "wrong gateway" - two
+    /// different things to tell a customer.
+    #[test]
+    fn naming_a_provider_on_an_unconfigured_tenant_is_not_a_refusal() {
+        let none = BillingService::pick_serveable(Vec::new(), Some("stripe"))
+            .expect("an unconfigured tenant is not a bad request");
+        assert!(none.is_none());
+    }
+
+    /// Naming NOTHING with two active cannot be answered, and picking one
+    /// would route a customer's money at whichever row the planner returned.
+    /// The message carries the choices so the client can ask again correctly.
+    #[test]
+    fn two_active_and_no_choice_is_refused_rather_than_guessed() {
+        match BillingService::pick_serveable(vec![row("stripe"), row("paypal")], None) {
+            Err(AppError::BadRequest(message)) => {
+                assert!(message.contains("stripe"), "{message}");
+                assert!(message.contains("paypal"), "{message}");
+                assert!(message.contains("Say which one"), "{message}");
+            }
+            other => panic!("expected a BadRequest listing both, got {other:?}"),
+        }
+    }
+
+    /// The order a customer sees is stable, whatever order the rows arrive in.
+    #[test]
+    fn the_serveable_order_does_not_depend_on_the_row_order() {
+        let forward = BillingService::serveable(vec![row("paypal"), row("stripe")]);
+        let backward = BillingService::serveable(vec![row("stripe"), row("paypal")]);
+        let ids: Vec<&str> = forward.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["paypal", "stripe"]);
+        assert_eq!(
+            forward.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            backward.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        );
     }
 }
 

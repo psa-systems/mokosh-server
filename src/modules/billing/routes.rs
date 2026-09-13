@@ -862,6 +862,10 @@ async fn pay_invoice(
             invoice_id,
             &request.success_url,
             &request.cancel_url,
+            // PMS-1179: the provider the customer picked. Absent from a client
+            // that predates the choice, which still works wherever one gateway
+            // is active.
+            request.provider.as_deref(),
         )
         .await?;
     Ok(Json(PayInvoiceResponse {
@@ -895,6 +899,28 @@ fn caller_id_for_rate_limit(caller: &CallerContext) -> Uuid {
 /// itself is hidden on the Support view (SPA-side `use_capability`).
 /// Staff plane keeps `assert_staff_billing_finance` for parity with
 /// every other billing read (PMS-962 in-source guard).
+/// MAPPS-671 / PMS-1179: what the Pay button says for one provider.
+///
+/// The admin's override wins when set; otherwise a provider-derived default,
+/// so a tenant that never touches the field still gets coherent copy.
+/// Empty-after-trim counts as no override, or a whitespace-only value would
+/// ship a blank button.
+///
+/// Extracted because PMS-1179 made the readiness response carry a list AND a
+/// single legacy label: two places computing the same string is how the button
+/// a customer sees comes to disagree with the button the list describes.
+fn payment_button_label(provider: &str, override_label: Option<&str>) -> String {
+    override_label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| match provider {
+            "stripe" => "Pay with card".to_string(),
+            "paypal" => "Pay with PayPal".to_string(),
+            other => format!("Pay with {other}"),
+        })
+}
+
 async fn get_invoice_payment_readiness(
     State(state): State<BillingRouterState>,
     RequireCallerContext(caller): RequireCallerContext,
@@ -918,24 +944,22 @@ async fn get_invoice_payment_readiness(
         }
     }
     let active = state.service.active_provider_display(tenant).await?;
-    let gateway_ready = active.is_some();
-    let button_label = active.map(|(id, override_label)| {
-        // MAPPS-671 (mokosh-invoices P2a): the admin's override wins when
-        // set; otherwise fall back to a provider-derived default so a
-        // tenant that never touches the field still gets a coherent
-        // label. Empty-after-trim is treated as no override so a
-        // whitespace-only value cannot ship a blank button.
-        override_label
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| match id.as_str() {
-                "stripe" => "Pay with card".to_string(),
-                "paypal" => "Pay with PayPal".to_string(),
-                other => format!("Pay with {other}"),
-            })
-    });
+    let gateway_ready = !active.is_empty();
+    // PMS-1179: every payable option, each carrying the label the client
+    // prints, so a client renders one button per provider without knowing any
+    // provider by name.
+    let providers: Vec<PaymentProviderOption> = active
+        .iter()
+        .map(|(id, override_label)| PaymentProviderOption {
+            provider: id.clone(),
+            label: payment_button_label(id, override_label.as_deref()),
+        })
+        .collect();
+    // The first option, kept so a client that predates PMS-1179 still renders
+    // one working button rather than none.
+    let button_label = active
+        .first()
+        .map(|(id, override_label)| payment_button_label(id, override_label.as_deref()));
     let invoice_payable = matches!(
         invoice.status,
         InvoiceStatus::Pending | InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid
@@ -949,6 +973,7 @@ async fn get_invoice_payment_readiness(
     Ok(Json(InvoicePaymentReadinessResponse {
         gateway_ready,
         button_label,
+        providers,
         invoice_payable,
         balance_due_display,
     }))
