@@ -200,6 +200,41 @@ impl PaypalProvider {
         Ok(value)
     }
 
+    /// PMS-1184: one authenticated POST of a JSON body this module composed as
+    /// TEXT, for the one request where the bytes matter.
+    ///
+    /// `post_json` below serialises a `Value`, which reorders object keys; the
+    /// verify call has to send PayPal's own body back unchanged, so it builds
+    /// the request as a string and hands it over here. Everything else about
+    /// the call is the same, including that the token is never echoed.
+    async fn post_raw_json(
+        &self,
+        path: &str,
+        body: String,
+    ) -> AppResult<(reqwest::StatusCode, Value)> {
+        let token = self.access_token().await?;
+        let url = format!("{}{}", self.base(), path);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| AppError::external_service("paypal", format!("request failed: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let body: Value = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).map_err(|e| {
+                AppError::external_service("paypal", format!("response not JSON: {e}"))
+            })?
+        };
+        Ok((status, body))
+    }
+
     /// One authenticated JSON POST, with PayPal's error message surfaced and the
     /// request (which carried the tenant's token) never echoed.
     async fn post_json(&self, path: &str, body: &Value) -> AppResult<(reqwest::StatusCode, Value)> {
@@ -225,6 +260,42 @@ impl PaypalProvider {
         };
         Ok((status, body))
     }
+}
+
+/// PMS-1184: the verify-webhook-signature request, with the delivered body
+/// spliced in byte for byte.
+///
+/// A string rather than a `Value`, and that is the whole point: the envelope's
+/// own fields are ordinary values, but `webhook_event` has to reach PayPal
+/// exactly as PayPal sent it. Going through `serde_json::Value` reorders every
+/// object's keys, because the map is a `BTreeMap` without the `preserve_order`
+/// feature, and PayPal's signature base is computed over the event it is
+/// handed - so the round trip through a parsed value is itself the failure.
+///
+/// `raw` is checked to be valid JSON by the caller before it gets here, so the
+/// result is valid JSON; the envelope's other six values are escaped through
+/// `Value::String`, which is the only place a header value could carry a quote.
+fn verify_request_body(
+    transmission_id: &str,
+    transmission_time: &str,
+    transmission_sig: &str,
+    cert_url: &str,
+    auth_algo: &str,
+    webhook_id: &str,
+    raw: &str,
+) -> String {
+    let quoted = |v: &str| Value::String(v.to_string()).to_string();
+    format!(
+        "{{\"transmission_id\":{},\"transmission_time\":{},\"transmission_sig\":{},\
+         \"cert_url\":{},\"auth_algo\":{},\"webhook_id\":{},\"webhook_event\":{}}}",
+        quoted(transmission_id),
+        quoted(transmission_time),
+        quoted(transmission_sig),
+        quoted(cert_url),
+        quoted(auth_algo),
+        quoted(webhook_id),
+        raw,
+    )
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -328,17 +399,28 @@ impl PaymentProvider for PaypalProvider {
         let event: Value = serde_json::from_slice(raw_body)
             .map_err(|_| AppError::BadRequest("Malformed PayPal event body".to_string()))?;
 
-        let request = json!({
-            "transmission_id": transmission_id,
-            "transmission_time": transmission_time,
-            "transmission_sig": transmission_sig,
-            "cert_url": cert_url,
-            "auth_algo": auth_algo,
-            "webhook_id": self.webhook_id,
-            "webhook_event": event,
-        });
+        // PMS-1184: the body goes back VERBATIM. It used to be sent as the
+        // parsed `event` above, and `serde_json::Map` is a `BTreeMap` unless
+        // the `preserve_order` feature is on (it is not, and nothing in the
+        // workspace turns it on), so every object was re-emitted with its keys
+        // in alphabetical order. PayPal computes the signature base from the
+        // `webhook_event` it is handed, so a re-serialised body never matches
+        // what it signed and EVERY delivery came back FAILURE, whatever was
+        // configured. Six approved sandbox payments were refused by this
+        // server with a 401 each and reached no invoice.
+        let raw = std::str::from_utf8(raw_body)
+            .map_err(|_| AppError::BadRequest("Malformed PayPal event body".to_string()))?;
+        let request = verify_request_body(
+            transmission_id,
+            transmission_time,
+            transmission_sig,
+            cert_url,
+            auth_algo,
+            &self.webhook_id,
+            raw,
+        );
         let (status, body) = self
-            .post_json("/v1/notifications/verify-webhook-signature", &request)
+            .post_raw_json("/v1/notifications/verify-webhook-signature", request)
             .await?;
         if !status.is_success() {
             return Err(AppError::external_service(
@@ -347,6 +429,19 @@ impl PaymentProvider for PaypalProvider {
             ));
         }
         if body["verification_status"].as_str() != Some("SUCCESS") {
+            // PMS-1184: one line, because the absence of one is how this cost
+            // six payments. A refused delivery leaves no trace in this
+            // deployment (PMS-1182 is the record), so the only evidence was a
+            // row in PayPal's own dashboard saying 401. The event's own id is
+            // safe to name and is what PayPal's log is keyed on; the body is
+            // not logged, because it carries the payer's name and address.
+            tracing::warn!(
+                target: "mokosh_server.billing",
+                event_id = %event["id"].as_str().unwrap_or("unknown"),
+                event_type = %event["event_type"].as_str().unwrap_or("unknown"),
+                status = %body["verification_status"].as_str().unwrap_or("absent"),
+                "PayPal refused this webhook's signature; the delivery is not recorded"
+            );
             return Err(AppError::Unauthorized);
         }
         parse_paypal_event(&event)
@@ -482,6 +577,86 @@ fn parse_paypal_event(event: &Value) -> AppResult<PaymentEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PMS-1184: the delivered body reaches PayPal byte for byte.
+    ///
+    /// The failure this pins is silent and total. PayPal computes the
+    /// signature base from the `webhook_event` it is handed, and this module
+    /// used to hand it a `serde_json::Value` round trip. `serde_json::Map` is
+    /// a `BTreeMap` without the `preserve_order` feature, which is not on in
+    /// this workspace, so every object came back with its keys in alphabetical
+    /// order and every delivery verified as FAILURE - six approved payments
+    /// refused with a 401 each and no invoice touched.
+    #[test]
+    fn the_delivered_body_is_sent_back_unchanged() {
+        // PayPal's own key order, which is not alphabetical: this is the
+        // shape of a real `CHECKOUT.ORDER.APPROVED`.
+        let raw = r#"{"id":"WH-1","create_time":"2026-09-13T02:39:12.254Z","resource_type":"checkout-order","event_type":"CHECKOUT.ORDER.APPROVED","resource":{"status":"APPROVED","id":"9GF1"}}"#;
+        let body = verify_request_body("tid", "ttime", "tsig", "curl", "SHA256withRSA", "WID", raw);
+
+        assert!(
+            body.contains(raw),
+            "the delivered bytes must appear verbatim, got {body}"
+        );
+
+        // And the shape that was being sent instead does NOT contain them,
+        // which is what makes the assertion above worth making.
+        let reserialised =
+            serde_json::to_string(&serde_json::from_str::<Value>(raw).expect("the fixture parses"))
+                .expect("serialise");
+        assert_ne!(
+            reserialised, raw,
+            "a Value round trip has to change this body, or the test proves nothing"
+        );
+    }
+
+    /// The envelope is still valid JSON, and every field PayPal requires is on
+    /// it under the name PayPal reads.
+    #[test]
+    fn the_verify_envelope_names_every_field_paypal_reads() {
+        let raw = r#"{"id":"WH-1","event_type":"CHECKOUT.ORDER.APPROVED"}"#;
+        let body = verify_request_body(
+            "4dc7a2ae",
+            "2026-09-13T02:39:12Z",
+            "sig==",
+            "https://api.sandbox.paypal.com/cert.pem",
+            "SHA256withRSA",
+            "3WL54026PT222181E",
+            raw,
+        );
+        let parsed: Value = serde_json::from_str(&body).expect("the envelope is valid JSON");
+        assert_eq!(parsed["transmission_id"], "4dc7a2ae");
+        assert_eq!(parsed["transmission_time"], "2026-09-13T02:39:12Z");
+        assert_eq!(parsed["transmission_sig"], "sig==");
+        assert_eq!(
+            parsed["cert_url"],
+            "https://api.sandbox.paypal.com/cert.pem"
+        );
+        assert_eq!(parsed["auth_algo"], "SHA256withRSA");
+        assert_eq!(parsed["webhook_id"], "3WL54026PT222181E");
+        assert_eq!(
+            parsed["webhook_event"]["event_type"],
+            "CHECKOUT.ORDER.APPROVED"
+        );
+    }
+
+    /// A header value carrying a quote is escaped rather than breaking the
+    /// envelope. The values come off the wire, so this is the one place a
+    /// hand-built JSON string could be malformed by its input.
+    #[test]
+    fn a_header_value_with_a_quote_does_not_break_the_envelope() {
+        let body = verify_request_body(
+            "id\"with\"quotes",
+            "t",
+            "s",
+            "c",
+            "a",
+            "w",
+            r#"{"id":"WH-1"}"#,
+        );
+        let parsed: Value = serde_json::from_str(&body).expect("still valid JSON");
+        assert_eq!(parsed["transmission_id"], "id\"with\"quotes");
+    }
 
     fn ids() -> (Uuid, Uuid) {
         (Uuid::new_v4(), Uuid::new_v4())
