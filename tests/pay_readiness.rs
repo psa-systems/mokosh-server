@@ -155,12 +155,25 @@ async fn seed_draft_invoice(pool: &PgPool, tenant_id: Uuid, company_id: Uuid) ->
 /// the discriminator string, so it must equal `"stripe"` to match
 /// `provider::is_supported`.
 async fn seed_stripe_gateway(pool: &PgPool, tenant_id: Uuid) {
+    // PMS-1181: readiness now BUILDS the provider rather than reading the
+    // discriminator, because a row whose credential is missing reported the
+    // invoice as ready to pay and the customer met the failure instead of the
+    // admin. So the row carries a credential that parses; it is still never
+    // used on the network, which no readiness read touches. The zero key is
+    // the one `common::boot` wires into the router.
+    let plaintext = serde_json::json!({
+        "secret_key": "sk_test_readiness",
+        "webhook_secret": "whsec_readiness",
+    })
+    .to_string();
+    let encrypted = mokosh_server::utils::crypto::encrypt(&plaintext, &[0u8; 32]).unwrap();
     sqlx::query(
         "INSERT INTO payment_gateway_configs \
-            (tenant_id, provider, is_active, is_test_mode) \
-         VALUES ($1, 'stripe', TRUE, TRUE)",
+            (tenant_id, provider, is_active, is_test_mode, config_encrypted) \
+         VALUES ($1, 'stripe', TRUE, TRUE, $2)",
     )
     .bind(tenant_id)
+    .bind(encrypted)
     .execute(pool)
     .await
     .expect("seed stripe gateway");

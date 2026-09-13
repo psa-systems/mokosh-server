@@ -84,6 +84,184 @@ pub fn webhook_url(base: Option<&str>, provider: &str, tenant_id: Uuid) -> Optio
     ))
 }
 
+/// One credential a provider needs, named the way that provider names it.
+///
+/// PMS-1181: the server owns these shapes, so the server is where "is this
+/// field a secret" is answered. The client has its own copy of the labels for
+/// the form it renders; what it cannot have is this decision, because getting
+/// it wrong there means a secret printed on a settings page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialSpec {
+    /// The key inside the stored config object, exactly as the provider's own
+    /// credential struct deserialises it.
+    pub key: &'static str,
+    pub label: &'static str,
+    /// Whether the value must never be shown back in full.
+    ///
+    /// PayPal's `client_id` and `webhook_id` are identifiers rather than
+    /// secrets: the client id is public in PayPal's own JS SDK, and the
+    /// webhook id is printed beside the webhook in their dashboard. Showing
+    /// them back is the whole point - comparing the stored webhook id against
+    /// the one PayPal shows is the check an admin cannot make today.
+    pub secret: bool,
+}
+
+/// What `provider` keeps in its credential blob.
+///
+/// Empty for a provider this build cannot serve, which is the same answer
+/// [`build`] gives: there is no credential set to describe.
+pub fn credential_specs(provider: &str) -> &'static [CredentialSpec] {
+    match provider {
+        "stripe" => &[
+            CredentialSpec {
+                key: "secret_key",
+                label: "Secret key",
+                secret: true,
+            },
+            CredentialSpec {
+                key: "webhook_secret",
+                label: "Webhook signing secret",
+                secret: true,
+            },
+        ],
+        // `sandbox` is stored beside these three and is deliberately not one:
+        // it is the Test mode switch the form already shows, not a credential.
+        "paypal" => &[
+            CredentialSpec {
+                key: "client_id",
+                label: "Client ID",
+                secret: false,
+            },
+            CredentialSpec {
+                key: "client_secret",
+                label: "Client secret",
+                secret: true,
+            },
+            CredentialSpec {
+                key: "webhook_id",
+                label: "Webhook ID",
+                secret: false,
+            },
+        ],
+        _ => &[],
+    }
+}
+
+/// PMS-1181: how much of a stored credential may be shown back.
+///
+/// A field that is not a secret is shown whole, because that is the point:
+/// an admin compares the stored PayPal webhook id against the one PayPal
+/// prints beside the webhook. A secret is shown as its last four characters,
+/// which is enough to tell two pasted keys apart and is the one deliberate
+/// exception to the write-only rule (PMS-342); Stripe shows the same four of
+/// its own keys for the same reason. A value shorter than that is reported as
+/// present with no tail rather than shown in full, since the tail of a short
+/// secret is most of it.
+///
+/// `None` means nothing is stored.
+pub fn shown_value(spec: &CredentialSpec, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if !spec.secret {
+        return Some(value.to_string());
+    }
+    let tail: String = value.chars().rev().take(4).collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if value.chars().count() <= 8 {
+        return None;
+    }
+    Some(tail)
+}
+
+/// What one named check of a stored credential concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckOutcome {
+    Passed,
+    Failed,
+    /// The provider offers no way to check this from here.
+    ///
+    /// A third outcome rather than a pass, because a green tick on a field
+    /// nothing checked is how this whole class of defect got here: Stripe
+    /// cannot verify a webhook signing secret remotely, and reporting that as
+    /// working would be the same lie in a new place.
+    NotCheckable,
+}
+
+impl CheckOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::NotCheckable => "not_checkable",
+        }
+    }
+}
+
+/// One named check [`PaymentProvider::check`] performed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayCheck {
+    /// What was checked, in the words the provider's own dashboard uses.
+    pub name: &'static str,
+    pub outcome: CheckOutcome,
+    /// Why it failed, or why it could not be checked. The provider's own words
+    /// where it gave any, because "invalid_client" is what the admin will find
+    /// in PayPal's documentation and a paraphrase is not.
+    pub detail: String,
+}
+
+impl GatewayCheck {
+    pub fn passed(name: &'static str) -> Self {
+        Self {
+            name,
+            outcome: CheckOutcome::Passed,
+            detail: String::new(),
+        }
+    }
+
+    pub fn failed(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            outcome: CheckOutcome::Failed,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn not_checkable(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            name,
+            outcome: CheckOutcome::NotCheckable,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// PMS-1181: the required fields of `config` that are blank.
+///
+/// Both credential structs are `#[serde(default)]`, so a blob missing every
+/// field deserialises into empty strings and built a provider that reported
+/// itself ready and could not transact - MAPPS-759's defect with the server
+/// half left open. Each `from_config` calls this and refuses rather than
+/// constructing one.
+pub(crate) fn blank_required_fields(values: &[(&'static str, &str)]) -> Vec<&'static str> {
+    values
+        .iter()
+        .filter(|(_, value)| value.trim().is_empty())
+        .map(|(key, _)| *key)
+        .collect()
+}
+
+/// The error a `from_config` returns for blank required fields.
+pub(crate) fn incomplete_credentials(provider: &str, missing: &[&'static str]) -> AppError {
+    AppError::Configuration(format!(
+        "stored {provider} config is missing {}",
+        missing.join(", ")
+    ))
+}
+
 /// Turn a stored `(provider, decrypted config)` pair into a provider.
 ///
 /// The ONE place a discriminator becomes an implementation. Every caller that
@@ -215,6 +393,21 @@ pub trait PaymentProvider: Send + Sync {
         headers: &HeaderMap,
     ) -> AppResult<PaymentEvent>;
 
+    /// PMS-1181: check the stored credentials against the provider, without
+    /// taking a payment.
+    ///
+    /// One entry per thing an admin filled in, so "the keys are right and the
+    /// webhook is wrong" is a state that can be read off a settings page
+    /// rather than inferred from a customer's payment not arriving. A check
+    /// the provider offers no way to perform answers
+    /// [`CheckOutcome::NotCheckable`] and says so.
+    ///
+    /// The `Err` arm is for a call that could not be made at all (the network,
+    /// a malformed base URL); a provider that answered and refused us is a
+    /// failed check, not an error, because the admin needs to see the other
+    /// checks beside it.
+    async fn check(&self) -> AppResult<Vec<GatewayCheck>>;
+
     /// Charge an approved checkout (PMS-969). Only meaningful for a provider
     /// that emits [`PaymentEvent::RequiresCapture`]; a provider that charges
     /// on completion returns an error, because being asked means the receiver
@@ -234,7 +427,12 @@ mod tests {
         let config = r#"{"secret_key":"sk_test","webhook_secret":"whsec_test"}"#;
 
         assert!(build("stripe", config, http.clone()).is_ok());
-        assert!(build("paypal", config, http.clone()).is_ok());
+        // PMS-1181: a PayPal provider built from Stripe's blob used to
+        // succeed, because every PayPal field is `#[serde(default)]`. That was
+        // asserted here as the contract; it is the defect. A PayPal config is
+        // what builds a PayPal provider.
+        assert!(build("paypal", config, http.clone()).is_err());
+        assert!(build("paypal", &full_config("paypal"), http.clone()).is_ok());
 
         for unsupported in ["authorize_net", "", "STRIPE", "PayPal"] {
             // `Box<dyn PaymentProvider>` is not `Debug`, so this matches rather
@@ -250,6 +448,100 @@ mod tests {
                 Ok(_) => panic!("{unsupported:?} must not build"),
             }
         }
+    }
+
+    /// A credential blob naming every field `credential_specs` declares for
+    /// `provider`. That it BUILDS is the claim: the specs are what the client
+    /// asks an admin to fill in, so a spec set missing a field the provider
+    /// requires is a form that cannot produce a working gateway.
+    fn full_config(provider: &str) -> String {
+        let fields: Vec<String> = credential_specs(provider)
+            .iter()
+            .map(|spec| format!("{:?}:{:?}", spec.key, format!("value-{}", spec.key)))
+            .collect();
+        format!("{{{}}}", fields.join(","))
+    }
+
+    /// PMS-1181: the form's field list is the provider's requirement list.
+    #[test]
+    fn a_config_naming_every_declared_field_builds() {
+        let http = reqwest::Client::new();
+        for id in SUPPORTED {
+            assert!(
+                !credential_specs(id).is_empty(),
+                "{id} is servable and declares no credentials"
+            );
+            assert!(
+                build(id, &full_config(id), http.clone()).is_ok(),
+                "{id} declares fields that do not satisfy its own parser"
+            );
+        }
+        assert!(credential_specs("authorize_net").is_empty());
+        assert!(credential_specs("").is_empty());
+    }
+
+    /// PMS-1181: a blank required field is refused, and the message names it.
+    ///
+    /// This is MAPPS-759's failure at the layer below: a blob nothing reads
+    /// deserialised into empty strings, the row reported itself configured,
+    /// and the only symptom was a customer's payment never arriving.
+    #[test]
+    fn a_blank_required_field_refuses_to_build() {
+        let http = reqwest::Client::new();
+        for (id, blob, expected) in [
+            (
+                "paypal",
+                r#"{"client_id":"id","client_secret":"","webhook_id":"wh"}"#,
+                "client_secret",
+            ),
+            (
+                "paypal",
+                r#"{"client_id":"id","client_secret":"s","webhook_id":"   "}"#,
+                "webhook_id",
+            ),
+            (
+                "stripe",
+                r#"{"secret_key":"","webhook_secret":"whsec_x"}"#,
+                "secret_key",
+            ),
+        ] {
+            match build(id, blob, http.clone()) {
+                Err(AppError::Configuration(message)) => assert!(
+                    message.contains(expected),
+                    "{id}: {message:?} does not name {expected}"
+                ),
+                other => panic!("{id} with a blank {expected} must not build: {:?}", other.is_ok()),
+            }
+        }
+    }
+
+    /// PMS-1181: an identifier comes back whole, a secret as a tail.
+    ///
+    /// Whole is the point for the identifiers: comparing the stored PayPal
+    /// webhook id against the one PayPal prints is the check that a wrong one
+    /// would otherwise survive all the way to a customer's payment.
+    #[test]
+    fn what_is_shown_back_depends_on_whether_it_is_a_secret() {
+        let id = CredentialSpec {
+            key: "webhook_id",
+            label: "Webhook ID",
+            secret: false,
+        };
+        let secret = CredentialSpec {
+            key: "client_secret",
+            label: "Client secret",
+            secret: true,
+        };
+        assert_eq!(
+            shown_value(&id, "3WL54026PT222181E").as_deref(),
+            Some("3WL54026PT222181E")
+        );
+        assert_eq!(shown_value(&secret, "EEynpmak2i66ZGeHZRj").as_deref(), Some("HZRj"));
+        // A short secret is nearly all tail, so it is reported as present and
+        // shown as nothing.
+        assert_eq!(shown_value(&secret, "sk_test"), None);
+        assert_eq!(shown_value(&id, "   "), None);
+        assert_eq!(shown_value(&secret, ""), None);
     }
 
     /// `SUPPORTED` and `build` are two statements of the same fact, and a

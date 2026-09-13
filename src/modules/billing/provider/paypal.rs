@@ -42,7 +42,9 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use super::{CheckoutParams, CheckoutSession, PaymentEvent, PaymentProvider, RefundLine};
+use super::{
+    CheckoutParams, CheckoutSession, GatewayCheck, PaymentEvent, PaymentProvider, RefundLine,
+};
 use crate::utils::error::{AppError, AppResult};
 
 /// PayPal REST API base. Overridable via `PAYPAL_API_BASE` so an integration
@@ -99,6 +101,19 @@ pub fn from_config(plaintext: &str, http: reqwest::Client) -> AppResult<PaypalPr
     let creds: PaypalCredentials = serde_json::from_str(plaintext).map_err(|_| {
         AppError::Configuration("stored PayPal config is not valid JSON".to_string())
     })?;
+    // PMS-1181: every field is `#[serde(default)]`, so a blob that names none
+    // of them deserialises into empty strings. Building from that produced a
+    // provider that reported itself ready, minted nothing, and said nothing
+    // about why - MAPPS-759's defect with the server half left open. Refuse
+    // here, and `gateway_ready` reports false, which is what it always meant.
+    let missing = super::blank_required_fields(&[
+        ("client_id", &creds.client_id),
+        ("client_secret", &creds.client_secret),
+        ("webhook_id", &creds.webhook_id),
+    ]);
+    if !missing.is_empty() {
+        return Err(super::incomplete_credentials("PayPal", &missing));
+    }
     Ok(PaypalProvider::new(
         creds.client_id,
         creds.client_secret,
@@ -350,6 +365,63 @@ impl PaymentProvider for PaypalProvider {
             return Err(AppError::Unauthorized);
         }
         parse_paypal_event(&event)
+    }
+
+    /// PMS-1181: prove the three stored fields without taking a payment.
+    ///
+    /// The token request is exactly what every other call here starts with, so
+    /// it proves the client id and secret against the same endpoint a real
+    /// payment would use. The webhook lookup is the one that matters: PayPal
+    /// verifies a delivery by being asked about it under this webhook id, so
+    /// an id that does not exist under this app refuses EVERY delivery, and
+    /// until now the first thing to discover that was a customer's payment
+    /// not arriving.
+    ///
+    /// Sandbox or live follows the stored `sandbox` flag, so the check runs
+    /// against the same PayPal the payments do. An app's credentials do not
+    /// work across the two, which is itself a failure this surfaces.
+    async fn check(&self) -> AppResult<Vec<GatewayCheck>> {
+        let token = match self.access_token().await {
+            Ok(token) => token,
+            Err(e) => {
+                // The credential is wrong, so nothing below can run: the
+                // webhook check needs a token. Reported rather than guessed
+                // at, so the admin is not told a webhook id is wrong when what
+                // is wrong is the secret beside it.
+                return Ok(vec![
+                    GatewayCheck::failed("Client ID and secret", e.to_string()),
+                    GatewayCheck::not_checkable(
+                        "Webhook ID",
+                        "Checking the webhook needs working credentials.",
+                    ),
+                ]);
+            }
+        };
+        let mut checks = vec![GatewayCheck::passed("Client ID and secret")];
+        let url = format!("{}/v1/notifications/webhooks/{}", self.base(), self.webhook_id);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| AppError::external_service("paypal", format!("request failed: {e}")))?;
+        let status = resp.status();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap_or_default())
+            .unwrap_or(Value::Null);
+        if status.is_success() {
+            checks.push(GatewayCheck::passed("Webhook ID"));
+        } else {
+            let detail = body["message"]
+                .as_str()
+                .or(body["details"][0]["description"].as_str())
+                .unwrap_or("PayPal does not recognise this webhook ID for this app.");
+            checks.push(GatewayCheck::failed(
+                "Webhook ID",
+                format!("{detail} ({status})"),
+            ));
+        }
+        Ok(checks)
     }
 
     async fn capture(&self, order_id: &str) -> AppResult<()> {
