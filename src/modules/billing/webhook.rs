@@ -68,9 +68,12 @@ pub async fn provider_webhook_handler(
     //    is the same 401, for the reason in the module doc.
     let provider = state
         .billing
-        .provider_for_webhook(tenant_id)
+        .provider_for_webhook(tenant_id, state.provider_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
+    // PMS-1179: the lookup above is BY this route's provider, so a mismatch
+    // cannot reach here. Kept as a belt: it costs one comparison and it is the
+    // invariant the verification below depends on.
     if provider.id() != state.provider_id {
         return Err(AppError::Unauthorized);
     }
