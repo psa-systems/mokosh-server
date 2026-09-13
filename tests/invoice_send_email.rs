@@ -104,11 +104,23 @@ async fn set_company_billing_contact(pool: &PgPool, company_id: Uuid, contact_id
 }
 
 async fn seed_active_gateway(pool: &PgPool) {
+    // PMS-1181: the row has to carry a credential that BUILDS, because "is
+    // there a gateway" now means "can one take a payment" rather than "is
+    // there a row". A NULL column here used to be enough; it means the
+    // credential is in the secret provider, which holds nothing in this suite.
+    // The zero key is the one `common::boot` wires into the router.
+    let plaintext = serde_json::json!({
+        "secret_key": "sk_test_invoice_email",
+        "webhook_secret": "whsec_invoice_email",
+    })
+    .to_string();
+    let encrypted = mokosh_server::utils::crypto::encrypt(&plaintext, &[0u8; 32]).unwrap();
     sqlx::query(
         "INSERT INTO payment_gateway_configs (tenant_id, provider, is_active, is_test_mode, config_encrypted) \
-         VALUES ($1, 'stripe', TRUE, TRUE, NULL)",
+         VALUES ($1, 'stripe', TRUE, TRUE, $2)",
     )
     .bind(common::DEFAULT_TENANT_ID)
+    .bind(encrypted)
     .execute(pool)
     .await
     .expect("seed gateway");

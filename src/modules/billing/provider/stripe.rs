@@ -27,7 +27,9 @@ use dunite_stripe_core::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{CheckoutParams, CheckoutSession, PaymentEvent, PaymentProvider, RefundLine};
+use super::{
+    CheckoutParams, CheckoutSession, GatewayCheck, PaymentEvent, PaymentProvider, RefundLine,
+};
 use crate::utils::error::{AppError, AppResult};
 
 /// Stripe REST API base. Overridable via `STRIPE_API_BASE` so an integration
@@ -40,8 +42,9 @@ fn api_base() -> String {
 
 /// A tenant's Stripe connection. Built per request from the decrypted config.
 pub struct StripeProvider {
-    /// The tenant's restricted secret key (`rk_live_...` / `sk_test_...`).
-    /// Bearer for API calls; empty is acceptable on the webhook-only path.
+    /// The tenant's restricted secret key (`rk_live_...` / `sk_test_...`),
+    /// the bearer for API calls. PMS-1181: never empty, because `from_config`
+    /// refuses a blob missing it.
     secret_key: String,
     /// The tenant's webhook signing secret (`whsec_...`).
     webhook_secret: String,
@@ -74,6 +77,19 @@ pub fn from_config(plaintext: &str, http: reqwest::Client) -> AppResult<StripePr
     let creds: StripeCredentials = serde_json::from_str(plaintext).map_err(|_| {
         AppError::Configuration("stored Stripe config is not valid JSON".to_string())
     })?;
+    // PMS-1181: both fields are `#[serde(default)]`, so the pre-MAPPS-759
+    // blob (`{"api_key": ...}`, a shape nothing here reads) deserialised into
+    // two empty strings and built a provider that could neither mint a
+    // checkout nor verify a delivery, while the row reported itself
+    // configured. Refuse it instead, and `gateway_ready` reports what is
+    // actually true.
+    let missing = super::blank_required_fields(&[
+        ("secret_key", &creds.secret_key),
+        ("webhook_secret", &creds.webhook_secret),
+    ]);
+    if !missing.is_empty() {
+        return Err(super::incomplete_credentials("Stripe", &missing));
+    }
     Ok(StripeProvider::new(
         creds.secret_key,
         creds.webhook_secret,
@@ -199,6 +215,54 @@ impl PaymentProvider for StripeProvider {
         )
         .map_err(|_| AppError::Unauthorized)?;
         parse_stripe_event(raw_body)
+    }
+
+    /// PMS-1181: check the two stored secrets, as far as Stripe allows.
+    ///
+    /// `GET /v1/account` is the cheapest call that proves the key: it needs no
+    /// resource to exist and answers with the account the key belongs to, so a
+    /// key for the wrong account or the wrong mode fails here rather than at a
+    /// customer's checkout.
+    ///
+    /// The webhook signing secret has no remote check. Stripe does not expose
+    /// an endpoint that takes one, and the only proof is a delivery it
+    /// verifies, so the shape is checked here and the rest is reported as
+    /// unchecked rather than dressed up as a pass.
+    async fn check(&self) -> AppResult<Vec<GatewayCheck>> {
+        let url = format!("{}/v1/account", api_base());
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.secret_key)
+            .send()
+            .await
+            .map_err(|e| AppError::external_service("stripe", format!("request failed: {e}")))?;
+        let status = resp.status();
+        let body: Value =
+            serde_json::from_str(&resp.text().await.unwrap_or_default()).unwrap_or(Value::Null);
+        let key_check = if status.is_success() {
+            GatewayCheck::passed("Secret key")
+        } else {
+            let detail = body["error"]["message"]
+                .as_str()
+                .unwrap_or("Stripe refused this key.");
+            GatewayCheck::failed("Secret key", format!("{detail} ({status})"))
+        };
+        let webhook_check = if self.webhook_secret.starts_with("whsec_") {
+            GatewayCheck::not_checkable(
+                "Webhook signing secret",
+                "Stripe offers no way to verify a signing secret without a delivery, so this one is stored but unproven.",
+            )
+        } else {
+            // The endpoint URL pasted into the secret field is the common
+            // version of this, and it is worth naming: it looks filled in and
+            // refuses every delivery.
+            GatewayCheck::failed(
+                "Webhook signing secret",
+                "This does not look like a Stripe signing secret; they begin with whsec_.",
+            )
+        };
+        Ok(vec![key_check, webhook_check])
     }
 
     async fn capture(&self, order_id: &str) -> AppResult<()> {

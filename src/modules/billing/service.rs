@@ -2313,21 +2313,45 @@ impl BillingService {
         .fetch_all(&mut *tx)
         .await?;
 
-        let gateways: Vec<PaymentGatewayConfigResponse> = rows
-            .into_iter()
-            .map(|r| PaymentGatewayConfigResponse {
+        // The rows are read inside the tenant-scoped transaction; the
+        // per-field state below reaches the secret provider, which is not a
+        // database read, so the transaction is finished with first.
+        drop(tx);
+
+        let mut gateways: Vec<PaymentGatewayConfigResponse> = Vec::with_capacity(rows.len());
+        for r in rows {
+            // PMS-968: NULL means the credential is in the secret provider,
+            // so the row is configured. Non-NULL and non-empty is the
+            // pre-move state and equally configured. Only an empty string
+            // would not be, and nothing writes one.
+            let configured = r.config_encrypted.as_ref().is_none_or(|c| !c.is_empty());
+            // PMS-1181: a credential that cannot be read is a warning and an
+            // empty field list, never a failed list. The row exists and the
+            // admin needs to see it; `check_payment_gateway` is where they
+            // find out why its fields could not be described.
+            let credentials = match self
+                .credential_state(tenant_id.get(), &r.provider, r.config_encrypted.clone())
+                .await
+            {
+                Ok(credentials) => credentials,
+                Err(e) => {
+                    tracing::warn!(
+                        provider = %r.provider,
+                        "gateway credential state unavailable: {e}"
+                    );
+                    Vec::new()
+                }
+            };
+            gateways.push(PaymentGatewayConfigResponse {
                 id: r.id,
                 provider: GatewayProvider::from_str(&r.provider).unwrap_or(GatewayProvider::Stripe),
                 is_active: r.is_active,
                 is_test_mode: r.is_test_mode,
-                // PMS-968: NULL means the credential is in the secret provider,
-                // so the row is configured. Non-NULL and non-empty is the
-                // pre-move state and equally configured. Only an empty string
-                // would not be, and nothing writes one.
-                configured: r.config_encrypted.as_ref().is_none_or(|c| !c.is_empty()),
+                configured,
                 client_display_name: r.client_display_name,
-            })
-            .collect();
+                credentials,
+            });
+        }
 
         Ok((gateways, total as u64))
     }
@@ -2515,6 +2539,19 @@ impl BillingService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
+        // PMS-1181: read separately, and never out of the snapshot above,
+        // which subtracts this column precisely so the audit trail cannot hold
+        // it. A metadata-only save leaves whatever the row had, so this is the
+        // only way to know whether the credential is in the store or still in
+        // the pre-PMS-968 column.
+        let stored_config_encrypted: Option<String> = sqlx::query_scalar(
+            "SELECT config_encrypted FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
         // MAPPS-671: read back the persisted override so the response
         // reflects it (an omit-to-preserve request keeps whatever was
         // already stored, not `None`). Pulled from the `after` snapshot
@@ -2538,15 +2575,32 @@ impl BillingService {
         .await?;
         tx.commit().await?;
 
-        // After an upsert a secret is always stored (either the new one or the
-        // preserved existing one), so the gateway is configured.
+        // PMS-1181: read the stored fields back, so the form that just saved
+        // them can show what landed without a second request.
+        let credentials = self
+            .credential_state(
+                tenant_id.get(),
+                request.provider.as_str(),
+                stored_config_encrypted.filter(|c| !c.is_empty()),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    provider = %request.provider.as_str(),
+                    "gateway credential state unavailable after save: {e}"
+                );
+                Vec::new()
+            });
         Ok(PaymentGatewayConfigResponse {
             id,
             provider: request.provider,
             is_active: request.is_active,
             is_test_mode: request.is_test_mode,
+            // After an upsert a secret is always stored (either the new one or
+            // the preserved existing one), so the gateway is configured.
             configured: true,
             client_display_name,
+            credentials,
         })
     }
 
@@ -2644,6 +2698,112 @@ impl BillingService {
                 })
             }
         }
+    }
+
+    /// PMS-1181: what a stored gateway holds, field by field.
+    ///
+    /// This reads the plaintext and is the ONE place a stored credential is
+    /// turned into something a client may see, which is why the decision about
+    /// how much of each field can be shown is `provider::shown_value` and not a
+    /// rule invented here. The identifier fields come back whole and the secret
+    /// ones as a tail; nothing else about the blob leaves.
+    ///
+    /// An `Err` from the store is not fatal to the caller: a gateway whose
+    /// credential cannot be read still has a row to list, and the caller
+    /// answers an empty field list rather than failing the whole read.
+    async fn credential_state(
+        &self,
+        tenant_id: Uuid,
+        provider_id: &str,
+        config_encrypted: Option<String>,
+    ) -> AppResult<Vec<GatewayCredentialState>> {
+        let specs = provider::credential_specs(provider_id);
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let plaintext = self
+            .gateway_plaintext(tenant_id, provider_id, config_encrypted)
+            .await?;
+        let stored: serde_json::Value = serde_json::from_str(&plaintext).unwrap_or(
+            // A blob that does not parse describes no fields. It is not an
+            // error here: `from_config` is what refuses it, with the message
+            // the admin needs, and this read exists to help them see why.
+            serde_json::Value::Null,
+        );
+        Ok(specs
+            .iter()
+            .map(|spec| {
+                let raw = stored
+                    .get(spec.key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                GatewayCredentialState {
+                    key: spec.key.to_string(),
+                    label: spec.label.to_string(),
+                    present: !raw.trim().is_empty(),
+                    secret: spec.secret,
+                    value: provider::shown_value(spec, raw),
+                }
+            })
+            .collect())
+    }
+
+    /// PMS-1181: check one gateway's stored credentials against the provider.
+    ///
+    /// The row is read whether or not it is active: an admin fixing a gateway
+    /// they switched off needs to know it works BEFORE they switch it back on,
+    /// and refusing to check an inactive row would make the fix a guess again.
+    ///
+    /// A provider that cannot be built (a blob missing fields, an unsupported
+    /// discriminator) is reported as a single failed check rather than an
+    /// error, because that IS the answer to "does this configuration work" and
+    /// it is the one an admin most needs spelled out.
+    pub async fn check_payment_gateway(
+        &self,
+        tenant_id: TenantId,
+        provider_id: &str,
+    ) -> AppResult<Vec<GatewayCheckResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT COALESCE(config_encrypted, '') FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((encrypted,)) = row else {
+            // Named by the provider the caller asked about, not by the column
+            // it is stored in.
+            let provider = provider_id;
+            return Err(AppError::NotFound(format!(
+                "No {provider} gateway is configured for this tenant."
+            )));
+        };
+        let config_encrypted = (!encrypted.is_empty()).then_some(encrypted);
+        let built = self
+            .build_provider(tenant_id.get(), provider_id, config_encrypted)
+            .await;
+        let provider = match built {
+            Ok(provider) => provider,
+            Err(e) => {
+                return Ok(vec![GatewayCheckResponse {
+                    name: "Stored credentials".to_string(),
+                    outcome: provider::CheckOutcome::Failed.as_str().to_string(),
+                    detail: e.to_string(),
+                }]);
+            }
+        };
+        Ok(provider
+            .check()
+            .await?
+            .into_iter()
+            .map(|c| GatewayCheckResponse {
+                name: c.name.to_string(),
+                outcome: c.outcome.as_str().to_string(),
+                detail: c.detail,
+            })
+            .collect())
     }
 
     /// Build the provider a resolved row names.
@@ -2817,15 +2977,60 @@ impl BillingService {
     }
 
     pub async fn has_active_gateway(&self, tenant_id: TenantId) -> AppResult<bool> {
+        Ok(!self.usable_providers(tenant_id).await?.is_empty())
+    }
+
+    /// PMS-1181: the tenant's active providers that can actually be built.
+    ///
+    /// "Can serve" is what both callers have always claimed to answer and
+    /// neither did: this was a discriminator check, so a row whose credential
+    /// was missing, half-moved, or the pre-MAPPS-759 shape that names none of
+    /// the fields counted as ready. The customer then got a Pay button, a
+    /// checkout that 400d or a payment that reconciled against nothing, and
+    /// the MSP got no signal at all. Building the provider is the whole check:
+    /// it reads the credential from wherever the row keeps it and parses it
+    /// into that provider's own shape.
+    ///
+    /// A provider that cannot be built is dropped with a warning naming it,
+    /// never an error: one broken gateway must not take the readiness of the
+    /// other one with it.
+    ///
+    /// It costs one secret read per active row, on a path that runs when an
+    /// invoice is opened. That is the price of the answer being true.
+    async fn usable_providers(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<Vec<(String, Option<String>)>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let providers: Vec<String> = sqlx::query_scalar(
-            "SELECT provider FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND is_active = TRUE",
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT provider, client_display_name, config_encrypted \
+             FROM payment_gateway_configs WHERE tenant_id = $1 AND is_active = TRUE",
         )
         .bind(tenant_id)
         .fetch_all(&mut *tx)
         .await?;
-        Ok(providers.iter().any(|id| provider::is_supported(id)))
+        drop(tx);
+
+        let serveable = Self::serveable(
+            rows.iter()
+                .map(|(id, label, _)| (id.clone(), label.clone()))
+                .collect(),
+        );
+        let mut usable = Vec::with_capacity(serveable.len());
+        for (id, label) in serveable {
+            let encrypted = rows
+                .iter()
+                .find(|(row_id, _, _)| row_id == &id)
+                .and_then(|(_, _, encrypted)| encrypted.clone());
+            match self.build_provider(tenant_id.get(), &id, encrypted).await {
+                Ok(_) => usable.push((id, label)),
+                Err(e) => tracing::warn!(
+                    provider = %id,
+                    "active gateway is not usable and is not offered: {e}"
+                ),
+            }
+        }
+        Ok(usable)
     }
 
     /// MAPPS-666 (mokosh-invoices P1a) + MAPPS-671 (P2a): the tenant's
@@ -2840,17 +3045,11 @@ impl BillingService {
         &self,
         tenant_id: TenantId,
     ) -> AppResult<Vec<(String, Option<String>)>> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT provider, client_display_name FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND is_active = TRUE",
-        )
-        .bind(tenant_id)
-        .fetch_all(&mut *tx)
-        .await?;
         // PMS-1179: every payable option, not the first one found. A tenant
         // with both connected offers both, and the customer chooses.
-        Ok(Self::serveable(rows))
+        // PMS-1181: and only the ones that can be built, so the button the
+        // customer is shown is one that can take their money.
+        self.usable_providers(tenant_id).await
     }
 
     /// PMS-1182: record one inbound webhook delivery, whatever became of it.

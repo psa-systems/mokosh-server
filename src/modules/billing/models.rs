@@ -512,6 +512,46 @@ pub struct PaymentGatewayConfigResponse {
     /// label ("Pay with card" for Stripe, "Pay with PayPal" for PayPal).
     #[serde(default)]
     pub client_display_name: Option<String>,
+    /// PMS-1181: what this gateway holds, field by field.
+    ///
+    /// `configured` above is one badge for a whole credential set, which is
+    /// all an admin could see: not which of PayPal's three fields is stored,
+    /// and not whether the stored webhook id is the one PayPal shows beside
+    /// the webhook. That comparison is the check a wrong id would otherwise
+    /// survive until a customer's payment failed to arrive.
+    pub credentials: Vec<GatewayCredentialState>,
+}
+
+/// PMS-1181: one credential field of a stored gateway, as much of it as can be
+/// shown.
+#[derive(Debug, Clone, Serialize)]
+pub struct GatewayCredentialState {
+    /// The key inside the stored config, as the provider names it.
+    pub key: String,
+    pub label: String,
+    /// Whether a non-empty value is stored.
+    pub present: bool,
+    /// Whether the value must never be shown in full.
+    pub secret: bool,
+    /// What can be shown: the whole value for a field that is not a secret (an
+    /// identifier the provider prints in its own dashboard), and the last four
+    /// characters for one that is, which is enough to tell two pasted keys
+    /// apart and is the one deliberate exception to PMS-342. `None` when
+    /// nothing is stored.
+    pub value: Option<String>,
+}
+
+/// PMS-1181: what checking a stored gateway concluded.
+///
+/// One entry per thing the admin filled in, so "the keys are right and the
+/// webhook is wrong" is a state that reads off the screen. `outcome` is
+/// `passed`, `failed` or `not_checkable`; the third is not a pass, because a
+/// green tick on a field nothing checked is the defect this closes.
+#[derive(Debug, Clone, Serialize)]
+pub struct GatewayCheckResponse {
+    pub name: String,
+    pub outcome: String,
+    pub detail: String,
 }
 
 /// PMS-1182: one inbound webhook delivery, as this deployment saw it.
@@ -594,6 +634,12 @@ pub struct InvoicePaymentReadinessResponse {
     /// credentials (via the secret store or an inline legacy config).
     /// Not just "the row exists"; the credential has to be reachable
     /// or the mint would 400 at click time.
+    ///
+    /// PMS-1181: that last sentence was the intention and not the behaviour.
+    /// The check read the discriminator and nothing else, so a row whose
+    /// credential was missing or was the pre-MAPPS-759 shape reported ready,
+    /// and the customer met the failure instead of the admin. It builds the
+    /// provider now.
     pub gateway_ready: bool,
     /// Provider-derived default ("Pay with card" for Stripe, "Pay with
     /// PayPal" for PayPal). Phase 2 lets the tenant override via a
