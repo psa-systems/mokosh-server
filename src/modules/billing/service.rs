@@ -3975,7 +3975,25 @@ impl BillingService {
             // a draft rather than a `sent` nobody received. The relay's
             // acceptance is what "sent" means from here; delivery beyond it is
             // the relay's.
-            if let Some((_, address)) = &recipient {
+            if let Some((contact_id, address)) = &recipient {
+                // PMS-1186: the mail carries a pay link, so the person it goes
+                // to has to be able to open the invoice it links to. Being
+                // sent an invoice is the MSP saying this person handles them,
+                // and until this the two facts were unconnected: the recipient
+                // is resolved from `billing_contact_id` and the company's
+                // default pointer, while what the portal shows comes from
+                // capabilities, so a customer could be mailed a Pay link into
+                // a portal that would not show them the invoice.
+                //
+                // Inside this transaction with the send, so a mail the relay
+                // refuses rolls the grant back with the rest of it.
+                crate::modules::contacts::portal_access::ensure_can_read_invoices(
+                    &mut tx,
+                    tenant_id,
+                    *contact_id,
+                    ctx,
+                )
+                .await?;
                 self.email_invoice(tenant_id, &document, address, &bytes)
                     .await?;
                 sqlx::query(

@@ -676,8 +676,11 @@ impl ContactService {
             .await?;
         self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
             .await?;
-        // PMS-993: assigning the billing contact is the role grant, so it is
-        // checked harder than a plain foreign id - tenant AND company.
+        // PMS-993 / PMS-1186: assigning the billing contact IS the role grant
+        // again, so it is checked harder than a plain foreign id - tenant AND
+        // company. It stopped being one when PMS-1064 retired the portal
+        // router that read this column as the gate, and the grant below is
+        // what makes the sentence true a second time.
         self.validate_fk_opt(tenant_id, "contacts", request.default_billing_contact_id)
             .await?;
         self.assert_contact_of_company(tenant_id, company_id, request.default_billing_contact_id)
@@ -985,6 +988,15 @@ impl ContactService {
             after,
         )
         .await?;
+        // PMS-1186: naming somebody the billing contact is what makes them one,
+        // so it is also what lets them read the invoices they will be sent.
+        // Inside this transaction, so a rolled-back update grants nothing.
+        if let Some(billing_id) = request.default_billing_contact_id {
+            crate::modules::contacts::portal_access::ensure_can_read_invoices(
+                &mut tx, tenant_id, billing_id, ctx,
+            )
+            .await?;
+        }
         tx.commit().await?;
 
         self.get_company(tenant_id, company_id).await
