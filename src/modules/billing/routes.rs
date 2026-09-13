@@ -156,6 +156,12 @@ pub fn billing_routes(service: BillingService, public_api_base: Option<String>) 
             "/payment-gateways/{provider}",
             delete(delete_payment_gateway),
         )
+        // PMS-1181: a POST because it calls the provider, and the admin is
+        // asking for that call to happen; nothing here is written.
+        .route(
+            "/payment-gateways/{provider}/check",
+            axum::routing::post(check_payment_gateway),
+        )
         .route("/tax-rates", get(list_tax_rates).post(create_tax_rate))
         .route(
             "/tax-rates/{id}",
@@ -366,6 +372,29 @@ async fn upsert_payment_gateway(
         .upsert_payment_gateway(user.tenant(), &request, &ctx)
         .await?;
     Ok(Json(g))
+}
+
+/// PMS-1181: check a stored gateway's credentials against the provider.
+///
+/// An admin filling this form in has no way to tell a right configuration from
+/// a wrong one: the credentials are write-only, and the first thing to
+/// exercise them is a customer's payment. A wrong PayPal webhook id in
+/// particular survives the save, the readiness check and the checkout, and
+/// shows up only as a payment that never reaches the invoice.
+async fn check_payment_gateway(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Path(provider): Path<String>,
+) -> AppResult<Json<Vec<GatewayCheckResponse>>> {
+    let provider = GatewayProvider::from_str(&provider).ok_or_else(|| {
+        crate::utils::error::AppError::BadRequest(format!("Unknown provider {provider:?}"))
+    })?;
+    let checks = state
+        .service
+        .check_payment_gateway(user.tenant(), provider.as_str())
+        .await?;
+    Ok(Json(checks))
 }
 
 async fn delete_payment_gateway(
