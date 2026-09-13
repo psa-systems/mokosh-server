@@ -205,7 +205,7 @@ impl InvitationsService {
         .await?;
 
         let rows = sqlx::query_as::<_, InvitationResponse>(
-            r#"SELECT id, email, role, status, invited_by, expires_at, created_at
+            r#"SELECT id, email, role, status, invited_by, expires_at, created_at, team_id
                FROM tenant_invitations
                WHERE tenant_id = $1 AND status = 'pending'
                ORDER BY created_at DESC
