@@ -529,6 +529,13 @@ services:
       # local hook and only failed in CI. `tests/` is compile-only here (the
       # Postgres-backed run stays in `just test-integration`).
       - ./tests:/app/tests
+      # PMS-1183: the nextest profile `just test-integration` names
+      # (`--profile ci`, from `.config/nextest.toml`, PMS-1177). This mount
+      # list enumerates the source tree file by file, so a new top-level
+      # config directory is invisible in dev until it is added here, and the
+      # recipe failed with an unknown-profile error while CI, which checks the
+      # whole repository out, stayed green.
+      - ./.config:/app/.config
       - server-target:/app/target
       # PMS-836: uploads (ticket attachments and tenant logos) land under
       # ATTACHMENT_DIR. Without this they live in the container filesystem and
