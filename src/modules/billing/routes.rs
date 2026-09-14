@@ -902,12 +902,23 @@ async fn pay_invoice(
 ) -> Result<Response, AppError> {
     request.validate()?;
     let tenant = caller.tenant();
+    // MAPPS-673: the amount override, when present, needs the `invoices:pay_partial`
+    // cap on top of the `invoices:pay` gate above; staff billing/finance
+    // bypasses both. Range validation (below the floor / above balance_due)
+    // stays in the service so a staff caller and a contact caller are
+    // refused on the same numbers.
+    let partial = request.amount.is_some();
     match &caller {
         CallerContext::Staff(auth) => {
             assert_staff_billing_finance(auth, &settings).await?;
         }
         CallerContext::Contact(_) => {
             caller.require_capability(caps::INVOICES_PAY, &db).await?;
+            if partial {
+                caller
+                    .require_capability(caps::INVOICES_PAY_PARTIAL, &db)
+                    .await?;
+            }
         }
     }
     // MAPPS-677: bound how many mints one caller (or one invoice) can trigger
@@ -940,6 +951,10 @@ async fn pay_invoice(
             // that predates the choice, which still works wherever one gateway
             // is active.
             request.provider.as_deref(),
+            // MAPPS-673: the chosen partial amount. `None` is the pre-MAPPS-673
+            // full-balance mint; a `Some` value has already been gated on
+            // `invoices:pay_partial` above and is range-checked in the service.
+            request.amount,
         )
         .await?;
     Ok(Json(PayInvoiceResponse {
@@ -1044,12 +1059,38 @@ async fn get_invoice_payment_readiness(
     } else {
         format!("{:.2} {}", invoice.balance_due, currency)
     };
+    // MAPPS-673: partial-payment gating for the amount input. Requires the
+    // gateway is ready, the invoice is payable AND the caller holds
+    // `invoices:pay_partial` (or is staff, which `has_capability` returns
+    // `true` for). The floor is read from the tenant's most restrictive
+    // active gateway config, so a client picking any provider still sees a
+    // value the pay endpoint will accept.
+    let partial_payment_allowed = gateway_ready
+        && invoice_payable
+        && caller
+            .has_capability(caps::INVOICES_PAY_PARTIAL, &db)
+            .await?;
+    let min_partial_amount_display = if partial_payment_allowed {
+        let floor = state
+            .service
+            .min_partial_amount_across_active(tenant)
+            .await?;
+        Some(if currency.eq_ignore_ascii_case("USD") {
+            format!("${floor:.2}")
+        } else {
+            format!("{floor:.2} {currency}")
+        })
+    } else {
+        None
+    };
     Ok(Json(InvoicePaymentReadinessResponse {
         gateway_ready,
         button_label,
         providers,
         invoice_payable,
         balance_due_display,
+        partial_payment_allowed,
+        min_partial_amount_display,
     }))
 }
 

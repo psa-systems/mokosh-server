@@ -73,6 +73,12 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
             description: "Start a payment checkout for an outstanding invoice.".to_string(),
         },
         CapabilityDescriptor {
+            key: caps::INVOICES_PAY_PARTIAL.to_string(),
+            label: "Pay a partial amount".to_string(),
+            group: "Invoices".to_string(),
+            description: "Pay less than the outstanding balance on an invoice (a chosen amount between the tenant's minimum and the balance).".to_string(),
+        },
+        CapabilityDescriptor {
             key: caps::INVOICES_DOWNLOAD_PDF.to_string(),
             label: "Download invoice PDFs".to_string(),
             group: "Invoices".to_string(),

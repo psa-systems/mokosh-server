@@ -60,8 +60,6 @@
 //!   the customer-facing submit)
 //! - `tickets:mark_all_read` (bulk-clear notification badges on tickets)
 //! - `invoices:view_payments` (see payment history against invoices)
-//! - `invoices:pay_partial` (split pay flow; today `invoices:pay` covers
-//!   the full-amount checkout only)
 //! - `quotes:comment` (post a public comment on a quote thread)
 //! - `quotes:request_revision` (kick a revise cycle back to the MSP)
 //! - `contracts:comment` (post a public comment on a contract thread)
@@ -117,6 +115,18 @@ pub const TICKETS_REQUEST_APPROVAL: &str = "tickets:request_approval";
 pub const INVOICES_READ: &str = "invoices:read";
 /// Trigger a payment checkout (Stripe / Paddle) for an outstanding invoice.
 pub const INVOICES_PAY: &str = "invoices:pay";
+/// MAPPS-673: pay a chosen amount below `balance_due` instead of the full
+/// balance. Gated separately from [`INVOICES_PAY`] so a Support Contact
+/// role can never mint a partial-payment checkout, and so an operator can
+/// grant "full pay only" without also granting split payments.
+///
+/// The route ([`crate::modules::billing::routes::pay_invoice`]) accepts an
+/// optional `amount` on `PayInvoiceRequest`; when it is present the caller
+/// MUST hold this capability (or be staff billing/finance), and the amount
+/// is clamped to `[min_partial_amount, balance_due]`. An amount at or above
+/// `balance_due` still needs [`INVOICES_PAY`], which is what a full-pay
+/// caller who does not hold this cap is allowed to send.
+pub const INVOICES_PAY_PARTIAL: &str = "invoices:pay_partial";
 /// PMS-936: download the rendered PDF of an invoice scoped to the
 /// caller's Company. Gated separately from `invoices:read` so a
 /// role can see invoice totals in the SPA without pulling the PDF.
@@ -205,6 +215,7 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     TICKETS_REQUEST_APPROVAL,
     INVOICES_READ,
     INVOICES_PAY,
+    INVOICES_PAY_PARTIAL,
     INVOICES_DOWNLOAD_PDF,
     PAYMENT_METHODS_MANAGE_OWN,
     QUOTES_READ,
@@ -241,6 +252,7 @@ pub const BUILTIN_BILLING_CONTACT: &[&str] = &[
     SETTINGS_MANAGE_OWN,
     INVOICES_DOWNLOAD_PDF,
     QUOTES_DOWNLOAD_PDF,
+    INVOICES_PAY_PARTIAL,
     PAYMENT_METHODS_MANAGE_OWN,
 ];
 
@@ -473,6 +485,10 @@ mod tests {
         let support_197 = &["approvals:decide"];
         // Migration 199 (PMS-1118) re-appends the unions above and adds
         // nothing, so it has no entry of its own.
+        // Migration 217 (MAPPS-673): appends `invoices:pay_partial` to
+        // Billing Contact so a portal contact holding the built-in role
+        // can mint a partial-amount checkout as well as a full one.
+        let billing_217 = &["invoices:pay_partial"];
         // Migration 219 (MAPPS-674): appends `payment_methods:manage_own` to
         // Billing Contact so a portal contact holding the built-in role can
         // save and remove their own cards (Stripe SetupIntent flow).
@@ -484,7 +500,7 @@ mod tests {
         let migrated: [(&str, BTreeSet<&str>); 3] = [
             (
                 "Billing Contact",
-                union(&[billing_171, billing_179, billing_219]),
+                union(&[billing_171, billing_179, billing_217, billing_219]),
             ),
             (
                 "Support Contact",
