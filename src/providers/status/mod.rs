@@ -60,6 +60,7 @@ use crate::utils::deployment::{
 };
 use crate::utils::email::MailerConfig;
 
+pub mod auth;
 pub mod public_summary;
 pub mod public_summary_route;
 pub mod renderer_html;

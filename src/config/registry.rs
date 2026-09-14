@@ -255,6 +255,20 @@ declare_keys! {
     Application ADMIN_PASSWORD = "ADMIN_PASSWORD";
     Application LOGIN_APPROVAL_ENABLED = "LOGIN_APPROVAL_ENABLED";
 
+    /// PMS-1193 / BUNYIP-641: the Bunyip machine-credential client_id this
+    /// deployment accepts on the admin provider-status routes. Set together
+    /// with `BUNYIP_STATUS_CLIENT_SECRET`; when either is unset the machine-
+    /// credential path is disabled and the routes gate on `RequireAdmin`
+    /// alone (the pre-PMS-1193 behaviour). Presented by Bunyip as HTTP
+    /// Basic per `bunyip/docs/provider-status-contract.md`.
+    Application BUNYIP_STATUS_CLIENT_ID = "BUNYIP_STATUS_CLIENT_ID";
+    /// PMS-1193 / BUNYIP-641: the plaintext client_secret paired with
+    /// `BUNYIP_STATUS_CLIENT_ID`. Compared in constant time against the
+    /// Basic auth Bunyip presents. Unset disables the machine-credential
+    /// path; a set value stays in the operator's SOPS-encrypted
+    /// compose-secrets on staging and prod.
+    Application BUNYIP_STATUS_CLIENT_SECRET = "BUNYIP_STATUS_CLIENT_SECRET";
+
     // -- Feature flags (PMS-983) ---------------------------------------------
     // Reached through `crate::config::flags`, so the parse rule and the
     // default live with the flag rather than at every read site. No feature
