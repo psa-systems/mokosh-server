@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use super::{
     CheckoutParams, CheckoutSession, GatewayCheck, PaymentEvent, PaymentProvider, RefundLine,
+    SetupIntentParams,
 };
 use crate::utils::error::{AppError, AppResult};
 
@@ -273,6 +274,126 @@ impl PaymentProvider for StripeProvider {
             "stripe has no capture step; order {order_id:?} was routed to the wrong provider"
         )))
     }
+
+    /// MAPPS-674: mint a Stripe Checkout Session in `mode: 'setup'`.
+    ///
+    /// Same POST endpoint as the payment mode above (Stripe's `mode` field
+    /// picks between them), so a `setup` session is a payment session that
+    /// stores the card without charging. Metadata stamps the tenant and the
+    /// contact so the webhook receiver on `checkout.session.completed` can
+    /// route the resulting row back to the calling contact without a
+    /// database join. `payment_method_data[allow_redisplay] = always` lets
+    /// Stripe show this card again on a future checkout session for the
+    /// same Customer, which is the whole point of saving it.
+    async fn create_setup_intent_session(
+        &self,
+        params: &SetupIntentParams<'_>,
+    ) -> AppResult<CheckoutSession> {
+        let mut form: Vec<(String, String)> = vec![
+            ("mode".into(), "setup".into()),
+            ("success_url".into(), params.success_url.to_string()),
+            ("cancel_url".into(), params.cancel_url.to_string()),
+            // Cards only for now; PayPal Reference Transactions is a
+            // different surface tracked as a MAPPS-674 follow-up.
+            ("payment_method_types[0]".into(), "card".into()),
+            ("metadata[tenant_id]".into(), params.tenant_id.to_string()),
+            ("metadata[contact_id]".into(), params.contact_id.to_string()),
+            // Stamp the SetupIntent too so the setup.succeeded event (should
+            // we ever move off checkout.session.completed) carries the same
+            // reconciliation keys as the session that owns it.
+            (
+                "setup_intent_data[metadata][tenant_id]".into(),
+                params.tenant_id.to_string(),
+            ),
+            (
+                "setup_intent_data[metadata][contact_id]".into(),
+                params.contact_id.to_string(),
+            ),
+        ];
+        if let Some(email) = params.customer_email {
+            form.push((String::from("customer_email"), email.to_string()));
+        }
+
+        let url = format!("{}/v1/checkout/sessions", api_base());
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.secret_key)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| AppError::external_service("stripe", format!("request failed: {e}")))?;
+        let status = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::external_service("stripe", format!("response not JSON: {e}")))?;
+        if !status.is_success() {
+            let msg = body["error"]["message"].as_str().unwrap_or("unknown error");
+            return Err(AppError::external_service(
+                "stripe",
+                format!("setup intent session failed ({status}): {msg}"),
+            ));
+        }
+        let session_id = body["id"].as_str().unwrap_or_default().to_string();
+        let checkout_url = body["url"].as_str().unwrap_or_default().to_string();
+        if session_id.is_empty() || checkout_url.is_empty() {
+            return Err(AppError::external_service(
+                "stripe",
+                "setup intent session response missing id/url",
+            ));
+        }
+        Ok(CheckoutSession {
+            session_id,
+            url: checkout_url,
+        })
+    }
+
+    /// MAPPS-674: `POST /v1/payment_methods/{pm}/detach`.
+    ///
+    /// Detach unlinks the PaymentMethod from every Customer it is attached
+    /// to, so no future charge from us can reach the card. Called by the
+    /// removal path BEFORE the `contact_payment_methods` row is deleted -
+    /// if the detach fails we surface the error and keep the row, so the
+    /// contact can retry; if the row deleted first and the detach then
+    /// failed, the card would stay attached with no mokosh record of it.
+    async fn detach_payment_method(&self, provider_pm_id: &str) -> AppResult<()> {
+        if provider_pm_id.is_empty() {
+            return Err(AppError::BadRequest(
+                "Empty PaymentMethod id cannot be detached.".to_string(),
+            ));
+        }
+        let url = format!(
+            "{}/v1/payment_methods/{}/detach",
+            api_base(),
+            provider_pm_id
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.secret_key)
+            .send()
+            .await
+            .map_err(|e| AppError::external_service("stripe", format!("request failed: {e}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        // A PaymentMethod that is already detached returns 400 with a
+        // `resource_missing` / already-detached code. Treat that as success
+        // so a retry after a partial removal completes cleanly.
+        let body: Value =
+            serde_json::from_str(&resp.text().await.unwrap_or_default()).unwrap_or(Value::Null);
+        let code = body["error"]["code"].as_str().unwrap_or_default();
+        if code == "resource_missing" {
+            return Ok(());
+        }
+        let msg = body["error"]["message"].as_str().unwrap_or("unknown error");
+        Err(AppError::external_service(
+            "stripe",
+            format!("detach payment method failed ({status}): {msg}"),
+        ))
+    }
 }
 
 /// Stripe's signature header name.
@@ -295,38 +416,17 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
 
     match kind.as_str() {
         "checkout.session.completed" => {
-            if object["payment_status"].as_str() != Some("paid") {
-                return Ok(PaymentEvent::Ignored { kind });
+            // MAPPS-674: the session's `mode` decides which PaymentEvent
+            // this becomes. `payment` (or a legacy blank, which Stripe
+            // treats as `payment`) is a charge; `setup` is a
+            // saved-card SetupIntent. Splitting here rather than at the
+            // receiver means the dispatcher never has to know Stripe's
+            // shape - one Stripe event maps to one PaymentEvent.
+            match object["mode"].as_str().unwrap_or("payment") {
+                "payment" => parse_stripe_payment_session(&event.raw, object, kind),
+                "setup" => parse_stripe_setup_session(&event.raw, object, kind),
+                _ => Ok(PaymentEvent::Ignored { kind }),
             }
-            let provider_reference = match object["payment_intent"].as_str() {
-                Some(pi) if !pi.is_empty() => pi.to_string(),
-                _ => return Ok(PaymentEvent::Ignored { kind }),
-            };
-            let tenant_id = object["metadata"]["tenant_id"]
-                .as_str()
-                .and_then(|s| Uuid::parse_str(s).ok());
-            let invoice_id = object["metadata"]["invoice_id"]
-                .as_str()
-                .and_then(|s| Uuid::parse_str(s).ok());
-            let amount_total = object["amount_total"].as_i64();
-            let (Some(tenant_id), Some(invoice_id), Some(amount_total)) =
-                (tenant_id, invoice_id, amount_total)
-            else {
-                // Legit Stripe event, but not one of ours (no metadata) or
-                // missing the amount. Do not act, do not retry.
-                return Ok(PaymentEvent::Ignored { kind });
-            };
-            Ok(PaymentEvent::PaymentSucceeded {
-                provider_reference,
-                tenant_id,
-                invoice_id,
-                amount: from_minor_units(amount_total),
-                currency: object["currency"]
-                    .as_str()
-                    .unwrap_or("usd")
-                    .to_ascii_uppercase(),
-                raw: event.raw,
-            })
         }
         "charge.refunded" => {
             let provider_reference = match object["payment_intent"].as_str() {
@@ -368,6 +468,141 @@ fn parse_stripe_event(raw_body: &[u8]) -> AppResult<PaymentEvent> {
         }
         _ => Ok(PaymentEvent::Ignored { kind }),
     }
+}
+
+/// Split out from [`parse_stripe_event`] so a `checkout.session.completed`
+/// in `mode: 'payment'` keeps the exact pre-MAPPS-674 shape.
+fn parse_stripe_payment_session(
+    raw: &Value,
+    object: &Value,
+    kind: String,
+) -> AppResult<PaymentEvent> {
+    if object["payment_status"].as_str() != Some("paid") {
+        return Ok(PaymentEvent::Ignored { kind });
+    }
+    let provider_reference = match object["payment_intent"].as_str() {
+        Some(pi) if !pi.is_empty() => pi.to_string(),
+        _ => return Ok(PaymentEvent::Ignored { kind }),
+    };
+    let tenant_id = object["metadata"]["tenant_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let invoice_id = object["metadata"]["invoice_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let amount_total = object["amount_total"].as_i64();
+    let (Some(tenant_id), Some(invoice_id), Some(amount_total)) =
+        (tenant_id, invoice_id, amount_total)
+    else {
+        return Ok(PaymentEvent::Ignored { kind });
+    };
+    Ok(PaymentEvent::PaymentSucceeded {
+        provider_reference,
+        tenant_id,
+        invoice_id,
+        amount: from_minor_units(amount_total),
+        currency: object["currency"]
+            .as_str()
+            .unwrap_or("usd")
+            .to_ascii_uppercase(),
+        raw: raw.clone(),
+    })
+}
+
+/// MAPPS-674: parse a `checkout.session.completed` in `mode: 'setup'` into
+/// [`PaymentEvent::PaymentMethodAttached`]. Reads:
+///
+/// - `customer` for the Stripe Customer id (the card owner on Stripe's side).
+/// - `setup_intent` for the SetupIntent id, then reads the `payment_method`
+///   off the object itself, since the session carries the expanded
+///   PaymentMethod on completion.
+/// - `metadata.tenant_id` / `metadata.contact_id`, stamped at mint time
+///   by [`StripeProvider::create_setup_intent_session`].
+/// - The `card` block for the display digest (brand + last4 + exp_month +
+///   exp_year), never the PAN or CVV.
+///
+/// Any field absent means an unrelated session on the tenant's account,
+/// which is [`PaymentEvent::Ignored`] so the receiver 200s and the provider
+/// stops retrying.
+fn parse_stripe_setup_session(
+    raw: &Value,
+    object: &Value,
+    kind: String,
+) -> AppResult<PaymentEvent> {
+    if object["status"].as_str() != Some("complete") {
+        return Ok(PaymentEvent::Ignored { kind });
+    }
+    let provider_customer_id = match object["customer"].as_str() {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return Ok(PaymentEvent::Ignored { kind }),
+    };
+    // The session carries the SetupIntent with the newly attached
+    // PaymentMethod. Stripe returns it either expanded (an object with
+    // `payment_method` inside) or as a plain id string; both need reading.
+    let setup_intent = &object["setup_intent"];
+    let payment_method = if setup_intent.is_object() {
+        setup_intent["payment_method"].clone()
+    } else {
+        object["payment_method"].clone()
+    };
+    let provider_pm_id = match payment_method_id(&payment_method) {
+        Some(id) => id,
+        None => return Ok(PaymentEvent::Ignored { kind }),
+    };
+    let tenant_id = object["metadata"]["tenant_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let contact_id = object["metadata"]["contact_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let (Some(tenant_id), Some(contact_id)) = (tenant_id, contact_id) else {
+        return Ok(PaymentEvent::Ignored { kind });
+    };
+    // The card block is only present when the PaymentMethod is expanded;
+    // absent means "someone attached a non-card via API", which we do not
+    // support here yet - ignore rather than fabricate a display digest.
+    let card = if payment_method.is_object() {
+        &payment_method["card"]
+    } else {
+        &Value::Null
+    };
+    let brand = card["brand"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let last4 = card["last4"].as_str().unwrap_or_default().to_string();
+    let exp_month = card["exp_month"].as_i64().unwrap_or(0);
+    let exp_year = card["exp_year"].as_i64().unwrap_or(0);
+    if brand.is_empty() || last4.is_empty() || exp_month == 0 || exp_year == 0 {
+        return Ok(PaymentEvent::Ignored { kind });
+    }
+    Ok(PaymentEvent::PaymentMethodAttached {
+        provider_pm_id,
+        provider_customer_id,
+        tenant_id,
+        contact_id,
+        brand,
+        last4,
+        exp_month: exp_month as u8,
+        exp_year: exp_year as u16,
+        raw: raw.clone(),
+    })
+}
+
+/// Extract a PaymentMethod id from an expanded object or a plain string;
+/// anything else is `None`.
+fn payment_method_id(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    if value.is_object() {
+        if let Some(id) = value["id"].as_str().filter(|s| !s.is_empty()) {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

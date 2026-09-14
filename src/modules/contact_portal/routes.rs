@@ -35,13 +35,20 @@ pub struct ContactRouterState {
     /// the password through one does not reset the other. Only a
     /// rejected re-auth spends it.
     pub reauth_limiter: Arc<crate::modules::auth::rate_limit::ReauthRateLimiter>,
+    /// MAPPS-674: card add / list / remove / set-default for the caller's
+    /// own saved payment methods. Built at startup so the four routes
+    /// below all reach the same service instance.
+    pub payment_methods: Arc<super::payment_methods::PaymentMethodsService>,
 }
 
 /// Build the `/api/v1/contact/*` sub-router. Layered with
 /// `portal_contact_middleware` so every request through this tree
 /// decodes the Bearer / cookie into a `ContactAuthState` extension
 /// (default when absent); downstream extractors then 401 as needed.
-pub fn contact_routes(service: ContactAuthService) -> Router {
+pub fn contact_routes(
+    service: ContactAuthService,
+    payment_methods: Arc<super::payment_methods::PaymentMethodsService>,
+) -> Router {
     let service_arc = Arc::new(service);
     let mw = ContactAuthMiddleware {
         service: service_arc.clone(),
@@ -49,6 +56,7 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
     let state = ContactRouterState {
         service: service_arc,
         reauth_limiter: crate::modules::auth::rate_limit::ReauthRateLimiter::new(10, 5),
+        payment_methods,
     };
     Router::new()
         .route("/auth/login", post(login))
@@ -115,6 +123,18 @@ pub fn contact_routes(service: ContactAuthService) -> Router {
         .route(
             "/portal/{slug}/resolve-to-portal-id",
             get(resolve_slug_to_portal_id),
+        )
+        // MAPPS-674: saved cards. Every route below is gated on
+        // `payment_methods:manage_own` inside the handler; without that cap
+        // the contact sees no Payment Methods page in the SPA either.
+        .route(
+            "/payment-methods",
+            get(list_payment_methods).post(start_add_payment_method),
+        )
+        .route("/payment-methods/{id}", delete(remove_payment_method))
+        .route(
+            "/payment-methods/{id}/default",
+            put(set_default_payment_method),
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
@@ -728,4 +748,117 @@ fn add_cookie(headers: &mut HeaderMap, cookie: &str) {
     if let Ok(v) = HeaderValue::from_str(cookie) {
         headers.append(header::SET_COOKIE, v);
     }
+}
+
+// ============================================================================
+// MAPPS-674: saved payment methods (Stripe SetupIntent + friends)
+// ============================================================================
+
+/// Body for `POST /api/v1/contact/payment-methods`.
+#[derive(serde::Deserialize)]
+struct StartAddPaymentMethodBody {
+    /// Where the provider returns the contact after they save the card.
+    /// Taken from the SPA router so a route rename moves the return URL
+    /// with it.
+    success_url: String,
+    /// Where the provider returns the contact if they cancel out of the
+    /// setup page. Same rationale as `success_url`.
+    cancel_url: String,
+}
+
+/// Response from `POST /api/v1/contact/payment-methods`: the hosted-page URL
+/// the SPA redirects the customer to.
+#[derive(serde::Serialize)]
+struct StartAddPaymentMethodResponse {
+    /// The provider's Checkout Session URL (Stripe: `https://checkout.stripe.com/...`).
+    checkout_url: String,
+}
+
+/// MAPPS-674 gate: the shared capability check. Contact plane only; a staff
+/// caller reaching a `/api/v1/contact/*` route is a plane misuse elsewhere
+/// and is already 401 at the middleware. The list uses the same check to
+/// stay consistent with the SPA's read-then-render posture.
+async fn require_manage_own(
+    state: &ContactRouterState,
+    session: &super::models::ContactSession,
+) -> AppResult<()> {
+    let caps = state
+        .service
+        .load_capabilities(session.tenant_id, session.id)
+        .await?;
+    if caps
+        .iter()
+        .any(|c| c == super::capabilities::PAYMENT_METHODS_MANAGE_OWN)
+    {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(format!(
+            "Missing required capability: {}",
+            super::capabilities::PAYMENT_METHODS_MANAGE_OWN
+        )))
+    }
+}
+
+async fn list_payment_methods(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+) -> AppResult<Json<Vec<super::payment_methods::PaymentMethodResponse>>> {
+    require_manage_own(&state, &session).await?;
+    let tenant = crate::modules::auth::TenantId::from_trusted(session.tenant_id);
+    let list = state.payment_methods.list(tenant, session.id).await?;
+    Ok(Json(list))
+}
+
+async fn start_add_payment_method(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Json(body): Json<StartAddPaymentMethodBody>,
+) -> AppResult<Json<StartAddPaymentMethodResponse>> {
+    require_manage_own(&state, &session).await?;
+    // Minimal validation: a non-URL success/cancel would be refused by the
+    // provider anyway, but we refuse here so the SPA sees the 400 without
+    // an extra round trip.
+    if url::Url::parse(&body.success_url).is_err() {
+        return Err(AppError::BadRequest(
+            "success_url must be a valid URL.".to_string(),
+        ));
+    }
+    if url::Url::parse(&body.cancel_url).is_err() {
+        return Err(AppError::BadRequest(
+            "cancel_url must be a valid URL.".to_string(),
+        ));
+    }
+    let tenant = crate::modules::auth::TenantId::from_trusted(session.tenant_id);
+    let session_out = state
+        .payment_methods
+        .start_add(tenant, session.id, &body.success_url, &body.cancel_url)
+        .await?;
+    Ok(Json(StartAddPaymentMethodResponse {
+        checkout_url: session_out.url,
+    }))
+}
+
+async fn remove_payment_method(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Path(id): Path<uuid::Uuid>,
+) -> AppResult<StatusCode> {
+    require_manage_own(&state, &session).await?;
+    let tenant = crate::modules::auth::TenantId::from_trusted(session.tenant_id);
+    state.payment_methods.remove(tenant, session.id, id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_default_payment_method(
+    State(state): State<ContactRouterState>,
+    RequireContactAuth(session): RequireContactAuth,
+    Path(id): Path<uuid::Uuid>,
+) -> AppResult<StatusCode> {
+    require_manage_own(&state, &session).await?;
+    let tenant = crate::modules::auth::TenantId::from_trusted(session.tenant_id);
+    state
+        .payment_methods
+        .set_default(tenant, session.id, id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

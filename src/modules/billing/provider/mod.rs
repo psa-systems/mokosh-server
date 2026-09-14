@@ -362,6 +362,40 @@ pub enum PaymentEvent {
     /// [`PaymentProvider::capture`] and lets the resulting completed-capture
     /// event record the payment through the normal path.
     RequiresCapture { order_id: String },
+    /// MAPPS-674: a saved-card SetupIntent completed. Fires when a portal
+    /// contact finishes typing their card into the provider's hosted page
+    /// (Stripe: `checkout.session.completed` with `mode: 'setup'`). The
+    /// receiver reads the session metadata to route the row to the calling
+    /// contact and inserts a `contact_payment_methods` row.
+    ///
+    /// The four display fields (`brand` / `last4` / `exp_month` / `exp_year`)
+    /// come off the PaymentMethod attached to the session; storing them
+    /// lets the list render without a per-request provider fetch. The card
+    /// data itself never enters mokosh - the raw event carries the PAN and
+    /// CVV blocks stripped, and the receiver only reads these four.
+    PaymentMethodAttached {
+        /// The provider's stable reference for the card (Stripe: `pm_...`).
+        provider_pm_id: String,
+        /// The provider's Customer this card is attached to (Stripe: `cus_...`).
+        /// Kept for the future auto-charge worker; today the row keys off
+        /// `provider_pm_id` alone.
+        provider_customer_id: String,
+        /// Tenant + contact recovered from the session metadata mokosh
+        /// stamped at mint time (see [`SetupIntentParams`]).
+        tenant_id: Uuid,
+        contact_id: Uuid,
+        /// Card brand as the provider spells it (`visa`, `mastercard`), and
+        /// last four digits of the PAN. Stored on the row so the list view
+        /// needs no per-render API call.
+        brand: String,
+        last4: String,
+        /// Expiry month (1..12) and four-digit year. The 30-day expiry
+        /// reminder worker (MAPPS-674 follow-up) reads these.
+        exp_month: u8,
+        exp_year: u16,
+        /// The full event JSON, persisted alongside the row for audit.
+        raw: Value,
+    },
     /// A recognised event we deliberately do not act on (abandoned checkout,
     /// failed payment intent, an unrelated session on the tenant's account,
     /// ...). Carried rather than error'd so the handler returns 200 and the
@@ -417,6 +451,72 @@ pub trait PaymentProvider: Send + Sync {
     /// on completion returns an error, because being asked means the receiver
     /// has confused which provider it is talking to.
     async fn capture(&self, order_id: &str) -> AppResult<()>;
+
+    /// MAPPS-674: mint a hosted setup session so a portal contact can save a
+    /// card WITHOUT being charged. Stripe: `POST /v1/checkout/sessions` with
+    /// `mode: 'setup'`. PayPal: Billing Agreement Create (Reference
+    /// Transactions), when that surface lands.
+    ///
+    /// The card data lands on the provider's page, never mokosh: a completed
+    /// SetupIntent fires `checkout.session.completed` and the webhook path
+    /// resolves it into a [`PaymentEvent::PaymentMethodAttached`]. Metadata
+    /// on the params (`contact_id`, `tenant_id`) is what lets the receiver
+    /// route the resulting row back to the calling contact.
+    ///
+    /// Providers that do not support the surface answer
+    /// [`AppError::BadRequest`], matching how [`Self::capture`] refuses; that
+    /// keeps the wrong-provider-for-the-call detection uniform.
+    async fn create_setup_intent_session(
+        &self,
+        params: &SetupIntentParams<'_>,
+    ) -> AppResult<CheckoutSession> {
+        let _ = params;
+        Err(AppError::BadRequest(format!(
+            "The {} payment provider does not support saved payment methods.",
+            self.id()
+        )))
+    }
+
+    /// MAPPS-674: detach a stored card from the provider's Customer so a
+    /// later charge from us cannot use it. Stripe: `POST
+    /// /v1/payment_methods/{pm}/detach`. Called by the removal path BEFORE
+    /// deleting the mokosh row so a resurrected row can never point at a
+    /// still-attached card.
+    ///
+    /// Same "provider does not support" refusal as
+    /// [`Self::create_setup_intent_session`] for providers that never
+    /// implement the surface.
+    async fn detach_payment_method(&self, provider_pm_id: &str) -> AppResult<()> {
+        let _ = provider_pm_id;
+        Err(AppError::BadRequest(format!(
+            "The {} payment provider does not support detaching payment methods.",
+            self.id()
+        )))
+    }
+}
+
+/// MAPPS-674: inputs for [`PaymentProvider::create_setup_intent_session`].
+/// Everything the provider needs to mint a hosted setup page and everything
+/// the webhook receiver needs to route the resulting row back to the contact
+/// that clicked Add Card, in one struct so the trait signature stays flat as
+/// more providers implement it.
+pub struct SetupIntentParams<'a> {
+    /// Tenant the contact belongs to. Stamped into the session metadata so
+    /// the webhook receiver on the tenant-scoped URL can double-check the
+    /// row it is about to insert.
+    pub tenant_id: Uuid,
+    /// The portal contact who is saving the card. Stamped into the session
+    /// metadata for the same reason.
+    pub contact_id: Uuid,
+    /// Where the provider returns the contact after they finish or cancel.
+    /// The SPA takes both from its own router so a route rename moves the
+    /// return URL with it.
+    pub success_url: &'a str,
+    pub cancel_url: &'a str,
+    /// Recipient email, pre-filled on the setup page when known. Read from
+    /// the `contacts` row, so the contact does not retype what mokosh
+    /// already knows.
+    pub customer_email: Option<&'a str>,
 }
 
 #[cfg(test)]

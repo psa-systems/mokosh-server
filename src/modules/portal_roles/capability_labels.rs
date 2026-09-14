@@ -86,6 +86,12 @@ pub fn descriptors() -> Vec<CapabilityDescriptor> {
                 .to_string(),
         },
         CapabilityDescriptor {
+            key: caps::PAYMENT_METHODS_MANAGE_OWN.to_string(),
+            label: "Manage own payment methods".to_string(),
+            group: "Invoices".to_string(),
+            description: "Save cards for future invoices, remove ones you no longer use, and pick which card is your default. Card data is typed into your payment provider's page and never touches your MSP.".to_string(),
+        },
+        CapabilityDescriptor {
             key: caps::QUOTES_READ.to_string(),
             label: "View quotes".to_string(),
             group: "Quotes".to_string(),

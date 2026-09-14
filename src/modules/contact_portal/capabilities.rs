@@ -131,6 +131,21 @@ pub const INVOICES_PAY_PARTIAL: &str = "invoices:pay_partial";
 /// caller's Company. Gated separately from `invoices:read` so a
 /// role can see invoice totals in the SPA without pulling the PDF.
 pub const INVOICES_DOWNLOAD_PDF: &str = "invoices:download_pdf";
+/// MAPPS-674: save, list, remove and set-default the caller's own
+/// payment methods (Stripe PaymentMethods today, PayPal Reference
+/// Transactions later). Gated separately from
+/// [`SETTINGS_MANAGE_OWN`] so a role can be granted profile edit
+/// without card management, and so a Support Contact can be denied
+/// the Payment Methods page without losing profile edit.
+///
+/// The card data itself never touches mokosh: the contact types their
+/// card into the provider's own hosted page (Stripe Checkout in
+/// `mode: 'setup'`), and mokosh stores the provider's stable reference
+/// plus a display digest (brand + last4 + exp_month + exp_year) so
+/// the list renders without a per-render API round trip. Every write
+/// runs on the caller's own contact, so the cap grants no cross-contact
+/// visibility.
+pub const PAYMENT_METHODS_MANAGE_OWN: &str = "payment_methods:manage_own";
 
 /// View quotes scoped to the contact's own Company.
 pub const QUOTES_READ: &str = "quotes:read";
@@ -202,6 +217,7 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     INVOICES_PAY,
     INVOICES_PAY_PARTIAL,
     INVOICES_DOWNLOAD_PDF,
+    PAYMENT_METHODS_MANAGE_OWN,
     QUOTES_READ,
     QUOTES_ACCEPT,
     QUOTES_DOWNLOAD_PDF,
@@ -237,6 +253,7 @@ pub const BUILTIN_BILLING_CONTACT: &[&str] = &[
     INVOICES_DOWNLOAD_PDF,
     QUOTES_DOWNLOAD_PDF,
     INVOICES_PAY_PARTIAL,
+    PAYMENT_METHODS_MANAGE_OWN,
 ];
 
 /// See [`BUILTIN_BILLING_CONTACT`].
@@ -472,6 +489,10 @@ mod tests {
         // Billing Contact so a portal contact holding the built-in role
         // can mint a partial-amount checkout as well as a full one.
         let billing_217 = &["invoices:pay_partial"];
+        // Migration 219 (MAPPS-674): appends `payment_methods:manage_own` to
+        // Billing Contact so a portal contact holding the built-in role can
+        // save and remove their own cards (Stripe SetupIntent flow).
+        let billing_219 = &["payment_methods:manage_own"];
 
         fn union(parts: &[&[&'static str]]) -> BTreeSet<&'static str> {
             parts.iter().flat_map(|p| p.iter().copied()).collect()
@@ -479,7 +500,7 @@ mod tests {
         let migrated: [(&str, BTreeSet<&str>); 3] = [
             (
                 "Billing Contact",
-                union(&[billing_171, billing_179, billing_217]),
+                union(&[billing_171, billing_179, billing_217, billing_219]),
             ),
             (
                 "Support Contact",

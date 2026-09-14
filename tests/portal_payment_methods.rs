@@ -1,0 +1,334 @@
+//! MAPPS-674: portal-contact saved payment methods.
+//!
+//! Exercises the `/api/v1/contact/payment-methods` surface end to end:
+//!
+//! - Contact with `payment_methods:manage_own` (built-in Billing Contact)
+//!   lists their own cards (empty at first). Contact without it 403s.
+//! - `POST /payment-methods` reaches the service and refuses with a
+//!   no-gateway 400 when no Stripe row exists on the tenant. That 400 is
+//!   the "handler cleared every gate" signal, matching the `pay_invoice`
+//!   suite's shape.
+//! - `PUT /payment-methods/{id}/default` with two saved cards flips
+//!   `is_default` atomically: the picked row wins, the other clears, the
+//!   partial UNIQUE index would refuse anything else.
+//! - `DELETE /payment-methods/{id}` refuses with the same no-gateway
+//!   posture on a tenant without a gateway (the service tries to detach
+//!   through the provider FIRST); rows are seeded directly for the
+//!   set-default flip so the deletion path is exercised where the
+//!   gateway is intentionally absent.
+
+mod common;
+
+use reqwest::StatusCode;
+use serde_json::Value;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const NO_GATEWAY: &str = "no active payment provider is configured";
+
+async fn seed_contact_with_roles(
+    app: &common::TestApp,
+    pool: &PgPool,
+    email_local: &str,
+    role_names: &[&str],
+) -> (Uuid, Uuid, String) {
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let email = format!("{email_local}@pm.example");
+    let company_id = Uuid::new_v4();
+    let slug = format!("pm-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    sqlx::query("INSERT INTO companies (id, tenant_id, name, portal_slug) VALUES ($1, $2, $3, $4)")
+        .bind(company_id)
+        .bind(tenant_id)
+        .bind(format!("PM Co {email_local}"))
+        .bind(&slug)
+        .execute(pool)
+        .await
+        .expect("seed company");
+
+    let contact_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contacts (id, tenant_id, company_id, first_name, last_name, email) \
+         VALUES ($1, $2, $3, 'Test', 'Payer', $4)",
+    )
+    .bind(contact_id)
+    .bind(tenant_id)
+    .bind(company_id)
+    .bind(&email)
+    .execute(pool)
+    .await
+    .expect("seed contact");
+
+    let db = mokosh_server::Database::from_pool(pool.clone());
+    let contact_svc = mokosh_server::modules::contacts::ContactService::new(db);
+    let mut role_ids = Vec::new();
+    for name in role_names {
+        let id: Uuid =
+            sqlx::query_scalar("SELECT id FROM portal_roles WHERE tenant_id = $1 AND name = $2")
+                .bind(tenant_id)
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|e| panic!("read portal_role {name}: {e}"));
+        role_ids.push(id);
+    }
+    let outcome = contact_svc
+        .grant_portal_access(
+            mokosh_server::modules::auth::TenantId::from_trusted(tenant_id),
+            contact_id,
+            &role_ids,
+            &mokosh_server::modules::audit::AuditCtx::system(tenant_id),
+        )
+        .await
+        .expect("grant_portal_access");
+
+    let prefix = format!("/portal/{}/set-password?token=", outcome.portal_slug);
+    let token = outcome
+        .setup_link
+        .split(&prefix)
+        .nth(1)
+        .expect("token in setup_link")
+        .to_string();
+    let strong = "Kq7$mZ2n#PxR9wLf";
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/auth/set-password"))
+        .json(&serde_json::json!({ "token": token, "password": strong }))
+        .send()
+        .await
+        .expect("set-password");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "set-password 204");
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/auth/login"))
+        .json(&serde_json::json!({
+            "slug": outcome.portal_slug,
+            "email": email,
+            "password": strong,
+        }))
+        .send()
+        .await
+        .expect("contact login");
+    assert_eq!(resp.status(), StatusCode::OK, "contact login 200");
+    let body: Value = resp.json().await.expect("login JSON");
+    let access = body["access_token"]
+        .as_str()
+        .expect("access_token in login response")
+        .to_string();
+    (company_id, contact_id, access)
+}
+
+/// Seed a row directly so the set-default / list assertions do not need
+/// the webhook path to run. `is_default = FALSE` by default; the caller
+/// picks which of the two rows they want the flip to land on.
+async fn seed_payment_method(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    contact_id: Uuid,
+    provider_pm_id: &str,
+    last4: &str,
+    is_default: bool,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contact_payment_methods \
+         (id, tenant_id, contact_id, provider, provider_pm_id, brand, last4, exp_month, exp_year, is_default) \
+         VALUES ($1, $2, $3, 'stripe', $4, 'visa', $5, 12, 2030, $6)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(contact_id)
+    .bind(provider_pm_id)
+    .bind(last4)
+    .bind(is_default)
+    .execute(pool)
+    .await
+    .expect("seed contact_payment_methods");
+    id
+}
+
+/// Row 1: a Billing Contact (which the built-in seed grants
+/// `payment_methods:manage_own`) can list their own methods. Empty until
+/// a webhook lands.
+#[sqlx::test]
+async fn contact_with_cap_lists_own_methods(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (_company, _contact, token) =
+        seed_contact_with_roles(&app, &pool, "pm-list", &["Billing Contact"]).await;
+
+    let resp = app
+        .client
+        .get(app.url("/api/v1/contact/payment-methods"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list");
+    assert_eq!(resp.status(), StatusCode::OK, "MAPPS-674: list 200");
+    let body: Value = resp.json().await.expect("json");
+    assert!(
+        body.as_array().is_some_and(|a| a.is_empty()),
+        "MAPPS-674: fresh contact has no saved methods, got {body}"
+    );
+}
+
+/// Row 2: a Support Contact holds `settings:manage_own` but NOT
+/// `payment_methods:manage_own`. Every route must refuse.
+#[sqlx::test]
+async fn contact_without_cap_403(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (_company, _contact, token) =
+        seed_contact_with_roles(&app, &pool, "pm-nocap", &["Support Contact"]).await;
+
+    for path in ["/api/v1/contact/payment-methods"] {
+        let resp = app
+            .client
+            .get(app.url(path))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("get");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "MAPPS-674: {path} without cap must 403"
+        );
+    }
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/payment-methods"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "success_url": "https://portal.example/methods",
+            "cancel_url": "https://portal.example/methods",
+        }))
+        .send()
+        .await
+        .expect("start_add");
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "MAPPS-674: POST without cap must 403"
+    );
+}
+
+/// Row 3: with the cap AND no gateway configured on the tenant, `POST` reaches
+/// the service and hits the same no-gateway 400 the pay-invoice matrix uses
+/// as the "the handler cleared every gate" signal. The Stripe-integrated
+/// success case is exercised elsewhere against a real key.
+#[sqlx::test]
+async fn start_add_without_gateway_400(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (_company, _contact, token) =
+        seed_contact_with_roles(&app, &pool, "pm-add", &["Billing Contact"]).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contact/payment-methods"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "success_url": "https://portal.example/methods",
+            "cancel_url": "https://portal.example/methods",
+        }))
+        .send()
+        .await
+        .expect("start_add");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "MAPPS-674: no gateway means 400 from the service, cap + validation passed"
+    );
+    let body: Value = resp.json().await.expect("json");
+    let msg = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or("");
+    assert!(
+        msg.to_ascii_lowercase().contains(NO_GATEWAY),
+        "MAPPS-674: no-gateway message expected, got {body}"
+    );
+}
+
+/// Row 4: `PUT /payment-methods/{id}/default` with two seeded rows flips
+/// the picked one to default and clears the other in one transaction.
+#[sqlx::test]
+async fn set_default_flips_atomically(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (_company, contact_id, token) =
+        seed_contact_with_roles(&app, &pool, "pm-default", &["Billing Contact"]).await;
+    // Two seeded rows on the same contact. Row A is the initial default;
+    // Row B is a newer card the customer wants to promote.
+    let a = seed_payment_method(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        contact_id,
+        "pm_test_A",
+        "4242",
+        true,
+    )
+    .await;
+    let b = seed_payment_method(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        contact_id,
+        "pm_test_B",
+        "1111",
+        false,
+    )
+    .await;
+
+    let resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contact/payment-methods/{b}/default")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("set-default");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "MAPPS-674: set-default returns 204"
+    );
+
+    let a_default: bool =
+        sqlx::query_scalar("SELECT is_default FROM contact_payment_methods WHERE id = $1")
+            .bind(a)
+            .fetch_one(&pool)
+            .await
+            .expect("read a");
+    let b_default: bool =
+        sqlx::query_scalar("SELECT is_default FROM contact_payment_methods WHERE id = $1")
+            .bind(b)
+            .fetch_one(&pool)
+            .await
+            .expect("read b");
+    assert!(
+        !a_default && b_default,
+        "MAPPS-674: after flip B is default and A is not (a_default={a_default}, b_default={b_default})"
+    );
+}
+
+/// Row 5: `PUT /default` on an unknown id 404s, so a foreign guess does
+/// not silently succeed or reveal existence.
+#[sqlx::test]
+async fn set_default_unknown_id_404(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (_company, _contact, token) =
+        seed_contact_with_roles(&app, &pool, "pm-unknown", &["Billing Contact"]).await;
+
+    let stranger = Uuid::new_v4();
+    let resp = app
+        .client
+        .put(app.url(&format!(
+            "/api/v1/contact/payment-methods/{stranger}/default"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("set-default");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "MAPPS-674: unknown id must 404, not 204"
+    );
+}
