@@ -664,6 +664,27 @@ pub struct InvoicePaymentReadinessResponse {
     /// contact is not surprised by the currency conversion on their
     /// card statement.
     pub balance_due_display: String,
+    /// MAPPS-673: `true` iff the caller may mint a partial-amount checkout
+    /// through `POST /invoices/{id}/pay` with `amount` set. Contact plane
+    /// requires
+    /// [`crate::modules::contact_portal::capabilities::INVOICES_PAY_PARTIAL`];
+    /// staff plane requires billing / finance. Independent of
+    /// `gateway_ready` and `invoice_payable`, so the SPA can grey the
+    /// partial-amount input on a paid invoice the same way it does the
+    /// full-pay button. The field is always populated (never `null`),
+    /// so a client that reads it as `false` cannot mistake "field
+    /// missing" for "caller lacks the cap".
+    #[serde(default)]
+    pub partial_payment_allowed: bool,
+    /// MAPPS-673: currency-formatted minimum partial-payment amount in the
+    /// invoice's own currency, so the SPA can show the floor next to the
+    /// amount input without knowing how to format money. `None` when the
+    /// invoice is not payable or no gateway is connected (the input is not
+    /// rendered in that case anyway), or when `partial_payment_allowed`
+    /// is `false`. Otherwise this is `max(gateway_config.min_partial_amount,
+    /// DEFAULT_MIN_PARTIAL_AMOUNT)` formatted in the invoice's currency.
+    #[serde(default)]
+    pub min_partial_amount_display: Option<String>,
 }
 
 /// PMS-914: body accepted by `POST /invoices/{invoice_id}/pay`. The SPA
@@ -685,6 +706,18 @@ pub struct PayInvoiceRequest {
     /// a customer's money goes.
     #[serde(default)]
     pub provider: Option<String>,
+    /// MAPPS-673: amount to charge in the invoice's own currency. `None`
+    /// (the pre-MAPPS-673 default) charges the full `balance_due` and takes
+    /// only the [`crate::modules::contact_portal::capabilities::INVOICES_PAY`]
+    /// cap on the contact plane. `Some(v)` mints a partial-payment session:
+    /// the caller must additionally hold
+    /// [`crate::modules::contact_portal::capabilities::INVOICES_PAY_PARTIAL`]
+    /// (or be staff billing/finance), and `v` is clamped to
+    /// `[min_partial_amount, balance_due]` by the handler. Range and cap
+    /// enforcement live in the route rather than in `validate()` because both
+    /// need database state (the invoice and the tenant's gateway config).
+    #[serde(default)]
+    pub amount: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
