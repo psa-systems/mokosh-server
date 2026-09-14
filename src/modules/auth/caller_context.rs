@@ -168,6 +168,20 @@ impl CallerContext {
             )))
         }
     }
+
+    /// MAPPS-673: same set as [`Self::require_capability`], but returning a
+    /// boolean instead of `Err(Forbidden)`. Callers use this on readiness
+    /// endpoints to say `partial_payment_allowed: bool` in the response body
+    /// rather than refusing the whole read; a staff caller always answers
+    /// `true`, matching the staff bypass in `require_capability`.
+    pub async fn has_capability(&self, cap: &str, db: &Database) -> AppResult<bool> {
+        let session = match self {
+            Self::Staff(_) => return Ok(true),
+            Self::Contact(session) => session,
+        };
+        let caps = load_contact_capabilities(db, session.tenant_id, session.id).await?;
+        Ok(caps.iter().any(|c| c == cap))
+    }
 }
 
 /// mokosh-contact-login prompt 008: reload the effective capability set
