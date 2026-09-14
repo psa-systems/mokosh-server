@@ -2894,7 +2894,10 @@ impl BillingService {
     /// connection. Used by the authenticated checkout path, where the caller's
     /// tenant is already established, so the read runs through
     /// `begin_with_tenant` like every other serving read.
-    async fn active_provider(
+    /// MAPPS-674: `pub` so the payment-methods service can build the same
+    /// provider adapter the invoice pay path does, without a second reader
+    /// of the encrypted credential.
+    pub async fn active_provider(
         &self,
         tenant_id: TenantId,
         requested: Option<&str>,

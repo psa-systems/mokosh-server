@@ -719,12 +719,27 @@ pub fn create_api_router(
     // secret). The tenant id in the path selects which tenant's secret to verify
     // against; it is not itself a credential. Its own `BillingService` instance
     // (the router's `billing_service` is moved into `billing_routes`).
+    // MAPPS-674: one `PaymentMethodsService` shared by every route and
+    // webhook receiver that touches `contact_payment_methods`. The billing
+    // handle it holds is the same shape the payment webhook uses (secret
+    // provider, encryption key), so `record_from_webhook` and
+    // `start_add` build providers from the same credential path.
+    let payment_methods_service =
+        Arc::new(crate::modules::contact_portal::PaymentMethodsService::new(
+            db.clone(),
+            Arc::new(BillingService::with_secrets(
+                db.clone(),
+                encryption_key,
+                secrets.clone(),
+            )),
+        ));
     let stripe_webhook_state = Arc::new(ProviderWebhookState {
         billing: Arc::new(BillingService::with_secrets(
             db.clone(),
             encryption_key,
             secrets.clone(),
         )),
+        payment_methods: payment_methods_service.clone(),
         provider_id: "stripe",
     });
     let stripe_webhooks = Router::new()
@@ -746,6 +761,7 @@ pub fn create_api_router(
             encryption_key,
             secrets.clone(),
         )),
+        payment_methods: payment_methods_service.clone(),
         provider_id: "paypal",
     });
     let paypal_webhooks = Router::new()
@@ -818,14 +834,17 @@ pub fn create_api_router(
     // `settings:manage_company_branding` gate without a duplicate
     // instance.
     let contact_service_arc = std::sync::Arc::new(contact_service.clone());
-    let contact_api = crate::modules::contact_portal::contact_routes(contact_service)
-        .merge(crate::modules::branding::routes::contact_routes(
-            db.clone(),
-            contact_service_arc,
-        ))
-        .layer(middleware::from_fn(
-            crate::utils::error::normalize_error_envelope,
-        ));
+    let contact_api = crate::modules::contact_portal::contact_routes(
+        contact_service,
+        payment_methods_service.clone(),
+    )
+    .merge(crate::modules::branding::routes::contact_routes(
+        db.clone(),
+        contact_service_arc,
+    ))
+    .layer(middleware::from_fn(
+        crate::utils::error::normalize_error_envelope,
+    ));
 
     Router::new()
         .nest("/api/v1", api_v1)

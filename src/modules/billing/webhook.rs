@@ -42,15 +42,23 @@ use uuid::Uuid;
 use super::provider::PaymentEvent;
 use super::BillingService;
 use crate::modules::auth::TenantId;
+use crate::modules::contact_portal::payment_methods::PaymentMethodsService;
 use crate::utils::error::{AppError, AppResult};
 
 /// State for one provider's webhook receiver. Holds the `BillingService`
 /// (which owns the DB handle, encryption key, and HTTP client) so the handler
 /// can load the tenant's credential and reconcile payments in one place, plus
 /// the provider discriminator this mount serves.
+///
+/// MAPPS-674 added the [`PaymentMethodsService`] so a
+/// `checkout.session.completed` in `mode: 'setup'` can insert the resulting
+/// `contact_payment_methods` row. The two services are held here rather than
+/// looked up per-request because both were already constructed at startup and
+/// the receiver owns nothing else.
 #[derive(Clone)]
 pub struct ProviderWebhookState {
     pub billing: Arc<BillingService>,
+    pub payment_methods: Arc<PaymentMethodsService>,
     /// Matches `PaymentProvider::id` and the stored `provider` column.
     pub provider_id: &'static str,
 }
@@ -245,6 +253,39 @@ async fn dispatch(
             // here, and a capture that fails is a 500 so the provider retries
             // the approval delivery.
             provider.capture(&order_id).await?;
+        }
+        PaymentEvent::PaymentMethodAttached {
+            provider_pm_id,
+            provider_customer_id,
+            tenant_id: event_tenant,
+            contact_id,
+            brand,
+            last4,
+            exp_month,
+            exp_year,
+            raw: _raw,
+        } => {
+            // MAPPS-674: same defence-in-depth as the payment path - the
+            // session metadata's tenant must match the URL tenant whose
+            // secret verified the delivery, or a Stripe account misuse
+            // could plant a card row against a foreign tenant.
+            if event_tenant != tenant_id {
+                return Err(AppError::Unauthorized);
+            }
+            state
+                .payment_methods
+                .record_from_webhook(
+                    scoped,
+                    contact_id,
+                    state.provider_id,
+                    &provider_pm_id,
+                    &provider_customer_id,
+                    &brand,
+                    &last4,
+                    exp_month,
+                    exp_year,
+                )
+                .await?;
         }
         PaymentEvent::Ignored { kind } => {
             tracing::debug!(
