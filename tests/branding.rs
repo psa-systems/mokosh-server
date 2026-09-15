@@ -321,3 +321,90 @@ async fn portal_host_returns_merged_effective_branding(pool: PgPool) {
         "unset Company field must fall through to the tenant default"
     );
 }
+
+/// MAPPS-807: with no branding name configured, the customer's brand names the
+/// MSP by the organization's own name, on the sign-in page and once signed in.
+///
+/// Before this the portal sign-in page read "Mokosh Platform" under the MSP's
+/// logo, because the brand carried no name and the client fell back to the
+/// vendor's. The MSP's emails never had that gap: they use `tenants.name`.
+#[sqlx::test]
+async fn the_customer_brand_names_the_msp_when_no_name_is_configured(pool: PgPool) {
+    let (_contact_id, _company_id, slug, portal_id, setup_token) =
+        seed_company_and_contact(&pool, "named@brand.example").await;
+    let organization: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE tenants SET branding = branding - 'display_name' - 'company_name' WHERE id = $1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = common::boot(pool.clone()).await;
+
+    let host: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contact/portal/{portal_id}/host")))
+        .send()
+        .await
+        .expect("GET /host")
+        .json()
+        .await
+        .expect("host JSON");
+    assert_eq!(
+        host["effective_branding"]["company_name"].as_str(),
+        Some(organization.as_str()),
+        "the sign-in page must name the MSP: {host}"
+    );
+
+    let bearer = sign_in_contact(&app, &slug, "named@brand.example", &setup_token).await;
+    let me = app
+        .client
+        .get(app.url("/api/v1/contact/auth/me"))
+        .bearer_auth(&bearer)
+        .send()
+        .await
+        .expect("GET /contact/auth/me");
+    assert_eq!(me.status(), reqwest::StatusCode::OK);
+    let me: serde_json::Value = me.json().await.expect("me JSON");
+    assert_eq!(
+        me["effective_branding"]["company_name"].as_str(),
+        Some(organization.as_str()),
+        "the signed-in portal must name the MSP too: {me}"
+    );
+}
+
+/// A name somebody configured is never replaced by the organization's.
+#[sqlx::test]
+async fn a_configured_brand_name_still_wins(pool: PgPool) {
+    let (_contact_id, _company_id, _slug, portal_id, _token) =
+        seed_company_and_contact(&pool, "configured@brand.example").await;
+    sqlx::query(
+        "UPDATE tenants SET branding = (branding - 'company_name') \
+             || '{\"display_name\": \"Niceguy Support\"}'::jsonb WHERE id = $1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = common::boot(pool.clone()).await;
+    let host: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contact/portal/{portal_id}/host")))
+        .send()
+        .await
+        .expect("GET /host")
+        .json()
+        .await
+        .expect("host JSON");
+    let eff = &host["effective_branding"];
+    assert_eq!(eff["display_name"].as_str(), Some("Niceguy Support"));
+    assert!(
+        eff["company_name"].is_null(),
+        "a configured display name means nothing is filled in: {eff}"
+    );
+}
