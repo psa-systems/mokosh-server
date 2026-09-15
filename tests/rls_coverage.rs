@@ -53,7 +53,16 @@ use sqlx::PgPool;
 ///   Decided in migration `154_tenant_membership_entitlements.sql`'s header
 ///   (MAPPS-459 / PMS-728) and restated at the call site; PMS-1040 moved it here
 ///   because a rule recorded only in prose is not a rule.
-const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
+/// * `mokosh_bunyip_grants` - BUNYIP-674's local mirror of Bunyip's
+///   `mokosh_account_grants`. A row is cross-tenant BY DESIGN (a grantee's
+///   row names an owner's tenant they do not otherwise belong to), so a
+///   `tenant_isolation` policy on the grantee's own tenant would refuse
+///   the lookup that decides whether the caller may act in the owner's
+///   tenant. `MokoshBunyipGrantService` reads the table with no
+///   `app.current_tenant` GUC for the same reason `tenant_membership_
+///   entitlements` above does; the webhook receiver writes it on the
+///   migrator pool because Bunyip is not authenticated into a tenant.
+const ALLOWED_WITHOUT_RLS: &[&str] = &["mokosh_bunyip_grants", "tenant_membership_entitlements"];
 
 /// Tables with NO `tenant_id` column that legitimately carry no
 /// `tenant_isolation` policy. Keep sorted; every entry states its reason.
