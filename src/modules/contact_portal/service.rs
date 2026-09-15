@@ -2639,6 +2639,12 @@ impl ContactAuthService {
         company_id: Uuid,
         patch: &serde_json::Value,
     ) -> AppResult<super::models::ContactOwnCompanyBranding> {
+        // PMS-1197: the same table that decides what a tenant's branding
+        // value is, or a portal contact could write an arbitrary
+        // `primary_color`, an off-path `logo_url`, or an unknown key that
+        // then overrides the tenant's own validated value everywhere
+        // `effective_branding` reads it.
+        crate::modules::tenants::branding::validate_company_branding_patch(patch)?;
         let mut tx = self
             .db
             .begin_with_tenant(TenantId::from_trusted(tenant_id))
