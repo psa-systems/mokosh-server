@@ -95,6 +95,15 @@ impl ContactAuthService {
         }
     }
 
+    /// PMS-1199: the `Database` handle backing this service, for a
+    /// caller that needs to run a check through `CallerContext`
+    /// (`RequireContactAuth` routes build a `CallerContext::Contact`
+    /// from the session and this handle rather than going through
+    /// `AuthState`).
+    pub(crate) fn db(&self) -> &Database {
+        &self.db
+    }
+
     /// PMS-1063: attach the key that protects the TOTP secret at rest.
     #[must_use]
     pub fn with_encryption_key(mut self, encryption_key: [u8; 32]) -> Self {
