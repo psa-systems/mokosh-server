@@ -222,6 +222,41 @@ mod tests {
         assert_eq!(out.support_email.as_deref(), Some("help@acme.example"));
     }
 
+    /// PMS-1197: `EffectiveBranding` is the merge of `TenantBranding` and
+    /// `CompanyBranding`, and both are written through
+    /// `validate_branding_patch` / `validate_company_branding_patch`
+    /// (`crate::modules::tenants::branding`). A field read here that table
+    /// has never validated is a key a third branding surface could write
+    /// unchecked and have it show up in what a client is shown, which is
+    /// exactly the regression this issue closes.
+    #[test]
+    fn every_field_effective_branding_reads_is_a_known_branding_key() {
+        use crate::modules::tenants::branding::KNOWN_KEYS;
+        let fields = [
+            "logo_url",
+            "logo_mime",
+            "favicon_url",
+            "favicon_mime",
+            "primary_color",
+            "secondary_color",
+            "background_color",
+            "background_url",
+            "background_mime",
+            "display_name",
+            "company_name",
+            "support_email",
+            "support_phone",
+            "support_contact_name",
+            "portal_domain",
+        ];
+        for field in fields {
+            assert!(
+                KNOWN_KEYS.contains(&field),
+                "EffectiveBranding reads `{field}` but it is not in validate_branding_patch's KNOWN_KEYS"
+            );
+        }
+    }
+
     /// MAPPS-807: with no name configured anywhere, a customer sees the
     /// organization's name - the one its emails already use - rather than
     /// nothing, which the client rendered as the vendor's product name.
