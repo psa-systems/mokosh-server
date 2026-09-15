@@ -149,6 +149,29 @@ impl AppError {
         }
     }
 
+    /// Create a rate-limit refusal. The only constructor of this variant
+    /// (PMS-1203): every call site names its wait through here rather than
+    /// spelling `Self::RateLimited { .. }` itself, so `rg 'AppError::RateLimited'`
+    /// finds nothing outside this file.
+    pub fn rate_limited(retry_after_seconds: Option<u64>) -> Self {
+        Self::RateLimited {
+            retry_after_seconds,
+        }
+    }
+
+    /// The wait a rate-limit refusal carries, when it is one and the wait is
+    /// known. `None` for every other error, so a caller that wants to fall
+    /// back to a custom message on a known wait (and propagate anything
+    /// else unchanged) can match on this instead of the variant itself.
+    pub fn known_retry_after(&self) -> Option<u64> {
+        match self {
+            Self::RateLimited {
+                retry_after_seconds,
+            } => *retry_after_seconds,
+            _ => None,
+        }
+    }
+
     /// Create a validation error for a single field
     pub fn validation_field(field: impl Into<String>, message: impl Into<String>) -> Self {
         // The `Validation` Display prefixes "Validation failed: ", so this
@@ -313,8 +336,27 @@ mod server_impl {
         resp
     }
 
+    /// A `RateLimited` refusal with no computed wait falls back to this many
+    /// seconds, so the field is never missing even from a caller that
+    /// genuinely does not know when the window lifts.
+    const DEFAULT_RATE_LIMIT_RETRY_AFTER_SECONDS: u64 = 60;
+
     impl IntoResponse for AppError {
         fn into_response(self) -> Response {
+            // PMS-1203: every `RateLimited` error renders through
+            // `rate_limited_response`, however it was constructed, so a
+            // bypass that returns one straight out of an `AppResult` handler
+            // (via `?`) still carries `retry_after_seconds`, the
+            // `Retry-After` header and `Cache-Control: no-store`.
+            if let AppError::RateLimited {
+                retry_after_seconds,
+            } = &self
+            {
+                let retry_after =
+                    retry_after_seconds.unwrap_or(DEFAULT_RATE_LIMIT_RETRY_AFTER_SECONDS);
+                return rate_limited_response(retry_after, &self.to_string());
+            }
+
             let status = StatusCode::from_u16(self.status_code())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -749,6 +791,48 @@ mod tests {
             "Too many requests, please try again shortly"
         );
         assert_eq!(body["retry_after_seconds"], 37);
+    }
+
+    /// PMS-1203: a bare `AppError::RateLimited` returned through `?` (no
+    /// explicit `rate_limited_response` call at the site) still renders the
+    /// exact same shape, so a bypass site cannot ship a 429 missing
+    /// `retry_after_seconds` or the `Retry-After` header ever again.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn a_bare_rate_limited_error_still_renders_through_the_helper() {
+        use axum::response::IntoResponse;
+
+        let response = AppError::rate_limited(Some(42)).into_response();
+        assert_eq!(response.status(), 429);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("42")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read the 429 body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("429 body is JSON");
+        assert_eq!(body["error"], "rate_limited");
+        assert_eq!(body["retry_after_seconds"], 42);
+
+        // No known wait: falls back to the default rather than omitting the
+        // field or reporting a bogus zero-second wait.
+        let response = AppError::rate_limited(None).into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read the 429 body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("429 body is JSON");
+        assert_eq!(body["retry_after_seconds"], 60);
     }
 
     #[test]
