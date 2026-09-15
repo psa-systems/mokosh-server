@@ -171,6 +171,17 @@ pub struct MembershipView {
     pub role: String,
     pub status: String,
     pub is_active: bool,
+    /// PMS-1210: `Some(grant_id)` when the row came from a
+    /// `mokosh_bunyip_grants` mirror (the caller is the grantee,
+    /// not the owner); `None` on the caller's OWN tenants where
+    /// the row lives in `tenant_memberships`. The client uses the
+    /// presence of the id to render the `Leave` affordance in
+    /// the mokosh-apps switcher, and to send the id verbatim to
+    /// `DELETE /api/v1/my-grants/{id}`.
+    /// `#[serde(default)]` keeps the wire shape backward-compatible
+    /// for a client that has not yet been rebuilt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mokosh_bunyip_grant_id: Option<Uuid>,
 }
 
 /// Current authenticated user state
