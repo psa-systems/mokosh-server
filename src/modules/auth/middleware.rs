@@ -7,6 +7,7 @@ use axum::{
 };
 use std::sync::Arc;
 
+use super::mokosh_bunyip_grants::map_grant_role;
 use super::oidc_rs::{Verifier as BunyipVerifier, VerifyError};
 use super::service::{is_unresolved_placeholder_email, BunyipPrincipal, UNRESOLVED_EMAIL_DOMAIN};
 use super::{AuthService, AuthState, CurrentUser, UserRole};
@@ -1072,6 +1073,19 @@ async fn resolve_bunyip_caller(
     sub: uuid::Uuid,
     claims: &super::oidc_rs::AtClaims,
 ) -> UserinfoDecision {
+    // BUNYIP-674 option B: a token carrying a `mokosh_grant_account_id`
+    // claim runs the GRANTEE resolver instead of the owner path below.
+    // The two gate on different things (the owner path reads the
+    // caller's own tenancy; the grantee path reads the mirror and the
+    // target tenant's placement) and only one applies to a given
+    // request. Runs before the owner-path `find_bunyip_principal` so a
+    // first-sight grantee without a Mokosh account of their own does
+    // not fall through the owner path's "no placement, no invite" MAPPS
+    // -458 refusal.
+    if let Some(target_slug) = claims.mokosh_grant_account_id.as_deref() {
+        return resolve_grantee_caller(auth_service, sub, target_slug, claims).await;
+    }
+
     // First sight: no local row yet, so the user must be JIT-provisioned (needs
     // email + name from userinfo). A read error reads the same way it did when
     // this was `find_user_placement(..).ok().flatten()`: no placement, so the
@@ -1153,6 +1167,230 @@ async fn resolve_bunyip_caller(
     UserinfoDecision::Skip(Box::new(principal))
 }
 
+/// BUNYIP-674 option B: the resolver for a grant token. Reads the
+/// mirror to gate on grant activeness, resolves the target tenant
+/// from the slug, and either returns the existing placement in that
+/// tenant (Skip) or asks the outer middleware for userinfo (Needed)
+/// so [`place_grantee_caller`] can JIT-provision the row.
+///
+/// A tenant slug that does not resolve is refused as Forbidden with
+/// the same copy the owner-path grant gate uses: the token carries a
+/// grant claim naming a Mokosh tenant Mokosh does not know about, so
+/// from the caller's point of view the grant is not active on this
+/// instance.
+async fn resolve_grantee_caller(
+    auth_service: &Arc<AuthService>,
+    sub: uuid::Uuid,
+    target_slug: &str,
+    claims: &super::oidc_rs::AtClaims,
+) -> UserinfoDecision {
+    // The grant gate runs FIRST: a revoked grantee never sees any
+    // downstream read (no tenant resolve, no placement lookup) whose
+    // failure could leak information about whose tenant is being
+    // named.
+    if let Err(e) = auth_service
+        .ensure_grant_still_active_if_claimed(claims)
+        .await
+    {
+        tracing::info!(error = %e, sub = %sub, "rejecting bunyip grantee on inactive mokosh grant");
+        return UserinfoDecision::Rejected(e);
+    }
+    let target_tenant = match auth_service.resolve_tenant_slug_opt(target_slug).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            tracing::info!(
+                target_slug = %target_slug,
+                sub = %sub,
+                "grant target slug does not resolve to a Mokosh tenant"
+            );
+            return UserinfoDecision::Rejected(AppError::Forbidden(
+                "Access to this organization is not active".to_string(),
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, sub = %sub, "grant target slug lookup failed");
+            return UserinfoDecision::Needed;
+        }
+    };
+    let principal = match auth_service
+        .find_bunyip_principal_in_tenant(sub, target_tenant)
+        .await
+    {
+        Ok(Some(p)) => p,
+        // No placement yet: JIT-provision on the userinfo path so
+        // `place_grantee_caller` has an email + name to seed the row.
+        Ok(None) => return UserinfoDecision::Needed,
+        Err(e) => {
+            tracing::warn!(error = %e, sub = %sub, tenant_id = %target_tenant, "grantee principal lookup failed");
+            return UserinfoDecision::Needed;
+        }
+    };
+    // The row already exists in the granted tenant. Gate on its
+    // status (PMS-698), then hand it to the caller. A placeholder
+    // email still needs userinfo so the row can be repaired.
+    if let Err(e) = auth_service.ensure_principal_usable(&principal.user).await {
+        tracing::info!(
+            error = %e,
+            user = %principal.user.id,
+            tenant_id = %principal.user.tenant_id,
+            "rejecting bunyip grantee principal"
+        );
+        return UserinfoDecision::Rejected(e);
+    }
+    if is_unresolved_placeholder_email(&principal.user.email) {
+        return UserinfoDecision::Needed;
+    }
+    UserinfoDecision::Skip(Box::new(principal))
+}
+
+/// BUNYIP-674 option B: the placement path for a grant token. Called
+/// from [`place_bunyip_user_with_rejection`] when the token carries a
+/// `mokosh_grant_account_id` claim. Distinct from
+/// [`place_bunyip_caller`] because a grantee is placed in a tenant
+/// they do not own at the grant's role, with no invite consumption,
+/// no personal-tenant provisioning, and no PMS-447 admin floor.
+///
+/// The grant gate runs first (so this function is safe to call
+/// directly from a test that skipped [`resolve_bunyip_caller`]),
+/// then the slug resolves to the target tenant. An existing
+/// placement in that tenant carries whatever role was written the
+/// last time this ran; a fresh grant re-syncs it in the same shape
+/// PMS-172's `bunyip_role` reconcile uses on the owner path.
+/// Absent placement is JIT-provisioned via
+/// [`AuthService::place_grantee_user`], which is where the fresh
+/// `users.id` + `bunyip_user_id = sub` axis comes from.
+async fn place_grantee_caller(
+    auth_service: &Arc<AuthService>,
+    sub: uuid::Uuid,
+    email: Option<String>,
+    email_verified: bool,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    claims: &super::oidc_rs::AtClaims,
+) -> (Option<AuthState>, Option<AppError>) {
+    if let Err(e) = auth_service
+        .ensure_grant_still_active_if_claimed(claims)
+        .await
+    {
+        return (None, Some(e));
+    }
+    let Some(target_slug) = claims.mokosh_grant_account_id.as_deref() else {
+        // The caller checked before dispatching to this function, so
+        // reaching here is a programmer error rather than a runtime
+        // one; a warn line is enough for observability.
+        tracing::warn!(sub = %sub, "place_grantee_caller called without a grant claim");
+        return (None, None);
+    };
+    let target_tenant = match auth_service.resolve_tenant_slug_opt(target_slug).await {
+        Ok(Some(t)) => t,
+        _ => {
+            return (
+                None,
+                Some(AppError::Forbidden(
+                    "Access to this organization is not active".to_string(),
+                )),
+            )
+        }
+    };
+
+    // Map the grant vocab to a Mokosh role. An unknown value is
+    // refused rather than silently falling to Technician: a grant
+    // that reaches this codepath was minted by Bunyip out of the
+    // PMS-1162 vocabulary, so an unmapped value means Bunyip and
+    // Mokosh disagree on the vocabulary and the request must not
+    // proceed under a guess.
+    let vocab = claims.mokosh_grant_role.as_deref().unwrap_or("");
+    let grant_role = match map_grant_role(vocab) {
+        Some(r) => r,
+        None => {
+            tracing::info!(
+                sub = %sub,
+                target = %target_slug,
+                grant_role = %vocab,
+                "unknown mokosh_grant_role vocabulary value; refusing"
+            );
+            return (
+                None,
+                Some(AppError::Forbidden(
+                    "Access to this organization is not active".to_string(),
+                )),
+            );
+        }
+    };
+
+    let user = match auth_service
+        .find_bunyip_principal_in_tenant(sub, target_tenant)
+        .await
+    {
+        Ok(Some(principal)) => {
+            if let Err(e) = auth_service.ensure_principal_usable(&principal.user).await {
+                return (None, Some(e));
+            }
+            let mut user = principal.user;
+            // Reconcile the grant role onto the row. The shape mirrors
+            // PMS-172's `set_user_role` write for the owner path: the
+            // request runs with the token-derived role regardless, and
+            // a failed persist is a debug log, not a rejection.
+            if user.role != grant_role {
+                if let Err(e) = auth_service
+                    .set_user_role(user.tenant_id, user.id, grant_role)
+                    .await
+                {
+                    tracing::warn!(error = %e, sub = %sub, "grantee role reconcile failed (request still uses grant role)");
+                }
+                user.role = grant_role;
+            }
+            user
+        }
+        _ => {
+            // First-sight grantee: JIT-provision the row in the
+            // granted tenant. Needs a verified email so the row is not
+            // seeded under a placeholder that would then need PMS-635
+            // repair on the very next request; refuse rather than
+            // insert a placeholder because the owner-path placeholder
+            // only exists to keep first-sight users addressable while
+            // Bunyip verifies them, and a grantee whose Bunyip email
+            // is not verified is not yet a Bunyip identity worth
+            // placing in someone else's tenant.
+            let addr = match (email.as_deref(), email_verified) {
+                (Some(em), true) if !em.trim().is_empty() => em.to_string(),
+                _ => {
+                    tracing::info!(
+                        sub = %sub,
+                        target = %target_slug,
+                        "grantee JIT provision refused: no verified email from userinfo"
+                    );
+                    return (None, None);
+                }
+            };
+            match auth_service
+                .place_grantee_user(
+                    sub,
+                    target_tenant,
+                    grant_role,
+                    &addr,
+                    given_name.as_deref(),
+                    family_name.as_deref(),
+                    email_verified,
+                )
+                .await
+            {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(error = %e, sub = %sub, "grantee JIT provision failed");
+                    return (None, None);
+                }
+            }
+        }
+    };
+
+    let tenant_id = user.tenant_id;
+    (
+        Some(AuthState::authenticated(user.to_current_user(), tenant_id)),
+        None,
+    )
+}
+
 /// PMS-249: the testable core of the bunyip login path. Given the verified
 /// `sub` plus the `email` / `email_verified` resolved from userinfo, resolve
 /// which Mokosh tenant the user belongs to (invite > existing placement >
@@ -1214,6 +1452,25 @@ pub async fn place_bunyip_user_with_rejection(
     family_name: Option<String>,
     claims: &super::oidc_rs::AtClaims,
 ) -> (Option<AuthState>, Option<AppError>) {
+    // BUNYIP-674 option B: a grant token takes the grantee placement
+    // path. Runs BEFORE `place_bunyip_caller`, so a first-sight
+    // grantee (no owner row of their own) does not trip the MAPPS-458
+    // "no placement, no invite" refusal in there. The grantee path
+    // never provisions a personal tenant, never accepts an invite,
+    // and never runs the PMS-447 admin floor: their role IS the
+    // grant's role.
+    if claims.mokosh_grant_account_id.is_some() {
+        return place_grantee_caller(
+            auth_service,
+            sub,
+            email,
+            email_verified,
+            given_name,
+            family_name,
+            claims,
+        )
+        .await;
+    }
     place_bunyip_caller(
         auth_service,
         tenants,

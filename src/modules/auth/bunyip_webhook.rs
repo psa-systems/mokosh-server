@@ -311,6 +311,44 @@ pub async fn mokosh_grant_changed(
     )
     .await?;
 
+    // BUNYIP-674 option B (phase 3): the mirror gate is what stops a
+    // revoked grantee's next request, so this tombstone is defence in
+    // depth: it also removes the placement row from lists that scan
+    // `users` inside the tenant (member rosters, notification
+    // targets, audit histories) without going through the auth
+    // path. The mirror upsert above has already recorded the revoke
+    // and cannot roll back if this UPDATE fails; a failure here is a
+    // WARN so a webhook redelivery re-runs it, rather than answering
+    // 500 and asking Bunyip to keep retrying the whole webhook (which
+    // would re-fire the mirror upsert too). The mokosh_account_id is
+    // subquery-joined to `tenants.slug` so a slug the tenant does not
+    // exist under is a no-op rather than an error, matching the
+    // no-op-on-unknown contract the mirror upsert honours.
+    //
+    // The granted branch does the mirror side and NOTHING to `users`
+    // by design: the placement row is JIT-provisioned on the
+    // grantee's first request (there is no email or name in the
+    // webhook payload to seed the row with).
+    if payload.state == "revoked" {
+        if let Err(e) = sqlx::query(
+            "UPDATE users SET deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW() \
+             WHERE bunyip_user_id = $1 \
+               AND tenant_id = (SELECT id FROM tenants WHERE slug = $2)",
+        )
+        .bind(payload.grantee_bunyip_user_id)
+        .bind(&payload.mokosh_account_id)
+        .execute(&state.pool)
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                grantee = %payload.grantee_bunyip_user_id,
+                mokosh_account_id = %payload.mokosh_account_id,
+                "grantee placement tombstone failed after mirror upsert (mirror is authoritative; request-time gate still refuses)"
+            );
+        }
+    }
+
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({

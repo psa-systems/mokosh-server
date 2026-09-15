@@ -29,6 +29,35 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use mokosh_types::auth::UserRole;
+
+/// BUNYIP-674 option B: project a grant role from Bunyip's PMS-1162
+/// vocabulary (`admin` / `manager` / `technician` / `finance` /
+/// `read_only`) onto Mokosh's [`UserRole`]. `None` on an unknown
+/// value so the middleware refuses to place the caller rather than
+/// silently granting one of the seven mokosh roles by accident.
+///
+/// `read_only` maps to [`UserRole::Technician`], the least-privilege
+/// mokosh role that already exists. This is deliberately over-
+/// privileged for now: mokosh has no first-class read-only tier, and
+/// a real one is a follow-up (a ticket separately opened once the
+/// grant surface has enough traffic to justify the schema move).
+/// Until then a `read_only` grantee has technician-level WRITE
+/// access on the granted tenant; a grant issuer who needs strict
+/// read-only should not issue this role yet.
+pub fn map_grant_role(vocab: &str) -> Option<UserRole> {
+    match vocab {
+        "admin" => Some(UserRole::Admin),
+        "manager" => Some(UserRole::Manager),
+        "technician" => Some(UserRole::Technician),
+        "finance" => Some(UserRole::Finance),
+        // See the note above: intentionally maps to Technician until
+        // a first-class read-only tier lands.
+        "read_only" => Some(UserRole::Technician),
+        _ => None,
+    }
+}
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -144,6 +173,59 @@ impl MokoshBunyipGrantService {
             );
         }
         Ok(active)
+    }
+
+    /// BUNYIP-674 option B (phase 2): the ROLE the grant carries when
+    /// it is active, `None` otherwise. Consults the same 30s cache
+    /// [`Self::is_grant_active`] populates and never re-queries when
+    /// that cache is warm - so the grant-scoped auth path, which asks
+    /// both "is it active" and "which role" per request, pays for the
+    /// DB read once.
+    ///
+    /// A revoked row returns `Ok(None)` for the same reason
+    /// `is_grant_active` returns `false`: the caller reads the role
+    /// only to project it as `AuthState.user.role`, and there is no
+    /// role to project when the grant is not active.
+    pub async fn active_grant_role(
+        pool: &PgPool,
+        grantee_bunyip_user_id: Uuid,
+        mokosh_account_id: &str,
+    ) -> AppResult<Option<String>> {
+        let key = GrantKey {
+            grantee_bunyip_user_id,
+            mokosh_account_id: mokosh_account_id.to_string(),
+        };
+        if let Some(snapshot) = read_cache(&key) {
+            if snapshot.resolved_at.elapsed() < GRANT_CACHE_TTL {
+                return Ok(if snapshot.active { snapshot.role } else { None });
+            }
+        }
+        let row: Option<GrantRow> = sqlx::query_as(
+            "SELECT role, revoked_at FROM mokosh_bunyip_grants \
+             WHERE grantee_bunyip_user_id = $1 AND mokosh_account_id = $2",
+        )
+        .bind(grantee_bunyip_user_id)
+        .bind(mokosh_account_id)
+        .fetch_optional(pool)
+        .await?;
+        let (role, active, cache) = match row {
+            Some(r) => {
+                let active = r.revoked_at.is_none() && r.role.is_some();
+                (r.role, active, true)
+            }
+            None => (None, false, false),
+        };
+        if cache {
+            write_cache(
+                key,
+                GrantSnapshot {
+                    role: role.clone(),
+                    active,
+                    resolved_at: Instant::now(),
+                },
+            );
+        }
+        Ok(if active { role } else { None })
     }
 
     /// Idempotent UPSERT called from the webhook receiver. `role` is
