@@ -33,6 +33,8 @@ pub mod bunyip_webhook;
 #[cfg(feature = "server")]
 pub mod grant_invitations;
 #[cfg(feature = "server")]
+pub mod grant_invitations_routes;
+#[cfg(feature = "server")]
 pub mod middleware;
 pub mod mokosh_bunyip_grants;
 // PMS-871: at-rest encryption of `users.mfa_secret`, plus the classification

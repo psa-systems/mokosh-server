@@ -21,7 +21,13 @@ use crate::modules::approvals::{approval_routes, ApprovalsService};
 use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::audit::{audit_routes, AuditService};
 use crate::modules::auth::{
-    auth_routes, bunyip_webhook::BunyipWebhookState, AuthMiddleware, AuthService,
+    auth_routes,
+    bunyip_webhook::BunyipWebhookState,
+    grant_invitations_routes::{
+        grant_invitations_by_token_routes, grant_invitations_grantee_routes,
+        grant_invitations_owner_routes,
+    },
+    AuthMiddleware, AuthService,
 };
 use crate::modules::billing::{
     billing_routes, provider_webhook_handler, BillingService, ProviderWebhookState,
@@ -362,6 +368,28 @@ pub fn create_api_router(
         // cheap Arc bump. PMS-837 removed the Google OAuth popup routes and
         // their `google_oauth` / `cookie_secure` parameters.
         .nest("/auth", auth_routes(auth_service.clone()))
+        // PMS-1208: cross-account Mokosh grants with a Cloudflare-shaped
+        // pending / accept / expire lifecycle. Three mounts:
+        //   /grants/invitations/*     - owner surface (RequireAdmin)
+        //   /grants/invitations/by-token/* - unauth token-driven
+        //   /my-grants/invitations    - grantee inbox (RequireAuth)
+        // The by-token mount is UNAUTHENTICATED at the middleware level
+        // because the token IS the credential; the accept/decline
+        // handlers still gate on the caller's identity when they have
+        // one, but a first-sight grantee bouncing through OIDC can hit
+        // the metadata endpoint before the auth chain sees them.
+        .nest(
+            "/grants/invitations/by-token",
+            grant_invitations_by_token_routes(Arc::new(db.clone())),
+        )
+        .nest(
+            "/grants/invitations",
+            grant_invitations_owner_routes(Arc::new(db.clone())),
+        )
+        .nest(
+            "/my-grants/invitations",
+            grant_invitations_grantee_routes(Arc::new(db.clone())),
+        )
         // MAPPS-513: platform super-admin routes. Distinct credential
         // store (`platform_admins`) and distinct JWT typ so the
         // super-admin persona is isolated from the tenant identity
