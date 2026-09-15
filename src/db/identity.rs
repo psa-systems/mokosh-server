@@ -173,6 +173,20 @@ impl MembershipRepo {
     /// (tenant name/slug/kind included) in one round trip. Ordered by
     /// `joined_at` so the phase-3 picker leads with the identity's
     /// longest-standing tenant.
+    ///
+    /// PMS-1210 addition: also UNIONs in every active row from
+    /// `mokosh_bunyip_grants` where the caller is the grantee, so
+    /// the client's switcher renders "shared with you" tenants
+    /// beside the caller's own. The grant rows carry
+    /// `mokosh_bunyip_grant_id = Some(grant.id)`; the identity's
+    /// own rows carry `None`, which is what the Leave affordance
+    /// keys on. The bunyip sub is resolved from the identity's
+    /// linked `users` row: BUNYIP-674 option B seeds `bunyip_user_id`
+    /// on JIT provisioning, so a granted user has a non-NULL value
+    /// there. A caller with no linked `users.bunyip_user_id`
+    /// (legacy identity, or the mocks in the unit-test rig) reads
+    /// zero grant rows and the shape reduces to what MAPPS-491
+    /// shipped.
     pub async fn list_views_for_identity(
         pool: &PgPool,
         identity_id: Uuid,
@@ -191,7 +205,7 @@ impl MembershipRepo {
         .fetch_all(pool)
         .await?;
 
-        Ok(rows
+        let mut views: Vec<mokosh_types::auth::MembershipView> = rows
             .into_iter()
             .map(
                 |(tenant_id, name, slug, kind, role, status)| mokosh_types::auth::MembershipView {
@@ -202,9 +216,63 @@ impl MembershipRepo {
                     tenant_kind: kind,
                     role,
                     status,
+                    mokosh_bunyip_grant_id: None,
                 },
             )
-            .collect())
+            .collect();
+
+        // PMS-1210: append grant-based memberships. A single UNION-
+        // like query joining identities.email/user_id to users
+        // would be cleaner, but `identities` and `users` are on
+        // separate identity/tenant axes, and the reliable link is
+        // through the identity's email address hitting a users row
+        // that carries a bunyip_user_id. The subquery below reads
+        // every DISTINCT bunyip_user_id linked to this identity by
+        // email (case-insensitive, matching how the JIT provisioner
+        // seeds the row).
+        let grant_rows: Vec<(Uuid, Uuid, String, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT g.id, t.id AS tenant_id, t.name, t.slug, t.kind, g.role
+            FROM mokosh_bunyip_grants g
+            JOIN tenants t ON t.slug = g.mokosh_account_id
+            WHERE g.revoked_at IS NULL
+              AND g.role IS NOT NULL
+              AND g.grantee_bunyip_user_id IN (
+                  SELECT DISTINCT u.bunyip_user_id
+                  FROM users u
+                  JOIN identities i ON lower(i.email) = lower(u.email)
+                  WHERE i.id = $1
+                    AND u.bunyip_user_id IS NOT NULL
+                    AND u.deleted_at IS NULL
+              )
+            ORDER BY g.granted_at ASC
+            "#,
+        )
+        .bind(identity_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        for (grant_id, tenant_id, name, slug, kind, role) in grant_rows {
+            // De-dupe against the identity's own tenant_memberships
+            // list: an owner who ALSO grants themselves would not
+            // appear twice.
+            if views.iter().any(|v| v.tenant_id == tenant_id) {
+                continue;
+            }
+            views.push(mokosh_types::auth::MembershipView {
+                is_active: Some(tenant_id) == active_tenant_id,
+                tenant_id,
+                tenant_name: name,
+                tenant_slug: slug,
+                tenant_kind: kind,
+                role,
+                status: "active".to_string(),
+                mokosh_bunyip_grant_id: Some(grant_id),
+            });
+        }
+
+        Ok(views)
     }
 }
 
