@@ -542,3 +542,97 @@ async fn a_contact_never_sees_an_unissued_quote(pool: PgPool) {
         .expect("contact get draft");
     assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
 }
+
+/// Captures what the API mails, so a test can read the link a customer gets.
+#[derive(Default)]
+struct CapturingMailer {
+    sent: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl mokosh_server::utils::email::Mailer for CapturingMailer {
+    async fn send_multipart(
+        &self,
+        to: &str,
+        _subject: &str,
+        text: &str,
+        _html: Option<&str>,
+    ) -> mokosh_server::utils::error::AppResult<()> {
+        self.sent
+            .lock()
+            .unwrap()
+            .push((to.to_string(), text.to_string()));
+        Ok(())
+    }
+
+    async fn send_with_attachments(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        _attachments: &[mokosh_server::utils::email::EmailAttachment<'_>],
+    ) -> mokosh_server::utils::error::AppResult<()> {
+        self.send_multipart(to, subject, text, None).await
+    }
+}
+
+/// MAPPS-779: the link in the quote email opens.
+///
+/// It was `{origin}/portal/quotes/{id}`, a route mokosh-apps retired with the
+/// rest of `/portal/*`, so every quote email pointed at the SPA's 404 page -
+/// PMS-1168's defect, fixed for invoices and missed for quotes because the
+/// quote link was its own `format!`. It is now the company's portal login,
+/// carrying the quote through sign-in, and this reads it out of the mail the
+/// API actually sent rather than asserting on what the service passed around.
+#[sqlx::test]
+async fn the_quote_email_links_to_the_portal_login_returning_to_the_quote(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company = seed_company_named(&pool, "Linked Client").await;
+    let contact = seed_portal_contact(&pool, company, "signoff-link@example.com").await;
+    let app = common::boot(pool.clone()).await;
+    let mailer = std::sync::Arc::new(CapturingMailer::default());
+    app.mailer.swap(mailer.clone());
+    let token = common::login(&app, &email, &password).await;
+
+    let quote = create_quote(
+        &app,
+        &token,
+        serde_json::json!({
+            "company_id": company,
+            "billing_contact_id": contact.id,
+            "title": "Linked quote",
+            "lines": [{"line_type":"service","description":"Build","quantity":"1","unit_price":"100"}],
+        }),
+    )
+    .await;
+    let quote_id = quote["id"].as_str().unwrap().to_string();
+    approve(&app, &token, &quote_id).await;
+    assert_eq!(
+        send_quote(&app, &token, &quote_id).await.status(),
+        StatusCode::OK
+    );
+
+    let portal_id: Option<i64> =
+        sqlx::query_scalar("SELECT portal_id FROM companies WHERE id = $1")
+            .bind(company)
+            .fetch_one(&pool)
+            .await
+            .expect("read portal id");
+    let login = match portal_id {
+        Some(handle) => format!("http://spa.localhost/portal/{handle}/login"),
+        None => "http://spa.localhost/portal/login".to_string(),
+    };
+    let expected = format!("{login}?next=/quotes/{quote_id}");
+
+    let sent = mailer.sent.lock().unwrap().clone();
+    let (to, text) = sent
+        .iter()
+        .find(|(to, _)| to == "signoff-link@example.com")
+        .unwrap_or_else(|| panic!("no quote mail to the billing contact: {sent:?}"));
+    assert_eq!(to, "signoff-link@example.com");
+    assert!(text.contains(&expected), "expected {expected} in:\n{text}");
+    assert!(
+        !text.contains("/portal/quotes/"),
+        "the retired route must never be emailed again:\n{text}"
+    );
+}
