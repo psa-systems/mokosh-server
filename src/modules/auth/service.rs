@@ -2753,6 +2753,63 @@ impl AuthService {
         }))
     }
 
+    /// BUNYIP-674 (option B): find the caller's placement inside a
+    /// SPECIFIC tenant, keyed on the bunyip sub rather than on the local
+    /// `users.id`. This is what the grant-scoped request path uses: a
+    /// grantee has their own `users` row in their own tenant AND a
+    /// separately-provisioned row in each granted tenant, so the sub
+    /// alone is not enough to pick which one this request runs under.
+    ///
+    /// Migration 221 backfilled `bunyip_user_id = id` for every existing
+    /// row, so for the OWNER call site (the caller's own tenant) this
+    /// returns the same row [`Self::find_bunyip_principal`] would.
+    ///
+    /// SAFETY (PMS-285/PMS-260): reads the migrator pool for the same
+    /// reason `find_bunyip_principal` does - the caller is not yet
+    /// placed, there is no `app.current_tenant` GUC to set, and the
+    /// (bunyip_user_id, tenant_id) predicate names exactly one row per
+    /// migration 221's partial UNIQUE index.
+    pub async fn find_bunyip_principal_in_tenant(
+        &self,
+        bunyip_user_id: Uuid,
+        tenant_id: Uuid,
+    ) -> AppResult<Option<BunyipPrincipal>> {
+        let row = sqlx::query_as::<_, BunyipPrincipalRow>(
+            r#"
+            SELECT u.id, u.tenant_id, u.email, u.password_hash, u.first_name, u.last_name,
+                   u.phone, u.mobile, u.title, u.avatar_url, u.timezone, u.locale,
+                   u.date_format_string, u.theme_base_mode, u.theme_accent_id, u.role,
+                   u.status, u.email_verified_at, u.last_login_at, u.last_login_country,
+                   u.login_location_alerts, u.mfa_enabled,
+                   u.mfa_secret, u.notification_preferences, u.settings,
+                   u.created_at, u.updated_at, u.password_changed_at, u.profile_completed_at,
+                   (SELECT own_company_id FROM tenants WHERE id = u.tenant_id) AS own_company_id,
+                   EXISTS (
+                       SELECT 1 FROM tenant_invitations i
+                       WHERE u.email_verified_at IS NOT NULL
+                         AND lower(i.email) = lower(btrim(u.email))
+                         AND i.status = 'pending'
+                         AND i.expires_at > NOW()
+                   ) AS has_pending_invite
+            FROM users u
+            WHERE u.bunyip_user_id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+            "#,
+        )
+        .bind(bunyip_user_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+
+        Ok(row.map(|row| {
+            let placement = (row.user.tenant_id, row.user.role.clone());
+            BunyipPrincipal {
+                placement,
+                user: row.user.into(),
+                has_pending_invite: row.has_pending_invite,
+            }
+        }))
+    }
+
     /// MAPPS-348: probe whether a user row exists in the tombstoned state.
     /// The auth middleware runs this on the error path (when the normal
     /// `deleted_at IS NULL` lookup returned nothing) to distinguish

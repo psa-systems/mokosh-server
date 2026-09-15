@@ -349,3 +349,136 @@ async fn ensure_grant_still_active_if_claimed_gates_on_the_mirror(pool: PgPool) 
         mokosh_server::utils::error::AppError::Forbidden(_)
     ));
 }
+
+/// BUNYIP-674 option B, phase 1: the new (bunyip_user_id, tenant_id)
+/// resolver finds a placement row keyed on the caller's Bunyip sub in
+/// a specific tenant. Two owner rows for the SAME bunyip sub in two
+/// different tenants (the shape a grantee turns into) are both
+/// resolvable, and each returns the row from its own tenant.
+#[sqlx::test]
+async fn find_bunyip_principal_in_tenant_returns_the_row_for_that_tenant(pool: PgPool) {
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+
+    // Two tenants, seeded here rather than through the app helpers so
+    // this file stays free of the process-global `tracing` subscriber
+    // `common` installs (`bunyip_query_budget` documents the reason).
+    let tenant_a = Uuid::new_v4();
+    let tenant_b = Uuid::new_v4();
+    for (id, name, slug) in [
+        (tenant_a, "TenantA", "tenant-a"),
+        (tenant_b, "TenantB", "tenant-b"),
+    ] {
+        sqlx::query("INSERT INTO tenants (id, name, slug, status) VALUES ($1, $2, $3, 'active')")
+            .bind(id)
+            .bind(name)
+            .bind(slug)
+            .execute(&pool)
+            .await
+            .expect("seed tenant");
+    }
+
+    // ONE bunyip sub, TWO placement rows (a's owner + b's grantee).
+    // Each row gets a distinct `users.id` so the FKs elsewhere in the
+    // schema still distinguish them; both point at the same
+    // `bunyip_user_id` so the resolver can find either by
+    // (sub, tenant_id). This is the shape option B lands.
+    let bunyip_sub = Uuid::new_v4();
+    let user_in_a = Uuid::new_v4();
+    let user_in_b = Uuid::new_v4();
+    for (uid, tid, role, email) in [
+        (user_in_a, tenant_a, "admin", "shared@example.com"),
+        (user_in_b, tenant_b, "manager", "shared@example.com"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, tenant_id, email, first_name, last_name, role, \
+             status, email_verified_at, bunyip_user_id) \
+             VALUES ($1, $2, $3, 'Shared', 'User', $4, 'active', NOW(), $5)",
+        )
+        .bind(uid)
+        .bind(tid)
+        .bind(email)
+        .bind(role)
+        .bind(bunyip_sub)
+        .execute(&pool)
+        .await
+        .expect("seed placement row");
+    }
+
+    let in_a = auth
+        .find_bunyip_principal_in_tenant(bunyip_sub, tenant_a)
+        .await
+        .expect("resolve in tenant A")
+        .expect("row present in A");
+    assert_eq!(in_a.user.id, user_in_a);
+    assert_eq!(in_a.user.tenant_id, tenant_a);
+    assert_eq!(in_a.placement.1, "admin");
+
+    let in_b = auth
+        .find_bunyip_principal_in_tenant(bunyip_sub, tenant_b)
+        .await
+        .expect("resolve in tenant B")
+        .expect("row present in B");
+    assert_eq!(in_b.user.id, user_in_b);
+    assert_eq!(in_b.user.tenant_id, tenant_b);
+    assert_eq!(in_b.placement.1, "manager");
+
+    // A tenant the sub is not placed in returns None (the grant path
+    // then knows to JIT-provision or refuse, depending on whether the
+    // mirror has an active grant).
+    let unknown_tenant = Uuid::new_v4();
+    let absent = auth
+        .find_bunyip_principal_in_tenant(bunyip_sub, unknown_tenant)
+        .await
+        .expect("resolve in a tenant with no placement");
+    assert!(absent.is_none());
+}
+
+/// Migration 221's backfill invariant: an OWNER row inserted with only
+/// `id` (as every pre-BUNYIP-674 code path does) is not visible to the
+/// new resolver, because bunyip_user_id is NULL on it. This pins that
+/// the fallback belongs at the CALLER (a request-time resolver runs
+/// the new lookup first and falls back to `find_bunyip_principal` for
+/// pre-migration rows) rather than being welded into the query with
+/// COALESCE, which would make it impossible to tell "same sub, other
+/// tenant" apart from "unmirrored row".
+#[sqlx::test]
+async fn a_row_with_no_bunyip_user_id_is_invisible_to_the_new_resolver(pool: PgPool) {
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+    let tenant_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name, slug, status) VALUES ($1, 'T', 't', 'active')")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Pre-BUNYIP-674 shape: id = sub, bunyip_user_id defaulted to NULL.
+    let sub = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, first_name, last_name, role, \
+         status, email_verified_at) \
+         VALUES ($1, $2, 'legacy@example.com', 'L', 'U', 'admin', 'active', NOW())",
+    )
+    .bind(sub)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let via_new = auth
+        .find_bunyip_principal_in_tenant(sub, tenant_id)
+        .await
+        .expect("query runs");
+    assert!(
+        via_new.is_none(),
+        "the new resolver refuses a NULL-mirror row so the caller can decide \
+         to backfill or fall back to find_bunyip_principal"
+    );
+
+    // The old resolver still finds it by id.
+    let via_old = auth
+        .find_bunyip_principal(sub)
+        .await
+        .expect("query runs")
+        .expect("legacy row is still resolvable by id");
+    assert_eq!(via_old.user.id, sub);
+}

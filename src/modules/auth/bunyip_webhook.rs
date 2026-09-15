@@ -286,7 +286,7 @@ pub async fn mokosh_grant_changed(
         "granted" => {
             if payload.role.is_none() {
                 return Err(AppError::BadRequest(
-                    "granted state must carry a role".to_string(),
+                    "A granted event must carry a role.".to_string(),
                 ));
             }
             None
