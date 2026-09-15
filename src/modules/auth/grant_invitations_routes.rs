@@ -32,12 +32,24 @@ use super::grant_invitations::{
     AcceptRefusal, CreatedInvitation, GrantInvitation, GrantInvitationsService, DEFAULT_TTL,
 };
 use super::middleware::{RequireAdminUser, RequireAuth};
+use super::tenant::TenantId;
 use crate::db::Database;
+use crate::modules::notifications::NotificationsService;
 use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
 pub struct GrantInvitationsState {
     pub db: Arc<Database>,
+    /// The mokosh-apps origin; the invitation email's accept link is
+    /// `{spa_base_url}/accept-grant?token=<plaintext>`. In SaaS mode
+    /// this is the tenant's mokosh SPA origin; in standalone mode it
+    /// is the deployment's single spa host.
+    pub spa_base_url: Arc<String>,
+    /// Dispatch queue for the invitation email. `None` in tests that
+    /// do not wire notifications; the create handler still succeeds
+    /// and logs at warn so a fixture without notifications does not
+    /// silently swallow the email.
+    pub notifications: Option<Arc<NotificationsService>>,
 }
 
 /// POST body for `POST /api/v1/grants/invitations`. Either
@@ -119,8 +131,16 @@ pub struct InvitationMetadata {
 
 /// Owner-facing mount. Sits under `/api/v1/grants/invitations` in
 /// `create_api_router`.
-pub fn grant_invitations_owner_routes(db: Arc<Database>) -> Router {
-    let state = GrantInvitationsState { db };
+pub fn grant_invitations_owner_routes(
+    db: Arc<Database>,
+    spa_base_url: Arc<String>,
+    notifications: Option<Arc<NotificationsService>>,
+) -> Router {
+    let state = GrantInvitationsState {
+        db,
+        spa_base_url,
+        notifications,
+    };
     Router::new()
         .route("/", post(create_invitation))
         .route("/", get(list_owner_outbox))
@@ -130,7 +150,11 @@ pub fn grant_invitations_owner_routes(db: Arc<Database>) -> Router {
 
 /// Grantee-facing mount. Sits under `/api/v1/my-grants/invitations`.
 pub fn grant_invitations_grantee_routes(db: Arc<Database>) -> Router {
-    let state = GrantInvitationsState { db };
+    let state = GrantInvitationsState {
+        db,
+        spa_base_url: Arc::new(String::new()),
+        notifications: None,
+    };
     Router::new()
         .route("/", get(list_grantee_inbox))
         .with_state(state)
@@ -139,7 +163,11 @@ pub fn grant_invitations_grantee_routes(db: Arc<Database>) -> Router {
 /// Unauthenticated mount for the token-driven endpoints. Sits
 /// under `/api/v1/grants/invitations/by-token`.
 pub fn grant_invitations_by_token_routes(db: Arc<Database>) -> Router {
-    let state = GrantInvitationsState { db };
+    let state = GrantInvitationsState {
+        db,
+        spa_base_url: Arc::new(String::new()),
+        notifications: None,
+    };
     Router::new()
         .route("/{token}", get(get_invitation_by_token))
         .route("/{token}/accept", post(accept_invitation))
@@ -192,6 +220,57 @@ async fn create_invitation(
     )
     .await?;
 
+    // Fire the invitation email through the notifications
+    // dispatcher (`auth.mokosh_grant_invite` template, migration 223).
+    // Best-effort: a mailer failure warns but does NOT roll back the
+    // invitation row, because the owner can resend from the outbox and
+    // the created row is still cancelable / accepatable through the
+    // token they can also copy-paste in dev. Skipping is loud, not
+    // silent.
+    match state.notifications.as_ref() {
+        Some(notify) => {
+            let accept_url = format!(
+                "{}/accept-grant?token={}",
+                state.spa_base_url.trim_end_matches('/'),
+                accept_token
+            );
+            let context = serde_json::json!({
+                "recipient_email": invitation.invitee_email,
+                "invitee_display_name": local_part(&invitation.invitee_email),
+                "inviter_display_name": display_name_for(&caller),
+                "mokosh_account_name": lookup_tenant_name(&state, caller.tenant_id)
+                    .await
+                    .unwrap_or_default(),
+                "role_display": role_display(&invitation.role),
+                "accept_url": accept_url,
+                "expires_at_human": humanize_expiry(invitation.expires_at),
+            });
+            if let Err(e) = notify
+                .dispatch(
+                    TenantId::from_trusted(caller.tenant_id),
+                    "auth.mokosh_grant_invite",
+                    &context,
+                )
+                .await
+            {
+                tracing::warn!(
+                    invitation_id = %invitation.id,
+                    error = ?e,
+                    "grant invitation notify dispatch failed; row persisted, owner can resend"
+                );
+            } else {
+                tracing::info!(
+                    invitation_id = %invitation.id,
+                    "grant invitation email queued via notifications dispatcher"
+                );
+            }
+        }
+        None => tracing::warn!(
+            invitation_id = %invitation.id,
+            "no notifications dispatcher wired; grant invitation persisted but no email queued"
+        ),
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(CreatedInvitationResponse {
@@ -199,6 +278,72 @@ async fn create_invitation(
             accept_token,
         }),
     ))
+}
+
+/// Local part of an email address, for a plausible display name
+/// when userinfo has not been consulted (or is not available in
+/// standalone mode). `"alice@example.com"` -> `"alice"`; a value
+/// with no `@` is returned as-is.
+fn local_part(email: &str) -> String {
+    email
+        .split_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or(email)
+        .to_string()
+}
+
+/// Best-effort display name for the inviter, matching the shape
+/// `auth.welcome` uses: `first_name last_name` when both are
+/// present, else whichever is set, else the email local part.
+fn display_name_for(caller: &super::CurrentUser) -> String {
+    let f = caller.first_name.trim();
+    let l = caller.last_name.trim();
+    match (f, l) {
+        ("", "") => local_part(&caller.email),
+        (f, "") => f.to_string(),
+        ("", l) => l.to_string(),
+        (f, l) => format!("{f} {l}"),
+    }
+}
+
+/// Title-cased human label for the PMS-1162 role vocab.
+fn role_display(role: &str) -> String {
+    match role {
+        "admin" => "Admin".to_string(),
+        "manager" => "Manager".to_string(),
+        "technician" => "Technician".to_string(),
+        "finance" => "Finance".to_string(),
+        "read_only" => "Read only".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// "in 7 days" for a 7-day-out expiry, an absolute date otherwise.
+/// Deliberately coarse: the template says "the invitation expires
+/// {{expires_at_human}}", and a to-the-minute label reads worse than
+/// a rounded one.
+fn humanize_expiry(expires_at: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let days = (expires_at - now).num_days();
+    if (1..=14).contains(&days) {
+        format!("in {days} days")
+    } else {
+        expires_at.format("on %B %-d, %Y").to_string()
+    }
+}
+
+/// Look the account name up for the `mokosh_account_name` template
+/// key. Errors and missing rows read as empty string so the email
+/// still fires with the substitution blank rather than blocking on
+/// a name lookup.
+async fn lookup_tenant_name(state: &GrantInvitationsState, tenant_id: Uuid) -> Option<String> {
+    sqlx::query_as::<_, (String,)>("SELECT name FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .fetch_optional(state.db.migrator_pool())
+        .await
+        .ok()
+        .flatten()
+        .map(|(name,)| name)
 }
 
 async fn list_owner_outbox(

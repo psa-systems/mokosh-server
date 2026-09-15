@@ -893,6 +893,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     scheduler.register(calendar_reminder_worker, std::time::Duration::from_secs(60));
 
+    // PMS-1208: hourly expiry sweep for pending grant invitations. The
+    // service also lazy-checks expiry at read + accept + decline time,
+    // so a late request never sees a stale row; this job is what
+    // removes expired rows from the owner outbox and grantee inbox.
+    let grant_invitations_sweep =
+        mokosh_server::modules::auth::grant_invitations_worker::GrantInvitationsExpirySweep::new(
+            std::sync::Arc::new(db.pool().clone()),
+        );
+    scheduler.register(
+        grant_invitations_sweep,
+        mokosh_server::modules::auth::grant_invitations_worker::GRANT_INVITATIONS_SWEEP_INTERVAL,
+    );
+
     // PMS-478: scheduled-report worker. Ticks every 60s; the cadence
     // matches the cron-expression granularity (cron crate parses
     // minute-level fields, so a sub-minute tick adds nothing). The

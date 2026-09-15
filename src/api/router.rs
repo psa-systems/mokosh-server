@@ -384,7 +384,11 @@ pub fn create_api_router(
         )
         .nest(
             "/grants/invitations",
-            grant_invitations_owner_routes(Arc::new(db.clone())),
+            grant_invitations_owner_routes(
+                Arc::new(db.clone()),
+                Arc::new(spa_base_url.clone()),
+                Some(Arc::new(notifications_service.clone())),
+            ),
         )
         .nest(
             "/my-grants/invitations",
