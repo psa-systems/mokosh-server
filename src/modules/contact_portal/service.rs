@@ -827,11 +827,12 @@ impl ContactAuthService {
             bool,
             serde_json::Value,
             serde_json::Value,
+            String,
         ) = sqlx::query_as(
             r#"
             SELECT c.id, c.tenant_id, c.email, c.first_name, c.last_name,
                    c.company_id, co.name, co.portal_slug, c.portal_mfa_enabled,
-                   t.branding, co.branding
+                   t.branding, co.branding, t.name
             FROM contacts c
             INNER JOIN companies co ON co.id = c.company_id
             INNER JOIN tenants t ON t.id = c.tenant_id
@@ -854,6 +855,7 @@ impl ContactAuthService {
             mfa_enabled,
             tenant_branding,
             company_branding,
+            organization_name,
         ) = row;
         let email = email.unwrap_or_default();
         let portal_slug = portal_slug.unwrap_or_default();
@@ -873,8 +875,13 @@ impl ContactAuthService {
             serde_json::from_value(tenant_branding).unwrap_or_default();
         let company_b: mokosh_types::contacts::CompanyBranding =
             serde_json::from_value(company_branding).unwrap_or_default();
-        let effective_branding =
-            crate::modules::branding::effective::effective_branding(&tenant_b, &company_b);
+        // MAPPS-807: the customer's brand names the MSP even when no branding
+        // name was configured, the way the MSP's emails already do.
+        let effective_branding = crate::modules::branding::effective::customer_branding(
+            &tenant_b,
+            &company_b,
+            &organization_name,
+        );
         Ok(ContactMe {
             id,
             tenant_id: tid,
@@ -933,14 +940,20 @@ impl ContactAuthService {
                     serde_json::from_value(tenant_branding).unwrap_or_default();
                 let company_b: mokosh_types::contacts::CompanyBranding =
                     serde_json::from_value(company_branding).unwrap_or_default();
+                let effective_branding = crate::modules::branding::effective::customer_branding(
+                    &tenant_b,
+                    &company_b,
+                    &tenant_display_name,
+                );
                 ContactPortalHostHint {
                     company_name,
                     portal_slug: slug,
                     tenant_display_name,
                     tenant_status,
-                    effective_branding: crate::modules::branding::effective::effective_branding(
-                        &tenant_b, &company_b,
-                    ),
+                    // MAPPS-807: names the MSP on the sign-in page even with
+                    // no branding name configured, from the same
+                    // `tenants.name` the emails use.
+                    effective_branding,
                 }
             },
         ))
@@ -993,14 +1006,20 @@ impl ContactAuthService {
                     serde_json::from_value(tenant_branding).unwrap_or_default();
                 let company_b: mokosh_types::contacts::CompanyBranding =
                     serde_json::from_value(company_branding).unwrap_or_default();
+                let effective_branding = crate::modules::branding::effective::customer_branding(
+                    &tenant_b,
+                    &company_b,
+                    &tenant_display_name,
+                );
                 ContactPortalHostHint {
                     company_name,
                     portal_slug: slug.unwrap_or_default(),
                     tenant_display_name,
                     tenant_status,
-                    effective_branding: crate::modules::branding::effective::effective_branding(
-                        &tenant_b, &company_b,
-                    ),
+                    // MAPPS-807: names the MSP on the sign-in page even with
+                    // no branding name configured, from the same
+                    // `tenants.name` the emails use.
+                    effective_branding,
                 }
             },
         ))
