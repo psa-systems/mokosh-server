@@ -21,7 +21,8 @@ use crate::modules::approvals::{approval_routes, ApprovalsService};
 use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::audit::{audit_routes, AuditService};
 use crate::modules::auth::{
-    auth_routes, bunyip_webhook::BunyipWebhookState, AuthMiddleware, AuthService,
+    auth_routes, bunyip_webhook::BunyipWebhookState, my_grants_routes::my_grants_routes,
+    AuthMiddleware, AuthService,
 };
 use crate::modules::billing::{
     billing_routes, provider_webhook_handler, BillingService, ProviderWebhookState,
@@ -362,6 +363,12 @@ pub fn create_api_router(
         // cheap Arc bump. PMS-837 removed the Google OAuth popup routes and
         // their `google_oauth` / `cookie_secure` parameters.
         .nest("/auth", auth_routes(auth_service.clone()))
+        // PMS-1210: grantee-side leave-account endpoint. `DELETE /my-grants/{id}`
+        // where `{id}` is a `mokosh_bunyip_grants.id` for a row where the caller
+        // is the grantee. Distinct from the owner-side `POST /v1/grants/{id}/revoke`
+        // on bunyip-api (BUNYIP-673); the two revoke initiators produce distinct
+        // audit lines (`revoked_by` column, migration 222).
+        .nest("/my-grants", my_grants_routes(Arc::new(db.clone())))
         // MAPPS-513: platform super-admin routes. Distinct credential
         // store (`platform_admins`) and distinct JWT typ so the
         // super-admin persona is isolated from the tenant identity

@@ -330,6 +330,29 @@ pub async fn mokosh_grant_changed(
     // grantee's first request (there is no email or name in the
     // webhook payload to seed the row with).
     if payload.state == "revoked" {
+        // PMS-1210: stamp `revoked_by = 'owner'` on the mirror so
+        // the audit log can distinguish this from the grantee-side
+        // leave path. Best-effort like the tombstone below: a
+        // failure here does NOT roll back the mirror upsert, which
+        // already committed above; the audit column reading NULL
+        // for this row means "unknown initiator" and is recoverable
+        // manually if it matters.
+        if let Err(e) = MokoshBunyipGrantService::mark_revoked_by(
+            &state.pool,
+            payload.grantee_bunyip_user_id,
+            &payload.mokosh_account_id,
+            "owner",
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                grantee = %payload.grantee_bunyip_user_id,
+                mokosh_account_id = %payload.mokosh_account_id,
+                "grant revoked_by stamp failed after mirror upsert"
+            );
+        }
+
         if let Err(e) = sqlx::query(
             "UPDATE users SET deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW() \
              WHERE bunyip_user_id = $1 \

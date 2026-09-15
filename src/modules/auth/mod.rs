@@ -34,6 +34,8 @@ pub mod bunyip_webhook;
 pub mod middleware;
 #[cfg(feature = "server")]
 pub mod mokosh_bunyip_grants;
+#[cfg(feature = "server")]
+pub mod my_grants_routes;
 // PMS-871: at-rest encryption of `users.mfa_secret`, plus the classification
 // that lets a pre-PMS-871 plaintext row upgrade itself on next use.
 #[cfg(feature = "server")]

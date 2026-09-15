@@ -278,6 +278,70 @@ impl MokoshBunyipGrantService {
         });
         Ok(())
     }
+
+    /// PMS-1210: stamp `revoked_by` on the mirror row for the
+    /// (grantee, account) pair. Called by the webhook receiver on a
+    /// `revoked` event so the audit log can distinguish an
+    /// owner-initiated revoke from a grantee-initiated leave. Safe
+    /// to call on a row that is not yet revoked - the WHERE clause
+    /// filters on `revoked_at IS NOT NULL` so a race with the
+    /// mirror upsert lands in the right order (upsert first, stamp
+    /// second).
+    pub async fn mark_revoked_by(
+        pool: &PgPool,
+        grantee_bunyip_user_id: Uuid,
+        mokosh_account_id: &str,
+        actor: &str,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE mokosh_bunyip_grants \
+             SET revoked_by = $3, updated_at = NOW() \
+             WHERE grantee_bunyip_user_id = $1 \
+               AND mokosh_account_id = $2 \
+               AND revoked_at IS NOT NULL",
+        )
+        .bind(grantee_bunyip_user_id)
+        .bind(mokosh_account_id)
+        .bind(actor)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// PMS-1210: grantee-initiated leave. Marks the ACTIVE grant for
+    /// this (grantee, account) as revoked in one atomic UPDATE that
+    /// also stamps `revoked_by = 'grantee'` so the audit log can
+    /// tell it apart from an owner revoke. Returns `Ok(Some(row))`
+    /// when a row was moved, `Ok(None)` when no active grant matched
+    /// (already revoked, unknown grantee, or wrong tenant), and the
+    /// caller picks whether that is 204 idempotent (leave twice) or
+    /// 404 enumeration-resistant (foreign id). Invalidates the 30s
+    /// cache so the very next request sees the revoke.
+    pub async fn revoke_by_grantee(
+        pool: &PgPool,
+        grantee_bunyip_user_id: Uuid,
+        mokosh_account_id: &str,
+    ) -> AppResult<Option<Uuid>> {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "UPDATE mokosh_bunyip_grants \
+             SET revoked_at = NOW(), revoked_by = 'grantee', role = NULL, updated_at = NOW() \
+             WHERE grantee_bunyip_user_id = $1 \
+               AND mokosh_account_id = $2 \
+               AND revoked_at IS NULL \
+             RETURNING id",
+        )
+        .bind(grantee_bunyip_user_id)
+        .bind(mokosh_account_id)
+        .fetch_optional(pool)
+        .await?;
+
+        invalidate_cache(&GrantKey {
+            grantee_bunyip_user_id,
+            mokosh_account_id: mokosh_account_id.to_string(),
+        });
+
+        Ok(row.map(|(id,)| id))
+    }
 }
 
 fn read_cache(key: &GrantKey) -> Option<GrantSnapshot> {
