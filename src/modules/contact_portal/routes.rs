@@ -477,9 +477,7 @@ fn check_reauth_budget(
 ) -> AppResult<()> {
     match state.reauth_limiter.check(ip, contact_id) {
         Ok(()) => Ok(()),
-        Err(retry_after) => Err(AppError::RateLimited {
-            retry_after_seconds: Some(retry_after),
-        }),
+        Err(retry_after) => Err(AppError::rate_limited(Some(retry_after))),
     }
 }
 

@@ -193,15 +193,15 @@ async fn login(
             // PMS-773: the persistent second-factor lockout knows exactly when it
             // lifts, so it answers with the same Retry-After contract as the
             // limiter above instead of a bare 429.
-            Err(AppError::RateLimited {
-                retry_after_seconds: Some(retry_after),
-            }) => {
-                return Ok(rate_limited_response(
-                    retry_after,
-                    "Too many failed verification codes, please try again later",
-                ))
-            }
-            Err(other) => return Err(other),
+            Err(other) => match other.known_retry_after() {
+                Some(retry_after) => {
+                    return Ok(rate_limited_response(
+                        retry_after,
+                        "Too many failed verification codes, please try again later",
+                    ))
+                }
+                None => return Err(other),
+            },
         }
     } else {
         state

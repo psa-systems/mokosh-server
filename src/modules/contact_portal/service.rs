@@ -204,9 +204,11 @@ impl ContactAuthService {
         // in the future = 429 with a retry hint.
         if let Some(until) = locked_until {
             if until > Utc::now() {
-                return Err(AppError::RateLimited {
-                    retry_after_seconds: None,
-                });
+                // PMS-773: the window's own remaining time is the wait the
+                // caller is owed, floored at 1 so a sub-second remainder is
+                // never reported as "retry immediately".
+                let retry_after = (until - Utc::now()).num_seconds().max(1) as u64;
+                return Err(AppError::rate_limited(Some(retry_after)));
             }
         }
 
@@ -1485,9 +1487,11 @@ impl ContactAuthService {
                 // wall.
                 if let Some(until) = locked_until {
                     if until > Utc::now() {
-                        return Err(AppError::RateLimited {
-                            retry_after_seconds: None,
-                        });
+                        // PMS-773: the window's own remaining time is the wait
+                        // the caller is owed, floored at 1 so a sub-second
+                        // remainder is never reported as "retry immediately".
+                        let retry_after = (until - Utc::now()).num_seconds().max(1) as u64;
+                        return Err(AppError::rate_limited(Some(retry_after)));
                     }
                 }
                 let second_factor_ok = self
