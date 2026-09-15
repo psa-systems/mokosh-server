@@ -356,6 +356,17 @@ pub const ACCESS_AREAS: &[AccessArea] = &[
         read_capability: PROJECTS_READ,
         granting_role: "Read-Only",
     },
+    // MAPPS-780: the Payment Methods page (MAPPS-674) had no area to ask for,
+    // so a contact without the capability was shown its internal name,
+    // `payment_methods:manage_own`, instead of a way to request it. There is
+    // no read half to this area: managing their own saved methods is the whole
+    // of it, so that capability is also the proof the area is reachable.
+    AccessArea {
+        key: "payment_methods",
+        label: "saved payment methods",
+        read_capability: PAYMENT_METHODS_MANAGE_OWN,
+        granting_role: "Billing Contact",
+    },
 ];
 
 /// The area `key` names, or `None` for anything outside the closed set.
@@ -378,6 +389,49 @@ pub fn validate_capabilities(caps: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MAPPS-780: every area can actually be granted.
+    ///
+    /// Granting a request assigns `granting_role`, and a request is refused
+    /// once `read_capability` is held. If a role did not carry the capability
+    /// that proves its area, granting would assign a role, close the request,
+    /// and leave the customer exactly where they started - with the request
+    /// marked granted and no way to ask again, because the next attempt would
+    /// still find the area unreachable and open a fresh request the MSP had
+    /// already "answered". This is the check that makes that mapping a fact
+    /// rather than a belief.
+    #[test]
+    fn every_access_area_is_granted_by_a_role_that_holds_it() {
+        for area in ACCESS_AREAS {
+            let role = BUILTIN_ROLES
+                .iter()
+                .find(|(name, _)| *name == area.granting_role)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} is granted by {:?}, which is not a built-in role",
+                        area.key, area.granting_role
+                    )
+                });
+            assert!(
+                role.1.contains(&area.read_capability),
+                "{} is granted by {} but that role does not hold {}",
+                area.key,
+                area.granting_role,
+                area.read_capability
+            );
+        }
+    }
+
+    /// Area keys are what a client sends and what a row stores, so two with
+    /// one key would make a request ambiguous.
+    #[test]
+    fn access_area_keys_are_unique() {
+        let mut keys: Vec<&str> = ACCESS_AREAS.iter().map(|a| a.key).collect();
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "duplicate access area key");
+    }
 
     #[test]
     fn constants_appear_in_all_capabilities() {
