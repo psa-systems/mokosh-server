@@ -2241,7 +2241,14 @@ impl TenantService {
                                  -- migration 215, which also backfills older
                                  -- tenants; copied here so a tenant created
                                  -- from now on hears about a request at all.
-                                 'portal.access_requested')
+                                 'portal.access_requested',
+                                 -- PMS-1208: Cloudflare-style pending invite
+                                 -- for cross-account grants. Seeded for the
+                                 -- default tenant by migration 223; copied
+                                 -- here so a tenant created from now on can
+                                 -- send an invitation email when the owner
+                                 -- shares their account.
+                                 'auth.mokosh_grant_invite')
             "#,
         )
         .bind(new_tenant_id)
@@ -2292,7 +2299,11 @@ impl TenantService {
                                    -- of these two is how the tenant this call
                                    -- is provisioning reaches its own admin.
                                    'auth.portal_password_reset',
-                                   'auth.portal_welcome')
+                                   'auth.portal_welcome',
+                                   -- PMS-1208: pair the invitation template
+                                   -- above with its rule. A template with no
+                                   -- rule is a message that is never sent.
+                                   'auth.mokosh_grant_invite')
             "#,
         )
         .bind(new_tenant_id)
