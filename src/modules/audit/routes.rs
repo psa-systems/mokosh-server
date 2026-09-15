@@ -150,7 +150,7 @@ async fn export_audit_log_csv(
         .header(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")
         .header(
             axum::http::header::CONTENT_DISPOSITION,
-            "attachment; filename=\"audit-log.csv\"",
+            crate::utils::content_disposition::content_disposition("audit-log.csv"),
         )
         .body(body)
         .map_err(|e| AppError::Internal(format!("failed to build CSV response: {e}")))?;

@@ -463,7 +463,10 @@ fn emit<T>(
                     // it in place under a URL ending in `/export`.
                     (
                         axum::http::header::CONTENT_DISPOSITION,
-                        format!("attachment; filename=\"{}.pdf\"", descriptor.key),
+                        crate::utils::content_disposition::content_disposition(&format!(
+                            "{}.pdf",
+                            descriptor.key
+                        )),
                     ),
                 ],
                 bytes,
