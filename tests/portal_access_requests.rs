@@ -333,3 +333,53 @@ async fn a_resolved_request_cannot_be_resolved_twice(pool: PgPool) {
         assert_eq!(resp.status(), expected);
     }
 }
+
+/// MAPPS-780: saved payment methods is an area a customer can ask for, and
+/// granting it lets them manage their payment methods. Before this the page
+/// could only show them the capability's internal name, and a request naming
+/// the area was refused as unknown.
+#[sqlx::test]
+async fn a_contact_can_ask_for_saved_payment_methods(pool: PgPool) {
+    let (_admin, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let staff_token = common::login(&app, &email, &password).await;
+    let (contact_id, token) =
+        seed_portal_contact(&app, &pool, "paymethods", &["Support Contact"]).await;
+
+    let (status, request) = ask_for(&app, &token, "payment_methods", None).await;
+    assert_eq!(status, StatusCode::OK, "{request}");
+    let request_id = request["id"].as_str().expect("request id");
+
+    let resp = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/contacts/contacts/access-requests/{request_id}/resolve"
+        )))
+        .bearer_auth(&staff_token)
+        .json(&serde_json::json!({ "grant": true }))
+        .send()
+        .await
+        .expect("resolve");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let caps: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT cap FROM contact_role_assignments cra \
+         INNER JOIN portal_roles pr ON pr.id = cra.role_id, \
+         LATERAL unnest(pr.capabilities) AS cap \
+         WHERE cra.tenant_id = $1 AND cra.contact_id = $2",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contact_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read caps");
+    assert!(
+        caps.contains(&"payment_methods:manage_own".to_string()),
+        "granting the area has to grant the capability that proves it: {caps:?}"
+    );
+
+    // And asking again is now refused as already held, which is what closes
+    // the loop rather than opening a request the MSP has already answered.
+    let (again, _) = ask_for(&app, &token, "payment_methods", None).await;
+    assert_eq!(again, StatusCode::BAD_REQUEST);
+}
