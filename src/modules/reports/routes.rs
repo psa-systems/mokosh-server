@@ -449,7 +449,12 @@ fn emit<T>(
         )
             .into_response()),
         ExportFormat::Pdf => {
-            let bytes = pdf::render(&to_pdf(data, descriptor.name))?;
+            // PMS-1206: a report stores nothing and is generated the moment
+            // this request is answered, so that moment is its own date.
+            let bytes = pdf::render(
+                &to_pdf(data, descriptor.name),
+                chrono::Utc::now().date_naive(),
+            )?;
             Ok((
                 [
                     (

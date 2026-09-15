@@ -874,9 +874,10 @@ async fn get_invoice_pdf(
                 .bill_to(tenant, invoice.company_id, invoice.billing_contact_id)
                 .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
-            crate::pdf::render(&crate::modules::billing::documents::invoice(
-                &invoice, &issuer, &bill_to, logo,
-            ))?
+            crate::pdf::render(
+                &crate::modules::billing::documents::invoice(&invoice, &issuer, &bill_to, logo),
+                invoice.invoice_date,
+            )?
         }
     };
     Ok(pdf_response(
@@ -1110,22 +1111,24 @@ async fn get_credit_note_pdf(
         .service
         .get_credit_note(tenant, credit_note_id)
         .await?;
-    let bytes =
-        match crate::modules::billing::documents::read_issued(tenant.get(), credit_note_id).await {
-            Some(stored) => stored,
-            None => {
-                let issuer = state.service.tenant_issuer(tenant).await?;
-                let credit_to = state
-                    .service
-                    .credit_to(tenant, note.company_id, note.invoice_id)
-                    .await?;
-                let logo =
-                    crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
-                crate::pdf::render(&crate::modules::billing::documents::credit_note(
-                    &note, &issuer, &credit_to, logo,
-                ))?
-            }
-        };
+    let bytes = match crate::modules::billing::documents::read_issued(tenant.get(), credit_note_id)
+        .await
+    {
+        Some(stored) => stored,
+        None => {
+            let issuer = state.service.tenant_issuer(tenant).await?;
+            let credit_to = state
+                .service
+                .credit_to(tenant, note.company_id, note.invoice_id)
+                .await?;
+            let logo =
+                crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
+            crate::pdf::render(
+                &crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
+                note.issue_date,
+            )?
+        }
+    };
     Ok(pdf_response(
         bytes,
         &format!("{}.pdf", note.credit_note_number),
@@ -1155,9 +1158,12 @@ async fn get_statement_pdf(
         .statement_account(tenant, statement.company_id)
         .await?;
     let logo = crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
-    let bytes = crate::pdf::render(&crate::modules::billing::documents::statement(
-        &statement, &issuer, &account, logo,
-    ))?;
+    // PMS-1206: a statement stores nothing (PMS-954), so there is no issue
+    // date to reuse; it is generated the moment this request is answered.
+    let bytes = crate::pdf::render(
+        &crate::modules::billing::documents::statement(&statement, &issuer, &account, logo),
+        chrono::Utc::now().date_naive(),
+    )?;
     Ok(pdf_response(
         bytes,
         &format!(
