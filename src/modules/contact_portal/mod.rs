@@ -12,6 +12,7 @@
 //! configurable capability set.
 
 pub mod capabilities;
+pub mod links;
 pub mod middleware;
 pub mod models;
 pub mod payment_methods;

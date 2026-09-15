@@ -827,19 +827,38 @@ impl QuotesService {
             return;
         };
 
-        let email: Option<String> = match self.db.begin_with_tenant(tenant_id).await {
+        // MAPPS-779: the company's portal handle is read beside the address,
+        // because the link names the company's own login.
+        let (email, portal_id): (Option<String>, Option<i64>) = match self
+            .db
+            .begin_with_tenant(tenant_id)
+            .await
+        {
             Ok(mut tx) => {
-                sqlx::query_scalar("SELECT email FROM contacts WHERE tenant_id = $1 AND id = $2")
-                    .bind(tenant_id)
-                    .bind(contact_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .ok()
-                    .flatten()
+                let email = sqlx::query_scalar(
+                    "SELECT email FROM contacts WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(contact_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .ok()
+                .flatten();
+                let portal_id = sqlx::query_scalar::<_, Option<i64>>(
+                    "SELECT portal_id FROM companies WHERE tenant_id = $1 AND id = $2",
+                )
+                .bind(tenant_id)
+                .bind(quote.company_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .ok()
+                .flatten()
+                .flatten();
+                (email, portal_id)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "could not open tx to resolve quote billing contact");
-                None
+                (None, None)
             }
         };
         let Some(email) = email.filter(|e| !e.is_empty()) else {
@@ -850,11 +869,25 @@ impl QuotesService {
             return;
         };
 
-        let link = format!(
-            "{}/portal/quotes/{}",
-            self.portal_origin.trim_end_matches('/'),
-            quote.id
-        );
+        // MAPPS-779: this was `{origin}/portal/quotes/{id}`, a route mokosh-apps
+        // retired with the rest of `/portal/*`, so every quote email since
+        // pointed at the SPA's 404 page - PMS-1168's defect, fixed for
+        // invoices and missed here because this was its own `format!`. Now
+        // the company's portal login, carrying the quote through sign-in.
+        let Some(link) = crate::modules::contact_portal::links::portal_login_link(
+            &self.portal_origin,
+            portal_id,
+            Some(&format!("/quotes/{}", quote.id)),
+        ) else {
+            // Not sent rather than sent without a link: a quote email is an
+            // ask to accept or decline, and one with nowhere to do it is a
+            // mail the customer can only answer by replying to it.
+            tracing::warn!(
+                quote_id = %quote.id,
+                "no portal origin is configured; quote sign-off mail not sent"
+            );
+            return;
+        };
         let number = quote.quote_number.as_deref().unwrap_or("(unnumbered)");
         let valid_until = quote.valid_until.map(|d| d.to_string());
 

@@ -2959,15 +2959,12 @@ impl BillingService {
     /// bounced to the STAFF login, which is the wrong plane for a customer. A
     /// link that survives the sign-in it requires needs `?next=` support in
     /// the client and is MAPPS-761.
+    ///
+    /// MAPPS-779: the building moved to `contact_portal::links`, because the
+    /// quote email had its own `format!` against the same retired route and
+    /// shipped the same 404. This keeps its name and its callers.
     pub(crate) fn portal_pay_link(origin: &str, portal_id: Option<i64>) -> Option<String> {
-        let origin = origin.trim().trim_end_matches('/');
-        if origin.is_empty() {
-            return None;
-        }
-        Some(match portal_id {
-            Some(handle) => format!("{origin}/portal/{handle}/login"),
-            None => format!("{origin}/portal/login"),
-        })
+        crate::modules::contact_portal::links::portal_login_link(origin, portal_id, None)
     }
 
     /// The company's portal handle, for [`portal_pay_link`].

@@ -233,8 +233,9 @@ pub fn create_api_router(
         db.clone(),
         mailer.clone(),
         notifications_service.clone(),
-        // MAPPS-425: the emailed quote link is `/portal/quotes/{id}`, a
-        // mokosh-apps route, so it takes the SPA origin.
+        // MAPPS-425: the emailed quote link is a mokosh-apps route, so it
+        // takes the SPA origin. MAPPS-779: it is the company's portal login
+        // returning to `/quotes/{id}`, since `/portal/quotes/{id}` was retired.
         spa_base_url.clone(),
     );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
