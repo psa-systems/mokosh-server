@@ -67,6 +67,7 @@ use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
 use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::inline_image::check_inline_image_mime;
+use crate::utils::upload_limits::oversized_upload_error;
 
 /// Default size cap when `ATTACHMENT_MAX_BYTES` is unset. 25 MiB
 /// matches what the ticket spec cites as the v1 default.
@@ -419,10 +420,7 @@ impl AttachmentService {
     ) -> AppResult<AttachmentResponse> {
         let size = bytes.len();
         if size as u64 > self.config.max_bytes {
-            return Err(AppError::PayloadTooLarge(format!(
-                "attachment exceeds {} byte cap",
-                self.config.max_bytes
-            )));
+            return Err(oversized_upload_error("attachment", self.config.max_bytes));
         }
         let id = Uuid::new_v4();
         let key = ObjectKey::ticket_attachment(tenant_id, id);
@@ -533,9 +531,7 @@ impl AttachmentService {
         }
         let cap = inline_cap(self.config.max_bytes);
         if bytes.len() as u64 > cap {
-            return Err(AppError::PayloadTooLarge(format!(
-                "an inline image exceeds the {cap} byte cap"
-            )));
+            return Err(oversized_upload_error("inline image", cap));
         }
         self.assert_ticket_in_tenant(tenant_id, ticket_id).await?;
         self.insert_blob(
