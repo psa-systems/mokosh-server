@@ -1011,6 +1011,14 @@ mod tests {
                 .any(|(a, b)| a.is_lowercase() && b.is_uppercase())
     }
 
+    /// PMS-1195: the `not_found` template is `"{0} not found"`, so an
+    /// argument that already ends in those words renders doubled
+    /// ("object not found not found"). Case-insensitive because the
+    /// template lowercases nothing and a caller might title-case it.
+    fn ends_with_not_found(noun: &str) -> bool {
+        noun.trim_end().to_ascii_lowercase().ends_with("not found")
+    }
+
     /// Recursively collect every `.rs` file under `dir`.
     fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("read source dir") {
@@ -1122,6 +1130,42 @@ mod tests {
             offenders.is_empty(),
             "AppError::NotFound must name the thing a user would recognise \
              (\"KB article\"), not the type or table behind it:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// PMS-1195: the enforcement for the doubled-suffix defect. The
+    /// `not_found` template appends " not found" itself, so a call site
+    /// (whether it constructs `AppError::NotFound(...)` directly or goes
+    /// through the `AppError::not_found(...)` helper) must never pass an
+    /// argument that already ends in those words, case-insensitive, or the
+    /// rendered message doubles it.
+    #[test]
+    fn not_found_arguments_do_not_already_say_not_found() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(
+            !files.is_empty(),
+            "no sources found under {}",
+            src.display()
+        );
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read source file");
+            for variant in ["NotFound", "not_found"] {
+                for (line, literal) in variant_literals(&source, variant) {
+                    if ends_with_not_found(&literal) {
+                        offenders.push(format!("{}:{line}: {literal:?}", file.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the not_found template already appends \" not found\"; a call site \
+             must not pass an argument that ends with those words too:\n{}",
             offenders.join("\n")
         );
     }

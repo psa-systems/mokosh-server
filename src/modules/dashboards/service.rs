@@ -88,7 +88,7 @@ impl DashboardsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?
-        .ok_or(AppError::NotFound("Dashboard not found".into()))?;
+        .ok_or(AppError::NotFound("Dashboard".into()))?;
         Ok(row.into())
     }
 
@@ -148,7 +148,7 @@ impl DashboardsService {
         .fetch_optional(&mut *tx)
         .await?;
         if exists.is_none() {
-            return Err(AppError::NotFound("Dashboard not found".into()));
+            return Err(AppError::NotFound("Dashboard".into()));
         }
         // Promoting a row to default clears the previous default in
         // the same transaction so the partial-unique index is
@@ -199,7 +199,7 @@ impl DashboardsService {
         .rows_affected();
         tx.commit().await?;
         if rows == 0 {
-            return Err(AppError::NotFound("Dashboard not found".into()));
+            return Err(AppError::NotFound("Dashboard".into()));
         }
         Ok(())
     }

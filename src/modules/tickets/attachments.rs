@@ -233,9 +233,7 @@ impl AttachmentService {
         .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         if exists.is_none() {
-            return Err(AppError::NotFound(
-                "ticket note not found in tenant scope".into(),
-            ));
+            return Err(AppError::NotFound("ticket note in tenant scope".into()));
         }
         Ok(())
     }
@@ -280,9 +278,7 @@ impl AttachmentService {
                 .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
                 .await?;
         if exists.is_none() {
-            return Err(AppError::NotFound(
-                "ticket not found in tenant scope".into(),
-            ));
+            return Err(AppError::NotFound("ticket in tenant scope".into()));
         }
         Ok(())
     }
@@ -507,7 +503,7 @@ impl AttachmentService {
         .bind(attachment_id)
         .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?
-        .ok_or_else(|| AppError::NotFound("attachment not found".into()))
+        .ok_or_else(|| AppError::NotFound("attachment".into()))
     }
 
     /// PMS-941: store an image the author is embedding in a description or a
@@ -584,7 +580,7 @@ impl AttachmentService {
         .bind(attachment_id)
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| AppError::NotFound("attachment not found".into()))
+        .ok_or_else(|| AppError::NotFound("attachment".into()))
     }
 
     async fn delete_one(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<()> {
@@ -602,7 +598,7 @@ impl AttachmentService {
         .await?;
         tx.commit().await?;
         let Some((path,)) = row else {
-            return Err(AppError::NotFound("attachment not found".into()));
+            return Err(AppError::NotFound("attachment".into()));
         };
         // Best-effort blob removal: a missing file is not a hard
         // error since the DB row is already gone (mirrors the soft-
@@ -984,7 +980,7 @@ async fn inline_image_response(
         .await
         .map_err(|e| {
             tracing::warn!(%attachment_id, "inline attachment blob missing: {e}");
-            AppError::NotFound("attachment not found".into())
+            AppError::NotFound("attachment".into())
         })?;
     let stream = ReaderStream::new(file).map(move |chunk| {
         chunk.inspect_err(|e| {
