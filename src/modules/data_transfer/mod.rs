@@ -212,7 +212,7 @@ async fn export_tenant_data(
         )
         .header(
             axum::http::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\""),
+            crate::utils::content_disposition::content_disposition(&filename),
         )
         .body(axum::body::Body::from(body))
         .map_err(|e| AppError::Internal(format!("failed to build export response: {e}")))
