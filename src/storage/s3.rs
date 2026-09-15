@@ -350,7 +350,7 @@ impl ObjectProvider for S3Provider {
                 .map_err(|e| AppError::Internal(format!("S3 read failed: {e}"))),
             // The local provider answers a missing file with `NotFound`, and
             // two callers lean on that to fall back to the legacy KB path.
-            StatusCode::NOT_FOUND => Err(AppError::NotFound("object not found".to_string())),
+            StatusCode::NOT_FOUND => Err(AppError::NotFound("object".to_string())),
             status => Err(unexpected("get", status, response).await),
         }
     }

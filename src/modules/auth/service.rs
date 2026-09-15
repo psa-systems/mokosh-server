@@ -3941,7 +3941,7 @@ impl AuthService {
         )
         .await
         .map_err(|_| AppError::Unauthorized)?
-        .ok_or_else(|| AppError::NotFound("Membership not found for this tenant".to_string()))?;
+        .ok_or_else(|| AppError::NotFound("Membership in this tenant".to_string()))?;
         if membership.status != "active" {
             return Err(AppError::NotFound("Membership is not active".to_string()));
         }

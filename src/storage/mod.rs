@@ -522,7 +522,7 @@ impl ObjectProvider for LocalProvider {
         let path = self.path_for(key)?;
         tokio::fs::read(&path)
             .await
-            .map_err(|e| AppError::NotFound(format!("object not found: {e}")))
+            .map_err(|e| AppError::NotFound(format!("object ({e})")))
     }
 
     async fn open(&self, key: &ObjectKey) -> AppResult<ObjectReader> {
