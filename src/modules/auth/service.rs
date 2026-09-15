@@ -1186,6 +1186,44 @@ impl AuthService {
         self.ensure_tenant_active(user.tenant_id).await
     }
 
+    /// BUNYIP-674: if the caller's `at+jwt` carries a
+    /// `mokosh_grant_account_id` claim (populated by Bunyip's
+    /// `mint_grant_access_token`), verify the grant is still active
+    /// against the local `mokosh_bunyip_grants` mirror. Called by the
+    /// middleware BEFORE `ensure_principal_usable`, so a revoked grant
+    /// refuses a request within the parent BUNYIP-674 ticket's 30-
+    /// second stale-window budget: the webhook keeps the mirror
+    /// current, and any request past that window falls back to the
+    /// same read on the same table.
+    ///
+    /// A missing claim is a no-op (`Ok(())`) - the caller is on their
+    /// own tenancy, and BUNYIP-673's normal-access path is unaffected.
+    /// A present claim whose (sub, mokosh_grant_account_id) does not
+    /// name an active row returns `Forbidden` with copy that does not
+    /// disclose which half of the check failed; the audit log names
+    /// the caller.
+    pub async fn ensure_grant_still_active_if_claimed(
+        &self,
+        claims: &super::oidc_rs::AtClaims,
+    ) -> AppResult<()> {
+        let Some(account_id) = claims.mokosh_grant_account_id.as_deref() else {
+            return Ok(());
+        };
+        let sub = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::Unauthorized)?;
+        let active = super::mokosh_bunyip_grants::MokoshBunyipGrantService::is_grant_active(
+            self.db.pool(),
+            sub,
+            account_id,
+        )
+        .await?;
+        if !active {
+            return Err(AppError::Forbidden(
+                "Access to this organization is not active".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
         // SAFETY (PMS-285 / PMS-692): the `tenants` table is the isolation root
         // and is deliberately excluded from RLS (migration 038:

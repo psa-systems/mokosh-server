@@ -1001,7 +1001,7 @@ pub async fn place_bunyip_user_from_local_state(
     sub: uuid::Uuid,
     claims: &super::oidc_rs::AtClaims,
 ) -> LocalPlacement {
-    let principal = match resolve_bunyip_caller(auth_service, invitations, sub).await {
+    let principal = match resolve_bunyip_caller(auth_service, invitations, sub, claims).await {
         UserinfoDecision::Needed => return LocalPlacement::UserinfoNeeded,
         UserinfoDecision::Rejected(e) => return LocalPlacement::Placed(Box::new((None, Some(e)))),
         UserinfoDecision::Skip(principal) => *principal,
@@ -1052,9 +1052,10 @@ pub async fn bunyip_userinfo_needed(
     auth_service: &Arc<AuthService>,
     invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
     sub: uuid::Uuid,
+    claims: &super::oidc_rs::AtClaims,
 ) -> bool {
     matches!(
-        resolve_bunyip_caller(auth_service, invitations, sub).await,
+        resolve_bunyip_caller(auth_service, invitations, sub, claims).await,
         UserinfoDecision::Needed
     )
 }
@@ -1069,6 +1070,7 @@ async fn resolve_bunyip_caller(
     auth_service: &Arc<AuthService>,
     invitations: Option<&Arc<crate::modules::invitations::InvitationsService>>,
     sub: uuid::Uuid,
+    claims: &super::oidc_rs::AtClaims,
 ) -> UserinfoDecision {
     // First sight: no local row yet, so the user must be JIT-provisioned (needs
     // email + name from userinfo). A read error reads the same way it did when
@@ -1098,6 +1100,27 @@ async fn resolve_bunyip_caller(
             user = %principal.user.id,
             tenant_id = %principal.user.tenant_id,
             "rejecting bunyip principal"
+        );
+        return UserinfoDecision::Rejected(e);
+    }
+    // BUNYIP-674: if the token carries a `mokosh_grant_account_id`
+    // claim, check the mirror BEFORE any placement decision below. A
+    // revoked grant is refused within the parent ticket's 30-second
+    // stale-window budget rather than at the next `at+jwt` refresh;
+    // gates like `ensure_principal_usable` above handle the user's own
+    // tenancy, but a grantee's access to a DIFFERENT tenant is the
+    // grant's own gate. Runs after the principal gate so an inactive
+    // grantee gets the same "not active" refusal a non-grant caller
+    // would (no need to double-log a grant refusal on a user Bunyip
+    // has already told us about).
+    if let Err(e) = auth_service
+        .ensure_grant_still_active_if_claimed(claims)
+        .await
+    {
+        tracing::info!(
+            error = %e,
+            user = %principal.user.id,
+            "rejecting bunyip principal on inactive mokosh grant"
         );
         return UserinfoDecision::Rejected(e);
     }

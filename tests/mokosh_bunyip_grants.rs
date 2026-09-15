@@ -261,3 +261,91 @@ async fn a_revoked_event_for_an_unknown_triple_lands_the_revoked_row(pool: PgPoo
             .unwrap()
     );
 }
+
+use mokosh_server::modules::auth::oidc_rs::AtClaims;
+use mokosh_server::modules::auth::AuthService;
+use mokosh_server::Database;
+
+fn claims_with_grant(sub: Uuid, mokosh_account_id: Option<&str>) -> AtClaims {
+    AtClaims {
+        iss: "https://bunyip.test".into(),
+        sub: sub.to_string(),
+        aud: "https://api.mokosh.test".into(),
+        client_id: "mokosh".into(),
+        scope: "openid".into(),
+        exp: 0,
+        iat: 0,
+        bunyip_role: Some("subscriber".to_string()),
+        mokosh_grant_id: mokosh_account_id.map(|_| Uuid::new_v4().to_string()),
+        mokosh_grant_role: mokosh_account_id.map(|_| "manager".to_string()),
+        mokosh_grant_account_id: mokosh_account_id.map(str::to_string),
+    }
+}
+
+/// BUNYIP-674 end-to-end: a token without a grant claim passes the gate
+/// with no DB touch; a token with an active grant passes; a token whose
+/// grant is revoked is refused with Forbidden.
+#[sqlx::test]
+async fn ensure_grant_still_active_if_claimed_gates_on_the_mirror(pool: PgPool) {
+    clear_cache_for_tests();
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+
+    let grantee = Uuid::new_v4();
+    let account = "acme";
+
+    // No grant claim: always Ok.
+    auth.ensure_grant_still_active_if_claimed(&claims_with_grant(grantee, None))
+        .await
+        .expect("no grant claim => pass");
+
+    // Grant claim but no matching mirror row: Forbidden.
+    let err = auth
+        .ensure_grant_still_active_if_claimed(&claims_with_grant(grantee, Some(account)))
+        .await
+        .expect_err("no mirror row => Forbidden");
+    assert!(
+        matches!(err, mokosh_server::utils::error::AppError::Forbidden(_)),
+        "expected Forbidden, got {err:?}"
+    );
+
+    // Now seed an active grant on the mirror.
+    let now = Utc::now();
+    MokoshBunyipGrantService::upsert(
+        &pool,
+        Uuid::new_v4(), // bunyip_grant_id
+        Uuid::new_v4(), // owner
+        grantee,
+        account,
+        Some("manager"),
+        now,
+        None,
+    )
+    .await
+    .expect("upsert active grant");
+
+    auth.ensure_grant_still_active_if_claimed(&claims_with_grant(grantee, Some(account)))
+        .await
+        .expect("active grant => pass");
+
+    // Revoke it and the same claim now fails.
+    MokoshBunyipGrantService::upsert(
+        &pool,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        grantee,
+        account,
+        None,
+        now,
+        Some(now),
+    )
+    .await
+    .expect("revoke grant");
+    let err = auth
+        .ensure_grant_still_active_if_claimed(&claims_with_grant(grantee, Some(account)))
+        .await
+        .expect_err("revoked grant => Forbidden");
+    assert!(matches!(
+        err,
+        mokosh_server::utils::error::AppError::Forbidden(_)
+    ));
+}

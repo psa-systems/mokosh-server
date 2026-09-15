@@ -136,6 +136,9 @@ fn claims(sub: Uuid) -> AtClaims {
         // What the SPA's token actually carries; the role reconcile is then a
         // no-op for an already-admin user, so it writes nothing.
         bunyip_role: Some("subscriber".to_string()),
+        mokosh_grant_id: None,
+        mokosh_grant_role: None,
+        mokosh_grant_account_id: None,
     }
 }
 
