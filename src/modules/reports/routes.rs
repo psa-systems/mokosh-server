@@ -661,9 +661,9 @@ fn pdf_for_tickets(r: &TicketsReportResponse, title: &str) -> pdf::Document {
                 .iter()
                 .map(|a| {
                     vec![
-                        a.assignee_id
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|| "unassigned".into()),
+                        a.assignee_name
+                            .clone()
+                            .unwrap_or_else(|| "Unassigned".into()),
                         a.count.to_string(),
                     ]
                 })
@@ -682,7 +682,10 @@ fn pdf_for_time(r: &TimeReportResponse, title: &str) -> pdf::Document {
         .table(
             "Minutes by user",
             vec!["User".into(), "Minutes".into()],
-            by_id(&r.minutes_by_user),
+            r.minutes_by_user
+                .iter()
+                .map(|u| vec![u.name.clone(), u.count.to_string()])
+                .collect(),
         )
         .table(
             "Minutes by work type",
