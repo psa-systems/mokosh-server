@@ -126,6 +126,7 @@ async fn list_appointments(
     Query(f): Query<AppointmentFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AppointmentResponse>>> {
+    pagination.reject_unsupported_sort()?;
     f.validate()?;
     let (items, total) = s
         .service
@@ -184,6 +185,7 @@ async fn get_user_availability(
     Path(user_id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<UserAvailabilityResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .get_user_availability(u.tenant(), user_id, &pagination)
@@ -202,6 +204,7 @@ async fn replace_user_availability(
     Query(pagination): Query<PaginationParams>,
     Json(req): Json<ReplaceAvailabilityRequest>,
 ) -> AppResult<Json<PaginatedResponse<UserAvailabilityResponse>>> {
+    pagination.reject_unsupported_sort()?;
     // Non-admins can only edit their own availability.
     if !u.role.is_admin() && user_id != u.id {
         return Err(crate::utils::error::AppError::Forbidden(
@@ -228,6 +231,7 @@ async fn list_time_off(
     Query(f): Query<TimeOffFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TimeOffResponse>>> {
+    pagination.reject_unsupported_sort()?;
     f.validate()?;
     let (items, total) = s.service.list_time_off(u.tenant(), &f, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
@@ -288,6 +292,7 @@ async fn list_on_call(
     RequireCalendar { user: u, .. }: RequireCalendar,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<OnCallScheduleResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_on_call_schedules(u.tenant(), &pagination)
@@ -355,6 +360,7 @@ async fn list_templates(
     Query(f): Query<SchedulingTemplateFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<SchedulingTemplateResponse>>> {
+    pagination.reject_unsupported_sort()?;
     f.validate()?;
     let (items, total) = s
         .service

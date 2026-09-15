@@ -642,6 +642,7 @@ async fn get_sessions(
     headers: HeaderMap,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<SessionInfo>>> {
+    pagination.reject_unsupported_sort()?;
     // Get current session ID from token
     let current_session_id = if let Some(auth_header) = headers.get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
@@ -762,6 +763,7 @@ async fn list_api_keys(
     RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ApiKeyResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (keys, total) = state
         .auth_service
         .list_api_keys(user.tenant_id, user.id, &pagination)
@@ -820,6 +822,7 @@ async fn list_directory(
     RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<mokosh_types::auth::DirectoryEntry>>> {
+    pagination.reject_unsupported_sort()?;
     let (entries, total) = state
         .auth_service
         .list_directory(user.tenant(), &pagination)

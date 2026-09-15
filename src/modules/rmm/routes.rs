@@ -70,6 +70,7 @@ async fn list_connections(
     _a: RequireAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RmmConnectionResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_connections(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -151,6 +152,7 @@ async fn list_device_mappings(
     Query(q): Query<ConnQuery>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RmmDeviceMappingResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_device_mappings(u.tenant(), q.rmm_connection_id, &pagination)
@@ -207,6 +209,7 @@ async fn list_alert_rules(
     Query(q): Query<ConnQuery>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RmmAlertRuleResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_alert_rules(u.tenant(), q.rmm_connection_id, &pagination)
