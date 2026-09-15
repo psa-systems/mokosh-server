@@ -507,7 +507,7 @@ async fn pay_amount_above_balance_is_400(pool: PgPool) {
 
 /// MAPPS-673: an amount below `DEFAULT_MIN_PARTIAL_AMOUNT` ($1.00) is
 /// refused. The seed tenant has no `payment_gateway_configs` row, so the
-/// floor falls back to the code default via `min_partial_amount_for_provider`.
+/// floor falls back to the code default via `min_partial_amount_across_active`.
 /// This proves the fee-abuse guard fires even when the tenant has not set
 /// a value in the column.
 #[sqlx::test]
@@ -517,10 +517,12 @@ async fn pay_amount_below_min_partial_is_400(pool: PgPool) {
         seed_contact_with_roles(&app, &pool, "pay-under", &["Billing Contact"]).await;
     let invoice_id = seed_invoice_on_company(&pool, common::DEFAULT_TENANT_ID, own_company).await;
 
-    // The seed helper stops before creating a payment gateway config, so the
-    // service is refused at the "no active payment provider" step BEFORE it
-    // reads the floor. We seed an active config so the range check runs,
-    // and set a NULL floor so the DEFAULT_MIN_PARTIAL_AMOUNT applies.
+    // Seed an active gateway row with a NULL min_partial_amount so the
+    // floor falls back to DEFAULT_MIN_PARTIAL_AMOUNT via
+    // `min_partial_amount_across_active`. `config_encrypted` is empty on
+    // purpose: the range check MUST run without decrypting the provider
+    // config, so a mid-migration or unbuildable row still refuses a below-
+    // floor amount with a 400 rather than 500ing on the decrypt.
     sqlx::query(
         "INSERT INTO payment_gateway_configs (id, tenant_id, provider, is_active, is_test_mode, \
          config_encrypted) VALUES ($1, $2, 'stripe', TRUE, TRUE, '')",

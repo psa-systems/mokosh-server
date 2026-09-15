@@ -3235,17 +3235,18 @@ impl BillingService {
                 "Invoice has no outstanding balance to pay".to_string(),
             ));
         }
-        let Some(provider) = self.active_provider(tenant_id, requested_provider).await? else {
-            return Err(AppError::BadRequest(
-                "No active payment provider is configured for this account".to_string(),
-            ));
-        };
 
-        // MAPPS-673: resolve the amount to charge. `None` (or a value at or
-        // above `balance_due`) charges the whole balance. A smaller value is
-        // range-checked against the tenant's per-provider floor so an amount
-        // below the floor is refused BEFORE the provider mint, matching the
-        // shape the staff bypass sees.
+        // MAPPS-673: range-check the requested amount BEFORE resolving the
+        // active gateway, so an amount over the invoice balance or below the
+        // floor refuses with the same 400 whether or not a provider is
+        // connected and whether or not its stored config can be built. Both
+        // checks are pure DB reads (`invoice.balance_due` and `MAX(min_
+        // partial_amount)` over active rows); the `active_provider` call
+        // below decrypts the connected provider's config and would otherwise
+        // 500 on a mid-migration or empty row before the range check ever
+        // ran. `min_partial_amount_across_active` clamps up to
+        // `DEFAULT_MIN_PARTIAL_AMOUNT` and returns that default when no
+        // gateway is configured, so this stays correct in both cases.
         let amount = match amount_override {
             None => invoice.balance_due,
             Some(v) if v > invoice.balance_due => {
@@ -3255,9 +3256,7 @@ impl BillingService {
                 )));
             }
             Some(v) => {
-                let floor = self
-                    .min_partial_amount_for_provider(tenant_id, provider.id())
-                    .await?;
+                let floor = self.min_partial_amount_across_active(tenant_id).await?;
                 if v < floor {
                     return Err(AppError::BadRequest(format!(
                         "The requested amount {v} is below the minimum partial payment {floor}."
@@ -3265,6 +3264,12 @@ impl BillingService {
                 }
                 v
             }
+        };
+
+        let Some(provider) = self.active_provider(tenant_id, requested_provider).await? else {
+            return Err(AppError::BadRequest(
+                "No active payment provider is configured for this account".to_string(),
+            ));
         };
 
         // Prefer the invoice's billing contact email so the checkout page is
@@ -3291,36 +3296,6 @@ impl BillingService {
             customer_email: customer_email.as_deref(),
         };
         provider.create_checkout_session(&params).await
-    }
-
-    /// MAPPS-673: the per-tenant floor for a partial-payment amount on the
-    /// named provider, in the invoice's currency.
-    ///
-    /// Read from `payment_gateway_configs.min_partial_amount` for the active
-    /// row; NULL (the default on migration 216) resolves to
-    /// [`DEFAULT_MIN_PARTIAL_AMOUNT`], and any stored value is CLAMPED UP to
-    /// that default so a tenant cannot configure a floor of $0.01 (the fee a
-    /// provider charges per authorised transaction is bigger than that; an
-    /// unbounded trickle drains a merchant's gateway budget). Missing-row
-    /// falls back to the default too, matching the "unset means default"
-    /// shape every other tenant-scoped config has here.
-    async fn min_partial_amount_for_provider(
-        &self,
-        tenant_id: TenantId,
-        provider: &str,
-    ) -> AppResult<Decimal> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(Option<Decimal>,)> = sqlx::query_as(
-            "SELECT min_partial_amount FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND provider = $2 AND is_active = TRUE",
-        )
-        .bind(tenant_id)
-        .bind(provider)
-        .fetch_optional(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        let configured = row.and_then(|(v,)| v).unwrap_or(DEFAULT_MIN_PARTIAL_AMOUNT);
-        Ok(configured.max(DEFAULT_MIN_PARTIAL_AMOUNT))
     }
 
     /// MAPPS-673: the friendliest floor a tenant might quote in the readiness
