@@ -348,6 +348,16 @@ services:
       OIDC_ISSUER: https://${USER}-bunyip-api.a8n.run
       OIDC_AUDIENCE: https://${USER}-mokosh-api.a8n.run
 
+      # PMS-1193 / BUNYIP-641: Bunyip's suite-wide provider-status aggregator
+      # (BUNYIP-634) calls GET /api/v1/admin/providers/status with HTTP Basic
+      # against these two values. Both empty in dev = the machine-credential
+      # path is disabled and the endpoint gates on `RequireAdmin` alone,
+      # which is the pre-PMS-1193 behaviour a self-hosted deployment without
+      # Bunyip aggregation runs on. Staging and prod get real values through
+      # the SOPS compose-secrets. Reference: bunyip/docs/provider-status-contract.md.
+      BUNYIP_STATUS_CLIENT_ID: ${BUNYIP_STATUS_CLIENT_ID:-}
+      BUNYIP_STATUS_CLIENT_SECRET: ${BUNYIP_STATUS_CLIENT_SECRET:-}
+
       # Browser-visible origin of the client that talks to this API. Must
       # equal it byte-for-byte: it is the CORS_ORIGIN default and the base
       # for emailed reset/invite links. PMS-837 removed the Google OAuth

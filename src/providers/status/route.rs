@@ -15,14 +15,22 @@
 //! test in `super::tests` pins that promise for the DATA; the routes here
 //! deliberately do not add anything a renderer could disagree with.
 //!
-//! # Auth deferred
+//! # Auth
 //!
-//! The ticket names a Bunyip machine credential as the JSON endpoint's
-//! future auth, but flags it "revise if BUNYIP-634 settles on another".
-//! Until that ticket ships, `RequireAdmin` is the gate: a staff bearer
-//! with an admin role. The HTML endpoint carries the same gate, and so
-//! does the POST refresh handler, which additionally records the operator's
-//! login as the actor on the resulting generation.
+//! Since PMS-1193, both a Bunyip machine credential (HTTP Basic against
+//! `BUNYIP_STATUS_CLIENT_ID` / `BUNYIP_STATUS_CLIENT_SECRET`, the shape
+//! Bunyip's suite-wide aggregator BUNYIP-634 uses per
+//! `bunyip/docs/provider-status-contract.md`) AND a staff admin session
+//! (`RequireAdmin`) are accepted. The extractor
+//! [`super::auth::RequireAdminOrBunyipMachine`] tries the Basic path
+//! first: a matching credential returns 200, a WRONG credential is a
+//! hard 401 rather than falling through, and no Basic auth (or the env
+//! not configured) delegates to `RequireAdmin` for the pre-PMS-1193
+//! staff-session behaviour. The POST refresh handler needs the
+//! operator's login (it records it as the actor on the resulting
+//! generation) and so keeps `RequireAdminUser` instead: a Bunyip
+//! aggregator has no operator identity to record, and reading through
+//! the aggregate does not trigger a refresh.
 
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
@@ -30,8 +38,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 
+use super::auth::RequireAdminOrBunyipMachine;
 use crate::config::{try_refresh, RefreshOutcome, RefreshRequest};
-use crate::modules::auth::{RequireAdmin, RequireAdminUser};
+use crate::modules::auth::RequireAdminUser;
 
 /// The admin router carrying all three endpoints. Mounted under `/api/v1` by
 /// `create_api_router` so the shared auth middleware and error envelope
@@ -43,16 +52,19 @@ pub fn provider_status_admin_routes() -> Router {
         .route("/admin/providers/status/refresh", post(refresh_status))
 }
 
-/// JSON handler. Admin-gated; produces the schema-versioned envelope from
+/// JSON handler. Gate is `RequireAdminOrBunyipMachine` (PMS-1193): a
+/// Bunyip machine credential presented as HTTP Basic OR a staff admin
+/// session. Produces the schema-versioned envelope from
 /// `renderer_json::render_json` against a freshly-collected report.
-async fn status_json(_admin: RequireAdmin) -> impl IntoResponse {
+async fn status_json(_gate: RequireAdminOrBunyipMachine) -> impl IntoResponse {
     let report = super::collect();
     Json(super::renderer_json::render_json(&report))
 }
 
-/// HTML handler. Admin-gated; produces the standalone admin page from
-/// `renderer_html::render_html` against a freshly-collected report.
-async fn status_html(_admin: RequireAdmin) -> impl IntoResponse {
+/// HTML handler. Same gate as the JSON endpoint: a Bunyip machine
+/// credential also reaches this page, so an operator debugging the
+/// aggregate can view the same page the standalone deployment renders.
+async fn status_html(_gate: RequireAdminOrBunyipMachine) -> impl IntoResponse {
     let report = super::collect();
     let body = super::renderer_html::render_html(&report);
     (
@@ -388,6 +400,173 @@ mod tests {
         assert!(
             ROUTER.contains("async fn ready_check"),
             "the /ready handler stays named ready_check"
+        );
+    }
+
+    // -- PMS-1193: HTTP Basic machine-credential path -----------------------
+    //
+    // These tests mutate process-global env and so run under one Mutex so
+    // one setter never wins on another test's compare. The tests are
+    // grouped under a `#[serial]`-style helper rather than `serial_test`
+    // because the crate is not on the workspace and one mutex + one
+    // `refresh()` per test is enough.
+
+    /// One-per-crate lock so no two PMS-1193 tests race on env vars.
+    /// `tokio::sync::Mutex` because the guard is held across `.await`; a
+    /// `std::sync::Mutex` guard would trip `clippy::await_holding_lock`.
+    fn env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    /// Set BOTH env keys, refresh the config generation so the reader sees
+    /// them, and return a guard that clears them on drop so the next test
+    /// starts blank. Any test in this module that sets the pair MUST take
+    /// `env_lock()` first.
+    struct BunyipEnvGuard;
+    impl BunyipEnvGuard {
+        fn set(client_id: &str, client_secret: &str) -> Self {
+            // SAFETY: the crate's tests hold `env_lock()` while mutating
+            // these variables; the process is single-threaded per test
+            // through that mutex.
+            unsafe {
+                std::env::set_var("BUNYIP_STATUS_CLIENT_ID", client_id);
+                std::env::set_var("BUNYIP_STATUS_CLIENT_SECRET", client_secret);
+            }
+            let _ = crate::config::refresh();
+            Self
+        }
+    }
+    impl Drop for BunyipEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("BUNYIP_STATUS_CLIENT_ID");
+                std::env::remove_var("BUNYIP_STATUS_CLIENT_SECRET");
+            }
+            let _ = crate::config::refresh();
+        }
+    }
+
+    fn basic_auth(client_id: &str, client_secret: &str) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        format!(
+            "Basic {}",
+            STANDARD.encode(format!("{client_id}:{client_secret}"))
+        )
+    }
+
+    /// PMS-1193 row 1: a correct Basic credential yields 200 WITHOUT any
+    /// AuthState injected, because the extractor accepts the machine path
+    /// before it consults `RequireAdmin`.
+    #[tokio::test]
+    async fn bunyip_basic_credential_yields_200() {
+        let _g = env_lock().lock().await;
+        let _env = BunyipEnvGuard::set("bunyip-status", "s3cret-value");
+        let app = test_router(None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/providers/status")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        basic_auth("bunyip-status", "s3cret-value"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// PMS-1193 row 2: a WRONG Basic credential is a hard 401 rather than
+    /// falling through to the staff session. Even injecting a valid admin
+    /// AuthState does NOT rescue the request, because the caller's intent
+    /// is to authenticate as the machine and getting it wrong is worth
+    /// surfacing.
+    #[tokio::test]
+    async fn wrong_bunyip_basic_credential_is_401_even_with_admin_session() {
+        let _g = env_lock().lock().await;
+        let _env = BunyipEnvGuard::set("bunyip-status", "s3cret-value");
+        let auth = AuthState::authenticated(admin_user(), uuid::Uuid::nil());
+        let app = test_router(Some(auth));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/providers/status")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        basic_auth("bunyip-status", "wrong-secret"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// PMS-1193 row 3: no Authorization at all falls through to the staff
+    /// session and remains 200 for a valid admin caller. Proves the pre-
+    /// PMS-1193 staff-session path is untouched when Basic is not
+    /// attempted.
+    #[tokio::test]
+    async fn admin_session_still_works_alongside_the_new_gate() {
+        let _g = env_lock().lock().await;
+        let _env = BunyipEnvGuard::set("bunyip-status", "s3cret-value");
+        let auth = AuthState::authenticated(admin_user(), uuid::Uuid::nil());
+        let app = test_router(Some(auth));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/providers/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// PMS-1193 row 4: env unset disables the machine-credential path,
+    /// which is the pre-PMS-1193 behaviour a self-hosted deployment
+    /// without Bunyip aggregation runs on. A caller presenting Basic auth
+    /// still reaches the staff-session fallback, which then 401s because
+    /// no AuthState is injected. The point of the assertion is that a
+    /// Basic HEADER does NOT itself become a rejection here when the env
+    /// is not configured.
+    #[tokio::test]
+    async fn env_unset_delegates_every_request_to_require_admin() {
+        let _g = env_lock().lock().await;
+        // No BunyipEnvGuard here: the vars stay unset.
+        // Refresh so nothing lingers from a prior test.
+        // SAFETY: the mutex is held.
+        unsafe {
+            std::env::remove_var("BUNYIP_STATUS_CLIENT_ID");
+            std::env::remove_var("BUNYIP_STATUS_CLIENT_SECRET");
+        }
+        let _ = crate::config::refresh();
+        let app = test_router(None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/providers/status")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        basic_auth("bunyip-status", "s3cret-value"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Falls through to `RequireAdmin` and 401s because no AuthState is
+        // injected. The important claim is that a Basic header alone,
+        // with the env unset, does NOT match the machine path.
+        assert!(
+            !response.status().is_success(),
+            "env-unset caller must not accept Basic on its own"
         );
     }
 }
