@@ -1062,6 +1062,74 @@ async fn concurrent_overpayment_is_rejected(pool: PgPool) {
     );
 }
 
+/// PMS-1225: the overpay guard must read `amount_credited` too, not just
+/// `amount_paid`. Reproduces the issue's exact failing scenario: invoice
+/// `INV-000101`, total 100.00, no payments yet; credit note `CN-000005` for
+/// 60.00 has already dropped `balance_due` to 40.00. Before the fix the guard
+/// computed `remaining = total - amount_paid = 100.00`, ignoring the credit,
+/// so a 100.00 payment passed and `recompute_invoice_balance` drove
+/// `balance_due` to -60.00. The guard must now reject it.
+#[sqlx::test]
+async fn overpay_guard_accounts_for_credits(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let invoice_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO invoices (
+            id, tenant_id, invoice_number, company_id, status,
+            invoice_date, due_date, subtotal, total, amount_paid,
+            amount_credited, balance_due
+        )
+        VALUES ($1, $2, 'INV-000101', $3, 'sent',
+                CURRENT_DATE, CURRENT_DATE + 30, 100.00, 100.00, 0, 60.00, 40.00)
+        "#,
+    )
+    .bind(invoice_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed INV-000101");
+    sqlx::query(
+        r#"
+        INSERT INTO credit_notes (
+            id, tenant_id, credit_note_number, company_id, invoice_id,
+            status, issue_date, reason, total
+        )
+        VALUES ($1, $2, 'CN-000005', $3, $4,
+                'issued', CURRENT_DATE, 'Billed for cancelled work', 60.00)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(invoice_id)
+    .execute(&pool)
+    .await
+    .expect("seed CN-000005");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let resp = post_payment(&app, &token, invoice_id, company_id, "100.00").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a 100.00 payment against a 40.00 remaining balance (100.00 total, \
+         60.00 already credited) must be refused, got {}",
+        resp.status()
+    );
+
+    let (paid, balance, status) = invoice_state(&pool, invoice_id).await;
+    assert_eq!(paid, "0.00", "the rejected payment left no trace");
+    assert_eq!(
+        balance, "40.00",
+        "balance_due is unchanged and never negative"
+    );
+    assert_eq!(status, "sent", "status is unchanged by a rejected payment");
+}
+
 /// Deleting one of two payments recomputes the invoice from the surviving
 /// rows rather than subtracting the deleted amount from a stale snapshot.
 #[sqlx::test]
