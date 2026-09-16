@@ -357,6 +357,10 @@ services:
       # the SOPS compose-secrets. Reference: bunyip/docs/provider-status-contract.md.
       BUNYIP_STATUS_CLIENT_ID: ${BUNYIP_STATUS_CLIENT_ID:-}
       BUNYIP_STATUS_CLIENT_SECRET: ${BUNYIP_STATUS_CLIENT_SECRET:-}
+      # PMS-1212 (PSA-70): Google Contacts OAuth client. Unset locally, so the
+      # integration reports itself unconfigured rather than half-working.
+      GOOGLE_CONTACTS_CLIENT_ID: ${GOOGLE_CONTACTS_CLIENT_ID:-}
+      GOOGLE_CONTACTS_CLIENT_SECRET: ${GOOGLE_CONTACTS_CLIENT_SECRET:-}
 
       # Browser-visible origin of the client that talks to this API. Must
       # equal it byte-for-byte: it is the CORS_ORIGIN default and the base
