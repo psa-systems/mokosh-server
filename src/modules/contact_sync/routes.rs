@@ -2,9 +2,11 @@
 //!
 //! Two planes, deliberately:
 //!
-//! * `/api/v1/integrations/contact-sync/*` is staff, admin-gated. Connecting a
-//!   tenant's directory to its CRM is an administrator's act, the same gate the
-//!   RMM connection routes carry.
+//! * `/api/v1/integrations/contact-sync/*` is staff. Connecting, choosing
+//!   labels, starting or cancelling an import and listing the Google labels are
+//!   admin-gated, the gate the RMM connection routes carry. Reading status and
+//!   run progress, and reading and answering the review queue, carry
+//!   `RequireAuth` (PMS-1215).
 //! * `/api/v1/contacts/contacts/{contact_id}/sync*` is one contact's
 //!   provenance, its locks, unlinking it, and removing its imported data
 //!   (PMS-1214). The doubled segment is the contacts module's own `/contacts`
@@ -22,12 +24,16 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::service::{ConnectionStatus, ContactProvenance, ContactSyncService, DataRemoval};
+use super::runs::RunStatus;
+use super::service::{
+    ConnectionStatus, ContactProvenance, ContactSyncService, DataRemoval, GroupOption, Resolution,
+    Resolved, ReviewItem,
+};
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
@@ -49,6 +55,22 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
         .route(
             "/integrations/contact-sync/google/disconnect",
             post(disconnect),
+        )
+        .route("/integrations/contact-sync/groups", get(list_groups))
+        .route("/integrations/contact-sync/selection", put(set_selection))
+        .route(
+            "/integrations/contact-sync/runs",
+            get(list_runs).post(queue_run),
+        )
+        .route("/integrations/contact-sync/runs/{run_id}", get(get_run))
+        .route(
+            "/integrations/contact-sync/runs/{run_id}/cancel",
+            post(cancel_run),
+        )
+        .route("/integrations/contact-sync/review-queue", get(review_queue))
+        .route(
+            "/integrations/contact-sync/review-queue/resolve",
+            post(resolve),
         )
         .route("/contacts/contacts/{contact_id}/sync", get(get_provenance))
         .route(
@@ -107,6 +129,113 @@ async fn disconnect(
 ) -> AppResult<StatusCode> {
     state.service.disconnect(user.tenant(), &ctx).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The labels with Google's counts, for the picker and its preview. Admin:
+/// it spends the tenant's grant on a read of their Google account.
+async fn list_groups(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<Vec<GroupOption>>> {
+    Ok(Json(state.service.groups(user.tenant()).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectionRequest {
+    group_ids: Vec<String>,
+}
+
+async fn set_selection(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+    Json(request): Json<SelectionRequest>,
+) -> AppResult<Json<ConnectionStatus>> {
+    Ok(Json(
+        state
+            .service
+            .set_selection(user.tenant(), &request.group_ids, &ctx)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct RunsQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn list_runs(
+    State(state): State<ContactSyncRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(query): Query<RunsQuery>,
+) -> AppResult<Json<Vec<RunStatus>>> {
+    Ok(Json(
+        state
+            .service
+            .runs(user.tenant(), query.limit.unwrap_or(20))
+            .await?,
+    ))
+}
+
+/// 202: the run is queued, and the worker does the import. The response is
+/// the row to poll, never the import's result.
+async fn queue_run(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+) -> AppResult<(StatusCode, Json<RunStatus>)> {
+    let run = state.service.queue_run(user.tenant(), &ctx).await?;
+    Ok((StatusCode::ACCEPTED, Json(run)))
+}
+
+async fn get_run(
+    State(state): State<ContactSyncRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(run_id): Path<Uuid>,
+) -> AppResult<Json<RunStatus>> {
+    Ok(Json(state.service.run(user.tenant(), run_id).await?))
+}
+
+async fn cancel_run(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+    Path(run_id): Path<Uuid>,
+) -> AppResult<Json<RunStatus>> {
+    Ok(Json(
+        state
+            .service
+            .cancel_run(user.tenant(), run_id, &ctx)
+            .await?,
+    ))
+}
+
+/// Reading and answering the queue carry `RequireAuth`, the gate on reading
+/// and editing a contact: each answer is a link, a create or a skip of one.
+async fn review_queue(
+    State(state): State<ContactSyncRouterState>,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<Vec<ReviewItem>>> {
+    Ok(Json(state.service.review_queue(user.tenant()).await?))
+}
+
+async fn resolve(
+    State(state): State<ContactSyncRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+    Json(resolution): Json<Resolution>,
+) -> AppResult<Json<Resolved>> {
+    Ok(Json(
+        state
+            .service
+            .resolve(user.tenant(), &resolution, &ctx)
+            .await?,
+    ))
 }
 
 async fn get_provenance(
