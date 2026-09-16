@@ -686,3 +686,91 @@ async fn releasing_a_draw_makes_the_entry_billable_again_in_full(pool: PgPool) {
     assert_eq!(status, "prepaid");
     assert_eq!(entry_draw(&pool, entry.id).await.1, Some(Decimal::from(5)));
 }
+
+// ============================================================================
+// PMS-1220: the draw and the entry's billing-status stamp commit atomically.
+// ============================================================================
+
+use mokosh_server::modules::contracts::ContractsService;
+
+/// A crash (or any transaction that never commits) between the balance draw
+/// and the entry's billing-status stamp must leave NEITHER applied, not the
+/// balance debited with the entry still showing `hours_consumed IS NULL`.
+/// Before PMS-1220 the draw committed in its own transaction inside
+/// `ContractsService::consume_hours`, so a crash right after that commit and
+/// before the stamp's own transaction left exactly that split with nothing to
+/// detect or repair it. `consume_hours_in_tx` runs the draw against a
+/// transaction the caller holds open and never commits it itself, so
+/// dropping that transaction without committing - simulating the crash -
+/// rolls the draw back right along with the stamp that was never reached.
+#[sqlx::test]
+async fn a_crash_between_the_draw_and_the_stamp_leaves_neither_applied(pool: PgPool) {
+    let company = common::seed_company(&pool).await;
+    let contract = seed_block_contract(&pool, company, 10).await;
+    let work_type = seed_work_type(&pool).await;
+    let (user_id, _e, _p) = common::seed_admin(&pool).await;
+
+    // A billable client entry already linked to the contract, as
+    // `create_time_entry` would leave it before drawing: `hours_consumed`
+    // still NULL, nothing drawn yet.
+    let entry = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO time_entries \
+         (id, tenant_id, user_id, work_type_id, company_id, contract_id, date, \
+          duration_minutes, is_billable, entry_kind, billing_status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 120, TRUE, 'client', 'ready_to_bill')",
+    )
+    .bind(entry)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(user_id)
+    .bind(work_type)
+    .bind(company)
+    .bind(contract)
+    .bind(WHEN())
+    .execute(&pool)
+    .await
+    .expect("seed unconsumed entry");
+
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let contracts = ContractsService::new(Database::from_pool(pool.clone()));
+    let when = WHEN().and_hms_opt(0, 0, 0).unwrap().and_utc();
+
+    // Draw against the shared transaction, then simulate a crash by
+    // dropping it before the stamp UPDATE ever runs and before either
+    // commits: the whole draw must vanish with it.
+    {
+        let mut tx = pool_begin_with_tenant(&pool, common::DEFAULT_TENANT_ID).await;
+        let outcome = contracts
+            .consume_hours_in_tx(&mut tx, tenant, contract, Decimal::from(2), when)
+            .await
+            .expect("draw");
+        assert_eq!(outcome.hours_applied, Decimal::from(2));
+        // Dropped here, uncommitted: the "crash".
+    }
+
+    assert!(
+        balance(&pool, contract).await.is_none(),
+        "the uncommitted draw must not be visible: it crashed before the stamp"
+    );
+    let (_, consumed) = entry_draw(&pool, entry).await;
+    assert_eq!(
+        consumed, None,
+        "the entry was never stamped, and now shows no draw either - consistent, not split"
+    );
+}
+
+/// Helper mirroring `Database::begin_with_tenant` for a bare `PgPool`, so the
+/// test above can hold the transaction open across the simulated crash
+/// without going through the full `Database` wrapper.
+async fn pool_begin_with_tenant(
+    pool: &PgPool,
+    tenant_id: Uuid,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.expect("begin tx");
+    sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+        .bind(tenant_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("set tenant guc");
+    tx
+}
