@@ -10,6 +10,8 @@
 //!   users, not identities).
 //! - Cross-plane isolation: writing identities.password_hash (via
 //!   MAPPS-499 change_password) does NOT touch platform_admins.
+//! - PMS-1219: a stale identities.password_hash never authenticates
+//!   the platform plane and never reverts a rotated platform hash.
 
 mod common;
 
@@ -195,66 +197,69 @@ async fn platform_change_password_isolates_from_identity_plane(pool: PgPool) {
     assert!(relog.status().is_success());
 }
 
-// MAPPS-550: platform login self-heals `platform_admins.password_hash`
-// from `identities.password_hash` when they drift. A stale platform
-// hash otherwise 401s the operator, the MAPPS-520 platform-first
-// chain falls through, and the platform bearer never lands - which
-// hides the sidebar "Clients" tab from the operator's walkthrough.
+// PMS-1219: the MAPPS-550 identity-hash fallback is removed.
+// `platform_admins.password_hash` is authoritative since migration
+// 164 severed the mirror from `identities`, so a stale identity-plane
+// hash must never authenticate the platform plane, and it must
+// certainly never overwrite a hash the operator already rotated.
 //
-// Fixture: platform_admins row at password A + a matching identities
-// row at the same email with password B (drift). POST /platform/login
-// with B succeeds AND rewrites platform_admins.password_hash so a
-// subsequent login with A returns 401 (proves the heal actually
-// happened, not that both hashes are silently accepted forever).
+// Fixture: platform_admins row rotated to password B, with an
+// identities row at the same email still holding the pre-rotation
+// password A (drift in the direction that matters: the identity
+// plane lags, not leads). Logging in with the stale identity
+// password A must 401 and must NOT touch platform_admins.password_hash;
+// logging in with the current platform password B must still succeed.
 #[sqlx::test]
-async fn platform_login_heals_from_identity_when_platform_hash_drifted(pool: PgPool) {
-    let email = "drifted@example.com".to_string();
-    let password_a = "PLATFORM-STALE-A".to_string();
-    let password_b = "IDENTITY-CURRENT-B".to_string();
-    let hash_a = mokosh_server::utils::crypto::hash_password(&password_a).expect("hash A");
-    let hash_b = mokosh_server::utils::crypto::hash_password(&password_b).expect("hash B");
+async fn platform_login_rejects_stale_identity_hash_after_rotation(pool: PgPool) {
+    let email = "rotated@example.com".to_string();
+    let password_old = "PLATFORM-OLD-STALE".to_string();
+    let password_new = "PLATFORM-NEW-ROTATED".to_string();
+    let hash_old = mokosh_server::utils::crypto::hash_password(&password_old).expect("hash old");
+    let hash_new = mokosh_server::utils::crypto::hash_password(&password_new).expect("hash new");
 
     let admin_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO platform_admins (id, email, password_hash, first_name, last_name, status, email_verified_at) \
-         VALUES ($1, $2, $3, 'Op', 'Drift', 'active', NOW())",
+         VALUES ($1, $2, $3, 'Op', 'Rotated', 'active', NOW())",
     )
     .bind(admin_id)
     .bind(&email)
-    .bind(&hash_a)
+    .bind(&hash_new)
     .execute(&pool)
     .await
-    .expect("insert stale platform_admin");
+    .expect("insert rotated platform_admin");
 
+    // identities row is a plane migration 164 stopped mirroring into;
+    // it still holds the pre-rotation hash.
     let identity_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO identities (id, email, password_hash, first_name, last_name, status) \
-         VALUES ($1, $2, $3, 'Op', 'Drift', 'active')",
+         VALUES ($1, $2, $3, 'Op', 'Rotated', 'active')",
     )
     .bind(identity_id)
     .bind(&email)
-    .bind(&hash_b)
+    .bind(&hash_old)
     .execute(&pool)
     .await
-    .expect("insert current identity");
+    .expect("insert stale identity");
 
     let app = common::boot(pool.clone()).await;
 
-    let resp = app
+    // The old, stale identity-plane password must NOT authenticate.
+    let stale = app
         .client
         .post(app.url("/api/v1/platform/login"))
-        .json(&serde_json::json!({ "email": email, "password": password_b }))
+        .json(&serde_json::json!({ "email": email, "password": password_old }))
         .send()
         .await
-        .expect("send login with identity password");
-    assert!(
-        resp.status().is_success(),
-        "MAPPS-550: identity password should heal the stale platform hash; got {}",
-        resp.status()
+        .expect("send login with stale identity password");
+    assert_eq!(
+        stale.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "PMS-1219: a stale identities.password_hash must not authenticate the platform plane"
     );
 
-    // The heal wrote the identity hash onto platform_admins.
-    // Verify by querying the row directly.
+    // And it must not have reverted the rotated hash.
     let stored: String =
         sqlx::query_scalar("SELECT password_hash FROM platform_admins WHERE id = $1")
             .bind(admin_id)
@@ -262,30 +267,29 @@ async fn platform_login_heals_from_identity_when_platform_hash_drifted(pool: PgP
             .await
             .expect("re-read platform_admin");
     assert_eq!(
-        stored, hash_b,
-        "MAPPS-550: heal writes the identity password hash onto platform_admins"
+        stored, hash_new,
+        "PMS-1219: a failed login must not change platform_admins.password_hash"
     );
 
-    // Old platform password A no longer authenticates - the heal is
-    // a real overwrite, not a "accept both" trapdoor.
-    let stale = app
+    // The current, rotated platform password still works.
+    let ok = app
         .client
         .post(app.url("/api/v1/platform/login"))
-        .json(&serde_json::json!({ "email": email, "password": password_a }))
+        .json(&serde_json::json!({ "email": email, "password": password_new }))
         .send()
         .await
-        .expect("send login with stale password");
-    assert_eq!(
-        stale.status(),
-        reqwest::StatusCode::UNAUTHORIZED,
-        "MAPPS-550: stale password must not authenticate post-heal"
+        .expect("send login with rotated password");
+    assert!(
+        ok.status().is_success(),
+        "the rotated platform password must still authenticate; got {}",
+        ok.status()
     );
 }
 
-// MAPPS-550: fresh install / no drift path is unchanged. A platform
-// admin at password A with no matching identities row still logs in
-// with A and gets 401 on any other password (no fallback loosening,
-// no crash on the missing-identity lookup).
+// A platform admin with no matching identities row still logs in
+// normally and gets 401 on any other password (no crash on the
+// missing-identity case, since there is no identity lookup at all
+// anymore).
 #[sqlx::test]
 async fn platform_login_no_identity_row_still_works(pool: PgPool) {
     let email = "solo-platform@example.com".to_string();
