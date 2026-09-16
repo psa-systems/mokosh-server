@@ -723,6 +723,14 @@ pub fn create_api_router(
             "/webhooks/account-deleted",
             post(crate::modules::auth::bunyip_webhook::account_deleted),
         )
+        // BUNYIP-674: local mirror of Bunyip's mokosh grants so a
+        // revoked grant takes effect on the next request rather than
+        // the next `at+jwt` refresh. Same HMAC signing key the
+        // account-deleted receiver verifies (BUNYIP-332 / PMS-591).
+        .route(
+            "/webhooks/mokosh-grant-changed",
+            post(crate::modules::auth::bunyip_webhook::mokosh_grant_changed),
+        )
         .with_state(bunyip_webhook_state)
         // PMS-298: shared JSON error envelope so a bad request here matches
         // the rest of the API surface.

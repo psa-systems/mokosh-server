@@ -221,6 +221,144 @@ async fn soft_delete(pool: &PgPool, user_id: Uuid) -> AppResult<()> {
     Ok(())
 }
 
+// -- BUNYIP-674: mokosh_grant_changed receiver -------------------------------
+
+use super::mokosh_bunyip_grants::MokoshBunyipGrantService;
+
+const EVENT_MOKOSH_GRANT_CHANGED: &str = "mokosh_grant_changed";
+
+/// BUNYIP-674 payload shape. Every field the Bunyip emitter names is
+/// present here; the wire contract is pinned in
+/// `crates/bunyip-domain/src/services/webhook.rs` (see the
+/// `mokosh_grant_changed_payload_carries_the_documented_fields` test).
+///
+/// `role` is `Some` on a `granted` event and `None` on a `revoked` one;
+/// the emitter drops it on revoke so a late-arriving `granted` cannot
+/// accidentally reinstate the role after Mokosh has seen a `revoked`.
+/// The migration's CHECK constraint pins the role-vs-revoked_at
+/// coupling, so an inconsistent payload fails at write time.
+#[derive(Debug, Deserialize)]
+struct MokoshGrantChangedPayload {
+    event: String,
+    grant_id: Uuid,
+    owner_bunyip_user_id: Uuid,
+    grantee_bunyip_user_id: Uuid,
+    mokosh_account_id: String,
+    state: String,
+    #[serde(default)]
+    role: Option<String>,
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Handler for `POST /api/v1/bunyip/webhooks/mokosh-grant-changed`.
+///
+/// Same signature-then-parse ordering as `account_deleted`: an
+/// unauthenticated body must not reach the JSON parser at all. On a
+/// verified body, upsert the mirror row through
+/// [`MokoshBunyipGrantService::upsert`] and answer `200`. A `granted`
+/// event for a triple Mokosh never saw is not an error; a `revoked`
+/// event for a triple Mokosh never saw is not an error either (the
+/// receiver inserts the row straight into the revoked state so a race
+/// where Mokosh missed the earlier `granted` still lands the correct
+/// end state).
+pub async fn mokosh_grant_changed(
+    State(state): State<Arc<BunyipWebhookState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<impl IntoResponse> {
+    let signature = headers
+        .get(SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AppError::Unauthorized)?;
+    verify_signature(&state.webhook_secret, &body, signature)?;
+
+    let payload: MokoshGrantChangedPayload = serde_json::from_slice(&body)
+        .map_err(|_| AppError::BadRequest("Malformed webhook body".to_string()))?;
+
+    if payload.event != EVENT_MOKOSH_GRANT_CHANGED {
+        return Err(AppError::BadRequest(format!(
+            "Unsupported event {:?}",
+            payload.event
+        )));
+    }
+
+    let revoked_at = match payload.state.as_str() {
+        "granted" => {
+            if payload.role.is_none() {
+                return Err(AppError::BadRequest(
+                    "A granted event must carry a role.".to_string(),
+                ));
+            }
+            None
+        }
+        "revoked" => Some(payload.at),
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "Unknown grant state {other:?}"
+            )));
+        }
+    };
+
+    MokoshBunyipGrantService::upsert(
+        &state.pool,
+        payload.grant_id,
+        payload.owner_bunyip_user_id,
+        payload.grantee_bunyip_user_id,
+        &payload.mokosh_account_id,
+        payload.role.as_deref(),
+        payload.at,
+        revoked_at,
+    )
+    .await?;
+
+    // BUNYIP-674 option B (phase 3): the mirror gate is what stops a
+    // revoked grantee's next request, so this tombstone is defence in
+    // depth: it also removes the placement row from lists that scan
+    // `users` inside the tenant (member rosters, notification
+    // targets, audit histories) without going through the auth
+    // path. The mirror upsert above has already recorded the revoke
+    // and cannot roll back if this UPDATE fails; a failure here is a
+    // WARN so a webhook redelivery re-runs it, rather than answering
+    // 500 and asking Bunyip to keep retrying the whole webhook (which
+    // would re-fire the mirror upsert too). The mokosh_account_id is
+    // subquery-joined to `tenants.slug` so a slug the tenant does not
+    // exist under is a no-op rather than an error, matching the
+    // no-op-on-unknown contract the mirror upsert honours.
+    //
+    // The granted branch does the mirror side and NOTHING to `users`
+    // by design: the placement row is JIT-provisioned on the
+    // grantee's first request (there is no email or name in the
+    // webhook payload to seed the row with).
+    if payload.state == "revoked" {
+        if let Err(e) = sqlx::query(
+            "UPDATE users SET deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW() \
+             WHERE bunyip_user_id = $1 \
+               AND tenant_id = (SELECT id FROM tenants WHERE slug = $2)",
+        )
+        .bind(payload.grantee_bunyip_user_id)
+        .bind(&payload.mokosh_account_id)
+        .execute(&state.pool)
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                grantee = %payload.grantee_bunyip_user_id,
+                mokosh_account_id = %payload.mokosh_account_id,
+                "grantee placement tombstone failed after mirror upsert (mirror is authoritative; request-time gate still refuses)"
+            );
+        }
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "grant_id": payload.grant_id,
+            "state": payload.state,
+        })),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +426,48 @@ mod tests {
             p.user_id,
             Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap()
         );
+    }
+
+    /// BUNYIP-674: the full `mokosh_grant_changed` payload the Bunyip
+    /// emitter documents decodes here. A wire-shape change on Bunyip
+    /// that this receiver has not caught up to would fail this test
+    /// with a serde error, not silently mishandle the event.
+    #[test]
+    fn mokosh_grant_changed_payload_decodes_granted_shape() {
+        let body = br#"{
+            "event": "mokosh_grant_changed",
+            "grant_id": "22222222-2222-2222-2222-222222222222",
+            "owner_bunyip_user_id": "33333333-3333-3333-3333-333333333333",
+            "grantee_bunyip_user_id": "44444444-4444-4444-4444-444444444444",
+            "mokosh_account_id": "acme",
+            "state": "granted",
+            "role": "manager",
+            "at": "2026-09-15T12:00:00Z"
+        }"#;
+        let p: MokoshGrantChangedPayload = serde_json::from_slice(body).unwrap();
+        assert_eq!(p.event, "mokosh_grant_changed");
+        assert_eq!(p.state, "granted");
+        assert_eq!(p.role.as_deref(), Some("manager"));
+        assert_eq!(p.mokosh_account_id, "acme");
+    }
+
+    /// The revoked variant drops the role to null; the receiver
+    /// converts that to a NULL `role` column on the mirror table (its
+    /// CHECK constraint refuses the granted-with-null-role case).
+    #[test]
+    fn mokosh_grant_changed_payload_decodes_revoked_shape() {
+        let body = br#"{
+            "event": "mokosh_grant_changed",
+            "grant_id": "22222222-2222-2222-2222-222222222222",
+            "owner_bunyip_user_id": "33333333-3333-3333-3333-333333333333",
+            "grantee_bunyip_user_id": "44444444-4444-4444-4444-444444444444",
+            "mokosh_account_id": "acme",
+            "state": "revoked",
+            "role": null,
+            "at": "2026-09-15T12:00:00Z"
+        }"#;
+        let p: MokoshGrantChangedPayload = serde_json::from_slice(body).unwrap();
+        assert_eq!(p.state, "revoked");
+        assert!(p.role.is_none());
     }
 }

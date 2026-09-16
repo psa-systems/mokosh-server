@@ -55,6 +55,9 @@ fn claims(sub: Uuid, bunyip_role: Option<&str>) -> AtClaims {
         exp: 0,
         iat: 0,
         bunyip_role: bunyip_role.map(|s| s.to_string()),
+        mokosh_grant_id: None,
+        mokosh_grant_role: None,
+        mokosh_grant_account_id: None,
     }
 }
 
@@ -1002,7 +1005,7 @@ async fn userinfo_is_fetched_for_a_first_sight_user(pool: PgPool) {
     let (auth, _tenants, invitations) = services(&pool);
     let sub = Uuid::new_v4();
     assert!(
-        bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        bunyip_userinfo_needed(&auth, Some(&invitations), sub, &claims(sub, None)).await,
         "a first-sight user needs userinfo to be provisioned"
     );
 }
@@ -1047,7 +1050,7 @@ async fn userinfo_is_skipped_for_an_existing_placed_user(pool: PgPool) {
     .expect("first placement");
 
     assert!(
-        !bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        !bunyip_userinfo_needed(&auth, Some(&invitations), sub, &claims(sub, None)).await,
         "an existing placed user with no invite must not trigger a userinfo fetch"
     );
 }
@@ -1106,7 +1109,7 @@ async fn userinfo_is_fetched_when_a_pending_invite_matches(pool: PgPool) {
         .expect("invite");
 
     assert!(
-        bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        bunyip_userinfo_needed(&auth, Some(&invitations), sub, &claims(sub, None)).await,
         "a pending invite for the user's verified email must trigger the userinfo path"
     );
 }
@@ -1433,7 +1436,7 @@ async fn userinfo_is_fetched_while_the_row_holds_a_placeholder_email(pool: PgPoo
     degrade_to_placeholder(&pool, sub).await;
 
     assert!(
-        bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        bunyip_userinfo_needed(&auth, Some(&invitations), sub, &claims(sub, None)).await,
         "a placeholder row must keep fetching userinfo until it is repaired"
     );
 }
@@ -1485,7 +1488,7 @@ async fn placeholder_email_is_repaired_once_bunyip_verifies_it(pool: PgPool) {
     let (tenant2, _) = user_tenant_role(&pool, sub).await;
     assert_eq!(tenant, tenant2, "the repair does not move the user");
     assert!(
-        !bunyip_userinfo_needed(&auth, Some(&invitations), sub).await,
+        !bunyip_userinfo_needed(&auth, Some(&invitations), sub, &claims(sub, None)).await,
         "a repaired row falls back to the no-userinfo fast path"
     );
 }
