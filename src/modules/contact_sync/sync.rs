@@ -219,6 +219,10 @@ struct Snapshot {
     links: HashMap<String, LinkRow>,
     /// `(external_id, contact_id)` pairs a human already resolved.
     answered: HashSet<(String, Uuid)>,
+    /// External ids a reviewer chose not to import (PMS-1215). A skip is about
+    /// the record, not the pairs it was asked about: a contact created later
+    /// that also matches it is not a reason to ask again.
+    skipped: HashSet<String>,
     /// External ids a person unlinked from this connection.
     unlinked: HashSet<String>,
     /// [`external_id_digest`]s of records whose data was removed on request.
@@ -740,6 +744,14 @@ impl ContactSyncEngine {
         .bind(connection_id)
         .fetch_all(&mut *tx)
         .await?;
+        let skipped: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT external_id FROM contact_sync_candidates \
+             WHERE tenant_id = $1 AND connection_id = $2 AND status = 'skipped'",
+        )
+        .bind(tenant_id)
+        .bind(connection_id)
+        .fetch_all(&mut *tx)
+        .await?;
         let unlinked: Vec<String> = sqlx::query_scalar(
             "SELECT external_id FROM contact_sync_links \
              WHERE tenant_id = $1 AND connection_id = $2 AND unlink_reason = 'unlinked'",
@@ -791,6 +803,7 @@ impl ContactSyncEngine {
                 .map(|l| (l.external_id.clone(), l))
                 .collect(),
             answered: answered.into_iter().collect(),
+            skipped: skipped.into_iter().collect(),
             unlinked: unlinked.into_iter().collect(),
             suppressed: suppressed.into_iter().collect(),
             companies: by_name,
@@ -893,6 +906,9 @@ impl ContactSyncEngine {
             &format!("{} {}", mapped.first_name, mapped.last_name),
             mapped.company_name.as_deref(),
         );
+        if snapshot.skipped.contains(&record.external_id) {
+            return Ok(Outcome::AlreadyReviewed);
+        }
         match decide(&incoming, &snapshot.locals) {
             MatchDecision::Link(contact_id) => {
                 let mut tx = self.db.begin_with_tenant(tenant_id).await?;
