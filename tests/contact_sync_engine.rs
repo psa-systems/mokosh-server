@@ -278,6 +278,7 @@ async fn a_sync_links_queues_and_creates_and_a_second_run_changes_nothing(pool: 
             linked: 1,
             queued: 2,
             not_selected: 1,
+            total: 5,
             ..SyncReport::default()
         }
     );
