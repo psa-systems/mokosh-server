@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use super::bunyip_directory::BunyipUserDirectory;
 use super::grant_invitations::{
     AcceptRefusal, CreatedInvitation, GrantInvitation, GrantInvitationsService, DEFAULT_TTL,
 };
@@ -50,6 +51,15 @@ pub struct GrantInvitationsState {
     /// and logs at warn so a fixture without notifications does not
     /// silently swallow the email.
     pub notifications: Option<Arc<NotificationsService>>,
+    /// PMS-1208: Bunyip user-directory client for the SaaS-mode gate.
+    /// `Some` when this deployment federates with Bunyip AND the
+    /// three `BUNYIP_DIRECTORY_*` config values are all set; `None`
+    /// in standalone mode. When `Some` the create handler refuses
+    /// an invitation to an email that does not resolve on Bunyip
+    /// with a 422 pointing the owner at "ask them to sign up first";
+    /// when `None` the standalone accept-time flow binds a local
+    /// `users.id` at accept time and the pre-check is skipped.
+    pub bunyip_directory: Option<Arc<BunyipUserDirectory>>,
 }
 
 /// POST body for `POST /api/v1/grants/invitations`. Either
@@ -135,11 +145,13 @@ pub fn grant_invitations_owner_routes(
     db: Arc<Database>,
     spa_base_url: Arc<String>,
     notifications: Option<Arc<NotificationsService>>,
+    bunyip_directory: Option<Arc<BunyipUserDirectory>>,
 ) -> Router {
     let state = GrantInvitationsState {
         db,
         spa_base_url,
         notifications,
+        bunyip_directory,
     };
     Router::new()
         .route("/", post(create_invitation))
@@ -154,6 +166,7 @@ pub fn grant_invitations_grantee_routes(db: Arc<Database>) -> Router {
         db,
         spa_base_url: Arc::new(String::new()),
         notifications: None,
+        bunyip_directory: None,
     };
     Router::new()
         .route("/", get(list_grantee_inbox))
@@ -167,6 +180,7 @@ pub fn grant_invitations_by_token_routes(db: Arc<Database>) -> Router {
         db,
         spa_base_url: Arc::new(String::new()),
         notifications: None,
+        bunyip_directory: None,
     };
     Router::new()
         .route("/{token}", get(get_invitation_by_token))
@@ -200,12 +214,44 @@ async fn create_invitation(
             ));
         }
     }
+    // PMS-1208 SaaS-mode gate: in the bunyip-federated deployment
+    // (`bunyip_directory` is `Some`) the grantee eventually signs in
+    // through Bunyip and the accept flow binds their Bunyip sub, so
+    // an invitation to an email that does not resolve on Bunyip is
+    // a dead end. Refuse it here with 422 pointing the owner at
+    // "ask them to sign up first" rather than reaching that dead
+    // end at accept time. In standalone mode (`None`) the accept
+    // flow binds a local `users.id` and no external identity
+    // exists to check against, so this gate is skipped and the
+    // invitation goes through email-only. When the request already
+    // carries `invitee_bunyip_user_id` a directory hit is
+    // guaranteed by construction, so the gate is only invoked on
+    // the email path.
+    let invitee_id_from_directory: Option<Uuid> = match (
+        &state.bunyip_directory,
+        body.invitee_bunyip_user_id,
+        invitee_email,
+    ) {
+        (Some(directory), None, Some(em)) => match directory.lookup(em).await? {
+            Some(id) => Some(id),
+            None => {
+                return Err(AppError::validation_field(
+                    "invitee_email",
+                    "This email is not registered on Bunyip yet. Ask them to sign up first, \
+                     then send the invitation.",
+                ));
+            }
+        },
+        _ => None,
+    };
+
     // The service's create returns Conflict on the partial-UNIQUE
     // trip; the "already an active grant" pre-check runs here so
     // the two 409s are named separately.
     let addr = invitee_email
         .map(str::to_string)
         .unwrap_or_else(|| body.invitee_bunyip_user_id.unwrap().to_string());
+    let resolved_invitee_id = body.invitee_bunyip_user_id.or(invitee_id_from_directory);
     let CreatedInvitation {
         invitation,
         accept_token,
@@ -213,7 +259,7 @@ async fn create_invitation(
         state.db.pool(),
         caller.tenant_id,
         caller.id,
-        body.invitee_bunyip_user_id,
+        resolved_invitee_id,
         &addr,
         body.role.trim(),
         DEFAULT_TTL,

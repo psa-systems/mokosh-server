@@ -269,6 +269,26 @@ declare_keys! {
     /// compose-secrets on staging and prod.
     Application BUNYIP_STATUS_CLIENT_SECRET = "BUNYIP_STATUS_CLIENT_SECRET";
 
+    /// PMS-1208: base URL of the Bunyip API this deployment federates
+    /// with in SaaS mode. Used by [`crate::modules::auth::bunyip_directory`]
+    /// to call `GET /v1/users/lookup?email=` before creating a pending
+    /// grant invitation. Unset in standalone mode; the directory
+    /// client is only constructed when this + the machine-credential
+    /// pair below are all set.
+    Application BUNYIP_API_BASE_URL = "BUNYIP_API_BASE_URL";
+    /// PMS-1208: machine-credential client_id this deployment
+    /// presents to Bunyip's `/v1/users/lookup` endpoint. Same shape
+    /// as `BUNYIP_STATUS_CLIENT_ID` above, but for the outbound
+    /// direction: Bunyip is the server, mokosh-server is the calling
+    /// app. Register via `bunyip-api machine-client register` on the
+    /// Bunyip side.
+    Application BUNYIP_DIRECTORY_CLIENT_ID = "BUNYIP_DIRECTORY_CLIENT_ID";
+    /// PMS-1208: plaintext client_secret paired with
+    /// `BUNYIP_DIRECTORY_CLIENT_ID`. Presented to Bunyip as HTTP
+    /// Basic. Stored in the operator's SOPS-encrypted compose
+    /// secrets on staging and prod; unset in standalone mode.
+    Application BUNYIP_DIRECTORY_CLIENT_SECRET = "BUNYIP_DIRECTORY_CLIENT_SECRET";
+
     // -- Feature flags (PMS-983) ---------------------------------------------
     // Reached through `crate::config::flags`, so the parse rule and the
     // default live with the flag rather than at every read site. No feature

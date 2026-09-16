@@ -29,6 +29,8 @@ pub mod caller_context;
 // PMS-591: receiver for Bunyip's `account_deleted` webhook. Wired outside
 // the JWT auth chain in `create_api_router`.
 #[cfg(feature = "server")]
+pub mod bunyip_directory;
+#[cfg(feature = "server")]
 pub mod bunyip_webhook;
 #[cfg(feature = "server")]
 pub mod grant_invitations;

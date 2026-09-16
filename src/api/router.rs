@@ -148,6 +148,28 @@ pub fn create_api_router(
         );
     }
 
+    // PMS-1208: construct the Bunyip user-directory client for the
+    // SaaS-mode gate on grant-invitation creation. Returns `None` in
+    // standalone mode (no bunyip config) and an `Err` on partial
+    // config, which the caller wraps to `.ok()` because the current
+    // wiring here is a warn-and-degrade rather than fail-boot: a
+    // deployment that later fills the config in gets the gate on
+    // the next restart, and one that meant to leave it off is
+    // unaffected.
+    let bunyip_directory =
+        match crate::modules::auth::bunyip_directory::BunyipUserDirectory::from_config() {
+            Ok(Some(client)) => Some(std::sync::Arc::new(client)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "PMS-1208 Bunyip directory client disabled: partial configuration. Grant \
+                     invitations will be created without the SaaS-mode existence check."
+                );
+                None
+            }
+        };
+
     // Create services. NotificationsService is constructed first so a
     // shared clone can be threaded into AuthService and TicketService,
     // letting them dispatch transactional messages (password reset,
@@ -388,6 +410,7 @@ pub fn create_api_router(
                 Arc::new(db.clone()),
                 Arc::new(spa_base_url.clone()),
                 Some(Arc::new(notifications_service.clone())),
+                bunyip_directory.clone(),
             ),
         )
         .nest(
