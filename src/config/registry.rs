@@ -269,6 +269,22 @@ declare_keys! {
     /// compose-secrets on staging and prod.
     Application BUNYIP_STATUS_CLIENT_SECRET = "BUNYIP_STATUS_CLIENT_SECRET";
 
+    /// PMS-1212 (PSA-70): the Google Cloud OAuth client this deployment
+    /// connects Google Contacts with. Unset disables the integration: the
+    /// Settings card says so rather than offering a Connect button that
+    /// cannot work.
+    ///
+    /// The consent screen this client belongs to must declare
+    /// `contacts.readonly`, `openid` and `email`, and no write scope (PMS-794).
+    Application GOOGLE_CONTACTS_CLIENT_ID = "GOOGLE_CONTACTS_CLIENT_ID";
+    /// PMS-1212: the secret paired with `GOOGLE_CONTACTS_CLIENT_ID`. Operator
+    /// configuration, the way every deployment credential is (PMS-912): it
+    /// belongs beside `INFISICAL_CLIENT_SECRET` and never in the database,
+    /// never in a log line, and never in an error body. A tenant's refresh
+    /// token is the other thing, and that goes to the secret provider under
+    /// `SecretKind::ContactSync`.
+    Application GOOGLE_CONTACTS_CLIENT_SECRET = "GOOGLE_CONTACTS_CLIENT_SECRET";
+
     // -- Feature flags (PMS-983) ---------------------------------------------
     // Reached through `crate::config::flags`, so the parse rule and the
     // default live with the flag rather than at every read site. No feature
