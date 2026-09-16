@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::upload_limits::oversized_upload_error;
 
 /// The on-disk suffix each allowed type is stored under. This table names
 /// extensions only: what is *allowed* is `utils::inline_image`, shared with the
@@ -158,10 +159,7 @@ impl TenantLogoStore {
             return Err(AppError::BadRequest("The uploaded file is empty".into()));
         }
         if bytes.len() as u64 > self.config.max_bytes {
-            return Err(AppError::BadRequest(format!(
-                "Logo is larger than the {} KiB limit",
-                self.config.max_bytes / 1024
-            )));
+            return Err(oversized_upload_error("logo", self.config.max_bytes));
         }
 
         self.remove(tenant_id).await;

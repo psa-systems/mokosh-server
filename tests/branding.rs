@@ -321,3 +321,249 @@ async fn portal_host_returns_merged_effective_branding(pool: PgPool) {
         "unset Company field must fall through to the tenant default"
     );
 }
+
+/// PMS-1197: the contact-plane Company writer must go through the same
+/// `validate_branding_patch` table the tenant PATCH already does, or a
+/// portal contact could write an arbitrary `primary_color` that then wins
+/// in `effective_branding` everywhere a client is shown it.
+#[sqlx::test]
+async fn contact_patch_branding_rejects_an_invalid_value(pool: PgPool) {
+    let (contact_id, _company_id, slug, _portal_id, token) =
+        seed_company_and_contact(&pool, "badcolor@brand.example").await;
+    grant_branding_cap(&pool, contact_id).await;
+    let app = common::boot(pool.clone()).await;
+    let bearer = sign_in_contact(&app, &slug, "badcolor@brand.example", &token).await;
+
+    let resp = app
+        .client
+        .patch(app.url("/api/v1/contact/companies/self/branding"))
+        .bearer_auth(&bearer)
+        .json(&json!({ "primary_color": "not-a-colour" }))
+        .send()
+        .await
+        .expect("PATCH");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.expect("error JSON");
+    let fields: Vec<&str> = body["error"]["errors"]
+        .as_array()
+        .expect("errors[]")
+        .iter()
+        .map(|e| e["field"].as_str().expect("field"))
+        .collect();
+    assert!(
+        fields.contains(&"branding.primary_color"),
+        "errors[] must name branding.primary_color: {body}"
+    );
+}
+
+/// PMS-1197: an unknown key on the same endpoint is refused and the
+/// message names the known keys, matching the tenant PATCH's behaviour.
+#[sqlx::test]
+async fn contact_patch_branding_rejects_an_unknown_key(pool: PgPool) {
+    let (contact_id, _company_id, slug, _portal_id, token) =
+        seed_company_and_contact(&pool, "unknownkey@brand.example").await;
+    grant_branding_cap(&pool, contact_id).await;
+    let app = common::boot(pool.clone()).await;
+    let bearer = sign_in_contact(&app, &slug, "unknownkey@brand.example", &token).await;
+
+    let resp = app
+        .client
+        .patch(app.url("/api/v1/contact/companies/self/branding"))
+        .bearer_auth(&bearer)
+        .json(&json!({ "not_a_real_key": "x" }))
+        .send()
+        .await
+        .expect("PATCH");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.expect("error JSON");
+    let messages: Vec<&str> = body["error"]["errors"]
+        .as_array()
+        .expect("errors[]")
+        .iter()
+        .map(|e| e["message"].as_str().expect("message"))
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("is not a branding key") && m.contains("primary_color")),
+        "must name the known keys: {body}"
+    );
+}
+
+/// PMS-1197: `portal_domain` and `invoice_template` are tenant-level
+/// concepts and refused on the Company side.
+#[sqlx::test]
+async fn contact_patch_branding_rejects_a_tenant_only_key(pool: PgPool) {
+    let (contact_id, _company_id, slug, _portal_id, token) =
+        seed_company_and_contact(&pool, "tenantonly@brand.example").await;
+    grant_branding_cap(&pool, contact_id).await;
+    let app = common::boot(pool.clone()).await;
+    let bearer = sign_in_contact(&app, &slug, "tenantonly@brand.example", &token).await;
+
+    let resp = app
+        .client
+        .patch(app.url("/api/v1/contact/companies/self/branding"))
+        .bearer_auth(&bearer)
+        .json(&json!({ "portal_domain": "portal.acme.example" }))
+        .send()
+        .await
+        .expect("PATCH");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// PMS-1197: the staff-plane company update (`PUT /contacts/companies/{id}`)
+/// refuses the identical payloads with the identical messages the contact
+/// endpoint does, since both writers now call
+/// `validate_company_branding_patch`.
+#[sqlx::test]
+async fn staff_put_company_branding_rejects_the_same_payloads_the_contact_endpoint_does(
+    pool: PgPool,
+) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let staff_token = common::login(&app, &email, &password).await;
+    let company_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Bad Patch Co')")
+        .bind(company_id)
+        .bind(common::DEFAULT_TENANT_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let bad_color = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&staff_token)
+        .json(&json!({ "branding": { "primary_color": "not-a-colour" } }))
+        .send()
+        .await
+        .expect("PUT company");
+    assert_eq!(
+        bad_color.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let bad_color_body: serde_json::Value = bad_color.json().await.expect("error JSON");
+    let fields: Vec<&str> = bad_color_body["error"]["errors"]
+        .as_array()
+        .expect("errors[]")
+        .iter()
+        .map(|e| e["field"].as_str().expect("field"))
+        .collect();
+    assert!(
+        fields.contains(&"branding.primary_color"),
+        "errors[] must name branding.primary_color: {bad_color_body}"
+    );
+
+    let unknown_key = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&staff_token)
+        .json(&json!({ "branding": { "not_a_real_key": "x" } }))
+        .send()
+        .await
+        .expect("PUT company");
+    assert_eq!(
+        unknown_key.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let unknown_key_body: serde_json::Value = unknown_key.json().await.expect("error JSON");
+    let messages: Vec<&str> = unknown_key_body["error"]["errors"]
+        .as_array()
+        .expect("errors[]")
+        .iter()
+        .map(|e| e["message"].as_str().expect("message"))
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("is not a branding key") && m.contains("primary_color")),
+        "must name the known keys: {unknown_key_body}"
+    );
+}
+
+/// MAPPS-807: with no branding name configured, the customer's brand names the
+/// MSP by the organization's own name, on the sign-in page and once signed in.
+///
+/// Before this the portal sign-in page read "Mokosh Platform" under the MSP's
+/// logo, because the brand carried no name and the client fell back to the
+/// vendor's. The MSP's emails never had that gap: they use `tenants.name`.
+#[sqlx::test]
+async fn the_customer_brand_names_the_msp_when_no_name_is_configured(pool: PgPool) {
+    let (_contact_id, _company_id, slug, portal_id, setup_token) =
+        seed_company_and_contact(&pool, "named@brand.example").await;
+    let organization: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE tenants SET branding = branding - 'display_name' - 'company_name' WHERE id = $1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = common::boot(pool.clone()).await;
+
+    let host: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contact/portal/{portal_id}/host")))
+        .send()
+        .await
+        .expect("GET /host")
+        .json()
+        .await
+        .expect("host JSON");
+    assert_eq!(
+        host["effective_branding"]["company_name"].as_str(),
+        Some(organization.as_str()),
+        "the sign-in page must name the MSP: {host}"
+    );
+
+    let bearer = sign_in_contact(&app, &slug, "named@brand.example", &setup_token).await;
+    let me = app
+        .client
+        .get(app.url("/api/v1/contact/auth/me"))
+        .bearer_auth(&bearer)
+        .send()
+        .await
+        .expect("GET /contact/auth/me");
+    assert_eq!(me.status(), reqwest::StatusCode::OK);
+    let me: serde_json::Value = me.json().await.expect("me JSON");
+    assert_eq!(
+        me["effective_branding"]["company_name"].as_str(),
+        Some(organization.as_str()),
+        "the signed-in portal must name the MSP too: {me}"
+    );
+}
+
+/// A name somebody configured is never replaced by the organization's.
+#[sqlx::test]
+async fn a_configured_brand_name_still_wins(pool: PgPool) {
+    let (_contact_id, _company_id, _slug, portal_id, _token) =
+        seed_company_and_contact(&pool, "configured@brand.example").await;
+    sqlx::query(
+        "UPDATE tenants SET branding = (branding - 'company_name') \
+             || '{\"display_name\": \"Niceguy Support\"}'::jsonb WHERE id = $1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let app = common::boot(pool.clone()).await;
+    let host: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contact/portal/{portal_id}/host")))
+        .send()
+        .await
+        .expect("GET /host")
+        .json()
+        .await
+        .expect("host JSON");
+    let eff = &host["effective_branding"];
+    assert_eq!(eff["display_name"].as_str(), Some("Niceguy Support"));
+    assert!(
+        eff["company_name"].is_null(),
+        "a configured display name means nothing is filled in: {eff}"
+    );
+}

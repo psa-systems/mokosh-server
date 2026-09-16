@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::config::{self, registry as keys, ConfigKey};
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::upload_limits::oversized_upload_error;
 
 const ALLOWED_MIME: &[(&str, &str)] = &[
     ("image/png", "png"),
@@ -227,10 +228,7 @@ impl BrandingAssetStore {
         }
         let cap = self.max_bytes(kind, scope);
         if bytes.len() as u64 > cap {
-            return Err(AppError::BadRequest(format!(
-                "The image is larger than the {} KiB limit.",
-                cap / 1024
-            )));
+            return Err(oversized_upload_error("image", cap));
         }
         self.remove(scope, kind).await;
         tokio::fs::create_dir_all(self.dir_for(scope, kind))

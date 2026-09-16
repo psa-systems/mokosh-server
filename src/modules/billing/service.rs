@@ -4028,9 +4028,10 @@ impl BillingService {
             )
             .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant_id.get(), issuer).await;
-            let bytes = crate::pdf::render(&crate::modules::billing::documents::invoice(
-                &document, issuer, &bill_to, logo,
-            ))?;
+            let bytes = crate::pdf::render(
+                &crate::modules::billing::documents::invoice(&document, issuer, &bill_to, logo),
+                document.invoice_date,
+            )?;
             crate::modules::billing::documents::store_issued(
                 &mut tx,
                 tenant_id.get(),
@@ -5170,9 +5171,10 @@ impl BillingService {
             Self::invoice_billing_contact_in_tx(&mut tx, tenant_id, note.invoice_id).await?;
         let credit_to = Self::bill_to_in_tx(&mut tx, tenant_id, note.company_id, contact).await?;
         let logo = crate::modules::billing::issuer::live_logo_bytes(tenant_id.get(), &issuer).await;
-        let bytes = crate::pdf::render(&crate::modules::billing::documents::credit_note(
-            &note, &issuer, &credit_to, logo,
-        ))?;
+        let bytes = crate::pdf::render(
+            &crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
+            note.issue_date,
+        )?;
         crate::modules::billing::documents::store_issued(
             &mut tx,
             tenant_id.get(),
