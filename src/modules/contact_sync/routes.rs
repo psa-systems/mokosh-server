@@ -5,6 +5,13 @@
 //! * `/api/v1/integrations/contact-sync/*` is staff, admin-gated. Connecting a
 //!   tenant's directory to its CRM is an administrator's act, the same gate the
 //!   RMM connection routes carry.
+//! * `/api/v1/contacts/contacts/{contact_id}/sync*` is one contact's
+//!   provenance, its locks, unlinking it, and removing its imported data
+//!   (PMS-1214). The doubled segment is the contacts module's own `/contacts`
+//!   nest, so these sit beside the contact they describe. Reading, releasing a
+//!   lock and unlinking carry `RequireAuth`, the gate editing the contact
+//!   itself carries, since each is a smaller act than an edit. Removing
+//!   imported data deletes a person and is admin-only.
 //! * `/api/v1/public/contact-sync/google/callback` is the browser redirect
 //!   Google performs, which carries no session by construction. Its credential
 //!   is the single-use state parameter (migration 221); it is listed in the
@@ -12,13 +19,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use uuid::Uuid;
 
-use super::service::{ConnectionStatus, ContactSyncService};
+use super::service::{ConnectionStatus, ContactProvenance, ContactSyncService, DataRemoval};
+use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
 
@@ -39,6 +49,16 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
         .route(
             "/integrations/contact-sync/google/disconnect",
             post(disconnect),
+        )
+        .route("/contacts/contacts/{contact_id}/sync", get(get_provenance))
+        .route(
+            "/contacts/contacts/{contact_id}/sync/locks/{field}",
+            delete(release_lock),
+        )
+        .route("/contacts/contacts/{contact_id}/sync/unlink", post(unlink))
+        .route(
+            "/contacts/contacts/{contact_id}/sync/remove-imported-data",
+            post(remove_imported_data),
         )
         .with_state(state)
 }
@@ -83,10 +103,72 @@ async fn disconnect(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
     RequireAuth(user): RequireAuth,
-    ctx: crate::modules::audit::AuditCtx,
-) -> AppResult<axum::http::StatusCode> {
+    ctx: AuditCtx,
+) -> AppResult<StatusCode> {
     state.service.disconnect(user.tenant(), &ctx).await?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_provenance(
+    State(state): State<ContactSyncRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(contact_id): Path<Uuid>,
+) -> AppResult<Json<ContactProvenance>> {
+    Ok(Json(
+        state.service.provenance(user.tenant(), contact_id).await?,
+    ))
+}
+
+async fn release_lock(
+    State(state): State<ContactSyncRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+    Path((contact_id, field)): Path<(Uuid, String)>,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .release_lock(user.tenant(), contact_id, &field, &ctx)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unlink(
+    State(state): State<ContactSyncRouterState>,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+    Path(contact_id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .unlink(user.tenant(), contact_id, &ctx)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveImportedDataRequest {
+    /// Who asked, or why. Required: this deletes a person's data, and the
+    /// audit row is the only account of it that remains.
+    #[serde(default)]
+    reason: String,
+}
+
+/// POST with a body rather than DELETE: it takes a reason, and it is not a
+/// delete of the resource at this path.
+async fn remove_imported_data(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+    Path(contact_id): Path<Uuid>,
+    Json(request): Json<RemoveImportedDataRequest>,
+) -> AppResult<Json<DataRemoval>> {
+    Ok(Json(
+        state
+            .service
+            .remove_imported_data(user.tenant(), contact_id, &request.reason, &ctx)
+            .await?,
+    ))
 }
 
 /// What Google appends to the redirect. `error` arrives when the admin pressed

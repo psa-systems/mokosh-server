@@ -3521,6 +3521,12 @@ impl ContactService {
         .bind(contact_id)
         .fetch_optional(&mut *tx)
         .await?;
+        // PMS-1214: a synced contact's edited fields stop following the
+        // source. Captured before the write, locked after it, same transaction.
+        let sync_before = crate::modules::contact_sync::locks::EditSnapshot::capture_if_linked(
+            &mut tx, tenant_id, contact_id,
+        )
+        .await?;
 
         // Reject moving the contact to a foreign tenant's company. Same
         // shape as the create-time validate_fk path above.
@@ -3779,6 +3785,17 @@ impl ContactService {
         } else {
             None
         };
+
+        if let Some(sync_before) = sync_before {
+            crate::modules::contact_sync::locks::lock_edited_fields(
+                &mut tx,
+                tenant_id,
+                contact_id,
+                &sync_before,
+                ctx,
+            )
+            .await?;
+        }
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",

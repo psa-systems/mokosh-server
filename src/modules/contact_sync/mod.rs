@@ -12,8 +12,12 @@
 //!   CRM, all pure (PMS-1213).
 //! * `sync`: one pass of one connection (PMS-1213). Scheduling and run
 //!   tracking are PMS-1215.
+//! * `locks`: an edit in Mokosh locks the field against the source; the
+//!   service's provenance, unlink and data-removal methods are the rest of what
+//!   decides whether a person trusts the integration (PMS-1214).
 
 pub mod google;
+pub mod locks;
 pub mod mapping;
 pub mod matching;
 pub mod normalize;
