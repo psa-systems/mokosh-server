@@ -63,7 +63,11 @@ where
         if let Some(header) = parts.headers.get(axum::http::header::AUTHORIZATION) {
             if let Ok(text) = header.to_str() {
                 if let Some(encoded) = text.strip_prefix("Basic ") {
-                    match verify_bunyip_basic(encoded) {
+                    let configured = configured_credential();
+                    let expected = configured
+                        .as_ref()
+                        .map(|(id, secret)| (id.as_str(), secret.as_str()));
+                    match verify_bunyip_basic(encoded, expected) {
                         BunyipBasicOutcome::Accepted => return Ok(Self),
                         BunyipBasicOutcome::Refused => {
                             // The caller tried to use the machine-credential
@@ -107,12 +111,30 @@ enum BunyipBasicOutcome {
     NotAttempted,
 }
 
-fn verify_bunyip_basic(encoded: &str) -> BunyipBasicOutcome {
-    let expected_id = crate::config::get(&crate::config::registry::BUNYIP_STATUS_CLIENT_ID)
-        .filter(|s| !s.is_empty());
-    let expected_secret = crate::config::get(&crate::config::registry::BUNYIP_STATUS_CLIENT_SECRET)
-        .filter(|s| !s.is_empty());
-    let (Some(expected_id), Some(expected_secret)) = (expected_id, expected_secret) else {
+/// The configured machine credential, or `None` when the path is disabled.
+///
+/// PMS-1218: the ONLY configuration read on this path, kept out of
+/// [`verify_bunyip_basic`] so the decision itself is a pure function. It used
+/// to read the two keys inline, which made every outcome depend on
+/// process-global state and made the unit tests below assert on whatever a
+/// concurrently running test had left in the environment.
+fn configured_credential() -> Option<(String, String)> {
+    let id = crate::config::get(&crate::config::registry::BUNYIP_STATUS_CLIENT_ID)
+        .filter(|s| !s.is_empty())?;
+    let secret = crate::config::get(&crate::config::registry::BUNYIP_STATUS_CLIENT_SECRET)
+        .filter(|s| !s.is_empty())?;
+    Some((id, secret))
+}
+
+/// Decide what an incoming Basic header means, given the configured
+/// credential.
+///
+/// Pure: `expected` is passed in rather than read here, so the outcome depends
+/// on nothing but the two arguments. That is what lets the tests below name a
+/// case and assert it, instead of asserting whichever answer the environment
+/// happened to hold.
+fn verify_bunyip_basic(encoded: &str, expected: Option<(&str, &str)>) -> BunyipBasicOutcome {
+    let Some((expected_id, expected_secret)) = expected else {
         return BunyipBasicOutcome::NotConfigured;
     };
     let Ok(bytes) = STANDARD.decode(encoded) else {
@@ -138,28 +160,56 @@ fn verify_bunyip_basic(encoded: &str) -> BunyipBasicOutcome {
 mod tests {
     use super::*;
 
-    /// Unset env: outcome is `NotConfigured` regardless of what the caller
-    /// sent, so the staff-session fallback runs the way it did before
+    const CONFIGURED: Option<(&str, &str)> = Some(("bunyip-status", "s3cret-value"));
+
+    /// No configured credential: the outcome is `NotConfigured` whatever the
+    /// caller sent, so the staff-session fallback runs the way it did before
     /// PMS-1193.
     #[test]
-    fn unset_env_falls_through() {
-        // Nothing to seed; a fresh test process has neither key set, and
-        // `crate::config::get` returns `None`. Any decoded input becomes
-        // `NotConfigured` at the guard above.
+    fn an_unconfigured_credential_falls_through() {
         assert_eq!(
-            verify_bunyip_basic("aWQ6c2VjcmV0"),
+            verify_bunyip_basic("aWQ6c2VjcmV0", None),
             BunyipBasicOutcome::NotConfigured
         );
     }
 
-    /// The env fixture is process-global; only assert on the pure decoder
-    /// path here. The full extractor integration test lives in
-    /// `tests/provider_status_machine_credential.rs`.
+    /// PMS-1218: a malformed header is `NotAttempted`, which is what this
+    /// test has always been named for and could not previously assert.
+    ///
+    /// The decision used to read the configured credential itself, so with
+    /// the keys unset every input short-circuited to `NotConfigured` before
+    /// the decoder ran - and the assertion said `NotConfigured` while the
+    /// name said otherwise. Which one was true depended on whether a
+    /// concurrently running test in `route.rs` had set the environment,
+    /// which is exactly how this flaked.
     #[test]
     fn malformed_base64_is_not_attempted() {
+        for malformed in ["!!! not base64 !!!", "bm9jb2xvbg==", ""] {
+            assert_eq!(
+                verify_bunyip_basic(malformed, CONFIGURED),
+                BunyipBasicOutcome::NotAttempted,
+                "{malformed:?}"
+            );
+        }
+    }
+
+    /// The two outcomes that decide a request, asserted against a credential
+    /// this test owns rather than one the process happens to hold.
+    #[test]
+    fn a_matching_credential_is_accepted_and_a_wrong_one_is_refused() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        let encode = |pair: &str| STANDARD.encode(pair);
         assert_eq!(
-            verify_bunyip_basic("!!! not base64 !!!"),
-            BunyipBasicOutcome::NotConfigured
+            verify_bunyip_basic(&encode("bunyip-status:s3cret-value"), CONFIGURED),
+            BunyipBasicOutcome::Accepted
         );
+        for wrong in ["bunyip-status:wrong", "wrong:s3cret-value", "wrong:wrong"] {
+            assert_eq!(
+                verify_bunyip_basic(&encode(wrong), CONFIGURED),
+                BunyipBasicOutcome::Refused,
+                "{wrong}"
+            );
+        }
     }
 }
