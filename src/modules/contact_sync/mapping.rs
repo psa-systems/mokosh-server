@@ -12,7 +12,7 @@
 //! | `organizations[].name` | `company_name` | Free text only. NEVER a `companies` row (PSA-70 G); a matching company is a suggestion for a human. |
 //! | `organizations[].title` | `title` | |
 //! | `organizations[].department` | `department` | |
-//! | `memberships[]` | (none) | Read for the opt-in group filter (PSA-70 E), not stored. |
+//! | `memberships[]` | `tags` | The opt-in label filter (PSA-70 E): a record carrying no selected label is not imported. The names of the SELECTED labels it carries are added to `tags` by the sync; an unselected label is never stored. |
 //!
 //! # Dropped, explicitly
 //!
