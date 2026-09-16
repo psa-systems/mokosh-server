@@ -41,6 +41,10 @@ pub mod recovery;
 // that applies it before any handler deserializes a request.
 pub mod text;
 pub mod totp;
+// PMS-1204: the one size-limit refusal every upload site shares (one status
+// code, one wording), so a ticket attachment, a KB image, a tenant logo and a
+// branding asset stop disagreeing on how "too big" is reported.
+pub mod upload_limits;
 pub mod validation;
 
 // Re-exports
