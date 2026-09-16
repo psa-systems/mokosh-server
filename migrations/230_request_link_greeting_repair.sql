@@ -31,11 +31,12 @@
 -- Unlike migration 212/224, zero matching rows here is a legitimate outcome
 -- (every live tenant may already read migration 106's post-774 copy): there
 -- is no known "expected" count to assert against, so this is a plain
--- self-healing UPDATE rather than a guarded-content DO block.
+-- self-healing UPDATE rather than a guarded-content DO block. The SET
+-- replaces on the bare column so a NULL body_html stays NULL (the 212 bug).
 
 UPDATE notification_templates
-   SET body_text = replace(COALESCE(body_text, ''), E'{{display_name}},\n\n', E'{{salutation}},\n\n'),
-       body_html = replace(COALESCE(body_html, ''), '<p>{{display_name}},</p>', '<p>{{salutation}},</p>'),
+   SET body_text = replace(body_text, E'{{display_name}},\n\n', E'{{salutation}},\n\n'),
+       body_html = replace(body_html, '<p>{{display_name}},</p>', '<p>{{salutation}},</p>'),
        updated_at = NOW()
  WHERE event_type = 'forms.request_link'
    AND channel_type = 'email'
