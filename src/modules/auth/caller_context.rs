@@ -33,6 +33,7 @@ use crate::db::Database;
 use crate::modules::auth::{AuthState, TenantId};
 use crate::modules::contact_portal::middleware::ContactAuthState;
 use crate::modules::contact_portal::models::ContactSession;
+use crate::modules::portal_roles::capability_labels;
 use crate::utils::error::{AppError, AppResult};
 
 /// mokosh-contact-login prompt 008: the two planes a dual-plane handler
@@ -163,9 +164,7 @@ impl CallerContext {
         if caps.iter().any(|c| c == cap) {
             Ok(())
         } else {
-            Err(AppError::Forbidden(format!(
-                "Missing required capability: {cap}"
-            )))
+            Err(AppError::Forbidden(capability_refusal_message(cap)))
         }
     }
 
@@ -213,6 +212,54 @@ pub async fn load_contact_capabilities(
     .fetch_all(db.migrator_pool())
     .await?;
     Ok(rows.into_iter().map(|(c,)| c).collect())
+}
+
+/// PMS-1199: the ONE place a missing-capability 403 message is built,
+/// so every capability-gated portal route (dual-plane and
+/// contact-only alike) refuses in the same words the role editor uses
+/// to describe the capability, rather than each call site printing the
+/// raw `domain:action` key. `capability_labels::descriptors()` is the
+/// human-facing name for a capability; falling back to the bare key
+/// only covers a capability that has no descriptor yet, which
+/// `capability_labels`'s own test already refuses to let happen.
+pub(crate) fn capability_refusal_message(cap: &str) -> String {
+    let phrase = capability_labels::descriptors()
+        .into_iter()
+        .find(|d| d.key == cap)
+        .map(|d| lower_first(&d.label))
+        .unwrap_or_else(|| "this action".to_string());
+    format!("Missing required capability. You don't have permission to {phrase}.")
+}
+
+fn lower_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_lowercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PMS-1199: a capability refusal must read as prose, not surface the
+    /// raw `domain:action` key (which itself contains a `:`), so a caller
+    /// scripting on the message text cannot enumerate capability names.
+    #[test]
+    fn refusal_message_carries_no_colon_separated_identifier() {
+        for cap in crate::modules::contact_portal::capabilities::ALL_CAPABILITIES {
+            let message = capability_refusal_message(cap);
+            assert!(
+                !message.contains(':'),
+                "refusal message for `{cap}` still contains a `:`-separated identifier: {message:?}"
+            );
+            assert!(
+                !message.contains(cap),
+                "refusal message for `{cap}` leaks the raw capability key: {message:?}"
+            );
+        }
+    }
 }
 
 /// mokosh-contact-login prompt 008: extractor for a dual-plane handler.

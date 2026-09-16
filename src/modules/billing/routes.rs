@@ -1185,7 +1185,7 @@ fn pdf_response(bytes: Vec<u8>, filename: &str) -> Response {
             ),
             (
                 axum::http::header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}\""),
+                crate::utils::content_disposition::content_disposition(filename),
             ),
         ],
         bytes,

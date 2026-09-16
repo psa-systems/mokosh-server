@@ -813,12 +813,11 @@ impl ContactService {
         // explicit `null` clears that key so the resolver falls back
         // to the tenant default on the next fetch.
         if let Some(branding) = request.branding.as_ref() {
-            if !branding.is_object() {
-                return Err(AppError::validation_field(
-                    "branding",
-                    "must be an object of branding keys",
-                ));
-            }
+            // PMS-1197: the same table `TenantService::update_tenant`
+            // already calls, minus the two tenant-only keys. The object
+            // check is folded into this: an unrecognised shape is
+            // refused the same way an invalid value is.
+            crate::modules::tenants::branding::validate_company_branding_patch(branding)?;
         }
         if request.branding.is_some() {
             updates.push(format!("branding = branding || ${param_idx}::jsonb"));
