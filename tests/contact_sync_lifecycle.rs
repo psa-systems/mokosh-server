@@ -350,7 +350,10 @@ async fn a_deletion_in_the_source_is_surfaced_and_changes_no_field(pool: PgPool)
             None,
         )
         .await;
-    assert_eq!(connection["deleted_in_source"], 1, "{connection}");
+    assert_eq!(
+        connection["connection"]["deleted_in_source"], 1,
+        "{connection}"
+    );
     assert_eq!(
         f.column(contact, "first_name").await.as_deref(),
         Some("Gone")

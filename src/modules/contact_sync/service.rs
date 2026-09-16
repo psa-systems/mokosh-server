@@ -14,6 +14,7 @@ use uuid::Uuid;
 use super::google::GoogleContactsProvider;
 use super::oauth::{self, OauthClient, Pkce, TokenError};
 use super::provider::{ContactSyncProvider, SourceGroup};
+use super::runs::{RunStatus, RUN_COLUMNS};
 use super::sync::{external_id_digest, fields, ContactSyncEngine, SyncReport};
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
@@ -75,11 +76,20 @@ struct ConnectionRow {
     last_error: Option<String>,
     created_at: chrono::DateTime<Utc>,
     deleted_in_source: i64,
+    selected_groups: serde_json::Value,
+    sync_interval_minutes: i32,
+    consecutive_failures: i32,
+    open_reviews: i64,
 }
 
 impl From<ConnectionRow> for ConnectionStatus {
     fn from(row: ConnectionRow) -> Self {
         Self {
+            selected_groups: serde_json::from_value(row.selected_groups).unwrap_or_default(),
+            sync_interval_minutes: row.sync_interval_minutes,
+            consecutive_failures: row.consecutive_failures,
+            open_reviews: row.open_reviews,
+            latest_run: None,
             id: row.id,
             provider: row.provider,
             account_email: row.account_email,
@@ -91,6 +101,29 @@ impl From<ConnectionRow> for ConnectionStatus {
             deleted_in_source: row.deleted_in_source,
         }
     }
+}
+
+/// What a completed consent did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    Connected(Uuid),
+    /// The same account again, so the existing connection kept its id and
+    /// got the new grant.
+    Reconnected(Uuid),
+}
+
+/// The Settings card's whole read (PMS-1241).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContactSyncOverview {
+    /// `integrations/google_contacts_enabled`. Off hides the connect action
+    /// for everyone and stops every sync; the connection and every imported
+    /// contact are kept.
+    pub enabled: bool,
+    /// This deployment has a Google OAuth client. Without one nobody can
+    /// connect, and the card says so rather than offering a broken button.
+    pub configured: bool,
+    /// `null` when never connected, or disconnected.
+    pub connection: Option<ConnectionStatus>,
 }
 
 /// What one connection looks like to the Settings card.
@@ -108,6 +141,74 @@ pub struct ConnectionStatus {
     /// only flagged, so this is what tells an admin there is something to look
     /// at rather than something that quietly happened.
     pub deleted_in_source: i64,
+    /// The label ids an admin opted into. Empty means nothing is imported.
+    pub selected_groups: Vec<String>,
+    pub sync_interval_minutes: i32,
+    /// Failed runs in a row. What makes a broken connection visible without
+    /// reading logs; `contact_sync.failing` is sent at three (PMS-1215).
+    pub consecutive_failures: i32,
+    /// Incoming records waiting on a reviewer.
+    pub open_reviews: i64,
+    /// The most recent run, active or not.
+    pub latest_run: Option<RunStatus>,
+}
+
+/// One label, as the import picker offers it (PSA-70 E).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GroupOption {
+    pub id: String,
+    pub name: String,
+    /// Google's own count, which is what the preview shows before anything
+    /// is written. A contact in two selected labels is counted in both.
+    pub member_count: Option<u32>,
+    pub selected: bool,
+}
+
+/// One incoming record waiting on a reviewer, with every Mokosh contact it
+/// might be (PSA-70 D).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReviewItem {
+    pub external_id: String,
+    /// The record as the sync saw it, for the side-by-side.
+    pub source: serde_json::Value,
+    pub queued_at: chrono::DateTime<Utc>,
+    pub candidates: Vec<ReviewCandidate>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ReviewCandidate {
+    pub contact_id: Uuid,
+    pub match_reason: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub email: Option<String>,
+    pub company_name: Option<String>,
+    pub title: Option<String>,
+    pub phones: Vec<String>,
+    /// Already linked to a different record from this connection: the "two
+    /// Google contacts, one Mokosh contact" case the client warns about.
+    pub already_linked: bool,
+}
+
+/// A reviewer's answer.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum Resolution {
+    /// This record is that contact.
+    Link {
+        external_id: String,
+        contact_id: Uuid,
+    },
+    /// This record is nobody Mokosh holds.
+    Create { external_id: String },
+    /// Do not import this record.
+    Skip { external_id: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Resolved {
+    pub external_id: String,
+    pub contact_id: Option<Uuid>,
 }
 
 /// Where a contact came from and what is protected on it (PMS-1214).
@@ -199,6 +300,7 @@ impl ContactSyncService {
     /// URL Google will reject: an operator who has not set the client sees
     /// that, not a Google error page.
     pub async fn begin_connect(&self, tenant_id: TenantId, user_id: Uuid) -> AppResult<String> {
+        self.assert_enabled(tenant_id).await?;
         let client = OauthClient::from_config().ok_or_else(|| {
             AppError::Configuration(
                 "Google Contacts is not configured on this deployment.".to_string(),
@@ -326,6 +428,88 @@ impl ContactSyncService {
         };
         let account_email = oauth::account_email(&self.http, &tokens.access_token).await?;
 
+        let outcome = self
+            .record_connection(tenant_id, started_by, &account_email, &refresh_token)
+            .await?;
+        let flag = match outcome {
+            ConnectOutcome::Connected(_) => "connected",
+            ConnectOutcome::Reconnected(_) => "reconnected",
+        };
+        Ok(format!(
+            "{}/settings/integrations/google-contacts?contact_sync={flag}",
+            self.spa_base_url.trim_end_matches('/')
+        ))
+    }
+
+    /// The half of a connect that follows Google's answer: store the grant
+    /// and the connection row (PMS-1212), or, when the tenant already has a
+    /// live connection to the SAME account, replace its grant (PMS-1241).
+    ///
+    /// Reconnecting is the only way out of `reconnect_required` (PSA-70 J), and
+    /// it must keep the connection: its links, runs, selection and review
+    /// queue all hang off the connection id, and a disconnect-then-connect
+    /// would turn every imported contact into a local record first. A
+    /// DIFFERENT account is refused instead: every link names the account it
+    /// came from, so swapping the account under a live connection would
+    /// attribute one address book's contacts to another.
+    ///
+    /// Public so the suite can drive it without Google's token endpoint; the
+    /// only production caller is [`Self::complete_connect`], after the state
+    /// was verified and consumed.
+    pub async fn record_connection(
+        &self,
+        tenant_id: TenantId,
+        started_by: Uuid,
+        account_email: &str,
+        refresh_token: &str,
+    ) -> AppResult<ConnectOutcome> {
+        let tenant_uuid = tenant_id.get();
+        let ctx = AuditCtx::system(tenant_uuid);
+        if let Some(existing) = self.connection(tenant_id).await? {
+            if !existing.account_email.eq_ignore_ascii_case(account_email) {
+                return Err(AppError::Conflict(format!(
+                    "This organization is connected to {}. Disconnect it before connecting a different Google account.",
+                    existing.account_email
+                )));
+            }
+            self.secrets
+                .put(
+                    &SecretKey::contact_sync(tenant_uuid, &existing.provider, existing.id),
+                    refresh_token,
+                )
+                .await?;
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query(
+                "UPDATE contact_sync_connections SET \
+                     sync_status = CASE WHEN last_sync_at IS NULL THEN 'never' ELSE 'success' END, \
+                     last_error = NULL, consecutive_failures = 0, failure_notified_at = NULL, \
+                     is_active = TRUE, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(existing.id)
+            .execute(&mut *tx)
+            .await?;
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                &ctx,
+                AuditAction::Update,
+                "contact_sync_connections",
+                Some(existing.id),
+                Some(serde_json::json!({ "sync_status": existing.sync_status })),
+                Some(serde_json::json!({
+                    "event": "contact_sync.reconnected",
+                    "provider": existing.provider,
+                    "account_email": existing.account_email,
+                    "reconnected_by_user_id": started_by,
+                })),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(ConnectOutcome::Reconnected(existing.id));
+        }
+
         // The id is minted here so the secret can be stored BEFORE the row
         // exists (PMS-968's ordering): an orphaned secret is harmless, while a
         // row claiming a credential the store never received is an integration
@@ -334,11 +518,10 @@ impl ContactSyncService {
         self.secrets
             .put(
                 &SecretKey::contact_sync(tenant_uuid, GOOGLE, connection_id),
-                &refresh_token,
+                refresh_token,
             )
             .await?;
 
-        let ctx = AuditCtx::system(tenant_uuid);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "INSERT INTO contact_sync_connections \
@@ -349,12 +532,13 @@ impl ContactSyncService {
         .bind(tenant_id)
         .bind(GOOGLE)
         .bind(started_by)
-        .bind(&account_email)
+        .bind(account_email)
         .execute(&mut *tx)
         .await
         .map_err(
             |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                // The live-connection index (migration 220) is the org-level rule.
+                // The live-connection index (migration 220) is the org-level
+                // rule; reaching it here means a connect raced this one.
                 Some("23505") => AppError::Conflict(
                     "This tenant already has a Google Contacts connection. Disconnect it first."
                         .to_string(),
@@ -379,11 +563,7 @@ impl ContactSyncService {
         )
         .await?;
         tx.commit().await?;
-
-        Ok(format!(
-            "{}/settings?contact_sync=connected",
-            self.spa_base_url.trim_end_matches('/')
-        ))
+        Ok(ConnectOutcome::Connected(connection_id))
     }
 
     /// Where to send a browser whose callback failed. The reason is a shape,
@@ -391,9 +571,35 @@ impl ContactSyncService {
     /// history.
     pub fn failure_redirect(&self) -> String {
         format!(
-            "{}/settings?contact_sync=failed",
+            "{}/settings/integrations/google-contacts?contact_sync=failed",
             self.spa_base_url.trim_end_matches('/')
         )
+    }
+
+    /// Everything the Settings card needs before it can decide what to draw
+    /// (PMS-1241): whether the tenant allows the integration, whether this
+    /// deployment can connect at all, and the connection if there is one.
+    pub async fn overview(&self, tenant_id: TenantId) -> AppResult<ContactSyncOverview> {
+        Ok(ContactSyncOverview {
+            enabled: crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id)
+                .await?,
+            configured: OauthClient::from_config().is_some(),
+            connection: self.connection(tenant_id).await?,
+        })
+    }
+
+    /// Refuse while `integrations/google_contacts_enabled` is off (PSA-70 K).
+    /// A 409 naming the setting, because the request is fine and the tenant's
+    /// state is what stands in the way.
+    pub async fn assert_enabled(&self, tenant_id: TenantId) -> AppResult<()> {
+        if crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await? {
+            Ok(())
+        } else {
+            Err(AppError::Conflict(
+                "Google Contacts is turned off for this organization. An administrator can turn it back on in Settings, Integrations."
+                    .to_string(),
+            ))
+        }
     }
 
     /// The tenant's live connection, if any.
@@ -401,17 +607,33 @@ impl ContactSyncService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<ConnectionRow> = sqlx::query_as(
             "SELECT c.id, c.provider, c.account_email, c.is_active, c.sync_status, c.last_sync_at, \
-                    c.last_error, c.created_at, \
+                    c.last_error, c.created_at, c.selected_groups, c.sync_interval_minutes, \
+                    c.consecutive_failures, \
                     (SELECT count(*) FROM contact_sync_links l \
                      WHERE l.connection_id = c.id AND l.unlinked_at IS NULL \
-                       AND l.deleted_in_source_at IS NOT NULL) AS deleted_in_source \
+                       AND l.deleted_in_source_at IS NOT NULL) AS deleted_in_source, \
+                    (SELECT count(DISTINCT k.external_id) FROM contact_sync_candidates k \
+                     WHERE k.connection_id = c.id AND k.status = 'open') AS open_reviews \
              FROM contact_sync_connections c \
              WHERE c.tenant_id = $1 AND c.disconnected_at IS NULL",
         )
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
-        Ok(row.map(ConnectionStatus::from))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let connection_id = row.id;
+        let mut status = ConnectionStatus::from(row);
+        status.latest_run = sqlx::query_as(&format!(
+            "SELECT {RUN_COLUMNS} FROM contact_sync_runs \
+             WHERE tenant_id = $1 AND connection_id = $2 ORDER BY created_at DESC LIMIT 1"
+        ))
+        .bind(tenant_id)
+        .bind(connection_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(Some(status))
     }
 
     /// Disconnect, keeping every imported contact.
@@ -432,6 +654,19 @@ impl ContactSyncService {
             "UPDATE contact_sync_connections \
              SET disconnected_at = NOW(), is_active = FALSE, sync_token = NULL, updated_at = NOW() \
              WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(connection.id)
+        .execute(&mut *tx)
+        .await?;
+        // An import in flight stops: a queued run is cancelled outright, and a
+        // running one at its next checkpoint (PMS-1215).
+        sqlx::query(
+            "UPDATE contact_sync_runs SET \
+                 status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END, \
+                 finished_at = CASE WHEN status = 'queued' THEN NOW() ELSE finished_at END, \
+                 cancel_requested_at = NOW() \
+             WHERE tenant_id = $1 AND connection_id = $2 AND status IN ('queued', 'running')",
         )
         .bind(tenant_id)
         .bind(connection.id)
@@ -497,10 +732,13 @@ impl ContactSyncService {
     }
 
     /// A provider for the live connection, holding a freshly refreshed token.
+    /// Refused while the integration is turned off: a read of the tenant's
+    /// Google account is exactly what the switch exists to stop.
     async fn source(
         &self,
         tenant_id: TenantId,
     ) -> AppResult<(ConnectionStatus, GoogleContactsProvider)> {
+        self.assert_enabled(tenant_id).await?;
         let connection = self.live_connection(tenant_id).await?;
         let token = self
             .access_token(tenant_id, connection.id, &connection.provider)
@@ -524,6 +762,362 @@ impl ContactSyncService {
         ContactSyncEngine::new(self.db.clone())
             .run(tenant_id, connection.id, &source)
             .await
+    }
+
+    /// The labels to choose from, marked with the current selection.
+    pub async fn groups(&self, tenant_id: TenantId) -> AppResult<Vec<GroupOption>> {
+        let connection = self.live_connection(tenant_id).await?;
+        let groups = self.source_groups(tenant_id).await?;
+        Ok(groups
+            .into_iter()
+            .map(|g| GroupOption {
+                selected: connection.selected_groups.contains(&g.id),
+                id: g.id,
+                name: g.name,
+                member_count: g.member_count,
+            })
+            .collect())
+    }
+
+    /// Replace the label selection. An empty list stops imports without
+    /// disconnecting. The ids are checked for shape, not against Google: an
+    /// id that names no label selects nobody, which is what it means.
+    pub async fn set_selection(
+        &self,
+        tenant_id: TenantId,
+        group_ids: &[String],
+        ctx: &AuditCtx,
+    ) -> AppResult<ConnectionStatus> {
+        const MAX_GROUPS: usize = 200;
+        let mut ids: Vec<String> = group_ids.iter().map(|g| g.trim().to_string()).collect();
+        ids.sort();
+        ids.dedup();
+        if ids.len() > MAX_GROUPS
+            || ids
+                .iter()
+                .any(|g| !g.starts_with("contactGroups/") || g.len() > 255)
+        {
+            return Err(AppError::validation_field(
+                "group_ids",
+                "must be Google label ids such as contactGroups/myContacts, at most 200",
+            ));
+        }
+        let connection = self.live_connection(tenant_id).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE contact_sync_connections SET selected_groups = $3, updated_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(connection.id)
+        .bind(serde_json::json!(ids))
+        .execute(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contact_sync_connections",
+            Some(connection.id),
+            Some(serde_json::json!({ "selected_groups": connection.selected_groups })),
+            Some(serde_json::json!({
+                "event": "contact_sync.selection_changed",
+                "selected_groups": ids,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        self.live_connection(tenant_id).await
+    }
+
+    /// Queue an import now. The first one after connecting is `initial`.
+    pub async fn queue_run(&self, tenant_id: TenantId, ctx: &AuditCtx) -> AppResult<RunStatus> {
+        self.assert_enabled(tenant_id).await?;
+        let connection = self.live_connection(tenant_id).await?;
+        if connection.selected_groups.is_empty() {
+            return Err(AppError::Conflict(
+                "Choose at least one Google label to import before syncing.".to_string(),
+            ));
+        }
+        if connection.sync_status == "reconnect_required" {
+            return Err(AppError::Conflict(
+                "Google has revoked this connection. Connect the account again before importing."
+                    .to_string(),
+            ));
+        }
+        let trigger = if connection.last_sync_at.is_none() {
+            "initial"
+        } else {
+            "manual"
+        };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let run: RunStatus = sqlx::query_as(&format!(
+            "INSERT INTO contact_sync_runs (tenant_id, connection_id, trigger, requested_by_user_id) \
+             VALUES ($1, $2, $3, $4) RETURNING {RUN_COLUMNS}"
+        ))
+        .bind(tenant_id)
+        .bind(connection.id)
+        .bind(trigger)
+        .bind(ctx.user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+            Some("23505") => AppError::Conflict(
+                "An import is already queued or running for this connection.".to_string(),
+            ),
+            _ => e.into(),
+        })?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "contact_sync_runs",
+            Some(run.id),
+            None,
+            Some(serde_json::json!({
+                "event": "contact_sync.run_queued",
+                "trigger": trigger,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(run)
+    }
+
+    /// Recent runs, newest first.
+    pub async fn runs(&self, tenant_id: TenantId, limit: i64) -> AppResult<Vec<RunStatus>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Ok(sqlx::query_as(&format!(
+            "SELECT {RUN_COLUMNS} FROM contact_sync_runs \
+             WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2"
+        ))
+        .bind(tenant_id)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&mut *tx)
+        .await?)
+    }
+
+    pub async fn run(&self, tenant_id: TenantId, run_id: Uuid) -> AppResult<RunStatus> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query_as(&format!(
+            "SELECT {RUN_COLUMNS} FROM contact_sync_runs WHERE tenant_id = $1 AND id = $2"
+        ))
+        .bind(tenant_id)
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Import run".to_string()))
+    }
+
+    /// Stop an import. A queued run is cancelled at once; a running one stops
+    /// at its next checkpoint with what landed kept and the cursor unmoved.
+    pub async fn cancel_run(
+        &self,
+        tenant_id: TenantId,
+        run_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<RunStatus> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let status: Option<String> = sqlx::query_scalar(
+            "UPDATE contact_sync_runs SET \
+                 status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END, \
+                 finished_at = CASE WHEN status = 'queued' THEN NOW() ELSE finished_at END, \
+                 cancel_requested_at = COALESCE(cancel_requested_at, NOW()) \
+             WHERE tenant_id = $1 AND id = $2 AND status IN ('queued', 'running') \
+             RETURNING status",
+        )
+        .bind(tenant_id)
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(status) = status else {
+            // Unknown, or already finished: say which.
+            drop(tx);
+            let run = self.run(tenant_id, run_id).await?;
+            return Err(AppError::Conflict(format!(
+                "This import has already finished ({}).",
+                run.status
+            )));
+        };
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contact_sync_runs",
+            Some(run_id),
+            None,
+            Some(serde_json::json!({
+                "event": "contact_sync.run_cancelled",
+                "status": status,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        self.run(tenant_id, run_id).await
+    }
+
+    /// Everything waiting on a reviewer, oldest first.
+    pub async fn review_queue(&self, tenant_id: TenantId) -> AppResult<Vec<ReviewItem>> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            external_id: String,
+            source_snapshot: serde_json::Value,
+            created_at: chrono::DateTime<Utc>,
+            #[sqlx(flatten)]
+            candidate: ReviewCandidate,
+        }
+        let connection = self.live_connection(tenant_id).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT k.external_id, k.source_snapshot, k.created_at, \
+                    k.candidate_contact_id AS contact_id, k.match_reason, \
+                    c.first_name, c.last_name, c.email, c.title, \
+                    COALESCE(co.name, c.company_name) AS company_name, \
+                    ARRAY(SELECT p.number FROM contact_phones p WHERE p.contact_id = c.id \
+                          ORDER BY p.sort_order) AS phones, \
+                    EXISTS (SELECT 1 FROM contact_sync_links l \
+                            WHERE l.contact_id = c.id AND l.connection_id = k.connection_id \
+                              AND l.unlinked_at IS NULL AND l.external_id <> k.external_id) \
+                        AS already_linked \
+             FROM contact_sync_candidates k \
+             JOIN contacts c ON c.id = k.candidate_contact_id \
+             LEFT JOIN companies co ON co.id = c.company_id \
+             WHERE k.tenant_id = $1 AND k.connection_id = $2 AND k.status = 'open' \
+             ORDER BY k.created_at, k.external_id, k.candidate_contact_id",
+        )
+        .bind(tenant_id)
+        .bind(connection.id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut items: Vec<ReviewItem> = Vec::new();
+        for row in rows {
+            match items.iter_mut().find(|i| i.external_id == row.external_id) {
+                Some(item) => item.candidates.push(row.candidate),
+                None => items.push(ReviewItem {
+                    external_id: row.external_id,
+                    source: row.source_snapshot,
+                    queued_at: row.created_at,
+                    candidates: vec![row.candidate],
+                }),
+            }
+        }
+        Ok(items)
+    }
+
+    /// Answer one queued record. Every open question about it closes in the
+    /// same transaction, so the next sync sees a human answered and does not
+    /// ask again.
+    pub async fn resolve(
+        &self,
+        tenant_id: TenantId,
+        resolution: &Resolution,
+        ctx: &AuditCtx,
+    ) -> AppResult<Resolved> {
+        self.assert_enabled(tenant_id).await?;
+        let external_id = match resolution {
+            Resolution::Link { external_id, .. }
+            | Resolution::Create { external_id }
+            | Resolution::Skip { external_id } => external_id.clone(),
+        };
+        let connection = self.live_connection(tenant_id).await?;
+        let engine = ContactSyncEngine::new(self.db.clone());
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let open: Vec<(Uuid, Option<String>, serde_json::Value)> = sqlx::query_as(
+            "SELECT candidate_contact_id, etag, source_snapshot FROM contact_sync_candidates \
+             WHERE tenant_id = $1 AND connection_id = $2 AND external_id = $3 AND status = 'open' \
+             FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(connection.id)
+        .bind(&external_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let Some((_, etag, snapshot)) = open.first().cloned() else {
+            return Err(AppError::NotFound("Review item".to_string()));
+        };
+
+        let (chosen, contact_id) = match resolution {
+            Resolution::Link { contact_id, .. } => {
+                if !open.iter().any(|(c, _, _)| c == contact_id) {
+                    return Err(AppError::validation_field(
+                        "contact_id",
+                        "must be one of the contacts this record was matched to",
+                    ));
+                }
+                engine
+                    .link_reviewed(
+                        &mut tx,
+                        tenant_id,
+                        connection.id,
+                        &external_id,
+                        etag.as_deref(),
+                        &snapshot,
+                        *contact_id,
+                        ctx,
+                    )
+                    .await
+                    .map_err(already_linked)?;
+                ("linked", Some(*contact_id))
+            }
+            Resolution::Create { .. } => {
+                let created = engine
+                    .create_reviewed(
+                        &mut tx,
+                        tenant_id,
+                        connection.id,
+                        &external_id,
+                        etag.as_deref(),
+                        &snapshot,
+                        ctx,
+                    )
+                    .await
+                    .map_err(already_linked)?;
+                ("created", Some(created))
+            }
+            Resolution::Skip { .. } => ("skipped", None),
+        };
+
+        // The chosen pair records the decision; the pairs not chosen were
+        // answered by it too, and read as skipped.
+        sqlx::query(
+            "UPDATE contact_sync_candidates SET \
+                 status = CASE WHEN $4 = 'linked' AND candidate_contact_id = $5 THEN 'linked' \
+                               WHEN $4 = 'created' THEN 'created' ELSE 'skipped' END, \
+                 resolved_by_user_id = $6, resolved_at = NOW() \
+             WHERE tenant_id = $1 AND connection_id = $2 AND external_id = $3 AND status = 'open'",
+        )
+        .bind(tenant_id)
+        .bind(connection.id)
+        .bind(&external_id)
+        .bind(chosen)
+        .bind(contact_id)
+        .bind(ctx.user_id)
+        .execute(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contact_sync_candidates",
+            contact_id,
+            None,
+            Some(serde_json::json!({
+                "event": "contact_sync.review_resolved",
+                "external_id": external_id,
+                "decision": chosen,
+                "contact_id": contact_id,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Resolved {
+            external_id,
+            contact_id,
+        })
     }
 
     /// Refuse a contact id that is not this tenant's, so every per-contact
@@ -872,5 +1466,18 @@ impl ContactSyncService {
                 "could not record the revoked grant: {e}"
             );
         }
+    }
+}
+
+/// The live-link index refusing a second link for one record: a sync got
+/// there between the reviewer loading the queue and answering it. The unique
+/// violation arrives as the generic 409, which would tell the reviewer nothing.
+fn already_linked(e: AppError) -> AppError {
+    match e {
+        AppError::Conflict(_) => AppError::Conflict(
+            "This record was linked by a sync while it was waiting for review. Reload the queue."
+                .to_string(),
+        ),
+        other => other,
     }
 }

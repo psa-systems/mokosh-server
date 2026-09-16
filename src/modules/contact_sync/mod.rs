@@ -10,8 +10,9 @@
 //!   (PMS-1212).
 //! * `normalize`, `matching`, `mapping`: what a source record means to the
 //!   CRM, all pure (PMS-1213).
-//! * `sync`: one pass of one connection (PMS-1213). Scheduling and run
-//!   tracking are PMS-1215.
+//! * `sync`: one pass of one connection (PMS-1213).
+//! * `runs`: the queue of import runs and the scheduled worker that drains it
+//!   (PMS-1215).
 //! * `locks`: an edit in Mokosh locks the field against the source; the
 //!   service's provenance, unlink and data-removal methods are the rest of what
 //!   decides whether a person trusts the integration (PMS-1214).
@@ -24,6 +25,7 @@ pub mod normalize;
 pub mod oauth;
 pub mod provider;
 pub mod routes;
+pub mod runs;
 pub mod service;
 pub mod sync;
 
