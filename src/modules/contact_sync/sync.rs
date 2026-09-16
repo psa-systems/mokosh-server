@@ -41,6 +41,13 @@
 //! never asked again. `tests/contact_sync_engine.rs` runs the same sync twice
 //! and compares.
 //!
+//! # A person's "stop" wins (PMS-1214)
+//!
+//! A record a person unlinked from a contact is skipped rather than re-linked
+//! by its email, and a record whose imported data was removed on request is
+//! recognised by [`external_id_digest`] and never imported again, across a
+//! disconnect and reconnect of the same account.
+//!
 //! # Failure
 //!
 //! Each record is its own transaction, so one bad record does not undo the
@@ -56,6 +63,7 @@ use mokosh_types::contacts::{
     ContactPhoneInput, ContactType, CreateContactRequest, PhoneType, PreferredContactMethod,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::mapping::{map_contact, MappedContact};
@@ -109,6 +117,9 @@ pub struct SyncReport {
     pub already_reviewed: u32,
     /// Records carrying none of the selected labels.
     pub not_selected: u32,
+    /// Records a person unlinked, or whose imported data was removed on
+    /// request (PMS-1214). Never re-linked, never re-imported.
+    pub excluded: u32,
     /// Links newly flagged as deleted in the source.
     pub deleted_in_source: u32,
     pub failed: u32,
@@ -179,6 +190,10 @@ struct Snapshot {
     links: HashMap<String, LinkRow>,
     /// `(external_id, contact_id)` pairs a human already resolved.
     answered: HashSet<(String, Uuid)>,
+    /// External ids a person unlinked from this connection.
+    unlinked: HashSet<String>,
+    /// [`external_id_digest`]s of records whose data was removed on request.
+    suppressed: HashSet<String>,
     /// Company name key to the ids carrying it.
     companies: HashMap<String, Vec<Uuid>>,
 }
@@ -187,6 +202,29 @@ struct Snapshot {
 pub struct ContactSyncEngine {
     db: Database,
     contacts: ContactService,
+}
+
+/// Whether the import made the contact or found it (migration 228). Removal of
+/// imported data (PSA-70 K) deletes only the first kind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkOrigin {
+    Created,
+    Linked,
+}
+
+impl LinkOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Linked => "linked",
+        }
+    }
+}
+
+/// How a removed record is recognised without being named
+/// (`contact_sync_suppressions.external_id_sha256`, migration 228).
+pub fn external_id_digest(external_id: &str) -> String {
+    format!("{:x}", Sha256::digest(external_id.as_bytes()))
 }
 
 /// Whether a first link or a later sync is being applied.
@@ -205,6 +243,7 @@ enum Outcome {
     AwaitingReview,
     AlreadyReviewed,
     NotSelected,
+    Excluded,
     DeletedInSource,
 }
 
@@ -280,7 +319,9 @@ impl ContactSyncEngine {
             full_read: connection.sync_token.is_none() || changes.was_full_resync,
             ..SyncReport::default()
         };
-        let mut snapshot = self.snapshot(tenant_id, connection_id).await?;
+        let mut snapshot = self
+            .snapshot(tenant_id, connection_id, &connection.provider)
+            .await?;
         let ctx = AuditCtx::system(tenant_id.get());
         let mut seen: HashSet<&str> = HashSet::new();
 
@@ -313,6 +354,7 @@ impl ContactSyncEngine {
                 Ok(Outcome::AwaitingReview) => report.awaiting_review += 1,
                 Ok(Outcome::AlreadyReviewed) => report.already_reviewed += 1,
                 Ok(Outcome::NotSelected) => report.not_selected += 1,
+                Ok(Outcome::Excluded) => report.excluded += 1,
                 Ok(Outcome::DeletedInSource) => report.deleted_in_source += 1,
                 Err(e) => {
                     report.failed += 1;
@@ -424,7 +466,12 @@ impl ContactSyncEngine {
         Ok(())
     }
 
-    async fn snapshot(&self, tenant_id: TenantId, connection_id: Uuid) -> AppResult<Snapshot> {
+    async fn snapshot(
+        &self,
+        tenant_id: TenantId,
+        connection_id: Uuid,
+        provider: &str,
+    ) -> AppResult<Snapshot> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let locals: Vec<LocalRow> = sqlx::query_as(
             "SELECT c.id, c.email, c.first_name, c.last_name, c.company_name, \
@@ -457,6 +504,22 @@ impl ContactSyncEngine {
         )
         .bind(tenant_id)
         .bind(connection_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let unlinked: Vec<String> = sqlx::query_scalar(
+            "SELECT external_id FROM contact_sync_links \
+             WHERE tenant_id = $1 AND connection_id = $2 AND unlink_reason = 'unlinked'",
+        )
+        .bind(tenant_id)
+        .bind(connection_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let suppressed: Vec<String> = sqlx::query_scalar(
+            "SELECT external_id_sha256 FROM contact_sync_suppressions \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider)
         .fetch_all(&mut *tx)
         .await?;
         let companies: Vec<(Uuid, String)> =
@@ -494,6 +557,8 @@ impl ContactSyncEngine {
                 .map(|l| (l.external_id.clone(), l))
                 .collect(),
             answered: answered.into_iter().collect(),
+            unlinked: unlinked.into_iter().collect(),
+            suppressed: suppressed.into_iter().collect(),
             companies: by_name,
         })
     }
@@ -510,6 +575,17 @@ impl ContactSyncEngine {
         snapshot: &Snapshot,
         ctx: &AuditCtx,
     ) -> AppResult<Outcome> {
+        // A person said stop (PMS-1214): an unlinked record is not re-linked by
+        // its email a minute later, and a removed one is not imported back.
+        // Checked before anything else, deletion included, because there is
+        // nothing left of either for a deletion to flag.
+        if snapshot.unlinked.contains(&record.external_id)
+            || snapshot
+                .suppressed
+                .contains(&external_id_digest(&record.external_id))
+        {
+            return Ok(Outcome::Excluded);
+        }
         let link = snapshot.links.get(&record.external_id);
 
         // A deletion is honoured whatever the selection: the link exists
@@ -605,6 +681,7 @@ impl ContactSyncEngine {
                         connection,
                         record,
                         contact_id,
+                        LinkOrigin::Linked,
                         None,
                         ctx,
                     )
@@ -684,6 +761,7 @@ impl ContactSyncEngine {
                         connection,
                         record,
                         contact_id,
+                        LinkOrigin::Created,
                         suggestion,
                         ctx,
                     )
@@ -703,14 +781,15 @@ impl ContactSyncEngine {
         connection: &ConnectionRow,
         record: &SourceContact,
         contact_id: Uuid,
+        origin: LinkOrigin,
         suggested_company_id: Option<Uuid>,
         ctx: &AuditCtx,
     ) -> AppResult<LinkRow> {
         let link: LinkRow = sqlx::query_as(
             "INSERT INTO contact_sync_links \
              (tenant_id, connection_id, provider, source_account_email, external_id, etag, \
-              contact_id, last_synced_at, suggested_company_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8) \
+              contact_id, last_synced_at, suggested_company_id, origin) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9) \
              RETURNING id, external_id, contact_id, etag, deleted_in_source_at",
         )
         .bind(tenant_id)
@@ -721,6 +800,7 @@ impl ContactSyncEngine {
         .bind(&record.etag)
         .bind(contact_id)
         .bind(suggested_company_id)
+        .bind(origin.as_str())
         .fetch_one(&mut *conn)
         .await?;
         audit_write(
@@ -736,6 +816,7 @@ impl ContactSyncEngine {
                 "provider": connection.provider,
                 "external_id": record.external_id,
                 "contact_id": contact_id,
+                "origin": origin.as_str(),
                 "suggested_company_id": suggested_company_id,
             })),
         )
