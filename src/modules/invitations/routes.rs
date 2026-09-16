@@ -38,6 +38,7 @@ async fn list_invitations(
     _a: RequireAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<InvitationResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_pending(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,

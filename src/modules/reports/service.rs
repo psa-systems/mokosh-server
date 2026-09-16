@@ -178,10 +178,17 @@ impl ReportsService {
         .bind(to)
         .fetch_one(&mut *tx)
         .await?;
-        let by_assignee: Vec<(Option<Uuid>, i64)> = sqlx::query_as(
-            r#"SELECT assigned_to_id, COUNT(*)::bigint FROM tickets
-               WHERE tenant_id = $1 AND created_at::date BETWEEN $2 AND $3
-               GROUP BY assigned_to_id"#,
+        // The name travels with the id here rather than being resolved later
+        // from a bare id list, so the PDF export can print "who" and not just
+        // "which row" without a second query (PMS-1196).
+        let by_assignee: Vec<(Option<Uuid>, Option<String>, i64)> = sqlx::query_as(
+            r#"SELECT t.assigned_to_id,
+                      COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.email),
+                      COUNT(*)::bigint
+               FROM tickets t
+               LEFT JOIN users u ON u.id = t.assigned_to_id
+               WHERE t.tenant_id = $1 AND t.created_at::date BETWEEN $2 AND $3
+               GROUP BY t.assigned_to_id, u.first_name, u.last_name, u.email"#,
         )
         .bind(tenant_id)
         .bind(from)
@@ -201,8 +208,9 @@ impl ReportsService {
             closed_total: closed,
             opened_by_assignee: by_assignee
                 .into_iter()
-                .map(|(uid, c)| AssigneeCount {
+                .map(|(uid, name, c)| AssigneeCount {
                     assignee_id: uid,
+                    assignee_name: name,
                     count: c,
                 })
                 .collect(),
@@ -225,10 +233,17 @@ impl ReportsService {
             to.unwrap_or(today),
         );
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let by_user: Vec<(Uuid, i64)> = sqlx::query_as(
-            r#"SELECT user_id, SUM(duration_minutes)::bigint FROM time_entries
-               WHERE tenant_id = $1 AND date BETWEEN $2 AND $3
-               GROUP BY user_id"#,
+        // Joined to `users` for the same reason as the ticket assignee query
+        // above: the PDF export names the user rather than printing their id
+        // (PMS-1196).
+        let by_user: Vec<(Uuid, Option<String>, i64)> = sqlx::query_as(
+            r#"SELECT te.user_id,
+                      COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.email),
+                      SUM(te.duration_minutes)::bigint
+               FROM time_entries te
+               LEFT JOIN users u ON u.id = te.user_id
+               WHERE te.tenant_id = $1 AND te.date BETWEEN $2 AND $3
+               GROUP BY te.user_id, u.first_name, u.last_name, u.email"#,
         )
         .bind(tenant_id)
         .bind(from)
@@ -250,7 +265,11 @@ impl ReportsService {
             to,
             minutes_by_user: by_user
                 .into_iter()
-                .map(|(id, m)| IdCount { id, count: m })
+                .map(|(id, name, m)| UserCount {
+                    id,
+                    name: name.unwrap_or_else(|| "Unknown user".into()),
+                    count: m,
+                })
                 .collect(),
             minutes_by_work_type: by_work_type
                 .into_iter()
@@ -533,12 +552,26 @@ pub struct DatedCount {
 #[derive(Debug, Clone, Serialize)]
 pub struct AssigneeCount {
     pub assignee_id: Option<Uuid>,
+    /// The assignee's display name, resolved alongside `assignee_id` (PMS-1196).
+    /// `None` when `assignee_id` is `None`.
+    pub assignee_name: Option<String>,
     pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IdCount {
     pub id: Uuid,
+    pub count: i64,
+}
+
+/// Like [`IdCount`], plus the display name resolved alongside `id` (PMS-1196):
+/// `minutes_by_user` names a user, so it carries a name the way
+/// `AssigneeCount` does, while `minutes_by_work_type` stays a bare
+/// [`IdCount`], since a work type has no comparable display-name lookup here.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserCount {
+    pub id: Uuid,
+    pub name: String,
     pub count: i64,
 }
 
@@ -569,7 +602,7 @@ pub struct TicketsReportResponse {
 pub struct TimeReportResponse {
     pub from: NaiveDate,
     pub to: NaiveDate,
-    pub minutes_by_user: Vec<IdCount>,
+    pub minutes_by_user: Vec<UserCount>,
     pub minutes_by_work_type: Vec<IdCount>,
 }
 

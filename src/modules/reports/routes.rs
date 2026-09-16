@@ -421,9 +421,10 @@ impl ExportFormat {
         } else if raw.eq_ignore_ascii_case("pdf") {
             Ok(Self::Pdf)
         } else {
-            Err(AppError::BadRequest(format!(
-                "Format {raw:?} is not supported; 'csv' and 'pdf' are"
-            )))
+            Err(AppError::query_error(
+                "format",
+                format!("must be 'csv' or 'pdf', not {raw}"),
+            ))
         }
     }
 }
@@ -449,7 +450,12 @@ fn emit<T>(
         )
             .into_response()),
         ExportFormat::Pdf => {
-            let bytes = pdf::render(&to_pdf(data, descriptor.name))?;
+            // PMS-1206: a report stores nothing and is generated the moment
+            // this request is answered, so that moment is its own date.
+            let bytes = pdf::render(
+                &to_pdf(data, descriptor.name),
+                chrono::Utc::now().date_naive(),
+            )?;
             Ok((
                 [
                     (
@@ -463,7 +469,10 @@ fn emit<T>(
                     // it in place under a URL ending in `/export`.
                     (
                         axum::http::header::CONTENT_DISPOSITION,
-                        format!("attachment; filename=\"{}.pdf\"", descriptor.key),
+                        crate::utils::content_disposition::content_disposition(&format!(
+                            "{}.pdf",
+                            descriptor.key
+                        )),
                     ),
                 ],
                 bytes,
@@ -658,9 +667,9 @@ fn pdf_for_tickets(r: &TicketsReportResponse, title: &str) -> pdf::Document {
                 .iter()
                 .map(|a| {
                     vec![
-                        a.assignee_id
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|| "unassigned".into()),
+                        a.assignee_name
+                            .clone()
+                            .unwrap_or_else(|| "Unassigned".into()),
                         a.count.to_string(),
                     ]
                 })
@@ -679,7 +688,10 @@ fn pdf_for_time(r: &TimeReportResponse, title: &str) -> pdf::Document {
         .table(
             "Minutes by user",
             vec!["User".into(), "Minutes".into()],
-            by_id(&r.minutes_by_user),
+            r.minutes_by_user
+                .iter()
+                .map(|u| vec![u.name.clone(), u.count.to_string()])
+                .collect(),
         )
         .table(
             "Minutes by work type",

@@ -34,6 +34,11 @@ use super::logo::check_mime;
 /// every email the tenant sends, or a pointer at something the public API base
 /// was never meant to reach.
 pub const PUBLIC_TENANT_PATH_PREFIX: &str = "/api/v1/public/tenants/";
+/// PMS-1197: the Company-scoped twin, served by
+/// `crate::modules::branding::routes::serve_company_asset`. The same
+/// image keys (`logo_url`, `favicon_url`, `background_url`) are legal
+/// on a Company row too, pointing at this prefix instead.
+pub const PUBLIC_COMPANY_PATH_PREFIX: &str = "/api/v1/public/companies/";
 
 /// Caps, in characters, for the free-text keys. Chosen from where each value is
 /// rendered rather than from the column: the contact sentence and the form
@@ -60,6 +65,25 @@ const MAX_URL: usize = 255;
 /// so a key outside it is silently invisible to every reader while still
 /// sitting in the JSONB the next writer merges into.
 pub fn validate_branding_patch(patch: &Value) -> AppResult<()> {
+    validate_branding_patch_with_keys(patch, KNOWN_KEYS)
+}
+
+/// Validate a whole `branding` PATCH document destined for a Company row
+/// (PMS-1197): the same table as [`validate_branding_patch`], minus
+/// [`TENANT_ONLY_KEYS`]. `companies.branding` is merged into the tenant's
+/// document field-by-field by `effective_branding`, so any key it does not
+/// name (`portal_domain`, `invoice_template`) is refused with the same
+/// unknown-key message a typo gets, naming only the keys legal on this row.
+pub fn validate_company_branding_patch(patch: &Value) -> AppResult<()> {
+    let company_keys: Vec<&str> = KNOWN_KEYS
+        .iter()
+        .copied()
+        .filter(|k| !TENANT_ONLY_KEYS.contains(k))
+        .collect();
+    validate_branding_patch_with_keys(patch, &company_keys)
+}
+
+fn validate_branding_patch_with_keys(patch: &Value, allowed: &[&str]) -> AppResult<()> {
     // PMS-758: an object or nothing. A string or an array here would replace
     // the document with something no reader can destructure, and `||` on two
     // non-objects concatenates rather than merges.
@@ -70,6 +94,15 @@ pub fn validate_branding_patch(patch: &Value) -> AppResult<()> {
         ));
     };
     for (key, value) in obj {
+        if !allowed.contains(&key.as_str()) {
+            return Err(AppError::validation_field(
+                format!("branding.{key}"),
+                format!(
+                    "`{key}` is not a branding key; the known keys are {}",
+                    allowed.join(", ")
+                ),
+            ));
+        }
         validate_branding_value(key, value)
             .map_err(|message| AppError::validation_field(format!("branding.{key}"), message))?;
     }
@@ -101,7 +134,7 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
         // `accent_color` is the deprecated alias for `secondary_color`, kept
         // accepted per PMS-703 F18 because the settings endpoint has written it
         // since PMS-113.
-        "primary_color" | "secondary_color" | "accent_color" => {
+        "primary_color" | "secondary_color" | "accent_color" | "background_color" => {
             let s = text(label, value, 7)?;
             if is_hex_color(s) {
                 Ok(())
@@ -123,7 +156,7 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
                 ))
             }
         }
-        "support_contact_name" | "company_name" | "legal_name" => {
+        "support_contact_name" | "company_name" | "legal_name" | "display_name" => {
             text(label, value, MAX_NAME).map(|_| ())
         }
         // PMS-911: whatever identifier the MSP's jurisdiction requires on an
@@ -160,25 +193,28 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
                 .map_err(|_| format!("`{label}` must be a web address like https://acme.example"))
         }
         // `logo_url` is what the upload route writes and what the email
-        // composer joins to the public API base. `favicon_url` has no reader
-        // yet; holding it to the same prefix stops it becoming an arbitrary
-        // URL before one arrives.
-        "logo_url" | "favicon_url" => {
+        // composer joins to the public API base. `favicon_url` and
+        // `background_url` are held to the same prefixes so neither becomes
+        // an arbitrary URL. Both the tenant and the Company prefix are legal
+        // here (PMS-1197): the same key set is written to either row, and
+        // which prefix is right depends on which row it lands in.
+        "logo_url" | "favicon_url" | "background_url" => {
             let s = text(label, value, MAX_PATH)?;
-            if s.starts_with(PUBLIC_TENANT_PATH_PREFIX) {
+            if s.starts_with(PUBLIC_TENANT_PATH_PREFIX) || s.starts_with(PUBLIC_COMPANY_PATH_PREFIX)
+            {
                 Ok(())
             } else {
                 Err(format!(
-                    "`{label}` must be a public tenant path beginning `{PUBLIC_TENANT_PATH_PREFIX}`"
+                    "`{label}` must be a public tenant or company path beginning `{PUBLIC_TENANT_PATH_PREFIX}` or `{PUBLIC_COMPANY_PATH_PREFIX}`"
                 ))
             }
         }
-        // The content type the public logo route answers with, so it is the
-        // same set the upload accepts.
-        "logo_mime" => {
+        // The content type the public asset routes answer with, so it is the
+        // same set the uploads accept.
+        "logo_mime" | "favicon_mime" | "background_mime" => {
             let s = text(label, value, 100)?;
             check_mime(s).map(|_| ()).map_err(|_| {
-                format!("`{label}` must be an image type the logo route can serve (PNG, JPEG, WebP or GIF)")
+                format!("`{label}` must be an image type the asset route can serve (PNG, JPEG, WebP or GIF)")
             })
         }
         "portal_domain" => {
@@ -199,9 +235,19 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
 }
 
 /// Every key the table above accepts, for the message an unknown key gets.
-/// Kept beside the match by [`known_keys_match_the_table`].
-const KNOWN_KEYS: &[&str] = &[
+/// Kept beside the match by [`known_keys_match_the_table`], and in step with
+/// every key `EffectiveBranding` reads
+/// ([`every_field_effective_branding_reads_is_a_known_branding_key`] in
+/// `crate::modules::branding::effective`), so a third branding surface
+/// cannot introduce a key this table has never validated.
+pub(crate) const KNOWN_KEYS: &[&str] = &[
+    "accent_color",
+    "background_color",
+    "background_mime",
+    "background_url",
     "company_name",
+    "display_name",
+    "favicon_mime",
     "favicon_url",
     "invoice_template",
     "legal_name",
@@ -211,13 +257,17 @@ const KNOWN_KEYS: &[&str] = &[
     "postal_address",
     "primary_color",
     "secondary_color",
-    "accent_color",
     "support_contact_name",
     "support_email",
     "support_phone",
     "tax_id",
     "website",
 ];
+
+/// Keys that are tenant-level concepts and refused on a Company row
+/// (PMS-1197): a document template and a portal hostname belong to the MSP,
+/// not to one of its customers.
+const TENANT_ONLY_KEYS: &[&str] = &["portal_domain", "invoice_template"];
 
 /// A string value that will be rendered: present, not blank, within its
 /// rendered length, and free of control characters. Blank is refused rather
@@ -502,5 +552,78 @@ mod tests {
         assert!(validate_branding_patch(&json!("not-an-object")).is_err());
         assert!(validate_branding_patch(&json!([])).is_err());
         assert!(validate_branding_patch(&json!({})).is_ok());
+    }
+
+    /// Pull the one field name + message an `AppError::validation_field`
+    /// call produced, the way a caller reading `errors[]` off the response
+    /// body would.
+    fn field_error(err: AppError) -> (String, String) {
+        match err {
+            AppError::Validation { errors, .. } => {
+                let e = errors.into_iter().next().expect("one field error");
+                (e.field, e.message)
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// PMS-1197: a Company row goes through the same table as the tenant's,
+    /// minus the two tenant-level keys, so a portal contact or a staff
+    /// company update cannot write an arbitrary `primary_color`, an
+    /// off-path `logo_url`, or an unknown key past this validator.
+    #[test]
+    fn a_company_patch_rejects_an_invalid_value_the_same_way_a_tenant_patch_does() {
+        let bad = json!({ "primary_color": "not-a-colour" });
+        let tenant_err = field_error(validate_branding_patch(&bad).unwrap_err());
+        let company_err = field_error(validate_company_branding_patch(&bad).unwrap_err());
+        assert_eq!(tenant_err, company_err);
+        assert_eq!(tenant_err.0, "branding.primary_color");
+    }
+
+    #[test]
+    fn a_company_patch_refuses_an_unknown_key_and_names_the_known_keys() {
+        let (field, message) = field_error(
+            validate_company_branding_patch(&json!({ "supprt_email": "help@acme.example" }))
+                .unwrap_err(),
+        );
+        assert_eq!(field, "branding.supprt_email");
+        assert!(message.contains("is not a branding key"), "{message}");
+        assert!(message.contains("primary_color"), "{message}");
+    }
+
+    #[test]
+    fn a_company_patch_refuses_the_two_tenant_only_keys() {
+        for key in TENANT_ONLY_KEYS {
+            let (_, message) = field_error(
+                validate_company_branding_patch(&json!({ (*key): "anything" })).unwrap_err(),
+            );
+            assert!(
+                message.contains("is not a branding key"),
+                "{key}: {message}"
+            );
+            let known_keys_named = message.split("are ").nth(1).unwrap_or("");
+            assert!(
+                !known_keys_named.contains(key),
+                "`{key}` must not be advertised as a legal Company key: {message}"
+            );
+        }
+        // Still legal on the tenant side.
+        assert!(
+            validate_branding_patch(&json!({ "portal_domain": "portal.acme.example" })).is_ok()
+        );
+        assert!(validate_branding_patch(&json!({ "invoice_template": "modern" })).is_ok());
+    }
+
+    #[test]
+    fn a_company_patch_accepts_every_other_known_key() {
+        for key in KNOWN_KEYS {
+            if TENANT_ONLY_KEYS.contains(key) {
+                continue;
+            }
+            assert!(
+                validate_company_branding_patch(&json!({ (*key): Value::Null })).is_ok(),
+                "`{key}` should be legal on a Company row"
+            );
+        }
     }
 }

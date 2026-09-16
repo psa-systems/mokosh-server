@@ -16,6 +16,17 @@ use crate::utils::pagination::PaginationParams;
 use super::automation::AutomationEngine;
 use super::models::*;
 
+/// PMS-1198 (CF-9): the sentence both the no-dispatcher fallback body below
+/// and the seeded `ticket.note_added` template (migration 148) print. Kept
+/// as one literal rather than one function, because the two sides render
+/// through different engines (a Rust `format!` here, a `{{token}}`-replaced
+/// SQL body there) and cannot share code across that boundary; instead
+/// `scripts/check-no-duplicate-mail-copy.nu` diffs this exact text against
+/// migration 148 on every CI run, so editing one side without the other
+/// fails the build the way migrations 104/110/148 rewriting the same row
+/// three times with nobody noticing never did.
+const TICKET_NOTE_ADDED_SENTENCE: &str = "has added an update to ticket";
+
 /// Ticket management service
 #[derive(Clone)]
 pub struct TicketService {
@@ -1212,15 +1223,8 @@ impl TicketService {
         };
         let contact_line = org.contact_line("Questions about this ticket?", None);
         let subject = format!("[{ticket_number}] {title}");
-        // This wording is a second copy of the `ticket.note_added` template
-        // (migration 104), reachable only by the no-dispatcher fallback below.
-        // PMS-700 removed exactly this duplication for the auth emails and
-        // `scripts/check-no-duplicate-mail-copy.nu` guards their phrases; this
-        // one survives because the fallback has no template to read. Change one
-        // and change the other, or which document a client receives depends on
-        // how the service was constructed.
         let body = format!(
-            "{} has added an update to ticket {ticket_number}:\n\n{content}\n\n{contact_line}\n",
+            "{} {TICKET_NOTE_ADDED_SENTENCE} {ticket_number}:\n\n{content}\n\n{contact_line}\n",
             org.name()
         );
 

@@ -97,7 +97,7 @@ pub async fn account_deleted(
 
     if payload.event != EVENT_ACCOUNT_DELETED {
         return Err(AppError::BadRequest(format!(
-            "Unsupported event {:?}",
+            "Unsupported event {}",
             payload.event
         )));
     }

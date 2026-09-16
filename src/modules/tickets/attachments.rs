@@ -67,6 +67,7 @@ use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
 use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::inline_image::check_inline_image_mime;
+use crate::utils::upload_limits::oversized_upload_error;
 
 /// Default size cap when `ATTACHMENT_MAX_BYTES` is unset. 25 MiB
 /// matches what the ticket spec cites as the v1 default.
@@ -233,9 +234,7 @@ impl AttachmentService {
         .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?;
         if exists.is_none() {
-            return Err(AppError::NotFound(
-                "ticket note not found in tenant scope".into(),
-            ));
+            return Err(AppError::NotFound("ticket note in tenant scope".into()));
         }
         Ok(())
     }
@@ -280,9 +279,7 @@ impl AttachmentService {
                 .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
                 .await?;
         if exists.is_none() {
-            return Err(AppError::NotFound(
-                "ticket not found in tenant scope".into(),
-            ));
+            return Err(AppError::NotFound("ticket in tenant scope".into()));
         }
         Ok(())
     }
@@ -423,10 +420,7 @@ impl AttachmentService {
     ) -> AppResult<AttachmentResponse> {
         let size = bytes.len();
         if size as u64 > self.config.max_bytes {
-            return Err(AppError::PayloadTooLarge(format!(
-                "attachment exceeds {} byte cap",
-                self.config.max_bytes
-            )));
+            return Err(oversized_upload_error("attachment", self.config.max_bytes));
         }
         let id = Uuid::new_v4();
         let key = ObjectKey::ticket_attachment(tenant_id, id);
@@ -507,7 +501,7 @@ impl AttachmentService {
         .bind(attachment_id)
         .fetch_optional(&mut *self.db.begin_with_tenant(tenant_id).await?)
         .await?
-        .ok_or_else(|| AppError::NotFound("attachment not found".into()))
+        .ok_or_else(|| AppError::NotFound("attachment".into()))
     }
 
     /// PMS-941: store an image the author is embedding in a description or a
@@ -537,9 +531,7 @@ impl AttachmentService {
         }
         let cap = inline_cap(self.config.max_bytes);
         if bytes.len() as u64 > cap {
-            return Err(AppError::PayloadTooLarge(format!(
-                "an inline image exceeds the {cap} byte cap"
-            )));
+            return Err(oversized_upload_error("inline image", cap));
         }
         self.assert_ticket_in_tenant(tenant_id, ticket_id).await?;
         self.insert_blob(
@@ -584,7 +576,7 @@ impl AttachmentService {
         .bind(attachment_id)
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| AppError::NotFound("attachment not found".into()))
+        .ok_or_else(|| AppError::NotFound("attachment".into()))
     }
 
     async fn delete_one(&self, tenant_id: Uuid, attachment_id: Uuid) -> AppResult<()> {
@@ -602,7 +594,7 @@ impl AttachmentService {
         .await?;
         tx.commit().await?;
         let Some((path,)) = row else {
-            return Err(AppError::NotFound("attachment not found".into()));
+            return Err(AppError::NotFound("attachment".into()));
         };
         // Best-effort blob removal: a missing file is not a hard
         // error since the DB row is already gone (mirrors the soft-
@@ -927,10 +919,7 @@ async fn attachment_response(
         })
     });
 
-    let disposition = format!(
-        "attachment; filename=\"{}\"",
-        row.file_name.replace('"', "")
-    );
+    let disposition = crate::utils::content_disposition::content_disposition(&row.file_name);
     Ok((
         StatusCode::OK,
         [
@@ -984,7 +973,7 @@ async fn inline_image_response(
         .await
         .map_err(|e| {
             tracing::warn!(%attachment_id, "inline attachment blob missing: {e}");
-            AppError::NotFound("attachment not found".into())
+            AppError::NotFound("attachment".into())
         })?;
     let stream = ReaderStream::new(file).map(move |chunk| {
         chunk.inspect_err(|e| {

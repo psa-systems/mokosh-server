@@ -906,18 +906,28 @@ async fn not_a_frontend(
         .strip_prefix("api.msp.")
         .map(|tld| format!("https://{tld}"))
         .unwrap_or(fallback_origin);
+    (StatusCode::NOT_FOUND, Html(not_a_frontend_body(&hub_link)))
+}
+
+/// Builds the `not_a_frontend` page body. Split out from the handler so the
+/// shared shell (PMS-1201) can be pinned by a test with no `HeaderMap` to
+/// construct.
+fn not_a_frontend_body(hub_link: &str) -> String {
     // PMS-789: read the cached name. This handler has no `State` and must
     // render when the database is down, which is when it is most looked at.
     // Escaped: `sanitize` bars control characters, not `<` or `&`.
     let app = crate::utils::html::html_escape(&crate::utils::app_name::app_name());
-    let body = format!(
+    let viewport = crate::utils::html::PAGE_SHELL_VIEWPORT;
+    let shell_css = crate::utils::html::page_shell_css("36rem");
+    format!(
         "<!doctype html>\n\
          <html lang=\"en\">\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
          <title>Not a frontend</title>\n\
          <meta name=\"robots\" content=\"noindex\">\n\
-         <style>body{{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#1a1a1a}}a{{color:#0066cc}}</style>\n\
+         {viewport}\n\
+         <style>{shell_css}a{{color:#0066cc}}</style>\n\
          </head>\n\
          <body>\n\
          <h1>This is an API endpoint.</h1>\n\
@@ -925,8 +935,7 @@ async fn not_a_frontend(
          <p>Visit <a href=\"{hub_link}\">{hub_link}</a> to reach the application.</p>\n\
          </body>\n\
          </html>\n"
-    );
-    (StatusCode::NOT_FOUND, Html(body))
+    )
 }
 
 /// Health check endpoint
@@ -1204,6 +1213,19 @@ mod tests {
             .expect("probe should be configured");
         assert_eq!(probe.url, "http://infisical:8080/api/status");
         assert_eq!(probe.display, "http://infisical:8080");
+    }
+
+    /// PMS-1201: `not_a_frontend` and the provider-status page must share one
+    /// page-shell scale (font stack, margin) and both declare a `viewport`
+    /// meta tag and `color-scheme`, only `max-width` may differ.
+    #[test]
+    fn not_a_frontend_declares_the_shared_page_shell() {
+        let body = not_a_frontend_body("https://example.com");
+        assert!(body.contains(crate::utils::html::PAGE_SHELL_VIEWPORT));
+        assert!(body.contains("font-family:system-ui,-apple-system,sans-serif"));
+        assert!(body.contains("margin:2rem auto"));
+        assert!(body.contains("color-scheme:light dark"));
+        assert!(body.contains("max-width:36rem"));
     }
 
     /// The mokosh-contact-login <- main merge (chore/merge-main-into-contact-

@@ -5,6 +5,10 @@
 // read it synchronously.
 pub mod app_name;
 pub mod client_ip;
+// PMS-1205: the one `Content-Disposition` builder every download response
+// (ticket attachments, report/billing/audit exports, the tenant data export)
+// calls, so a filename edge case is handled the same way everywhere.
+pub mod content_disposition;
 pub mod crypto;
 pub mod datetime;
 // PMS-902: self-hosted vs SaaS. Decides whether mokosh owns platform identity
@@ -37,6 +41,10 @@ pub mod recovery;
 // that applies it before any handler deserializes a request.
 pub mod text;
 pub mod totp;
+// PMS-1204: the one size-limit refusal every upload site shares (one status
+// code, one wording), so a ticket attachment, a KB image, a tenant logo and a
+// branding asset stop disagreeing on how "too big" is reported.
+pub mod upload_limits;
 pub mod validation;
 
 // Re-exports

@@ -85,6 +85,39 @@ pub fn effective_branding(tenant: &TenantBranding, company: &CompanyBranding) ->
     }
 }
 
+/// MAPPS-807: the brand a CUSTOMER is shown, which always names the MSP.
+///
+/// [`effective_branding`] carries a name only when somebody typed one into the
+/// optional `display_name` / `company_name` fields, and the client falls back
+/// to the vendor's product name when both are absent. So the portal sign-in
+/// page read "Mokosh Platform" under the MSP's own logo, and the "not shared
+/// with you" screen and the read-only profile said "your provider", while every
+/// email the same MSP sent said "Niceguy IT": `OrgIdentity::name()` uses the
+/// organization's own name, `tenants.name`, which onboarding requires.
+///
+/// This fills `company_name` with that name when neither side set a name, so
+/// the portal names the MSP exactly as its emails do. A configured
+/// `display_name` or `company_name`, on the company or the tenant, still wins.
+///
+/// Only for what a customer sees. The brand editor keeps [`effective_branding`]
+/// for its preview, because a synthesized name there would read as a value
+/// somebody configured.
+pub fn customer_branding(
+    tenant: &TenantBranding,
+    company: &CompanyBranding,
+    organization_name: &str,
+) -> EffectiveBranding {
+    let mut brand = effective_branding(tenant, company);
+    let named = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if !named(&brand.display_name) && !named(&brand.company_name) {
+        let organization_name = organization_name.trim();
+        if !organization_name.is_empty() {
+            brand.company_name = Some(organization_name.to_string());
+        }
+    }
+    brand
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +220,101 @@ mod tests {
         assert_eq!(out.secondary_color.as_deref(), Some("#222222"));
         assert_eq!(out.display_name.as_deref(), Some("Acme MSP"));
         assert_eq!(out.support_email.as_deref(), Some("help@acme.example"));
+    }
+
+    /// PMS-1197: `EffectiveBranding` is the merge of `TenantBranding` and
+    /// `CompanyBranding`, and both are written through
+    /// `validate_branding_patch` / `validate_company_branding_patch`
+    /// (`crate::modules::tenants::branding`). A field read here that table
+    /// has never validated is a key a third branding surface could write
+    /// unchecked and have it show up in what a client is shown, which is
+    /// exactly the regression this issue closes.
+    #[test]
+    fn every_field_effective_branding_reads_is_a_known_branding_key() {
+        use crate::modules::tenants::branding::KNOWN_KEYS;
+        let fields = [
+            "logo_url",
+            "logo_mime",
+            "favicon_url",
+            "favicon_mime",
+            "primary_color",
+            "secondary_color",
+            "background_color",
+            "background_url",
+            "background_mime",
+            "display_name",
+            "company_name",
+            "support_email",
+            "support_phone",
+            "support_contact_name",
+            "portal_domain",
+        ];
+        for field in fields {
+            assert!(
+                KNOWN_KEYS.contains(&field),
+                "EffectiveBranding reads `{field}` but it is not in validate_branding_patch's KNOWN_KEYS"
+            );
+        }
+    }
+
+    /// MAPPS-807: with no name configured anywhere, a customer sees the
+    /// organization's name - the one its emails already use - rather than
+    /// nothing, which the client rendered as the vendor's product name.
+    #[test]
+    fn a_customer_sees_the_organization_name_when_none_is_configured() {
+        let out = customer_branding(
+            &TenantBranding::default(),
+            &CompanyBranding::default(),
+            "Niceguy IT",
+        );
+        assert_eq!(out.company_name.as_deref(), Some("Niceguy IT"));
+        assert_eq!(out.display_name, None, "display_name is not invented");
+    }
+
+    /// A name somebody configured always wins, on either side and in either
+    /// field.
+    #[test]
+    fn a_configured_name_is_never_overridden() {
+        let tenant = TenantBranding {
+            display_name: Some("Niceguy Support".into()),
+            ..TenantBranding::default()
+        };
+        let out = customer_branding(&tenant, &CompanyBranding::default(), "Niceguy IT");
+        assert_eq!(out.display_name.as_deref(), Some("Niceguy Support"));
+        assert_eq!(out.company_name, None);
+
+        let company = CompanyBranding {
+            company_name: Some("Acme Portal".into()),
+            ..CompanyBranding::default()
+        };
+        let out = customer_branding(&TenantBranding::default(), &company, "Niceguy IT");
+        assert_eq!(out.company_name.as_deref(), Some("Acme Portal"));
+    }
+
+    /// A blank configured name is no name, so it is filled; a blank
+    /// organization name fills nothing rather than a blank.
+    #[test]
+    fn blanks_are_treated_as_absent() {
+        let tenant = TenantBranding {
+            display_name: Some("   ".into()),
+            ..TenantBranding::default()
+        };
+        let out = customer_branding(&tenant, &CompanyBranding::default(), "Niceguy IT");
+        assert_eq!(out.company_name.as_deref(), Some("Niceguy IT"));
+
+        let out = customer_branding(
+            &TenantBranding::default(),
+            &CompanyBranding::default(),
+            "  ",
+        );
+        assert_eq!(out.company_name, None);
+    }
+
+    /// Everything else about the brand is exactly the plain resolver's.
+    #[test]
+    fn nothing_but_the_name_changes() {
+        let plain = effective_branding(&tenant_full(), &company_full());
+        let customer = customer_branding(&tenant_full(), &company_full(), "Niceguy IT");
+        assert_eq!(plain, customer, "a fully configured brand is untouched");
     }
 }

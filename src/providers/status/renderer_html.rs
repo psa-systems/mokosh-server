@@ -20,8 +20,11 @@ pub fn render_html(report: &ProviderStatusReport) -> String {
     out.push_str("<!doctype html>\n<html lang=\"en\"><head>\n");
     out.push_str("<meta charset=\"utf-8\">\n");
     out.push_str("<meta name=\"robots\" content=\"noindex\">\n");
+    out.push_str(crate::utils::html::PAGE_SHELL_VIEWPORT);
+    out.push('\n');
     out.push_str("<title>Mokosh Provider Status</title>\n");
     out.push_str("<style>");
+    out.push_str(&crate::utils::html::page_shell_css("64rem"));
     out.push_str(include_str!("style.css"));
     out.push_str("</style>\n</head><body>\n");
     out.push_str("<h1>Mokosh Provider Status</h1>\n");

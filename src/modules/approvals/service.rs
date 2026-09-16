@@ -299,7 +299,7 @@ impl ApprovalsService {
                 .await?;
         drop(tx);
         if ticket_owned.is_none() {
-            return Err(AppError::NotFound("Ticket not found".into()));
+            return Err(AppError::NotFound("Ticket".into()));
         }
         self.create_for_entity(
             tenant_id,
@@ -397,7 +397,7 @@ impl ApprovalsService {
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or(AppError::NotFound("Approval not found".into()))?;
+            .ok_or(AppError::NotFound("Approval".into()))?;
         Ok(row.into())
     }
 
@@ -433,8 +433,7 @@ impl ApprovalsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
-        let (status, by_user, by_role) =
-            scope.ok_or(AppError::NotFound("Approval not found".into()))?;
+        let (status, by_user, by_role) = scope.ok_or(AppError::NotFound("Approval".into()))?;
         if status != "pending" {
             return Err(AppError::BadRequest(format!(
                 "Approval is already {status}"
@@ -496,7 +495,7 @@ impl ApprovalsService {
         .bind(contact_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let status = status.ok_or(AppError::NotFound("Approval not found".into()))?;
+        let status = status.ok_or(AppError::NotFound("Approval".into()))?;
         if status != "pending" {
             return Err(AppError::BadRequest(format!(
                 "Approval is already {status}"
@@ -543,7 +542,7 @@ impl ApprovalsService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
-        let (status, requester) = row.ok_or(AppError::NotFound("Approval not found".into()))?;
+        let (status, requester) = row.ok_or(AppError::NotFound("Approval".into()))?;
         if status != "pending" {
             return Err(AppError::BadRequest(format!(
                 "Approval is already {status}"
@@ -600,7 +599,7 @@ impl ApprovalsService {
                 .await?;
         drop(tx);
         if ticket_owned.is_none() {
-            return Err(AppError::NotFound("Ticket not found".into()));
+            return Err(AppError::NotFound("Ticket".into()));
         }
         self.create_for_entity(
             tenant_id,

@@ -483,7 +483,7 @@ fn validate_segment(segment: &str) -> AppResult<()> {
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
     {
         return Err(AppError::BadRequest(format!(
-            "{segment:?} is not a usable file extension"
+            "{segment} is not a usable file extension"
         )));
     }
     Ok(())
@@ -498,7 +498,7 @@ fn validate_segment(segment: &str) -> AppResult<()> {
 fn validate_digest(digest: &str) -> AppResult<()> {
     if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AppError::Internal(format!(
-            "{digest:?} is not a content digest"
+            "{digest} is not a content digest"
         )));
     }
     Ok(())
@@ -522,7 +522,7 @@ impl ObjectProvider for LocalProvider {
         let path = self.path_for(key)?;
         tokio::fs::read(&path)
             .await
-            .map_err(|e| AppError::NotFound(format!("object not found: {e}")))
+            .map_err(|e| AppError::NotFound(format!("object ({e})")))
     }
 
     async fn open(&self, key: &ObjectKey) -> AppResult<ObjectReader> {
@@ -633,7 +633,7 @@ impl StorageProviderKind {
             provider::LOCAL => Ok(StorageProviderKind::Local),
             provider::S3 => Ok(StorageProviderKind::S3),
             other => Err(AppError::Configuration(format!(
-                "STORAGE_BACKEND {other:?} is not a known provider; expected 'local' or 's3'"
+                "STORAGE_BACKEND {other} is not a known provider; expected 'local' or 's3'"
             ))),
         }
     }

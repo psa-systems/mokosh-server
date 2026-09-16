@@ -198,6 +198,7 @@ async fn list_payment_terms(
     _finance: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<PaymentTermResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (terms, total) = state
         .service
         .list_payment_terms(user.tenant(), &pagination)
@@ -255,6 +256,7 @@ async fn list_tax_rates(
     _finance: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TaxRateResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (rates, total) = state
         .service
         .list_tax_rates(user.tenant(), &pagination)
@@ -393,6 +395,7 @@ async fn list_payment_gateways(
     _finance: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<PaymentGatewayConfigResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (gateways, total) = state
         .service
         .list_payment_gateways(user.tenant(), &pagination)
@@ -433,7 +436,7 @@ async fn check_payment_gateway(
     Path(provider): Path<String>,
 ) -> AppResult<Json<Vec<GatewayCheckResponse>>> {
     let provider = GatewayProvider::from_str(&provider).ok_or_else(|| {
-        crate::utils::error::AppError::BadRequest(format!("Unknown provider {provider:?}"))
+        crate::utils::error::AppError::BadRequest(format!("Unknown provider {provider}"))
     })?;
     let checks = state
         .service
@@ -450,7 +453,7 @@ async fn delete_payment_gateway(
     Path(provider): Path<String>,
 ) -> AppResult<()> {
     let provider = GatewayProvider::from_str(&provider).ok_or_else(|| {
-        crate::utils::error::AppError::BadRequest(format!("Unknown provider {provider:?}"))
+        crate::utils::error::AppError::BadRequest(format!("Unknown provider {provider}"))
     })?;
     state
         .service
@@ -666,6 +669,7 @@ async fn list_credit_notes(
     Query(filter): Query<CreditNoteFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<CreditNoteResponse>>> {
+    pagination.reject_unsupported_sort()?;
     filter.validate()?;
     let (notes, total) = state
         .service
@@ -874,9 +878,10 @@ async fn get_invoice_pdf(
                 .bill_to(tenant, invoice.company_id, invoice.billing_contact_id)
                 .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
-            crate::pdf::render(&crate::modules::billing::documents::invoice(
-                &invoice, &issuer, &bill_to, logo,
-            ))?
+            crate::pdf::render(
+                &crate::modules::billing::documents::invoice(&invoice, &issuer, &bill_to, logo),
+                invoice.invoice_date,
+            )?
         }
     };
     Ok(pdf_response(
@@ -1110,22 +1115,24 @@ async fn get_credit_note_pdf(
         .service
         .get_credit_note(tenant, credit_note_id)
         .await?;
-    let bytes =
-        match crate::modules::billing::documents::read_issued(tenant.get(), credit_note_id).await {
-            Some(stored) => stored,
-            None => {
-                let issuer = state.service.tenant_issuer(tenant).await?;
-                let credit_to = state
-                    .service
-                    .credit_to(tenant, note.company_id, note.invoice_id)
-                    .await?;
-                let logo =
-                    crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
-                crate::pdf::render(&crate::modules::billing::documents::credit_note(
-                    &note, &issuer, &credit_to, logo,
-                ))?
-            }
-        };
+    let bytes = match crate::modules::billing::documents::read_issued(tenant.get(), credit_note_id)
+        .await
+    {
+        Some(stored) => stored,
+        None => {
+            let issuer = state.service.tenant_issuer(tenant).await?;
+            let credit_to = state
+                .service
+                .credit_to(tenant, note.company_id, note.invoice_id)
+                .await?;
+            let logo =
+                crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
+            crate::pdf::render(
+                &crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
+                note.issue_date,
+            )?
+        }
+    };
     Ok(pdf_response(
         bytes,
         &format!("{}.pdf", note.credit_note_number),
@@ -1155,9 +1162,12 @@ async fn get_statement_pdf(
         .statement_account(tenant, statement.company_id)
         .await?;
     let logo = crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
-    let bytes = crate::pdf::render(&crate::modules::billing::documents::statement(
-        &statement, &issuer, &account, logo,
-    ))?;
+    // PMS-1206: a statement stores nothing (PMS-954), so there is no issue
+    // date to reuse; it is generated the moment this request is answered.
+    let bytes = crate::pdf::render(
+        &crate::modules::billing::documents::statement(&statement, &issuer, &account, logo),
+        chrono::Utc::now().date_naive(),
+    )?;
     Ok(pdf_response(
         bytes,
         &format!(
@@ -1179,7 +1189,7 @@ fn pdf_response(bytes: Vec<u8>, filename: &str) -> Response {
             ),
             (
                 axum::http::header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}\""),
+                crate::utils::content_disposition::content_disposition(filename),
             ),
         ],
         bytes,
@@ -1198,6 +1208,7 @@ async fn list_products(
     Query(filter): Query<ProductFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ProductResponse>>> {
+    pagination.reject_unsupported_sort()?;
     filter.validate()?;
     let (products, total) = state
         .service
