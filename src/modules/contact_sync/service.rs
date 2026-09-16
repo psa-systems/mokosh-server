@@ -11,7 +11,10 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
+use super::google::GoogleContactsProvider;
 use super::oauth::{self, OauthClient, Pkce, TokenError};
+use super::provider::{ContactSyncProvider, SourceGroup};
+use super::sync::{ContactSyncEngine, SyncReport};
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
@@ -414,6 +417,44 @@ impl ContactSyncService {
             );
         }
         Ok(())
+    }
+
+    /// The live connection's id and provider, or the NotFound every caller
+    /// below would otherwise spell out.
+    async fn live_connection(&self, tenant_id: TenantId) -> AppResult<ConnectionStatus> {
+        self.connection(tenant_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Google Contacts connection".to_string()))
+    }
+
+    /// A provider for the live connection, holding a freshly refreshed token.
+    async fn source(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<(ConnectionStatus, GoogleContactsProvider)> {
+        let connection = self.live_connection(tenant_id).await?;
+        let token = self
+            .access_token(tenant_id, connection.id, &connection.provider)
+            .await?;
+        Ok((
+            connection,
+            GoogleContactsProvider::new(self.http.clone(), token),
+        ))
+    }
+
+    /// The labels an admin can choose from, with their counts (PSA-70 E).
+    pub async fn source_groups(&self, tenant_id: TenantId) -> AppResult<Vec<SourceGroup>> {
+        let (_, source) = self.source(tenant_id).await?;
+        Ok(source.list_groups().await?)
+    }
+
+    /// Run one sync of the tenant's live connection now (PMS-1213). The
+    /// scheduled worker and the run rows that make it resumable are PMS-1215.
+    pub async fn sync_now(&self, tenant_id: TenantId) -> AppResult<SyncReport> {
+        let (connection, source) = self.source(tenant_id).await?;
+        ContactSyncEngine::new(self.db.clone())
+            .run(tenant_id, connection.id, &source)
+            .await
     }
 
     /// A usable access token for a connection, refreshed from the stored
