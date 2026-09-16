@@ -67,9 +67,9 @@ pub fn validate(anchor: &serde_json::Value) -> AppResult<()> {
         AppError::validation_field("anchor", format!("not a TextQuoteSelector: {e}"))
     })?;
     if selector.kind != "TextQuoteSelector" {
-        return Err(AppError::validation_field(
+        return Err(AppError::validation_must_be(
             "anchor.type",
-            "must be TextQuoteSelector",
+            "TextQuoteSelector",
         ));
     }
     let exact_len = selector.exact.chars().count();
@@ -101,9 +101,9 @@ pub fn validate(anchor: &serde_json::Value) -> AppResult<()> {
     }
     if let Some(position) = selector.refined_by {
         if position.kind != "TextPositionSelector" {
-            return Err(AppError::validation_field(
+            return Err(AppError::validation_must_be(
                 "anchor.refinedBy.type",
-                "must be TextPositionSelector",
+                "TextPositionSelector",
             ));
         }
         if position.start < 0 {
