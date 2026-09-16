@@ -9,8 +9,10 @@
 
 mod common;
 
+use printpdf::PdfDocument;
 use reqwest::StatusCode;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Every registry key `GET /reports/{key}/export` serves. Seven, not the five
 /// PMS-876 was written against: `projects` and `clients` joined the registry
@@ -154,4 +156,117 @@ async fn the_csv_export_is_unchanged(pool: PgPool) {
         "CSV gained a header this issue was not meant to give it"
     );
     assert!(!body.is_empty());
+}
+
+/// Read the text back out of rendered bytes, through printpdf's own parser so
+/// this reads what a PDF reader reads (the pattern `document_bill_to.rs` uses).
+fn extracted_text(bytes: &[u8]) -> String {
+    let mut warnings = Vec::new();
+    PdfDocument::parse(bytes, &printpdf::PdfParseOptions::default(), &mut warnings)
+        .expect("the served bytes parse as a PDF")
+        .extract_text()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// PMS-1196: `pdf_for_tickets`'s "Assignee" column and `pdf_for_time`'s "User"
+/// column used to print the raw `Uuid`, while the CSV export of the same data
+/// honestly wrote `assignee_id` / `user_id`. Both now resolve a display name,
+/// with the CSV export left untouched (it still writes the ids under their id
+/// column names).
+#[sqlx::test]
+async fn pdf_columns_name_the_user_instead_of_printing_a_uuid(pool: PgPool) {
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let status_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND is_closed = FALSE LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("an open ticket status");
+    let priority_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_priorities WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("a ticket priority");
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("a ticket queue");
+
+    // A ticket assigned to the seeded admin, so `pdf_for_tickets`'s "Opened by
+    // assignee" table has a resolvable assignee to name.
+    sqlx::query(
+        r#"INSERT INTO tickets
+           (id, tenant_id, ticket_number, title, status_id, priority_id,
+            queue_id, company_id, created_by_id, assigned_to_id)
+           VALUES ($1, $2, 'PDF-1', 'Seed ticket', $3, $4, $5, $6, $7, $7)"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(status_id)
+    .bind(priority_id)
+    .bind(queue_id)
+    .bind(company_id)
+    .bind(admin_id)
+    .execute(&pool)
+    .await
+    .expect("seed assigned ticket");
+
+    // A time entry logged by the same admin, so `pdf_for_time`'s "Minutes by
+    // user" table has a resolvable user to name.
+    let work_type_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM work_types WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("a seeded work type");
+    sqlx::query(
+        r#"INSERT INTO time_entries
+           (id, tenant_id, user_id, date, duration_minutes, work_type_id, company_id)
+           VALUES ($1, $2, $3, CURRENT_DATE, 60, $4, $5)"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(admin_id)
+    .bind(work_type_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed time entry");
+
+    let uuid_shaped = admin_id.to_string();
+
+    let (status, _headers, tickets_pdf) = export(&app, &token, "tickets", "pdf").await;
+    assert_eq!(status, StatusCode::OK);
+    let tickets_text = extracted_text(&tickets_pdf);
+    assert!(
+        tickets_text.contains("Test Admin"),
+        "tickets PDF should name the assignee: {tickets_text}"
+    );
+    assert!(
+        !tickets_text.contains(&uuid_shaped),
+        "tickets PDF should not print the assignee's raw id: {tickets_text}"
+    );
+
+    let (status, _headers, time_pdf) = export(&app, &token, "time", "pdf").await;
+    assert_eq!(status, StatusCode::OK);
+    let time_text = extracted_text(&time_pdf);
+    assert!(
+        time_text.contains("Test Admin"),
+        "time PDF should name the user: {time_text}"
+    );
+    assert!(
+        !time_text.contains(&uuid_shaped),
+        "time PDF should not print the user's raw id: {time_text}"
+    );
 }

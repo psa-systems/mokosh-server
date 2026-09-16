@@ -9,8 +9,12 @@
 # call. This fails a PR that:
 #
 #   - names TOO_MANY_REQUESTS outside src/utils/error.rs (a fifth hand-rolled
-#     copy), or
-#   - discards a computed wait with `let _ = retry_after`.
+#     copy),
+#   - discards a computed wait with `let _ = retry_after`, or
+#   - spells `AppError::RateLimited { .. }` outside src/utils/error.rs (PMS-1203):
+#     that variant now renders through `rate_limited_response` on its own, but
+#     `AppError::rate_limited(retry_after_seconds)`, the one constructor, is the
+#     only bypass-proof way to build one.
 
 const HELPER_FILE = 'src/utils/error.rs'
 
@@ -30,10 +34,16 @@ def main [] {
                     and (not ($trimmed | str starts-with '//'))
                 )
                 let dropped_wait = ($row.item | str contains 'let _ = retry_after')
+                let bypasses_constructor = (
+                    ($row.item | str contains 'AppError::RateLimited')
+                    and (not $is_helper)
+                )
                 let reason = if $inline_429 {
                     'builds a 429 outside the shared helper'
                 } else if $dropped_wait {
                     'computes a retry delay and discards it'
+                } else if $bypasses_constructor {
+                    'constructs AppError::RateLimited directly instead of calling AppError::rate_limited(..)'
                 } else {
                     null
                 }

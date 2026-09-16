@@ -829,9 +829,7 @@ impl AuthService {
                 // caller is owed, floored at 1 so a sub-second remainder is
                 // never reported as "retry immediately".
                 let retry_after = (until - Utc::now()).num_seconds().max(1) as u64;
-                return Err(AppError::RateLimited {
-                    retry_after_seconds: Some(retry_after),
-                });
+                return Err(AppError::rate_limited(Some(retry_after)));
             }
 
             if let Some(rc) = request.recovery_code.as_deref() {

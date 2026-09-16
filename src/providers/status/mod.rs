@@ -766,6 +766,19 @@ mod tests {
         }
     }
 
+    /// PMS-1201: shares the same page-shell scale (font stack, margin) as
+    /// `not_a_frontend`, and declares a `viewport` meta tag and
+    /// `color-scheme`, closing PMS-703's F19/F20 for this page too.
+    #[test]
+    fn html_declares_the_shared_page_shell() {
+        let html = renderer_html::render_html(&collect());
+        assert!(html.contains(crate::utils::html::PAGE_SHELL_VIEWPORT));
+        assert!(html.contains("font-family:system-ui,-apple-system,sans-serif"));
+        assert!(html.contains("margin:2rem auto"));
+        assert!(html.contains("color-scheme:light dark"));
+        assert!(html.contains("max-width:64rem"));
+    }
+
     /// HTML: values that look like they could be interpreted as markup are
     /// escaped. A provider name of `<script>alert(1)</script>` should not
     /// reach the page as a raw tag.

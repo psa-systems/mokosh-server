@@ -5,6 +5,10 @@
 // read it synchronously.
 pub mod app_name;
 pub mod client_ip;
+// PMS-1205: the one `Content-Disposition` builder every download response
+// (ticket attachments, report/billing/audit exports, the tenant data export)
+// calls, so a filename edge case is handled the same way everywhere.
+pub mod content_disposition;
 pub mod crypto;
 pub mod datetime;
 // PMS-902: self-hosted vs SaaS. Decides whether mokosh owns platform identity
