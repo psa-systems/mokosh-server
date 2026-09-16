@@ -270,7 +270,7 @@ pub fn create_api_router(
     let forms_service = FormsService::with_request_links(
         db.clone(),
         notifications_service.clone(),
-        TicketService::new(db.clone()),
+        ticket_service.clone(),
     )
     // PMS-748: only the authenticated surface sends mail, but the public
     // surface is built from the same constructor, so both are given it and
@@ -846,7 +846,7 @@ pub fn create_api_router(
             FormsService::with_request_links(
                 db.clone(),
                 notifications_service.clone(),
-                TicketService::new(db.clone()),
+                ticket_service.clone(),
             )
             .with_abuse_contact(abuse_contact_email)
             .with_public_api_base(public_api_base_url),
