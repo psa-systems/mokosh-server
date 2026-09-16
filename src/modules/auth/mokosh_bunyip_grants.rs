@@ -238,6 +238,71 @@ impl MokoshBunyipGrantService {
     /// account) pair so the next reader sees the fresh value without
     /// waiting for the TTL.
     #[allow(clippy::too_many_arguments)]
+    /// PMS-1208 finding 3: 9-arg variant that also records the
+    /// grantee's `grantee_email` (case-insensitively indexed on the
+    /// mirror in migration 224). The accept path and the webhook
+    /// receiver's granted branch use this; the plain [`Self::upsert`]
+    /// forwards to it with `grantee_email = None` and stays the
+    /// stable surface every test caller reads.
+    ///
+    /// The `grantee_email` column is what the standalone-mode
+    /// MembershipView UNION reads to render "shared with you" rows
+    /// in the switcher, since no `users.bunyip_user_id` is set in a
+    /// deployment without Bunyip. Populating it is what makes the
+    /// grant actually usable to the grantee in that mode.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_with_email(
+        pool: &PgPool,
+        bunyip_grant_id: Uuid,
+        owner_bunyip_user_id: Uuid,
+        grantee_bunyip_user_id: Uuid,
+        mokosh_account_id: &str,
+        role: Option<&str>,
+        granted_at: DateTime<Utc>,
+        revoked_at: Option<DateTime<Utc>>,
+        grantee_email: Option<&str>,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "INSERT INTO mokosh_bunyip_grants (\
+                 bunyip_grant_id, owner_bunyip_user_id, grantee_bunyip_user_id, \
+                 mokosh_account_id, role, granted_at, revoked_at, grantee_email, \
+                 updated_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) \
+             ON CONFLICT (grantee_bunyip_user_id, mokosh_account_id) \
+             DO UPDATE SET \
+                 bunyip_grant_id = EXCLUDED.bunyip_grant_id, \
+                 owner_bunyip_user_id = EXCLUDED.owner_bunyip_user_id, \
+                 role = EXCLUDED.role, \
+                 granted_at = EXCLUDED.granted_at, \
+                 revoked_at = EXCLUDED.revoked_at, \
+                 grantee_email = COALESCE(EXCLUDED.grantee_email, mokosh_bunyip_grants.grantee_email), \
+                 updated_at = NOW()",
+        )
+        .bind(bunyip_grant_id)
+        .bind(owner_bunyip_user_id)
+        .bind(grantee_bunyip_user_id)
+        .bind(mokosh_account_id)
+        .bind(role)
+        .bind(granted_at)
+        .bind(revoked_at)
+        .bind(grantee_email)
+        .execute(pool)
+        .await?;
+
+        invalidate_cache(&GrantKey {
+            grantee_bunyip_user_id,
+            mokosh_account_id: mokosh_account_id.to_string(),
+        });
+        Ok(())
+    }
+
+    /// PMS-1208 finding 3 shim: pre-PMS-1208 8-arg surface, kept so
+    /// every existing caller (the webhook receiver's revoked branch,
+    /// the integration-test rig) compiles unchanged. Delegates to
+    /// [`Self::upsert_with_email`] with `grantee_email = None`, which
+    /// leaves the column untouched via COALESCE on ON CONFLICT and
+    /// writes NULL on the INSERT branch.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         pool: &PgPool,
         bunyip_grant_id: Uuid,
@@ -248,35 +313,18 @@ impl MokoshBunyipGrantService {
         granted_at: DateTime<Utc>,
         revoked_at: Option<DateTime<Utc>>,
     ) -> AppResult<()> {
-        sqlx::query(
-            "INSERT INTO mokosh_bunyip_grants (\
-                 bunyip_grant_id, owner_bunyip_user_id, grantee_bunyip_user_id, \
-                 mokosh_account_id, role, granted_at, revoked_at, updated_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
-             ON CONFLICT (grantee_bunyip_user_id, mokosh_account_id) \
-             DO UPDATE SET \
-                 bunyip_grant_id = EXCLUDED.bunyip_grant_id, \
-                 owner_bunyip_user_id = EXCLUDED.owner_bunyip_user_id, \
-                 role = EXCLUDED.role, \
-                 granted_at = EXCLUDED.granted_at, \
-                 revoked_at = EXCLUDED.revoked_at, \
-                 updated_at = NOW()",
-        )
-        .bind(bunyip_grant_id)
-        .bind(owner_bunyip_user_id)
-        .bind(grantee_bunyip_user_id)
-        .bind(mokosh_account_id)
-        .bind(role)
-        .bind(granted_at)
-        .bind(revoked_at)
-        .execute(pool)
-        .await?;
-
-        invalidate_cache(&GrantKey {
+        Self::upsert_with_email(
+            pool,
+            bunyip_grant_id,
+            owner_bunyip_user_id,
             grantee_bunyip_user_id,
-            mokosh_account_id: mokosh_account_id.to_string(),
-        });
-        Ok(())
+            mokosh_account_id,
+            role,
+            granted_at,
+            revoked_at,
+            None,
+        )
+        .await
     }
 }
 

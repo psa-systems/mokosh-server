@@ -358,6 +358,16 @@ services:
       BUNYIP_STATUS_CLIENT_ID: ${BUNYIP_STATUS_CLIENT_ID:-}
       BUNYIP_STATUS_CLIENT_SECRET: ${BUNYIP_STATUS_CLIENT_SECRET:-}
 
+      # PMS-1208: Bunyip user-directory client (SaaS mode only). All
+      # three unset in dev by default = standalone mode, no lookup
+      # runs. Set all three together to enable the pre-invitation
+      # existence check against Bunyip's `/v1/users/lookup`. Partial
+      # config warns and disables the gate. Reference:
+      # mokosh-server/src/modules/auth/bunyip_directory.rs.
+      BUNYIP_API_BASE_URL: ${BUNYIP_API_BASE_URL:-}
+      BUNYIP_DIRECTORY_CLIENT_ID: ${BUNYIP_DIRECTORY_CLIENT_ID:-}
+      BUNYIP_DIRECTORY_CLIENT_SECRET: ${BUNYIP_DIRECTORY_CLIENT_SECRET:-}
+
       # Browser-visible origin of the client that talks to this API. Must
       # equal it byte-for-byte: it is the CORS_ORIGIN default and the base
       # for emailed reset/invite links. PMS-837 removed the Google OAuth

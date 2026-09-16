@@ -370,7 +370,7 @@ impl GrantInvitationsService {
             .ok_or_else(|| AppError::internal("Owner tenant vanished during accept"))?
             .0;
 
-        MokoshBunyipGrantService::upsert(
+        MokoshBunyipGrantService::upsert_with_email(
             pool,
             accepted.id, // Reuse the invitation id as the grant id (there is no bunyip mokosh_account_grants row in standalone mode).
             owner_bunyip_user_id_fallback,
@@ -381,6 +381,13 @@ impl GrantInvitationsService {
                 .accepted_at
                 .expect("accepted_at was just stamped by the UPDATE above"),
             None,
+            // PMS-1208 finding 3: also record the grantee's email so
+            // the standalone MembershipView UNION can render this row
+            // in the switcher (bunyip_user_id is NULL there and the
+            // sub-based join never fires). In SaaS mode this is
+            // redundant with the bunyip_user_id axis, but writing it
+            // costs nothing and keeps both modes on one code path.
+            Some(&accepted.invitee_email),
         )
         .await?;
 
