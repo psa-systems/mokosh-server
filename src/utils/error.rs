@@ -172,7 +172,28 @@ impl AppError {
         }
     }
 
-    /// Create a validation error for a single field
+    /// Create a validation error for a single field.
+    ///
+    /// # Message convention (PMS-1202/CF-3)
+    ///
+    /// `field` and `message` are served as separate keys in the structured
+    /// field-error body (`{"field": ..., "message": ..., "code": ...}`), never
+    /// concatenated server-side into one sentence, so `message` has to read on
+    /// its own. Called from 45+ sites with no shared wording before this, so a
+    /// new call site follows these rules rather than inventing another shape:
+    ///
+    /// - starts with a lowercase letter and carries no trailing period (matches
+    ///   the majority of existing call sites; a handful of older ones that
+    ///   still read like sentences are pre-existing debt, not a second style)
+    /// - never repeats `field`'s value verbatim in the message: the caller
+    ///   already supplies it structurally, so restating it (e.g. `` "`name` is
+    ///   required" `` for field `"name"`) is redundant rather than clearer
+    /// - interpolates any value with `{}` (Display), never `{:?}` (Debug),
+    ///   because the message is client-facing text and Debug output can carry
+    ///   stray quoting or brace noise a customer should not see (CF-6)
+    /// - reaches for [`AppError::validation_required`] or
+    ///   [`AppError::validation_must_be`] before writing a bespoke sentence,
+    ///   when the shape matches one of those templates
     pub fn validation_field(field: impl Into<String>, message: impl Into<String>) -> Self {
         // The `Validation` Display prefixes "Validation failed: ", so this
         // message must not repeat that phrase (PMS-298).
@@ -180,6 +201,22 @@ impl AppError {
             message: "one or more fields are invalid".to_string(),
             errors: vec![FieldError::new(field, message, "invalid")],
         }
+    }
+
+    /// A field with no value at all. Template for the [`validation_field`]
+    /// convention's "is required" shape (PMS-1202/CF-3).
+    ///
+    /// [`validation_field`]: AppError::validation_field
+    pub fn validation_required(field: impl Into<String>) -> Self {
+        Self::validation_field(field, "is required")
+    }
+
+    /// A field whose value must equal `expected`. Template for the
+    /// [`validation_field`] convention's "must be X" shape (PMS-1202/CF-3).
+    ///
+    /// [`validation_field`]: AppError::validation_field
+    pub fn validation_must_be(field: impl Into<String>, expected: impl std::fmt::Display) -> Self {
+        Self::validation_field(field, format!("must be {expected}"))
     }
 
     /// Create a not found error
