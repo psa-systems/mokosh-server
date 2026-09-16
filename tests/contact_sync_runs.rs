@@ -205,10 +205,12 @@ impl Fixture {
         run
     }
 
+    /// The connection half of the status read.
     async fn connection(&self) -> Value {
         self.call(Method::GET, "/api/v1/integrations/contact-sync", None)
             .await
-            .1
+            .1["connection"]
+            .clone()
     }
 
     async fn count(&self, sql: &str) -> i64 {
@@ -705,4 +707,108 @@ async fn admins_start_imports_and_staff_follow_them(pool: PgPool) {
         let (status, _) = f.call_as(&tech, Method::GET, &path, None).await;
         assert_eq!(status, StatusCode::OK, "{path}");
     }
+}
+
+/// PMS-1241: the tenant-wide off switch. Off, nothing connects, imports or
+/// resolves, a run queued before the switch is cancelled rather than run, and
+/// the worker schedules nothing; the connection and its contacts stay. On
+/// again, everything works.
+#[sqlx::test]
+async fn the_off_switch_stops_every_sync_and_keeps_the_data(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+    f.script.full(vec![person(1)]);
+    f.run_now(f.queue().await).await;
+    let queued_before = f.queue().await;
+
+    let switch = |on: Value| {
+        f.call(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "category": "integrations", "key": "google_contacts_enabled", "value": on })),
+        )
+    };
+    assert_eq!(
+        switch(json!("no")).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let (status, body) = switch(json!(false)).await;
+    assert!(status.is_success(), "{status}: {body}");
+
+    let (_, overview) = f
+        .call(Method::GET, "/api/v1/integrations/contact-sync", None)
+        .await;
+    assert_eq!(overview["enabled"], false, "{overview}");
+    assert!(
+        overview["connection"].is_object(),
+        "the connection is kept: {overview}"
+    );
+
+    for (method, path, body) in [
+        (Method::POST, "/api/v1/integrations/contact-sync/runs", None),
+        (
+            Method::POST,
+            "/api/v1/integrations/contact-sync/google/authorize",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/integrations/contact-sync/review-queue/resolve",
+            Some(json!({ "action": "skip", "external_id": "people/c1" })),
+        ),
+        (
+            Method::GET,
+            "/api/v1/integrations/contact-sync/groups",
+            None,
+        ),
+    ] {
+        let (status, body) = f.call(method.clone(), path, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{method} {path}: {body}");
+        assert!(
+            body.to_string().contains("turned off"),
+            "{method} {path}: {body}"
+        );
+    }
+
+    let summary = f.runner.tick().await.unwrap();
+    assert_eq!(
+        summary.executed, 1,
+        "the run queued before the switch is settled"
+    );
+    let run = f.poll(queued_before).await;
+    assert_eq!(run["status"], "cancelled", "{run}");
+    assert!(
+        run["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("turned off"),
+        "{run}"
+    );
+    assert_eq!(
+        f.connection().await["consecutive_failures"],
+        0,
+        "being switched off is not failing"
+    );
+
+    sqlx::query("UPDATE contact_sync_connections SET last_sync_at = NOW() - INTERVAL '2 hours'")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.runner.tick().await.unwrap().scheduled,
+        0,
+        "nothing is scheduled while off"
+    );
+    assert_eq!(
+        f.count("SELECT count(*) FROM contacts").await,
+        1,
+        "imported contacts stay"
+    );
+
+    let (status, _) = switch(json!(true)).await;
+    assert!(status.is_success());
+    assert_eq!(
+        f.runner.tick().await.unwrap().scheduled,
+        1,
+        "on again, the schedule resumes"
+    );
 }
