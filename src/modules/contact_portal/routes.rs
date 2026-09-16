@@ -372,14 +372,22 @@ async fn me(
 async fn mfa_setup(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ContactMfaSetupRequest>,
 ) -> AppResult<Json<ContactMfaSetupResponse>> {
     request.validate()?;
-    let resp = state
+    // PMS-1236: shares the reauth failure budget with mfa_disable /
+    // change_password (PMS-881), so a stolen access token cannot grind the
+    // current password at full rate through this endpoint either.
+    let ip = reauth_client_ip(addr, &headers);
+    check_reauth_budget(&state, ip, session.id)?;
+    let result = state
         .service
         .start_mfa_enrollment(session.tenant_id, session.id, &request.current_password)
-        .await?;
-    Ok(Json(resp))
+        .await;
+    spend_reauth_budget_on_refusal(&state, ip, session.id, &result);
+    Ok(Json(result?))
 }
 
 /// PMS-1063: finish MFA enrolment. Verifies one live code against the
@@ -388,10 +396,15 @@ async fn mfa_setup(
 async fn mfa_enable(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ContactMfaEnableRequest>,
 ) -> AppResult<Json<ContactMfaEnableResponse>> {
     request.validate()?;
-    let resp = state
+    // PMS-1236: same reauth budget as mfa_setup above.
+    let ip = reauth_client_ip(addr, &headers);
+    check_reauth_budget(&state, ip, session.id)?;
+    let result = state
         .service
         .enable_mfa(
             session.tenant_id,
@@ -399,8 +412,9 @@ async fn mfa_enable(
             &request.code,
             &request.current_password,
         )
-        .await?;
-    Ok(Json(resp))
+        .await;
+    spend_reauth_budget_on_refusal(&state, ip, session.id, &result);
+    Ok(Json(result?))
 }
 
 /// PMS-1063: remove MFA. Needs the current password and a live code
