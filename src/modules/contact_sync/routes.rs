@@ -34,6 +34,7 @@ use super::service::{
     ConnectionStatus, ContactProvenance, ContactSyncOverview, ContactSyncService, DataRemoval,
     GroupOption, Resolution, Resolved, ReviewItem,
 };
+use super::sync::ImportPreview;
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::AppResult;
@@ -58,6 +59,7 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
         )
         .route("/integrations/contact-sync/groups", get(list_groups))
         .route("/integrations/contact-sync/selection", put(set_selection))
+        .route("/integrations/contact-sync/preview", post(preview))
         .route(
             "/integrations/contact-sync/runs",
             get(list_runs).post(queue_run),
@@ -140,6 +142,29 @@ async fn list_groups(
     RequireAuth(user): RequireAuth,
 ) -> AppResult<Json<Vec<GroupOption>>> {
     Ok(Json(state.service.groups(user.tenant()).await?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PreviewRequest {
+    #[serde(default)]
+    group_ids: Option<Vec<String>>,
+}
+
+/// POST because it reads the tenant's whole Google account on the grant,
+/// which a GET that a link or a prefetch could fire must not do. Admin, like
+/// the label list. Writes nothing.
+async fn preview(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<PreviewRequest>,
+) -> AppResult<Json<ImportPreview>> {
+    Ok(Json(
+        state
+            .service
+            .preview(user.tenant(), request.group_ids.as_deref())
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
