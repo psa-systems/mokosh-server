@@ -119,6 +119,7 @@ async fn list_categories(
     axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbCategoryResponse>>> {
+    pagination.reject_unsupported_sort()?;
     // PMS-1082: a contact with `kb:read` sees the non-internal
     // categories; staff keep the module gate they had.
     let tenant = caller.tenant();
@@ -203,6 +204,7 @@ async fn list_articles(
     Query(f): Query<KbArticleFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<axum::response::Response> {
+    pagination.reject_unsupported_sort()?;
     use axum::response::IntoResponse;
     f.validate()?;
     // PMS-1082: dual-plane. The contact arm requires `kb:read`
@@ -360,6 +362,7 @@ async fn list_article_versions(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbArticleVersionResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_article_versions(u.tenant(), id, &pagination)
@@ -462,6 +465,7 @@ async fn list_article_tickets(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<KbArticleTicketRow>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_article_tickets(u.tenant(), id, &pagination)

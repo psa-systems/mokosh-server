@@ -368,7 +368,7 @@ pub async fn run(
     let src = SOURCES
         .iter()
         .find(|s| s.key == spec.source)
-        .ok_or_else(|| AppError::BadRequest(format!("Unknown report source {:?}", spec.source)))?;
+        .ok_or_else(|| AppError::BadRequest(format!("Unknown report source {}", spec.source)))?;
 
     if spec.measures.is_empty() {
         return Err(AppError::BadRequest(
@@ -379,14 +379,14 @@ pub async fn run(
     let mut dims = Vec::new();
     for k in &spec.dimensions {
         let d = src.dims.iter().find(|d| d.key == *k).ok_or_else(|| {
-            AppError::BadRequest(format!("Unknown dimension {k:?} for source {:?}", src.key))
+            AppError::BadRequest(format!("Unknown dimension {k} for source {}", src.key))
         })?;
         dims.push(d);
     }
     let mut measures = Vec::new();
     for k in &spec.measures {
         let m = src.measures.iter().find(|m| m.key == *k).ok_or_else(|| {
-            AppError::BadRequest(format!("Unknown measure {k:?} for source {:?}", src.key))
+            AppError::BadRequest(format!("Unknown measure {k} for source {}", src.key))
         })?;
         measures.push(m);
     }
@@ -414,7 +414,7 @@ pub async fn run(
     for f in &spec.filters {
         if !f.op.is_empty() && f.op != "eq" {
             return Err(AppError::BadRequest(format!(
-                "Unsupported filter op {:?}; only 'eq' is supported",
+                "Unsupported filter op {}; only 'eq' is supported",
                 f.op
             )));
         }
@@ -424,7 +424,7 @@ pub async fn run(
             .find(|x| x.key == f.field)
             .ok_or_else(|| {
                 AppError::BadRequest(format!(
-                    "Unknown filter field {:?} for source {:?}",
+                    "Unknown filter field {} for source {}",
                     f.field, src.key
                 ))
             })?;

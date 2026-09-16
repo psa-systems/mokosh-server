@@ -15,6 +15,7 @@ pub mod billing;
 pub mod branding;
 pub mod calendar;
 pub mod contact_portal;
+pub mod contact_sync;
 pub mod contacts;
 pub mod contracts;
 /// PMS-1012: the write-read-back-compare invariant, extracted from

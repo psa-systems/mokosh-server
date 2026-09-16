@@ -58,6 +58,8 @@
 
 use std::fmt;
 
+use std::borrow::Cow;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
@@ -81,6 +83,17 @@ pub enum SecretKind {
     /// A tenant's payment-provider credentials, keyed by the discriminator
     /// stored in `payment_gateway_configs.provider` (PMS-966).
     PaymentGateway { provider: String },
+    /// PMS-1211: a contact-sync connection's OAuth refresh token, keyed by the
+    /// provider and the connection it belongs to.
+    ///
+    /// The connection id is part of the key rather than the value because a
+    /// tenant can disconnect and reconnect, and the new token must not be
+    /// reachable at the old address: a stale secret that still resolves is how
+    /// a revoked grant keeps appearing to work.
+    ContactSync {
+        provider: String,
+        connection_id: Uuid,
+    },
 }
 
 impl SecretKind {
@@ -88,13 +101,23 @@ impl SecretKind {
     fn prefix(&self) -> &'static str {
         match self {
             SecretKind::PaymentGateway { .. } => "PAYMENT_GATEWAY",
+            SecretKind::ContactSync { .. } => "CONTACT_SYNC",
         }
     }
 
     /// The discriminator within the kind.
-    fn discriminator(&self) -> &str {
+    ///
+    /// Borrowed where the kind already holds the whole string, owned where it
+    /// is composed: a contact-sync secret is identified by its provider AND
+    /// its connection, and composing that here keeps the one
+    /// `validate_discriminator` check over every kind.
+    fn discriminator(&self) -> Cow<'_, str> {
         match self {
-            SecretKind::PaymentGateway { provider } => provider,
+            SecretKind::PaymentGateway { provider } => Cow::Borrowed(provider),
+            SecretKind::ContactSync {
+                provider,
+                connection_id,
+            } => Cow::Owned(format!("{provider}_{}", connection_id.simple())),
         }
     }
 }
@@ -112,6 +135,17 @@ pub struct SecretKey {
 }
 
 impl SecretKey {
+    /// PMS-1211: a contact-sync connection's refresh token.
+    pub fn contact_sync(tenant_id: Uuid, provider: impl Into<String>, connection_id: Uuid) -> Self {
+        Self {
+            tenant_id,
+            kind: SecretKind::ContactSync {
+                provider: provider.into(),
+                connection_id,
+            },
+        }
+    }
+
     pub fn payment_gateway(tenant_id: Uuid, provider: impl Into<String>) -> Self {
         Self {
             tenant_id,
@@ -144,7 +178,7 @@ impl SecretKey {
     /// because an Infisical secret name is conventionally `A-Z0-9_`.
     pub fn name(&self) -> AppResult<String> {
         let discriminator = self.kind.discriminator();
-        validate_discriminator(discriminator)?;
+        validate_discriminator(&discriminator)?;
         Ok(format!(
             "{}__{}__{}",
             self.kind.prefix(),
@@ -350,6 +384,44 @@ pub fn provider_from_env(
 
 #[cfg(test)]
 mod tests {
+
+    /// PMS-1211: a contact-sync token is addressed by its CONNECTION, not just
+    /// its provider.
+    ///
+    /// A tenant can disconnect and reconnect, and the new grant must not be
+    /// reachable at the old address: a stale secret that still resolves is how
+    /// a revoked grant keeps appearing to work.
+    #[test]
+    fn two_contact_sync_connections_never_share_a_secret_name() {
+        let tenant = Uuid::from_u128(7);
+        let first = SecretKey::contact_sync(tenant, "google", Uuid::from_u128(1))
+            .name()
+            .expect("valid");
+        let second = SecretKey::contact_sync(tenant, "google", Uuid::from_u128(2))
+            .name()
+            .expect("valid");
+        assert_ne!(first, second);
+        assert!(first.starts_with("CONTACT_SYNC__"), "{first}");
+        assert!(
+            first.contains(&tenant.simple().to_string().to_uppercase())
+                || first.contains(&tenant.simple().to_string()),
+            "{first}"
+        );
+    }
+
+    /// And it never collides with a payment-gateway secret for the same
+    /// tenant, because the kind is part of the name.
+    #[test]
+    fn kinds_do_not_collide() {
+        let tenant = Uuid::from_u128(7);
+        let gateway = SecretKey::payment_gateway(tenant, "google")
+            .name()
+            .expect("valid");
+        let sync = SecretKey::contact_sync(tenant, "google", Uuid::from_u128(1))
+            .name()
+            .expect("valid");
+        assert_ne!(gateway, sync);
+    }
     use super::*;
 
     const TENANT: Uuid = Uuid::from_u128(1);

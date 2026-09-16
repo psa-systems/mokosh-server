@@ -310,6 +310,7 @@ async fn get_company_contacts(
     Path(company_id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContactResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (contacts, total) = state
         .contact_service
         .get_company_contacts(user.tenant(), company_id, &pagination)
@@ -329,6 +330,7 @@ async fn get_company_sites(
     Path(company_id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<SiteResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (sites, total) = state
         .contact_service
         .get_company_sites(user.tenant(), company_id, &pagination)
@@ -553,6 +555,7 @@ async fn list_company_industries(
     RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<CompanyIndustryResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (rows, total) = state
         .contact_service
         .list_company_industries(user.tenant(), &pagination)

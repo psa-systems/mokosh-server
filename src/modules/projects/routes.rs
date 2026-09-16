@@ -218,6 +218,7 @@ async fn list_project_phases(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ProjectPhaseResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_project_phases(u.tenant(), id, &pagination)
@@ -271,6 +272,7 @@ async fn list_task_statuses(
     RequireProjects { user: u, .. }: RequireProjects,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TaskStatusResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_task_statuses(u.tenant(), &pagination)
@@ -324,6 +326,7 @@ async fn list_project_types(
     RequireProjects { user: u, .. }: RequireProjects,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ProjectTypeResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_project_types(u.tenant(), &pagination)
@@ -378,6 +381,7 @@ async fn list_project_tasks(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TaskResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_project_tasks(u.tenant(), id, &pagination)

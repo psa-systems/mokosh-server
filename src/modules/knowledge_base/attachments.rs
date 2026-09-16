@@ -52,6 +52,7 @@ use crate::db::Database;
 use crate::modules::auth::{RequireManager, TenantId, TenantScoped};
 use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::upload_limits::oversized_upload_error;
 // PMS-941: one allowlist for every publicly-readable image route. SVG is
 // refused there, for the reason the module header of `inline_image` states.
 use crate::utils::inline_image::check_inline_image_mime;
@@ -133,10 +134,7 @@ impl KbAttachmentService {
             return Err(AppError::BadRequest("The uploaded file is empty".into()));
         }
         if bytes.len() as u64 > self.config.max_bytes {
-            return Err(AppError::BadRequest(format!(
-                "Image is larger than the {} KiB limit",
-                self.config.max_bytes / 1024
-            )));
+            return Err(oversized_upload_error("KB image", self.config.max_bytes));
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;

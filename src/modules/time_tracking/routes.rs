@@ -103,6 +103,7 @@ async fn list_work_types(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<WorkTypeResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = state
         .service
         .list_work_types(user.tenant(), &pagination)
@@ -255,6 +256,7 @@ async fn list_timesheets(
     Query(filter): Query<TimesheetFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TimesheetSummaryResponse>>> {
+    pagination.reject_unsupported_sort()?;
     filter.validate()?;
     let (items, total) = state
         .service
@@ -364,6 +366,7 @@ async fn list_active_timers(
     Query(q): Query<ActiveTimersQuery>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ActiveTimerResponse>>> {
+    pagination.reject_unsupported_sort()?;
     // Non-admins always see only their own timer.
     let user_filter = if user.role.is_admin() {
         q.user_id
@@ -529,6 +532,7 @@ async fn list_rounding_rules(
     RequireTimeTracking { user, .. }: RequireTimeTracking,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TimeRoundingRuleResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = state
         .service
         .list_rounding_rules(user.tenant(), &pagination)

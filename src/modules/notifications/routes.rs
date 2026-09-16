@@ -76,6 +76,7 @@ async fn list_channels(
     _a: RequireAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationChannelResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_channels(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -125,6 +126,7 @@ async fn list_templates(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationTemplateResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_templates(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -176,6 +178,7 @@ async fn list_user_prefs(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<UserNotificationPreferenceResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_user_preferences(u.tenant(), u.id, &pagination)
@@ -211,6 +214,7 @@ async fn list_inbox(
     axum::extract::Extension(db): axum::extract::Extension<Database>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationInboxItemResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let tenant = caller.tenant();
     let (items, total) = match &caller {
         CallerContext::Staff(auth) => {
@@ -273,6 +277,7 @@ async fn list_rules(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<NotificationRuleResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_rules(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,

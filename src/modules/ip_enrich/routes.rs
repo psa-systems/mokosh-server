@@ -87,7 +87,7 @@ async fn ip_enrichment(
     let ip: IpAddr =
         q.ip.trim()
             .parse()
-            .map_err(|_| AppError::BadRequest("Invalid IP address".to_string()))?;
+            .map_err(|_| AppError::query_error("ip", "not a valid IP address"))?;
 
     let Some(svc) = s.service.as_ref() else {
         return Ok(Json(None));
