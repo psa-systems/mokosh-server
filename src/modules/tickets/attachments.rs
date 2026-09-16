@@ -923,10 +923,7 @@ async fn attachment_response(
         })
     });
 
-    let disposition = format!(
-        "attachment; filename=\"{}\"",
-        row.file_name.replace('"', "")
-    );
+    let disposition = crate::utils::content_disposition::content_disposition(&row.file_name);
     Ok((
         StatusCode::OK,
         [
