@@ -1029,13 +1029,37 @@ impl ContractsService {
         hours: Decimal,
         when: DateTime<Utc>,
     ) -> AppResult<ConsumeOutcome> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let outcome = self
+            .consume_hours_in_tx(&mut tx, tenant_id, contract_id, hours, when)
+            .await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// The draw half of [`Self::consume_hours`], against a transaction the
+    /// caller already holds open (PMS-1220).
+    ///
+    /// `TimeTrackingService::consume_for_entry` is the reason this exists:
+    /// the candidate read, this draw, and the entry's billing-status stamp
+    /// used to each commit in their own transaction, so a crash between any
+    /// two left the hour-balance ledger and the entry's stamp disagreeing
+    /// with no reconciler to catch it. Sharing one transaction across all
+    /// three makes the whole draw atomic - it either lands in full or not at
+    /// all - rather than compensating for a split after the fact.
+    pub async fn consume_hours_in_tx(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        contract_id: Uuid,
+        hours: Decimal,
+        when: DateTime<Utc>,
+    ) -> AppResult<ConsumeOutcome> {
         if hours < Decimal::ZERO {
             return Err(AppError::BadRequest(
                 "consume_hours: hours must be non-negative".to_string(),
             ));
         }
-
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // 1. block-hours contract item + the contract's billing cycle / start.
         let item = sqlx::query_as::<_, BlockItemRow>(
@@ -1129,8 +1153,6 @@ impl ContractsService {
         .execute(&mut *tx)
         .await?;
 
-        tx.commit().await?;
-
         Ok(ConsumeOutcome {
             hours_applied,
             overage_hours,
@@ -1162,10 +1184,28 @@ impl ContractsService {
         balance_id: Uuid,
         applied: Decimal,
     ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        self.release_hours_in_tx(&mut tx, tenant_id, balance_id, applied)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The give-back half of [`Self::release_hours`], against a transaction
+    /// the caller already holds open (PMS-1220), for the same reason
+    /// [`Self::consume_hours_in_tx`] exists: `TimeTrackingService::release_for_entry`
+    /// claims the entry's stamp and gives the hours back in one commit
+    /// instead of two.
+    pub async fn release_hours_in_tx(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        balance_id: Uuid,
+        applied: Decimal,
+    ) -> AppResult<()> {
         if applied <= Decimal::ZERO {
             return Ok(());
         }
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<BalanceMutRow> = sqlx::query_as(
             r#"SELECT id, hours_used, hours_remaining
                FROM contract_hour_balances
@@ -1196,7 +1236,6 @@ impl ContractsService {
         .bind(row.hours_remaining + give_back)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
         Ok(())
     }
 
