@@ -103,6 +103,29 @@ impl From<ConnectionRow> for ConnectionStatus {
     }
 }
 
+/// What a completed consent did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    Connected(Uuid),
+    /// The same account again, so the existing connection kept its id and
+    /// got the new grant.
+    Reconnected(Uuid),
+}
+
+/// The Settings card's whole read (PMS-1241).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContactSyncOverview {
+    /// `integrations/google_contacts_enabled`. Off hides the connect action
+    /// for everyone and stops every sync; the connection and every imported
+    /// contact are kept.
+    pub enabled: bool,
+    /// This deployment has a Google OAuth client. Without one nobody can
+    /// connect, and the card says so rather than offering a broken button.
+    pub configured: bool,
+    /// `null` when never connected, or disconnected.
+    pub connection: Option<ConnectionStatus>,
+}
+
 /// What one connection looks like to the Settings card.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectionStatus {
@@ -277,6 +300,7 @@ impl ContactSyncService {
     /// URL Google will reject: an operator who has not set the client sees
     /// that, not a Google error page.
     pub async fn begin_connect(&self, tenant_id: TenantId, user_id: Uuid) -> AppResult<String> {
+        self.assert_enabled(tenant_id).await?;
         let client = OauthClient::from_config().ok_or_else(|| {
             AppError::Configuration(
                 "Google Contacts is not configured on this deployment.".to_string(),
@@ -404,6 +428,88 @@ impl ContactSyncService {
         };
         let account_email = oauth::account_email(&self.http, &tokens.access_token).await?;
 
+        let outcome = self
+            .record_connection(tenant_id, started_by, &account_email, &refresh_token)
+            .await?;
+        let flag = match outcome {
+            ConnectOutcome::Connected(_) => "connected",
+            ConnectOutcome::Reconnected(_) => "reconnected",
+        };
+        Ok(format!(
+            "{}/settings/integrations/google-contacts?contact_sync={flag}",
+            self.spa_base_url.trim_end_matches('/')
+        ))
+    }
+
+    /// The half of a connect that follows Google's answer: store the grant
+    /// and the connection row (PMS-1212), or, when the tenant already has a
+    /// live connection to the SAME account, replace its grant (PMS-1241).
+    ///
+    /// Reconnecting is the only way out of `reconnect_required` (PSA-70 J), and
+    /// it must keep the connection: its links, runs, selection and review
+    /// queue all hang off the connection id, and a disconnect-then-connect
+    /// would turn every imported contact into a local record first. A
+    /// DIFFERENT account is refused instead: every link names the account it
+    /// came from, so swapping the account under a live connection would
+    /// attribute one address book's contacts to another.
+    ///
+    /// Public so the suite can drive it without Google's token endpoint; the
+    /// only production caller is [`Self::complete_connect`], after the state
+    /// was verified and consumed.
+    pub async fn record_connection(
+        &self,
+        tenant_id: TenantId,
+        started_by: Uuid,
+        account_email: &str,
+        refresh_token: &str,
+    ) -> AppResult<ConnectOutcome> {
+        let tenant_uuid = tenant_id.get();
+        let ctx = AuditCtx::system(tenant_uuid);
+        if let Some(existing) = self.connection(tenant_id).await? {
+            if !existing.account_email.eq_ignore_ascii_case(account_email) {
+                return Err(AppError::Conflict(format!(
+                    "This organization is connected to {}. Disconnect it before connecting a different Google account.",
+                    existing.account_email
+                )));
+            }
+            self.secrets
+                .put(
+                    &SecretKey::contact_sync(tenant_uuid, &existing.provider, existing.id),
+                    refresh_token,
+                )
+                .await?;
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query(
+                "UPDATE contact_sync_connections SET \
+                     sync_status = CASE WHEN last_sync_at IS NULL THEN 'never' ELSE 'success' END, \
+                     last_error = NULL, consecutive_failures = 0, failure_notified_at = NULL, \
+                     is_active = TRUE, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(existing.id)
+            .execute(&mut *tx)
+            .await?;
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                &ctx,
+                AuditAction::Update,
+                "contact_sync_connections",
+                Some(existing.id),
+                Some(serde_json::json!({ "sync_status": existing.sync_status })),
+                Some(serde_json::json!({
+                    "event": "contact_sync.reconnected",
+                    "provider": existing.provider,
+                    "account_email": existing.account_email,
+                    "reconnected_by_user_id": started_by,
+                })),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(ConnectOutcome::Reconnected(existing.id));
+        }
+
         // The id is minted here so the secret can be stored BEFORE the row
         // exists (PMS-968's ordering): an orphaned secret is harmless, while a
         // row claiming a credential the store never received is an integration
@@ -412,11 +518,10 @@ impl ContactSyncService {
         self.secrets
             .put(
                 &SecretKey::contact_sync(tenant_uuid, GOOGLE, connection_id),
-                &refresh_token,
+                refresh_token,
             )
             .await?;
 
-        let ctx = AuditCtx::system(tenant_uuid);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "INSERT INTO contact_sync_connections \
@@ -427,12 +532,13 @@ impl ContactSyncService {
         .bind(tenant_id)
         .bind(GOOGLE)
         .bind(started_by)
-        .bind(&account_email)
+        .bind(account_email)
         .execute(&mut *tx)
         .await
         .map_err(
             |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                // The live-connection index (migration 220) is the org-level rule.
+                // The live-connection index (migration 220) is the org-level
+                // rule; reaching it here means a connect raced this one.
                 Some("23505") => AppError::Conflict(
                     "This tenant already has a Google Contacts connection. Disconnect it first."
                         .to_string(),
@@ -457,11 +563,7 @@ impl ContactSyncService {
         )
         .await?;
         tx.commit().await?;
-
-        Ok(format!(
-            "{}/settings?contact_sync=connected",
-            self.spa_base_url.trim_end_matches('/')
-        ))
+        Ok(ConnectOutcome::Connected(connection_id))
     }
 
     /// Where to send a browser whose callback failed. The reason is a shape,
@@ -469,9 +571,35 @@ impl ContactSyncService {
     /// history.
     pub fn failure_redirect(&self) -> String {
         format!(
-            "{}/settings?contact_sync=failed",
+            "{}/settings/integrations/google-contacts?contact_sync=failed",
             self.spa_base_url.trim_end_matches('/')
         )
+    }
+
+    /// Everything the Settings card needs before it can decide what to draw
+    /// (PMS-1241): whether the tenant allows the integration, whether this
+    /// deployment can connect at all, and the connection if there is one.
+    pub async fn overview(&self, tenant_id: TenantId) -> AppResult<ContactSyncOverview> {
+        Ok(ContactSyncOverview {
+            enabled: crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id)
+                .await?,
+            configured: OauthClient::from_config().is_some(),
+            connection: self.connection(tenant_id).await?,
+        })
+    }
+
+    /// Refuse while `integrations/google_contacts_enabled` is off (PSA-70 K).
+    /// A 409 naming the setting, because the request is fine and the tenant's
+    /// state is what stands in the way.
+    pub async fn assert_enabled(&self, tenant_id: TenantId) -> AppResult<()> {
+        if crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await? {
+            Ok(())
+        } else {
+            Err(AppError::Conflict(
+                "Google Contacts is turned off for this organization. An administrator can turn it back on in Settings, Integrations."
+                    .to_string(),
+            ))
+        }
     }
 
     /// The tenant's live connection, if any.
@@ -604,10 +732,13 @@ impl ContactSyncService {
     }
 
     /// A provider for the live connection, holding a freshly refreshed token.
+    /// Refused while the integration is turned off: a read of the tenant's
+    /// Google account is exactly what the switch exists to stop.
     async fn source(
         &self,
         tenant_id: TenantId,
     ) -> AppResult<(ConnectionStatus, GoogleContactsProvider)> {
+        self.assert_enabled(tenant_id).await?;
         let connection = self.live_connection(tenant_id).await?;
         let token = self
             .access_token(tenant_id, connection.id, &connection.provider)
@@ -702,6 +833,7 @@ impl ContactSyncService {
 
     /// Queue an import now. The first one after connecting is `initial`.
     pub async fn queue_run(&self, tenant_id: TenantId, ctx: &AuditCtx) -> AppResult<RunStatus> {
+        self.assert_enabled(tenant_id).await?;
         let connection = self.live_connection(tenant_id).await?;
         if connection.selected_groups.is_empty() {
             return Err(AppError::Conflict(
@@ -884,6 +1016,7 @@ impl ContactSyncService {
         resolution: &Resolution,
         ctx: &AuditCtx,
     ) -> AppResult<Resolved> {
+        self.assert_enabled(tenant_id).await?;
         let external_id = match resolution {
             Resolution::Link { external_id, .. }
             | Resolution::Create { external_id }

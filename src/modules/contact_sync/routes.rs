@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use super::runs::RunStatus;
 use super::service::{
-    ConnectionStatus, ContactProvenance, ContactSyncService, DataRemoval, GroupOption, Resolution,
-    Resolved, ReviewItem,
+    ConnectionStatus, ContactProvenance, ContactSyncOverview, ContactSyncService, DataRemoval,
+    GroupOption, Resolution, Resolved, ReviewItem,
 };
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
@@ -93,13 +93,14 @@ pub fn contact_sync_public_routes(service: Arc<ContactSyncService>) -> Router {
         .with_state(state)
 }
 
-/// What the Settings card reads. `None` means never connected, which the card
-/// renders as an offer rather than as an error.
+/// What the Settings card reads (PMS-1241): whether the integration is
+/// allowed, whether this deployment can connect, and the connection or `null`.
+/// Never connected is an offer, not an error.
 async fn get_connection(
     State(state): State<ContactSyncRouterState>,
     RequireAuth(user): RequireAuth,
-) -> AppResult<Json<Option<ConnectionStatus>>> {
-    Ok(Json(state.service.connection(user.tenant()).await?))
+) -> AppResult<Json<ContactSyncOverview>> {
+    Ok(Json(state.service.overview(user.tenant()).await?))
 }
 
 #[derive(Debug, serde::Serialize)]
