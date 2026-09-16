@@ -863,6 +863,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `tokio::spawn(run_forever(..))` cadences.
     scheduler.register(dispatcher, std::time::Duration::from_secs(5));
     scheduler.register(rmm_worker, std::time::Duration::from_secs(60));
+
+    // PMS-1215: Google Contacts import runs. Every 60s the worker resumes runs
+    // whose process died, queues connections past their interval, and drains
+    // the queue; the request that starts an import only inserts a row, so a
+    // closed tab cannot stop one. Its own ContactSyncService, built from the
+    // same secret provider and URLs as the router's, refreshes each run's
+    // access token.
+    let contact_sync_service = std::sync::Arc::new(
+        mokosh_server::modules::contact_sync::ContactSyncService::new(
+            db.clone(),
+            secrets.clone(),
+            config.public_api_base_url.clone(),
+            config.spa_base_url.clone(),
+        ),
+    );
+    let contact_sync_notifications =
+        mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
+            db.clone(),
+            encryption_key,
+        )
+        .with_public_api_base(config.public_api_base_url.clone());
+    scheduler.register(
+        mokosh_server::modules::contact_sync::runs::ContactSyncRunner::new(
+            db.clone(),
+            std::sync::Arc::new(
+                mokosh_server::modules::contact_sync::runs::GoogleSourceFactory::new(
+                    contact_sync_service,
+                ),
+            ),
+            Some(contact_sync_notifications),
+            config.spa_base_url.clone(),
+        ),
+        std::time::Duration::from_secs(60),
+    );
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
     scheduler.register(
         recurring_invoicing_worker,

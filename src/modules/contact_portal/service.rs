@@ -2868,6 +2868,12 @@ impl ContactAuthService {
         request: &super::models::ContactSelfUpdateRequest,
     ) -> AppResult<ContactMe> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1214: a customer correcting their own name on a synced contact
+        // is an edit in Mokosh like any other, and locks the same way.
+        let sync_before = crate::modules::contact_sync::locks::EditSnapshot::capture_if_linked(
+            &mut tx, tenant_id, contact_id,
+        )
+        .await?;
         let rows = sqlx::query(
             r#"
             UPDATE contacts SET
@@ -2892,6 +2898,19 @@ impl ContactAuthService {
         .rows_affected();
         if rows == 0 {
             return Err(AppError::NotFound("Contact".to_string()));
+        }
+        if let Some(sync_before) = sync_before {
+            // The actor is a contact, not a `users` row, so the lock names
+            // nobody in `locked_by_user_id` (the PMS-1089 audit shape).
+            let ctx = crate::modules::audit::AuditCtx::system(tenant_id.get());
+            crate::modules::contact_sync::locks::lock_edited_fields(
+                &mut tx,
+                tenant_id,
+                contact_id,
+                &sync_before,
+                &ctx,
+            )
+            .await?;
         }
         tx.commit().await?;
         self.me(tenant_id.get(), contact_id).await
