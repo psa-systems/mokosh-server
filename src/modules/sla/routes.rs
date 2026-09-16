@@ -68,6 +68,7 @@ async fn list_policies(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<SlaPolicyResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_policies(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -121,6 +122,7 @@ async fn list_targets(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<SlaTargetResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_targets(u.tenant(), id, &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -154,6 +156,7 @@ async fn list_business_hours(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<BusinessHoursResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_business_hours(u.tenant(), &pagination)
@@ -209,6 +212,7 @@ async fn list_holiday_calendars(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<HolidayCalendarResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_holiday_calendars(u.tenant(), &pagination)

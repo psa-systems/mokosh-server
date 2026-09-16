@@ -71,6 +71,7 @@ async fn list_contracts(
     Query(mut f): Query<ContractFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<axum::response::Response> {
+    pagination.reject_unsupported_sort()?;
     use axum::response::IntoResponse;
     f.validate()?;
     // PMS-935: dual-plane sweep. Staff branch keeps the pre-sweep
@@ -199,6 +200,7 @@ async fn list_contract_items(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContractItemResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_contract_items(u.tenant(), id, &pagination)
@@ -259,6 +261,7 @@ async fn get_hour_balance(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ContractHourBalanceResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .get_hour_balance(u.tenant(), id, &pagination)
@@ -276,6 +279,7 @@ async fn list_rate_cards(
     _f: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RateCardResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_rate_cards(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -339,6 +343,7 @@ async fn list_rate_card_items(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<RateCardItemResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_rate_card_items(u.tenant(), id, &pagination)

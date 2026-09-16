@@ -513,6 +513,7 @@ async fn get_ticket_notes(
     Path(ticket_id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketNoteResponse>>> {
+    pagination.reject_unsupported_sort()?;
     // PMS-935: staff branch keeps the full note stream (public,
     // internal, resolution, time_entry) - agent back-channel
     // discussion belongs on the internal notes. Contact branch must
@@ -565,6 +566,7 @@ async fn list_contact_notes(
     Path(contact_id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketNoteResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let policy = state.ticket_service.note_edit_policy(user.tenant()).await?;
     let (notes, total) = state
         .ticket_service
@@ -805,6 +807,7 @@ async fn get_statuses(
     RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketStatus>>> {
+    pagination.reject_unsupported_sort()?;
     let (statuses, total) = state
         .ticket_service
         .get_statuses(user.tenant(), &pagination)
@@ -821,6 +824,7 @@ async fn get_priorities(
     RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketPriority>>> {
+    pagination.reject_unsupported_sort()?;
     let (priorities, total) = state
         .ticket_service
         .get_priorities(user.tenant(), &pagination)
@@ -837,6 +841,7 @@ async fn get_queues(
     RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketQueue>>> {
+    pagination.reject_unsupported_sort()?;
     let (queues, total) = state
         .ticket_service
         .get_queues(user.tenant(), &pagination)
@@ -853,6 +858,7 @@ async fn get_types(
     RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketType>>> {
+    pagination.reject_unsupported_sort()?;
     let (types, total) = state
         .ticket_service
         .get_types(user.tenant(), &pagination)
@@ -1041,6 +1047,7 @@ async fn get_categories(
     RequireAuth(user): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TicketCategoryResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (categories, total) = state
         .ticket_service
         .get_categories(user.tenant(), &pagination)
