@@ -28,6 +28,30 @@ const PHRASES = [
     "Welcome to Mokosh"
 ]
 
+# PMS-1198 (CF-9): unlike the auth mails above, the ticket-note body is a
+# DELIBERATE second copy. `TicketService`'s no-dispatcher fallback (older test
+# fixtures; no `NotificationsService` wired up) has no template to read, so it
+# hand-builds the same sentence the seeded `ticket.note_added` template
+# (migration 148) prints. The two must therefore keep saying the same thing,
+# verbatim, or which document a client receives depends on how the service was
+# constructed - exactly the gap that let migrations 104/110/148 rewrite this
+# same row three times with nobody noticing the fallback had gone stale.
+const TICKET_NOTE_SENTENCE = "has added an update to ticket"
+const TICKET_NOTE_SEED_FILE = "migrations/148_restore_ticket_note_org_identity.sql"
+const TICKET_NOTE_RUST_FILE = "src/modules/tickets/service.rs"
+
+def check_ticket_note_parity [] {
+    let seed_text = (open --raw $TICKET_NOTE_SEED_FILE | decode utf-8)
+    let rust_text = (open --raw $TICKET_NOTE_RUST_FILE | decode utf-8)
+    let in_seed = ($seed_text | str contains $TICKET_NOTE_SENTENCE)
+    let in_rust = ($rust_text | str contains $TICKET_NOTE_SENTENCE)
+    if $in_seed and $in_rust {
+        null
+    } else {
+        {seed_file: $TICKET_NOTE_SEED_FILE, seed_has_it: $in_seed, rust_file: $TICKET_NOTE_RUST_FILE, rust_has_it: $in_rust}
+    }
+}
+
 def main [] {
     let hits = (
         glob src/**/*.rs
@@ -38,6 +62,10 @@ def main [] {
         | flatten
     )
 
+    let ticket_note_mismatch = (check_ticket_note_parity)
+
+    mut ok = true
+
     if ($hits | is-empty) {
         print $"mail copy OK: none of the ($PHRASES | length) seeded template phrases appear under src/"
     } else {
@@ -45,6 +73,21 @@ def main [] {
         print --stderr "The dispatcher renders these bodies from notification_templates; edit the"
         print --stderr "template (in a NEW migration) instead of re-adding a second copy here."
         print --stderr ($hits | table)
+        $ok = false
+    }
+
+    if ($ticket_note_mismatch == null) {
+        print $"ticket-note copy OK: '($TICKET_NOTE_SENTENCE)' appears in both ($TICKET_NOTE_SEED_FILE) and ($TICKET_NOTE_RUST_FILE)"
+    } else {
+        print --stderr "ERROR: the ticket-note copy has diverged between its two sites."
+        print --stderr $"The sentence '($TICKET_NOTE_SENTENCE)' must appear verbatim in both:"
+        print --stderr $"  ($TICKET_NOTE_SEED_FILE) \(the seeded ticket.note_added template\)"
+        print --stderr $"  ($TICKET_NOTE_RUST_FILE) \(the no-dispatcher fallback body\)"
+        print --stderr ($ticket_note_mismatch | table)
+        $ok = false
+    }
+
+    if not $ok {
         exit 1
     }
 }
