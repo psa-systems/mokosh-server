@@ -19,7 +19,7 @@
 //!   land on the same file; favicon/background are new).
 
 use axum::body::Body;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -34,6 +34,7 @@ use crate::modules::branding::assets::{
     asset_path, AssetScope, BrandAssetKind, BrandingAssetStore,
 };
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::upload_limits::body_limit_bytes;
 
 // ============================================================================
 // STAFF - COMPANY SCOPE
@@ -49,18 +50,29 @@ pub struct StaffBrandingState {
 /// - Per-Company (`role.is_admin()` gate + cross-tenant scope check).
 /// - Per-tenant defaults (`role.is_admin()` gate).
 pub fn staff_routes(db: Database) -> Router {
+    let store = BrandingAssetStore::from_env();
+    // PMS-1233: each route accepts all three `BrandAssetKind`s through the
+    // `{asset}` segment, and `store` only picks the per-kind cap once the
+    // body is already buffered, so the route's `DefaultBodyLimit` has to
+    // cover the largest of the three for its scope.
+    let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company(Uuid::nil()));
+    let tenant_max_bytes = store.max_bytes_for_scope(AssetScope::Tenant(Uuid::nil()));
     let state = StaffBrandingState {
         db,
-        store: Arc::new(BrandingAssetStore::from_env()),
+        store: Arc::new(store),
     };
     Router::new()
         .route(
             "/companies/{company_id}/{asset}",
-            put(staff_upload_company_asset).delete(staff_delete_company_asset),
+            put(staff_upload_company_asset)
+                .delete(staff_delete_company_asset)
+                .layer(DefaultBodyLimit::max(body_limit_bytes(company_max_bytes))),
         )
         .route(
             "/tenants/current/branding/{asset}",
-            put(staff_upload_tenant_asset).delete(staff_delete_tenant_asset),
+            put(staff_upload_tenant_asset)
+                .delete(staff_delete_tenant_asset)
+                .layer(DefaultBodyLimit::max(body_limit_bytes(tenant_max_bytes))),
         )
         .with_state(state)
 }
@@ -183,15 +195,20 @@ pub fn contact_routes(
     db: Database,
     contact_service: Arc<crate::modules::contact_portal::ContactAuthService>,
 ) -> Router {
+    let store = BrandingAssetStore::from_env();
+    // PMS-1233: see the matching comment in `staff_routes`.
+    let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company(Uuid::nil()));
     let state = ContactBrandingState {
         db,
-        store: Arc::new(BrandingAssetStore::from_env()),
+        store: Arc::new(store),
         contact_service,
     };
     Router::new()
         .route(
             "/companies/self/{asset}",
-            put(contact_upload_asset).delete(contact_delete_asset),
+            put(contact_upload_asset)
+                .delete(contact_delete_asset)
+                .layer(DefaultBodyLimit::max(body_limit_bytes(company_max_bytes))),
         )
         .with_state(state)
 }
