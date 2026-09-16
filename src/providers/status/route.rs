@@ -248,6 +248,26 @@ mod tests {
     }
 
     /// An admin caller gets HTML with a `text/html` content type.
+    /// PMS-1218: the lock over the process-global CONFIGURATION, which is two
+    /// things and not one: the `BUNYIP_STATUS_*` environment variables, and
+    /// the configuration generation `crate::config::refresh()` replaces.
+    ///
+    /// It was named `env_lock` and taken only by the tests that set the
+    /// variables, which left the generation unguarded - and
+    /// `admin_refresh_applies_and_names_the_operator` asserts on the actor
+    /// recorded in the CURRENT generation. A guard's `refresh()` on another
+    /// thread, at set or at drop, replaced that generation between the
+    /// refresh call and the assertion, and the actor read `System` instead of
+    /// the operator. Every test that mutates the environment, calls
+    /// `refresh()`, or asserts on the generation takes this.
+    ///
+    /// `tokio::sync::Mutex` because the guard is held across `.await`; a
+    /// `std::sync::Mutex` guard would trip `clippy::await_holding_lock`.
+    fn config_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[tokio::test]
     async fn admin_html_is_ok_and_serves_text_html() {
         let auth = AuthState::authenticated(admin_user(), uuid::Uuid::nil());
@@ -323,6 +343,11 @@ mod tests {
     /// report's actor is now the caller's login.
     #[tokio::test]
     async fn admin_refresh_applies_and_names_the_operator() {
+        // PMS-1218: this asserts on the actor recorded in the process-global
+        // configuration generation, so it takes the same lock the env fixture
+        // does. Without it, a `BunyipEnvGuard` refreshing on another thread
+        // replaced the generation between the refresh below and the read.
+        let _g = config_lock().lock().await;
         let auth = AuthState::authenticated(admin_user(), uuid::Uuid::nil());
         let app = test_router(Some(auth));
         let response = app
@@ -406,27 +431,16 @@ mod tests {
     // -- PMS-1193: HTTP Basic machine-credential path -----------------------
     //
     // These tests mutate process-global env and so run under one Mutex so
-    // one setter never wins on another test's compare. The tests are
-    // grouped under a `#[serial]`-style helper rather than `serial_test`
-    // because the crate is not on the workspace and one mutex + one
-    // `refresh()` per test is enough.
-
-    /// One-per-crate lock so no two PMS-1193 tests race on env vars.
-    /// `tokio::sync::Mutex` because the guard is held across `.await`; a
-    /// `std::sync::Mutex` guard would trip `clippy::await_holding_lock`.
-    fn env_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
+    // one setter never wins on another test's compare.
 
     /// Set BOTH env keys, refresh the config generation so the reader sees
     /// them, and return a guard that clears them on drop so the next test
     /// starts blank. Any test in this module that sets the pair MUST take
-    /// `env_lock()` first.
+    /// `config_lock()` first.
     struct BunyipEnvGuard;
     impl BunyipEnvGuard {
         fn set(client_id: &str, client_secret: &str) -> Self {
-            // SAFETY: the crate's tests hold `env_lock()` while mutating
+            // SAFETY: the crate's tests hold `config_lock()` while mutating
             // these variables; the process is single-threaded per test
             // through that mutex.
             unsafe {
@@ -461,7 +475,7 @@ mod tests {
     /// before it consults `RequireAdmin`.
     #[tokio::test]
     async fn bunyip_basic_credential_yields_200() {
-        let _g = env_lock().lock().await;
+        let _g = config_lock().lock().await;
         let _env = BunyipEnvGuard::set("bunyip-status", "s3cret-value");
         let app = test_router(None);
         let response = app
@@ -487,7 +501,7 @@ mod tests {
     /// surfacing.
     #[tokio::test]
     async fn wrong_bunyip_basic_credential_is_401_even_with_admin_session() {
-        let _g = env_lock().lock().await;
+        let _g = config_lock().lock().await;
         let _env = BunyipEnvGuard::set("bunyip-status", "s3cret-value");
         let auth = AuthState::authenticated(admin_user(), uuid::Uuid::nil());
         let app = test_router(Some(auth));
@@ -513,7 +527,7 @@ mod tests {
     /// attempted.
     #[tokio::test]
     async fn admin_session_still_works_alongside_the_new_gate() {
-        let _g = env_lock().lock().await;
+        let _g = config_lock().lock().await;
         let _env = BunyipEnvGuard::set("bunyip-status", "s3cret-value");
         let auth = AuthState::authenticated(admin_user(), uuid::Uuid::nil());
         let app = test_router(Some(auth));
@@ -538,7 +552,7 @@ mod tests {
     /// is not configured.
     #[tokio::test]
     async fn env_unset_delegates_every_request_to_require_admin() {
-        let _g = env_lock().lock().await;
+        let _g = config_lock().lock().await;
         // No BunyipEnvGuard here: the vars stay unset.
         // Refresh so nothing lingers from a prior test.
         // SAFETY: the mutex is held.
