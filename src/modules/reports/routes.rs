@@ -421,7 +421,7 @@ impl ExportFormat {
         } else if raw.eq_ignore_ascii_case("pdf") {
             Ok(Self::Pdf)
         } else {
-            Err(AppError::validation_field(
+            Err(AppError::query_error(
                 "format",
                 format!("must be 'csv' or 'pdf', not {raw}"),
             ))
