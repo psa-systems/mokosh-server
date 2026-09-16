@@ -1184,6 +1184,49 @@ impl AuthService {
         self.ensure_tenant_active(user.tenant_id).await
     }
 
+    /// BUNYIP-674: if the caller's `at+jwt` carries a
+    /// `mokosh_grant_account_id` claim (populated by Bunyip's
+    /// `mint_grant_access_token`), verify the grant is still active
+    /// against the local `mokosh_bunyip_grants` mirror. Called by the
+    /// middleware BEFORE `ensure_principal_usable`, so a revoked grant
+    /// refuses a request within the parent BUNYIP-674 ticket's 30-
+    /// second stale-window budget: the webhook keeps the mirror
+    /// current, and any request past that window falls back to the
+    /// same read on the same table.
+    ///
+    /// A missing claim is a no-op (`Ok(())`) - the caller is on their
+    /// own tenancy, and BUNYIP-673's normal-access path is unaffected.
+    /// A present claim whose (sub, mokosh_grant_account_id) does not
+    /// name an active row returns `Forbidden` with copy that does not
+    /// disclose which half of the check failed; the audit log names
+    /// the caller.
+    pub async fn ensure_grant_still_active_if_claimed(
+        &self,
+        claims: &super::oidc_rs::AtClaims,
+    ) -> AppResult<()> {
+        let Some(account_id) = claims.mokosh_grant_account_id.as_deref() else {
+            return Ok(());
+        };
+        let sub = uuid::Uuid::parse_str(&claims.sub).map_err(|e| {
+            tracing::warn!(sub = %claims.sub, error = %e, "grant claim carries a non-UUID sub");
+            AppError::Unauthorized
+        })?;
+        // SAFETY (PMS-285 / PMS-692): `mokosh_bunyip_grants` has no tenant_id and no RLS
+        // (TENANTLESS_WITHOUT_RLS); this lookup decides which tenant the caller may act in.
+        let active = super::mokosh_bunyip_grants::MokoshBunyipGrantService::is_grant_active(
+            self.db.pool(),
+            sub,
+            account_id,
+        )
+        .await?;
+        if !active {
+            return Err(AppError::Forbidden(
+                "Access to this organization is not active".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
         // SAFETY (PMS-285 / PMS-692): the `tenants` table is the isolation root
         // and is deliberately excluded from RLS (migration 038:
@@ -2713,6 +2756,63 @@ impl AuthService {
         }))
     }
 
+    /// BUNYIP-674 (option B): find the caller's placement inside a
+    /// SPECIFIC tenant, keyed on the bunyip sub rather than on the local
+    /// `users.id`. This is what the grant-scoped request path uses: a
+    /// grantee has their own `users` row in their own tenant AND a
+    /// separately-provisioned row in each granted tenant, so the sub
+    /// alone is not enough to pick which one this request runs under.
+    ///
+    /// Migration 221 backfilled `bunyip_user_id = id` for every existing
+    /// row, so for the OWNER call site (the caller's own tenant) this
+    /// returns the same row [`Self::find_bunyip_principal`] would.
+    ///
+    /// SAFETY (PMS-285/PMS-260): reads the migrator pool for the same
+    /// reason `find_bunyip_principal` does - the caller is not yet
+    /// placed, there is no `app.current_tenant` GUC to set, and the
+    /// (bunyip_user_id, tenant_id) predicate names exactly one row per
+    /// migration 226's partial UNIQUE index.
+    pub async fn find_bunyip_principal_in_tenant(
+        &self,
+        bunyip_user_id: Uuid,
+        tenant_id: Uuid,
+    ) -> AppResult<Option<BunyipPrincipal>> {
+        let row = sqlx::query_as::<_, BunyipPrincipalRow>(
+            r#"
+            SELECT u.id, u.tenant_id, u.email, u.password_hash, u.first_name, u.last_name,
+                   u.phone, u.mobile, u.title, u.avatar_url, u.timezone, u.locale,
+                   u.date_format_string, u.theme_base_mode, u.theme_accent_id, u.role,
+                   u.status, u.email_verified_at, u.last_login_at, u.last_login_country,
+                   u.login_location_alerts, u.mfa_enabled,
+                   u.mfa_secret, u.notification_preferences, u.settings,
+                   u.created_at, u.updated_at, u.password_changed_at, u.profile_completed_at,
+                   (SELECT own_company_id FROM tenants WHERE id = u.tenant_id) AS own_company_id,
+                   EXISTS (
+                       SELECT 1 FROM tenant_invitations i
+                       WHERE u.email_verified_at IS NOT NULL
+                         AND lower(i.email) = lower(btrim(u.email))
+                         AND i.status = 'pending'
+                         AND i.expires_at > NOW()
+                   ) AS has_pending_invite
+            FROM users u
+            WHERE u.bunyip_user_id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+            "#,
+        )
+        .bind(bunyip_user_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+
+        Ok(row.map(|row| {
+            let placement = (row.user.tenant_id, row.user.role.clone());
+            BunyipPrincipal {
+                placement,
+                user: row.user.into(),
+                has_pending_invite: row.has_pending_invite,
+            }
+        }))
+    }
+
     /// MAPPS-348: probe whether a user row exists in the tombstoned state.
     /// The auth middleware runs this on the error path (when the normal
     /// `deleted_at IS NULL` lookup returned nothing) to distinguish
@@ -2965,6 +3065,151 @@ impl AuthService {
         .await?;
         tx.commit().await?;
         self.get_user_by_id(tenant_id, sub).await
+    }
+
+    /// BUNYIP-674 option B: JIT-provision a GRANTEE placement row in a
+    /// tenant the caller does not own. Unlike
+    /// [`Self::upsert_user_from_oidc`] this does not use `sub` as
+    /// `users.id` (which would collide with the grantee's own tenant
+    /// row on the primary key) - it mints a fresh `users.id` and
+    /// records the bunyip sub in `users.bunyip_user_id`. The unique
+    /// index migration 226 added on (bunyip_user_id, tenant_id) is
+    /// the idempotency guard: a duplicate call for the same
+    /// (sub, tenant) upserts through it, un-tombstoning
+    /// `deleted_at` and refreshing role / names in the process (the
+    /// same shape the receiver uses on a re-grant after a revoke).
+    ///
+    /// The grantee's `role` is what the grant carries; there is no
+    /// PMS-447 admin floor here (that floor exists so an owner is at
+    /// least admin of their own tenant, and a grantee is not the
+    /// owner). Every write goes through the migrator pool because
+    /// this row is being CREATED in a tenant the caller has no other
+    /// placement in, so there is no `app.current_tenant` GUC that
+    /// would already be set for the request.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn place_grantee_user(
+        &self,
+        bunyip_user_id: Uuid,
+        tenant_id: Uuid,
+        role: UserRole,
+        email: &str,
+        given_name_hint: Option<&str>,
+        family_name_hint: Option<&str>,
+        email_verified: bool,
+    ) -> AppResult<User> {
+        let first_hint = given_name_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let last_hint = family_name_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (default_first, default_last) = synthetic_name_from_email(email);
+        let seed_first = first_hint.clone().unwrap_or(default_first);
+        let seed_last = last_hint.clone().unwrap_or(default_last);
+        let email_verified_at = if email_verified {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
+        // Fresh row id so the grantee's placement is distinct from
+        // their own-tenant placement (which uses `id = sub`). A
+        // brand-new placement mints this id; the ON CONFLICT branch
+        // keeps the existing id so referential integrity elsewhere
+        // (user_sessions, audit_log, ticket assignments, ...) is
+        // preserved across a revoke/re-grant cycle.
+        let fresh_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+                id, tenant_id, bunyip_user_id, email, role, status,
+                email_verified_at, timezone, first_name, last_name
+            )
+            VALUES ($1, $2, $3, $4, $5, 'active', $6, 'UTC', $7, $8)
+            ON CONFLICT (bunyip_user_id, tenant_id)
+                WHERE bunyip_user_id IS NOT NULL
+            DO UPDATE SET
+                -- A re-grant after a revoke reopens the row: clear the
+                -- tombstone, refresh role from the new grant, and re-stamp
+                -- the address from what userinfo now reports (which the
+                -- caller of this method has already resolved to the same
+                -- verified value the owner path uses). Names stay COALESCE-
+                -- guarded so an empty hint cannot overwrite a real one.
+                deleted_at = NULL,
+                role = EXCLUDED.role,
+                status = 'active',
+                email = EXCLUDED.email,
+                first_name = COALESCE($9, users.first_name),
+                last_name = COALESCE($10, users.last_name),
+                email_verified_at = COALESCE(
+                    users.email_verified_at,
+                    EXCLUDED.email_verified_at
+                ),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(fresh_id)
+        .bind(tenant_id)
+        .bind(bunyip_user_id)
+        .bind(email)
+        .bind(role.as_str())
+        .bind(email_verified_at)
+        .bind(&seed_first)
+        .bind(&seed_last)
+        .bind(&first_hint)
+        .bind(&last_hint)
+        .execute(self.db.migrator_pool())
+        .await?;
+
+        // Read the row back by the unique axis rather than by the id
+        // we bound (the ON CONFLICT branch keeps the existing id, not
+        // `fresh_id`).
+        let row: BunyipPrincipalRow = sqlx::query_as(
+            r#"
+            SELECT u.id, u.tenant_id, u.email, u.password_hash, u.first_name, u.last_name,
+                   u.phone, u.mobile, u.title, u.avatar_url, u.timezone, u.locale,
+                   u.date_format_string, u.theme_base_mode, u.theme_accent_id, u.role,
+                   u.status, u.email_verified_at, u.last_login_at, u.last_login_country,
+                   u.login_location_alerts, u.mfa_enabled,
+                   u.mfa_secret, u.notification_preferences, u.settings,
+                   u.created_at, u.updated_at, u.password_changed_at, u.profile_completed_at,
+                   (SELECT own_company_id FROM tenants WHERE id = u.tenant_id) AS own_company_id,
+                   FALSE AS has_pending_invite
+            FROM users u
+            WHERE u.bunyip_user_id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+            "#,
+        )
+        .bind(bunyip_user_id)
+        .bind(tenant_id)
+        .fetch_one(self.db.migrator_pool())
+        .await?;
+        Ok(row.user.into())
+    }
+
+    /// BUNYIP-674 option B: tombstone a grantee's placement row when
+    /// Bunyip revokes the grant. Soft-deletes via `deleted_at` (the
+    /// same tombstone shape the owner path uses on account deletion)
+    /// so all the FKs on `users.id` stay valid; the placement becomes
+    /// invisible to `find_bunyip_principal_in_tenant` on its next
+    /// read. Idempotent: a second revoke leaves the timestamp on the
+    /// first one.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn tombstone_grantee_placement(
+        &self,
+        bunyip_user_id: Uuid,
+        tenant_id: Uuid,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "UPDATE users SET deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW() \
+             WHERE bunyip_user_id = $1 AND tenant_id = $2",
+        )
+        .bind(bunyip_user_id)
+        .bind(tenant_id)
+        .execute(self.db.migrator_pool())
+        .await?;
+        Ok(())
     }
 
     /// PMS-635: replace the JIT placeholder address with the real one once the
@@ -3242,6 +3487,21 @@ impl AuthService {
     /// slug so the response is indistinguishable from a wrong password
     /// (same status the downstream password-verify path returns), so
     /// the endpoint cannot be walked to enumerate tenant slugs.
+    /// BUNYIP-674 option B: resolve a tenant slug the way the grant
+    /// path needs, returning `Ok(None)` when the slug is unknown
+    /// rather than 401. The grant claim came off a verified at+jwt,
+    /// so an unknown slug is not a bad login attempt to obscure - it
+    /// is an inconsistency between what Bunyip minted and what Mokosh
+    /// mirrors, and the caller logs and refuses at 403 instead of
+    /// pretending it was a wrong password.
+    pub async fn resolve_tenant_slug_opt(&self, slug: &str) -> AppResult<Option<Uuid>> {
+        let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM tenants WHERE slug = $1")
+            .bind(slug)
+            .fetch_optional(self.db.migrator_pool())
+            .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
     async fn resolve_tenant_slug(&self, slug: &str) -> AppResult<Uuid> {
         // Deliberately does NOT filter on `status = 'active'`: a filtered lookup
         // collapses a suspended tenant into "unknown slug" and returns 401, which

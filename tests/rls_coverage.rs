@@ -86,6 +86,15 @@ const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
 ///   `src/modules/auth/service.rs`, `src/modules/tenants/routes.rs`). Its seat
 ///   table, `tenant_memberships`, DOES carry a `tenant_id` and gained the policy
 ///   in migration 195. PMS-1040.
+/// * `mokosh_bunyip_grants` - BUNYIP-674's local mirror of Bunyip's
+///   `mokosh_account_grants` (migration `225_mokosh_bunyip_grants.sql`). It
+///   has no `tenant_id` column: a row names the owner's tenant by slug in
+///   `mokosh_account_id`, and it is cross-tenant BY DESIGN (a grantee's row
+///   names a tenant they do not otherwise belong to), so there is no parent to
+///   join through. `MokoshBunyipGrantService` reads it with no
+///   `app.current_tenant` GUC because the lookup decides WHICH tenant the
+///   caller may act in, and the webhook receiver writes it on the migrator
+///   pool because Bunyip is not authenticated into a tenant.
 /// * `platform_admins` - the platform super-admin registry (MAPPS-513,
 ///   migration `160_platform_admins.sql`), deliberately outside tenancy so the
 ///   persona's credential lifecycle never intersects a tenant admin's identity.
@@ -103,6 +112,7 @@ const TENANTLESS_WITHOUT_RLS: &[&str] = &[
     "app_config",
     "app_secrets",
     "identities",
+    "mokosh_bunyip_grants",
     "platform_admins",
     "tenants",
 ];

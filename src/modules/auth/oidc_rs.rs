@@ -45,6 +45,26 @@ pub struct AtClaims {
     /// mokosh's own role taxonomy (see `effective_role_from_bunyip`, PMS-172).
     #[serde(default)]
     pub bunyip_role: Option<String>,
+    /// BUNYIP-673 / 674: the id of the `mokosh_account_grants` row on
+    /// Bunyip this token was minted for. `Some` on a grant-scoped
+    /// `at+jwt` (Bunyip's `mint_grant_access_token` populates it),
+    /// `None` on every other mint. Kept for observability; the grant
+    /// check itself keys on `(sub, mokosh_grant_account_id)` because a
+    /// revoke-then-regrant on Bunyip mints a new id.
+    #[serde(default)]
+    pub mokosh_grant_id: Option<String>,
+    /// BUNYIP-673 / 674: the role the grant carries, as a string in the
+    /// PMS-1162 vocabulary. When present it names the effective role
+    /// the caller acts under for the granted tenant; the identity-level
+    /// `bunyip_role` stays on the token unchanged for observability.
+    #[serde(default)]
+    pub mokosh_grant_role: Option<String>,
+    /// BUNYIP-673 / 674: the Mokosh tenant slug the grant targets. When
+    /// present, `ensure_principal_usable` consults
+    /// `MokoshBunyipGrantService::is_grant_active(sub, this)` against
+    /// the BUNYIP-674 mirror before letting the caller act.
+    #[serde(default)]
+    pub mokosh_grant_account_id: Option<String>,
 }
 
 /// Subset of bunyip-api's `/oauth2/userinfo` response. The RS calls this on

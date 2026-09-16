@@ -216,6 +216,17 @@ pub fn create_api_router(
         spa_base_url.clone(),
         secrets.clone(),
     );
+    // PMS-1212 (PSA-70): Google Contacts, one-way into the CRM. Takes the
+    // secret provider for the tenant's refresh token, the PUBLIC api base
+    // because that is the origin GOOGLE returns the browser to, and the SPA
+    // origin because that is where the admin is sent afterwards.
+    let contact_sync_service =
+        std::sync::Arc::new(crate::modules::contact_sync::ContactSyncService::new(
+            db.clone(),
+            secrets.clone(),
+            public_api_base_url.clone(),
+            spa_base_url.clone(),
+        ));
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
@@ -509,6 +520,11 @@ pub fn create_api_router(
         .merge(notifications_routes(notifications_service.clone()))
         // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
         .merge(rmm_routes(rmm_service))
+        // PMS-1212 (PSA-70): connect, status and disconnect for the Google
+        // Contacts import. Admin-gated inside, the RMM shape.
+        .merge(crate::modules::contact_sync::routes::contact_sync_routes(
+            contact_sync_service.clone(),
+        ))
         // Reports: dashboard, tickets, time, billing, CSV export. PMS-94.
         .merge(reports_routes(reports_service))
         // PMS-457: saved custom-report definitions (Phase 1; the
@@ -707,6 +723,14 @@ pub fn create_api_router(
             "/webhooks/account-deleted",
             post(crate::modules::auth::bunyip_webhook::account_deleted),
         )
+        // BUNYIP-674: local mirror of Bunyip's mokosh grants so a
+        // revoked grant takes effect on the next request rather than
+        // the next `at+jwt` refresh. Same HMAC signing key the
+        // account-deleted receiver verifies (BUNYIP-332 / PMS-591).
+        .route(
+            "/webhooks/mokosh-grant-changed",
+            post(crate::modules::auth::bunyip_webhook::mokosh_grant_changed),
+        )
         .with_state(bunyip_webhook_state)
         // PMS-298: shared JSON error envelope so a bad request here matches
         // the rest of the API surface.
@@ -782,6 +806,16 @@ pub fn create_api_router(
     // identity, and it resolves its own tenant. Same envelope normalization as
     // the other trees so a 400 here looks like a 400 anywhere else.
     let public_api = Router::new()
+        // PMS-1212 (PSA-70): the OAuth redirect Google sends an admin's
+        // browser to. Unauthenticated by construction - a redirect carries no
+        // session - and its credential is the single-use `state` parameter,
+        // which names the tenant that started the flow. It exposes nothing:
+        // every outcome is a redirect back to the SPA.
+        .merge(
+            crate::modules::contact_sync::routes::contact_sync_public_routes(
+                contact_sync_service.clone(),
+            ),
+        )
         // MAPPS-429: the tenant logo, readable without a session. A client's
         // mail client renders it straight out of the request-form email and
         // will never authenticate.
