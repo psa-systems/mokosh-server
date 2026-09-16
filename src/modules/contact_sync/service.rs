@@ -15,7 +15,7 @@ use super::google::GoogleContactsProvider;
 use super::oauth::{self, OauthClient, Pkce, TokenError};
 use super::provider::{ContactSyncProvider, SourceGroup};
 use super::runs::{RunStatus, RUN_COLUMNS};
-use super::sync::{external_id_digest, fields, ContactSyncEngine, SyncReport};
+use super::sync::{external_id_digest, fields, ContactSyncEngine, ImportPreview, SyncReport};
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
@@ -777,6 +777,22 @@ impl ContactSyncService {
                 member_count: g.member_count,
             })
             .collect())
+    }
+
+    /// What importing would do, without importing (PMS-1242). `group_ids`
+    /// narrows the simulation to that selection so its totals are exact;
+    /// `None` simulates every labelled record for per-label figures.
+    pub async fn preview(
+        &self,
+        tenant_id: TenantId,
+        group_ids: Option<&[String]>,
+    ) -> AppResult<ImportPreview> {
+        let (connection, source) = self.source(tenant_id).await?;
+        let selection: Option<std::collections::BTreeSet<String>> =
+            group_ids.map(|ids| ids.iter().map(|g| g.trim().to_string()).collect());
+        ContactSyncEngine::new(self.db.clone())
+            .preview(tenant_id, connection.id, &source, selection.as_ref())
+            .await
     }
 
     /// Replace the label selection. An empty list stops imports without

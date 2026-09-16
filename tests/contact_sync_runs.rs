@@ -695,6 +695,11 @@ async fn admins_start_imports_and_staff_follow_them(pool: PgPool) {
             "/api/v1/integrations/contact-sync/groups".to_string(),
             None,
         ),
+        (
+            Method::POST,
+            "/api/v1/integrations/contact-sync/preview".to_string(),
+            Some(json!({})),
+        ),
     ] {
         let (status, _) = f.call_as(&tech, method.clone(), &path, body).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
