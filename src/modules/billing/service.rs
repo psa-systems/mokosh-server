@@ -287,9 +287,14 @@ impl BillingService {
     /// The status ladder is unchanged for an invoice with no credits: with
     /// `credited = 0` the first arm cannot fire and the rest reduce to exactly
     /// the pre-PMS-953 expression, zero-total invoices included. Crediting away
-    /// the whole outstanding balance moves the invoice to `void`, which is what
-    /// finally gives that status a writer: before this it was a value the model
-    /// knew and no code path could reach.
+    /// the invoice's full total moves it to `void`, which is what finally
+    /// gives that status a writer: before this it was a value the model knew
+    /// and no code path could reach. The threshold is `i.total`, not the
+    /// already-paid remainder `i.total - p.paid` (PMS-1226): once an invoice
+    /// is fully paid that remainder is zero, so any credit at all, including
+    /// a small post-payment goodwill adjustment (`service.rs`, `create_credit_note`
+    /// documents crediting a paid invoice as intentional), would satisfy it and
+    /// void an invoice that is still paid in full.
     ///
     /// `paid_at` stays keyed on payments alone. A credited invoice was not
     /// paid, and stamping it would put a payment date on money nobody sent.
@@ -314,7 +319,7 @@ impl BillingService {
                 -- status standing.
                 status      = CASE WHEN i.written_off_at IS NOT NULL THEN 'written_off'
                                    WHEN p.credited > 0
-                                    AND p.credited >= i.total - p.paid THEN 'void'
+                                    AND p.credited >= i.total THEN 'void'
                                    WHEN i.total - p.paid - p.credited <= 0 THEN 'paid'
                                    WHEN p.paid > 0 THEN 'partially_paid'
                                    ELSE 'sent' END,
