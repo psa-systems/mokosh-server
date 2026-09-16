@@ -204,7 +204,7 @@ async fn contact_upload_asset(
 ) -> AppResult<Response> {
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
-    require_branding_cap(&state.contact_service, session.tenant_id, session.id).await?;
+    require_branding_cap(&state.contact_service, &session).await?;
     upload_asset(
         &state.store,
         &state.db,
@@ -223,7 +223,7 @@ async fn contact_delete_asset(
 ) -> AppResult<Response> {
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
-    require_branding_cap(&state.contact_service, session.tenant_id, session.id).await?;
+    require_branding_cap(&state.contact_service, &session).await?;
     delete_asset(
         &state.store,
         &state.db,
@@ -470,20 +470,17 @@ async fn verify_company_in_tenant(
     Ok(())
 }
 
-/// Refresh the caller's live capability set from the DB (matches the
-/// pattern in `update_me` from contact_portal/routes.rs) and fail
-/// with 403 when `settings:manage_company_branding` is missing.
+/// PMS-1199: gate on `settings:manage_company_branding` through the one
+/// shared `CallerContext::require_capability` check, rather than a fifth
+/// hand-rolled load-and-check shape. `RequireContactAuth` does not go
+/// through `CallerContext`, so this wraps the session the same way
+/// `contact_portal::routes` does for its own `settings:*`-gated routes.
 async fn require_branding_cap(
     service: &crate::modules::contact_portal::ContactAuthService,
-    tenant_id: Uuid,
-    contact_id: Uuid,
+    session: &crate::modules::contact_portal::models::ContactSession,
 ) -> AppResult<()> {
     use crate::modules::contact_portal::capabilities::SETTINGS_MANAGE_COMPANY_BRANDING;
-    let caps = service.load_capabilities(tenant_id, contact_id).await?;
-    if !caps.iter().any(|c| c == SETTINGS_MANAGE_COMPANY_BRANDING) {
-        return Err(AppError::Forbidden(format!(
-            "Missing required capability: {SETTINGS_MANAGE_COMPANY_BRANDING}"
-        )));
-    }
-    Ok(())
+    crate::modules::auth::CallerContext::Contact(session.clone())
+        .require_capability(SETTINGS_MANAGE_COMPANY_BRANDING, service.db())
+        .await
 }

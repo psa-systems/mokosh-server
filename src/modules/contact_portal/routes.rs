@@ -19,7 +19,7 @@ use validator::Validate;
 use super::middleware::{portal_contact_middleware, ContactAuthMiddleware, RequireContactAuth};
 use super::models::*;
 use super::service::ContactAuthService;
-use crate::modules::auth::TenantId;
+use crate::modules::auth::{CallerContext, TenantId};
 use crate::modules::contact_portal::capabilities as caps;
 use crate::utils::error::{AppError, AppResult};
 
@@ -548,22 +548,13 @@ async fn update_me(
     Json(request): Json<ContactSelfUpdateRequest>,
 ) -> AppResult<Json<ContactMe>> {
     request.validate()?;
-    // Belt-and-braces: reload the effective cap set from
-    // `portal_roles` (mirrors what CallerContext::require_capability
-    // does on the dual-plane routes) so a role revoke lands within
-    // one tick instead of after the JWT TTL. RequireContactAuth
-    // does not go through CallerContext, so the check is inlined
-    // through the service's DB handle here.
-    let capabilities = state
-        .service
-        .load_capabilities(session.tenant_id, session.id)
+    // PMS-1199: `RequireContactAuth` does not go through `CallerContext`,
+    // so wrap the session in one to reach the one shared
+    // `require_capability` check (mirrors what the dual-plane routes do)
+    // instead of hand-rolling a second load-and-check shape here.
+    CallerContext::Contact(session.clone())
+        .require_capability(caps::SETTINGS_MANAGE_OWN, state.service.db())
         .await?;
-    if !capabilities.iter().any(|c| c == caps::SETTINGS_MANAGE_OWN) {
-        return Err(AppError::Forbidden(format!(
-            "Missing required capability: {}",
-            caps::SETTINGS_MANAGE_OWN
-        )));
-    }
     let tenant = TenantId::from_trusted(session.tenant_id);
     let me = state
         .service
@@ -582,19 +573,9 @@ async fn get_own_company_branding(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
 ) -> AppResult<Json<ContactOwnCompanyBranding>> {
-    let capabilities = state
-        .service
-        .load_capabilities(session.tenant_id, session.id)
+    CallerContext::Contact(session.clone())
+        .require_capability(caps::SETTINGS_MANAGE_COMPANY_BRANDING, state.service.db())
         .await?;
-    if !capabilities
-        .iter()
-        .any(|c| c == caps::SETTINGS_MANAGE_COMPANY_BRANDING)
-    {
-        return Err(AppError::Forbidden(format!(
-            "Missing required capability: {}",
-            caps::SETTINGS_MANAGE_COMPANY_BRANDING
-        )));
-    }
     let out = state
         .service
         .load_own_company_branding(session.tenant_id, session.company_id)
@@ -613,19 +594,9 @@ async fn update_own_company_branding(
     RequireContactAuth(session): RequireContactAuth,
     Json(branding): Json<serde_json::Value>,
 ) -> AppResult<Json<ContactOwnCompanyBranding>> {
-    let capabilities = state
-        .service
-        .load_capabilities(session.tenant_id, session.id)
+    CallerContext::Contact(session.clone())
+        .require_capability(caps::SETTINGS_MANAGE_COMPANY_BRANDING, state.service.db())
         .await?;
-    if !capabilities
-        .iter()
-        .any(|c| c == caps::SETTINGS_MANAGE_COMPANY_BRANDING)
-    {
-        return Err(AppError::Forbidden(format!(
-            "Missing required capability: {}",
-            caps::SETTINGS_MANAGE_COMPANY_BRANDING
-        )));
-    }
     if !branding.is_object() {
         return Err(AppError::validation_field(
             "branding",
@@ -774,27 +745,16 @@ struct StartAddPaymentMethodResponse {
 
 /// MAPPS-674 gate: the shared capability check. Contact plane only; a staff
 /// caller reaching a `/api/v1/contact/*` route is a plane misuse elsewhere
-/// and is already 401 at the middleware. The list uses the same check to
-/// stay consistent with the SPA's read-then-render posture.
+/// and is already 401 at the middleware. PMS-1199: this is a thin wrapper
+/// over `CallerContext::require_capability` (the one place the 403 message
+/// is built) rather than its own hand-rolled load-and-check.
 async fn require_manage_own(
     state: &ContactRouterState,
     session: &super::models::ContactSession,
 ) -> AppResult<()> {
-    let caps = state
-        .service
-        .load_capabilities(session.tenant_id, session.id)
-        .await?;
-    if caps
-        .iter()
-        .any(|c| c == super::capabilities::PAYMENT_METHODS_MANAGE_OWN)
-    {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden(format!(
-            "Missing required capability: {}",
-            super::capabilities::PAYMENT_METHODS_MANAGE_OWN
-        )))
-    }
+    CallerContext::Contact(session.clone())
+        .require_capability(caps::PAYMENT_METHODS_MANAGE_OWN, state.service.db())
+        .await
 }
 
 async fn list_payment_methods(
