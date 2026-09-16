@@ -104,6 +104,7 @@ async fn list_asset_types(
     RequireAssets { user: u, .. }: RequireAssets,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetTypeResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s.service.list_asset_types(u.tenant(), &pagination).await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
@@ -154,6 +155,7 @@ async fn list_assets(
     Query(mut f): Query<AssetFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<axum::response::Response> {
+    pagination.reject_unsupported_sort()?;
     use axum::response::IntoResponse;
     f.validate()?;
     // PMS-935: dual-plane sweep. Contact callers must hold
@@ -273,6 +275,7 @@ async fn list_asset_relationships(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetRelationshipResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_asset_relationships(u.tenant(), id, &pagination)
@@ -374,6 +377,7 @@ async fn list_configuration_items(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ConfigurationItemSummary>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_configuration_items(u.tenant(), id, &pagination)
@@ -427,6 +431,7 @@ async fn list_credentials(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<CredentialSummary>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_credentials(u.tenant(), id, &pagination)
@@ -480,6 +485,7 @@ async fn list_asset_audit_log(
     Path(id): Path<Uuid>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AssetAuditLogResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_asset_audit_log(u.tenant(), id, &pagination)

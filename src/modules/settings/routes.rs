@@ -172,6 +172,7 @@ async fn list_settings(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TenantSettingResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_tenant_settings(u.tenant(), &pagination)
@@ -204,6 +205,7 @@ async fn list_module_configs(
     RequireAuth(u): RequireAuth,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ModuleConfigResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (items, total) = s
         .service
         .list_module_configs(u.tenant(), &pagination)

@@ -198,6 +198,7 @@ async fn list_payment_terms(
     _finance: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<PaymentTermResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (terms, total) = state
         .service
         .list_payment_terms(user.tenant(), &pagination)
@@ -255,6 +256,7 @@ async fn list_tax_rates(
     _finance: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TaxRateResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (rates, total) = state
         .service
         .list_tax_rates(user.tenant(), &pagination)
@@ -393,6 +395,7 @@ async fn list_payment_gateways(
     _finance: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<PaymentGatewayConfigResponse>>> {
+    pagination.reject_unsupported_sort()?;
     let (gateways, total) = state
         .service
         .list_payment_gateways(user.tenant(), &pagination)
@@ -666,6 +669,7 @@ async fn list_credit_notes(
     Query(filter): Query<CreditNoteFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<CreditNoteResponse>>> {
+    pagination.reject_unsupported_sort()?;
     filter.validate()?;
     let (notes, total) = state
         .service
@@ -1204,6 +1208,7 @@ async fn list_products(
     Query(filter): Query<ProductFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<ProductResponse>>> {
+    pagination.reject_unsupported_sort()?;
     filter.validate()?;
     let (products, total) = state
         .service
