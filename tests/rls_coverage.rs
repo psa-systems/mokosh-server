@@ -53,16 +53,7 @@ use sqlx::PgPool;
 ///   Decided in migration `154_tenant_membership_entitlements.sql`'s header
 ///   (MAPPS-459 / PMS-728) and restated at the call site; PMS-1040 moved it here
 ///   because a rule recorded only in prose is not a rule.
-/// * `mokosh_bunyip_grants` - BUNYIP-674's local mirror of Bunyip's
-///   `mokosh_account_grants`. A row is cross-tenant BY DESIGN (a grantee's
-///   row names an owner's tenant they do not otherwise belong to), so a
-///   `tenant_isolation` policy on the grantee's own tenant would refuse
-///   the lookup that decides whether the caller may act in the owner's
-///   tenant. `MokoshBunyipGrantService` reads the table with no
-///   `app.current_tenant` GUC for the same reason `tenant_membership_
-///   entitlements` above does; the webhook receiver writes it on the
-///   migrator pool because Bunyip is not authenticated into a tenant.
-const ALLOWED_WITHOUT_RLS: &[&str] = &["mokosh_bunyip_grants", "tenant_membership_entitlements"];
+const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
 
 /// Tables with NO `tenant_id` column that legitimately carry no
 /// `tenant_isolation` policy. Keep sorted; every entry states its reason.
@@ -95,6 +86,15 @@ const ALLOWED_WITHOUT_RLS: &[&str] = &["mokosh_bunyip_grants", "tenant_membershi
 ///   `src/modules/auth/service.rs`, `src/modules/tenants/routes.rs`). Its seat
 ///   table, `tenant_memberships`, DOES carry a `tenant_id` and gained the policy
 ///   in migration 195. PMS-1040.
+/// * `mokosh_bunyip_grants` - BUNYIP-674's local mirror of Bunyip's
+///   `mokosh_account_grants` (migration `225_mokosh_bunyip_grants.sql`). It
+///   has no `tenant_id` column: a row names the owner's tenant by slug in
+///   `mokosh_account_id`, and it is cross-tenant BY DESIGN (a grantee's row
+///   names a tenant they do not otherwise belong to), so there is no parent to
+///   join through. `MokoshBunyipGrantService` reads it with no
+///   `app.current_tenant` GUC because the lookup decides WHICH tenant the
+///   caller may act in, and the webhook receiver writes it on the migrator
+///   pool because Bunyip is not authenticated into a tenant.
 /// * `platform_admins` - the platform super-admin registry (MAPPS-513,
 ///   migration `160_platform_admins.sql`), deliberately outside tenancy so the
 ///   persona's credential lifecycle never intersects a tenant admin's identity.
@@ -112,6 +112,7 @@ const TENANTLESS_WITHOUT_RLS: &[&str] = &[
     "app_config",
     "app_secrets",
     "identities",
+    "mokosh_bunyip_grants",
     "platform_admins",
     "tenants",
 ];

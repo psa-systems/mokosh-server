@@ -33,9 +33,8 @@
 --
 -- RLS: this table is cross-tenant BY DESIGN (a grantee's row names an
 -- owner's tenant they do not otherwise belong to), so it stays outside
--- the standard tenant_isolation policy. `tenant_membership_entitlements`
--- takes the same shape and is listed in `tests/rls_coverage.rs`'s
--- `ALLOWED_WITHOUT_RLS` allowlist; this table follows.
+-- the standard tenant_isolation policy. It has no `tenant_id` column, so
+-- `tests/rls_coverage.rs` lists it in `TENANTLESS_WITHOUT_RLS`.
 CREATE TABLE mokosh_bunyip_grants (
     id                     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     grantee_bunyip_user_id UUID        NOT NULL,

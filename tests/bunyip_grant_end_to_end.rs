@@ -167,13 +167,15 @@ impl StubOp {
 /// so this file has no dependency on the owner-provisioning path.
 async fn seed_tenant(pool: &PgPool, slug: &str) -> Uuid {
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO tenants (id, name, slug, status) VALUES ($1, $2, $3, 'active')")
-        .bind(id)
-        .bind(format!("Tenant {slug}"))
-        .bind(slug)
-        .execute(pool)
-        .await
-        .expect("seed tenant");
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) VALUES ($1, $2, $3, 'active', 'org')",
+    )
+    .bind(id)
+    .bind(format!("Tenant {slug}"))
+    .bind(slug)
+    .execute(pool)
+    .await
+    .expect("seed tenant");
     id
 }
 

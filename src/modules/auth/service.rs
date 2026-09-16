@@ -1207,7 +1207,12 @@ impl AuthService {
         let Some(account_id) = claims.mokosh_grant_account_id.as_deref() else {
             return Ok(());
         };
-        let sub = uuid::Uuid::parse_str(&claims.sub).map_err(|_| AppError::Unauthorized)?;
+        let sub = uuid::Uuid::parse_str(&claims.sub).map_err(|e| {
+            tracing::warn!(sub = %claims.sub, error = %e, "grant claim carries a non-UUID sub");
+            AppError::Unauthorized
+        })?;
+        // SAFETY (PMS-285 / PMS-692): `mokosh_bunyip_grants` has no tenant_id and no RLS
+        // (TENANTLESS_WITHOUT_RLS); this lookup decides which tenant the caller may act in.
         let active = super::mokosh_bunyip_grants::MokoshBunyipGrantService::is_grant_active(
             self.db.pool(),
             sub,
@@ -2766,7 +2771,7 @@ impl AuthService {
     /// reason `find_bunyip_principal` does - the caller is not yet
     /// placed, there is no `app.current_tenant` GUC to set, and the
     /// (bunyip_user_id, tenant_id) predicate names exactly one row per
-    /// migration 221's partial UNIQUE index.
+    /// migration 226's partial UNIQUE index.
     pub async fn find_bunyip_principal_in_tenant(
         &self,
         bunyip_user_id: Uuid,
@@ -3068,7 +3073,7 @@ impl AuthService {
     /// `users.id` (which would collide with the grantee's own tenant
     /// row on the primary key) - it mints a fresh `users.id` and
     /// records the bunyip sub in `users.bunyip_user_id`. The unique
-    /// index migration 221 added on (bunyip_user_id, tenant_id) is
+    /// index migration 226 added on (bunyip_user_id, tenant_id) is
     /// the idempotency guard: a duplicate call for the same
     /// (sub, tenant) upserts through it, un-tombstoning
     /// `deleted_at` and refreshing role / names in the process (the

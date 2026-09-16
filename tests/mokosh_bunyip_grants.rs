@@ -369,7 +369,7 @@ async fn find_bunyip_principal_in_tenant_returns_the_row_for_that_tenant(pool: P
         (tenant_a, "TenantA", "tenant-a"),
         (tenant_b, "TenantB", "tenant-b"),
     ] {
-        sqlx::query("INSERT INTO tenants (id, name, slug, status) VALUES ($1, $2, $3, 'active')")
+        sqlx::query("INSERT INTO tenants (id, name, slug, status, kind) VALUES ($1, $2, $3, 'active', 'org')")
             .bind(id)
             .bind(name)
             .bind(slug)
@@ -528,8 +528,8 @@ async fn place_grantee_user_jits_the_row_and_is_idempotent(pool: PgPool) {
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let tenant_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO tenants (id, name, slug, status) \
-         VALUES ($1, 'Acme', 'acme', 'active')",
+        "INSERT INTO tenants (id, name, slug, status, kind) \
+         VALUES ($1, 'Acme', 'acme', 'active', 'org')",
     )
     .bind(tenant_id)
     .execute(&pool)
@@ -597,8 +597,8 @@ async fn tombstone_then_reinstate_via_place_grantee_user(pool: PgPool) {
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let tenant_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO tenants (id, name, slug, status) \
-         VALUES ($1, 'Acme', 'acme', 'active')",
+        "INSERT INTO tenants (id, name, slug, status, kind) \
+         VALUES ($1, 'Acme', 'acme', 'active', 'org')",
     )
     .bind(tenant_id)
     .execute(&pool)
@@ -674,11 +674,13 @@ async fn tombstone_then_reinstate_via_place_grantee_user(pool: PgPool) {
 async fn a_row_with_no_bunyip_user_id_is_invisible_to_the_new_resolver(pool: PgPool) {
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let tenant_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO tenants (id, name, slug, status) VALUES ($1, 'T', 't', 'active')")
-        .bind(tenant_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) VALUES ($1, 'T', 't', 'active', 'org')",
+    )
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // Pre-BUNYIP-674 shape: id = sub, bunyip_user_id defaulted to NULL.
     let sub = Uuid::new_v4();
