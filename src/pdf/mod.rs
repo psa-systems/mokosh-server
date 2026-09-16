@@ -73,10 +73,12 @@
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
+use chrono::{Datelike, NaiveDate};
 use printpdf::{
-    Color, FontId, Line, LinePoint, Mm, Op, PaintMode, ParsedFont, PdfDocument, PdfFont,
+    Color, Date as PdfDate, FontId, Line, LinePoint, Mm, Offset as PdfOffset,
+    OffsetDateTime as PdfOffsetDateTime, Op, PaintMode, ParsedFont, PdfDocument, PdfFont,
     PdfFontHandle, PdfPage, PdfSaveOptions, Point, Polygon, PolygonRing, Pt, RawImage, Rgb,
-    TextItem, WindingOrder, XObjectId, XObjectTransform,
+    TextItem, Time as PdfTime, WindingOrder, XObjectId, XObjectTransform,
 };
 
 use serde::{Deserialize, Serialize};
@@ -747,17 +749,53 @@ fn subset_face(weight: Weight, face: &ParsedFont, used: &BTreeSet<char>) -> Opti
     subset
 }
 
-/// Render a document to PDF bytes.
+/// Turn a calendar date into the midnight-UTC timestamp printpdf's
+/// `metadata.info` wants.
+///
+/// PMS-1206: the caller owns which date this is (an invoice's `invoice_date`,
+/// a credit note's `issue_date`, or today for a live report), never
+/// `SystemTime::now()` read here, so [`render`] stays a pure function of its
+/// input and two renders of the same document keep producing the same bytes.
+fn document_date(date: NaiveDate) -> PdfOffsetDateTime {
+    PdfOffsetDateTime {
+        date: PdfDate {
+            year: date.year(),
+            month: date.month() as u8,
+            day: date.day() as u8,
+        },
+        time: PdfTime {
+            hour: 0,
+            minute: 0,
+            second: 0,
+            millisecond: 0,
+        },
+        offset: PdfOffset {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            milliseconds: 0,
+        },
+    }
+}
+
+/// Render a document to PDF bytes, stamped with `generated_on`.
+///
+/// PMS-1206: `generated_on` is the document's own date, not the system clock,
+/// so this stays a pure function of its input: the same document and date
+/// render to the same bytes every time (see `rendering_is_deterministic`).
 ///
 /// Fails only when the vendored faces will not parse, which is a broken build
 /// rather than a bad document: see [`faces`].
-pub fn render(document: &Document) -> AppResult<Vec<u8>> {
+pub fn render(document: &Document, generated_on: NaiveDate) -> AppResult<Vec<u8>> {
     let faces = faces()?;
     let theme = Theme::resolve(document.template, document.accent.as_deref());
     // The title also goes in the document information dictionary, which
     // printpdf writes as UTF-16BE, so that copy carries any character at all
     // and is passed through unfolded.
     let mut doc = PdfDocument::new(&document.title);
+    let stamp = document_date(generated_on);
+    doc.metadata.info.creation_date = stamp;
+    doc.metadata.info.modification_date = stamp;
     let mut layout = Layout::new(faces, theme);
 
     if theme.band {
@@ -861,6 +899,11 @@ pub fn render(document: &Document) -> AppResult<Vec<u8>> {
 /// PDF specification says a newly created file should carry anyway: the pair is
 /// "original" and "current", and for a document that has never been updated
 /// they are equal.
+///
+/// PMS-1206: `metadata.info`'s `CreationDate`/`ModDate` are set from
+/// [`render`]'s `generated_on` argument rather than left at printpdf's epoch
+/// default, so this is the only remaining source of non-determinism between
+/// two renders of the same input.
 ///
 /// The replacement is the same length as what it replaces, so no byte offset
 /// moves and the cross-reference table stays valid. A change in printpdf that
@@ -1524,6 +1567,17 @@ fn truncate_to(text: &str, width_mm: f32, size_pt: f32) -> String {
 mod tests {
     use super::*;
 
+    /// PMS-1206: `rendering_is_deterministic` needs the same input on every
+    /// call, `generated_on` included, so every test renders with this fixed
+    /// date rather than each other's or `Utc::now()`.
+    fn test_date() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 1, 15).expect("valid date")
+    }
+
+    fn render_dated(document: &Document) -> AppResult<Vec<u8>> {
+        render(document, test_date())
+    }
+
     fn sample() -> Document {
         Document::new("Ticket Volume")
             .subtitle("2026-01-01 to 2026-01-31")
@@ -1548,7 +1602,7 @@ mod tests {
     /// `Content-Type` makes.
     #[test]
     fn a_rendered_document_is_a_pdf() {
-        let bytes = render(&sample()).expect("render");
+        let bytes = render_dated(&sample()).expect("render");
         assert!(bytes.starts_with(b"%PDF-"), "a PDF starts with its magic");
         assert!(
             bytes.windows(5).any(|w| w == b"%%EOF"),
@@ -1583,28 +1637,46 @@ mod tests {
     ///
     /// PMS-911 rests on this: "a later rebrand leaves the rendered invoice
     /// byte-identical" is only checkable if rendering is deterministic in the
-    /// first place. It is, because printpdf's `PdfDocumentInfo::default()` sets
-    /// the creation, modification and metadata dates to the unix epoch rather
-    /// than to `now()`. That is a property of a dependency rather than of this
-    /// code, which is exactly why it is pinned: an upgrade that started
-    /// stamping the real time would break the acceptance criterion silently,
-    /// and every test of it would keep passing while comparing two documents
-    /// rendered in the same second.
+    /// first place. It is, because [`render`] never reads the system clock:
+    /// `generated_on` (PMS-1206) is an explicit argument, and `render_dated`
+    /// passes the same fixed [`test_date`] on every call here, so two renders
+    /// of the same document agree regardless of what second the test runs in.
     #[test]
     fn rendering_is_deterministic() {
-        let first = render(&sample()).expect("render");
-        let second = render(&sample()).expect("render");
+        let first = render_dated(&sample()).expect("render");
+        let second = render_dated(&sample()).expect("render");
         assert_eq!(first, second, "two renders of one document must agree");
 
-        let with_logo = render(&sample().logo(Some(logo()))).expect("render");
+        let with_logo = render_dated(&sample().logo(Some(logo()))).expect("render");
         assert_eq!(
             with_logo,
-            render(&sample().logo(Some(logo()))).expect("render"),
+            render_dated(&sample().logo(Some(logo()))).expect("render"),
             "and so must two renders carrying an image"
         );
         assert_ne!(
             first, with_logo,
             "a logo has to actually reach the document, or the test above proves nothing"
+        );
+    }
+
+    /// PMS-1206: `CreationDate`/`ModDate` carry the caller's date, not the
+    /// unix epoch printpdf defaults to.
+    #[test]
+    fn the_rendered_pdf_is_stamped_with_the_given_date() {
+        let bytes =
+            render(&sample(), NaiveDate::from_ymd_opt(2026, 3, 7).unwrap()).expect("render");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("/CreationDate(D:20260307"),
+            "expected a 2026-03-07 CreationDate, got: {text}"
+        );
+        assert!(
+            text.contains("/ModDate(D:20260307"),
+            "expected a 2026-03-07 ModDate, got: {text}"
+        );
+        assert!(
+            !text.contains("D:19700101"),
+            "the epoch default must not survive into the stamped document"
         );
     }
 
@@ -1619,11 +1691,11 @@ mod tests {
             max_width_mm: 40.0,
             max_height_mm: 20.0,
         };
-        let rendered = render(&sample().logo(Some(broken))).expect("still renders");
+        let rendered = render_dated(&sample().logo(Some(broken))).expect("still renders");
         assert!(rendered.starts_with(b"%PDF-"));
         assert_eq!(
             rendered,
-            render(&sample()).expect("render"),
+            render_dated(&sample()).expect("render"),
             "and what comes out is exactly the document with no logo"
         );
     }
@@ -1640,16 +1712,21 @@ mod tests {
                 "Sydney NSW 2000".into(),
             ],
         );
-        let bytes = render(&doc).expect("render");
+        let bytes = render_dated(&doc).expect("render");
         assert!(bytes.starts_with(b"%PDF-"));
-        assert!(bytes.len() > render(&Document::new("Invoice")).expect("render").len());
+        assert!(
+            bytes.len()
+                > render_dated(&Document::new("Invoice"))
+                    .expect("render")
+                    .len()
+        );
     }
 
     /// An empty document still renders one page. A zero-page PDF parses in some
     /// readers and not others, which is a worse answer than a blank sheet.
     #[test]
     fn a_document_with_no_sections_still_has_a_page() {
-        let bytes = render(&Document::new("Nothing")).expect("render");
+        let bytes = render_dated(&Document::new("Nothing")).expect("render");
         assert!(bytes.starts_with(b"%PDF-"));
     }
 
@@ -1666,8 +1743,8 @@ mod tests {
             .map(|i| vec![format!("row {i}"), i.to_string()])
             .collect();
         let doc = Document::new("Long").table("Rows", vec!["Label".into(), "Count".into()], rows);
-        let long = page_count(&render(&doc).expect("render"));
-        let short = page_count(&render(&sample()).expect("render"));
+        let long = page_count(&render_dated(&doc).expect("render"));
+        let short = page_count(&render_dated(&sample()).expect("render"));
         assert_eq!(short, 1, "the sample fits on one page");
         assert!(long > short, "400 rows do not: {long} pages");
     }
@@ -1788,13 +1865,16 @@ mod tests {
                 ("Tax".into(), "0.00 USD".into()),
                 ("Balance due".into(), "300.00 USD".into()),
             ]);
-        let first = render(&doc).expect("render");
-        let second = render(&doc).expect("render");
+        let first = render_dated(&doc).expect("render");
+        let second = render_dated(&doc).expect("render");
         assert!(first.starts_with(b"%PDF-"));
         assert_eq!(first, second, "the new shapes are deterministic");
         assert_eq!(page_count(&first), 1);
         assert!(
-            first.len() > render(&Document::new("Invoice")).expect("render").len(),
+            first.len()
+                > render_dated(&Document::new("Invoice"))
+                    .expect("render")
+                    .len(),
             "and they drew something"
         );
     }
@@ -1988,8 +2068,8 @@ mod tests {
             .map(|key| {
                 let template = Template::from_key(key).expect("key");
                 let doc = invoice_of(6).template(template);
-                let first = render(&doc).expect("render");
-                let second = render(&invoice_of(6).template(template)).expect("render");
+                let first = render_dated(&doc).expect("render");
+                let second = render_dated(&invoice_of(6).template(template)).expect("render");
                 assert_eq!(first, second, "{key} must render the same bytes twice");
                 assert!(first.starts_with(b"%PDF-"), "{key} must be a PDF");
                 first
@@ -2018,7 +2098,7 @@ mod tests {
             "a value the validator never saw falls back rather than reaching the page"
         );
         let doc = |accent: Option<&str>| {
-            render(
+            render_dated(
                 &invoice_of(3)
                     .template(Template::Modern)
                     .accent(accent.map(str::to_string)),
@@ -2042,7 +2122,7 @@ mod tests {
     #[test]
     fn band_text_is_dark_on_a_pale_accent_and_light_on_a_dark_one() {
         let render_with = |accent: &str| {
-            render(
+            render_dated(
                 &invoice_of(3)
                     .template(Template::Modern)
                     .accent(Some(accent.to_string())),
@@ -2074,7 +2154,7 @@ mod tests {
     #[test]
     fn a_thirty_line_invoice_takes_fewer_pages_in_compact() {
         let pages = |template: Template| {
-            page_count(&render(&invoice_of(30).template(template)).expect("render"))
+            page_count(&render_dated(&invoice_of(30).template(template)).expect("render"))
         };
         let classic = pages(Template::Classic);
         let compact = pages(Template::Compact);
@@ -2129,15 +2209,15 @@ mod tests {
         let with = invoice_of(3).footer(vec!["Payment terms: Net 30".to_string()]);
         let without = invoice_of(3).footer(Vec::new());
         assert_eq!(
-            render(&with.template(Template::Classic)).expect("render"),
-            render(&without.template(Template::Classic)).expect("render"),
+            render_dated(&with.template(Template::Classic)).expect("render"),
+            render_dated(&without.template(Template::Classic)).expect("render"),
             "Classic prints no footer, so carrying the lines changes nothing"
         );
         let with = invoice_of(3).footer(vec!["Payment terms: Net 30".to_string()]);
         let without = invoice_of(3).footer(Vec::new());
         assert_ne!(
-            render(&with.template(Template::Modern)).expect("render"),
-            render(&without.template(Template::Modern)).expect("render"),
+            render_dated(&with.template(Template::Modern)).expect("render"),
+            render_dated(&without.template(Template::Modern)).expect("render"),
             "Modern prints one"
         );
     }
@@ -2181,7 +2261,7 @@ mod tests {
             )])
             .totals(vec![("Balance due".into(), "1500.00 \u{20ac}".into())]);
 
-        let text = extracted_text(&render(&doc).expect("render"));
+        let text = extracted_text(&render_dated(&doc).expect("render"));
         for expected in [
             "\u{141}ukasiewicz",
             "\u{3a0}\u{3b1}\u{3c0}\u{3b1}\u{3b4}\u{3cc}\u{3c0}\u{3bf}\u{3c5}\u{3bb}\u{3bf}\u{3c2}",
@@ -2233,7 +2313,7 @@ mod tests {
     /// size, which is only true if each carries its own glyphs.
     #[test]
     fn a_document_carries_only_the_glyphs_it_draws() {
-        let latin = render(&one_line_invoice(vec![
+        let latin = render_dated(&one_line_invoice(vec![
             "NiceGuy IT".to_string(),
             "1 Customer Way".to_string(),
         ]))
@@ -2244,7 +2324,7 @@ mod tests {
             latin.len()
         );
 
-        let mixed = render(&one_line_invoice(vec![
+        let mixed = render_dated(&one_line_invoice(vec![
             "\u{141}ukasiewicz Sp. z o.o.".to_string(),
             "\u{418}\u{432}\u{430}\u{43d}\u{43e}\u{432}".to_string(),
             "\u{3a0}\u{3b1}\u{3c0}\u{3b1}\u{3b4}\u{3cc}\u{3c0}\u{3bf}\u{3c5}".to_string(),
@@ -2315,7 +2395,7 @@ mod tests {
             .lines("Bill to", vec!["\u{4e2d}\u{6587} \u{4e2d} Ltd".to_string()]);
         let bytes = tracing::subscriber::with_default(
             tracing_subscriber::registry().with(WarningLayer(warnings.clone())),
-            || render(&doc).expect("render"),
+            || render_dated(&doc).expect("render"),
         );
 
         assert!(
@@ -2349,7 +2429,7 @@ mod tests {
         let warnings = std::sync::Arc::new(Warnings::default());
         tracing::subscriber::with_default(
             tracing_subscriber::registry().with(WarningLayer(warnings.clone())),
-            || render(&sample().logo(Some(logo()))).expect("render"),
+            || render_dated(&sample().logo(Some(logo()))).expect("render"),
         );
         assert!(
             warnings.0.lock().expect("warning log").is_empty(),
