@@ -11,7 +11,10 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
+use super::google::GoogleContactsProvider;
 use super::oauth::{self, OauthClient, Pkce, TokenError};
+use super::provider::{ContactSyncProvider, SourceGroup};
+use super::sync::{external_id_digest, fields, ContactSyncEngine, SyncReport};
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
@@ -71,6 +74,7 @@ struct ConnectionRow {
     last_sync_at: Option<chrono::DateTime<Utc>>,
     last_error: Option<String>,
     created_at: chrono::DateTime<Utc>,
+    deleted_in_source: i64,
 }
 
 impl From<ConnectionRow> for ConnectionStatus {
@@ -84,6 +88,7 @@ impl From<ConnectionRow> for ConnectionStatus {
             last_sync_at: row.last_sync_at,
             last_error: row.last_error,
             connected_at: row.created_at,
+            deleted_in_source: row.deleted_in_source,
         }
     }
 }
@@ -99,6 +104,55 @@ pub struct ConnectionStatus {
     pub last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_error: Option<String>,
     pub connected_at: chrono::DateTime<chrono::Utc>,
+    /// Linked contacts the source has deleted (PSA-70 I). They are kept and
+    /// only flagged, so this is what tells an admin there is something to look
+    /// at rather than something that quietly happened.
+    pub deleted_in_source: i64,
+}
+
+/// Where a contact came from and what is protected on it (PMS-1214).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContactProvenance {
+    pub contact_id: Uuid,
+    /// Every link the contact has had, live first. A disconnected or unlinked
+    /// one is kept: it is the record that this contact was imported.
+    pub links: Vec<ProvenanceLink>,
+    pub locks: Vec<FieldLock>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ProvenanceLink {
+    pub id: Uuid,
+    pub provider: String,
+    pub source_account_email: String,
+    pub external_id: String,
+    /// `created` or `linked`; absent on a link older than migration 228.
+    pub origin: Option<String>,
+    pub last_synced_at: Option<chrono::DateTime<Utc>>,
+    pub deleted_in_source_at: Option<chrono::DateTime<Utc>>,
+    pub unlinked_at: Option<chrono::DateTime<Utc>>,
+    /// `unlinked` or `disconnected`.
+    pub unlink_reason: Option<String>,
+    pub suggested_company_id: Option<Uuid>,
+    pub suggested_company_name: Option<String>,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct FieldLock {
+    pub field: String,
+    pub locked_by_user_id: Option<Uuid>,
+    pub locked_by_name: Option<String>,
+    pub locked_at: chrono::DateTime<Utc>,
+}
+
+/// What a removal of imported data did.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DataRemoval {
+    /// The import created the contact, so it is gone. `false` means it was
+    /// already in the CRM and only its link to the source was removed.
+    pub contact_deleted: bool,
+    pub links_removed: u64,
 }
 
 impl ContactSyncService {
@@ -346,10 +400,13 @@ impl ContactSyncService {
     pub async fn connection(&self, tenant_id: TenantId) -> AppResult<Option<ConnectionStatus>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<ConnectionRow> = sqlx::query_as(
-            "SELECT id, provider, account_email, is_active, sync_status, last_sync_at, \
-                    last_error, created_at \
-             FROM contact_sync_connections \
-             WHERE tenant_id = $1 AND disconnected_at IS NULL",
+            "SELECT c.id, c.provider, c.account_email, c.is_active, c.sync_status, c.last_sync_at, \
+                    c.last_error, c.created_at, \
+                    (SELECT count(*) FROM contact_sync_links l \
+                     WHERE l.connection_id = c.id AND l.unlinked_at IS NULL \
+                       AND l.deleted_in_source_at IS NOT NULL) AS deleted_in_source \
+             FROM contact_sync_connections c \
+             WHERE c.tenant_id = $1 AND c.disconnected_at IS NULL",
         )
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
@@ -361,9 +418,11 @@ impl ContactSyncService {
     ///
     /// The connection row is marked rather than deleted, and the refresh token
     /// is dropped from the secret store: a disconnected connection must not
-    /// hold a usable credential. What happens to the contacts themselves -
-    /// conversion to local records with their former source noted (PSA-70 J) -
-    /// is PMS-1214; the links already carry provider and account for that.
+    /// hold a usable credential. Every live link is closed as `disconnected`
+    /// in the same transaction (PMS-1214, PSA-70 J), which is what makes the
+    /// contacts local records: nothing syncs into them again, nothing about
+    /// them is deleted, and the link row still names the provider and account
+    /// they came from.
     pub async fn disconnect(&self, tenant_id: TenantId, ctx: &AuditCtx) -> AppResult<()> {
         let Some(connection) = self.connection(tenant_id).await? else {
             return Err(AppError::NotFound("Google Contacts connection".to_string()));
@@ -378,6 +437,18 @@ impl ContactSyncService {
         .bind(connection.id)
         .execute(&mut *tx)
         .await?;
+        let kept_as_local = sqlx::query(
+            "UPDATE contact_sync_links \
+             SET unlinked_at = NOW(), unlink_reason = 'disconnected', unlinked_by_user_id = $3, \
+                 updated_at = NOW() \
+             WHERE tenant_id = $1 AND connection_id = $2 AND unlinked_at IS NULL",
+        )
+        .bind(tenant_id)
+        .bind(connection.id)
+        .bind(ctx.user_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         audit_write(
             &mut *tx,
             tenant_id,
@@ -392,6 +463,7 @@ impl ContactSyncService {
             Some(serde_json::json!({
                 "event": "contact_sync.disconnected",
                 "imported_contacts": "kept",
+                "contacts_kept_as_local": kept_as_local,
             })),
         )
         .await?;
@@ -414,6 +486,324 @@ impl ContactSyncService {
             );
         }
         Ok(())
+    }
+
+    /// The live connection's id and provider, or the NotFound every caller
+    /// below would otherwise spell out.
+    async fn live_connection(&self, tenant_id: TenantId) -> AppResult<ConnectionStatus> {
+        self.connection(tenant_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Google Contacts connection".to_string()))
+    }
+
+    /// A provider for the live connection, holding a freshly refreshed token.
+    async fn source(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<(ConnectionStatus, GoogleContactsProvider)> {
+        let connection = self.live_connection(tenant_id).await?;
+        let token = self
+            .access_token(tenant_id, connection.id, &connection.provider)
+            .await?;
+        Ok((
+            connection,
+            GoogleContactsProvider::new(self.http.clone(), token),
+        ))
+    }
+
+    /// The labels an admin can choose from, with their counts (PSA-70 E).
+    pub async fn source_groups(&self, tenant_id: TenantId) -> AppResult<Vec<SourceGroup>> {
+        let (_, source) = self.source(tenant_id).await?;
+        Ok(source.list_groups().await?)
+    }
+
+    /// Run one sync of the tenant's live connection now (PMS-1213). The
+    /// scheduled worker and the run rows that make it resumable are PMS-1215.
+    pub async fn sync_now(&self, tenant_id: TenantId) -> AppResult<SyncReport> {
+        let (connection, source) = self.source(tenant_id).await?;
+        ContactSyncEngine::new(self.db.clone())
+            .run(tenant_id, connection.id, &source)
+            .await
+    }
+
+    /// Refuse a contact id that is not this tenant's, so every per-contact
+    /// method below 404s the same way the contact routes do.
+    async fn assert_contact(
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<()> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if exists {
+            Ok(())
+        } else {
+            Err(AppError::NotFound("Contact".to_string()))
+        }
+    }
+
+    /// Where a contact came from, whether the source still has it, and which
+    /// of its fields a person has locked (PMS-1214).
+    pub async fn provenance(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<ContactProvenance> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::assert_contact(&mut tx, tenant_id, contact_id).await?;
+        let links: Vec<ProvenanceLink> = sqlx::query_as(
+            "SELECT l.id, l.provider, l.source_account_email, l.external_id, l.origin, \
+                    l.last_synced_at, l.deleted_in_source_at, l.unlinked_at, l.unlink_reason, \
+                    l.suggested_company_id, co.name AS suggested_company_name, l.created_at \
+             FROM contact_sync_links l \
+             LEFT JOIN companies co ON co.id = l.suggested_company_id AND co.tenant_id = l.tenant_id \
+             WHERE l.tenant_id = $1 AND l.contact_id = $2 \
+             ORDER BY (l.unlinked_at IS NULL) DESC, l.created_at DESC",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let locks: Vec<FieldLock> = sqlx::query_as(
+            "SELECT k.field, k.locked_by_user_id, \
+                    NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') \
+                        AS locked_by_name, \
+                    k.locked_at \
+             FROM contact_field_locks k \
+             LEFT JOIN users u ON u.id = k.locked_by_user_id \
+             WHERE k.tenant_id = $1 AND k.contact_id = $2 \
+             ORDER BY k.field",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(ContactProvenance {
+            contact_id,
+            links,
+            locks,
+        })
+    }
+
+    /// Let the source write a locked field again.
+    pub async fn release_lock(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        field: &str,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        if !fields::ALL.contains(&field) {
+            return Err(AppError::validation_field(
+                "field",
+                format!("must be one of {}", fields::ALL.join(", ")),
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::assert_contact(&mut tx, tenant_id, contact_id).await?;
+        let released = sqlx::query(
+            "DELETE FROM contact_field_locks WHERE tenant_id = $1 AND contact_id = $2 AND field = $3",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(field)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if released == 0 {
+            return Err(AppError::NotFound("Field lock".to_string()));
+        }
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "contact_field_locks",
+            Some(contact_id),
+            Some(serde_json::json!({ "field": field })),
+            Some(serde_json::json!({
+                "event": "contact_sync.lock_released",
+                "contact_id": contact_id,
+                "field": field,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Stop syncing one contact, leaving it exactly as it is (PSA-70 J).
+    ///
+    /// The link row stays, marked `unlinked`, and the sync skips that source
+    /// record from then on instead of linking it straight back by its email.
+    pub async fn unlink(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::assert_contact(&mut tx, tenant_id, contact_id).await?;
+        let unlinked: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "UPDATE contact_sync_links \
+             SET unlinked_at = NOW(), unlink_reason = 'unlinked', unlinked_by_user_id = $3, \
+                 updated_at = NOW() \
+             WHERE tenant_id = $1 AND contact_id = $2 AND unlinked_at IS NULL \
+             RETURNING id, provider, external_id",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .bind(ctx.user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if unlinked.is_empty() {
+            return Err(AppError::NotFound("Contact sync link".to_string()));
+        }
+        for (link_id, provider, external_id) in &unlinked {
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                ctx,
+                AuditAction::Update,
+                "contact_sync_links",
+                Some(*link_id),
+                None,
+                Some(serde_json::json!({
+                    "event": "contact_sync.unlinked",
+                    "contact_id": contact_id,
+                    "provider": provider,
+                    "external_id": external_id,
+                    "contact": "kept",
+                })),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove a person's imported data on request (PSA-70 K).
+    ///
+    /// A contact the import CREATED is deleted; a contact that was already in
+    /// the CRM and only linked keeps its record and loses its link. Either
+    /// way the link rows, the review-queue snapshots of the source record and
+    /// the field locks go, and a suppression marker keyed on
+    /// [`external_id_digest`] keeps every later sync from importing the person
+    /// back. One transaction: a contact that tickets or invoices refer to
+    /// cannot be deleted, and then NOTHING is removed, rather than the link
+    /// going and the contact staying behind as if it had been created by hand.
+    ///
+    /// The audit row records that a removal happened, who asked and why, and
+    /// deliberately not the removed values. Rows the audit log already holds
+    /// from earlier writes are not rewritten: the log is append-only.
+    pub async fn remove_imported_data(
+        &self,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        reason: &str,
+        ctx: &AuditCtx,
+    ) -> AppResult<DataRemoval> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(AppError::validation_field(
+                "reason",
+                "say who asked for the removal, or why",
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        Self::assert_contact(&mut tx, tenant_id, contact_id).await?;
+        let links: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT provider, external_id, origin FROM contact_sync_links \
+             WHERE tenant_id = $1 AND contact_id = $2 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if links.is_empty() {
+            return Err(AppError::NotFound("Imported contact data".to_string()));
+        }
+        // An unknown origin keeps the contact: a guess that keeps a CRM record
+        // is recoverable, a guess that deletes one is not (migration 228).
+        let created = links
+            .iter()
+            .any(|(_, _, origin)| origin.as_deref() == Some("created"));
+
+        for (provider, external_id, _) in &links {
+            sqlx::query(
+                "INSERT INTO contact_sync_suppressions \
+                 (tenant_id, provider, external_id_sha256, reason, created_by_user_id) \
+                 VALUES ($1, $2, $3, 'data_removed', $4) \
+                 ON CONFLICT (tenant_id, provider, external_id_sha256) DO NOTHING",
+            )
+            .bind(tenant_id)
+            .bind(provider)
+            .bind(external_id_digest(external_id))
+            .bind(ctx.user_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM contact_sync_candidates WHERE tenant_id = $1 AND external_id = $2",
+            )
+            .bind(tenant_id)
+            .bind(external_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let links_removed =
+            sqlx::query("DELETE FROM contact_sync_links WHERE tenant_id = $1 AND contact_id = $2")
+                .bind(tenant_id)
+                .bind(contact_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        sqlx::query("DELETE FROM contact_field_locks WHERE tenant_id = $1 AND contact_id = $2")
+            .bind(tenant_id)
+            .bind(contact_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if created {
+            sqlx::query("DELETE FROM contacts WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(contact_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                    Some("23503") => AppError::Conflict(
+                        "This contact was imported, but tickets, invoices or other records refer to it, so it cannot be deleted. Nothing was removed. Reassign or remove those records first."
+                            .to_string(),
+                    ),
+                    _ => e.into(),
+                })?;
+        }
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Delete,
+            "contacts",
+            Some(contact_id),
+            None,
+            Some(serde_json::json!({
+                "event": "contact_sync.imported_data_removed",
+                "contact_deleted": created,
+                "links_removed": links_removed,
+                "reason": reason,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(DataRemoval {
+            contact_deleted: created,
+            links_removed,
+        })
     }
 
     /// A usable access token for a connection, refreshed from the stored

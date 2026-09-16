@@ -2908,16 +2908,57 @@ impl ContactService {
             request.company_name.as_deref().filter(|s| !s.is_empty())
         };
 
+        // Mutation + audit row in one transaction so a rollback drops
+        // both. CREATE: old = None, after captured by the new row id.
+        // PMS-117.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let (contact_id, setup_token) = self
+            .insert_contact_in(
+                &mut tx,
+                tenant_id,
+                request,
+                &phones,
+                &links,
+                insert_company_id,
+                stored_company_name,
+                ctx,
+            )
+            .await?;
+        tx.commit().await?;
+
+        let contact = self.get_contact(tenant_id, contact_id).await?;
+        // Email the setup link only after the grant transaction committed.
+        if let Some(token) = setup_token {
+            self.send_setup_email(&contact, &token).await;
+        }
+        Ok(contact)
+    }
+
+    /// The rows a new contact is: the INSERT, its phones and company links,
+    /// the recomputed mirrors, the optional portal grant and the audit row,
+    /// all on the caller's transaction.
+    ///
+    /// Split out of [`Self::create_contact`] for the contact-sync importer
+    /// (PMS-1213, [`Self::import_contact_in`]). The caller has already
+    /// resolved and validated `phones` and `links` against the tenant, which
+    /// `create_contact` does before it opens the transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_contact_in(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        request: &CreateContactRequest,
+        phones: &[ResolvedPhone],
+        links: &[ResolvedLink],
+        insert_company_id: Option<Uuid>,
+        stored_company_name: Option<&str>,
+        ctx: &AuditCtx,
+    ) -> AppResult<(Uuid, Option<String>)> {
         let contact_id = Uuid::new_v4();
         let timezone = request
             .timezone
             .clone()
             .unwrap_or_else(|| "UTC".to_string());
-
-        // Mutation + audit row in one transaction so a rollback drops
-        // both. CREATE: old = None, after captured by the new row id.
-        // PMS-117.
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // MAPPS-637: when the create request also grants portal
         // access, refuse a duplicate portal email under the same
@@ -2944,7 +2985,7 @@ impl ContactService {
                 .bind(tenant_id)
                 .bind(cid)
                 .bind(email)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut *conn)
                 .await?;
                 if clash {
                     return Err(AppError::validation_field(
@@ -2984,17 +3025,17 @@ impl ContactService {
         .bind(&request.custom_fields)
         .bind(&request.tags)
         .bind(&request.notes)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         // PMS-806: the child collections are authoritative; the scalar columns
         // written above are then recomputed from them in the same transaction,
         // so the audit `after` snapshot below already shows the mirrors.
-        self.write_contact_phones(&mut tx, tenant_id, contact_id, &phones)
+        self.write_contact_phones(&mut *conn, tenant_id, contact_id, phones)
             .await?;
-        self.write_contact_companies(&mut tx, tenant_id, contact_id, &links)
+        self.write_contact_companies(&mut *conn, tenant_id, contact_id, links)
             .await?;
-        self.recompute_contact_mirrors(&mut tx, tenant_id, contact_id)
+        self.recompute_contact_mirrors(&mut *conn, tenant_id, contact_id)
             .await?;
 
         // PMS-19 / PMS-136: flip the contact's `is_portal_user` flag so the
@@ -3009,10 +3050,10 @@ impl ContactService {
                 "UPDATE contacts SET is_portal_user = TRUE, updated_at = NOW() WHERE id = $1",
             )
             .bind(contact_id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
             Some(
-                self.insert_setup_token(&mut tx, tenant_id, contact_id)
+                self.insert_setup_token(&mut *conn, tenant_id, contact_id)
                     .await?,
             )
         } else {
@@ -3024,11 +3065,11 @@ impl ContactService {
         )
         .bind(tenant_id)
         .bind(contact_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await?;
 
         audit_write(
-            &mut *tx,
+            &mut *conn,
             tenant_id,
             ctx,
             AuditAction::Create,
@@ -3038,14 +3079,62 @@ impl ContactService {
             after,
         )
         .await?;
-        tx.commit().await?;
+        Ok((contact_id, setup_token))
+    }
 
-        let contact = self.get_contact(tenant_id, contact_id).await?;
-        // Email the setup link only after the grant transaction committed.
-        if let Some(token) = setup_token {
-            self.send_setup_email(&contact, &token).await;
+    /// Create an imported contact on the caller's transaction (PMS-1213).
+    ///
+    /// The importer has to write the contact and its provenance link in ONE
+    /// transaction: a contact committed without its link is imported again by
+    /// the next sync. It links no company (PSA-70 G: an organisation name from
+    /// the source is free text, never a `companies` row) and grants no portal
+    /// access, so both are refused here rather than trusted to be absent.
+    pub(crate) async fn import_contact_in(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        request: &CreateContactRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<Uuid> {
+        if request.company_id.is_some()
+            || request.companies.as_ref().is_some_and(|c| !c.is_empty())
+            || request.create_portal_access
+        {
+            return Err(AppError::Internal(
+                "an imported contact links no company and grants no portal access".to_string(),
+            ));
         }
-        Ok(contact)
+        let phones = resolve_phone_list(request.phones.as_deref().unwrap_or_default())?;
+        let company_name = request.company_name.as_deref().filter(|s| !s.is_empty());
+        let (contact_id, _) = self
+            .insert_contact_in(
+                conn,
+                tenant_id,
+                request,
+                &phones,
+                &[],
+                None,
+                company_name,
+                ctx,
+            )
+            .await?;
+        Ok(contact_id)
+    }
+
+    /// Replace a contact's phone list on the caller's transaction and
+    /// recompute the mirrors from it (PMS-1213).
+    pub(crate) async fn replace_contact_phones_in(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+        entries: &[ContactPhoneInput],
+    ) -> AppResult<()> {
+        let phones = resolve_phone_list(entries)?;
+        self.write_contact_phones(&mut *conn, tenant_id, contact_id, &phones)
+            .await?;
+        self.recompute_contact_mirrors(&mut *conn, tenant_id, contact_id)
+            .await
     }
 
     /// Get contact by ID
@@ -3432,6 +3521,12 @@ impl ContactService {
         .bind(contact_id)
         .fetch_optional(&mut *tx)
         .await?;
+        // PMS-1214: a synced contact's edited fields stop following the
+        // source. Captured before the write, locked after it, same transaction.
+        let sync_before = crate::modules::contact_sync::locks::EditSnapshot::capture_if_linked(
+            &mut tx, tenant_id, contact_id,
+        )
+        .await?;
 
         // Reject moving the contact to a foreign tenant's company. Same
         // shape as the create-time validate_fk path above.
@@ -3690,6 +3785,17 @@ impl ContactService {
         } else {
             None
         };
+
+        if let Some(sync_before) = sync_before {
+            crate::modules::contact_sync::locks::lock_edited_fields(
+                &mut tx,
+                tenant_id,
+                contact_id,
+                &sync_before,
+                ctx,
+            )
+            .await?;
+        }
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(c) FROM contacts c WHERE tenant_id = $1 AND id = $2",

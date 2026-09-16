@@ -1035,27 +1035,45 @@ impl TimeTrackingService {
     /// An entry with no contract, no billable flag, or no duration is a no-op,
     /// which is most entries: only client work against a company holding a
     /// block-hours contract draws anything.
+    ///
+    /// PMS-1220: the candidate read, the balance draw and the billing-status
+    /// stamp used to each commit in their own transaction (the draw ran
+    /// inside `ContractsService::consume_hours`'s own `begin`/`commit`), so a
+    /// crash or a concurrent edit between any two left the hour-balance
+    /// ledger and the entry's stamp disagreeing with nothing to reconcile
+    /// them. All three now share one transaction, locked with `FOR UPDATE`
+    /// on the candidate row from the first statement, so a concurrent second
+    /// call for the same entry blocks on that lock rather than racing the
+    /// stamp: it resumes only after the first call has committed or rolled
+    /// back, and by then `hours_consumed IS NULL` is no longer true, so it
+    /// draws nothing.
     async fn consume_for_entry(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<ConsumeCandidateRow> = sqlx::query_as(
             r#"SELECT contract_id, duration_minutes, date, is_billable, entry_kind
                FROM time_entries
-               WHERE tenant_id = $1 AND id = $2 AND hours_consumed IS NULL"#,
+               WHERE tenant_id = $1 AND id = $2 AND hours_consumed IS NULL
+               FOR UPDATE"#,
         )
         .bind(tenant_id)
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
-        drop(tx);
-        let Some(row) = row else { return Ok(()) };
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(());
+        };
         let Some(contract_id) = row.contract_id else {
+            tx.commit().await?;
             return Ok(());
         };
         if !row.is_billable.unwrap_or(false) || row.entry_kind != ENTRY_KIND_CLIENT {
+            tx.commit().await?;
             return Ok(());
         }
         let hours = Decimal::from(row.duration_minutes) / Decimal::from(60);
         if hours <= Decimal::ZERO {
+            tx.commit().await?;
             return Ok(());
         }
         let when = row
@@ -1066,7 +1084,7 @@ impl TimeTrackingService {
 
         let contracts = crate::modules::contracts::ContractsService::new(self.db.clone());
         let outcome = contracts
-            .consume_hours(tenant_id, contract_id, hours, when)
+            .consume_hours_in_tx(&mut tx, tenant_id, contract_id, hours, when)
             .await?;
 
         // The stamp is claimed, not written: `hours_consumed IS NULL` again, so
@@ -1082,7 +1100,6 @@ impl TimeTrackingService {
         // Only a `ready_to_bill` entry flips: one already on an invoice stays
         // `billed`, which cannot happen here in practice because the claim is
         // made at creation, but the CASE says so rather than assuming it.
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"UPDATE time_entries
                SET hours_consumed  = $3,
@@ -1163,15 +1180,21 @@ impl TimeTrackingService {
         .bind(id)
         .fetch_optional(&mut *tx)
         .await?;
-        tx.commit().await?;
 
+        // PMS-1220: the claim and the give-back share this transaction now,
+        // for the same reason consume_for_entry's draw and stamp do - a
+        // crash between the two used to leave the entry's stamp cleared with
+        // the balance never credited back.
         let Some((Some(applied), Some(balance_id))) = claimed else {
+            tx.commit().await?;
             return Ok(());
         };
         let contracts = crate::modules::contracts::ContractsService::new(self.db.clone());
         contracts
-            .release_hours(tenant_id, balance_id, applied)
-            .await
+            .release_hours_in_tx(&mut tx, tenant_id, balance_id, applied)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Reject every pending entry in the user's week with a reason. Manager+
