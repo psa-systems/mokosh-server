@@ -366,7 +366,10 @@ pub struct UpdateInvoiceRequest {
     /// means "this invoice bills for nothing".
     #[validate(length(min = 1, message = "At least one line item is required"))]
     pub lines: Option<Vec<CreateInvoiceLineRequest>>,
-    /// Transition status. Same set as the schema CHECK constraint.
+    /// Transition status. Deserializes the same set as the schema CHECK
+    /// constraint, but the service rejects `void` and `written_off` here
+    /// (PMS-1227): those are terminal states owned by `void_invoice` and
+    /// `write_off_invoice`, each with its own preconditions.
     pub status: Option<InvoiceStatus>,
     /// PMS-992: mark the invoice sent WITHOUT emailing it, for one delivered
     /// by hand (printed, or attached to a message the operator writes). Off,

@@ -15,7 +15,7 @@ use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::settings::{read_invoice_reminder_settings, read_tenant_zone};
 use crate::utils::email::Mailer;
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::{AppError, AppResult, FieldError};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
@@ -3757,6 +3757,26 @@ impl BillingService {
         request: &UpdateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
+        // PMS-1227: `void` and `written_off` are terminal states owned by
+        // `void_invoice` and `write_off_invoice`, each with its own
+        // preconditions and its own write-off/void detail columns. Accepting
+        // them here let a draft jump straight to `written_off` with every
+        // one of those columns NULL, a row neither dedicated endpoint could
+        // then reach: `is_frozen` blocked this method, and `write_off_invoice`
+        // requires `sent` or `partially_paid`.
+        if let Some(status) = request.status {
+            if matches!(status, InvoiceStatus::Void | InvoiceStatus::WrittenOff) {
+                return Err(AppError::validation(
+                    "status cannot be set to void or written_off here",
+                    vec![FieldError::new(
+                        "status",
+                        "void and written_off are set through their own endpoints (void_invoice, write_off_invoice), not through this update",
+                        "invalid_status_transition",
+                    )],
+                ));
+            }
+        }
+
         let current = self.get_invoice(tenant_id, invoice_id).await?;
         if current.status.is_frozen() {
             return Err(AppError::Conflict(format!(
