@@ -230,6 +230,17 @@ impl MembershipRepo {
         // every DISTINCT bunyip_user_id linked to this identity by
         // email (case-insensitive, matching how the JIT provisioner
         // seeds the row).
+        //
+        // PMS-1208 finding 3: the second identity axis is
+        // `g.grantee_email`. Standalone-mode grantees have no
+        // `users.bunyip_user_id` (there is no Bunyip identity plane),
+        // and the sub-based subquery above never matches for them, so
+        // grants they accepted stayed invisible to the switcher.
+        // Migration 224 added `mokosh_bunyip_grants.grantee_email`
+        // populated at accept time; matching it against the identity's
+        // email (case-insensitively, matching the identity/users
+        // email join shape) makes those grants visible without paying
+        // anything in SaaS mode where both axes match the same row.
         let grant_rows: Vec<(Uuid, Uuid, String, String, String, String)> = sqlx::query_as(
             r#"
             SELECT g.id, t.id AS tenant_id, t.name, t.slug, t.kind, g.role
@@ -237,13 +248,23 @@ impl MembershipRepo {
             JOIN tenants t ON t.slug = g.mokosh_account_id
             WHERE g.revoked_at IS NULL
               AND g.role IS NOT NULL
-              AND g.grantee_bunyip_user_id IN (
-                  SELECT DISTINCT u.bunyip_user_id
-                  FROM users u
-                  JOIN identities i ON lower(i.email) = lower(u.email)
-                  WHERE i.id = $1
-                    AND u.bunyip_user_id IS NOT NULL
-                    AND u.deleted_at IS NULL
+              AND (
+                  g.grantee_bunyip_user_id IN (
+                      SELECT DISTINCT u.bunyip_user_id
+                      FROM users u
+                      JOIN identities i ON lower(i.email) = lower(u.email)
+                      WHERE i.id = $1
+                        AND u.bunyip_user_id IS NOT NULL
+                        AND u.deleted_at IS NULL
+                  )
+                  OR (
+                      g.grantee_email IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM identities i
+                          WHERE i.id = $1
+                            AND lower(i.email) = lower(g.grantee_email)
+                      )
+                  )
               )
             ORDER BY g.granted_at ASC
             "#,
