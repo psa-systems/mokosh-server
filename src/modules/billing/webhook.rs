@@ -227,6 +227,7 @@ async fn dispatch(
                 .billing
                 .record_gateway_payment(
                     scoped,
+                    provider.id(),
                     invoice_id,
                     &provider_reference,
                     amount,
@@ -244,7 +245,14 @@ async fn dispatch(
         } => {
             state
                 .billing
-                .record_gateway_refunds(scoped, &provider_reference, &currency, &refunds, &raw)
+                .record_gateway_refunds(
+                    scoped,
+                    provider.id(),
+                    &provider_reference,
+                    &currency,
+                    &refunds,
+                    &raw,
+                )
                 .await?;
         }
         PaymentEvent::RequiresCapture { order_id } => {
