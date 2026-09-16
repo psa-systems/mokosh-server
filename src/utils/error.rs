@@ -33,6 +33,20 @@ pub enum AppError {
         errors: Vec<FieldError>,
     },
 
+    /// A rejected query parameter: the field-level body of [`Validation`],
+    /// served at 400 (PMS-1202). A query parameter the client cannot spell
+    /// correctly is a malformed request, not a well-formed one carrying an
+    /// unacceptable value, and these sites answered 400 before they were given
+    /// the structured shape, so the status stays where it was and only the body
+    /// changes.
+    ///
+    /// [`Validation`]: AppError::Validation
+    #[error("{message}")]
+    QueryError {
+        message: String,
+        errors: Vec<FieldError>,
+    },
+
     /// State conflict, of which a duplicate is only one kind. The call site
     /// writes the whole sentence (PMS-771): the old " already exists" suffix
     /// doubled itself on the sites that said it and contradicted the majority
@@ -203,6 +217,27 @@ impl AppError {
         }
     }
 
+    /// Reject a query parameter, with the same message convention and the same
+    /// `{"field", "message", "code"}` body as [`validation_field`], at 400
+    /// rather than 422 (PMS-1202).
+    ///
+    /// [`validation_field`]: AppError::validation_field
+    pub fn query_error(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::QueryError {
+            message: "one or more query parameters are invalid".to_string(),
+            errors: vec![FieldError::new(field, message, "invalid")],
+        }
+    }
+
+    /// A query parameter with no value at all, the [`query_error`] twin of
+    /// [`validation_required`].
+    ///
+    /// [`query_error`]: AppError::query_error
+    /// [`validation_required`]: AppError::validation_required
+    pub fn query_required(field: impl Into<String>) -> Self {
+        Self::query_error(field, "is required")
+    }
+
     /// A field with no value at all. Template for the [`validation_field`]
     /// convention's "is required" shape (PMS-1202/CF-3).
     ///
@@ -259,6 +294,7 @@ impl AppError {
             Self::Forbidden(_) => 403,
             Self::NotFound(_) => 404,
             Self::Validation { .. } => 422,
+            Self::QueryError { .. } => 400,
             Self::Conflict(_) => 409,
             Self::BadRequest(_) => 400,
             Self::Gone(_) => 410,
@@ -285,6 +321,9 @@ impl AppError {
             Self::Forbidden(_) => "FORBIDDEN",
             Self::NotFound(_) => "NOT_FOUND",
             Self::Validation { .. } => "VALIDATION_ERROR",
+            // The code these sites already answered with, so only the body gains
+            // `errors[]`; a new code would be a second contract change (PMS-1202).
+            Self::QueryError { .. } => "BAD_REQUEST",
             Self::Conflict(_) => "CONFLICT",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::Gone(_) => "GONE",
@@ -322,7 +361,9 @@ pub struct ErrorDetail {
 impl From<AppError> for ErrorResponse {
     fn from(error: AppError) -> Self {
         let errors = match &error {
-            AppError::Validation { errors, .. } => Some(errors.clone()),
+            AppError::Validation { errors, .. } | AppError::QueryError { errors, .. } => {
+                Some(errors.clone())
+            }
             _ => None,
         };
 
