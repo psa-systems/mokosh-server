@@ -113,6 +113,11 @@ async fn the_portal_password_reset_names_the_msp_and_never_the_product(pool: PgP
         body.contains("/reset-password?token="),
         "the reset link survived the split: {body}"
     );
+    assert!(
+        body.starts_with("Hello Portal,"),
+        "PMS-1198: the reset mail greets the contact by name, the same way \
+         its sibling auth.portal_welcome does: {body}"
+    );
 
     // The product name must not reach a customer. `Mokosh` is the default
     // app name, so its absence is the check that this mail is not the staff

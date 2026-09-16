@@ -46,6 +46,7 @@ async fn list_entity_history(
     Path((entity_type, entity_id)): Path<(String, Uuid)>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<EntityHistoryEntry>>> {
+    pagination.reject_unsupported_sort()?;
     if !HISTORY_ENTITY_TYPES.contains(&entity_type.as_str()) {
         return Err(AppError::NotFound("history".to_string()));
     }
@@ -67,6 +68,7 @@ async fn list_audit_log(
     Query(filter): Query<AuditLogFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<AuditLogEntryResponse>>> {
+    pagination.reject_unsupported_sort()?;
     filter.validate()?;
     // Super-admins can cross tenants by setting the special X-Tenant-Id
     // header (read by a future middleware); for now everyone reads

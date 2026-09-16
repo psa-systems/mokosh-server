@@ -10,4 +10,9 @@
 //! PMS-1215; the routes are PMS-1212. Nothing here reaches the network yet.
 
 pub mod google;
+pub mod oauth;
+pub mod routes;
+pub mod service;
+
+pub use service::ContactSyncService;
 pub mod provider;

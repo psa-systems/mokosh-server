@@ -784,9 +784,11 @@ impl ContactAuthService {
                 slug,
                 token,
             );
+            let display_name = contact_first_name.unwrap_or_default();
             let context = serde_json::json!({
                 "recipient_email": email_addr,
-                "display_name": contact_first_name.unwrap_or_default(),
+                "display_name": &display_name,
+                "salutation": crate::utils::email::salutation(&display_name),
                 "reset_link": reset_link,
             });
             // PMS-1140: the portal-side event, not the staff one. The
@@ -794,6 +796,11 @@ impl ContactAuthService {
             // `auth.password_reset` names the product (migration 116) because
             // it now serves staff only. Migration 206 seeded and backfilled
             // this event's template for every tenant.
+            //
+            // PMS-1198: `auth.portal_welcome`'s dispatch site (migration 206)
+            // already supplies `{{salutation}}`; this one now does too
+            // (migration 220), rather than opening on a cold, nameless
+            // "We received a request...".
             let _ = notify
                 .dispatch(
                     TenantId::from_trusted(tenant_id),

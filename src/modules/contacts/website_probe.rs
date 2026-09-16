@@ -179,10 +179,10 @@ pub struct ProbeTarget {
 pub fn parse_target(input: &str) -> Result<ProbeTarget, AppError> {
     let raw = input.trim();
     if raw.is_empty() {
-        return Err(AppError::validation_required("url"));
+        return Err(AppError::query_required("url"));
     }
     if raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(AppError::validation_field(
+        return Err(AppError::query_error(
             "url",
             "must not contain spaces or control characters",
         ));
@@ -192,18 +192,15 @@ pub fn parse_target(input: &str) -> Result<ProbeTarget, AppError> {
     // would store. A value the normalizer declines to touch still has to parse
     // as an http(s) URL below, which is where the rejection happens.
     let normalized = mokosh_types::contacts::normalize_website(raw)
-        .ok_or_else(|| AppError::validation_required("url"))?;
+        .ok_or_else(|| AppError::query_required("url"))?;
 
     let url = Url::parse(&normalized)
-        .map_err(|e| AppError::validation_field("url", format!("not a valid web address: {e}")))?;
+        .map_err(|e| AppError::query_error("url", format!("not a valid web address: {e}")))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(AppError::validation_field("url", "must use http or https"));
+        return Err(AppError::query_error("url", "must use http or https"));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(AppError::validation_field(
-            "url",
-            "must not contain credentials",
-        ));
+        return Err(AppError::query_error("url", "must not contain credentials"));
     }
     // `Host`'s Display re-brackets an IPv6 literal, so the stored value can be
     // pasted straight back into a URL; `host_str` (used by the resolver) gives
@@ -212,10 +209,10 @@ pub fn parse_target(input: &str) -> Result<ProbeTarget, AppError> {
         .host()
         .map(|h| h.to_string().to_ascii_lowercase())
         .filter(|h| !h.is_empty())
-        .ok_or_else(|| AppError::validation_field("url", "must contain a host"))?;
+        .ok_or_else(|| AppError::query_error("url", "must contain a host"))?;
     if let Some(port) = url.port() {
         if !ALLOWED_PORTS.contains(&port) {
-            return Err(AppError::validation_field("url", "must use port 80 or 443"));
+            return Err(AppError::query_error("url", "must use port 80 or 443"));
         }
     }
 

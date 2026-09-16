@@ -157,6 +157,26 @@ impl PaginationParams {
 
         Ok(format!("{} {}", field, direction))
     }
+
+    /// PMS-1194: for a handler that has not been wired to an allow-list,
+    /// this is the whole contract. A `sort` param used to be accepted and
+    /// silently dropped there, so a 200 gave no signal about whether the
+    /// order the client asked for was the order it got; MAPPS-527 shipped a
+    /// client built on that false assumption. Call this before using
+    /// `pagination` in any handler whose service call does not itself go
+    /// through `order_by` / `order_by_mapped`, so the caller gets a 422
+    /// naming `sort` instead of a 200 in the default order. A `sort` that is
+    /// absent is unchanged, exactly as with the two helpers above: a caller
+    /// that never asks to sort never sees this.
+    pub fn reject_unsupported_sort(&self) -> AppResult<()> {
+        match self.sort.as_deref() {
+            Some(requested) => Err(AppError::validation_field(
+                "sort",
+                format!("unknown sort field `{requested}`; this endpoint does not support sorting"),
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Paginated response wrapper
@@ -477,5 +497,118 @@ mod tests {
 
         assert_eq!(mapped.data, vec![2, 4, 6]);
         assert_eq!(mapped.meta.total, 3);
+    }
+}
+
+/// PMS-1194: every handler that extracts `Query<PaginationParams>` either
+/// honours `sort` through an allow-list or refuses it, never both accepting
+/// and silently ignoring it. This scans the actual route source rather than
+/// trusting a comment, the `finance_gate` / `repo_hygiene` shape this
+/// codebase already uses for a rule that has to stay true as new handlers
+/// are added.
+#[cfg(test)]
+mod pms1194_sort_guard {
+    /// `(module, source)` for every `routes.rs` that extracts
+    /// `Query<PaginationParams>`. Adding a tenth module means adding its
+    /// file here too, or this scan silently stops covering it.
+    const ROUTE_FILES: &[(&str, &str)] = &[
+        ("assets", include_str!("../modules/assets/routes.rs")),
+        ("audit", include_str!("../modules/audit/routes.rs")),
+        ("auth", include_str!("../modules/auth/routes.rs")),
+        ("billing", include_str!("../modules/billing/routes.rs")),
+        ("calendar", include_str!("../modules/calendar/routes.rs")),
+        ("contacts", include_str!("../modules/contacts/routes.rs")),
+        ("contracts", include_str!("../modules/contracts/routes.rs")),
+        (
+            "invitations",
+            include_str!("../modules/invitations/routes.rs"),
+        ),
+        (
+            "knowledge_base",
+            include_str!("../modules/knowledge_base/routes.rs"),
+        ),
+        (
+            "mileage_tracking",
+            include_str!("../modules/mileage_tracking/routes.rs"),
+        ),
+        (
+            "notifications",
+            include_str!("../modules/notifications/routes.rs"),
+        ),
+        ("projects", include_str!("../modules/projects/routes.rs")),
+        ("quotes", include_str!("../modules/quotes/routes.rs")),
+        ("rmm", include_str!("../modules/rmm/routes.rs")),
+        ("settings", include_str!("../modules/settings/routes.rs")),
+        ("sla", include_str!("../modules/sla/routes.rs")),
+        ("tenants", include_str!("../modules/tenants/routes.rs")),
+        ("tickets", include_str!("../modules/tickets/routes.rs")),
+        (
+            "time_tracking",
+            include_str!("../modules/time_tracking/routes.rs"),
+        ),
+    ];
+
+    /// Handlers whose service call is already wired to a `sort`
+    /// allow-list via `order_by` / `order_by_mapped`, named
+    /// `module::handler_fn`. Verified by reading the matching
+    /// `service.rs` at the time this list was written; a handler that
+    /// stops calling one of those two functions has to drop out of this
+    /// list and start calling `reject_unsupported_sort` instead, or this
+    /// test fails.
+    const HONOURED: &[&str] = &[
+        "auth::list_users",
+        "billing::list_invoices",
+        "billing::list_payments",
+        "contacts::list_companies",
+        "contacts::list_contacts",
+        "mileage_tracking::list_mileage_entries",
+        "projects::list_projects",
+        "quotes::list_quotes",
+        "tickets::list_tickets",
+        "time_tracking::list_time_entries",
+    ];
+
+    #[test]
+    fn every_pagination_handler_honours_or_rejects_sort() {
+        let mut seen = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+
+        for (module, src) in ROUTE_FILES {
+            for chunk in src.split("async fn ").skip(1) {
+                if !chunk.contains("Query<PaginationParams>") {
+                    continue;
+                }
+                let Some((name, rest)) = chunk.split_once('(') else {
+                    continue;
+                };
+                let Some((_args, body)) = rest.split_once(") ->") else {
+                    continue;
+                };
+
+                seen += 1;
+                let key = format!("{module}::{name}");
+                let honoured = HONOURED.contains(&key.as_str());
+                let rejects = body.contains("reject_unsupported_sort");
+                if !honoured && !rejects {
+                    bad.push(key);
+                }
+            }
+        }
+
+        assert!(
+            seen >= 70,
+            "the scan found only {seen} handlers extracting \
+             `Query<PaginationParams>`, so it has stopped matching this \
+             codebase's shape and is no longer proving anything"
+        );
+        assert!(
+            bad.is_empty(),
+            "these handlers extract `Query<PaginationParams>` but neither \
+             honour `sort` through an allow-list nor reject it: {bad:?}. \
+             Either wire the service call to `order_by` / `order_by_mapped` \
+             and add the handler to HONOURED, or call \
+             `pagination.reject_unsupported_sort()?` before using \
+             `pagination`."
+        );
     }
 }
