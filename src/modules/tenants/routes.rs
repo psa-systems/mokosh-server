@@ -1,11 +1,12 @@
 //! Tenant API routes (Super Admin only)
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
+    Router,
 };
 use std::sync::Arc;
 use uuid::Uuid;

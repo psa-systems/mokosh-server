@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Query, State},
     routing::get,
-    Json, Router,
+    Router,
 };
 use serde::Deserialize;
 

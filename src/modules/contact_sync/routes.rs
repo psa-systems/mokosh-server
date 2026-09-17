@@ -21,11 +21,12 @@
 
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{delete, get, post, put};
-use axum::{Json, Router};
+use axum::Router;
 use serde::Deserialize;
 use uuid::Uuid;
 
