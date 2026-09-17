@@ -67,15 +67,26 @@ impl PaymentMethodsService {
     /// per-page (contact portal lands back on the Payment Methods page).
     /// `customer_email` is looked up from `contacts` so the setup page
     /// pre-fills; a contact without an email (edge case) sends `None`.
+    ///
+    /// `requested_provider` names which gateway to save the card on.
+    /// `active_provider` refuses to pick between two active providers on its
+    /// own (PMS-1235, the same refusal `pay_invoice` gets with no provider
+    /// named), so a tenant with both Stripe and PayPal connected could not
+    /// add a card at all until a caller could say which one.
     pub async fn start_add(
         &self,
         tenant_id: TenantId,
         contact_id: Uuid,
+        requested_provider: Option<&str>,
         success_url: &str,
         cancel_url: &str,
     ) -> AppResult<CheckoutSession> {
         let email = self.contact_email(tenant_id, contact_id).await?;
-        let Some(provider) = self.billing.active_provider(tenant_id, None).await? else {
+        let Some(provider) = self
+            .billing
+            .active_provider(tenant_id, requested_provider)
+            .await?
+        else {
             return Err(AppError::BadRequest(
                 "No active payment provider is configured for this account.".to_string(),
             ));
@@ -141,7 +152,7 @@ impl PaymentMethodsService {
         .bind(contact_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((provider_id, provider_pm_id, _was_default)) = row else {
+        let Some((provider_id, provider_pm_id, was_default)) = row else {
             tx.commit().await?;
             return Err(AppError::NotFound("Payment method".to_string()));
         };
@@ -168,6 +179,27 @@ impl PaymentMethodsService {
         .bind(contact_id)
         .execute(&mut *tx)
         .await?;
+        // PMS-1235: removing the default left the contact with no default at
+        // all, even with other cards still on file, and the future
+        // auto-charge worker this table exists for (MAPPS-674) names a
+        // specific card by looking here. Newest first, the same order
+        // `record_from_webhook` gives the contact's very first card.
+        if was_default {
+            sqlx::query(
+                "UPDATE contact_payment_methods SET is_default = TRUE, updated_at = NOW() \
+                  WHERE id = (
+                      SELECT id FROM contact_payment_methods \
+                       WHERE tenant_id = $1 AND contact_id = $2 \
+                       ORDER BY created_at DESC \
+                       LIMIT 1 \
+                       FOR UPDATE \
+                  )",
+            )
+            .bind(tenant_id)
+            .bind(contact_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }

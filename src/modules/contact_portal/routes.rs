@@ -747,6 +747,12 @@ struct StartAddPaymentMethodBody {
     /// Where the provider returns the contact if they cancel out of the
     /// setup page. Same rationale as `success_url`.
     cancel_url: String,
+    /// PMS-1235: which gateway to save the card on, when the tenant has more
+    /// than one connected. `active_provider` refuses to guess between two
+    /// active providers the same way `pay_invoice` does, so a dual-provider
+    /// tenant needs this to add a card at all.
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 /// Response from `POST /api/v1/contact/payment-methods`: the hosted-page URL
@@ -803,7 +809,13 @@ async fn start_add_payment_method(
     let tenant = crate::modules::auth::TenantId::from_trusted(session.tenant_id);
     let session_out = state
         .payment_methods
-        .start_add(tenant, session.id, &body.success_url, &body.cancel_url)
+        .start_add(
+            tenant,
+            session.id,
+            body.provider.as_deref(),
+            &body.success_url,
+            &body.cancel_url,
+        )
         .await?;
     Ok(Json(StartAddPaymentMethodResponse {
         checkout_url: session_out.url,
