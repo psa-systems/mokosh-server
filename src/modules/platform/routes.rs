@@ -71,7 +71,9 @@ async fn change_password(
 /// tenant `auth_middleware` runs earlier in the stack and won't
 /// populate its own `AuthState` for a `typ="platform"` token (the
 /// legacy path only accepts `typ="access"`), so a platform bearer
-/// passes through untouched and lands here.
+/// passes through untouched and lands here. Also re-checks the
+/// admin's status against `platform_admins` on every request, so an
+/// offboarded admin is rejected before their token's natural expiry.
 pub struct RequirePlatformAdmin {
     pub id: Uuid,
     pub email: String,
@@ -104,6 +106,7 @@ where
             .and_then(|s| s.strip_prefix("Bearer "))
             .ok_or(AppError::Unauthorized)?;
         let (id, email) = service.decode_token(token)?;
+        service.ensure_admin_active(id).await?;
         Ok(RequirePlatformAdmin { id, email })
     }
 }

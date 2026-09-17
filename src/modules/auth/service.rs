@@ -1687,7 +1687,7 @@ impl AuthService {
         // Get current password hash + email (need the email to
         // resolve the identity row for the MAPPS-499 write).
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(String, String)> = sqlx::query_as(
+        let row: Option<(Option<String>, String)> = sqlx::query_as(
             "SELECT password_hash, email FROM users WHERE id = $1 AND tenant_id = $2",
         )
         .bind(user_id)
@@ -1695,6 +1695,12 @@ impl AuthService {
         .fetch_optional(&mut *tx)
         .await?;
         let (current_hash, email) = row.ok_or_else(|| AppError::NotFound("User".to_string()))?;
+        // PMS-1236: migrations 162 and 166 deliberately write a NULL
+        // password_hash for a bunyip-only user (no local password set).
+        // That is "no password to change", not a server error.
+        let current_hash = current_hash.ok_or_else(|| {
+            AppError::Forbidden("This account has no local password set".to_string())
+        })?;
 
         // Verify current password
         if !verify_password(&request.current_password, &current_hash)? {
@@ -2099,11 +2105,11 @@ impl AuthService {
     /// identities mirror (a mirror that copies a secret verbatim can turn a
     /// sealed one back into plaintext), so the application owns the fan-out
     /// that trigger used to perform. It has to cover every users row at the
-    /// email, not just the caller's: `enable_mfa` flips `mfa_enabled` on the
-    /// identity row, and THAT still mirrors onto every users row at the email,
-    /// so a users row left without the secret is a row whose next
-    /// tenant-scoped login reads `mfa_enabled` true with nothing to verify
-    /// against and answers 500.
+    /// email, not just the caller's, because `enable_mfa` and `disable_mfa`
+    /// fan `mfa_enabled` out through [`Self::write_mfa_enabled`] rather than
+    /// through the mirror trigger (PMS-1223), so a users row left without the
+    /// secret is a row whose next tenant-scoped login reads `mfa_enabled`
+    /// true with nothing to verify against and answers 500.
     ///
     /// `value` is the sealed secret, or `None` to clear it. `previous` is the
     /// idempotency guard for the PMS-871 in-place legacy upgrade (`AND
@@ -2139,6 +2145,51 @@ impl AuthService {
             .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// PMS-1223: `mfa_enabled` goes to every `identities` and `users` row at
+    /// this email, on the same bypass-RLS migrator pool [`Self::write_mfa_secret`]
+    /// uses, so the flag lands in the same row set the secret does.
+    ///
+    /// Before this, `enable_mfa` and `disable_mfa` flipped the flag only on
+    /// the caller's tenant-scoped `identities` row and relied on the
+    /// `sync_identity_to_users` trigger to mirror it onto every `users` row.
+    /// That trigger carries no `SECURITY DEFINER` (migration
+    /// `196_mfa_secret_leaves_the_mirror.sql`), so its own `UPDATE users`
+    /// runs under the caller's `app.current_tenant` GUC and is filtered by
+    /// RLS to that one tenant. A user with a seat in a second tenant was left
+    /// with `mfa_enabled` stuck at its old value there even though
+    /// `write_mfa_secret` had already sealed (or cleared) the secret on
+    /// every tenant's row: enabling in one tenant left another tenant's login
+    /// reading `mfa_enabled = FALSE` with a live secret (second factor
+    /// silently skipped), and disabling left it reading `mfa_enabled = TRUE`
+    /// with the secret gone (a hard 500, and no way to re-enroll).
+    ///
+    /// SAFETY (PMS-285): the migrator pool, for the same reason
+    /// `write_mfa_secret` uses it - the flag has to reach every tenant seat
+    /// the human holds, not just the caller's, and `identities` has no
+    /// tenant column for a single GUC to cover anyway.
+    async fn write_mfa_enabled(&self, email: &str, enabled: bool) -> AppResult<()> {
+        let mut tx = self.db.migrator_pool().begin().await?;
+        sqlx::query(
+            "UPDATE identities SET mfa_enabled = $1, mfa_last_totp_step = 0, \
+                                   updated_at = NOW() \
+             WHERE lower(email) = lower($2)",
+        )
+        .bind(enabled)
+        .bind(email)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE users SET mfa_enabled = $1, updated_at = NOW() \
+             WHERE lower(email) = lower($2)",
+        )
+        .bind(enabled)
+        .bind(email)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2240,20 +2291,17 @@ impl AuthService {
             .map(|c| recovery_code_hex_hash(c))
             .collect();
 
-        // MAPPS-501 (MAPPS-496 stage 2c): flip mfa_enabled + reset
-        // watermark on identities (source of truth); recovery-code
-        // hashes remain a users-only column (added by migration 029,
-        // not mirrored to identities).
+        // PMS-1223: flip mfa_enabled on every identities and users row at
+        // this email, on the migrator pool - see `write_mfa_enabled` for why
+        // the caller's tenant-scoped identities UPDATE this used to run
+        // (relying on the mirror trigger to fan it to `users`) left every
+        // other tenant seat's flag unchanged.
+        self.write_mfa_enabled(&user.email, true).await?;
+
+        // Recovery-code hashes remain a users-only column (added by
+        // migration 029, not mirrored to identities) and stay scoped to the
+        // tenant the caller enrolled from.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
-            "UPDATE identities SET mfa_enabled = TRUE, \
-                                   mfa_last_totp_step = 0, \
-                                   updated_at = NOW() \
-             WHERE lower(email) = lower($1)",
-        )
-        .bind(&user.email)
-        .execute(&mut *tx)
-        .await?;
         sqlx::query(
             "UPDATE users SET mfa_recovery_codes_hashes = $1, updated_at = NOW() \
              WHERE id = $2 AND tenant_id = $3",
@@ -2287,30 +2335,20 @@ impl AuthService {
             return Err(AppError::Unauthorized);
         }
 
-        // MAPPS-501 (MAPPS-496 stage 2c): clear mfa_enabled + mfa_secret
-        // + watermark on identities (source of truth); clear recovery
-        // hashes on users (users-only column). Both writes share the
-        // same tx.
+        // PMS-1223: clear mfa_enabled on every identities and users row at
+        // this email, on the migrator pool - see `write_mfa_enabled`. Then
+        // clear recovery hashes on the caller's own users row (a
+        // users-only column, tenant-scoped like the rest of this method).
         //
         // PMS-1055: the secret is cleared through `write_mfa_secret`, on both
-        // planes and on every users row at this email. `mfa_enabled` still
-        // mirrors back from the identity write, but `mfa_secret` no longer does
-        // (migration 195), so leaning on the trigger would leave a usable TOTP
-        // secret at rest on a row whose MFA the user just turned off. It runs
-        // AFTER the flag write and not before: this way a failure leaves MFA
-        // off with an unusable secret still stored (the next enrolment
-        // overwrites it), where the other order would leave it ON with nothing
-        // to verify against, which is a lockout.
+        // planes and on every users row at this email; that write stays
+        // AFTER the flag write and not before, so a failure leaves MFA off
+        // with an unusable secret still stored (the next enrolment overwrites
+        // it), where the other order would leave it ON with nothing to
+        // verify against, which is a lockout.
+        self.write_mfa_enabled(&user.email, false).await?;
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
-            "UPDATE identities SET mfa_enabled = FALSE, \
-                                   mfa_last_totp_step = 0, \
-                                   updated_at = NOW() \
-             WHERE lower(email) = lower($1)",
-        )
-        .bind(&user.email)
-        .execute(&mut *tx)
-        .await?;
         sqlx::query(
             "UPDATE users SET mfa_recovery_codes_hashes = '{}', updated_at = NOW() \
              WHERE id = $1 AND tenant_id = $2",
@@ -2516,7 +2554,7 @@ impl AuthService {
         let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
             r#"
             SELECT id,
-                   COALESCE(NULLIF(TRIM(first_name || ' ' || last_name), ''), email) AS name,
+                   COALESCE(NULLIF(TRIM(first_name || ' ' || last_name), ''), 'Unnamed User') AS name,
                    LOWER(split_part(email, '@', 1)) AS handle
             FROM users
             WHERE tenant_id = $1 AND status = 'active'
@@ -3032,7 +3070,13 @@ impl AuthService {
             )
             VALUES ($1, $2, $3, $4, 'active', $8, 'UTC', $5, $6, $7)
             ON CONFLICT (id) DO UPDATE SET
-                email = EXCLUDED.email,
+                -- PMS-1236: a failed userinfo read (or one that comes back
+                -- unverified) has already been forced to the
+                -- `{sub}@unresolved.invalid` placeholder above, and that
+                -- placeholder must never overwrite a real address already on
+                -- the row. Only a verified email from the IdP is trusted to
+                -- replace what is there.
+                email = CASE WHEN $11 THEN EXCLUDED.email ELSE users.email END,
                 -- PMS-512: bunyip owns the names; refresh them on every run.
                 -- $9 / $10 are the raw hints (NULL when absent or empty), so
                 -- COALESCE keeps the existing NOT NULL value rather than
@@ -3061,6 +3105,7 @@ impl AuthService {
         .bind(email_verified_at)
         .bind(&first_hint)
         .bind(&last_hint)
+        .bind(email_verified)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

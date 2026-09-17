@@ -95,11 +95,15 @@ async fn reset_mail(pool: &PgPool, email: &str) -> (String, String) {
     .await
     .expect("reset queues mail");
 
-    sqlx::query_as("SELECT subject, body FROM notifications WHERE recipient = $1")
-        .bind(email)
-        .fetch_one(pool)
-        .await
-        .expect("the reset queued an email row")
+    // PMS-1237: a user recipient is queued by user_id and resolved at send time.
+    sqlx::query_as(
+        "SELECT subject, body FROM notifications
+         WHERE recipient = $1 OR user_id IN (SELECT id FROM users WHERE email = $1)",
+    )
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .expect("the reset queued an email row")
 }
 
 fn actx() -> AuditCtx {

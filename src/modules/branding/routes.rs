@@ -50,8 +50,10 @@ pub struct StaffBrandingState {
 /// - Per-tenant defaults (`role.is_admin()` gate).
 pub fn staff_routes(db: Database) -> Router {
     let state = StaffBrandingState {
+        // PMS-1234: gives the tenant-logo write path (only) a ledger, the
+        // same way `TenantLogoStore::with_ledger` does.
+        store: Arc::new(BrandingAssetStore::from_env().with_ledger(db.clone())),
         db,
-        store: Arc::new(BrandingAssetStore::from_env()),
     };
     Router::new()
         .route(
@@ -184,8 +186,8 @@ pub fn contact_routes(
     contact_service: Arc<crate::modules::contact_portal::ContactAuthService>,
 ) -> Router {
     let state = ContactBrandingState {
+        store: Arc::new(BrandingAssetStore::from_env().with_ledger(db.clone())),
         db,
-        store: Arc::new(BrandingAssetStore::from_env()),
         contact_service,
     };
     Router::new()

@@ -616,6 +616,77 @@ async fn a_valid_submission_creates_a_ticket_carrying_the_data_and_the_article(p
     assert!(ticket_id.is_some(), "the submission records its ticket");
 }
 
+/// PMS-1221: the public magic-link submission runs through the SAME
+/// `TicketService` instance the public router mounts at
+/// `public_form_routes`, so the ticket it creates must run
+/// `on_create` automation the way any other ticket does. Before this fix
+/// that `FormsService` carried a bare `TicketService::new(db.clone())`
+/// with no dispatcher, so `send_notification` silently fell back to the
+/// legacy mailer path (`automation.rs`'s `None` arm) and queued nothing
+/// in `notifications`. A `send_notification` rule is the observable half
+/// of that gap: it is the one automation action whose two code paths
+/// (dispatcher vs. legacy mailer) differ in whether a row lands in
+/// `notifications` at all.
+#[sqlx::test]
+async fn a_ticket_created_via_the_public_request_form_dispatches_a_notification(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let agent_token = common::login(&app, &email, &password).await;
+    let (form_id, _article_id) = seed_form_with_article(&app, &agent_token, &pool, admin_id).await;
+    let (token, _link_id) = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+
+    sqlx::query(
+        r#"INSERT INTO ticket_automation_rules
+             (tenant_id, name, trigger_type, conditions, actions)
+           VALUES ($1, 'Notify on new request-form ticket', 'on_create', '[]'::jsonb, $2::jsonb)"#,
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(serde_json::json!([{
+        "action_type": "send_notification",
+        "params": {
+            "to": "watcher@example.com",
+            "subject": "New request-form ticket",
+            "body": "A client submitted a request form."
+        }
+    }]))
+    .execute(&pool)
+    .await
+    .expect("seed on_create automation rule");
+
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/public/request-forms/{token}")))
+        .json(&json!({"payload": {
+            "first_name": "Dana",
+            "start_date": "2099-06-01",
+            "laptop": "new"
+        }}))
+        .send()
+        .await
+        .expect("send good submission");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "valid submission should 201"
+    );
+
+    let (subject, recipient): (String, Option<String>) = sqlx::query_as(
+        "SELECT subject, recipient FROM notifications \
+         WHERE tenant_id = $1 AND recipient = 'watcher@example.com' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect(
+        "the ticket created via the public request-form path must dispatch \
+         the on_create send_notification action through the queue",
+    );
+    assert_eq!(subject, "New request-form ticket");
+    assert_eq!(recipient.as_deref(), Some("watcher@example.com"));
+}
+
 #[sqlx::test]
 async fn a_link_is_single_use(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
