@@ -23,7 +23,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{delete, get},
+    routing::{delete, get, patch},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -98,7 +98,16 @@ pub fn owner_grants_routes(
     Router::new()
         .route("/", get(list_owner_outbox))
         .route("/{id}", delete(revoke_owner_grant))
+        .route("/{id}", patch(update_owner_grant_role))
         .with_state(state)
+}
+
+/// BUNYIP-748 SPA-side wire body. `role` is the PMS-1162
+/// vocabulary; SaaS bunyip and standalone mokosh both validate on
+/// receive, so a bad value is 400 from one side or the other.
+#[derive(Debug, Deserialize)]
+pub struct UpdateGrantRoleBody {
+    pub role: String,
 }
 
 async fn list_owner_outbox(
@@ -292,6 +301,76 @@ async fn revoke_owner_grant(
             mokosh_account_id = %mokosh_account_id,
             "grantee placement tombstone failed after owner revoke (mirror is authoritative)"
         );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// BUNYIP-748 SPA-side `PATCH /api/v1/grants/{id}`. Changes an
+/// active grant's role in place. Fans out to bunyip in SaaS mode via
+/// `BunyipUserDirectory::update_grant_role` (which fires the mokosh
+/// mirror re-sync webhook on success); standalone mode writes the
+/// mirror directly.
+///
+/// Validation of the PMS-1162 role vocabulary happens on bunyip's
+/// side in SaaS mode (the machine handler validates); standalone
+/// mode validates here with the same closed set so the two modes
+/// answer the same shape for a bad role.
+async fn update_owner_grant_role(
+    State(state): State<OwnerGrantsState>,
+    RequireAdminUser(caller): RequireAdminUser,
+    Path(grant_id): Path<Uuid>,
+    Json(body): Json<UpdateGrantRoleBody>,
+) -> AppResult<StatusCode> {
+    let new_role = body.role.trim();
+
+    if let Some(directory) = state.bunyip_directory.as_ref() {
+        // SaaS mode: bunyip validates + fires the webhook + returns
+        // 4xx for an unknown role or a foreign grant. Any non-2xx
+        // surfaces as `AppError::Internal`, which the axum error
+        // handler turns into a 500; this differs from the standalone
+        // 400 shape on a bad role but the SPA renders the message
+        // body the same way (`error.user_message()`).
+        directory
+            .update_grant_role(grant_id, caller.id, new_role)
+            .await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Standalone mode: no bunyip, the local mirror is authoritative.
+    // Validate the role against the same closed vocabulary bunyip
+    // enforces so a standalone deployment answers the same 400 for a
+    // bad role as SaaS would.
+    if !matches!(
+        new_role,
+        "admin" | "manager" | "technician" | "finance" | "read_only"
+    ) {
+        return Err(AppError::BadRequest(
+            "role must be one of admin | manager | technician | finance | read_only".to_string(),
+        ));
+    }
+
+    // Same WHERE the sibling revoke uses (bunyip_grant_id OR id, +
+    // owner match, + active). The mokosh mirror's CHECK constraint
+    // rejects a non-PMS-1162 role too, but the vocabulary check
+    // above is what makes the failure a clean 400 rather than a 500
+    // from the database constraint.
+    let updated: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE mokosh_bunyip_grants \
+         SET role = $3, updated_at = NOW() \
+         WHERE (bunyip_grant_id = $1 OR id = $1) \
+           AND owner_bunyip_user_id = $2 \
+           AND revoked_at IS NULL \
+         RETURNING id",
+    )
+    .bind(grant_id)
+    .bind(caller.id)
+    .bind(new_role)
+    .fetch_optional(state.db.migrator_pool())
+    .await?;
+
+    if updated.is_none() {
+        return Err(AppError::NotFound("grant".to_string()));
     }
 
     Ok(StatusCode::NO_CONTENT)

@@ -203,6 +203,146 @@ async fn owner_revoke_stamps_actor_and_clears_role(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn owner_role_change_updates_the_mirror_in_place(pool: PgPool) {
+    clear_cache_for_tests();
+    let _tenant_id = seed_owner_tenant(&pool).await;
+    let owner = Uuid::new_v4();
+    let grantee = Uuid::new_v4();
+    let grant_id = Uuid::new_v4();
+
+    MokoshBunyipGrantService::upsert(
+        &pool,
+        grant_id,
+        owner,
+        grantee,
+        OWNER_TENANT_SLUG,
+        Some("read_only"),
+        Utc::now(),
+        None,
+    )
+    .await
+    .expect("upsert mirror");
+
+    // Same UPDATE the standalone branch of `update_owner_grant_role`
+    // runs. Same enumeration-resistant WHERE the revoke shape uses.
+    let updated: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        "UPDATE mokosh_bunyip_grants \
+         SET role = $3, updated_at = NOW() \
+         WHERE (bunyip_grant_id = $1 OR id = $1) \
+           AND owner_bunyip_user_id = $2 \
+           AND revoked_at IS NULL \
+         RETURNING id, role",
+    )
+    .bind(grant_id)
+    .bind(owner)
+    .bind("manager")
+    .fetch_optional(&pool)
+    .await
+    .expect("execute update");
+    let (_, new_role) = updated.expect("one row moved");
+    assert_eq!(new_role.as_deref(), Some("manager"));
+
+    // The mirror row is still active - a role change is not a
+    // revoke. Read it back and confirm.
+    let row: (Option<String>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT role, revoked_at FROM mokosh_bunyip_grants \
+         WHERE bunyip_grant_id = $1",
+    )
+    .bind(grant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read row");
+    assert_eq!(row.0.as_deref(), Some("manager"));
+    assert!(row.1.is_none(), "role change must not revoke");
+}
+
+#[sqlx::test]
+async fn owner_role_change_is_idempotent_at_the_same_role(pool: PgPool) {
+    clear_cache_for_tests();
+    let _tenant_id = seed_owner_tenant(&pool).await;
+    let owner = Uuid::new_v4();
+    let grantee = Uuid::new_v4();
+    let grant_id = Uuid::new_v4();
+
+    MokoshBunyipGrantService::upsert(
+        &pool,
+        grant_id,
+        owner,
+        grantee,
+        OWNER_TENANT_SLUG,
+        Some("manager"),
+        Utc::now(),
+        None,
+    )
+    .await
+    .expect("upsert mirror");
+
+    // PATCH to the same role must not error; a stale SPA that
+    // re-fires the same change under a refetch race should succeed
+    // rather than 400 on "already this role".
+    let updated: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE mokosh_bunyip_grants \
+         SET role = $3, updated_at = NOW() \
+         WHERE (bunyip_grant_id = $1 OR id = $1) \
+           AND owner_bunyip_user_id = $2 \
+           AND revoked_at IS NULL \
+         RETURNING id",
+    )
+    .bind(grant_id)
+    .bind(owner)
+    .bind("manager")
+    .fetch_optional(&pool)
+    .await
+    .expect("execute update");
+    assert!(updated.is_some(), "no-op update returns the same row");
+}
+
+#[sqlx::test]
+async fn owner_role_change_refuses_a_revoked_grant(pool: PgPool) {
+    clear_cache_for_tests();
+    let _tenant_id = seed_owner_tenant(&pool).await;
+    let owner = Uuid::new_v4();
+    let grantee = Uuid::new_v4();
+    let grant_id = Uuid::new_v4();
+
+    MokoshBunyipGrantService::upsert(
+        &pool,
+        grant_id,
+        owner,
+        grantee,
+        OWNER_TENANT_SLUG,
+        Some("technician"),
+        Utc::now(),
+        Some(Utc::now()),
+    )
+    .await
+    .expect("upsert revoked mirror");
+
+    // PATCH filters on `revoked_at IS NULL`, so a revoked row is
+    // invisible to the UPDATE - the caller sees 404 via the None
+    // return, matching the stale-client case the BUNYIP-748 ticket
+    // describes.
+    let updated: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE mokosh_bunyip_grants \
+         SET role = $3, updated_at = NOW() \
+         WHERE (bunyip_grant_id = $1 OR id = $1) \
+           AND owner_bunyip_user_id = $2 \
+           AND revoked_at IS NULL \
+         RETURNING id",
+    )
+    .bind(grant_id)
+    .bind(owner)
+    .bind("admin")
+    .fetch_optional(&pool)
+    .await
+    .expect("execute update");
+    assert!(
+        updated.is_none(),
+        "revoked grant must not receive a new role"
+    );
+}
+
+#[sqlx::test]
 async fn cancel_moves_a_pending_invitation_out_of_the_outbox(pool: PgPool) {
     clear_cache_for_tests();
     let tenant_id = seed_owner_tenant(&pool).await;

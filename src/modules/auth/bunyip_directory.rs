@@ -290,6 +290,54 @@ impl BunyipUserDirectory {
         Ok(body.data.unwrap_or_default())
     }
 
+    /// BUNYIP-748: change a bunyip grant's role in place. Same shape
+    /// as `revoke_grant`: `Ok(())` on 2xx, `Err(AppError::Internal)`
+    /// on transport / non-2xx (unknown id, foreign owner, revoked
+    /// grant, or a role outside the PMS-1162 vocabulary all surface
+    /// as non-2xx from bunyip). Distinguishing the cases is the
+    /// caller upstream's job via the message body.
+    ///
+    /// The grantee's next request re-reads the mirror through
+    /// `resolve_grantee_caller` and picks up the new role without
+    /// re-authenticating; no session invalidation is needed.
+    #[tracing::instrument(skip(self), fields(grant_id = %grant_id, owner = %owner_bunyip_user_id, role = %new_role))]
+    pub async fn update_grant_role(
+        &self,
+        grant_id: Uuid,
+        owner_bunyip_user_id: Uuid,
+        new_role: &str,
+    ) -> AppResult<()> {
+        let url = format!("{}/v1/mokosh-grants/{grant_id}", self.base_url);
+        let body = serde_json::json!({
+            "owner_bunyip_user_id": owner_bunyip_user_id,
+            "role": new_role,
+        });
+        let resp = self
+            .http
+            .patch(&url)
+            .header("Authorization", &self.basic_header)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::internal(format!("bunyip mokosh-grant update transport: {e}"))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body.chars().take(200).collect::<String>(),
+                "bunyip mokosh-grant update returned a non-2xx"
+            );
+            return Err(AppError::internal(format!(
+                "bunyip mokosh-grant update returned status {status}"
+            )));
+        }
+        Ok(())
+    }
+
     /// MAPPS-875: revoke a bunyip grant on the owner's behalf. Idempotent
     /// on bunyip's side (an already-revoked grant is 204 without
     /// re-firing the webhook), so retrying a network-dropped revoke is

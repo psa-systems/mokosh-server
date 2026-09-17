@@ -44,6 +44,7 @@ use mokosh_server::modules::auth::bunyip_directory::BunyipUserDirectory;
 struct StubState {
     grants_by_owner: Arc<Mutex<Vec<(Uuid, serde_json::Value)>>>,
     revoked_ids: Arc<Mutex<Vec<Uuid>>>,
+    updated_ids: Arc<Mutex<Vec<Uuid>>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -98,10 +99,57 @@ async fn revoke_handler(
     StatusCode::NO_CONTENT
 }
 
+#[derive(serde::Deserialize)]
+struct UpdateRoleBody {
+    #[serde(rename = "owner_bunyip_user_id")]
+    _owner: Uuid,
+    role: String,
+}
+
+async fn update_handler(
+    State(state): State<StubState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateRoleBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Validate the role against the same closed vocabulary the real
+    // bunyip enforces so the client's error branch is reachable.
+    if !matches!(
+        body.role.as_str(),
+        "admin" | "manager" | "technician" | "finance" | "read_only"
+    ) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut rows = state.grants_by_owner.lock().unwrap();
+    let Some(row) = rows
+        .iter_mut()
+        .find(|(_, row)| row["grant_id"].as_str() == Some(&id.to_string()))
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    // Mutate the row in place so the next list_owner_grants call
+    // reports the new role, matching the mirror-refresh contract.
+    if let Some(obj) = row.1.as_object_mut() {
+        obj.insert(
+            "role".to_string(),
+            serde_json::Value::String(body.role.clone()),
+        );
+    }
+    state.updated_ids.lock().unwrap().push(id);
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "data": row.1.clone(),
+        "meta": { "request_id": "test-request-id" },
+    })))
+}
+
 async fn spawn_stub(state: StubState) -> String {
     let app = Router::new()
         .route("/v1/mokosh-grants", get(list_handler))
         .route("/v1/mokosh-grants/{id}", delete(revoke_handler))
+        .route(
+            "/v1/mokosh-grants/{id}",
+            axum::routing::patch(update_handler),
+        )
         .with_state(state);
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -209,6 +257,74 @@ async fn revoke_grant_returns_ok_on_204(_pool: PgPool) {
     // right id in the URL.
     let revoked = revoked_ids.lock().unwrap().clone();
     assert_eq!(revoked, vec![grant_id]);
+}
+
+#[sqlx::test]
+async fn update_grant_role_fires_the_patch_on_success(_pool: PgPool) {
+    let owner = Uuid::new_v4();
+    let grant_id = Uuid::new_v4();
+
+    let state = StubState::default();
+    state.grants_by_owner.lock().unwrap().push((
+        owner,
+        serde_json::json!({
+            "grant_id": grant_id.to_string(),
+            "grantee_bunyip_user_id": Uuid::new_v4().to_string(),
+            "mokosh_account_id": "acme",
+            "role": "read_only",
+            "granted_at": "2026-01-01T00:00:00Z",
+        }),
+    ));
+    let updated_ids = state.updated_ids.clone();
+    let grants_snapshot = state.grants_by_owner.clone();
+
+    let base_url = spawn_stub(state).await;
+    let directory = BunyipUserDirectory::for_tests(base_url);
+
+    directory
+        .update_grant_role(grant_id, owner, "manager")
+        .await
+        .expect("update ok");
+
+    // Pin that the DIRECTORY reached the PATCH endpoint AND that the
+    // stub's row-mutation shows the new role, matching the mirror-
+    // refresh contract mokosh's grantee JIT reads on the next
+    // request.
+    let updates = updated_ids.lock().unwrap().clone();
+    assert_eq!(updates, vec![grant_id]);
+    let snapshot = grants_snapshot.lock().unwrap();
+    let row = &snapshot[0].1;
+    assert_eq!(row["role"].as_str(), Some("manager"));
+}
+
+#[sqlx::test]
+async fn update_grant_role_surfaces_400_on_an_unknown_role(_pool: PgPool) {
+    let owner = Uuid::new_v4();
+    let grant_id = Uuid::new_v4();
+
+    let state = StubState::default();
+    state.grants_by_owner.lock().unwrap().push((
+        owner,
+        serde_json::json!({
+            "grant_id": grant_id.to_string(),
+            "grantee_bunyip_user_id": Uuid::new_v4().to_string(),
+            "mokosh_account_id": "acme",
+            "role": "admin",
+            "granted_at": "2026-01-01T00:00:00Z",
+        }),
+    ));
+
+    let base_url = spawn_stub(state).await;
+    let directory = BunyipUserDirectory::for_tests(base_url);
+
+    // The stub answers 400 for a role outside the vocabulary (the
+    // real bunyip does the same via `validate_grant_role`). The
+    // client's non-2xx path surfaces as Err; the SPA translates
+    // that to a toast.
+    let result = directory
+        .update_grant_role(grant_id, owner, "godmode")
+        .await;
+    assert!(result.is_err(), "invalid role must not report success");
 }
 
 #[sqlx::test]
