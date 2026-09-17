@@ -714,7 +714,7 @@ impl TenantService {
         };
 
         let secret = generate_token(64);
-        let token_hash = match hash_password(&secret) {
+        let token_hash = match hash_password(&secret).await {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(

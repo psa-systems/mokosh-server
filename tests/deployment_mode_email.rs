@@ -105,6 +105,7 @@ fn new_user(email: &str) -> CreateUserRequest {
 async fn seed_user(pool: &PgPool, email: &str) -> Uuid {
     let id = Uuid::new_v4();
     let hash = mokosh_server::utils::crypto::hash_password("local-password-123")
+        .await
         .expect("hash test password");
     sqlx::query(
         r#"

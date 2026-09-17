@@ -222,7 +222,7 @@ impl ContactAuthService {
         }
 
         let stored_hash = password_hash.ok_or(AppError::Unauthorized)?;
-        if !verify_password(password, &stored_hash)? {
+        if !verify_password(password, &stored_hash).await? {
             // Best-effort: bump the failed-login counter + arm lockout
             // if we cross the threshold. Errors here do not fail the
             // response - they just skip the lockout write.
@@ -377,7 +377,7 @@ impl ContactAuthService {
         let Some((tenant_id, contact_id, hash, revoked_at, expires_at, family_id)) = row else {
             return Err(AppError::Unauthorized);
         };
-        if !verify_password(secret, &hash)? {
+        if !verify_password(secret, &hash).await? {
             return Err(AppError::Unauthorized);
         }
         if revoked_at.is_some() {
@@ -524,7 +524,7 @@ impl ContactAuthService {
         let Some((hash, family_id, tenant_id, contact_id)) = row else {
             return Ok(());
         };
-        if !verify_password(secret, &hash)? {
+        if !verify_password(secret, &hash).await? {
             return Ok(());
         }
         self.revoke_session_family(family_id).await?;
@@ -617,7 +617,7 @@ impl ContactAuthService {
 
         let mut matched: Option<(Uuid, Uuid)> = None;
         for (token_id, tenant_id, token_hash, used_at, expires_at) in &candidates {
-            if verify_password(secret, token_hash)? {
+            if verify_password(secret, token_hash).await? {
                 if used_at.is_some() {
                     tracing::warn!(
                         contact_id = %contact_id,
@@ -669,7 +669,7 @@ impl ContactAuthService {
             AppError::BadRequest(m)
         })?;
 
-        let hash = hash_password(new_password)?;
+        let hash = hash_password(new_password).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, \
@@ -759,7 +759,7 @@ impl ContactAuthService {
         // table so `setup_password` / `reset_password` can share the
         // same verify path. 30-min TTL.
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::minutes(RESET_TOKEN_TTL_MIN);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1239,7 +1239,7 @@ impl ContactAuthService {
 
             let intent_id = Uuid::new_v4();
             let secret = generate_token(32);
-            let secret_hash = hash_password(&secret)?;
+            let secret_hash = hash_password(&secret).await?;
             let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
             let ip_text = ip.map(|ip| ip.to_string()).unwrap_or_default();
             sqlx::query(
@@ -1398,7 +1398,7 @@ impl ContactAuthService {
             );
             return Err(invalid());
         }
-        if !verify_password(secret, &secret_hash)? {
+        if !verify_password(secret, &secret_hash).await? {
             tracing::warn!(
                 intent_id = %intent_id,
                 "redeem_login_link rejected: secret hash did not verify against the row"
@@ -1617,7 +1617,7 @@ impl ContactAuthService {
         portal_slug: &str,
     ) -> AppResult<String> {
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::hours(72);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -2011,7 +2011,7 @@ impl ContactAuthService {
         ip: Option<IpAddr>,
     ) -> AppResult<String> {
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
         let expires_at = Utc::now() + Duration::days(REFRESH_TOKEN_TTL_DAYS);
         let ip_text = ip.map(|ip| ip.to_string()).unwrap_or_default();
         sqlx::query(
@@ -2154,7 +2154,7 @@ impl ContactAuthService {
             return Err(AppError::Unauthorized);
         };
         let hash = password_hash.ok_or(AppError::Unauthorized)?;
-        if !verify_password(current_password, &hash)? {
+        if !verify_password(current_password, &hash).await? {
             return Err(AppError::Unauthorized);
         }
         Ok((enabled, secret, email.unwrap_or_default()))
@@ -2193,7 +2193,7 @@ impl ContactAuthService {
             let crate::utils::password_policy::PasswordPolicyError::UserMessage(m) = e;
             AppError::BadRequest(m)
         })?;
-        let hash = hash_password(new_password)?;
+        let hash = hash_password(new_password).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE contacts SET portal_password_hash = $1, updated_at = NOW() \

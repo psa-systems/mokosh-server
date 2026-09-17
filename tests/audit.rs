@@ -135,8 +135,9 @@ async fn audit_read_requires_admin(pool: PgPool) {
     // read endpoint rejects them (RequireAdmin).
     let email = "manager@example.com".to_string();
     let password = "manager-password-12345".to_string();
-    let password_hash =
-        mokosh_server::utils::crypto::hash_password(&password).expect("hash manager password");
+    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash manager password");
     sqlx::query(
         r#"INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at)
            VALUES ($1, $2, $3, $4, 'Man', 'Ager', 'manager', 'active', NOW())"#,

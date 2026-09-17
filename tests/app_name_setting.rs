@@ -67,6 +67,7 @@ async fn seed_one_admin(pool: &PgPool) -> Uuid {
 /// later, so nothing else has to run.
 async fn reset_mail(pool: &PgPool, email: &str) -> (String, String) {
     let hash = mokosh_server::utils::crypto::hash_password("local-password-123")
+        .await
         .expect("hash test password");
     sqlx::query(
         "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status)
