@@ -117,6 +117,27 @@ impl BunyipUserDirectory {
     /// `Err` when the shape is partial - the deployment almost
     /// certainly meant to enable the client and left a value out,
     /// and silently disabling it hides the misconfiguration.
+    /// MAPPS-875: test-only constructor for integration tests that
+    /// point the client at a mock bunyip HTTP server (`tests/owner_grant_saas.rs`).
+    /// Never called in production - `from_config` is the one path
+    /// that mints a production instance - but the constructor cannot
+    /// be `#[cfg(test)]` because integration tests link this crate
+    /// as an external dependency. `#[doc(hidden)]` keeps it out of
+    /// the rustdoc public surface.
+    #[doc(hidden)]
+    pub fn for_tests(base_url: impl Into<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("build test bunyip directory client");
+        let basic = B64.encode("test-client-id:test-client-secret");
+        Self {
+            http,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            basic_header: format!("Basic {basic}"),
+        }
+    }
+
     pub fn from_config() -> AppResult<Option<Self>> {
         let base = config::get(&BUNYIP_API_BASE_URL)
             .map(|s| s.trim().to_string())
