@@ -38,19 +38,22 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
-use axum::http::{header, StatusCode};
-use axum::response::IntoResponse;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
+use tokio_stream::StreamExt;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::{RequireManager, TenantId, TenantScoped};
-use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
+use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider, ObjectReader};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::upload_limits::oversized_upload_error;
 // PMS-941: one allowlist for every publicly-readable image route. SVG is
@@ -61,6 +64,11 @@ use crate::utils::inline_image::check_inline_image_mime;
 /// screenshot or a diagram, well under the 25 MiB a ticket attachment allows,
 /// because these are embedded in a page rather than downloaded on purpose.
 const DEFAULT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// PMS-1246: the public read is streamed and immutable (the id names one set
+/// of bytes for its whole life), the same shape as the ticket inline image;
+/// see `tickets::attachments::INLINE_CACHE_CONTROL_VALUE`.
+const CACHE_CONTROL_VALUE: &str = "public, max-age=31536000, immutable";
 
 #[derive(Clone, Debug)]
 pub struct KbAttachmentConfig {
@@ -280,7 +288,8 @@ impl KbAttachmentService {
         Ok(())
     }
 
-    /// The bytes for an id, for the PUBLIC read path.
+    /// Metadata for an id, for the PUBLIC read path: enough to answer a
+    /// conditional request and set headers without opening the blob.
     ///
     /// SAFETY (PMS-285 / PMS-923): this runs on the BYPASSRLS migrator pool
     /// because it has no tenant to set the `app.current_tenant` GUC to. The
@@ -291,38 +300,79 @@ impl KbAttachmentService {
     ///
     /// The id is a v4 UUID, so it is the credential. Every OTHER access to this
     /// table is tenant-scoped through `begin_with_tenant` above.
-    async fn read_public(&self, id: Uuid) -> AppResult<(String, Vec<u8>)> {
+    async fn read_public(&self, id: Uuid) -> AppResult<PublicAttachmentRow> {
         let pool: &PgPool = self.db.migrator_pool();
         // PMS-910: the tenant comes off the row rather than off the request,
         // because this path has none. The stored layout ignores it today, but
         // the key carries it so PMS-960 can move these files under a tenant
         // prefix without touching this call site.
-        let row: Option<(String, Uuid)> =
-            sqlx::query_as("SELECT mime_type, tenant_id FROM kb_article_attachments WHERE id = $1")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+        let row: Option<(String, Uuid, i64)> = sqlx::query_as(
+            "SELECT mime_type, tenant_id, file_size FROM kb_article_attachments WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
         // An unknown id and a deleted attachment answer identically, so this is
         // not an existence oracle for ids somebody is guessing at.
-        let (mime, tenant_id) = row.ok_or_else(|| AppError::NotFound("Attachment".to_string()))?;
-        let bytes = match self
+        let (mime_type, tenant_id, file_size) =
+            row.ok_or_else(|| AppError::NotFound("Attachment".to_string()))?;
+        Ok(PublicAttachmentRow {
+            id,
+            tenant_id,
+            mime_type,
+            file_size,
+        })
+    }
+
+    /// PMS-1246: stream rather than buffer the blob. Same legacy-path fallback
+    /// as the old `read_public` (see the module header): the tenant on both
+    /// keys is the row's own, never the request's.
+    async fn open_public(&self, row: &PublicAttachmentRow) -> AppResult<ObjectReader> {
+        match self
             .store
-            .read(&ObjectKey::kb_attachment(tenant_id, id))
+            .open(&ObjectKey::kb_attachment(row.tenant_id, row.id))
             .await
         {
-            Ok(bytes) => bytes,
-            // PMS-960: uploaded before the layout carried a tenant, and the
-            // mover has not reached it yet. The tenant on both keys is the
-            // row's own, so this cannot serve another tenant's file; see the
-            // module header. Costs one extra open, and only on a miss.
+            Ok(reader) => Ok(reader),
             Err(_) => self
                 .store
-                .read(&ObjectKey::legacy_kb_attachment(tenant_id, id))
+                .open(&ObjectKey::legacy_kb_attachment(row.tenant_id, row.id))
                 .await
-                .map_err(|_| AppError::NotFound("Attachment".to_string()))?,
-        };
-        Ok((mime, bytes))
+                .map_err(|_| AppError::NotFound("Attachment".to_string())),
+        }
     }
+}
+
+/// Metadata for [`KbAttachmentService::read_public`], enough to build headers
+/// and an ETag before the blob is opened.
+struct PublicAttachmentRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    mime_type: String,
+    file_size: i64,
+}
+
+/// Strong validator for an immutable blob: the uuid that addresses it plus the
+/// size recorded on the row. Mirrors
+/// `tickets::attachments::attachment_etag` (PMS-783); duplicated rather than
+/// shared because the two modules already keep their attachment-serving code
+/// independent (see the ticket-attachment module header).
+fn attachment_etag(id: Uuid, file_size: i64) -> String {
+    format!("\"{id}-{file_size}\"")
+}
+
+/// RFC 9110 compares `If-None-Match` with the WEAK function, so `W/"x"` matches
+/// `"x"`, `*` matches any existing representation, and the value may be a list.
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(raw) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    raw.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
 }
 
 #[derive(Clone)]
@@ -433,27 +483,52 @@ async fn delete_attachment(
 
 /// UNAUTHENTICATED. The id in the path is the only identity; see the module
 /// header for why an `<img>` leaves no other option.
+///
+/// PMS-1246: streamed rather than buffered whole into memory, and a matching
+/// `If-None-Match` gets a 304 with no blob read at all.
 async fn get_public_attachment(
     State(s): State<KbAttachmentRouterState>,
+    headers: HeaderMap,
     Path(attachment_id): Path<Uuid>,
-) -> AppResult<impl IntoResponse> {
-    let (mime, bytes) = s.service.read_public(attachment_id).await?;
+) -> AppResult<Response> {
+    let row = s.service.read_public(attachment_id).await?;
+    let etag = attachment_etag(row.id, row.file_size);
+    if if_none_match_matches(&headers, &etag) {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::CACHE_CONTROL, CACHE_CONTROL_VALUE.to_string()),
+                (header::ETAG, etag),
+            ],
+        )
+            .into_response());
+    }
+
+    let attachment_id = row.id;
+    let reader = s.service.open_public(&row).await?;
+    let stream = ReaderStream::new(reader).map(move |chunk| {
+        chunk.inspect_err(|e| {
+            tracing::error!(%attachment_id, "kb attachment stream read failed: {e}");
+        })
+    });
+
     Ok((
+        StatusCode::OK,
         [
-            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_TYPE, row.mime_type),
+            (header::CONTENT_LENGTH, row.file_size.to_string()),
             // Immutable: the id names one set of bytes for its whole life, so a
             // client that has fetched it never needs to ask again.
-            (
-                header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable".to_string(),
-            ),
+            (header::CACHE_CONTROL, CACHE_CONTROL_VALUE.to_string()),
+            (header::ETAG, etag),
             // The bytes are user-supplied; make certain a browser renders them
             // as the declared type rather than sniffing its way to something
             // scriptable.
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
         ],
-        bytes,
-    ))
+        Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 #[cfg(test)]
