@@ -18,7 +18,10 @@
 //! for the field-level behavior, and by `tests/upload_body_limit_branding.rs`
 //! (PMS-1233) at the HTTP level for the route's `DefaultBodyLimit` sizing,
 //! which a pure-function unit test cannot exercise because it never builds
-//! an axum `Router`.
+//! an axum `Router`. The one exception covered here is the tenant logo
+//! (PMS-1234, below): it has a second, older entry point
+//! (`PUT /tenants/current/logo`) that must write the same object, so
+//! that convergence needs an HTTP-level test rather than a unit one.
 
 mod common;
 
@@ -566,5 +569,76 @@ async fn a_configured_brand_name_still_wins(pool: PgPool) {
     assert!(
         eff["company_name"].is_null(),
         "a configured display name means nothing is filled in: {eff}"
+    );
+}
+
+/// PMS-1234: the branding route's tenant-logo write must land at the same
+/// object the older `PUT /tenants/current/logo` route writes, so the public
+/// logo endpoint serves whichever upload happened last regardless of which
+/// route made it.
+#[sqlx::test]
+async fn a_branding_route_logo_upload_serves_from_the_public_logo_endpoint(pool: PgPool) {
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    let (_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let part = reqwest::multipart::Part::bytes(PNG.to_vec())
+        .file_name("logo.png")
+        .mime_str("image/png")
+        .expect("mime");
+    let resp = app
+        .client
+        .put(app.url("/api/v1/tenants/current/branding/logo"))
+        .bearer_auth(&token)
+        .multipart(reqwest::multipart::Form::new().part("file", part))
+        .send()
+        .await
+        .expect("upload via branding route");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "branding-route logo upload"
+    );
+
+    let public = app
+        .client
+        .get(app.url(&format!(
+            "/api/v1/public/tenants/{}/logo",
+            common::DEFAULT_TENANT_ID
+        )))
+        .send()
+        .await
+        .expect("public logo fetch");
+    assert_eq!(
+        public.status(),
+        reqwest::StatusCode::OK,
+        "the public logo endpoint must serve the branding-route upload"
+    );
+    let bytes = public.bytes().await.expect("public logo bytes");
+    assert_eq!(
+        bytes.as_ref(),
+        PNG,
+        "the public endpoint must serve the exact bytes the branding route stored"
+    );
+
+    let ledger_path: Option<String> = sqlx::query_scalar(
+        "SELECT storage_path FROM files WHERE id = $1 AND entity_type = 'tenant_logo'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_optional(&pool)
+    .await
+    .expect("read the ledger");
+    assert_eq!(
+        ledger_path.as_deref(),
+        Some(format!("{}/logo.png", common::DEFAULT_TENANT_ID).as_str()),
+        "the branding route must record the same ledger row `PUT /tenants/current/logo` does"
     );
 }

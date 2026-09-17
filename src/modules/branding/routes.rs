@@ -58,8 +58,10 @@ pub fn staff_routes(db: Database) -> Router {
     let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company(Uuid::nil()));
     let tenant_max_bytes = store.max_bytes_for_scope(AssetScope::Tenant(Uuid::nil()));
     let state = StaffBrandingState {
+        // PMS-1234: gives the tenant-logo write path (only) a ledger, the
+        // same way `TenantLogoStore::with_ledger` does.
+        store: Arc::new(store.with_ledger(db.clone())),
         db,
-        store: Arc::new(store),
     };
     Router::new()
         .route(
@@ -199,8 +201,8 @@ pub fn contact_routes(
     // PMS-1233: see the matching comment in `staff_routes`.
     let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company(Uuid::nil()));
     let state = ContactBrandingState {
+        store: Arc::new(store.with_ledger(db.clone())),
         db,
-        store: Arc::new(store),
         contact_service,
     };
     Router::new()

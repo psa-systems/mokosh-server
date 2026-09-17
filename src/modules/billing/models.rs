@@ -366,7 +366,10 @@ pub struct UpdateInvoiceRequest {
     /// means "this invoice bills for nothing".
     #[validate(length(min = 1, message = "At least one line item is required"))]
     pub lines: Option<Vec<CreateInvoiceLineRequest>>,
-    /// Transition status. Same set as the schema CHECK constraint.
+    /// Transition status. Deserializes the same set as the schema CHECK
+    /// constraint, but the service rejects `void` and `written_off` here
+    /// (PMS-1227): those are terminal states owned by `void_invoice` and
+    /// `write_off_invoice`, each with its own preconditions.
     pub status: Option<InvoiceStatus>,
     /// PMS-992: mark the invoice sent WITHOUT emailing it, for one delivered
     /// by hand (printed, or attached to a message the operator writes). Off,
@@ -389,6 +392,10 @@ pub enum PaymentMethod {
     Ach,
     Wire,
     Cash,
+    /// PMS-1235: a gateway-confirmed PayPal payment. Distinct from
+    /// `CreditCard`, which `record_gateway_payment` used to record for every
+    /// gateway regardless of which one actually took the payment.
+    Paypal,
     Other,
 }
 
@@ -400,6 +407,7 @@ impl PaymentMethod {
             Self::Ach => "ach",
             Self::Wire => "wire",
             Self::Cash => "cash",
+            Self::Paypal => "paypal",
             Self::Other => "other",
         }
     }
@@ -411,6 +419,7 @@ impl PaymentMethod {
             "ach" => Some(Self::Ach),
             "wire" => Some(Self::Wire),
             "cash" => Some(Self::Cash),
+            "paypal" => Some(Self::Paypal),
             "other" => Some(Self::Other),
             _ => None,
         }
@@ -1194,11 +1203,18 @@ pub struct StatementResponse {
     pub total_credited: Decimal,
     /// Sum of `write_offs` above (PMS-1036).
     pub total_written_off: Decimal,
-    /// `opening_balance + total_invoiced + total_refunded - total_paid -
-    /// total_credited - total_written_off`, and the tests assert exactly that
-    /// rather than trusting the sentence. A written-off amount leaves the
-    /// account the customer is asked to settle; it is the MSP's loss, not a
-    /// sum still being collected.
+    /// PMS-1235: the part of `total_paid` that is a recovery, a payment made
+    /// against an invoice on or after it was written off. `write_offs` above
+    /// carries the write-off's own frozen amount undiscounted, so a payment
+    /// that later recovers it would otherwise be subtracted a second time by
+    /// `total_paid`; this is added back to cancel exactly that, and only
+    /// that, whichever period the write-off and its recovery fall in.
+    pub total_recovered: Decimal,
+    /// `opening_balance + total_invoiced + total_refunded + total_recovered -
+    /// total_paid - total_credited - total_written_off`, and the tests assert
+    /// exactly that rather than trusting the sentence. A written-off amount
+    /// leaves the account the customer is asked to settle; it is the MSP's
+    /// loss, not a sum still being collected, unless it is later recovered.
     pub closing_balance: Decimal,
 }
 

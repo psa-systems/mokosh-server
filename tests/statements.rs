@@ -139,11 +139,13 @@ async fn statement(
 /// that does not satisfy this is not a statement, whatever else is right about
 /// it.
 fn assert_reconciles(s: &Value) {
-    let expected =
-        dec(&s["opening_balance"]) + dec(&s["total_invoiced"]) + dec(&s["total_refunded"])
-            - dec(&s["total_paid"])
-            - dec(&s["total_credited"])
-            - dec(&s["total_written_off"]);
+    let expected = dec(&s["opening_balance"])
+        + dec(&s["total_invoiced"])
+        + dec(&s["total_refunded"])
+        + dec(&s["total_recovered"])
+        - dec(&s["total_paid"])
+        - dec(&s["total_credited"])
+        - dec(&s["total_written_off"]);
     assert_eq!(
         dec(&s["closing_balance"]),
         expected,
@@ -431,4 +433,74 @@ async fn a_statement_is_scoped_and_its_period_is_checked(pool: PgPool) {
         .await
         .expect("send unknown company");
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+async fn write_off(app: &common::TestApp, token: &str, invoice_id: &str, reason: &str) {
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/invoices/{invoice_id}/write-off")))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "reason": reason }))
+        .send()
+        .await
+        .expect("send write-off");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "write off");
+}
+
+/// PMS-1235: a written-off invoice later paid in full (a recovery, PMS-1036)
+/// must leave the account, not zero it out twice. `write_off_amount` is a
+/// frozen bucket taken out of the balance once; the recovery payment lands in
+/// `payments` like any other and would be taken out a second time for the
+/// same debt without `total_recovered` cancelling it back in.
+#[sqlx::test]
+async fn a_recovered_write_off_is_deducted_from_the_balance_only_once(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = common::seed_company(&pool).await;
+    // PMS-993: an invoice cannot be sent without a billing contact.
+    common::seed_billing_contact(&pool, company_id).await;
+
+    // `written_off_at` is stamped at write-off time rather than caller-given
+    // (PMS-1036), so the period this test asks for has to be wide enough to
+    // contain whatever "now" is when the suite runs.
+    let today = chrono::Utc::now().date_naive();
+    let invoice_id = invoice_on(&app, &token, company_id, "2020-01-01", "1000").await;
+    send(&app, &token, &invoice_id).await;
+    write_off(&app, &token, &invoice_id, "Customer went out of business").await;
+
+    // The recovery: the customer pays in full anyway, dated on or after the
+    // write-off (same day here, since both happen in this one test run).
+    pay(
+        &app,
+        &token,
+        company_id,
+        &invoice_id,
+        &today.to_string(),
+        "1000",
+    )
+    .await;
+
+    let s = statement(&app, &token, company_id, "2000-01-01", "2100-01-01").await;
+    assert_reconciles(&s);
+    assert_eq!(
+        dec(&s["total_written_off"]),
+        Decimal::from(1000),
+        "the write-off still shows its own frozen amount"
+    );
+    assert_eq!(
+        dec(&s["total_paid"]),
+        Decimal::from(1000),
+        "the recovery payment still shows as a real payment"
+    );
+    assert_eq!(
+        dec(&s["total_recovered"]),
+        Decimal::from(1000),
+        "the recovery cancels the write-off's deduction, not adds a second one"
+    );
+    assert_eq!(
+        dec(&s["closing_balance"]),
+        Decimal::ZERO,
+        "invoiced 1000, written off, then fully recovered: the account is settled, not -1000"
+    );
 }

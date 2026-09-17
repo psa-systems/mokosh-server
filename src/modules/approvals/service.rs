@@ -424,10 +424,18 @@ impl ApprovalsService {
             }
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1236: lock the row before deciding. Without this, two
+        // concurrent decisions (e.g. two role-holders both approving/
+        // rejecting) both read `status = 'pending'`, both pass the
+        // authorisation check, and the docstring's "a race cannot double-
+        // decide" claim did not hold: only the UPDATE was unconditional, and
+        // with no lock on the read the second decision could still land
+        // after the first, overwriting it. The lock serializes the second
+        // caller behind the first's commit.
         let scope: Option<(String, Option<Uuid>, Option<String>)> = sqlx::query_as(
             "SELECT status, approver_user_id, approver_role \
              FROM ticket_approvals \
-             WHERE tenant_id = $1 AND id = $2",
+             WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
         )
         .bind(tenant_id)
         .bind(id)
@@ -445,10 +453,10 @@ impl ApprovalsService {
                 "Only the assigned approver may decide".into(),
             ));
         }
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE ticket_approvals SET status = $3, decision_notes = $4, \
                                           decided_by_id = $5, decided_at = NOW() \
-             WHERE tenant_id = $1 AND id = $2",
+             WHERE tenant_id = $1 AND id = $2 AND status = 'pending'",
         )
         .bind(tenant_id)
         .bind(id)
@@ -456,7 +464,13 @@ impl ApprovalsService {
         .bind(&req.decision_notes)
         .bind(caller_id)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Err(AppError::BadRequest(
+                "Approval is already decided".to_string(),
+            ));
+        }
         tx.commit().await?;
         self.get(tenant_id, id).await
     }
@@ -486,9 +500,11 @@ impl ApprovalsService {
             }
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1236: lock the row before deciding, the same race the staff
+        // arm (`decide`) closes - see its comment.
         let status: Option<String> = sqlx::query_scalar(
             "SELECT status FROM ticket_approvals \
-             WHERE tenant_id = $1 AND id = $2 AND approver_contact_id = $3",
+             WHERE tenant_id = $1 AND id = $2 AND approver_contact_id = $3 FOR UPDATE",
         )
         .bind(tenant_id)
         .bind(id)
@@ -501,10 +517,10 @@ impl ApprovalsService {
                 "Approval is already {status}"
             )));
         }
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE ticket_approvals SET status = $4, decision_notes = $5, \
                                           decided_by_contact_id = $3, decided_at = NOW() \
-             WHERE tenant_id = $1 AND id = $2 AND approver_contact_id = $3",
+             WHERE tenant_id = $1 AND id = $2 AND approver_contact_id = $3 AND status = 'pending'",
         )
         .bind(tenant_id)
         .bind(id)
@@ -512,7 +528,13 @@ impl ApprovalsService {
         .bind(new_status)
         .bind(&req.decision_notes)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Err(AppError::BadRequest(
+                "Approval is already decided".to_string(),
+            ));
+        }
         tx.commit().await?;
         if let Err(err) = crate::modules::audit::audit_portal_event(
             self.db.migrator_pool(),
@@ -534,7 +556,13 @@ impl ApprovalsService {
     /// cancel; other paths surface 403.
     pub async fn cancel(&self, tenant_id: Uuid, id: Uuid, caller_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(String, Uuid)> = sqlx::query_as(
+        // PMS-1236: `requested_by_id` is NULL for a contact-filed approval
+        // (those carry `requested_by_contact_id` instead), so it must decode
+        // as `Option<Uuid>`. Decoding it as a bare `Uuid` made a
+        // contact-filed row fail with a 500 on every cancel attempt instead
+        // of the intended 403 (a staff caller is never the contact who
+        // filed it).
+        let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
             "SELECT status, requested_by_id FROM ticket_approvals \
              WHERE tenant_id = $1 AND id = $2",
         )
@@ -548,7 +576,7 @@ impl ApprovalsService {
                 "Approval is already {status}"
             )));
         }
-        if requester != caller_id {
+        if requester != Some(caller_id) {
             return Err(AppError::Forbidden("Only the requester may cancel".into()));
         }
         sqlx::query(
