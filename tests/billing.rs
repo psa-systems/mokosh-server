@@ -1359,6 +1359,67 @@ async fn sending_persists_the_resolved_billing_contact(pool: PgPool) {
     );
 }
 
+/// PMS-1227: `update_invoice` cannot walk a draft straight into a terminal
+/// status. Those transitions have their own endpoints with their own
+/// preconditions (`void_invoice`, `write_off_invoice`), each writing detail
+/// columns this path never touches; accepting the status verbatim here used
+/// to commit e.g. `written_off` with every write-off column NULL, a row
+/// neither dedicated endpoint could then reach.
+#[sqlx::test]
+async fn update_invoice_rejects_void_and_written_off_status(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let invoice: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-07-15",
+            "lines": [{ "line_type": "service", "description": "Work", "quantity": "1", "unit_price": "100" }],
+        }))
+        .send()
+        .await
+        .expect("create invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    let invoice_id = Uuid::parse_str(invoice["id"].as_str().expect("id")).expect("uuid");
+    assert_eq!(invoice["status"].as_str(), Some("draft"));
+
+    for status in ["written_off", "void"] {
+        let resp = app
+            .client
+            .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "status": status }))
+            .send()
+            .await
+            .expect("update invoice");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{status} is rejected as a validation error"
+        );
+    }
+
+    let row_status: String =
+        sqlx::query_scalar("SELECT status FROM invoices WHERE tenant_id = $1 AND id = $2")
+            .bind(common::DEFAULT_TENANT_ID)
+            .bind(invoice_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read invoice back");
+    assert_eq!(
+        row_status, "draft",
+        "the rejected transitions leave status unchanged"
+    );
+}
+
 /// PMS-1004: a generated line describes the work, not the row.
 ///
 /// `Time entry {uuid}` was the description of every line the builder wrote,

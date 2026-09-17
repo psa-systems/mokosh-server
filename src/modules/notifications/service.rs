@@ -1299,6 +1299,12 @@ impl NotificationsService {
 
         let mut messages: Vec<RenderedNotification> = Vec::new();
         for rule in rules {
+            // PMS-1237 finding 2: a rule scoped by `conditions` only fires
+            // for a matching dispatch context.
+            if !rule_conditions_match(&rule.conditions, context) {
+                continue;
+            }
+
             // PMS-782 batch: templates were loaded up front (see
             // `template_index` above), so the per-rule lookup is one hash hit
             // rather than a round-trip. Main's per-rule fetch was PMS-261's
@@ -1353,6 +1359,24 @@ impl NotificationsService {
                 if !emails.iter().any(|e| e == addr) {
                     emails.push(addr.clone());
                 }
+            }
+
+            // PMS-1237 finding 4: `user_ids` and `emails` are each deduped
+            // against themselves above, but a recipient named by both a user
+            // id (rule.recipients or `recipient_user_id`) and their own email
+            // address (rule.recipients or `recipient_email`) was not deduped
+            // across the two lists, so they got the row `dispatch` queues for
+            // `user_ids` (through `lookup_user_emails` at send time) AND the
+            // standalone row queued for `emails`, for the same channel. Drop
+            // an email address that already resolves to one of this rule's
+            // user_ids, the same lookup the worker uses at delivery.
+            if !user_ids.is_empty() && !emails.is_empty() {
+                let user_addresses = self
+                    .load_user_emails(&mut *conn, tenant_id, &user_ids)
+                    .await?;
+                let user_addresses_lower: std::collections::HashSet<String> =
+                    user_addresses.values().map(|e| e.to_lowercase()).collect();
+                emails.retain(|e| !user_addresses_lower.contains(&e.to_lowercase()));
             }
 
             // PMS-729 phase 2 §7 slice B / I12: contact recipients. Same
@@ -1591,6 +1615,32 @@ struct RenderedNotification {
 /// (project default). Row with `is_enabled = false` = reject. Row with
 /// `is_enabled = true` = accept only if `channel_types` contains the
 /// channel.
+/// PMS-1237 finding 2: a rule's `conditions` (validated, persisted and
+/// returned by the API since migration 013) narrows which notifications of
+/// its `event_type` it fires for, but nothing consulted it: every active
+/// rule for an event type fired regardless of what it named. Absent or `{}`
+/// conditions (the column default, and every rule created before this) match
+/// unconditionally, so existing dispatch behaviour is unchanged. A non-empty
+/// object requires every key to match the dispatch context: an array value
+/// is an "in" check (`{"priority": ["high", "urgent"]}`), a scalar is
+/// equality, and a context missing the key fails the rule rather than
+/// matching it, since a rule cannot be scoped by a field the event never
+/// carries.
+fn rule_conditions_match(conditions: &serde_json::Value, context: &serde_json::Value) -> bool {
+    let Some(map) = conditions.as_object() else {
+        return true;
+    };
+    map.iter().all(|(key, expected)| {
+        let Some(actual) = context.get(key) else {
+            return false;
+        };
+        match expected {
+            serde_json::Value::Array(candidates) => candidates.iter().any(|c| c == actual),
+            other => other == actual,
+        }
+    })
+}
+
 fn accepts_channel(pref: Option<&(Option<bool>, Vec<String>)>, channel: &str) -> bool {
     match pref {
         None => true,
@@ -1688,10 +1738,73 @@ pub fn render_template(input: &str, context: &serde_json::Value) -> (String, Vec
 
 #[cfg(test)]
 mod tests {
-    use super::{render_template, require_template_id, UpsertNotificationRuleRequest};
+    use super::{
+        render_template, require_template_id, rule_conditions_match, UpsertNotificationRuleRequest,
+    };
     use serde_json::json;
     use uuid::Uuid;
     use validator::Validate;
+
+    #[test]
+    fn empty_conditions_match_every_context() {
+        assert!(rule_conditions_match(
+            &json!({}),
+            &json!({"priority": "low"})
+        ));
+    }
+
+    #[test]
+    fn null_conditions_match_every_context() {
+        assert!(rule_conditions_match(
+            &serde_json::Value::Null,
+            &json!({"priority": "low"})
+        ));
+    }
+
+    #[test]
+    fn scalar_condition_requires_equality() {
+        let conditions = json!({"priority": "high"});
+        assert!(rule_conditions_match(
+            &conditions,
+            &json!({"priority": "high"})
+        ));
+        assert!(!rule_conditions_match(
+            &conditions,
+            &json!({"priority": "low"})
+        ));
+    }
+
+    #[test]
+    fn array_condition_is_an_in_check() {
+        let conditions = json!({"priority": ["high", "urgent"]});
+        assert!(rule_conditions_match(
+            &conditions,
+            &json!({"priority": "urgent"})
+        ));
+        assert!(!rule_conditions_match(
+            &conditions,
+            &json!({"priority": "low"})
+        ));
+    }
+
+    #[test]
+    fn a_context_missing_the_key_does_not_match() {
+        let conditions = json!({"priority": "high"});
+        assert!(!rule_conditions_match(&conditions, &json!({})));
+    }
+
+    #[test]
+    fn every_condition_key_must_match() {
+        let conditions = json!({"priority": "high", "source": "email"});
+        assert!(rule_conditions_match(
+            &conditions,
+            &json!({"priority": "high", "source": "email"})
+        ));
+        assert!(!rule_conditions_match(
+            &conditions,
+            &json!({"priority": "high", "source": "portal"})
+        ));
+    }
 
     #[test]
     fn render_substitutes_string_keys() {

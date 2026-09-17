@@ -2241,7 +2241,12 @@ impl TenantService {
                                  -- migration 215, which also backfills older
                                  -- tenants; copied here so a tenant created
                                  -- from now on hears about a request at all.
-                                 'portal.access_requested')
+                                 'portal.access_requested',
+                                 -- PMS-1215: the mail that tells an admin a
+                                 -- Google Contacts import keeps failing.
+                                 -- Seeded for the default tenant by migration
+                                 -- 229, which also backfills older tenants.
+                                 'contact_sync.failing')
             "#,
         )
         .bind(new_tenant_id)
@@ -2292,7 +2297,14 @@ impl TenantService {
                                    -- of these two is how the tenant this call
                                    -- is provisioning reaches its own admin.
                                    'auth.portal_password_reset',
-                                   'auth.portal_welcome')
+                                   'auth.portal_welcome',
+                                   -- PMS-1215: the rule for the template above.
+                                   -- `portal.access_requested` rides here too:
+                                   -- PMS-1187 added its template to the copy
+                                   -- above and not its rule, so a tenant
+                                   -- created since never sent that mail.
+                                   'portal.access_requested',
+                                   'contact_sync.failing')
             "#,
         )
         .bind(new_tenant_id)

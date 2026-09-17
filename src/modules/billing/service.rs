@@ -15,7 +15,7 @@ use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::settings::{read_invoice_reminder_settings, read_tenant_zone};
 use crate::utils::email::Mailer;
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::{AppError, AppResult, FieldError};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
@@ -287,9 +287,14 @@ impl BillingService {
     /// The status ladder is unchanged for an invoice with no credits: with
     /// `credited = 0` the first arm cannot fire and the rest reduce to exactly
     /// the pre-PMS-953 expression, zero-total invoices included. Crediting away
-    /// the whole outstanding balance moves the invoice to `void`, which is what
-    /// finally gives that status a writer: before this it was a value the model
-    /// knew and no code path could reach.
+    /// the invoice's full total moves it to `void`, which is what finally
+    /// gives that status a writer: before this it was a value the model knew
+    /// and no code path could reach. The threshold is `i.total`, not the
+    /// already-paid remainder `i.total - p.paid` (PMS-1226): once an invoice
+    /// is fully paid that remainder is zero, so any credit at all, including
+    /// a small post-payment goodwill adjustment (`service.rs`, `create_credit_note`
+    /// documents crediting a paid invoice as intentional), would satisfy it and
+    /// void an invoice that is still paid in full.
     ///
     /// `paid_at` stays keyed on payments alone. A credited invoice was not
     /// paid, and stamping it would put a payment date on money nobody sent.
@@ -314,7 +319,7 @@ impl BillingService {
                 -- status standing.
                 status      = CASE WHEN i.written_off_at IS NOT NULL THEN 'written_off'
                                    WHEN p.credited > 0
-                                    AND p.credited >= i.total - p.paid THEN 'void'
+                                    AND p.credited >= i.total THEN 'void'
                                    WHEN i.total - p.paid - p.credited <= 0 THEN 'paid'
                                    WHEN p.paid > 0 THEN 'partially_paid'
                                    ELSE 'sent' END,
@@ -3759,6 +3764,26 @@ impl BillingService {
         request: &UpdateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
+        // PMS-1227: `void` and `written_off` are terminal states owned by
+        // `void_invoice` and `write_off_invoice`, each with its own
+        // preconditions and its own write-off/void detail columns. Accepting
+        // them here let a draft jump straight to `written_off` with every
+        // one of those columns NULL, a row neither dedicated endpoint could
+        // then reach: `is_frozen` blocked this method, and `write_off_invoice`
+        // requires `sent` or `partially_paid`.
+        if let Some(status) = request.status {
+            if matches!(status, InvoiceStatus::Void | InvoiceStatus::WrittenOff) {
+                return Err(AppError::validation(
+                    "status cannot be set to void or written_off here",
+                    vec![FieldError::new(
+                        "status",
+                        "void and written_off are set through their own endpoints (void_invoice, write_off_invoice), not through this update",
+                        "invalid_status_transition",
+                    )],
+                ));
+            }
+        }
+
         let current = self.get_invoice(tenant_id, invoice_id).await?;
         if current.status.is_frozen() {
             return Err(AppError::Conflict(format!(

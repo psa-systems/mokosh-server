@@ -268,16 +268,22 @@ async fn one_dispatch_is_one_transaction(pool: PgPool) {
 
     // The whole statement budget, so a new per-row read cannot creep back in
     // unnoticed: the branding read, the rule read, the template read, the
-    // preference read, the three inserts, the set_config and the COMMIT.
+    // user-email lookup, the preference read, the three inserts, the
+    // set_config and the COMMIT.
     //
     // PMS-1068: the branding read (PMS-729 phase 2 section 6 slice 5) landed after
     // PMS-782 wrote this budget and was never added to the count, so a nine-
     // statement dispatch was being measured against an eight-statement
     // enumeration. It is one statement, not one transaction, because it now
     // runs on the dispatch's own connection.
+    //
+    // PMS-1237: a rule naming both user ids and standalone emails now resolves
+    // the user ids' addresses once (finding 4's cross-list dedup, dropping an
+    // email that already belongs to one of the rule's user ids so the same
+    // person cannot be queued twice), adding the tenth statement.
     assert_eq!(
         statements.len(),
-        9,
+        10,
         "unexpected statement budget for one dispatch: {statements:#?}"
     );
 }
