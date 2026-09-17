@@ -109,6 +109,65 @@ impl BunyipUserDirectory {
         }
     }
 
+    /// PMS-1208 finding 5: register a grant on Bunyip so its
+    /// `mokosh_account_grants` table has a row the SPA's later
+    /// `POST /v1/grants/{id}/access-token` mint call can find. Called
+    /// from `GrantInvitationsService::accept` after the local mirror
+    /// upsert lands; the caller passes the mirror's own `grant_id` so
+    /// mokosh's `mokosh_bunyip_grants.bunyip_grant_id` and bunyip's
+    /// `mokosh_account_grants.id` share the SAME uuid by construction
+    /// and no id translation is needed later.
+    ///
+    /// Behaviour on failure. Standalone mode (`BunyipUserDirectory::from_config`
+    /// returned `None`) never calls this at all; the caller is on the
+    /// SaaS branch. A transport or non-2xx response returns
+    /// `AppError::Internal`, which the accept path surfaces as 500 so
+    /// the grantee sees the registration failed rather than a mirror
+    /// they cannot switch into. Idempotent by design on bunyip's side
+    /// (`ON CONFLICT (id) DO UPDATE`), so a retried accept is safe.
+    #[tracing::instrument(skip(self), fields(grant_id = %grant_id))]
+    pub async fn register_grant(
+        &self,
+        grant_id: Uuid,
+        owner_bunyip_user_id: Uuid,
+        grantee_bunyip_user_id: Uuid,
+        mokosh_account_id: &str,
+        role: &str,
+    ) -> AppResult<()> {
+        let url = format!("{}/v1/mokosh-grants", self.base_url);
+        let body = serde_json::json!({
+            "grant_id": grant_id,
+            "owner_bunyip_user_id": owner_bunyip_user_id,
+            "grantee_bunyip_user_id": grantee_bunyip_user_id,
+            "mokosh_account_id": mokosh_account_id,
+            "role": role,
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", &self.basic_header)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::internal(format!("bunyip mokosh-grant register transport: {e}"))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body.chars().take(200).collect::<String>(),
+                "bunyip mokosh-grant register returned a non-2xx"
+            );
+            return Err(AppError::internal(format!(
+                "bunyip mokosh-grant register returned status {status}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Look one email up. Returns:
     /// - `Ok(Some(user_id))` on a Bunyip match.
     /// - `Ok(None)` on 404 (unknown to Bunyip or soft-deleted).

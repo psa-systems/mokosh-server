@@ -293,6 +293,7 @@ impl GrantInvitationsService {
         token: &str,
         caller_bunyip_user_id: Uuid,
         owner_bunyip_user_id_fallback: Uuid,
+        bunyip_directory: Option<&super::bunyip_directory::BunyipUserDirectory>,
     ) -> AppResult<Result<GrantInvitation, AcceptRefusal>> {
         use super::mokosh_bunyip_grants::MokoshBunyipGrantService;
 
@@ -317,6 +318,52 @@ impl GrantInvitationsService {
             if existing != caller_bunyip_user_id {
                 return Ok(Err(AcceptRefusal::WrongCaller));
             }
+        }
+
+        // Resolve the granted account's slug once up front so we can
+        // hand it to bunyip below AND to the mirror upsert further
+        // down without a second read. A missing tenant is a 500-level
+        // configuration error: the tenant that owns the invitation
+        // cannot have disappeared between create and accept in the
+        // normal flow.
+        let slug: Option<(String,)> = sqlx::query_as("SELECT slug FROM tenants WHERE id = $1")
+            .bind(invitation.tenant_id)
+            .fetch_optional(pool)
+            .await?;
+        let slug = slug
+            .ok_or_else(|| AppError::internal("Owner tenant vanished during accept"))?
+            .0;
+
+        // PMS-1208 finding 5: in SaaS mode, register the grant on
+        // bunyip BEFORE marking the invitation accepted. Bunyip's
+        // `mokosh_account_grants` table is what its
+        // `POST /v1/grants/{id}/access-token` mint endpoint reads;
+        // without a row there, mint 404s and the grantee lands on
+        // "The requested resource could not be found" the moment they
+        // click the granted team in the switcher. We pass the
+        // invitation id as the grant id so mokosh's mirror row and
+        // bunyip's row share the same uuid by construction, and the
+        // SPA can send that same id to bunyip's mint endpoint later
+        // without a translation step.
+        //
+        // Order matters: before the local UPDATE. A failure here
+        // returns to the caller with the invitation still `pending`
+        // (a retry re-registers idempotently on bunyip and re-tries
+        // accept), while a success followed by a local UPDATE failure
+        // leaves an orphan bunyip row that a retry heals through
+        // bunyip's `ON CONFLICT (id) DO UPDATE`. Standalone mode
+        // (bunyip_directory is None) skips this step, because there
+        // is no bunyip to register against.
+        if let Some(directory) = bunyip_directory {
+            directory
+                .register_grant(
+                    invitation.id,
+                    owner_bunyip_user_id_fallback,
+                    caller_bunyip_user_id,
+                    &slug,
+                    invitation.role.trim(),
+                )
+                .await?;
         }
 
         // Bind the caller onto the row (no-op when it already
@@ -356,23 +403,9 @@ impl GrantInvitationsService {
             }));
         };
 
-        // Resolve the granted account's slug and write the mirror
-        // row that BUNYIP-674 option B's placement path reads.
-        // The slug lookup runs on the same pool; a missing tenant
-        // is a 500-level configuration error (the tenant that
-        // owns the invitation cannot have disappeared between
-        // create and accept in the normal flow).
-        let slug: Option<(String,)> = sqlx::query_as("SELECT slug FROM tenants WHERE id = $1")
-            .bind(accepted.tenant_id)
-            .fetch_optional(pool)
-            .await?;
-        let slug = slug
-            .ok_or_else(|| AppError::internal("Owner tenant vanished during accept"))?
-            .0;
-
         MokoshBunyipGrantService::upsert_with_email(
             pool,
-            accepted.id, // Reuse the invitation id as the grant id (there is no bunyip mokosh_account_grants row in standalone mode).
+            accepted.id, // Same uuid bunyip's `mokosh_account_grants.id` holds (register_grant above wrote it there).
             owner_bunyip_user_id_fallback,
             caller_bunyip_user_id,
             &slug,

@@ -479,8 +479,14 @@ async fn accept_invitation(
         .ok_or_else(|| AppError::NotFound("invitation".to_string()))?;
     let owner = invitation.inviter_bunyip_user_id;
 
-    let outcome =
-        GrantInvitationsService::accept(state.db.pool(), &token, caller.id, owner).await?;
+    let outcome = GrantInvitationsService::accept(
+        state.db.pool(),
+        &token,
+        caller.id,
+        owner,
+        state.bunyip_directory.as_deref(),
+    )
+    .await?;
     match outcome {
         Ok(invitation) => Ok(Json(invitation.into())),
         Err(AcceptRefusal::NotFound) => Err(AppError::NotFound("invitation".to_string())),
