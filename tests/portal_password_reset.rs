@@ -60,15 +60,17 @@ async fn seed_reset_token(
     expires_at: chrono::DateTime<chrono::Utc>,
 ) -> (Uuid, String) {
     let hash = mokosh_server::utils::crypto::hash_password(secret).expect("hash");
+    let lookup_hash = mokosh_server::utils::crypto::sha256_hex(secret);
     let token_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO portal_setup_tokens (id, tenant_id, contact_id, token_hash, expires_at) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO portal_setup_tokens (id, tenant_id, contact_id, token_hash, lookup_hash, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(token_id)
     .bind(common::DEFAULT_TENANT_ID)
     .bind(contact_id)
     .bind(&hash)
+    .bind(&lookup_hash)
     .bind(expires_at)
     .execute(pool)
     .await

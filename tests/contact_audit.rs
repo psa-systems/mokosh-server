@@ -210,15 +210,17 @@ async fn password_reset_and_change_write_rows(pool: PgPool) {
 
     let secret = "reset-secret-abcdefghij";
     let hash = mokosh_server::utils::crypto::hash_password(secret).unwrap();
+    let lookup_hash = mokosh_server::utils::crypto::sha256_hex(secret);
     let token_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO portal_setup_tokens (id, tenant_id, contact_id, token_hash, expires_at) \
-         VALUES ($1, $2, $3, $4, NOW() + INTERVAL '30 minutes')",
+        "INSERT INTO portal_setup_tokens (id, tenant_id, contact_id, token_hash, lookup_hash, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '30 minutes')",
     )
     .bind(token_id)
     .bind(common::DEFAULT_TENANT_ID)
     .bind(contact.id)
     .bind(&hash)
+    .bind(&lookup_hash)
     .execute(&pool)
     .await
     .unwrap();

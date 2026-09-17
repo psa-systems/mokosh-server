@@ -2637,13 +2637,15 @@ async fn craft_reset_token(
     let secret = "pms659secretvaluewithoutanydots0";
     let token_hash =
         mokosh_server::utils::crypto::hash_password(secret).expect("hash the reset secret");
+    let lookup_hash = mokosh_server::utils::crypto::sha256_hex(secret);
     sqlx::query(
-        "INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, lookup_hash, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(tenant_id)
     .bind(user_id)
     .bind(&token_hash)
+    .bind(&lookup_hash)
     .bind(expires_at)
     .execute(pool)
     .await
