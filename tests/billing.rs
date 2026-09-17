@@ -1062,6 +1062,74 @@ async fn concurrent_overpayment_is_rejected(pool: PgPool) {
     );
 }
 
+/// PMS-1225: the overpay guard must read `amount_credited` too, not just
+/// `amount_paid`. Reproduces the issue's exact failing scenario: invoice
+/// `INV-000101`, total 100.00, no payments yet; credit note `CN-000005` for
+/// 60.00 has already dropped `balance_due` to 40.00. Before the fix the guard
+/// computed `remaining = total - amount_paid = 100.00`, ignoring the credit,
+/// so a 100.00 payment passed and `recompute_invoice_balance` drove
+/// `balance_due` to -60.00. The guard must now reject it.
+#[sqlx::test]
+async fn overpay_guard_accounts_for_credits(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let invoice_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO invoices (
+            id, tenant_id, invoice_number, company_id, status,
+            invoice_date, due_date, subtotal, total, amount_paid,
+            amount_credited, balance_due
+        )
+        VALUES ($1, $2, 'INV-000101', $3, 'sent',
+                CURRENT_DATE, CURRENT_DATE + 30, 100.00, 100.00, 0, 60.00, 40.00)
+        "#,
+    )
+    .bind(invoice_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed INV-000101");
+    sqlx::query(
+        r#"
+        INSERT INTO credit_notes (
+            id, tenant_id, credit_note_number, company_id, invoice_id,
+            status, issue_date, reason, total
+        )
+        VALUES ($1, $2, 'CN-000005', $3, $4,
+                'issued', CURRENT_DATE, 'Billed for cancelled work', 60.00)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .bind(invoice_id)
+    .execute(&pool)
+    .await
+    .expect("seed CN-000005");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let resp = post_payment(&app, &token, invoice_id, company_id, "100.00").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a 100.00 payment against a 40.00 remaining balance (100.00 total, \
+         60.00 already credited) must be refused, got {}",
+        resp.status()
+    );
+
+    let (paid, balance, status) = invoice_state(&pool, invoice_id).await;
+    assert_eq!(paid, "0.00", "the rejected payment left no trace");
+    assert_eq!(
+        balance, "40.00",
+        "balance_due is unchanged and never negative"
+    );
+    assert_eq!(status, "sent", "status is unchanged by a rejected payment");
+}
+
 /// Deleting one of two payments recomputes the invoice from the surviving
 /// rows rather than subtracting the deleted amount from a stale snapshot.
 #[sqlx::test]
@@ -1288,6 +1356,67 @@ async fn sending_persists_the_resolved_billing_contact(pool: PgPool) {
         stored,
         Some(contact_id),
         "the send writes the recipient it resolved, it does not only check it"
+    );
+}
+
+/// PMS-1227: `update_invoice` cannot walk a draft straight into a terminal
+/// status. Those transitions have their own endpoints with their own
+/// preconditions (`void_invoice`, `write_off_invoice`), each writing detail
+/// columns this path never touches; accepting the status verbatim here used
+/// to commit e.g. `written_off` with every write-off column NULL, a row
+/// neither dedicated endpoint could then reach.
+#[sqlx::test]
+async fn update_invoice_rejects_void_and_written_off_status(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let invoice: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/invoices"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "invoice_date": "2026-06-15",
+            "due_date": "2026-07-15",
+            "lines": [{ "line_type": "service", "description": "Work", "quantity": "1", "unit_price": "100" }],
+        }))
+        .send()
+        .await
+        .expect("create invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    let invoice_id = Uuid::parse_str(invoice["id"].as_str().expect("id")).expect("uuid");
+    assert_eq!(invoice["status"].as_str(), Some("draft"));
+
+    for status in ["written_off", "void"] {
+        let resp = app
+            .client
+            .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "status": status }))
+            .send()
+            .await
+            .expect("update invoice");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{status} is rejected as a validation error"
+        );
+    }
+
+    let row_status: String =
+        sqlx::query_scalar("SELECT status FROM invoices WHERE tenant_id = $1 AND id = $2")
+            .bind(common::DEFAULT_TENANT_ID)
+            .bind(invoice_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read invoice back");
+    assert_eq!(
+        row_status, "draft",
+        "the rejected transitions leave status unchanged"
     );
 }
 

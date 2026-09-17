@@ -33,6 +33,12 @@ impl SecretProvider for ForgetfulStore {
     async fn put(&self, _key: &SecretKey, _value: &str) -> AppResult<()> {
         Ok(())
     }
+    async fn put_if_absent(&self, _key: &SecretKey, _value: &str) -> AppResult<bool> {
+        // This store never remembers anything is present, so every claim
+        // succeeds; the forgotten write is caught by the read-back that
+        // follows, exactly as it is for the unconditional `put` path.
+        Ok(true)
+    }
     async fn delete(&self, _key: &SecretKey) -> AppResult<()> {
         Ok(())
     }
@@ -48,6 +54,31 @@ impl SecretProvider for UnreachableStore {
     }
     async fn put(&self, _key: &SecretKey, _value: &str) -> AppResult<()> {
         Err(AppError::external_service("Infisical", "unreachable"))
+    }
+    async fn put_if_absent(&self, _key: &SecretKey, _value: &str) -> AppResult<bool> {
+        Err(AppError::external_service("Infisical", "unreachable"))
+    }
+    async fn delete(&self, _key: &SecretKey) -> AppResult<()> {
+        Ok(())
+    }
+}
+
+/// A store that already holds a credential at every key, simulating a
+/// concurrent live save that won the race against the mover.
+struct AlreadyClaimedStore {
+    value: String,
+}
+
+#[async_trait]
+impl SecretProvider for AlreadyClaimedStore {
+    async fn get(&self, _key: &SecretKey) -> AppResult<Option<String>> {
+        Ok(Some(self.value.clone()))
+    }
+    async fn put(&self, _key: &SecretKey, _value: &str) -> AppResult<()> {
+        panic!("must never overwrite a value that is already there")
+    }
+    async fn put_if_absent(&self, _key: &SecretKey, _value: &str) -> AppResult<bool> {
+        Ok(false)
     }
     async fn delete(&self, _key: &SecretKey) -> AppResult<()> {
         Ok(())
@@ -201,6 +232,31 @@ async fn a_credential_that_cannot_be_decrypted_is_left_alone(pool: PgPool) {
         column_for(&pool, tenant, "stripe").await.as_deref(),
         Some("not-valid-ciphertext"),
         "an undecryptable credential is kept, never blanked"
+    );
+}
+
+/// The race PMS-1235 closes: a concurrent live save has already claimed the
+/// store address this legacy column would move to. The mover must defer to
+/// it (never call `put`, which `AlreadyClaimedStore` would panic on) and must
+/// still clear the now-redundant column.
+#[sqlx::test]
+async fn a_store_already_holding_a_credential_is_never_overwritten(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    seed_legacy_gateway(&pool, tenant, "stripe", "sk_test_stale").await;
+
+    let store = Arc::new(AlreadyClaimedStore {
+        value: serde_json::json!({
+            "secret_key": "sk_test_fresher",
+            "webhook_secret": "whsec_test",
+        })
+        .to_string(),
+    });
+    let outcome = mover(&pool, store).run_tick().await.expect("tick");
+    assert_eq!(outcome.moved, 1);
+    assert_eq!(outcome.failed, 0);
+    assert!(
+        column_for(&pool, tenant, "stripe").await.is_none(),
+        "the address already holds a real credential, so the column is redundant"
     );
 }
 

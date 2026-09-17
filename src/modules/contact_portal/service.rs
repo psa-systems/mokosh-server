@@ -2244,10 +2244,17 @@ impl ContactAuthService {
         .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
+        // PMS-1236: `<>` against a subquery that returns NULL (the current
+        // session row was purged by retention) evaluates to NULL for every
+        // row, so the UPDATE matched nothing and "revoke every other
+        // session" silently revoked zero. `IS DISTINCT FROM` treats a NULL
+        // right-hand side as distinct from any family_id, so a missing
+        // current-session row now means "revoke everything" instead of
+        // "revoke nothing".
         sqlx::query(
             "UPDATE contact_sessions SET revoked_at = NOW() \
              WHERE contact_id = $1 AND tenant_id = $2 AND revoked_at IS NULL \
-               AND family_id <> (SELECT family_id FROM contact_sessions WHERE id = $3)",
+               AND family_id IS DISTINCT FROM (SELECT family_id FROM contact_sessions WHERE id = $3)",
         )
         .bind(contact_id)
         .bind(tenant_id)

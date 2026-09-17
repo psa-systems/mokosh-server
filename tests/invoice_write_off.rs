@@ -322,3 +322,50 @@ async fn the_statement_shows_the_write_off_and_settles_it(pool: PgPool) {
         .expect("statement pdf");
     assert_eq!(pdf.status(), StatusCode::OK);
 }
+
+/// PMS-1235: a write-off already says the debt is gone (a bad-debt expense);
+/// a credit note says the customer never owed it. Issuing both would take the
+/// same debt out of the account twice with no path back, since write-offs
+/// have no reversal in v1. The invoice's frozen `write_off_amount` and status
+/// must be untouched by the refused attempt.
+#[sqlx::test]
+async fn a_written_off_invoice_refuses_a_credit_note(pool: PgPool) {
+    let (_admin, email, password) = common::seed_admin(&pool).await;
+    let company = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let invoice = invoice_on(&app, &token, company, "2026-03-01", "500").await;
+    send(&app, &token, &invoice).await;
+    let resp = write_off(&app, &token, &invoice, "Customer ceased trading").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let attempt = app
+        .client
+        .post(app.url("/api/v1/credit-notes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "invoice_id": invoice,
+            "issue_date": "2026-03-15",
+            "reason": "Should not be allowed",
+            "lines": [{
+                "line_type": "adjustment",
+                "description": "Credit",
+                "quantity": "1",
+                "unit_price": "500",
+            }],
+        }))
+        .send()
+        .await
+        .expect("send credit note attempt");
+    assert_eq!(attempt.status(), StatusCode::BAD_REQUEST);
+    let text = attempt.text().await.unwrap_or_default();
+    assert!(text.contains("written off"), "{text}");
+
+    let read = get_invoice(&app, &token, &invoice).await;
+    assert_eq!(read["status"], "written_off");
+    assert_eq!(
+        dec(&read["write_off_amount"]),
+        Decimal::from(500),
+        "the refused attempt leaves the write-off untouched"
+    );
+}

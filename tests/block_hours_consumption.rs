@@ -65,6 +65,45 @@ async fn seed_block_contract(pool: &PgPool, company: Uuid, included: i32) -> Uui
     contract
 }
 
+/// A block-hours contract that stops covering dates after `end_date`,
+/// otherwise identical to [`seed_block_contract`]. PMS-1232's failing
+/// scenario needs a contract with a real end, since an open-ended one
+/// covers every future date and never exposes the bug.
+async fn seed_block_contract_with_end(
+    pool: &PgPool,
+    company: Uuid,
+    included: i32,
+    end_date: NaiveDate,
+) -> Uuid {
+    let contract = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contracts (id, tenant_id, name, company_id, contract_type, status, \
+         start_date, end_date, billing_cycle) \
+         VALUES ($1, $2, 'Block', $3, 'block_hours', 'active', $4, $5, 'monthly')",
+    )
+    .bind(contract)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .bind(START())
+    .bind(end_date)
+    .execute(pool)
+    .await
+    .expect("seed contract");
+    sqlx::query(
+        "INSERT INTO contract_items (id, tenant_id, contract_id, name, item_type, quantity, \
+         unit_price, total_price, included_hours, overage_rate, billing_rule) \
+         VALUES ($1, $2, $3, 'Block', 'block_hours', 1, 0, 0, $4, 200, 'manual')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contract)
+    .bind(Decimal::from(included))
+    .execute(pool)
+    .await
+    .expect("seed block item");
+    contract
+}
+
 async fn balance(pool: &PgPool, contract: Uuid) -> Option<(Decimal, Decimal)> {
     sqlx::query_as(
         "SELECT hours_used, hours_remaining FROM contract_hour_balances \
@@ -95,6 +134,26 @@ fn create_request(
     serde_json::from_value(serde_json::json!({
         "user_id": user_id,
         "date": WHEN(),
+        "duration_minutes": minutes,
+        "work_type_id": work_type_id,
+        "company_id": company_id,
+        "is_billable": billable,
+        "notes": "Block work",
+    }))
+    .expect("build request")
+}
+
+fn create_request_on(
+    user_id: Uuid,
+    work_type_id: Uuid,
+    company_id: Option<Uuid>,
+    minutes: i32,
+    billable: bool,
+    date: NaiveDate,
+) -> mokosh_types::time_tracking::CreateTimeEntryRequest {
+    serde_json::from_value(serde_json::json!({
+        "user_id": user_id,
+        "date": date,
         "duration_minutes": minutes,
         "work_type_id": work_type_id,
         "company_id": company_id,
@@ -773,4 +832,154 @@ async fn pool_begin_with_tenant(
         .await
         .expect("set tenant guc");
     tx
+}
+
+// ============================================================================
+// PMS-1232: editing an entry's date re-derives its covering contract.
+// ============================================================================
+
+/// The exact scenario from PMS-1232: contract `C` runs 2026-01-01 through
+/// 2026-06-30. Entry `E`, logged 2026-06-20 for 3h, draws from `C`'s June
+/// window. A manager then corrects `E`'s date to 2026-08-05, five weeks after
+/// `C` expired. Before this fix `update_time_entry` never re-derived
+/// `contract_id`, so the release/re-draw cycle re-ran against the stale
+/// contract with the new date, and `period_for`'s unbounded forward walk
+/// seeded a synthetic August balance for a contract that no longer existed
+/// there - 3h billed to nobody. The fix must refuse that draw rather than
+/// seed a stale balance: no contract covers 2026-08-05, so the entry ends up
+/// undrawn (`contract_id` and `hours_consumed` both `NULL`) and `C`'s balance
+/// is back to fully unused, not short by 3h with nothing to show for it.
+#[sqlx::test]
+async fn editing_an_entrys_date_past_contract_coverage_refuses_the_draw(pool: PgPool) {
+    let (user_id, _e, _p) = common::seed_admin(&pool).await;
+    let company = common::seed_company(&pool).await;
+    let work_type = seed_work_type(&pool).await;
+    let end = NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+    let contract = seed_block_contract_with_end(&pool, company, 10, end).await;
+
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    let june_20 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+    let entry = svc
+        .create_time_entry(
+            tenant,
+            &create_request_on(user_id, work_type, Some(company), 180, true, june_20),
+            &ctx,
+        )
+        .await
+        .expect("create entry in June");
+    assert_eq!(
+        entry_draw(&pool, entry.id).await,
+        (Some(contract), Some(Decimal::from(3))),
+        "the June entry draws from C"
+    );
+    assert_eq!(
+        balance(&pool, contract).await,
+        Some((Decimal::from(3), Decimal::from(7)))
+    );
+
+    let august_5 = NaiveDate::from_ymd_opt(2026, 8, 5).unwrap();
+    let move_to_august: mokosh_types::time_tracking::UpdateTimeEntryRequest =
+        serde_json::from_value(serde_json::json!({ "date": august_5 })).expect("build update");
+    svc.update_time_entry(tenant, entry.id, &move_to_august)
+        .await
+        .expect("correct the date");
+
+    assert_eq!(
+        entry_draw(&pool, entry.id).await,
+        (None, None),
+        "no contract covers 2026-08-05, so the entry is refused a draw rather \
+         than seeding a stale balance against the expired contract"
+    );
+    assert_eq!(
+        balance(&pool, contract).await,
+        Some((Decimal::ZERO, Decimal::from(10))),
+        "C's balance is given back in full, not left short for a draw that \
+         moved off its coverage"
+    );
+    let (status, _, _, _) = entry_billing(&pool, entry.id).await;
+    assert_eq!(
+        status, "ready_to_bill",
+        "with no block behind it any more, the entry bills hourly like any \
+         other client work"
+    );
+}
+
+/// Moving an entry to a date covered by a DIFFERENT contract re-derives onto
+/// that one, which is the legitimate case the alternative design (freezing
+/// `contract_id` at creation) would have broken.
+#[sqlx::test]
+async fn editing_an_entrys_date_into_another_contracts_window_redraws_there(pool: PgPool) {
+    let (user_id, _e, _p) = common::seed_admin(&pool).await;
+    let company = common::seed_company(&pool).await;
+    let work_type = seed_work_type(&pool).await;
+
+    let first_end = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+    let first = seed_block_contract_with_end(&pool, company, 10, first_end).await;
+
+    let second = Uuid::new_v4();
+    let second_start = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+    sqlx::query(
+        "INSERT INTO contracts (id, tenant_id, name, company_id, contract_type, status, \
+         start_date, billing_cycle) \
+         VALUES ($1, $2, 'Block 2', $3, 'block_hours', 'active', $4, 'monthly')",
+    )
+    .bind(second)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .bind(second_start)
+    .execute(&pool)
+    .await
+    .expect("seed second contract");
+    sqlx::query(
+        "INSERT INTO contract_items (id, tenant_id, contract_id, name, item_type, quantity, \
+         unit_price, total_price, included_hours, overage_rate, billing_rule) \
+         VALUES ($1, $2, $3, 'Block', 'block_hours', 1, 0, 0, $4, 200, 'manual')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(second)
+    .bind(Decimal::from(5))
+    .execute(&pool)
+    .await
+    .expect("seed second block item");
+
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    let march_10 = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+    let entry = svc
+        .create_time_entry(
+            tenant,
+            &create_request_on(user_id, work_type, Some(company), 120, true, march_10),
+            &ctx,
+        )
+        .await
+        .expect("create entry in March");
+    assert_eq!(entry_draw(&pool, entry.id).await.0, Some(first));
+
+    let april_10 = NaiveDate::from_ymd_opt(2026, 4, 10).unwrap();
+    let move_to_april: mokosh_types::time_tracking::UpdateTimeEntryRequest =
+        serde_json::from_value(serde_json::json!({ "date": april_10 })).expect("build update");
+    svc.update_time_entry(tenant, entry.id, &move_to_april)
+        .await
+        .expect("correct the date");
+
+    assert_eq!(
+        entry_draw(&pool, entry.id).await,
+        (Some(second), Some(Decimal::from(2))),
+        "the entry now draws from the second contract, whose window covers April"
+    );
+    assert_eq!(
+        balance(&pool, first).await,
+        Some((Decimal::ZERO, Decimal::from(10))),
+        "the first contract's draw was released"
+    );
+    assert_eq!(
+        balance(&pool, second).await,
+        Some((Decimal::from(2), Decimal::from(3)))
+    );
 }
