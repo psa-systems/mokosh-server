@@ -76,6 +76,18 @@ pub struct DirectoryHit {
     pub email_verified: bool,
 }
 
+/// MAPPS-875: one active grant returned by `list_owner_grants`. Same
+/// field set bunyip's `GET /v1/mokosh-grants` sends, so mokosh does
+/// not carry a per-side view struct.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OwnerGrantView {
+    pub grant_id: Uuid,
+    pub grantee_bunyip_user_id: Uuid,
+    pub mokosh_account_id: String,
+    pub role: String,
+    pub granted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// A client that can resolve an email to a Bunyip user id. Cheap to
 /// clone (holds a `reqwest::Client`); construct once at boot and
 /// share across handlers through `Arc`.
@@ -183,6 +195,103 @@ impl BunyipUserDirectory {
             );
             return Err(AppError::internal(format!(
                 "bunyip mokosh-grant register returned status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// MAPPS-875: list an owner's active outgoing grants on bunyip.
+    /// Returns the same shape bunyip's user-authed `list_active_by_owner`
+    /// returns, minus revoked rows. Used by mokosh-server's
+    /// owner-outbox endpoint to fetch the SaaS-mode authoritative view;
+    /// standalone mode reads the local mirror directly and never calls
+    /// this method.
+    ///
+    /// Behaviour on failure. A transport failure or a non-2xx response
+    /// returns `AppError::Internal`, so the caller can distinguish an
+    /// empty outbox (`Ok(vec![])`) from a bunyip outage. The mokosh
+    /// route surfaces the internal error as 500 rather than pretending
+    /// the owner has no grants: a false empty on this page would let
+    /// them believe access they revoked seconds ago is gone when it is
+    /// still active.
+    #[tracing::instrument(skip(self), fields(owner = %owner_bunyip_user_id))]
+    pub async fn list_owner_grants(
+        &self,
+        owner_bunyip_user_id: Uuid,
+    ) -> AppResult<Vec<OwnerGrantView>> {
+        let url = format!("{}/v1/mokosh-grants", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", &self.basic_header)
+            .query(&[(
+                "owner_bunyip_user_id",
+                owner_bunyip_user_id.to_string().as_str(),
+            )])
+            .send()
+            .await
+            .map_err(|e| AppError::internal(format!("bunyip mokosh-grant list transport: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body.chars().take(200).collect::<String>(),
+                "bunyip mokosh-grant list returned a non-2xx"
+            );
+            return Err(AppError::internal(format!(
+                "bunyip mokosh-grant list returned status {status}"
+            )));
+        }
+
+        // Response envelope mirrors bunyip's `success()`:
+        // `{ "success": true, "data": [...], "meta": {...} }`.
+        #[derive(Debug, Deserialize)]
+        struct ListEnvelope {
+            data: Option<Vec<OwnerGrantView>>,
+        }
+        let body: ListEnvelope = resp.json().await.map_err(|e| {
+            AppError::internal(format!(
+                "bunyip mokosh-grant list response was not JSON: {e}"
+            ))
+        })?;
+        Ok(body.data.unwrap_or_default())
+    }
+
+    /// MAPPS-875: revoke a bunyip grant on the owner's behalf. Idempotent
+    /// on bunyip's side (an already-revoked grant is 204 without
+    /// re-firing the webhook), so retrying a network-dropped revoke is
+    /// safe from mokosh's side. Returns `Ok(())` on 204; `Err` on
+    /// transport / non-2xx / 404 (`grant not owned by this owner or
+    /// unknown`).
+    #[tracing::instrument(skip(self), fields(grant_id = %grant_id, owner = %owner_bunyip_user_id))]
+    pub async fn revoke_grant(&self, grant_id: Uuid, owner_bunyip_user_id: Uuid) -> AppResult<()> {
+        let url = format!("{}/v1/mokosh-grants/{grant_id}", self.base_url);
+        let body = serde_json::json!({
+            "owner_bunyip_user_id": owner_bunyip_user_id,
+        });
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", &self.basic_header)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::internal(format!("bunyip mokosh-grant revoke transport: {e}"))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body.chars().take(200).collect::<String>(),
+                "bunyip mokosh-grant revoke returned a non-2xx"
+            );
+            return Err(AppError::internal(format!(
+                "bunyip mokosh-grant revoke returned status {status}"
             )));
         }
         Ok(())

@@ -27,6 +27,7 @@ use crate::modules::auth::{
         grant_invitations_by_token_routes, grant_invitations_grantee_routes,
         grant_invitations_owner_routes,
     },
+    owner_grants_routes::owner_grants_routes,
     AuthMiddleware, AuthService,
 };
 use crate::modules::billing::{
@@ -416,6 +417,16 @@ pub fn create_api_router(
         .nest(
             "/my-grants/invitations",
             grant_invitations_grantee_routes(Arc::new(db.clone())),
+        )
+        // MAPPS-875: owner-side grant management. Two routes:
+        //   GET  /grants?role=owner  - pending + active outbox
+        //   DELETE /grants/{id}      - revoke an active grant
+        // In SaaS mode the active read + revoke fan out to bunyip via
+        // `BunyipUserDirectory`. In standalone mode both read and
+        // write the local mirror.
+        .nest(
+            "/grants",
+            owner_grants_routes(Arc::new(db.clone()), bunyip_directory.clone()),
         )
         // MAPPS-513: platform super-admin routes. Distinct credential
         // store (`platform_admins`) and distinct JWT typ so the
