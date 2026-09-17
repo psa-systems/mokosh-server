@@ -1,7 +1,7 @@
 //! Tenant API routes (Super Admin only)
 
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -89,6 +89,7 @@ impl TenantOrPlatformCaller {
 use crate::modules::settings::{ModuleConfigResponse, SettingsService, UpsertModuleConfigRequest};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
+use crate::utils::upload_limits::body_limit_bytes;
 use mokosh_types::auth::{AdditionalTenantRequest, LoginResponse, SelfServeTenantRequest};
 
 #[derive(Clone)]
@@ -122,6 +123,10 @@ pub fn tenant_routes(
     // so it is the one that records what is stored.
     let logos =
         TenantLogoStore::new(TenantLogoConfig::from_env()).with_ledger(tenant_service.db.clone());
+    // PMS-1233: read before `logos` moves into the state, so the upload
+    // route's `DefaultBodyLimit` matches the cap `TenantLogoStore::store`
+    // enforces rather than axum's undocumented 2 MiB default.
+    let logo_max_bytes = logos.max_bytes();
     let state = TenantRouterState {
         tenant_service: Arc::new(tenant_service),
         logos: Arc::new(logos),
@@ -169,7 +174,10 @@ pub fn tenant_routes(
         // PUBLIC router below, because the two places it has to appear (a
         // client's browser on the request-form page, a client's mail client)
         // have no session.
-        .route("/current/logo", put(upload_current_logo))
+        .route(
+            "/current/logo",
+            put(upload_current_logo).layer(DefaultBodyLimit::max(body_limit_bytes(logo_max_bytes))),
+        )
         .route("/current/logo", delete(delete_current_logo))
         .route("/{tenant_id}", get(get_tenant))
         .route("/{tenant_id}", put(update_tenant))

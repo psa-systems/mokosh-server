@@ -1065,7 +1065,7 @@ impl ContractsService {
         let item = sqlx::query_as::<_, BlockItemRow>(
             r#"SELECT ci.id, ci.included_hours, ci.overage_rate,
                       ci.rollover_enabled, ci.max_rollover_hours,
-                      c.billing_cycle, c.start_date
+                      c.billing_cycle, c.start_date, c.end_date
                FROM contract_items ci
                INNER JOIN contracts c ON c.id = ci.contract_id
                WHERE ci.tenant_id = $1 AND ci.contract_id = $2
@@ -1083,6 +1083,21 @@ impl ContractsService {
         let overage_rate = item.overage_rate.unwrap_or(Decimal::ZERO);
         let billing_cycle = item.billing_cycle.as_deref().unwrap_or("monthly");
         let when_date = when.date_naive();
+        // PMS-1232: `period_for` walks forward from the contract's
+        // `start_date` with no upper bound and falls back to the first
+        // window for a `when` before the anchor, so a `when` outside the
+        // contract's own coverage would otherwise seed a synthetic balance
+        // for a period the contract never ran (or draw against its very
+        // first period for a date that precedes it). The caller
+        // (`block_hours_contract_for`) already selects only a contract
+        // covering the entry's date, so this refuses rather than papering
+        // over a `contract_id` that is stale or was moved outside its
+        // contract's coverage some other way.
+        if when_date < item.start_date || item.end_date.is_some_and(|end| when_date > end) {
+            return Err(AppError::BadRequest(format!(
+                "Date {when_date} is outside contract {contract_id}'s coverage.",
+            )));
+        }
         let (period_start, period_end) =
             Self::period_for(item.start_date, billing_cycle, when_date);
 
@@ -1822,6 +1837,7 @@ struct BlockItemRow {
     max_rollover_hours: Option<Decimal>,
     billing_cycle: Option<String>,
     start_date: chrono::NaiveDate,
+    end_date: Option<chrono::NaiveDate>,
 }
 
 /// Minimal mutable view of a `contract_hour_balances` row used when

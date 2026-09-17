@@ -48,7 +48,7 @@ use mokosh_types::tenants::TenantBranding;
 
 use crate::modules::tenants::logo::TenantLogoStore;
 use crate::pdf::Template;
-use crate::storage::ObjectKey;
+use crate::storage::{FileLedger, FileRecord, ObjectKey};
 use crate::utils::error::AppResult;
 
 /// The issuing MSP, as a document shows it, and how that document is laid out.
@@ -163,6 +163,7 @@ fn resolve_template(key: Option<&str>) -> Template {
 /// that will not decode: withholding an invoice over its decoration is worse
 /// than sending one without it.
 pub async fn freeze(
+    tx: &mut crate::db::TenantTransaction<'_>,
     tenant_id: Uuid,
     tenant_name: &str,
     branding: &TenantBranding,
@@ -172,7 +173,7 @@ pub async fn freeze(
     let Some(mime) = issuer.logo_mime.clone() else {
         return issuer;
     };
-    match copy_logo(tenant_id, &mime, logos).await {
+    match copy_logo(tx, tenant_id, &mime, logos).await {
         Ok(digest) => issuer.logo_digest = Some(digest),
         Err(e) => {
             tracing::warn!(
@@ -186,15 +187,50 @@ pub async fn freeze(
     issuer
 }
 
-async fn copy_logo(tenant_id: Uuid, mime: &str, logos: &TenantLogoStore) -> AppResult<String> {
+/// The `files` row id for a frozen logo. Derived from the content digest
+/// rather than fresh, so the same logo bytes always upsert the same row
+/// (PMS-957/PMS-910: one object per distinct logo, not one per invoice).
+fn branding_logo_file_id(digest_bytes: &[u8]) -> Uuid {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest_bytes[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+async fn copy_logo(
+    tx: &mut crate::db::TenantTransaction<'_>,
+    tenant_id: Uuid,
+    mime: &str,
+    logos: &TenantLogoStore,
+) -> AppResult<String> {
     let bytes = logos.read(tenant_id, mime).await?;
-    let digest = hex(&<Sha256 as Digest>::digest(&bytes));
+    let digest_bytes = <Sha256 as Digest>::digest(&bytes);
+    let digest = hex(&digest_bytes);
     let store = crate::storage::shared();
     let key = ObjectKey::branding_logo(tenant_id, &digest);
     // Idempotent by construction: the same bytes give the same key, so a second
     // invoice sent under the same logo rewrites the identical object rather
     // than adding one.
     store.put(&key, &bytes).await?;
+    // PMS-1235: without a ledger row this blob is unreachable by storage-usage
+    // accounting or any future cleanup pass. Recorded in the caller's own
+    // transaction, the PMS-959 shape, so a rolled-back send leaves only litter
+    // at a content-addressed key rather than a row for bytes that never
+    // committed.
+    FileLedger::record_in_tx(
+        tx,
+        tenant_id,
+        &key,
+        branding_logo_file_id(&digest_bytes),
+        FileRecord {
+            original_name: "logo",
+            mime_type: mime,
+            file_size: bytes.len() as i64,
+            uploaded_by_id: None,
+            entity_type: "branding_logo_snapshot",
+            entity_id: Some(tenant_id),
+        },
+    )
+    .await?;
     Ok(digest)
 }
 
