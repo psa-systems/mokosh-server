@@ -246,6 +246,20 @@ pub trait SecretProvider: Send + Sync {
     /// Store a value, replacing whatever was there.
     async fn put(&self, key: &SecretKey, value: &str) -> AppResult<()>;
 
+    /// Store a value only if nothing is stored for this key yet. Returns
+    /// `true` when the write happened, `false` when something was already
+    /// there and this call left it untouched.
+    ///
+    /// This is the compare-and-set [`crate::modules::billing::GatewayCredentialMover`]
+    /// needs (PMS-1235): it replays a legacy DB column into whichever address
+    /// [`SecretKey::payment_gateway`] gives, and a live credential save can
+    /// write a fresher value to that same address at any time, with no DB row
+    /// lock in common between the two paths (the live save's own store write
+    /// happens before it touches the row). An unconditional `put` from the
+    /// mover can therefore land after a fresher save and silently revert it.
+    /// Once anything is at an address, it wins over the mover's replay.
+    async fn put_if_absent(&self, key: &SecretKey, value: &str) -> AppResult<bool>;
+
     /// Best-effort: a secret that is already gone is not an error, matching
     /// [`crate::storage::ObjectProvider::delete`] and for the same reason - the
     /// caller has already removed the row that pointed at it.

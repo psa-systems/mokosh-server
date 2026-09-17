@@ -170,6 +170,36 @@ impl SecretProvider for InfisicalSecretProvider {
         Ok(())
     }
 
+    async fn put_if_absent(&self, key: &SecretKey, value: &str) -> AppResult<bool> {
+        let name = key.name()?;
+        // Bypass the cache: a stale cached `None` here would write over a
+        // credential a concurrent save just wrote, which is exactly the race
+        // this method exists to close. Infisical exposes no atomic
+        // create-only write, so this is a check-then-act, not a true CAS; the
+        // window it leaves is a second call landing between the read and the
+        // write, no smaller than the window a fresh `SECRET_BACKEND=infisical`
+        // deployment already accepts elsewhere in this module for the same
+        // reason (secrets change rarely, PMS-967).
+        let existing = self
+            .client
+            .get_secret(&self.project_id, &self.environment, SECRET_PATH, &name)
+            .await?;
+        if existing.is_some() {
+            return Ok(false);
+        }
+        self.client
+            .put_secret(
+                &self.project_id,
+                &self.environment,
+                SECRET_PATH,
+                &name,
+                value,
+            )
+            .await?;
+        self.invalidate(&name).await;
+        Ok(true)
+    }
+
     async fn delete(&self, key: &SecretKey) -> AppResult<()> {
         let name = key.name()?;
         self.client

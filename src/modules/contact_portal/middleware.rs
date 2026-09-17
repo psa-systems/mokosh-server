@@ -66,48 +66,53 @@ pub async fn portal_contact_middleware(
     let auth_state = match bearer(&request).or_else(|| cookie(&request)) {
         Some(token) => match state.service.decode_token(token) {
             Ok(claims) => {
-                // mokosh-contact-login prompt 004: gate on tenant
-                // status BEFORE trusting the JWT further. A suspended
-                // tenant's live contact sessions must die on the next
-                // request, not after the 15-min access token TTL.
-                if state
+                // PMS-1222: gate on the same conditions `login` checks
+                // BEFORE trusting the JWT further. A suspended tenant,
+                // a contact whose portal access was revoked, or a
+                // locked-out contact must all die on the next request,
+                // not after the 15-min access token TTL.
+                match state
                     .service
-                    .ensure_tenant_active(claims.tid)
+                    .contact_access_ok(claims.tid, claims.sub)
                     .await
-                    .is_err()
                 {
-                    tracing::info!(
-                        tenant_id = %claims.tid,
-                        contact_id = %claims.sub,
-                        "contact request rejected: owning tenant is not active",
-                    );
-                    ContactAuthState::default()
-                } else if state
-                    .service
-                    .ensure_session_active(claims.tid, claims.sid)
-                    .await
-                    .is_err()
-                {
-                    // PMS-1224: the `sid` row was revoked (or purged)
-                    // since this access token was minted. `sid` exists
-                    // precisely so a session can be killed mid-life;
-                    // without this check the token still served every
-                    // contact route until its own 15-minute TTL expired.
-                    tracing::info!(
-                        tenant_id = %claims.tid,
-                        contact_id = %claims.sub,
-                        sid = %claims.sid,
-                        "contact request rejected: session is revoked",
-                    );
-                    ContactAuthState::default()
-                } else {
-                    ContactAuthState::authenticated(ContactSession {
-                        id: claims.sub,
-                        tenant_id: claims.tid,
-                        company_id: claims.cid,
-                        email: claims.email,
-                        sid: claims.sid,
-                    })
+                    Ok(true) => {
+                        // PMS-1224: the `sid` row was revoked (or purged)
+                        // since this access token was minted. `sid` exists
+                        // precisely so a session can be killed mid-life;
+                        // without this check the token still served every
+                        // contact route until its own 15-minute TTL expired.
+                        if state
+                            .service
+                            .ensure_session_active(claims.tid, claims.sid)
+                            .await
+                            .is_err()
+                        {
+                            tracing::info!(
+                                tenant_id = %claims.tid,
+                                contact_id = %claims.sub,
+                                sid = %claims.sid,
+                                "contact request rejected: session is revoked",
+                            );
+                            ContactAuthState::default()
+                        } else {
+                            ContactAuthState::authenticated(ContactSession {
+                                id: claims.sub,
+                                tenant_id: claims.tid,
+                                company_id: claims.cid,
+                                email: claims.email,
+                                sid: claims.sid,
+                            })
+                        }
+                    }
+                    Ok(false) | Err(_) => {
+                        tracing::info!(
+                            tenant_id = %claims.tid,
+                            contact_id = %claims.sub,
+                            "contact request rejected: access check failed",
+                        );
+                        ContactAuthState::default()
+                    }
                 }
             }
             Err(_) => ContactAuthState::default(),
