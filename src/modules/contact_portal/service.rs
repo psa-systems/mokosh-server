@@ -1729,6 +1729,46 @@ impl ContactAuthService {
         }
     }
 
+    /// PMS-1222: re-check, on every request, the subset of `login`'s
+    /// gates that stays meaningful after a token has been minted.
+    /// `login` (lines 160-210 before this change) resolves a company,
+    /// then requires the contact row to still be `is_portal_user = TRUE`
+    /// for that tenant, then refuses a locked-out contact; the
+    /// middleware used to check none of that, only the owning tenant's
+    /// status, so revoking portal access at the contact level (or
+    /// locking the account) had no effect until the 15-min access
+    /// token expired. Portal_id/slug resolution and the password/MFA
+    /// checks stay login-only: they establish a NEW session and have
+    /// no per-request analogue to re-check against one already minted.
+    ///
+    /// Fails closed: any error (row gone, tenant gone) reads as `false`
+    /// rather than propagating, so a caller only needs one bool check.
+    pub async fn contact_access_ok(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<bool> {
+        if self.ensure_tenant_active(tenant_id).await.is_err() {
+            return Ok(false);
+        }
+        let row: Option<(bool, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT is_portal_user, portal_locked_until FROM contacts \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((is_portal_user, locked_until)) = row else {
+            return Ok(false);
+        };
+        if !is_portal_user {
+            return Ok(false);
+        }
+        if let Some(until) = locked_until {
+            if until > Utc::now() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// mokosh-contact-login prompt 004: decode a Bearer token from
     /// request headers. Middleware calls this. Verifies signature +
     /// exp + typ.
