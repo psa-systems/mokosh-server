@@ -123,9 +123,37 @@ pub struct SyncReport {
     /// Links newly flagged as deleted in the source.
     pub deleted_in_source: u32,
     pub failed: u32,
+    /// Records the source returned for this pass.
+    pub total: u32,
+    /// Stopped at a checkpoint because a person cancelled the run (PMS-1215).
+    /// Nothing after the checkpoint was applied and the cursor did not move.
+    pub cancelled: bool,
+    /// What did not land, per record, capped at [`MAX_RECORDED_FAILURES`].
+    pub failures: Vec<RecordFailure>,
 }
 
+/// One record that could not be applied, and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordFailure {
+    pub external_id: String,
+    pub reason: String,
+}
+
+/// Enough to see the shape of a failure without letting one broken import
+/// grow a run row without bound. `failed` still counts every one.
+pub const MAX_RECORDED_FAILURES: usize = 50;
+
+/// How many records between progress writes. Each checkpoint is one UPDATE
+/// that also reports whether the run was cancelled.
+const CHECKPOINT_EVERY: usize = 25;
+
 impl SyncReport {
+    /// Records that were read and deliberately not imported: outside the
+    /// selection, unlinked or removed, or already answered by a reviewer.
+    pub fn skipped(&self) -> u32 {
+        self.not_selected + self.excluded + self.already_reviewed
+    }
+
     /// Whether the pass wrote anything at all. The idempotency test's
     /// question.
     pub fn changed_anything(&self) -> bool {
@@ -136,6 +164,7 @@ impl SyncReport {
 #[derive(sqlx::FromRow)]
 struct ConnectionRow {
     provider: String,
+    sync_status: String,
     account_email: String,
     is_active: bool,
     sync_token: Option<String>,
@@ -190,6 +219,10 @@ struct Snapshot {
     links: HashMap<String, LinkRow>,
     /// `(external_id, contact_id)` pairs a human already resolved.
     answered: HashSet<(String, Uuid)>,
+    /// External ids a reviewer chose not to import (PMS-1215). A skip is about
+    /// the record, not the pairs it was asked about: a contact created later
+    /// that also matches it is not a reason to ask again.
+    skipped: HashSet<String>,
     /// External ids a person unlinked from this connection.
     unlinked: HashSet<String>,
     /// [`external_id_digest`]s of records whose data was removed on request.
@@ -202,6 +235,180 @@ struct Snapshot {
 pub struct ContactSyncEngine {
     db: Database,
     contacts: ContactService,
+}
+
+/// What the sync will do with one record, decided from the snapshot alone.
+///
+/// The one decision both [`ContactSyncEngine::apply_record`] and
+/// [`ContactSyncEngine::preview`] act on, so a preview cannot drift from the
+/// import it previews (PMS-1242): the import performs the plan, the preview
+/// counts it.
+enum Plan<'a> {
+    /// A person unlinked it or had its data removed (PMS-1214).
+    Excluded,
+    /// Deleted in the source, linked, and not flagged yet.
+    FlagDeleted(&'a LinkRow),
+    /// Carries none of the selected labels.
+    NotSelected,
+    /// Linked, and its etag says nothing changed.
+    Unchanged,
+    /// Linked, and changed in the source.
+    Update(&'a LinkRow),
+    /// A reviewer already answered it.
+    AlreadyReviewed,
+    /// Matches exactly one contact by email.
+    Link(Uuid),
+    /// Questions to put to a reviewer, minus any already answered.
+    Review(Vec<(Uuid, super::matching::MatchReason)>),
+    /// Nobody Mokosh holds; the company suggestion, if exactly one matches.
+    Create(Option<Uuid>),
+}
+
+fn plan<'a>(
+    record: &SourceContact,
+    selected: &BTreeSet<String>,
+    snapshot: &'a Snapshot,
+    mapped: &MappedContact,
+) -> Plan<'a> {
+    // A person said stop (PMS-1214): an unlinked record is not re-linked by
+    // its email a minute later, and a removed one is not imported back.
+    // Checked before anything else, deletion included, because there is
+    // nothing left of either for a deletion to flag.
+    if snapshot.unlinked.contains(&record.external_id)
+        || snapshot
+            .suppressed
+            .contains(&external_id_digest(&record.external_id))
+    {
+        return Plan::Excluded;
+    }
+    let link = snapshot.links.get(&record.external_id);
+
+    // A deletion is honoured whatever the selection: the link exists because
+    // the record was once selected.
+    if record.deleted {
+        return match link {
+            Some(link) if link.deleted_in_source_at.is_none() => Plan::FlagDeleted(link),
+            _ => Plan::Unchanged,
+        };
+    }
+    if !record.group_ids.iter().any(|g| selected.contains(g)) {
+        return Plan::NotSelected;
+    }
+    if let Some(link) = link {
+        if link.etag.is_some() && link.etag == record.etag && link.deleted_in_source_at.is_none() {
+            return Plan::Unchanged;
+        }
+        return Plan::Update(link);
+    }
+    if snapshot.skipped.contains(&record.external_id) {
+        return Plan::AlreadyReviewed;
+    }
+    let incoming = IncomingKeys::from_values(
+        record.emails.iter().map(String::as_str),
+        record.phones.iter().flat_map(|p| {
+            p.canonical
+                .as_deref()
+                .into_iter()
+                .chain([p.number.as_str()])
+        }),
+        &format!("{} {}", mapped.first_name, mapped.last_name),
+        mapped.company_name.as_deref(),
+    );
+    match decide(&incoming, &snapshot.locals) {
+        MatchDecision::Link(contact_id) => Plan::Link(contact_id),
+        MatchDecision::Review(pairs) => {
+            let open: Vec<_> = pairs
+                .into_iter()
+                .filter(|(id, _)| {
+                    !snapshot
+                        .answered
+                        .contains(&(record.external_id.clone(), *id))
+                })
+                .collect();
+            if open.is_empty() {
+                Plan::AlreadyReviewed
+            } else {
+                Plan::Review(open)
+            }
+        }
+        MatchDecision::Create => Plan::Create(
+            mapped
+                .company_name
+                .as_deref()
+                .and_then(name_key)
+                .and_then(|key| snapshot.companies.get(&key))
+                .and_then(|ids| match ids.as_slice() {
+                    [only] => Some(*only),
+                    _ => None,
+                }),
+        ),
+    }
+}
+
+/// What importing one record would do, as the preview reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewOutcome {
+    /// A new contact.
+    Create,
+    /// Linked to the one contact its email matches.
+    Link,
+    /// Put to a reviewer: nothing is created or linked until they answer.
+    Review,
+    /// Already imported; an import only updates it.
+    Imported,
+    /// Unlinked, removed on request, or skipped by a reviewer; not imported.
+    Excluded,
+}
+
+/// One record in the preview: its labels and its outcome, and deliberately
+/// nothing that names the person. A client totals any combination of labels
+/// from these without another read of the account.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PreviewRecord {
+    pub group_ids: Vec<String>,
+    pub outcome: PreviewOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PreviewGroup {
+    pub id: String,
+    pub name: String,
+    pub member_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PreviewTotals {
+    pub contacts: u32,
+    pub create: u32,
+    pub link: u32,
+    pub review: u32,
+    pub imported: u32,
+    pub excluded: u32,
+}
+
+impl PreviewTotals {
+    fn add(&mut self, outcome: PreviewOutcome) {
+        self.contacts += 1;
+        match outcome {
+            PreviewOutcome::Create => self.create += 1,
+            PreviewOutcome::Link => self.link += 1,
+            PreviewOutcome::Review => self.review += 1,
+            PreviewOutcome::Imported => self.imported += 1,
+            PreviewOutcome::Excluded => self.excluded += 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ImportPreview {
+    pub groups: Vec<PreviewGroup>,
+    /// The labels the totals were simulated for.
+    pub selection: Vec<String>,
+    pub records: Vec<PreviewRecord>,
+    /// Exact for `selection`: each record counted once, however many of its
+    /// labels are selected.
+    pub totals: PreviewTotals,
 }
 
 /// Whether the import made the contact or found it (migration 228). Removal of
@@ -263,6 +470,20 @@ impl ContactSyncEngine {
         connection_id: Uuid,
         source: &dyn ContactSyncProvider,
     ) -> AppResult<SyncReport> {
+        self.run_tracked(tenant_id, connection_id, source, None)
+            .await
+    }
+
+    /// [`Self::run`], writing progress to `contact_sync_runs` row `run_id`
+    /// every [`CHECKPOINT_EVERY`] records and stopping at the first checkpoint
+    /// after a cancel was requested (PMS-1215).
+    pub async fn run_tracked(
+        &self,
+        tenant_id: TenantId,
+        connection_id: Uuid,
+        source: &dyn ContactSyncProvider,
+        run_id: Option<Uuid>,
+    ) -> AppResult<SyncReport> {
         let connection = self.load_connection(tenant_id, connection_id).await?;
         if connection.provider != source.id() {
             return Err(AppError::Internal(format!(
@@ -317,15 +538,28 @@ impl ContactSyncEngine {
 
         let mut report = SyncReport {
             full_read: connection.sync_token.is_none() || changes.was_full_resync,
+            total: u32::try_from(changes.contacts.len()).unwrap_or(u32::MAX),
             ..SyncReport::default()
         };
+        if let Some(run_id) = run_id {
+            self.checkpoint(tenant_id, run_id, &report, 0).await?;
+        }
         let mut snapshot = self
             .snapshot(tenant_id, connection_id, &connection.provider)
             .await?;
         let ctx = AuditCtx::system(tenant_id.get());
         let mut seen: HashSet<&str> = HashSet::new();
 
-        for record in &changes.contacts {
+        for (index, record) in changes.contacts.iter().enumerate() {
+            if let Some(run_id) = run_id {
+                if index > 0
+                    && index % CHECKPOINT_EVERY == 0
+                    && self.checkpoint(tenant_id, run_id, &report, index).await?
+                {
+                    report.cancelled = true;
+                    break;
+                }
+            }
             seen.insert(record.external_id.as_str());
             let outcome = self
                 .apply_record(
@@ -363,8 +597,32 @@ impl ContactSyncEngine {
                         external_id = %record.external_id,
                         "contact sync could not apply a record: {e}"
                     );
+                    if report.failures.len() < MAX_RECORDED_FAILURES {
+                        report.failures.push(RecordFailure {
+                            external_id: record.external_id.clone(),
+                            reason: e.to_string().chars().take(300).collect(),
+                        });
+                    }
                 }
             }
+        }
+
+        // A cancel stops here: no tombstones from a read that was not
+        // walked, no cursor moved past records that were never applied, and
+        // the connection says what it said before this run began.
+        if report.cancelled {
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            sqlx::query(
+                "UPDATE contact_sync_connections SET sync_status = $3, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(connection_id)
+            .bind(&connection.sync_status)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(report);
         }
 
         // Absent from a complete read means gone from the source. Only on a
@@ -384,6 +642,10 @@ impl ContactSyncEngine {
             }
         }
 
+        if let Some(run_id) = run_id {
+            self.checkpoint(tenant_id, run_id, &report, changes.contacts.len())
+                .await?;
+        }
         if report.failed == 0 {
             self.finish(tenant_id, connection_id, changes.next_sync_token.as_deref())
                 .await?;
@@ -403,6 +665,156 @@ impl ContactSyncEngine {
         Ok(report)
     }
 
+    /// A reviewer linked a queued record to a contact (PMS-1215), on the
+    /// caller's transaction. The same first-link rule the sync uses: only
+    /// empty fields are filled, from the snapshot the reviewer compared.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn link_reviewed(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        connection_id: Uuid,
+        external_id: &str,
+        etag: Option<&str>,
+        snapshot: &serde_json::Value,
+        contact_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        let connection = Self::connection_in(&mut *conn, tenant_id, connection_id).await?;
+        let (record, mapped, labels) = from_snapshot(external_id, etag, snapshot);
+        self.apply_fields(
+            &mut *conn,
+            tenant_id,
+            contact_id,
+            &record,
+            &mapped,
+            &labels,
+            Pass::FirstLink,
+            ctx,
+        )
+        .await?;
+        self.insert_link(
+            &mut *conn,
+            tenant_id,
+            connection_id,
+            &connection,
+            &record,
+            contact_id,
+            LinkOrigin::Linked,
+            None,
+            ctx,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// A reviewer decided a queued record is nobody Mokosh holds (PMS-1215):
+    /// create it exactly as the sync would have.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_reviewed(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        connection_id: Uuid,
+        external_id: &str,
+        etag: Option<&str>,
+        snapshot: &serde_json::Value,
+        ctx: &AuditCtx,
+    ) -> AppResult<Uuid> {
+        let connection = Self::connection_in(&mut *conn, tenant_id, connection_id).await?;
+        let (record, mapped, labels) = from_snapshot(external_id, etag, snapshot);
+        let suggestion = match mapped.company_name.as_deref().and_then(name_key) {
+            Some(key) => {
+                let companies: Vec<(Uuid, String)> =
+                    sqlx::query_as("SELECT id, name FROM companies WHERE tenant_id = $1")
+                        .bind(tenant_id)
+                        .fetch_all(&mut *conn)
+                        .await?;
+                match companies
+                    .into_iter()
+                    .filter(|(_, name)| name_key(name).as_deref() == Some(key.as_str()))
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    [only] => Some(*only),
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        let request = create_request(&mapped, &labels);
+        let contact_id = self
+            .contacts
+            .import_contact_in(&mut *conn, tenant_id, &request, ctx)
+            .await?;
+        self.insert_link(
+            &mut *conn,
+            tenant_id,
+            connection_id,
+            &connection,
+            &record,
+            contact_id,
+            LinkOrigin::Created,
+            suggestion,
+            ctx,
+        )
+        .await?;
+        Ok(contact_id)
+    }
+
+    async fn connection_in(
+        conn: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        connection_id: Uuid,
+    ) -> AppResult<ConnectionRow> {
+        sqlx::query_as(
+            "SELECT provider, sync_status, account_email, is_active, sync_token, selected_groups, disconnected_at \
+             FROM contact_sync_connections WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(connection_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::NotFound("contact sync connection".to_string()))
+    }
+
+    /// Write progress onto the run. Returns whether a cancel was requested.
+    async fn checkpoint(
+        &self,
+        tenant_id: TenantId,
+        run_id: Uuid,
+        report: &SyncReport,
+        processed: usize,
+    ) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let cancel: Option<bool> = sqlx::query_scalar(
+            "UPDATE contact_sync_runs SET \
+                total = $3, full_read = $4, processed = $5, created = $6, linked = $7, \
+                updated = $8, queued_for_review = $9, skipped = $10, deleted_in_source = $11, \
+                failed_records = $12, failures = $13, heartbeat_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2 \
+             RETURNING cancel_requested_at IS NOT NULL",
+        )
+        .bind(tenant_id)
+        .bind(run_id)
+        .bind(i32::try_from(report.total).unwrap_or(i32::MAX))
+        .bind(report.full_read)
+        .bind(i32::try_from(processed).unwrap_or(i32::MAX))
+        .bind(report.created as i32)
+        .bind(report.linked as i32)
+        .bind(report.updated as i32)
+        .bind(report.queued as i32)
+        .bind(report.skipped() as i32)
+        .bind(report.deleted_in_source as i32)
+        .bind(report.failed as i32)
+        .bind(serde_json::to_value(&report.failures).unwrap_or_default())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(cancel.unwrap_or(false))
+    }
+
     async fn load_connection(
         &self,
         tenant_id: TenantId,
@@ -410,7 +822,7 @@ impl ContactSyncEngine {
     ) -> AppResult<ConnectionRow> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query_as(
-            "SELECT provider, account_email, is_active, sync_token, selected_groups, disconnected_at \
+            "SELECT provider, sync_status, account_email, is_active, sync_token, selected_groups, disconnected_at \
              FROM contact_sync_connections WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
@@ -506,6 +918,14 @@ impl ContactSyncEngine {
         .bind(connection_id)
         .fetch_all(&mut *tx)
         .await?;
+        let skipped: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT external_id FROM contact_sync_candidates \
+             WHERE tenant_id = $1 AND connection_id = $2 AND status = 'skipped'",
+        )
+        .bind(tenant_id)
+        .bind(connection_id)
+        .fetch_all(&mut *tx)
+        .await?;
         let unlinked: Vec<String> = sqlx::query_scalar(
             "SELECT external_id FROM contact_sync_links \
              WHERE tenant_id = $1 AND connection_id = $2 AND unlink_reason = 'unlinked'",
@@ -557,6 +977,7 @@ impl ContactSyncEngine {
                 .map(|l| (l.external_id.clone(), l))
                 .collect(),
             answered: answered.into_iter().collect(),
+            skipped: skipped.into_iter().collect(),
             unlinked: unlinked.into_iter().collect(),
             suppressed: suppressed.into_iter().collect(),
             companies: by_name,
@@ -575,92 +996,56 @@ impl ContactSyncEngine {
         snapshot: &Snapshot,
         ctx: &AuditCtx,
     ) -> AppResult<Outcome> {
-        // A person said stop (PMS-1214): an unlinked record is not re-linked by
-        // its email a minute later, and a removed one is not imported back.
-        // Checked before anything else, deletion included, because there is
-        // nothing left of either for a deletion to flag.
-        if snapshot.unlinked.contains(&record.external_id)
-            || snapshot
-                .suppressed
-                .contains(&external_id_digest(&record.external_id))
-        {
-            return Ok(Outcome::Excluded);
-        }
-        let link = snapshot.links.get(&record.external_id);
-
-        // A deletion is honoured whatever the selection: the link exists
-        // because the record was once selected.
-        if record.deleted {
-            return match link {
-                Some(link) if link.deleted_in_source_at.is_none() => {
-                    self.flag_deleted(tenant_id, link, ctx).await?;
-                    Ok(Outcome::DeletedInSource)
-                }
-                _ => Ok(Outcome::Unchanged),
-            };
-        }
-        if !record.group_ids.iter().any(|g| selected.contains(g)) {
-            return Ok(Outcome::NotSelected);
-        }
-        let labels: Vec<String> = record
-            .group_ids
-            .iter()
-            .filter(|g| selected.contains(*g))
-            .filter_map(|g| label_names.get(g).cloned())
-            .collect();
         let mapped = map_contact(record);
-
-        if let Some(link) = link {
-            if link.etag.is_some()
-                && link.etag == record.etag
-                && link.deleted_in_source_at.is_none()
-            {
-                return Ok(Outcome::Unchanged);
+        let labels = || -> Vec<String> {
+            record
+                .group_ids
+                .iter()
+                .filter(|g| selected.contains(*g))
+                .filter_map(|g| label_names.get(g).cloned())
+                .collect()
+        };
+        match plan(record, selected, snapshot, &mapped) {
+            Plan::Excluded => Ok(Outcome::Excluded),
+            Plan::NotSelected => Ok(Outcome::NotSelected),
+            Plan::Unchanged => Ok(Outcome::Unchanged),
+            Plan::AlreadyReviewed => Ok(Outcome::AlreadyReviewed),
+            Plan::FlagDeleted(link) => {
+                self.flag_deleted(tenant_id, link, ctx).await?;
+                Ok(Outcome::DeletedInSource)
             }
-            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-            let changed = self
-                .apply_fields(
-                    &mut tx,
-                    tenant_id,
-                    link.contact_id,
-                    record,
-                    &mapped,
-                    &labels,
-                    Pass::Owned,
-                    ctx,
+            Plan::Update(link) => {
+                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+                let changed = self
+                    .apply_fields(
+                        &mut tx,
+                        tenant_id,
+                        link.contact_id,
+                        record,
+                        &mapped,
+                        &labels(),
+                        Pass::Owned,
+                        ctx,
+                    )
+                    .await?;
+                sqlx::query(
+                    "UPDATE contact_sync_links \
+                     SET etag = $3, last_synced_at = NOW(), deleted_in_source_at = NULL, updated_at = NOW() \
+                     WHERE tenant_id = $1 AND id = $2",
                 )
+                .bind(tenant_id)
+                .bind(link.id)
+                .bind(&record.etag)
+                .execute(&mut *tx)
                 .await?;
-            sqlx::query(
-                "UPDATE contact_sync_links \
-                 SET etag = $3, last_synced_at = NOW(), deleted_in_source_at = NULL, updated_at = NOW() \
-                 WHERE tenant_id = $1 AND id = $2",
-            )
-            .bind(tenant_id)
-            .bind(link.id)
-            .bind(&record.etag)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            return Ok(if changed {
-                Outcome::Updated
-            } else {
-                Outcome::Unchanged
-            });
-        }
-
-        let incoming = IncomingKeys::from_values(
-            record.emails.iter().map(String::as_str),
-            record.phones.iter().flat_map(|p| {
-                p.canonical
-                    .as_deref()
-                    .into_iter()
-                    .chain([p.number.as_str()])
-            }),
-            &format!("{} {}", mapped.first_name, mapped.last_name),
-            mapped.company_name.as_deref(),
-        );
-        match decide(&incoming, &snapshot.locals) {
-            MatchDecision::Link(contact_id) => {
+                tx.commit().await?;
+                Ok(if changed {
+                    Outcome::Updated
+                } else {
+                    Outcome::Unchanged
+                })
+            }
+            Plan::Link(contact_id) => {
                 let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 self.apply_fields(
                     &mut tx,
@@ -668,7 +1053,7 @@ impl ContactSyncEngine {
                     contact_id,
                     record,
                     &mapped,
-                    &labels,
+                    &labels(),
                     Pass::FirstLink,
                     ctx,
                 )
@@ -689,19 +1074,8 @@ impl ContactSyncEngine {
                 tx.commit().await?;
                 Ok(Outcome::Linked { contact_id, link })
             }
-            MatchDecision::Review(pairs) => {
-                let open: Vec<_> = pairs
-                    .into_iter()
-                    .filter(|(id, _)| {
-                        !snapshot
-                            .answered
-                            .contains(&(record.external_id.clone(), *id))
-                    })
-                    .collect();
-                if open.is_empty() {
-                    return Ok(Outcome::AlreadyReviewed);
-                }
-                let snapshot_json = source_snapshot(record, &mapped, &labels);
+            Plan::Review(open) => {
+                let snapshot_json = source_snapshot(record, &mapped, &labels());
                 let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 let mut inserted = 0;
                 for (candidate, reason) in open {
@@ -737,17 +1111,8 @@ impl ContactSyncEngine {
                     Outcome::AwaitingReview
                 })
             }
-            MatchDecision::Create => {
-                let suggestion = mapped
-                    .company_name
-                    .as_deref()
-                    .and_then(name_key)
-                    .and_then(|key| snapshot.companies.get(&key))
-                    .and_then(|ids| match ids.as_slice() {
-                        [only] => Some(*only),
-                        _ => None,
-                    });
-                let request = create_request(&mapped, &labels);
+            Plan::Create(suggestion) => {
+                let request = create_request(&mapped, &labels());
                 let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 let contact_id = self
                     .contacts
@@ -770,6 +1135,104 @@ impl ContactSyncEngine {
                 Ok(Outcome::Created { contact_id, link })
             }
         }
+    }
+
+    /// What importing would do, without doing it (PMS-1242, PSA-70 E).
+    ///
+    /// Reads the whole account once and runs every record through [`plan`],
+    /// the same decision the import makes, against the same snapshot, writing
+    /// nothing: no link, no candidate, no run, no sync token. A record the
+    /// simulation would create or link is remembered in the snapshot exactly
+    /// as the import remembers it, so two records for one new address preview
+    /// as one create and one review, the way they import.
+    ///
+    /// `selection` limits the simulation to records carrying one of those
+    /// labels, which is what makes its totals exact for that selection. `None`
+    /// simulates every record carrying ANY offered label, so a client can show
+    /// per-label figures from one read.
+    pub async fn preview(
+        &self,
+        tenant_id: TenantId,
+        connection_id: Uuid,
+        source: &dyn ContactSyncProvider,
+        selection: Option<&BTreeSet<String>>,
+    ) -> AppResult<ImportPreview> {
+        let connection = self.load_connection(tenant_id, connection_id).await?;
+        if connection.disconnected_at.is_some() || !connection.is_active {
+            return Err(AppError::Conflict(
+                "This contact sync connection is not active.".to_string(),
+            ));
+        }
+        let groups = source.list_groups().await?;
+        let changes = source.changes_since(None).await?;
+        let offered: BTreeSet<String> = groups.iter().map(|g| g.id.clone()).collect();
+        let considered: BTreeSet<String> = match selection {
+            Some(selection) => selection.intersection(&offered).cloned().collect(),
+            None => offered.clone(),
+        };
+
+        let mut snapshot = self
+            .snapshot(tenant_id, connection_id, &connection.provider)
+            .await?;
+        let mut records = Vec::new();
+        let mut totals = PreviewTotals::default();
+        for record in changes.contacts.iter().filter(|r| !r.deleted) {
+            let mapped = map_contact(record);
+            let planned = plan(record, &considered, &snapshot, &mapped);
+            let outcome = match &planned {
+                Plan::NotSelected | Plan::FlagDeleted(_) => None,
+                Plan::Excluded | Plan::AlreadyReviewed => Some(PreviewOutcome::Excluded),
+                Plan::Unchanged | Plan::Update(_) => Some(PreviewOutcome::Imported),
+                Plan::Link(_) => Some(PreviewOutcome::Link),
+                Plan::Review(_) => Some(PreviewOutcome::Review),
+                Plan::Create(_) => Some(PreviewOutcome::Create),
+            };
+            let simulated_link = match planned {
+                Plan::Link(contact_id) => Some((contact_id, false)),
+                Plan::Create(_) => Some((Uuid::new_v4(), true)),
+                _ => None,
+            };
+            if let Some((contact_id, created)) = simulated_link {
+                let link = LinkRow {
+                    id: Uuid::new_v4(),
+                    external_id: record.external_id.clone(),
+                    contact_id,
+                    etag: record.etag.clone(),
+                    deleted_in_source_at: None,
+                };
+                if created {
+                    snapshot.remember(contact_id, record, link);
+                } else {
+                    snapshot.mark_linked(contact_id, link);
+                }
+            }
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            totals.add(outcome);
+            records.push(PreviewRecord {
+                group_ids: record
+                    .group_ids
+                    .iter()
+                    .filter(|g| offered.contains(*g))
+                    .cloned()
+                    .collect(),
+                outcome,
+            });
+        }
+        Ok(ImportPreview {
+            groups: groups
+                .into_iter()
+                .map(|g| PreviewGroup {
+                    id: g.id,
+                    name: g.name,
+                    member_count: g.member_count,
+                })
+                .collect(),
+            selection: considered.into_iter().collect(),
+            records,
+            totals,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1158,6 +1621,83 @@ fn create_request(mapped: &MappedContact, labels: &[String]) -> CreateContactReq
         ),
         companies: None,
     }
+}
+
+/// The record a reviewer saw, rebuilt from its [`source_snapshot`]. Only
+/// what the snapshot holds: enough to apply the same mapping the sync would,
+/// never a second read of the source.
+fn from_snapshot(
+    external_id: &str,
+    etag: Option<&str>,
+    snapshot: &serde_json::Value,
+) -> (SourceContact, MappedContact, Vec<String>) {
+    let text = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let strings = |key: &str| -> Vec<String> {
+        snapshot
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let phones: Vec<super::mapping::MappedPhone> = snapshot
+        .get("phones")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|p| {
+                    Some(super::mapping::MappedPhone {
+                        number: p.get("number")?.as_str()?.to_string(),
+                        phone_type: super::mapping::MappedPhoneType::from_label(
+                            p.get("phone_type").and_then(|t| t.as_str()),
+                        ),
+                        is_primary: p
+                            .get("is_primary")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mapped = MappedContact {
+        first_name: text("first_name").unwrap_or_else(|| "(no name)".to_string()),
+        last_name: text("last_name").unwrap_or_default(),
+        email: text("email"),
+        phones,
+        company_name: text("company_name"),
+        title: text("title"),
+        department: text("department"),
+        dropped: strings("dropped"),
+    };
+    let record = SourceContact {
+        external_id: external_id.to_string(),
+        etag: etag.map(str::to_string),
+        display_name: text("display_name"),
+        given_name: text("first_name"),
+        family_name: text("last_name"),
+        emails: strings("emails"),
+        phones: vec![],
+        organization: mapped.company_name.clone(),
+        title: mapped.title.clone(),
+        department: mapped.department.clone(),
+        group_ids: vec![],
+        photo_url: None,
+        deleted: false,
+    };
+    (record, mapped, strings("labels"))
 }
 
 /// The incoming record as the review queue's side-by-side renders it.

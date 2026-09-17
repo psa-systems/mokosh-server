@@ -95,11 +95,15 @@ async fn reset_mail(pool: &PgPool, email: &str) -> (String, String) {
     .await
     .expect("reset queues mail");
 
-    sqlx::query_as("SELECT subject, body FROM notifications WHERE recipient = $1")
-        .bind(email)
-        .fetch_one(pool)
-        .await
-        .expect("the reset queued an email row")
+    // PMS-1237: a user recipient is queued by user_id and resolved at send time.
+    sqlx::query_as(
+        "SELECT subject, body FROM notifications
+         WHERE recipient = $1 OR user_id IN (SELECT id FROM users WHERE email = $1)",
+    )
+    .bind(email)
+    .fetch_one(pool)
+    .await
+    .expect("the reset queued an email row")
 }
 
 fn actx() -> AuditCtx {
@@ -498,9 +502,13 @@ async fn no_seeded_template_still_names_the_product_literally(pool: PgPool) {
     // `{{msp_name}}` and no product name at all. The count is asserted rather
     // than a lower bound because a new template quietly naming the product is
     // what this test exists to catch.
+    //
+    // PMS-1215 made it four: `contact_sync.failing` goes to the MSP admin who
+    // connected Google Contacts and points them at the integration in the
+    // product, so it names the product through the placeholder too.
     assert_eq!(
-        templated, 3,
-        "expected the three MSP-side transactional templates to carry the placeholder"
+        templated, 4,
+        "expected the four MSP-side transactional templates to carry the placeholder"
     );
 }
 
