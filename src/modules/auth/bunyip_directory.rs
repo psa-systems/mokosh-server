@@ -54,6 +54,26 @@ struct LookupData {
     user_id: String,
     #[allow(dead_code)]
     email: String,
+    /// PMS-1208 finding 7: whether the bunyip identity has verified
+    /// its email address. Absent on a bunyip that predates the field;
+    /// `#[serde(default)]` reads that as `false` so the mokosh side
+    /// refuses the invitation instead of quietly assuming yes and
+    /// letting the accept dead-end at placement.
+    #[serde(default)]
+    email_verified: bool,
+}
+
+/// PMS-1208 finding 7: what `lookup` returns to its caller. The
+/// existing `bunyip_directory` callers want two properties (does the
+/// identity exist? if so, is it verified?), and the mokosh
+/// invitation gate turns each into a distinct 422: unregistered is
+/// "ask them to sign up first", registered-but-unverified is "ask
+/// them to verify their email first". A bare `Uuid` return would
+/// hide the second half at the seam.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectoryHit {
+    pub user_id: Uuid,
+    pub email_verified: bool,
 }
 
 /// A client that can resolve an email to a Bunyip user id. Cheap to
@@ -169,14 +189,19 @@ impl BunyipUserDirectory {
     }
 
     /// Look one email up. Returns:
-    /// - `Ok(Some(user_id))` on a Bunyip match.
+    /// - `Ok(Some(DirectoryHit { user_id, email_verified }))` on a
+    ///   Bunyip match. Both fields matter: an unverified identity
+    ///   is registered but the mokosh middleware still refuses to
+    ///   JIT-provision it into someone else's tenant (PMS-1208
+    ///   finding 7), so the caller has to distinguish "unknown" from
+    ///   "known but unverified" to answer the owner accurately.
     /// - `Ok(None)` on 404 (unknown to Bunyip or soft-deleted).
     /// - `Err(AppError::Internal)` on transport failure or a non-2xx
     ///   non-404 response, so a Bunyip outage refuses the caller's
     ///   invitation rather than silently degrading to "create it
     ///   anyway."
     #[tracing::instrument(skip(self), fields(email = %redact(email)))]
-    pub async fn lookup(&self, email: &str) -> AppResult<Option<Uuid>> {
+    pub async fn lookup(&self, email: &str) -> AppResult<Option<DirectoryHit>> {
         let url = format!("{}/v1/users/lookup", self.base_url);
         let resp = self
             .http
@@ -209,12 +234,16 @@ impl BunyipUserDirectory {
         let data = body.data.ok_or_else(|| {
             AppError::internal("bunyip directory 2xx response had no `data` field")
         })?;
-        Uuid::parse_str(&data.user_id).map(Some).map_err(|_| {
+        let user_id = Uuid::parse_str(&data.user_id).map_err(|_| {
             AppError::internal(format!(
                 "bunyip directory returned a non-UUID user_id: {}",
                 data.user_id
             ))
-        })
+        })?;
+        Ok(Some(DirectoryHit {
+            user_id,
+            email_verified: data.email_verified,
+        }))
     }
 }
 

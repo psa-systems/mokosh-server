@@ -245,13 +245,31 @@ async fn create_invitation(
     // carries `invitee_bunyip_user_id` a directory hit is
     // guaranteed by construction, so the gate is only invoked on
     // the email path.
+    //
+    // PMS-1208 finding 7: a hit whose `email_verified` is false is
+    // ALSO refused, because BUNYIP-674 option B's grantee JIT gate
+    // refuses to place an unverified identity into someone else's
+    // tenant (deliberate: the placeholder path exists only for
+    // first-sight owners bunyip is in the middle of verifying, and
+    // an unverified identity is not one worth placing in someone
+    // else's tenant). Without this second half the owner sends the
+    // mail, the grantee accepts, and the switch dead-ends at the
+    // generic 403 the middleware answers with. Refusing the
+    // invitation gives the owner the message they can ACT on.
     let invitee_id_from_directory: Option<Uuid> = match (
         &state.bunyip_directory,
         body.invitee_bunyip_user_id,
         invitee_email,
     ) {
         (Some(directory), None, Some(em)) => match directory.lookup(em).await? {
-            Some(id) => Some(id),
+            Some(hit) if hit.email_verified => Some(hit.user_id),
+            Some(_) => {
+                return Err(AppError::validation_field(
+                    "invitee_email",
+                    "This person is registered on Bunyip but has not verified their email address \
+                     yet. Ask them to verify their email, then send the invitation.",
+                ));
+            }
             None => {
                 return Err(AppError::validation_field(
                     "invitee_email",
