@@ -750,6 +750,16 @@ async fn migrate_config(
         return;
     };
     for key in registry::REGISTRY {
+        if key.tier() == registry::Tier::Bootstrap {
+            lines.push(MoveLine {
+                tier: "config",
+                key: key.name().to_string(),
+                outcome: "skipped: bootstrap-tier key cannot be written to an application-tier \
+                          config store"
+                    .to_string(),
+            });
+            continue;
+        }
         let outcome = move_one_config(key.name(), source.as_ref(), target.as_ref()).await;
         lines.push(MoveLine {
             tier: "config",
@@ -1024,6 +1034,17 @@ async fn purge_config(
     // Disabled means "not in the current chain". `provider_for` returned a
     // provider, so it IS in the chain and every key it holds is refused.
     for key in registry::REGISTRY {
+        if key.tier() == registry::Tier::Bootstrap {
+            lines.push(PurgeLine {
+                tier: "config",
+                key: key.name().to_string(),
+                outcome: "skipped: bootstrap-tier key cannot live in an application-tier config \
+                          store"
+                    .to_string(),
+                deleted: false,
+            });
+            continue;
+        }
         if !target.has(key.name()) {
             continue;
         }
@@ -1808,5 +1829,145 @@ mod tests {
         fn get(&self, _: GovernedSecret) -> Option<String> {
             self.value.clone()
         }
+    }
+
+    /// An in-memory [`ConfigProvider`] that counts every `set`/`delete` call,
+    /// so a test can assert a bootstrap-tier key was never reached with a
+    /// write rather than only inspecting the final map.
+    struct MemConfigProvider {
+        name: &'static str,
+        values: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        writes: std::sync::atomic::AtomicUsize,
+        deletes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MemConfigProvider {
+        fn new(name: &'static str, seed: &[(&str, &str)]) -> Self {
+            Self {
+                name,
+                values: std::sync::Mutex::new(
+                    seed.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                ),
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                deletes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigProvider for MemConfigProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn get(&self, key: &str) -> Option<String> {
+            self.values.lock().unwrap().get(key).cloned()
+        }
+        fn has(&self, key: &str) -> bool {
+            self.values.lock().unwrap().contains_key(key)
+        }
+        async fn set(&self, key: &str, value: &str) -> AppResult<()> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+        async fn delete(&self, key: &str) -> AppResult<()> {
+            self.deletes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    /// `provider-migrate`'s config walk must skip a bootstrap-tier key with
+    /// a named "skipped" outcome and never call the target's `set` for it,
+    /// even though the source holds it: this is the CLI-layer half of
+    /// PMS-1228 (`set`/`delete` themselves refuse it too, in `database.rs`
+    /// and `file.rs`).
+    #[tokio::test]
+    async fn migrate_config_skips_a_bootstrap_tier_key_and_reports_it() {
+        let source = MemConfigProvider::new(
+            "environment",
+            &[
+                ("ENCRYPTION_KEY", "super-secret"),
+                ("SMTP_HOST", "relay.example.com"),
+            ],
+        );
+        let target = MemConfigProvider::new("database", &[]);
+        let chain = ConfigProviderChain::new(vec![
+            (ConfigProviderKind::Environment, Arc::new(source)),
+            (ConfigProviderKind::Database, Arc::new(target)),
+        ]);
+        let mut lines = Vec::new();
+        migrate_config(
+            ConfigProviderKind::Environment,
+            ConfigProviderKind::Database,
+            &chain,
+            &mut lines,
+        )
+        .await;
+
+        let bootstrap_line = lines
+            .iter()
+            .find(|l| l.key == "ENCRYPTION_KEY")
+            .expect("ENCRYPTION_KEY must be reported, not silently dropped");
+        assert!(
+            bootstrap_line.outcome.starts_with("skipped:")
+                && bootstrap_line.outcome.contains("bootstrap"),
+            "outcome: {}",
+            bootstrap_line.outcome
+        );
+
+        let target = chain
+            .entries_for_cli()
+            .into_iter()
+            .find(|(kind, _)| *kind == ConfigProviderKind::Database)
+            .unwrap()
+            .1;
+        assert!(
+            !target.has("ENCRYPTION_KEY"),
+            "the bootstrap-tier key must never reach the target provider"
+        );
+        // The application-tier key beside it migrates normally.
+        assert_eq!(
+            target.get("SMTP_HOST").as_deref(),
+            Some("relay.example.com")
+        );
+    }
+
+    /// `provider-purge`'s config walk must skip a bootstrap-tier key even
+    /// when `--confirm` is set and the key is (wrongly) present in the
+    /// target, rather than attempting a delete on it.
+    #[tokio::test]
+    async fn purge_config_skips_a_bootstrap_tier_key_and_reports_it() {
+        let target = Arc::new(MemConfigProvider::new(
+            "database",
+            &[("ENCRYPTION_KEY", "leaked")],
+        ));
+        let chain = ConfigProviderChain::new(vec![(
+            ConfigProviderKind::Database,
+            target.clone() as Arc<dyn ConfigProvider>,
+        )]);
+        let mut lines = Vec::new();
+        purge_config(ConfigProviderKind::Database, &chain, true, &mut lines).await;
+
+        let bootstrap_line = lines
+            .iter()
+            .find(|l| l.key == "ENCRYPTION_KEY")
+            .expect("ENCRYPTION_KEY must be reported, not silently dropped");
+        assert!(
+            bootstrap_line.outcome.starts_with("skipped:")
+                && bootstrap_line.outcome.contains("bootstrap"),
+            "outcome: {}",
+            bootstrap_line.outcome
+        );
+        assert!(!bootstrap_line.deleted);
+        assert_eq!(target.deletes.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(target.has("ENCRYPTION_KEY"));
     }
 }
