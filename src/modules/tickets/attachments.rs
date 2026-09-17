@@ -47,7 +47,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -67,7 +67,7 @@ use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
 use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::inline_image::check_inline_image_mime;
-use crate::utils::upload_limits::oversized_upload_error;
+use crate::utils::upload_limits::{body_limit_bytes, oversized_upload_error};
 
 /// Default size cap when `ATTACHMENT_MAX_BYTES` is unset. 25 MiB
 /// matches what the ticket spec cites as the v1 default.
@@ -694,6 +694,11 @@ pub struct AttachmentsRouterState {
 }
 
 pub fn agent_attachment_routes(service: AttachmentService) -> Router {
+    // PMS-1233: read the caps before `service` moves into the state, so each
+    // route's `DefaultBodyLimit` matches the cap its own handler enforces
+    // rather than axum's undocumented 2 MiB default.
+    let attachment_max_bytes = service.config.max_bytes;
+    let inline_max_bytes = inline_cap(attachment_max_bytes);
     let state = AttachmentsRouterState {
         service: Arc::new(service),
     };
@@ -714,11 +719,16 @@ pub fn agent_attachment_routes(service: AttachmentService) -> Router {
         // a URL that names its constraint.
         .route(
             "/tickets/{ticket_id}/attachments/inline",
-            post(upload_inline_agent),
+            post(upload_inline_agent)
+                .layer(DefaultBodyLimit::max(body_limit_bytes(inline_max_bytes))),
         )
         .route(
             "/tickets/{ticket_id}/notes/{note_id}/attachments",
-            get(list_agent).post(upload_agent),
+            get(list_agent)
+                .post(upload_agent)
+                .layer(DefaultBodyLimit::max(body_limit_bytes(
+                    attachment_max_bytes,
+                ))),
         )
         .route(
             "/tickets/{ticket_id}/notes/{note_id}/attachments/{attachment_id}",
