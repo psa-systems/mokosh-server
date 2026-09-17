@@ -464,6 +464,23 @@ pub async fn read_note_editing(db: &Database, tenant_id: TenantId) -> AppResult<
     Ok(value.and_then(|v| v.as_str().map(str::to_string)))
 }
 
+/// PMS-1241: whether Google Contacts is allowed at all for this tenant
+/// (`integrations/google_contacts_enabled`, PSA-70 K). Unset is enabled: the
+/// switch exists to turn it OFF. A stored value that is not a boolean cannot
+/// arrive through `PUT /settings` (validated) and reads as enabled, the same
+/// answer as no row.
+pub async fn read_google_contacts_enabled(db: &Database, tenant_id: TenantId) -> AppResult<bool> {
+    let mut tx = db.begin_with_tenant(tenant_id).await?;
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'integrations' AND key = 'google_contacts_enabled'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(value.and_then(|v| v.as_bool()).unwrap_or(true))
+}
+
 /// PMS-1145: who may correct a work-day segment (`timesheets/segment_editing`),
 /// as the stored string; `SegmentEditPolicy::parse` gives it a meaning. Unset
 /// means `owner_or_admin`. A stored value the parser refuses is treated the

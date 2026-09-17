@@ -19,7 +19,7 @@ use mokosh_server::modules::contact_sync::provider::{
     ContactSyncProvider, SourceChanges, SourceContact, SourceError, SourceGroup, SourcePhone,
     SourceResult,
 };
-use mokosh_server::modules::contact_sync::sync::{ContactSyncEngine, SyncReport};
+use mokosh_server::modules::contact_sync::sync::{ContactSyncEngine, PreviewTotals, SyncReport};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -278,6 +278,7 @@ async fn a_sync_links_queues_and_creates_and_a_second_run_changes_nothing(pool: 
             linked: 1,
             queued: 2,
             not_selected: 1,
+            total: 5,
             ..SyncReport::default()
         }
     );
@@ -598,5 +599,101 @@ async fn two_records_for_one_address_do_not_create_two_contacts(pool: PgPool) {
         f.scalar::<String>("SELECT match_reason FROM contact_sync_candidates")
             .await,
         "email_ambiguous"
+    );
+}
+
+/// PMS-1242: the preview says what the import will do, and writes nothing.
+/// Previewed, then imported: the counts agree.
+#[sqlx::test]
+async fn a_preview_writes_nothing_and_agrees_with_the_import(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+    f.contact("Ada", "Lovelace", Some("ada@acme.example"), None)
+        .await;
+    let grace = f.contact("Grace", "Hopper", None, None).await;
+    f.phone(grace, "+14155550000").await;
+    f.contact("Sam", "Smith", None, Some("Acme Ltd")).await;
+    // A second new record for Nora's address: one create, one question.
+    let mut twin = person("people/c6", "e1", "Nora", "Twin");
+    twin.emails = vec!["nora@new.example".into()];
+    let mut account = fixture_account();
+    account.push(twin);
+
+    let source = FakeSource::new(vec![
+        read(account.clone(), "unused", false),
+        read(account.clone(), "unused", false),
+        read(account, "t1", false),
+    ]);
+    let engine = ContactSyncEngine::new(f.db.clone());
+    let before = f.state().await;
+
+    // Every labelled record, Friends included: per-label figures from one read.
+    let everything = engine
+        .preview(f.tenant, f.connection_id, &source, None)
+        .await
+        .expect("preview");
+    assert_eq!(
+        everything.totals,
+        PreviewTotals {
+            contacts: 6,
+            create: 2,
+            link: 1,
+            review: 3,
+            imported: 0,
+            excluded: 0
+        }
+    );
+    assert_eq!(everything.groups.len(), 2);
+    let friends = everything
+        .records
+        .iter()
+        .filter(|r| r.group_ids == vec![FRIENDS.to_string()])
+        .count();
+    assert_eq!(friends, 1);
+
+    // Narrowed to Clients: exact for that selection.
+    let clients: std::collections::BTreeSet<String> = [CLIENTS.to_string()].into();
+    let narrowed = engine
+        .preview(f.tenant, f.connection_id, &source, Some(&clients))
+        .await
+        .expect("preview");
+    assert_eq!(
+        narrowed.totals,
+        PreviewTotals {
+            contacts: 5,
+            create: 1,
+            link: 1,
+            review: 3,
+            imported: 0,
+            excluded: 0
+        }
+    );
+    let serialized = serde_json::to_string(&narrowed).unwrap();
+    for personal in ["nora@new.example", "Lovelace", "+1415"] {
+        assert!(
+            !serialized.contains(personal),
+            "the preview names nobody: {personal}"
+        );
+    }
+    assert_eq!(f.state().await, before, "a preview writes nothing");
+    assert_eq!(
+        f.scalar::<Option<String>>(&format!(
+            "SELECT sync_token FROM contact_sync_connections WHERE id = '{}'",
+            f.connection_id
+        ))
+        .await,
+        None,
+        "not even the cursor"
+    );
+
+    // Now import exactly that selection.
+    let report = f.sync(&source).await.expect("import");
+    assert_eq!(
+        (report.created, report.linked, report.queued),
+        (
+            narrowed.totals.create,
+            narrowed.totals.link,
+            narrowed.totals.review
+        ),
+        "{report:?}"
     );
 }

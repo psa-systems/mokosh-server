@@ -324,3 +324,56 @@ async fn addressing_an_approval_validates_the_contact(pool: PgPool) {
     let ok = post(json!({ "approver_contact_id": me.id })).await.unwrap();
     assert_eq!(ok.status(), StatusCode::OK);
 }
+
+// PMS-1230: deleting a contact who is the sole approver on an approval
+// must succeed, leaving the approval row in the "unknown approver"
+// state (all three approver columns NULL) rather than failing the
+// DELETE with the `ticket_approvals_approver_xor` CHECK.
+#[sqlx::test]
+async fn deleting_a_sole_approver_contact_succeeds_and_leaves_the_approval_queryable(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Erasure Co").await;
+    let c =
+        common::seed_portal_contact(&pool, company, "erase-me@example.com", &["Support Contact"])
+            .await;
+    let app = common::boot(pool.clone()).await;
+    let staff = common::login(&app, &email, &password).await;
+    let t = seed_ticket(&pool, company, admin_id, "Sole approver").await;
+    let a = address_to_contact(&app, &staff, t, c.id, "Please approve").await;
+    let a = Uuid::parse_str(a["id"].as_str().unwrap()).unwrap();
+
+    sqlx::query("DELETE FROM contacts WHERE id = $1")
+        .bind(c.id)
+        .execute(&pool)
+        .await
+        .expect("deleting the sole approver contact must succeed");
+
+    let row: (Option<Uuid>, Option<Uuid>, Option<String>, Option<Uuid>) = sqlx::query_as(
+        "SELECT approver_contact_id, approver_user_id, approver_role, id \
+         FROM ticket_approvals WHERE id = $1",
+    )
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .expect("approval row still queryable");
+    assert!(row.0.is_none(), "approver_contact_id");
+    assert!(row.1.is_none(), "approver_user_id");
+    assert!(row.2.is_none(), "approver_role");
+    assert_eq!(row.3, Some(a));
+
+    // The staff read path still serves the row (as an unknown approver)
+    // rather than erroring or vanishing.
+    let listed: Value = app
+        .client
+        .get(app.url(&format!("/api/v1/tickets/{t}/approvals")))
+        .bearer_auth(&staff)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed[0]["id"], a.to_string());
+    assert!(listed[0]["approver_contact_id"].is_null());
+    assert!(listed[0]["approver_contact_name"].is_null());
+}
