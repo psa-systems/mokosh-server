@@ -14,6 +14,13 @@ use uuid::Uuid;
 use validator::Validate;
 
 /// A team row. Returned by every endpoint that reads a team.
+///
+/// MAPPS-877: `member_count` rides on list responses so a client can
+/// render a real count instead of a placeholder. Batched server-side
+/// (one COUNT for the page), never per-row. `Option` for wire-compat
+/// with a client whose server has not been redeployed yet;
+/// `list_teams` always sets it, `get_team` leaves it None (a single
+/// team read is not the site where the count matters).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Team {
     pub id: Uuid,
@@ -25,6 +32,8 @@ pub struct Team {
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<u64>,
 }
 
 /// A `team_members` row, projected verbatim from the DB.

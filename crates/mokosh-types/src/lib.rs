@@ -22,6 +22,7 @@ pub mod auth;
 pub mod contacts;
 pub mod datetime;
 pub mod forms;
+pub mod members;
 pub mod mileage_tracking;
 pub mod sort;
 pub mod teams;

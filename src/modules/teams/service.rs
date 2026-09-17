@@ -384,7 +384,33 @@ impl TeamsService {
             q = q.bind(mgr);
         }
         let rows = q.fetch_all(&mut *tx).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut teams: Vec<Team> = rows.into_iter().map(Into::into).collect();
+
+        // MAPPS-877: batched member count. One GROUP BY over the page's
+        // team ids, so an N-team response fires one COUNT rather than
+        // N. Zero-member teams are absent from the result set and are
+        // filled in as `Some(0)` in the merge below rather than left as
+        // `None`, so a client can render "0" instead of "-" for an
+        // empty team without an extra round-trip.
+        if !teams.is_empty() {
+            let team_ids: Vec<Uuid> = teams.iter().map(|t| t.id).collect();
+            let counts: Vec<(Uuid, i64)> = sqlx::query_as(
+                "SELECT team_id, COUNT(*)::BIGINT FROM team_members \
+                 WHERE tenant_id = $1 AND team_id = ANY($2) \
+                 GROUP BY team_id",
+            )
+            .bind(*tenant_id)
+            .bind(&team_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            let mut count_map: std::collections::HashMap<Uuid, u64> =
+                counts.into_iter().map(|(id, n)| (id, n as u64)).collect();
+            for team in teams.iter_mut() {
+                team.member_count = Some(count_map.remove(&team.id).unwrap_or(0));
+            }
+        }
+
+        Ok(teams)
     }
 
     /// Member roster for a team, joined to `users` so the client gets
@@ -788,6 +814,10 @@ impl From<TeamRow> for Team {
             is_active: r.is_active,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            // MAPPS-877: filled by `list_teams` with one batched COUNT
+            // per response. Single-row reads leave it None because
+            // the count is not the site the number matters on.
+            member_count: None,
         }
     }
 }

@@ -44,6 +44,7 @@ use crate::modules::knowledge_base::attachments::{
     kb_attachment_routes, public_kb_attachment_routes, KbAttachmentConfig, KbAttachmentService,
 };
 use crate::modules::knowledge_base::{kb_routes, KbService};
+use crate::modules::members::{members_routes, MembersService};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::platform::{platform_routes, PlatformAdminService};
@@ -427,6 +428,17 @@ pub fn create_api_router(
         .nest(
             "/grants",
             owner_grants_routes(Arc::new(db.clone()), bunyip_directory.clone()),
+        )
+        // MAPPS-877: unified members list. One endpoint (fan-out over
+        // users + owner-outbox), read-only, manager-gated. Serves the
+        // People pane of `/settings/members` on the SPA; writes stay
+        // on the existing per-kind endpoints.
+        .nest(
+            "/members",
+            members_routes(MembersService::new(
+                Arc::new(db.clone()),
+                bunyip_directory.clone(),
+            )),
         )
         // MAPPS-513: platform super-admin routes. Distinct credential
         // store (`platform_admins`) and distinct JWT typ so the

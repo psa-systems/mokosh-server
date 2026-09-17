@@ -28,6 +28,7 @@ pub mod forms;
 pub mod invitations;
 pub mod ip_enrich;
 pub mod knowledge_base;
+pub mod members;
 pub mod mileage_tracking;
 pub mod notifications;
 pub mod platform;
