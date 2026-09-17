@@ -1364,22 +1364,30 @@ async fn place_grantee_caller(
                     );
                     // PMS-1208 finding 8: return a SPECIFIC 403 so the
                     // SPA does not paint the generic "You don't have
-                    // permission" copy over a refusal the grantee can
-                    // act on. This is the exact refusal the tester hit
-                    // after every previous defect was cleared:
-                    // placement into someone else's tenant requires a
-                    // verified Bunyip identity, and until Bunyip flips
-                    // the flag mokosh will not place. The mokosh
-                    // invitation gate (PMS-1208 finding 7) refuses new
-                    // invitations from this state, but a grant accepted
-                    // BEFORE that gate landed still reaches this branch
-                    // and the message names what to do.
+                    // permission" copy over a refusal that names its
+                    // cause in the log.
+                    //
+                    // The message does NOT tell the grantee to "verify
+                    // their email in Bunyip". A previous revision did,
+                    // and it read as misleading in every case that
+                    // actually reaches this branch on the current wire:
+                    // the grantee's address IS verified on bunyip, but
+                    // bunyip's userinfo only returns the `email` /
+                    // `email_verified` fields when the token carries
+                    // the `email` scope, and the grant mint (BUNYIP-673
+                    // `POST /v1/grants/{id}/access-token`) now requests
+                    // it. A grantee reading a "verify in Bunyip"
+                    // instruction whose address is already verified has
+                    // been sent to the one place the fix cannot be. A
+                    // support-facing message names the shape so a
+                    // support agent (and their log line) can trace the
+                    // right layer.
                     return (
                         None,
                         Some(AppError::Forbidden(
-                            "Your Bunyip email address is not verified yet, so you can't be \
-                             placed in this shared account. Verify your email in Bunyip, then \
-                             try switching again."
+                            "Couldn't confirm your identity for this shared account. Contact \
+                             the account owner or support with the time of this attempt so \
+                             they can check the server log."
                                 .to_string(),
                         )),
                     );
