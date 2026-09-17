@@ -245,7 +245,7 @@ impl BillingService {
     }
 
     /// Lock an invoice row for a payment read-modify-write and return its
-    /// `(total, amount_paid)` (PMS-695).
+    /// `(total, amount_paid, amount_credited)` (PMS-695, PMS-1225).
     ///
     /// `FOR UPDATE` is what makes concurrent payment creates/deletes
     /// serialise: without it two transactions both read the pre-payment
@@ -256,9 +256,9 @@ impl BillingService {
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         invoice_id: Uuid,
-    ) -> AppResult<Option<(Decimal, Decimal)>> {
+    ) -> AppResult<Option<(Decimal, Decimal, Decimal)>> {
         Ok(sqlx::query_as(
-            "SELECT total, amount_paid FROM invoices \
+            "SELECT total, amount_paid, amount_credited FROM invoices \
              WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
         )
         .bind(invoice_id)
@@ -3585,16 +3585,18 @@ impl BillingService {
         // whole read-modify-write is serialised and an overpayment rejection
         // does not have to unwind an already-inserted payment row.
         if let Some(invoice_id) = request.invoice_id {
-            let Some((total, prior_paid)) =
+            let Some((total, prior_paid, prior_credited)) =
                 Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?
             else {
                 return Err(AppError::NotFound("Invoice".to_string()));
             };
             // Reject overpayment so `balance_due` never goes negative
-            // (PMS-194). The remaining balance is `total - prior_paid`; a
-            // payment larger than that is a data-integrity error, not a
-            // valid partial/full payment.
-            let remaining = total - prior_paid;
+            // (PMS-194, widened in PMS-1225 to account for credits). The
+            // remaining balance is `total - prior_paid - prior_credited`,
+            // matching `recompute_invoice_balance`'s own formula; a payment
+            // larger than that is a data-integrity error, not a valid
+            // partial/full payment.
+            let remaining = total - prior_paid - prior_credited;
             if request.amount > remaining {
                 return Err(AppError::BadRequest(format!(
                     "Payment amount {} exceeds invoice balance due {}",
