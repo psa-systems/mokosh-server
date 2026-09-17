@@ -217,6 +217,7 @@ impl MembershipRepo {
                     role,
                     status,
                     mokosh_bunyip_grant_id: None,
+                    bunyip_grant_id: None,
                 },
             )
             .collect();
@@ -241,9 +242,9 @@ impl MembershipRepo {
         // email (case-insensitively, matching the identity/users
         // email join shape) makes those grants visible without paying
         // anything in SaaS mode where both axes match the same row.
-        let grant_rows: Vec<(Uuid, Uuid, String, String, String, String)> = sqlx::query_as(
+        let grant_rows: Vec<(Uuid, Uuid, Uuid, String, String, String, String)> = sqlx::query_as(
             r#"
-            SELECT g.id, t.id AS tenant_id, t.name, t.slug, t.kind, g.role
+            SELECT g.id, g.bunyip_grant_id, t.id AS tenant_id, t.name, t.slug, t.kind, g.role
             FROM mokosh_bunyip_grants g
             JOIN tenants t ON t.slug = g.mokosh_account_id
             WHERE g.revoked_at IS NULL
@@ -274,7 +275,7 @@ impl MembershipRepo {
         .await
         .unwrap_or_default();
 
-        for (grant_id, tenant_id, name, slug, kind, role) in grant_rows {
+        for (grant_id, bunyip_grant_id, tenant_id, name, slug, kind, role) in grant_rows {
             // De-dupe against the identity's own tenant_memberships
             // list: an owner who ALSO grants themselves would not
             // appear twice.
@@ -289,7 +290,19 @@ impl MembershipRepo {
                 tenant_kind: kind,
                 role,
                 status: "active".to_string(),
+                // PMS-1210: mokosh mirror id, used by
+                // DELETE `/api/v1/my-grants/{id}` (mokosh's own row).
                 mokosh_bunyip_grant_id: Some(grant_id),
+                // PMS-1208 finding 4: bunyip source-of-truth id, used
+                // by the SPA's tenant switcher to mint a grant-scoped
+                // at+jwt at bunyip's `POST /v1/grants/{id}/access-token`
+                // (bunyip's own row). Not the same id as
+                // `mokosh_bunyip_grant_id` above: mokosh assigns the
+                // mirror its own `id` on receive, and stores bunyip's
+                // side-of-truth id verbatim as `bunyip_grant_id`.
+                // Sending mokosh's mirror id to bunyip 404s because
+                // bunyip's table has never seen that UUID.
+                bunyip_grant_id: Some(bunyip_grant_id),
             });
         }
 
