@@ -291,6 +291,8 @@ async fn create_invitation(
     let CreatedInvitation {
         invitation,
         accept_token,
+        // SAFETY (PMS-285): no RLS on `mokosh_grant_invitations`; the
+        // INSERT names `tenant_id` from the authenticated caller.
     } = GrantInvitationsService::create(
         state.db.pool(),
         caller.tenant_id,
@@ -432,6 +434,9 @@ async fn list_owner_outbox(
     State(state): State<GrantInvitationsState>,
     RequireAdminUser(caller): RequireAdminUser,
 ) -> AppResult<Json<Vec<InvitationResponse>>> {
+    // SAFETY (PMS-285): `mokosh_grant_invitations` has no RLS policy;
+    // the service query filters on `tenant_id = $1` with the caller's
+    // authenticated tenant.
     let rows =
         GrantInvitationsService::find_pending_by_tenant(state.db.pool(), caller.tenant_id).await?;
     Ok(Json(rows.into_iter().map(Into::into).collect()))
@@ -441,10 +446,11 @@ async fn list_grantee_inbox(
     State(state): State<GrantInvitationsState>,
     RequireAuth(caller): RequireAuth,
 ) -> AppResult<Json<Vec<InvitationResponse>>> {
-    // The grantee inbox is cross-tenant by design (a bunyip user
-    // may be invited by any number of owners on different tenants).
-    // The service reads through the migrator pool for the same
-    // reason `find_bunyip_principal_in_tenant` does.
+    // SAFETY (PMS-285): the grantee inbox is cross-tenant by design
+    // (a bunyip user may be invited by any number of owners on
+    // different tenants); no `tenant_id` scope makes sense here.
+    // `mokosh_grant_invitations` has no RLS policy and the read filters
+    // on `invitee_bunyip_user_id = $1` with the caller's own sub.
     let rows =
         GrantInvitationsService::find_pending_for_invitee(state.db.pool(), caller.id).await?;
     Ok(Json(rows.into_iter().map(Into::into).collect()))
@@ -455,6 +461,9 @@ async fn cancel_invitation(
     RequireAdminUser(caller): RequireAdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
+    // SAFETY (PMS-285): no RLS on `mokosh_grant_invitations`; the
+    // UPDATE names BOTH `id` AND `tenant_id`, so a foreign-tenant id
+    // is invisible (enumeration-resistant).
     let ok = GrantInvitationsService::cancel(state.db.pool(), id, caller.tenant_id).await?;
     // Idempotent shape: whether we moved a pending row or found
     // none to move, answer 204. The endpoint is enumeration-
@@ -468,6 +477,10 @@ async fn get_invitation_by_token(
     State(state): State<GrantInvitationsState>,
     Path(token): Path<String>,
 ) -> AppResult<Json<InvitationMetadata>> {
+    // SAFETY (PMS-285): this is a pre-auth path - the token in the
+    // URL IS the credential (Argon2 hash on the row, single-use). No
+    // `tenant_id` scope is available yet and none is needed: the
+    // token uniquely identifies the row.
     let invitation = GrantInvitationsService::find_by_token(state.db.pool(), &token)
         .await?
         .ok_or_else(|| AppError::NotFound("invitation".to_string()))?;
@@ -510,11 +523,21 @@ async fn accept_invitation(
     // caller has no bunyip identity and the invitation's
     // `invitee_bunyip_user_id` was NULL at create time, which the
     // service's accept path binds now.
+    // SAFETY (PMS-285): pre-auth-ish path (the caller is authenticated
+    // via `RequireAuth` but on the GRANTEE plane, not the tenant plane;
+    // there is no owner-tenant scope to set here). The token in the URL
+    // uniquely identifies the row, and the WRITE half checks
+    // `invitee_bunyip_user_id` against `caller.id` inside the service
+    // (`WrongCaller` refusal).
     let invitation = GrantInvitationsService::find_by_token(state.db.pool(), &token)
         .await?
         .ok_or_else(|| AppError::NotFound("invitation".to_string()))?;
     let owner = invitation.inviter_bunyip_user_id;
 
+    // SAFETY (PMS-285): same shape as the read above. `accept` runs
+    // its own guarded UPDATE (WHERE id = ... AND status = 'pending')
+    // and calls the mirror upsert on `mokosh_bunyip_grants`, which
+    // also has no RLS.
     let outcome = GrantInvitationsService::accept(
         state.db.pool(),
         &token,
@@ -549,6 +572,9 @@ async fn decline_invitation(
     RequireAuth(caller): RequireAuth,
     Path(token): Path<String>,
 ) -> AppResult<Json<InvitationResponse>> {
+    // SAFETY (PMS-285): mirrors the accept path above - token
+    // uniquely identifies the row, no RLS on the table, and the
+    // guarded UPDATE stays enumeration-resistant.
     let outcome = GrantInvitationsService::decline(state.db.pool(), &token, caller.id).await?;
     match outcome {
         Ok(invitation) => Ok(Json(invitation.into())),

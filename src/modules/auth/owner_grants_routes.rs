@@ -123,6 +123,12 @@ async fn pending_for_owner(
     state: &OwnerGrantsState,
     tenant_id: Uuid,
 ) -> AppResult<Vec<PendingInvitationView>> {
+    // SAFETY (PMS-285): `mokosh_grant_invitations` has no RLS policy
+    // (migration 222 does not enable it), and the service's query
+    // filters on `tenant_id = $1` explicitly, using the caller's
+    // authenticated `tenant_id` extracted by `RequireAdminUser`. The
+    // sibling `grant_invitations_routes` calls this service the same
+    // way for the same reason.
     let rows = GrantInvitationsService::find_pending_by_tenant(state.db.pool(), tenant_id).await?;
     Ok(rows
         .into_iter()
