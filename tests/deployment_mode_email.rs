@@ -68,12 +68,12 @@ fn with_sso(pool: &PgPool, mode: DeploymentMode, sso_mounted: bool) -> AuthServi
     .with_sso_mounted(sso_mounted)
 }
 
-/// How many email rows are queued for `recipient`. The dispatcher writes one
-/// per rule match; the worker drains them later, so this counts what was
-/// dispatched without needing the worker to run.
+/// How many email rows are queued for `recipient`, whether by address or by the
+/// user it belongs to (PMS-1237: a user recipient is resolved at send time).
 async fn queued_for(pool: &PgPool, recipient: &str) -> i64 {
     sqlx::query_scalar(
-        "SELECT COUNT(*) FROM notifications WHERE channel_type = 'email' AND recipient = $1",
+        "SELECT COUNT(*) FROM notifications WHERE channel_type = 'email'
+         AND (recipient = $1 OR user_id IN (SELECT id FROM users WHERE email = $1))",
     )
     .bind(recipient)
     .fetch_one(pool)

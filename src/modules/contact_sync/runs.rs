@@ -61,6 +61,10 @@ pub const STALE_AFTER_MINUTES: i64 = 30;
 /// tick can hold the worker.
 pub const RUNS_PER_TICK: i64 = 5;
 
+/// Why a run the tenant turned the integration off under did not happen.
+const TURNED_OFF: &str =
+    "Google Contacts was turned off for this organization before this import ran.";
+
 /// Consecutive failed runs before anyone is told.
 pub const NOTIFY_AFTER: i32 = 3;
 
@@ -243,6 +247,9 @@ impl ContactSyncRunner {
              SELECT c.tenant_id, c.id, 'scheduled' FROM contact_sync_connections c \
              WHERE c.disconnected_at IS NULL AND c.is_active \
                AND jsonb_array_length(c.selected_groups) > 0 \
+               AND NOT EXISTS (SELECT 1 FROM tenant_settings s \
+                               WHERE s.tenant_id = c.tenant_id AND s.category = 'integrations' \
+                                 AND s.key = 'google_contacts_enabled' AND s.value = 'false'::jsonb) \
                AND c.sync_status NOT IN ('reconnect_required', 'in_progress') \
                AND c.last_sync_at IS NOT NULL \
                AND c.last_sync_at <= NOW() - (c.sync_interval_minutes * INTERVAL '1 minute') \
@@ -308,6 +315,11 @@ impl ContactSyncRunner {
     }
 
     async fn attempt(&self, tenant_id: TenantId, claimed: &Claimed) -> AppResult<SyncReport> {
+        // Turned off after the run was queued (PMS-1241): no token refresh, no
+        // read of the account. `settle` records the run as cancelled.
+        if !crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await? {
+            return Err(AppError::Conflict(TURNED_OFF.to_string()));
+        }
         let provider: String = {
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             sqlx::query_scalar(
@@ -339,9 +351,12 @@ impl ContactSyncRunner {
         outcome: AppResult<SyncReport>,
     ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let (connection_status, disconnected): (String, bool) = sqlx::query_as(
-            "SELECT sync_status, disconnected_at IS NOT NULL FROM contact_sync_connections \
-             WHERE tenant_id = $1 AND id = $2",
+        let (connection_status, disconnected, turned_off): (String, bool, bool) = sqlx::query_as(
+            "SELECT c.sync_status, c.disconnected_at IS NOT NULL, \
+                    EXISTS (SELECT 1 FROM tenant_settings s \
+                            WHERE s.tenant_id = c.tenant_id AND s.category = 'integrations' \
+                              AND s.key = 'google_contacts_enabled' AND s.value = 'false'::jsonb) \
+             FROM contact_sync_connections c WHERE c.tenant_id = $1 AND c.id = $2",
         )
         .bind(tenant_id)
         .bind(claimed.connection_id)
@@ -354,6 +369,7 @@ impl ContactSyncRunner {
             // Disconnected while queued or running: the admin ended it, and a
             // connection that no longer exists has no failure streak.
             _ if disconnected => ("cancelled", None, None),
+            Err(_) if turned_off => ("cancelled", Some(TURNED_OFF.to_string()), None),
             Ok(report) if report.failed == 0 => ("completed", None, Some(false)),
             Ok(report) => (
                 "failed",
@@ -509,7 +525,7 @@ impl ContactSyncRunner {
             // The Settings page the connect flow already returns to
             // (`ContactSyncService::complete_connect`).
             "settings_url": format!(
-                "{}/settings?contact_sync={}",
+                "{}/settings/integrations/{}-contacts",
                 self.spa_base_url.trim_end_matches('/'),
                 streak.provider
             ),
