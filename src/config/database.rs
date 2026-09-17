@@ -170,6 +170,12 @@ impl ConfigProvider for DatabaseProvider {
     /// a write sees the new value. A failing DB write leaves the cache and
     /// the previous value serving.
     async fn set(&self, key: &str, value: &str) -> AppResult<()> {
+        if super::registry::tier_of(key) == Some(Tier::Bootstrap) {
+            return Err(AppError::Configuration(format!(
+                "{key} is a bootstrap-tier key and cannot be written to the database \
+                 configuration provider"
+            )));
+        }
         let db = match &self.writer {
             WriteBackend::Real { db } => db,
             #[cfg(test)]
@@ -205,6 +211,12 @@ impl ConfigProvider for DatabaseProvider {
     /// PMS-1012: delete the `app_config` row and drop the cached value. A
     /// row that is already gone is not an error.
     async fn delete(&self, key: &str) -> AppResult<()> {
+        if super::registry::tier_of(key) == Some(Tier::Bootstrap) {
+            return Err(AppError::Configuration(format!(
+                "{key} is a bootstrap-tier key and cannot be deleted from the database \
+                 configuration provider"
+            )));
+        }
         let db = match &self.writer {
             WriteBackend::Real { db } => db,
             #[cfg(test)]
@@ -276,6 +288,36 @@ mod tests {
         let provider = DatabaseProvider::from_map(HashMap::new());
         assert_eq!(provider.get("DATABASE_URL"), None);
         assert!(!provider.has("DATABASE_URL"));
+    }
+
+    #[tokio::test]
+    async fn set_refuses_a_bootstrap_tier_key() {
+        let provider = DatabaseProvider::from_map(HashMap::new());
+        let err = provider
+            .set("ENCRYPTION_KEY", "not-a-real-key")
+            .await
+            .expect_err("a bootstrap-tier key must not be written to app_config");
+        let msg = err.to_string();
+        assert!(msg.contains("ENCRYPTION_KEY"), "{msg}");
+        assert!(msg.contains("bootstrap"), "the message must say why: {msg}");
+        // Refused before the disabled writer is even reached, so the cache
+        // stays untouched too.
+        assert!(!provider.has("ENCRYPTION_KEY"));
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_a_bootstrap_tier_key() {
+        let mut values = HashMap::new();
+        values.insert("ENCRYPTION_KEY".to_string(), "leaked".to_string());
+        let provider = DatabaseProvider::from_map(values);
+        let err = provider
+            .delete("ENCRYPTION_KEY")
+            .await
+            .expect_err("a bootstrap-tier key must not be deleted from app_config");
+        assert!(err.to_string().contains("ENCRYPTION_KEY"));
+        // Refusing the delete leaves the (already-wrong) cached value alone
+        // rather than quietly clearing it.
+        assert!(provider.has("ENCRYPTION_KEY"));
     }
 
     #[test]
