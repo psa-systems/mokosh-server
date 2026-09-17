@@ -130,6 +130,21 @@ impl fmt::Display for ConfigKey {
     }
 }
 
+/// Look up a declared key's tier by name. `None` when `name` is not a
+/// declared key at all, which a write-path guard treats as "not bootstrap":
+/// an undeclared name cannot be the bootstrap keys this guard exists to
+/// stop (see [`Tier::Bootstrap`]'s doc), and refusing it here would be the
+/// wrong error for what is actually an unknown-key problem.
+///
+/// The one place a config-store `set`/`delete` checks before writing
+/// (PMS-1228), so the refusal lives once rather than once per provider.
+pub fn tier_of(name: &str) -> Option<Tier> {
+    REGISTRY
+        .iter()
+        .find(|key| key.name() == name)
+        .map(|key| key.tier())
+}
+
 /// Declare a key and its registry entry in one statement.
 ///
 /// The macro exists so [`REGISTRY`] cannot fall out of step with the constants:

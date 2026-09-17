@@ -15,7 +15,7 @@ use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::settings::{read_invoice_reminder_settings, read_tenant_zone};
 use crate::utils::email::Mailer;
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::{AppError, AppResult, FieldError};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
@@ -245,7 +245,7 @@ impl BillingService {
     }
 
     /// Lock an invoice row for a payment read-modify-write and return its
-    /// `(total, amount_paid)` (PMS-695).
+    /// `(total, amount_paid, amount_credited)` (PMS-695, PMS-1225).
     ///
     /// `FOR UPDATE` is what makes concurrent payment creates/deletes
     /// serialise: without it two transactions both read the pre-payment
@@ -256,9 +256,9 @@ impl BillingService {
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         invoice_id: Uuid,
-    ) -> AppResult<Option<(Decimal, Decimal)>> {
+    ) -> AppResult<Option<(Decimal, Decimal, Decimal)>> {
         Ok(sqlx::query_as(
-            "SELECT total, amount_paid FROM invoices \
+            "SELECT total, amount_paid, amount_credited FROM invoices \
              WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
         )
         .bind(invoice_id)
@@ -287,9 +287,14 @@ impl BillingService {
     /// The status ladder is unchanged for an invoice with no credits: with
     /// `credited = 0` the first arm cannot fire and the rest reduce to exactly
     /// the pre-PMS-953 expression, zero-total invoices included. Crediting away
-    /// the whole outstanding balance moves the invoice to `void`, which is what
-    /// finally gives that status a writer: before this it was a value the model
-    /// knew and no code path could reach.
+    /// the invoice's full total moves it to `void`, which is what finally
+    /// gives that status a writer: before this it was a value the model knew
+    /// and no code path could reach. The threshold is `i.total`, not the
+    /// already-paid remainder `i.total - p.paid` (PMS-1226): once an invoice
+    /// is fully paid that remainder is zero, so any credit at all, including
+    /// a small post-payment goodwill adjustment (`service.rs`, `create_credit_note`
+    /// documents crediting a paid invoice as intentional), would satisfy it and
+    /// void an invoice that is still paid in full.
     ///
     /// `paid_at` stays keyed on payments alone. A credited invoice was not
     /// paid, and stamping it would put a payment date on money nobody sent.
@@ -314,7 +319,7 @@ impl BillingService {
                 -- status standing.
                 status      = CASE WHEN i.written_off_at IS NOT NULL THEN 'written_off'
                                    WHEN p.credited > 0
-                                    AND p.credited >= i.total - p.paid THEN 'void'
+                                    AND p.credited >= i.total THEN 'void'
                                    WHEN i.total - p.paid - p.credited <= 0 THEN 'paid'
                                    WHEN p.paid > 0 THEN 'partially_paid'
                                    ELSE 'sent' END,
@@ -3580,16 +3585,18 @@ impl BillingService {
         // whole read-modify-write is serialised and an overpayment rejection
         // does not have to unwind an already-inserted payment row.
         if let Some(invoice_id) = request.invoice_id {
-            let Some((total, prior_paid)) =
+            let Some((total, prior_paid, prior_credited)) =
                 Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?
             else {
                 return Err(AppError::NotFound("Invoice".to_string()));
             };
             // Reject overpayment so `balance_due` never goes negative
-            // (PMS-194). The remaining balance is `total - prior_paid`; a
-            // payment larger than that is a data-integrity error, not a
-            // valid partial/full payment.
-            let remaining = total - prior_paid;
+            // (PMS-194, widened in PMS-1225 to account for credits). The
+            // remaining balance is `total - prior_paid - prior_credited`,
+            // matching `recompute_invoice_balance`'s own formula; a payment
+            // larger than that is a data-integrity error, not a valid
+            // partial/full payment.
+            let remaining = total - prior_paid - prior_credited;
             if request.amount > remaining {
                 return Err(AppError::BadRequest(format!(
                     "Payment amount {} exceeds invoice balance due {}",
@@ -3757,6 +3764,26 @@ impl BillingService {
         request: &UpdateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
+        // PMS-1227: `void` and `written_off` are terminal states owned by
+        // `void_invoice` and `write_off_invoice`, each with its own
+        // preconditions and its own write-off/void detail columns. Accepting
+        // them here let a draft jump straight to `written_off` with every
+        // one of those columns NULL, a row neither dedicated endpoint could
+        // then reach: `is_frozen` blocked this method, and `write_off_invoice`
+        // requires `sent` or `partially_paid`.
+        if let Some(status) = request.status {
+            if matches!(status, InvoiceStatus::Void | InvoiceStatus::WrittenOff) {
+                return Err(AppError::validation(
+                    "status cannot be set to void or written_off here",
+                    vec![FieldError::new(
+                        "status",
+                        "void and written_off are set through their own endpoints (void_invoice, write_off_invoice), not through this update",
+                        "invalid_status_transition",
+                    )],
+                ));
+            }
+        }
+
         let current = self.get_invoice(tenant_id, invoice_id).await?;
         if current.status.is_frozen() {
             return Err(AppError::Conflict(format!(

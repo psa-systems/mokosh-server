@@ -587,6 +587,22 @@ impl TimeTrackingService {
             day_minutes_excluding(&mut *tx, tenant_id, current.user_id, target_date, Some(id))
                 .await?;
         enforce_day_cap(existing, worked, cap_minutes)?;
+        // PMS-1232: re-derive the covering block-hours contract for the
+        // entry's (possibly new) date, the same derivation create_time_entry
+        // uses. `entry_kind` and `company_id` cannot change on an update, so
+        // the date (and a flip of `is_billable`) are the only inputs that can
+        // move which contract, if any, covers this entry; leaving the
+        // original `contract_id` standing would re-draw a moved entry
+        // against a period, or a contract, that no longer covers it.
+        let contract_id = block_hours_contract_for(
+            &mut tx,
+            tenant_id,
+            current.company_id,
+            target_date,
+            kind.kind,
+            is_billable,
+        )
+        .await?;
         let affected = sqlx::query(
             r#"
             UPDATE time_entries SET
@@ -606,6 +622,7 @@ impl TimeTrackingService {
                 task_id           = COALESCE($14, task_id),
                 work_category     = $15,
                 billing_status    = $18,
+                contract_id       = $19,
                 updated_at        = NOW()
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -636,6 +653,7 @@ impl TimeTrackingService {
             is_billable,
             Some(current.billing_status),
         ))
+        .bind(contract_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();

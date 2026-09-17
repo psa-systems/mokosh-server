@@ -93,7 +93,13 @@ pub fn validate_setting_value(
         // and not per company, because the employee taking the break is the
         // MSP's, and a client company has none of the MSP's staff. Default off,
         // which is the absence of a row; PMS-950 reads it.
+        //
+        // PMS-1241: `integrations/google_contacts_enabled` is the tenant-wide
+        // off switch for Google Contacts (PSA-70 K). Default ON, the absence
+        // of a row, because turning it off is the deliberate act; the reader
+        // is `read_google_contacts_enabled`.
         ("timesheets", "track_breaks")
+        | ("integrations", "google_contacts_enabled")
         | ("notifications", "channel_email_enabled")
         | ("notifications", "channel_in_app_enabled") => match value {
             Value::Bool(_) => Ok(()),

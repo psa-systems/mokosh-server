@@ -1161,6 +1161,208 @@ async fn enrolling_in_one_tenant_arms_the_same_secret_in_the_other(pool: PgPool)
     );
 }
 
+/// PMS-1223: `mfa_enabled` and `mfa_secret` must land on the same row set
+/// under the actual `NOBYPASSRLS` app role, not just under the superuser
+/// pool `common::boot` runs on.
+///
+/// `enrolling_in_one_tenant_arms_the_same_secret_in_the_other` above already
+/// pins the secret's fan-out, but `common::boot` wraps a single superuser
+/// pool as both the app and migrator connections, so RLS never bites there
+/// and it could not have caught this bug: `enable_mfa`'s tenant-scoped
+/// `UPDATE identities` relied on the `sync_identity_to_users` trigger's own
+/// `UPDATE users` to reach the second tenant's row, and that trigger has no
+/// `SECURITY DEFINER`, so under a real `NOBYPASSRLS` connection its write is
+/// filtered by RLS to the caller's tenant alone. This uses `common::boot_rls`
+/// to exercise that role and proves the second tenant's `users` row gets both
+/// columns, and that logging in there is actually prompted for a code.
+#[sqlx::test]
+async fn enabling_mfa_in_one_tenant_arms_the_flag_in_the_other_under_rls(pool: PgPool) {
+    let (_uid, email, password) = common::seed_admin(&pool).await;
+
+    let tenant_b_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) \
+         VALUES ($1, 'Tenant B', 'tenant-b', 'active', 'org')",
+    )
+    .bind(tenant_b_id)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b");
+    let tenant_b_user_id = Uuid::new_v4();
+    let password_hash =
+        mokosh_server::utils::crypto::hash_password(&password).expect("hash tenant-b password");
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'Test', 'Admin', 'admin', 'active', NOW())",
+    )
+    .bind(tenant_b_user_id)
+    .bind(tenant_b_id)
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b seat");
+
+    let app = common::boot_rls(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let secret = enroll_and_enable_mfa(&app, &token).await;
+
+    let (b_enabled, b_secret): (bool, Option<String>) =
+        sqlx::query_as("SELECT mfa_enabled, mfa_secret FROM users WHERE id = $1")
+            .bind(tenant_b_user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read the tenant-b seat");
+    assert!(
+        b_enabled,
+        "mfa_enabled must fan out to every tenant's users row, not just the caller's"
+    );
+    assert!(
+        b_secret.is_some(),
+        "the tenant-b seat must hold the secret alongside the enabled flag"
+    );
+
+    // The half that matters to the human: tenant B's login now demands a
+    // second factor instead of either skipping it or 500ing.
+    let code_now = mokosh_server::utils::totp::code_at(&secret, Utc::now());
+    let login = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_id": tenant_b_id,
+            "mfa_code": code_now,
+        }))
+        .send()
+        .await
+        .expect("send tenant-b login");
+    let status = login.status();
+    let body = login.text().await.expect("tenant-b login body");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "MFA enabled in one tenant must be enforced, and satisfiable, in the other; body: {body}"
+    );
+}
+
+/// PMS-1223: the disable side of the same contract. Disabling MFA in one
+/// tenant must clear `mfa_enabled` on every tenant's `users` row, not just
+/// the caller's, so a second tenant is never left reading `mfa_enabled =
+/// TRUE` with no secret to verify against (a hard 500, and no way to
+/// re-enroll). Unlike the enable side, this one does not discriminate the
+/// pre-fix code from the fix: the old tenant-scoped `identities` write left
+/// tenant B's flag stuck at its old value, but `disable_mfa`'s own
+/// `write_mfa_secret` call right after it re-touches the `identities` row on
+/// the migrator pool, and that incidentally re-fires the (RLS-unscoped,
+/// bypass-pool) mirror trigger and fans the already-correct `identities.mfa_enabled`
+/// out to every tenant's `users` row as a side effect - so the pre-fix code
+/// passes this assertion too. It stays as direct coverage of the disable
+/// contract itself, which `write_mfa_enabled` now satisfies without relying
+/// on that trigger side effect.
+#[sqlx::test]
+async fn disabling_mfa_in_one_tenant_clears_the_flag_in_the_other_under_rls(pool: PgPool) {
+    let (uid, email, password) = common::seed_admin(&pool).await;
+
+    let tenant_b_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, status, kind) \
+         VALUES ($1, 'Tenant B', 'tenant-b', 'active', 'org')",
+    )
+    .bind(tenant_b_id)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b");
+    let tenant_b_user_id = Uuid::new_v4();
+    let password_hash =
+        mokosh_server::utils::crypto::hash_password(&password).expect("hash tenant-b password");
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
+         VALUES ($1, $2, $3, $4, 'Test', 'Admin', 'admin', 'active', NOW())",
+    )
+    .bind(tenant_b_user_id)
+    .bind(tenant_b_id)
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .expect("insert tenant-b seat");
+
+    let app = common::boot_rls(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    enroll_and_enable_mfa(&app, &token).await;
+
+    // Put tenant B in the state a correctly fanned-out `enable_mfa` would
+    // have left it in (armed with the same secret), independent of whether
+    // enabling itself fans out correctly, so this test isolates the disable
+    // side of the bug rather than depending on the enable side already
+    // passing.
+    let (a_enabled, a_secret): (bool, Option<String>) =
+        sqlx::query_as("SELECT mfa_enabled, mfa_secret FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read the tenant-a seat's armed state before overriding tenant-b");
+    assert!(a_enabled, "the caller's own tenant must be armed by now");
+    sqlx::query("UPDATE users SET mfa_enabled = TRUE, mfa_secret = $1 WHERE id = $2")
+        .bind(&a_secret)
+        .bind(tenant_b_user_id)
+        .execute(&pool)
+        .await
+        .expect("arm tenant-b's seat directly, as a correctly fanned-out enable would have");
+
+    let disable_resp = app
+        .client
+        .post(app.url("/api/v1/auth/me/mfa/disable"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "password": password }))
+        .send()
+        .await
+        .expect("send mfa disable");
+    assert!(
+        disable_resp.status().is_success(),
+        "disable mfa should succeed, got {}",
+        disable_resp.status()
+    );
+
+    let (b_enabled, b_secret): (bool, Option<String>) =
+        sqlx::query_as("SELECT mfa_enabled, mfa_secret FROM users WHERE id = $1")
+            .bind(tenant_b_user_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("read the tenant-b seat");
+    assert!(
+        !b_enabled,
+        "mfa_enabled must clear on every tenant's users row, not just the caller's"
+    );
+    assert!(
+        b_secret.is_none(),
+        "the tenant-b seat must not be left with mfa_enabled cleared but a stale secret, \
+         or the reverse"
+    );
+
+    // The half that matters to the human: tenant B's login now succeeds with
+    // no second factor, rather than 500ing on a flag with no secret.
+    let login = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_id": tenant_b_id,
+        }))
+        .send()
+        .await
+        .expect("send tenant-b login");
+    let status = login.status();
+    let body = login.text().await.expect("tenant-b login body");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "disabling MFA in one tenant must clear it in the other; body: {body}"
+    );
+}
+
 // ============================================================================
 // PMS-502: second-factor anti-replay + per-account attempt lockout
 // ============================================================================

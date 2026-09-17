@@ -93,8 +93,15 @@ async fn a_tenant_with_no_connection_reads_as_none(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: Value = resp.json().await.expect("json");
     assert!(
-        body.is_null(),
+        body["connection"].is_null(),
         "no connection is null, not an error: {body}"
+    );
+    // PMS-1241: the card can tell never connected from turned off and from a
+    // deployment with no Google client, without a second request.
+    assert_eq!(body["enabled"], true, "unset means enabled: {body}");
+    assert_eq!(
+        body["configured"], false,
+        "the test environment has no Google client: {body}"
     );
 }
 
@@ -174,4 +181,92 @@ async fn state_rows_are_tenant_scoped(pool: PgPool) {
             .await
             .expect("count");
     assert_eq!(visible, 0, "another tenant's state row must be invisible");
+}
+
+/// PMS-1241: `reconnect_required` has a way out. Consenting again with the
+/// SAME Google account replaces the stored grant on the existing connection -
+/// its id, links, runs and selection all hang off that id - and clears the
+/// failure state. A DIFFERENT account is refused, because every link names the
+/// account it came from.
+#[sqlx::test]
+async fn reconnecting_the_same_account_keeps_the_connection(pool: PgPool) {
+    use mokosh_server::db::Database;
+    use mokosh_server::modules::auth::TenantId;
+    use mokosh_server::modules::contact_sync::service::ConnectOutcome;
+    use mokosh_server::modules::contact_sync::ContactSyncService;
+    use mokosh_server::secrets::{DatabaseSecretProvider, SecretKey, SecretProvider};
+    use std::sync::Arc;
+
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let db = Database::from_pool(pool.clone());
+    let secrets: Arc<dyn SecretProvider> =
+        Arc::new(DatabaseSecretProvider::new(db.clone(), [0u8; 32]));
+    let service = ContactSyncService::new(
+        db,
+        secrets.clone(),
+        None,
+        "https://app.msp.example".to_string(),
+    );
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    let ConnectOutcome::Connected(id) = service
+        .record_connection(tenant, admin_id, "ops@msp.example", "grant-one")
+        .await
+        .expect("first connect")
+    else {
+        panic!("a first connect is a new connection");
+    };
+    sqlx::query(
+        "UPDATE contact_sync_connections SET sync_status = 'reconnect_required', \
+         last_error = 'Google has revoked this connection.', consecutive_failures = 4, \
+         failure_notified_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let again = service
+        .record_connection(tenant, admin_id, "OPS@msp.example", "grant-two")
+        .await
+        .expect("reconnect");
+    assert_eq!(
+        again,
+        ConnectOutcome::Reconnected(id),
+        "the same connection"
+    );
+    let key = SecretKey::contact_sync(common::DEFAULT_TENANT_ID, "google", id);
+    assert_eq!(
+        secrets.get(&key).await.unwrap().as_deref(),
+        Some("grant-two"),
+        "the new grant replaced the revoked one"
+    );
+    let (status, error, failures, notified): (String, Option<String>, i32, bool) = sqlx::query_as(
+        "SELECT sync_status, last_error, consecutive_failures, failure_notified_at IS NOT NULL \
+         FROM contact_sync_connections WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (status.as_str(), error, failures, notified),
+        ("never", None, 0, false)
+    );
+
+    let other = service
+        .record_connection(tenant, admin_id, "someone@else.example", "grant-three")
+        .await
+        .expect_err("a different account is refused");
+    assert!(other.to_string().contains("ops@msp.example"), "{other}");
+    assert_eq!(
+        secrets.get(&key).await.unwrap().as_deref(),
+        Some("grant-two"),
+        "a refused account touches nothing"
+    );
+    let connections: i64 = sqlx::query_scalar("SELECT count(*) FROM contact_sync_connections")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(connections, 1);
 }

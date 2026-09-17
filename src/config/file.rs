@@ -32,7 +32,7 @@ use std::sync::RwLock;
 
 use async_trait::async_trait;
 
-use super::{ConfigProvider, Enumeration, REGISTRY};
+use super::{registry, ConfigProvider, Enumeration, Tier, REGISTRY};
 use crate::utils::error::{AppError, AppResult};
 
 /// A directory the operator points at with `CONFIG_FILE_DIR`, holding one
@@ -190,6 +190,12 @@ impl ConfigProvider for FileProvider {
     /// operator asking to migrate TO the file provider without pointing it
     /// anywhere gets a clear message rather than a silent success.
     async fn set(&self, key: &str, value: &str) -> AppResult<()> {
+        if registry::tier_of(key) == Some(Tier::Bootstrap) {
+            return Err(AppError::Configuration(format!(
+                "{key} is a bootstrap-tier key and cannot be written to the file \
+                 configuration provider"
+            )));
+        }
         let root = self.root.as_ref().ok_or_else(|| {
             AppError::Configuration(
                 "file configuration provider has no directory; set CONFIG_FILE_DIR to enable \
@@ -221,6 +227,12 @@ impl ConfigProvider for FileProvider {
 
     /// PMS-1012: remove the per-key file. Absence is not an error.
     async fn delete(&self, key: &str) -> AppResult<()> {
+        if registry::tier_of(key) == Some(Tier::Bootstrap) {
+            return Err(AppError::Configuration(format!(
+                "{key} is a bootstrap-tier key and cannot be deleted from the file \
+                 configuration provider"
+            )));
+        }
         if let Some(root) = self.root.as_ref() {
             let path = root.join(key);
             match std::fs::remove_file(&path) {
@@ -323,6 +335,35 @@ mod tests {
         std::fs::write(dir.join("NOT_A_KEY"), "x").unwrap();
         let provider = FileProvider::load(dir.clone());
         assert_eq!(provider.get("NOT_A_KEY"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_refuses_a_bootstrap_tier_key() {
+        let dir = tempdir("set-bootstrap");
+        let provider = FileProvider::load(dir.clone());
+        let err = provider
+            .set("ENCRYPTION_KEY", "not-a-real-key")
+            .await
+            .expect_err("a bootstrap-tier key must not be written to a config file");
+        let msg = err.to_string();
+        assert!(msg.contains("ENCRYPTION_KEY"), "{msg}");
+        assert!(msg.contains("bootstrap"), "the message must say why: {msg}");
+        assert!(!dir.join("ENCRYPTION_KEY").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_a_bootstrap_tier_key() {
+        let dir = tempdir("delete-bootstrap");
+        std::fs::write(dir.join("ENCRYPTION_KEY"), "leaked").unwrap();
+        let provider = FileProvider::load(dir.clone());
+        let err = provider
+            .delete("ENCRYPTION_KEY")
+            .await
+            .expect_err("a bootstrap-tier key must not be deleted from a config file");
+        assert!(err.to_string().contains("ENCRYPTION_KEY"));
+        assert!(dir.join("ENCRYPTION_KEY").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
