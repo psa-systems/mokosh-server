@@ -17,7 +17,14 @@ use mokosh_types::members::MemberRow;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-async fn seed_user(pool: &PgPool, tenant: Uuid, email: &str, first: &str, last: &str, role: &str) -> Uuid {
+async fn seed_user(
+    pool: &PgPool,
+    tenant: Uuid,
+    email: &str,
+    first: &str,
+    last: &str,
+    role: &str,
+) -> Uuid {
     let user_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO users (id, tenant_id, bunyip_user_id, email, first_name, last_name, \
@@ -103,7 +110,12 @@ async fn list_members_returns_native_users_alone_when_no_grants(pool: PgPool) {
 
     let svc = service(pool);
     let resp = svc
-        .list(tenant, owner, &MembersFilter::default(), &default_pagination())
+        .list(
+            tenant,
+            owner,
+            &MembersFilter::default(),
+            &default_pagination(),
+        )
         .await
         .expect("list ok");
 
@@ -112,7 +124,9 @@ async fn list_members_returns_native_users_alone_when_no_grants(pool: PgPool) {
     assert!(resp.bunyip_reachable);
     for row in &resp.rows {
         match row {
-            MemberRow::User { placed_by_grant_id, .. } => assert!(placed_by_grant_id.is_none()),
+            MemberRow::User {
+                placed_by_grant_id, ..
+            } => assert!(placed_by_grant_id.is_none()),
             MemberRow::UnplacedGuest { .. } => panic!("expected only natives"),
         }
     }
@@ -135,7 +149,12 @@ async fn list_members_emits_unplaced_guest_when_grant_has_no_users_row(pool: PgP
 
     let svc = service(pool);
     let resp = svc
-        .list(tenant, owner, &MembersFilter::default(), &default_pagination())
+        .list(
+            tenant,
+            owner,
+            &MembersFilter::default(),
+            &default_pagination(),
+        )
         .await
         .expect("list ok");
 
@@ -178,11 +197,24 @@ async fn list_members_decorates_a_placed_guest_with_placed_by_grant_id(pool: PgP
     .execute(&pool)
     .await
     .unwrap();
-    let grant_id = seed_grant(&pool, owner, placed_bunyip, "acme", "manager", "placed@partner.com").await;
+    let grant_id = seed_grant(
+        &pool,
+        owner,
+        placed_bunyip,
+        "acme",
+        "manager",
+        "placed@partner.com",
+    )
+    .await;
 
     let svc = service(pool);
     let resp = svc
-        .list(tenant, owner, &MembersFilter::default(), &default_pagination())
+        .list(
+            tenant,
+            owner,
+            &MembersFilter::default(),
+            &default_pagination(),
+        )
         .await
         .expect("list ok");
 
@@ -226,7 +258,10 @@ async fn list_members_filters_by_q_across_kinds(pool: PgPool) {
         q: Some("ali".to_string()),
         ..Default::default()
     };
-    let resp = svc.list(tenant, owner, &filter, &default_pagination()).await.unwrap();
+    let resp = svc
+        .list(tenant, owner, &filter, &default_pagination())
+        .await
+        .unwrap();
 
     // Alice (user) and alicia (guest) match `ali`; Bob does not.
     assert_eq!(resp.total, 2);
@@ -275,7 +310,10 @@ async fn list_members_filters_by_kind(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(guests_only.total, 1);
-    assert!(matches!(guests_only.rows[0], MemberRow::UnplacedGuest { .. }));
+    assert!(matches!(
+        guests_only.rows[0],
+        MemberRow::UnplacedGuest { .. }
+    ));
 }
 
 #[sqlx::test]
@@ -316,7 +354,12 @@ async fn list_members_hides_the_system_attribution_user(pool: PgPool) {
     .await;
     let svc = service(pool);
     let resp = svc
-        .list(tenant, owner, &MembersFilter::default(), &default_pagination())
+        .list(
+            tenant,
+            owner,
+            &MembersFilter::default(),
+            &default_pagination(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.total, 1);
@@ -367,7 +410,10 @@ async fn team_list_carries_member_count(pool: PgPool) {
     let svc = mokosh_server::modules::teams::TeamsService::new(db);
     let tenant_scoped = mokosh_server::modules::auth::TenantId::from_trusted(tenant);
     let teams = svc
-        .list_teams(tenant_scoped, mokosh_server::modules::teams::TeamListFilters::default())
+        .list_teams(
+            tenant_scoped,
+            mokosh_server::modules::teams::TeamListFilters::default(),
+        )
         .await
         .unwrap();
 
