@@ -1358,9 +1358,31 @@ async fn place_grantee_caller(
                     tracing::info!(
                         sub = %sub,
                         target = %target_slug,
+                        has_email = email.as_deref().is_some_and(|s| !s.trim().is_empty()),
+                        email_verified = email_verified,
                         "grantee JIT provision refused: no verified email from userinfo"
                     );
-                    return (None, None);
+                    // PMS-1208 finding 8: return a SPECIFIC 403 so the
+                    // SPA does not paint the generic "You don't have
+                    // permission" copy over a refusal the grantee can
+                    // act on. This is the exact refusal the tester hit
+                    // after every previous defect was cleared:
+                    // placement into someone else's tenant requires a
+                    // verified Bunyip identity, and until Bunyip flips
+                    // the flag mokosh will not place. The mokosh
+                    // invitation gate (PMS-1208 finding 7) refuses new
+                    // invitations from this state, but a grant accepted
+                    // BEFORE that gate landed still reaches this branch
+                    // and the message names what to do.
+                    return (
+                        None,
+                        Some(AppError::Forbidden(
+                            "Your Bunyip email address is not verified yet, so you can't be \
+                             placed in this shared account. Verify your email in Bunyip, then \
+                             try switching again."
+                                .to_string(),
+                        )),
+                    );
                 }
             };
             match auth_service
@@ -1378,7 +1400,23 @@ async fn place_grantee_caller(
                 Ok(u) => u,
                 Err(e) => {
                     tracing::warn!(error = %e, sub = %sub, "grantee JIT provision failed");
-                    return (None, None);
+                    // PMS-1208 finding 8: distinct from the unverified
+                    // refusal above. A JIT WRITE failure is the shape
+                    // that reads as "the row could not be inserted"
+                    // (unique-index race, constraint, transient DB
+                    // error), and lands here rather than an earlier
+                    // gate. Same generic-403 override reasoning: the
+                    // grantee sees a message that says try again,
+                    // rather than "You don't have permission".
+                    return (
+                        None,
+                        Some(AppError::Forbidden(
+                            "Couldn't place you in this shared account. Try switching again \
+                             in a moment; if it keeps failing, ask the account owner to \
+                             re-share it with you."
+                                .to_string(),
+                        )),
+                    );
                 }
             }
         }
