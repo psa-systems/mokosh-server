@@ -402,7 +402,7 @@ pub fn create_api_router(
         // the metadata endpoint before the auth chain sees them.
         .nest(
             "/grants/invitations/by-token",
-            grant_invitations_by_token_routes(Arc::new(db.clone())),
+            grant_invitations_by_token_routes(Arc::new(db.clone()), bunyip_directory.clone()),
         )
         .nest(
             "/grants/invitations",

@@ -175,12 +175,30 @@ pub fn grant_invitations_grantee_routes(db: Arc<Database>) -> Router {
 
 /// Unauthenticated mount for the token-driven endpoints. Sits
 /// under `/api/v1/grants/invitations/by-token`.
-pub fn grant_invitations_by_token_routes(db: Arc<Database>) -> Router {
+///
+/// `bunyip_directory` is REQUIRED positional, not an Option with a
+/// default and not a builder method, even though its own type stays
+/// `Option<...>` because `None` legitimately means standalone mode.
+/// The property being enforced in source is that a mount cannot
+/// forget to decide: a `None` default here silently skipped the
+/// bunyip grant registration in SaaS mode for every accept between
+/// PMS-1208 landing and this fix, because `accept_invitation`
+/// receives the state from this mount and passes its
+/// `bunyip_directory` on to `GrantInvitationsService::accept` (see
+/// the "finding 5" block in `grant_invitations.rs`). The register
+/// block was already correct - the handle it needed was thrown away
+/// two callers up, in this constructor. Making the parameter
+/// positional means a future mount fails to compile rather than
+/// repeating the same silent skip.
+pub fn grant_invitations_by_token_routes(
+    db: Arc<Database>,
+    bunyip_directory: Option<Arc<BunyipUserDirectory>>,
+) -> Router {
     let state = GrantInvitationsState {
         db,
         spa_base_url: Arc::new(String::new()),
         notifications: None,
-        bunyip_directory: None,
+        bunyip_directory,
     };
     Router::new()
         .route("/{token}", get(get_invitation_by_token))
@@ -532,5 +550,82 @@ async fn decline_invitation(
         Err(AcceptRefusal::WrongCaller) => Err(AppError::Forbidden(
             "This invitation was sent to a different account.".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod wiring_guards {
+    //! Regression guards for the bunyip-directory wiring on the
+    //! by-token mount. Written as source scans because the failure
+    //! mode being pinned is exactly a compile-time choice that
+    //! silently produces the wrong runtime behaviour: an ordinary
+    //! service-level test of `GrantInvitationsService::accept` passes
+    //! without the mount ever handing the directory through, which is
+    //! how the defect shipped in the first place.
+    //!
+    //! The property being enforced is that a caller of
+    //! `grant_invitations_by_token_routes` must decide whether to
+    //! wire a directory or not; a `None` default is what let the
+    //! router forget to decide. A future mount then fails to compile
+    //! rather than silently skipping registration.
+
+    /// The by-token constructor must take a `bunyip_directory`
+    /// argument positionally and consume it into the state, not
+    /// hard-code `None`.
+    #[test]
+    fn by_token_constructor_consumes_its_directory_argument() {
+        let src = include_str!("grant_invitations_routes.rs");
+        let start = src
+            .find("pub fn grant_invitations_by_token_routes(")
+            .expect("by-token constructor present");
+        // Body ends at the next top-level `pub fn` or `async fn`.
+        let tail = &src[start..];
+        let end = tail
+            .find("\npub fn ")
+            .or_else(|| tail.find("\nasync fn "))
+            .unwrap_or(tail.len());
+        let body = &tail[..end];
+
+        assert!(
+            body.contains("bunyip_directory: Option<Arc<BunyipUserDirectory>>"),
+            "the by-token constructor must take `bunyip_directory` positionally so a \
+             mount cannot forget to decide whether to wire it: {body}"
+        );
+        assert!(
+            !body.contains("bunyip_directory: None"),
+            "the by-token constructor must not hard-code `bunyip_directory: None` \
+             (regression: the accept flow silently skipped bunyip grant \
+             registration in SaaS mode for every accept until this was fixed): {body}"
+        );
+        assert!(
+            body.contains("bunyip_directory,"),
+            "the by-token constructor must move its `bunyip_directory` argument into \
+             the state so `accept_invitation` receives it: {body}"
+        );
+    }
+
+    /// The `create_api_router` mount that hands to
+    /// `grant_invitations_by_token_routes` must forward
+    /// `bunyip_directory` into the constructor. Anchors on the
+    /// constructor call itself (a bare `nest(` on the URL matches
+    /// nearby doc-comments too, which is why we anchor on the fn
+    /// call).
+    #[test]
+    fn create_api_router_passes_directory_to_the_by_token_mount() {
+        let src = include_str!("../../api/router.rs");
+        let anchor = "grant_invitations_by_token_routes(";
+        let idx = src
+            .find(anchor)
+            .expect("by-token constructor call present in create_api_router");
+        // Search a bounded window from the call site for the argument
+        // list. 400 bytes is enough for a multi-line call with heavy
+        // whitespace.
+        let window = &src[idx..idx.saturating_add(400).min(src.len())];
+        assert!(
+            window.contains("bunyip_directory"),
+            "the by-token constructor call in create_api_router must forward \
+             bunyip_directory (regression: without this the constructor receives \
+             the default and silently skips grant registration): {window}"
+        );
     }
 }
