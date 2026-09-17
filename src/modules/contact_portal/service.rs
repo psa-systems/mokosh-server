@@ -1729,6 +1729,28 @@ impl ContactAuthService {
         }
     }
 
+    /// PMS-1224: fail-closed check that the `contact_sessions` row an
+    /// access token's `sid` names is still live. Called by the
+    /// middleware on every authenticated /api/v1/contact/* request so
+    /// `revoke_session`, the revoke inside `change_password`, and
+    /// `revoke_portal_access` (`contacts::service`) all kick the
+    /// bearer on its next use rather than only at its next refresh: a
+    /// missing row (revoked-and-purged) or a `revoked_at` already set
+    /// is treated the same as an unauthenticated request.
+    pub async fn ensure_session_active(&self, tenant_id: Uuid, session_id: Uuid) -> AppResult<()> {
+        let revoked_at: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
+            "SELECT revoked_at FROM contact_sessions WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(session_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        match revoked_at {
+            Some(None) => Ok(()),
+            _ => Err(AppError::Unauthorized),
+        }
+    }
+
     /// mokosh-contact-login prompt 004: decode a Bearer token from
     /// request headers. Middleware calls this. Verifies signature +
     /// exp + typ.

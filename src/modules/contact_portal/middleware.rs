@@ -82,6 +82,24 @@ pub async fn portal_contact_middleware(
                         "contact request rejected: owning tenant is not active",
                     );
                     ContactAuthState::default()
+                } else if state
+                    .service
+                    .ensure_session_active(claims.tid, claims.sid)
+                    .await
+                    .is_err()
+                {
+                    // PMS-1224: the `sid` row was revoked (or purged)
+                    // since this access token was minted. `sid` exists
+                    // precisely so a session can be killed mid-life;
+                    // without this check the token still served every
+                    // contact route until its own 15-minute TTL expired.
+                    tracing::info!(
+                        tenant_id = %claims.tid,
+                        contact_id = %claims.sub,
+                        sid = %claims.sid,
+                        "contact request rejected: session is revoked",
+                    );
+                    ContactAuthState::default()
                 } else {
                     ContactAuthState::authenticated(ContactSession {
                         id: claims.sub,
