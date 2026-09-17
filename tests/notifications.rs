@@ -1142,3 +1142,255 @@ async fn a_tenant_with_no_support_address_gets_a_whole_footer_sentence(pool: PgP
         "no unresolved placeholder reaches a recipient: {body}"
     );
 }
+
+/// PMS-1237 finding 2: `notification_rules.conditions` is validated,
+/// persisted and returned by the API, but the dispatcher never consulted it
+/// when deciding whether a rule should fire. A rule scoped to
+/// `{"priority": "high"}` must only fire for a dispatch whose context names
+/// that priority.
+#[sqlx::test]
+async fn a_rule_scoped_by_conditions_only_fires_for_a_matching_context(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let event_type = "test.conditions_scoped";
+
+    let template_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO notification_templates
+            (id, tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+        VALUES ($1, $2, 'Conditions Test', $3, 'in_app', 'Subject', 'Body', NULL, TRUE)
+        "#,
+    )
+    .bind(template_id)
+    .bind(tenant_id)
+    .bind(event_type)
+    .execute(&pool)
+    .await
+    .expect("seed template");
+
+    sqlx::query(
+        r#"
+        INSERT INTO notification_rules
+            (id, tenant_id, name, event_type, conditions, channels, recipients, template_id, is_active)
+        VALUES ($1, $2, 'High Priority Only', $3, $4::jsonb, ARRAY['in_app']::VARCHAR(20)[],
+                '{"user_ids": [], "emails": []}'::jsonb, $5, TRUE)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(event_type)
+    .bind(serde_json::json!({"priority": "high"}))
+    .bind(template_id)
+    .execute(&pool)
+    .await
+    .expect("seed rule");
+
+    // A non-matching context must not fire the rule at all.
+    let miss_resp = app
+        .client
+        .post(app.url("/api/v1/notifications/dispatch"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "event_type": event_type,
+            "context": { "recipient_user_id": admin_id.to_string(), "priority": "low" },
+        }))
+        .send()
+        .await
+        .expect("send dispatch (non-matching)");
+    assert!(miss_resp.status().is_success(), "{}", miss_resp.status());
+
+    let miss_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE tenant_id = $1 AND template_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(template_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rows after non-matching dispatch");
+    assert_eq!(
+        miss_count, 0,
+        "a rule scoped to priority=high must not fire for priority=low",
+    );
+
+    // A matching context fires it.
+    let hit_resp = app
+        .client
+        .post(app.url("/api/v1/notifications/dispatch"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "event_type": event_type,
+            "context": { "recipient_user_id": admin_id.to_string(), "priority": "high" },
+        }))
+        .send()
+        .await
+        .expect("send dispatch (matching)");
+    assert!(hit_resp.status().is_success(), "{}", hit_resp.status());
+
+    let hit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE tenant_id = $1 AND template_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(template_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rows after matching dispatch");
+    assert_eq!(
+        hit_count, 1,
+        "a rule scoped to priority=high must fire for priority=high",
+    );
+}
+
+/// PMS-1237 finding 3: the notification worker's recipient-email lookup had
+/// no active-status filter, unlike every other recipient-expansion site in
+/// the codebase, so an offboarded user kept receiving tenant mail.
+#[sqlx::test]
+async fn an_inactive_user_is_excluded_from_email_dispatch(pool: PgPool) {
+    let (admin_id, admin_email, password) = common::seed_admin(&pool).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let (inactive_id, _inactive_email, _) =
+        common::seed_user(&pool, tenant_id, "offboarded@example.test", "technician").await;
+    sqlx::query("UPDATE users SET status = 'inactive' WHERE id = $1")
+        .bind(inactive_id)
+        .execute(&pool)
+        .await
+        .expect("deactivate user");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &admin_email, &password).await;
+    let event_type = "test.inactive_user_excluded";
+
+    let template_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO notification_templates
+            (id, tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+        VALUES ($1, $2, 'Inactive User Test', $3, 'email', 'Subject', 'Body', NULL, TRUE)
+        "#,
+    )
+    .bind(template_id)
+    .bind(tenant_id)
+    .bind(event_type)
+    .execute(&pool)
+    .await
+    .expect("seed template");
+
+    sqlx::query(
+        r#"
+        INSERT INTO notification_rules
+            (id, tenant_id, name, event_type, channels, recipients, template_id, is_active)
+        VALUES ($1, $2, 'Inactive User Rule', $3, ARRAY['email']::VARCHAR(20)[],
+                $4::jsonb, $5, TRUE)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(event_type)
+    .bind(serde_json::json!({"user_ids": [admin_id, inactive_id], "emails": []}))
+    .bind(template_id)
+    .execute(&pool)
+    .await
+    .expect("seed rule");
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/notifications/dispatch"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "event_type": event_type, "context": {} }))
+        .send()
+        .await
+        .expect("send dispatch");
+    assert!(resp.status().is_success(), "{}", resp.status());
+
+    let mailer = Arc::new(CapturingMailer::default());
+    let worker = DispatcherWorker::new(Database::from_pool(pool.clone()), mailer.clone());
+    let stats = worker.run_tick(10).await.expect("worker tick");
+    assert_eq!(
+        stats.sent, 1,
+        "only the active user should be mailed: {stats:?}"
+    );
+    assert_eq!(
+        stats.failed, 1,
+        "the inactive user's row should fail permanently, not send: {stats:?}",
+    );
+
+    let sent = mailer.sent.lock().unwrap().clone();
+    let recipients: Vec<&String> = sent.iter().map(|m| &m.to).collect();
+    assert!(
+        sent.iter().all(|m| m.to != "offboarded@example.test"),
+        "an inactive user must never receive tenant mail, got: {recipients:?}",
+    );
+}
+
+/// PMS-1237 finding 4: a recipient named by both a user id and their own
+/// email address was deduped within each list but not across them, so they
+/// received the same channel twice.
+#[sqlx::test]
+async fn a_recipient_named_by_user_id_and_email_sends_exactly_once(pool: PgPool) {
+    let (admin_id, admin_email, password) = common::seed_admin(&pool).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &admin_email, &password).await;
+    let event_type = "test.cross_list_dedup";
+
+    let template_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO notification_templates
+            (id, tenant_id, name, event_type, channel_type, subject, body_text, body_html, is_active)
+        VALUES ($1, $2, 'Cross Dedup Test', $3, 'email', 'Subject', 'Body', NULL, TRUE)
+        "#,
+    )
+    .bind(template_id)
+    .bind(tenant_id)
+    .bind(event_type)
+    .execute(&pool)
+    .await
+    .expect("seed template");
+
+    // The rule names the same person twice: once by user id, once by their
+    // own email address.
+    sqlx::query(
+        r#"
+        INSERT INTO notification_rules
+            (id, tenant_id, name, event_type, channels, recipients, template_id, is_active)
+        VALUES ($1, $2, 'Cross Dedup Rule', $3, ARRAY['email']::VARCHAR(20)[],
+                $4::jsonb, $5, TRUE)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(tenant_id)
+    .bind(event_type)
+    .bind(serde_json::json!({"user_ids": [admin_id], "emails": [admin_email]}))
+    .bind(template_id)
+    .execute(&pool)
+    .await
+    .expect("seed rule");
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/notifications/dispatch"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "event_type": event_type, "context": {} }))
+        .send()
+        .await
+        .expect("send dispatch");
+    assert!(resp.status().is_success(), "{}", resp.status());
+
+    let mailer = Arc::new(CapturingMailer::default());
+    let worker = DispatcherWorker::new(Database::from_pool(pool.clone()), mailer.clone());
+    let stats = worker.run_tick(10).await.expect("worker tick");
+    assert_eq!(
+        stats.sent, 1,
+        "a recipient named by both id and email must be mailed exactly once: {stats:?}",
+    );
+
+    let sent = mailer.sent.lock().unwrap().clone();
+    let matching = sent.iter().filter(|m| m.to == admin_email).count();
+    assert_eq!(
+        matching, 1,
+        "expected exactly one send to {admin_email}, got {matching}",
+    );
+}

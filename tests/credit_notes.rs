@@ -195,6 +195,69 @@ async fn crediting_the_whole_balance_voids_the_invoice(pool: PgPool) {
     );
 }
 
+/// PMS-1226: the void threshold is the invoice's full total, not the already-
+/// paid remainder. `INV-000042`, total 100.00, fully paid: a 5.00 goodwill
+/// credit note (a post-payment adjustment `create_credit_note` documents as
+/// intended) must not void it, because `i.total - p.paid` is already zero and
+/// any credit at all used to satisfy `p.credited >= i.total - p.paid`.
+#[sqlx::test]
+async fn a_partial_credit_on_a_fully_paid_invoice_leaves_it_paid(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let (company_id, invoice_id) = sent_invoice(&app, &token, &pool, "100").await;
+
+    sqlx::query("UPDATE invoices SET invoice_number = 'INV-000042' WHERE id = $1")
+        .bind(uuid::Uuid::from_str(&invoice_id).expect("invoice id"))
+        .execute(&pool)
+        .await
+        .expect("stamp invoice number");
+
+    let payment = app
+        .client
+        .post(app.url("/api/v1/payments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "invoice_id": invoice_id,
+            "company_id": company_id,
+            "payment_date": "2026-08-15",
+            "amount": "100",
+            "payment_method": "check",
+        }))
+        .send()
+        .await
+        .expect("send record-payment request");
+    assert!(
+        payment.status().is_success(),
+        "recording the full payment should 2xx, got {}",
+        payment.status()
+    );
+
+    let paid = get_invoice(&app, &token, &invoice_id).await;
+    assert_eq!(paid["invoice_number"].as_str(), Some("INV-000042"));
+    assert_eq!(paid["status"].as_str(), Some("paid"));
+
+    let resp = credit(&app, &token, &invoice_id, "5").await;
+    assert!(
+        resp.status().is_success(),
+        "raising the goodwill credit note should 2xx, got {}",
+        resp.status()
+    );
+
+    let after = get_invoice(&app, &token, &invoice_id).await;
+    assert_eq!(
+        after["status"].as_str(),
+        Some("paid"),
+        "a partial credit on a fully-paid invoice must not void it"
+    );
+    assert_eq!(dec(&after["amount_credited"]), Decimal::from(5));
+    assert_eq!(dec(&after["balance_due"]), Decimal::from(-5));
+    assert!(
+        !after["paid_at"].is_null(),
+        "the invoice is still paid, so its payment date stands"
+    );
+}
+
 /// A credit note is never edited, for the reason its invoice is not. Voiding
 /// changes no amount and no line; the credit simply stops counting, and the
 /// invoice walks back to the status it would have had.
