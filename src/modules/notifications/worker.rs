@@ -384,13 +384,18 @@ impl DispatcherWorker {
         user_ids: &[Uuid],
     ) -> AppResult<Vec<(Uuid, String)>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let rows: Vec<(Uuid, String)> =
-            sqlx::query_as("SELECT id, email FROM users WHERE tenant_id = $1 AND id = ANY($2)")
-                .bind(tenant_id)
-                .bind(user_ids)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| AppError::Database(format!("lookup_user_emails: {e}")))?;
+        // PMS-1237 finding 3: every other recipient-expansion site in the
+        // codebase filters on `status = 'active'`; this lookup didn't, so an
+        // offboarded user kept receiving tenant mail until their row was
+        // deleted rather than the moment they were deactivated.
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, email FROM users WHERE tenant_id = $1 AND id = ANY($2) AND status = 'active'",
+        )
+        .bind(tenant_id)
+        .bind(user_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(format!("lookup_user_emails: {e}")))?;
         // Committed rather than dropped: a dropped read-only transaction is
         // rolled back lazily, which parks the connection `idle in transaction`
         // for as long as the pool takes to reuse it, i.e. across the sends
