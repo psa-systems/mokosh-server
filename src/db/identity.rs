@@ -192,56 +192,34 @@ impl MembershipRepo {
         identity_id: Uuid,
         active_tenant_id: Option<Uuid>,
     ) -> Result<Vec<mokosh_types::auth::MembershipView>, sqlx::Error> {
-        let rows: Vec<(Uuid, String, String, String, String, String)> = sqlx::query_as(
-            r#"
-            SELECT tm.tenant_id, t.name, t.slug, t.kind, tm.role, tm.status
-            FROM tenant_memberships tm
-            JOIN tenants t ON t.id = tm.tenant_id
-            WHERE tm.identity_id = $1 AND tm.status = 'active'
-            ORDER BY tm.joined_at ASC
-            "#,
-        )
-        .bind(identity_id)
-        .fetch_all(pool)
-        .await?;
-
-        let mut views: Vec<mokosh_types::auth::MembershipView> = rows
-            .into_iter()
-            .map(
-                |(tenant_id, name, slug, kind, role, status)| mokosh_types::auth::MembershipView {
-                    is_active: Some(tenant_id) == active_tenant_id,
-                    tenant_id,
-                    tenant_name: name,
-                    tenant_slug: slug,
-                    tenant_kind: kind,
-                    role,
-                    status,
-                    mokosh_bunyip_grant_id: None,
-                    bunyip_grant_id: None,
-                },
-            )
-            .collect();
-
-        // PMS-1210: append grant-based memberships. A single UNION-
-        // like query joining identities.email/user_id to users
-        // would be cleaner, but `identities` and `users` are on
-        // separate identity/tenant axes, and the reliable link is
-        // through the identity's email address hitting a users row
-        // that carries a bunyip_user_id. The subquery below reads
-        // every DISTINCT bunyip_user_id linked to this identity by
-        // email (case-insensitive, matching how the JIT provisioner
-        // seeds the row).
+        // PMS-1208 finding 11: grant rows are collected FIRST, and
+        // tenant_memberships rows for the same tenant are skipped.
         //
-        // PMS-1208 finding 3: the second identity axis is
-        // `g.grantee_email`. Standalone-mode grantees have no
-        // `users.bunyip_user_id` (there is no Bunyip identity plane),
-        // and the sub-based subquery above never matches for them, so
-        // grants they accepted stayed invisible to the switcher.
-        // Migration 224 added `mokosh_bunyip_grants.grantee_email`
-        // populated at accept time; matching it against the identity's
-        // email (case-insensitively, matching the identity/users
-        // email join shape) makes those grants visible without paying
-        // anything in SaaS mode where both axes match the same row.
+        // Why the order matters. Migration 157's
+        // `users_sync_to_identity` trigger fires on every `users`
+        // INSERT/UPDATE and materialises a matching
+        // `tenant_memberships` row (identity_id, tenant_id, role) via
+        // an ON CONFLICT upsert. `AuthService::place_grantee_user`
+        // INSERTs a `users` row for the JIT-placed grantee, and that
+        // trigger writes a tenant_memberships row for the grantee's
+        // identity in the granted tenant. Without this reorder the
+        // memberships list carried the trigger-produced row from the
+        // owner arm, `mokosh_bunyip_grant_id` came back None, the SPA
+        // switcher rendered "Member" instead of "Shared with you",
+        // and its `switch_to` fell to `POST /auth/switch-tenant/{id}`
+        // (the own-tenant path) which minted a legacy HS256 session -
+        // the very `typ=JWT` bursts a parallel diagnosis flagged.
+        //
+        // Collecting grants first + skipping owner-arm dupes gives
+        // the grantee's tenant its authoritative designation (the
+        // grant's role, `mokosh_bunyip_grant_id: Some(...)`,
+        // `bunyip_grant_id: Some(...)`) and keeps the SPA on the
+        // bunyip mint path. An owner who happens to grant themselves
+        // their OWN tenant is a corner case the previous
+        // dedupe comment named; it now surfaces as "Shared with you"
+        // for that owner, which is unusual but not wrong (the grant
+        // IS what put a row here) and does not affect their real
+        // access, which the owner path resolves separately.
         let grant_rows: Vec<(Uuid, Uuid, Uuid, String, String, String, String)> = sqlx::query_as(
             r#"
             SELECT g.id, g.bunyip_grant_id, t.id AS tenant_id, t.name, t.slug, t.kind, g.role
@@ -275,10 +253,54 @@ impl MembershipRepo {
         .await
         .unwrap_or_default();
 
-        for (grant_id, bunyip_grant_id, tenant_id, name, slug, kind, role) in grant_rows {
-            // De-dupe against the identity's own tenant_memberships
-            // list: an owner who ALSO grants themselves would not
-            // appear twice.
+        let mut views: Vec<mokosh_types::auth::MembershipView> = grant_rows
+            .into_iter()
+            .map(
+                |(grant_id, bunyip_grant_id, tenant_id, name, slug, kind, role)| {
+                    mokosh_types::auth::MembershipView {
+                        is_active: Some(tenant_id) == active_tenant_id,
+                        tenant_id,
+                        tenant_name: name,
+                        tenant_slug: slug,
+                        tenant_kind: kind,
+                        role,
+                        status: "active".to_string(),
+                        // PMS-1210: mokosh mirror id, used by
+                        // DELETE `/api/v1/my-grants/{id}` (mokosh's
+                        // own row).
+                        mokosh_bunyip_grant_id: Some(grant_id),
+                        // PMS-1208 finding 4: bunyip source-of-truth
+                        // id, used by the SPA's tenant switcher to
+                        // mint a grant-scoped at+jwt at bunyip's
+                        // `POST /v1/grants/{id}/access-token`.
+                        // Distinct from `mokosh_bunyip_grant_id` above:
+                        // mokosh assigns its mirror `id` on receive,
+                        // and stores bunyip's `id` verbatim as
+                        // `bunyip_grant_id`. Sending mokosh's mirror
+                        // id to bunyip 404s because bunyip's table
+                        // has never seen that UUID.
+                        bunyip_grant_id: Some(bunyip_grant_id),
+                    }
+                },
+            )
+            .collect();
+
+        let owner_rows: Vec<(Uuid, String, String, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT tm.tenant_id, t.name, t.slug, t.kind, tm.role, tm.status
+            FROM tenant_memberships tm
+            JOIN tenants t ON t.id = tm.tenant_id
+            WHERE tm.identity_id = $1 AND tm.status = 'active'
+            ORDER BY tm.joined_at ASC
+            "#,
+        )
+        .bind(identity_id)
+        .fetch_all(pool)
+        .await?;
+
+        for (tenant_id, name, slug, kind, role, status) in owner_rows {
+            // A tenant already claimed by the grants arm keeps its
+            // grant designation. See the head-of-function comment.
             if views.iter().any(|v| v.tenant_id == tenant_id) {
                 continue;
             }
@@ -289,20 +311,9 @@ impl MembershipRepo {
                 tenant_slug: slug,
                 tenant_kind: kind,
                 role,
-                status: "active".to_string(),
-                // PMS-1210: mokosh mirror id, used by
-                // DELETE `/api/v1/my-grants/{id}` (mokosh's own row).
-                mokosh_bunyip_grant_id: Some(grant_id),
-                // PMS-1208 finding 4: bunyip source-of-truth id, used
-                // by the SPA's tenant switcher to mint a grant-scoped
-                // at+jwt at bunyip's `POST /v1/grants/{id}/access-token`
-                // (bunyip's own row). Not the same id as
-                // `mokosh_bunyip_grant_id` above: mokosh assigns the
-                // mirror its own `id` on receive, and stores bunyip's
-                // side-of-truth id verbatim as `bunyip_grant_id`.
-                // Sending mokosh's mirror id to bunyip 404s because
-                // bunyip's table has never seen that UUID.
-                bunyip_grant_id: Some(bunyip_grant_id),
+                status,
+                mokosh_bunyip_grant_id: None,
+                bunyip_grant_id: None,
             });
         }
 
