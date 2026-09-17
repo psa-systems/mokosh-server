@@ -1007,6 +1007,41 @@ pub async fn place_bunyip_user_from_local_state(
         UserinfoDecision::Rejected(e) => return LocalPlacement::Placed(Box::new((None, Some(e)))),
         UserinfoDecision::Skip(principal) => *principal,
     };
+    // BUNYIP-674 option B: keep grant-scoped tokens off the owner path
+    // on the FAST path too. `place_bunyip_user_with_rejection` (the
+    // userinfo-needed dispatcher above `place_bunyip_caller`) already
+    // branches to `place_grantee_caller` when the token carries a
+    // `mokosh_grant_account_id` claim; the same branch was missing
+    // here, so a subsequent request from a grantee with an already-
+    // placed row hit `place_bunyip_caller` (owner path), which runs
+    // `effective_role_from_bunyip` and promotes the grantee's role to
+    // Admin. That is a full-privilege escalation on every request the
+    // grantee makes: a `read_only` grant becomes an `admin` users row
+    // within one round-trip. `place_grantee_caller` re-reads the row
+    // rather than reusing the resolved principal (its shape does not
+    // yet take a pre-resolved principal, and the DB read is cheap
+    // next to the correctness the branch buys). PMS-1208 finding 9.
+    if claims.mokosh_grant_account_id.is_some() {
+        // Silence unused: the resolved principal was correct for the
+        // owner-path branch below and would be usable if we grow a
+        // pre-resolved shape for `place_grantee_caller`.
+        let _ = principal;
+        return LocalPlacement::Placed(Box::new(
+            place_grantee_caller(
+                auth_service,
+                sub,
+                // No userinfo on the fast path: an existing placement
+                // reconciles from the grant claim and the row, no name
+                // hints needed.
+                None,
+                false,
+                None,
+                None,
+                claims,
+            )
+            .await,
+        ));
+    }
     LocalPlacement::Placed(Box::new(
         place_bunyip_caller(
             auth_service,
