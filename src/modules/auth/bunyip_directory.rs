@@ -79,6 +79,12 @@ pub struct DirectoryHit {
 /// MAPPS-875: one active grant returned by `list_owner_grants`. Same
 /// field set bunyip's `GET /v1/mokosh-grants` sends, so mokosh does
 /// not carry a per-side view struct.
+///
+/// v2 adds `grantee_email` and `grantee_name`. Both are optional
+/// because bunyip's response omits them when the grantee's `users`
+/// row has been soft-deleted (the grant stays visible so the owner
+/// can revoke it, but there is no identity to render). `#[serde(default)]`
+/// keeps the wire compatible with a bunyip build that predates v2.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OwnerGrantView {
     pub grant_id: Uuid,
@@ -86,6 +92,10 @@ pub struct OwnerGrantView {
     pub mokosh_account_id: String,
     pub role: String,
     pub granted_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub grantee_email: Option<String>,
+    #[serde(default)]
+    pub grantee_name: Option<String>,
 }
 
 /// A client that can resolve an email to a Bunyip user id. Cheap to

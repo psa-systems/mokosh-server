@@ -151,17 +151,15 @@ async fn active_for_owner(
             .into_iter()
             .map(|g| ActiveGrantView {
                 id: g.grant_id,
-                // MAPPS-875 v1 wire shape: grantee_email / grantee_name
-                // are shown in the SPA. Bunyip's list does not expose
-                // them today; a follow-up call to the directory would
-                // add a second round-trip. Deferred: v1 lists by role
-                // + granted_at and lets the owner recognise the row by
-                // "who did I recently invite" (the email is on the
-                // pending row and stays there until accepted). If the
-                // UX asks for it, `list_owner_grants` grows the field
-                // rather than growing a second call.
-                grantee_email: None,
-                grantee_name: None,
+                // MAPPS-875 v2: bunyip's list now joins `users` on
+                // `grantee_bunyip_user_id`, so email + name (when the
+                // grantee row still exists) are available for the SPA
+                // to render "Revoke access for <person>" without a
+                // second call. A soft-deleted grantee still shows the
+                // grant so the owner can revoke it, just without a
+                // display name.
+                grantee_email: g.grantee_email,
+                grantee_name: g.grantee_name,
                 role: g.role,
                 granted_at: g.granted_at,
             })
