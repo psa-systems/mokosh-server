@@ -142,7 +142,25 @@ impl GatewayCredentialMover {
         let plaintext = crate::utils::crypto::decrypt(ciphertext, &self.encryption_key)?;
         let key = SecretKey::payment_gateway(tenant_id, provider);
 
-        self.secrets.put(&key, &plaintext).await?;
+        // PMS-1235: `put_if_absent`, not `put`. `upsert_payment_gateway` writes
+        // a fresh credential to this same address with no DB row lock in
+        // common with this job (its own store write happens before it touches
+        // the row), so between `run_tick`'s SELECT and this call a concurrent
+        // save can already have claimed this address with newer data. An
+        // unconditional `put` would silently revert it to what this legacy
+        // column held; the compare-and-set means whichever write reaches the
+        // store first wins, and the store is the one place both paths agree
+        // to check.
+        let claimed = self.secrets.put_if_absent(&key, &plaintext).await?;
+        if !claimed {
+            // Something is already at this address: either a concurrent save
+            // won the race, or an earlier tick already moved it and this
+            // column's clear failed to commit for an unrelated reason. Either
+            // way, the store is not ours to overwrite, and the column is safe
+            // to clear below: the address has a real credential now, and this
+            // legacy copy is redundant.
+            return self.clear_column(tenant_id, provider).await;
+        }
 
         // The read-back is the whole point of doing this in code rather than in
         // SQL. A store that accepted the write and does not return it is the
@@ -155,10 +173,14 @@ impl GatewayCredentialMover {
             )));
         }
 
-        // `IS NOT NULL` makes the clear idempotent and makes a concurrent write
-        // through the API the winner: if `upsert_payment_gateway` has already
-        // stored a newer credential and NULLed this row, there is nothing here
-        // to clear and nothing to undo.
+        self.clear_column(tenant_id, provider).await
+    }
+
+    /// `IS NOT NULL` makes this idempotent and makes a concurrent write
+    /// through the API the winner: if `upsert_payment_gateway` has already
+    /// stored a newer credential and NULLed this row, there is nothing here
+    /// to clear and nothing to undo.
+    async fn clear_column(&self, tenant_id: Uuid, provider: &str) -> AppResult<()> {
         sqlx::query(
             "UPDATE payment_gateway_configs SET config_encrypted = NULL \
              WHERE tenant_id = $1 AND provider = $2 AND config_encrypted IS NOT NULL",

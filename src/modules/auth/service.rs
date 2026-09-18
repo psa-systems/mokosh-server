@@ -783,7 +783,7 @@ impl AuthService {
         // Verify password
         let password_hash = user.password_hash.as_ref().ok_or(AppError::Unauthorized)?;
 
-        if !verify_password(&request.password, password_hash)? {
+        if !verify_password(&request.password, password_hash).await? {
             // Record the failed attempt (PMS-117 AC3) before bailing.
             let ctx = AuditCtx {
                 tenant_id: Some(user.tenant_id),
@@ -1418,7 +1418,7 @@ impl AuthService {
         // `{user_id}.{secret}`; only the secret is hashed and stored so
         // reset_password can scope its lookup to this user.
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
         let lookup_hash = sha256_hex(&secret);
         let token = format!("{}.{}", user.id, secret);
         let expires_at = Utc::now() + Duration::hours(24);
@@ -1522,7 +1522,9 @@ impl AuthService {
             Some((tenant_id, token_hash)) => (Some(*tenant_id), Some(token_hash.as_str())),
             None => (None, None),
         };
-        let verified = verify_password_or_dummy(secret, row_hash).unwrap_or(false);
+        let verified = verify_password_or_dummy(secret, row_hash)
+            .await
+            .unwrap_or(false);
         let tenant_id = match (verified, candidate_tenant) {
             (true, Some(tenant_id)) => tenant_id,
             _ => return Err(AppError::NotFound("token".to_string())),
@@ -1598,7 +1600,7 @@ impl AuthService {
             Some((tenant_id, token_hash)) => (Some(*tenant_id), Some(token_hash.as_str())),
             None => (None, None),
         };
-        let verified = verify_password_or_dummy(secret, row_hash)?;
+        let verified = verify_password_or_dummy(secret, row_hash).await?;
         let tenant_id = match (verified, candidate_tenant) {
             (true, Some(tenant_id)) => tenant_id,
             _ => {
@@ -1609,7 +1611,7 @@ impl AuthService {
         };
 
         // Hash new password
-        let new_hash = hash_password(&request.new_password)?;
+        let new_hash = hash_password(&request.new_password).await?;
 
         // MAPPS-551: password_hash lives per-tenant on `users`. The
         // MAPPS-498 mirror no longer touches password (see migration
@@ -1694,7 +1696,7 @@ impl AuthService {
         // Get current password hash + email (need the email to
         // resolve the identity row for the MAPPS-499 write).
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(String, String)> = sqlx::query_as(
+        let row: Option<(Option<String>, String)> = sqlx::query_as(
             "SELECT password_hash, email FROM users WHERE id = $1 AND tenant_id = $2",
         )
         .bind(user_id)
@@ -1702,9 +1704,15 @@ impl AuthService {
         .fetch_optional(&mut *tx)
         .await?;
         let (current_hash, email) = row.ok_or_else(|| AppError::NotFound("User".to_string()))?;
+        // PMS-1236: migrations 162 and 166 deliberately write a NULL
+        // password_hash for a bunyip-only user (no local password set).
+        // That is "no password to change", not a server error.
+        let current_hash = current_hash.ok_or_else(|| {
+            AppError::Forbidden("This account has no local password set".to_string())
+        })?;
 
         // Verify current password
-        if !verify_password(&request.current_password, &current_hash)? {
+        if !verify_password(&request.current_password, &current_hash).await? {
             return Err(AppError::validation_field(
                 "current_password",
                 "Current password is incorrect",
@@ -1712,7 +1720,7 @@ impl AuthService {
         }
 
         // Hash and update new password
-        let new_hash = hash_password(&request.new_password)?;
+        let new_hash = hash_password(&request.new_password).await?;
 
         // MAPPS-551: retire the identity write. Password lives on the
         // per-tenant users row only; migration 135's mirror no longer
@@ -1864,7 +1872,7 @@ impl AuthService {
             // Same user-bound `{user_id}.{secret}` token shape as
             // request_password_reset so reset_password can scope the lookup.
             let secret = generate_token(64);
-            let token_hash = hash_password(&secret)?;
+            let token_hash = hash_password(&secret).await?;
             let lookup_hash = sha256_hex(&secret);
             let token = format!("{}.{}", user_id, secret);
             let expires_at = Utc::now() + Duration::days(7);
@@ -2334,7 +2342,7 @@ impl AuthService {
             .password_hash
             .as_ref()
             .ok_or_else(|| AppError::BadRequest("This account has no password".to_string()))?;
-        if !verify_password(password, hash)? {
+        if !verify_password(password, hash).await? {
             return Err(AppError::Unauthorized);
         }
 
@@ -2384,7 +2392,7 @@ impl AuthService {
         let raw_key = generate_api_key();
         // `psa_` + 40 alnum = 44 chars; prefix is 10 chars.
         let key_prefix: String = raw_key.chars().take(10).collect();
-        let key_hash = hash_password(&raw_key)?;
+        let key_hash = hash_password(&raw_key).await?;
 
         let id = Uuid::new_v4();
         let scopes = request
@@ -2557,7 +2565,7 @@ impl AuthService {
         let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
             r#"
             SELECT id,
-                   COALESCE(NULLIF(TRIM(first_name || ' ' || last_name), ''), email) AS name,
+                   COALESCE(NULLIF(TRIM(first_name || ' ' || last_name), ''), 'Unnamed User') AS name,
                    LOWER(split_part(email, '@', 1)) AS handle
             FROM users
             WHERE tenant_id = $1 AND status = 'active'
@@ -3073,7 +3081,13 @@ impl AuthService {
             )
             VALUES ($1, $2, $3, $4, 'active', $8, 'UTC', $5, $6, $7)
             ON CONFLICT (id) DO UPDATE SET
-                email = EXCLUDED.email,
+                -- PMS-1236: a failed userinfo read (or one that comes back
+                -- unverified) has already been forced to the
+                -- `{sub}@unresolved.invalid` placeholder above, and that
+                -- placeholder must never overwrite a real address already on
+                -- the row. Only a verified email from the IdP is trusted to
+                -- replace what is there.
+                email = CASE WHEN $11 THEN EXCLUDED.email ELSE users.email END,
                 -- PMS-512: bunyip owns the names; refresh them on every run.
                 -- $9 / $10 are the raw hints (NULL when absent or empty), so
                 -- COALESCE keeps the existing NOT NULL value rather than
@@ -3102,6 +3116,7 @@ impl AuthService {
         .bind(email_verified_at)
         .bind(&first_hint)
         .bind(&last_hint)
+        .bind(email_verified)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -3911,7 +3926,7 @@ impl AuthService {
                 .password_hash
                 .as_deref()
                 .ok_or(AppError::Unauthorized)?;
-            if !verify_password(&request.password, identity_hash)? {
+            if !verify_password(&request.password, identity_hash).await? {
                 return Err(AppError::Unauthorized);
             }
         } else {
@@ -3926,7 +3941,7 @@ impl AuthService {
                 let Some(hash) = user.password_hash.as_deref() else {
                     continue;
                 };
-                match verify_password(&request.password, hash) {
+                match verify_password(&request.password, hash).await {
                     Ok(true) => {
                         matched_memberships.push(m.clone());
                         if any_verified_user.is_none() {

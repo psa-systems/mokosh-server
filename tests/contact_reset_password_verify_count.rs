@@ -21,7 +21,7 @@ use uuid::Uuid;
 /// Insert a redeemable `portal_setup_tokens` row for `contact_id` with a
 /// known secret.
 async fn seed_candidate(pool: &PgPool, tenant_id: Uuid, contact_id: Uuid, secret: &str) {
-    let token_hash = hash_password(secret).expect("hash secret");
+    let token_hash = hash_password(secret).await.expect("hash secret");
     let lookup_hash = sha256_hex(secret);
     sqlx::query(
         "INSERT INTO portal_setup_tokens (id, tenant_id, contact_id, token_hash, lookup_hash, expires_at) \

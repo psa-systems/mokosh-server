@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// Insert a redeemable `password_reset_tokens` row for `user_id` with a
 /// known secret, both hashes PMS-1244 needs.
 async fn seed_candidate(pool: &PgPool, tenant_id: Uuid, user_id: Uuid, secret: &str) {
-    let token_hash = hash_password(secret).expect("hash secret");
+    let token_hash = hash_password(secret).await.expect("hash secret");
     let lookup_hash = sha256_hex(secret);
     sqlx::query(
         "INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, lookup_hash, expires_at) \

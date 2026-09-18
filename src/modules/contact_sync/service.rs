@@ -309,7 +309,7 @@ impl ContactSyncService {
         let redirect_uri = self.redirect_uri()?;
         let pkce = Pkce::generate();
         let secret = generate_token(48);
-        let state_hash = hash_password(&secret)?;
+        let state_hash = hash_password(&secret).await?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let state_id: Uuid = sqlx::query_scalar(
@@ -386,7 +386,7 @@ impl ContactSyncService {
         // probing state ids learns nothing from the difference.
         let usable = consumed_at.is_none()
             && expires_at > Utc::now()
-            && verify_password(secret, &state_hash).unwrap_or(false);
+            && verify_password(secret, &state_hash).await.unwrap_or(false);
         if !usable {
             return Err(AppError::BadRequest(
                 "That connection attempt is no longer valid. Start again from Settings."

@@ -187,22 +187,32 @@ pub fn generate_numeric_code(length: usize) -> String {
         .collect()
 }
 
-/// Hash a password using Argon2id
+/// Hash a password using Argon2id.
+///
+/// Argon2 is deliberately CPU-expensive, so this runs on the blocking pool
+/// via `spawn_blocking` (PMS-1245) rather than inline on the Tokio worker
+/// thread handling the request: without that, one hash stalls every other
+/// request the worker is multiplexing for the full hashing duration.
 #[cfg(feature = "server")]
-pub fn hash_password(password: &str) -> AppResult<String> {
+pub async fn hash_password(password: &str) -> AppResult<String> {
     use argon2::{
         password_hash::{rand_core::OsRng, SaltString},
         Argon2, PasswordHasher,
     };
 
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
+    let password = password.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        let argon2 = Argon2::default();
 
-    let hash = argon2
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| AppError::Internal(format!("Password hashing error: {}", e)))?;
+        let hash = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|e| AppError::Internal(format!("Password hashing error: {}", e)))?;
 
-    Ok(hash.to_string())
+        Ok(hash.to_string())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Password hashing task panicked: {}", e)))?
 }
 
 /// Count of every `verify_password` call made in this process. PMS-1244:
@@ -219,36 +229,50 @@ pub fn verify_password_call_count() -> usize {
     VERIFY_PASSWORD_CALLS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Verify a password against a hash
+/// Verify a password against a hash.
+///
+/// Runs on the blocking pool for the same reason as [`hash_password`]
+/// (PMS-1245).
 #[cfg(feature = "server")]
-pub fn verify_password(password: &str, hash: &str) -> AppResult<bool> {
+pub async fn verify_password(password: &str, hash: &str) -> AppResult<bool> {
     use argon2::{Argon2, PasswordHash, PasswordVerifier};
 
     VERIFY_PASSWORD_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let parsed_hash = PasswordHash::new(hash)
-        .map_err(|e| AppError::Internal(format!("Invalid password hash: {}", e)))?;
+    let password = password.to_owned();
+    let hash = hash.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let parsed_hash = PasswordHash::new(&hash)
+            .map_err(|e| AppError::Internal(format!("Invalid password hash: {}", e)))?;
 
-    match Argon2::default().verify_password(password.as_bytes(), &parsed_hash) {
-        Ok(()) => Ok(true),
-        Err(argon2::password_hash::Error::Password) => Ok(false),
-        Err(e) => Err(AppError::Internal(format!(
-            "Password verification error: {}",
-            e
-        ))),
-    }
+        match Argon2::default().verify_password(password.as_bytes(), &parsed_hash) {
+            Ok(()) => Ok(true),
+            Err(argon2::password_hash::Error::Password) => Ok(false),
+            Err(e) => Err(AppError::Internal(format!(
+                "Password verification error: {}",
+                e
+            ))),
+        }
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Password verification task panicked: {}", e)))?
 }
 
 /// A fixed, validly-formatted Argon2 hash with no real secret behind it.
 /// Memoized: hashing is the expensive part, and every caller needs the same
-/// constant-cost stand-in, not a fresh one per call.
+/// constant-cost stand-in, not a fresh one per call. `hash_password` is
+/// async (PMS-1245), so the memoization uses `tokio::sync::OnceCell` rather
+/// than `std::sync::OnceLock`, whose `get_or_init` closure cannot `.await`.
 #[cfg(feature = "server")]
-fn dummy_password_hash() -> &'static str {
-    use std::sync::OnceLock;
-    static DUMMY: OnceLock<String> = OnceLock::new();
-    DUMMY.get_or_init(|| {
-        hash_password("pms-1244-no-token-row-matched").expect("dummy hash always succeeds")
-    })
+async fn dummy_password_hash() -> &'static str {
+    static DUMMY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    DUMMY
+        .get_or_init(|| async {
+            hash_password("pms-1244-no-token-row-matched")
+                .await
+                .expect("dummy hash always succeeds")
+        })
+        .await
 }
 
 /// Verify `secret` against `row_hash` when a redemption lookup found a
@@ -262,11 +286,11 @@ fn dummy_password_hash() -> &'static str {
 /// Always returns `Ok(false)` for the no-row case; the dummy verify's own
 /// result is never a match.
 #[cfg(feature = "server")]
-pub fn verify_password_or_dummy(secret: &str, row_hash: Option<&str>) -> AppResult<bool> {
+pub async fn verify_password_or_dummy(secret: &str, row_hash: Option<&str>) -> AppResult<bool> {
     match row_hash {
-        Some(hash) => verify_password(secret, hash),
+        Some(hash) => verify_password(secret, hash).await,
         None => {
-            verify_password(secret, dummy_password_hash())?;
+            verify_password(secret, dummy_password_hash().await).await?;
             Ok(false)
         }
     }
@@ -405,23 +429,25 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
-    #[test]
-    fn test_password_hash_verify() {
+    #[tokio::test]
+    async fn test_password_hash_verify() {
         let password = "secure_password_123";
-        let hash = hash_password(password).unwrap();
+        let hash = hash_password(password).await.unwrap();
 
-        assert!(verify_password(password, &hash).unwrap());
-        assert!(!verify_password("wrong_password", &hash).unwrap());
+        assert!(verify_password(password, &hash).await.unwrap());
+        assert!(!verify_password("wrong_password", &hash).await.unwrap());
     }
 
     #[cfg(feature = "server")]
-    #[test]
-    fn verify_password_or_dummy_matches_a_real_row_and_rejects_a_missing_one() {
+    #[tokio::test]
+    async fn verify_password_or_dummy_matches_a_real_row_and_rejects_a_missing_one() {
         let secret = "correct-secret";
-        let hash = hash_password(secret).unwrap();
+        let hash = hash_password(secret).await.unwrap();
 
-        assert!(verify_password_or_dummy(secret, Some(&hash)).unwrap());
-        assert!(!verify_password_or_dummy("wrong-secret", Some(&hash)).unwrap());
-        assert!(!verify_password_or_dummy(secret, None).unwrap());
+        assert!(verify_password_or_dummy(secret, Some(&hash)).await.unwrap());
+        assert!(!verify_password_or_dummy("wrong-secret", Some(&hash))
+            .await
+            .unwrap());
+        assert!(!verify_password_or_dummy(secret, None).await.unwrap());
     }
 }

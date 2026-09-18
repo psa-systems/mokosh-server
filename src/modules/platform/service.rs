@@ -58,6 +58,22 @@ impl PlatformAdminService {
         &self.db
     }
 
+    /// Re-checks the admin's current status against `platform_admins`,
+    /// so an offboarded admin is rejected on their next request rather
+    /// than riding out their token's TTL (mirrors the tenant plane's
+    /// per-request `ensure_principal_usable` gate).
+    pub async fn ensure_admin_active(&self, admin_id: Uuid) -> AppResult<()> {
+        let pool = self.db.migrator_pool();
+        let admin = PlatformAdminRepo::find_by_id(pool, admin_id)
+            .await
+            .map_err(|_| AppError::Unauthorized)?
+            .ok_or(AppError::Unauthorized)?;
+        if admin.status != "active" {
+            return Err(AppError::Unauthorized);
+        }
+        Ok(())
+    }
+
     pub async fn authenticate(
         &self,
         email: &str,
@@ -86,7 +102,7 @@ impl PlatformAdminService {
         // overwrite the rotated hash back to the old one. There is
         // no live case where a real platform_admins row should trust
         // an older hash from another plane.
-        if !verify_password(password, hash)? {
+        if !verify_password(password, hash).await? {
             return Err(AppError::Unauthorized);
         }
 
@@ -218,13 +234,13 @@ impl PlatformAdminService {
             .password_hash
             .as_deref()
             .ok_or(AppError::Unauthorized)?;
-        if !verify_password(current, hash)? {
+        if !verify_password(current, hash).await? {
             return Err(AppError::validation_field(
                 "current_password",
                 "Current password is incorrect",
             ));
         }
-        let new_hash = hash_password(new)?;
+        let new_hash = hash_password(new).await?;
         PlatformAdminRepo::update_password_hash(pool, admin_id, &new_hash)
             .await
             .map_err(|_| AppError::Internal("Failed to update password".to_string()))?;

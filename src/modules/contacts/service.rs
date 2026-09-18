@@ -1047,9 +1047,16 @@ impl ContactService {
         ctx: &AuditCtx,
     ) -> AppResult<PortalAccessRequestRow> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1236: lock the row before deciding anything. Without this, a
+        // concurrent grant and decline both read `status = 'open'`, both pass
+        // the check below, and both apply their side effects (the grant's
+        // role INSERT included) before either commits its UPDATE - leaving
+        // the request's final status disagreeing with what actually happened.
+        // The lock serializes the second caller behind the first's commit, so
+        // it re-reads the now-resolved status and takes the conflict branch.
         let existing: Option<(Uuid, String, String)> = sqlx::query_as(
             "SELECT contact_id, area, status FROM portal_access_requests \
-             WHERE tenant_id = $1 AND id = $2",
+             WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
         )
         .bind(tenant_id)
         .bind(request_id)
@@ -1103,7 +1110,7 @@ impl ContactService {
         let row = sqlx::query_as::<_, PortalAccessRequestRow>(
             "UPDATE portal_access_requests \
              SET status = $3, resolved_by_id = $4, resolved_at = NOW() \
-             WHERE tenant_id = $1 AND id = $2 \
+             WHERE tenant_id = $1 AND id = $2 AND status = 'open' \
              RETURNING id, contact_id, company_id, area, note, status, requested_at, \
                        resolved_by_id, resolved_at",
         )
@@ -1111,8 +1118,13 @@ impl ContactService {
         .bind(request_id)
         .bind(if grant { "granted" } else { "declined" })
         .bind(resolved_by)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        let Some(row) = row else {
+            return Err(AppError::Conflict(
+                "This request was already resolved.".to_string(),
+            ));
+        };
 
         audit_write(
             &mut *tx,
@@ -1428,7 +1440,7 @@ impl ContactService {
         contact_id: Uuid,
     ) -> AppResult<String> {
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
         let lookup_hash = sha256_hex(&secret);
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::hours(PORTAL_SETUP_TOKEN_TTL_HOURS);
@@ -2467,7 +2479,7 @@ impl ContactService {
         const LOGIN_INTENT_TTL_MIN: i64 = 15;
         let intent_id = Uuid::new_v4();
         let secret = crate::utils::crypto::generate_token(32);
-        let secret_hash = crate::utils::crypto::hash_password(&secret)?;
+        let secret_hash = crate::utils::crypto::hash_password(&secret).await?;
         let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
         // SAFETY (PMS-285): grant email is called post-commit from
         // `grant_portal_access` and there is no `app.current_tenant`
@@ -2773,6 +2785,40 @@ impl ContactService {
         .fetch_all(&mut *conn)
         .await?;
 
+        // PMS-1260: provenance, one row per imported contact - its live link
+        // if it has one, else its most recent - in the same pass.
+        let origin_rows: Vec<(Uuid, String, String, bool, bool)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT ON (l.contact_id)
+                   l.contact_id, l.provider, l.source_account_email,
+                   l.unlinked_at IS NULL AND l.connection_id IS NOT NULL AS linked,
+                   l.deleted_in_source_at IS NOT NULL AS deleted_in_source
+            FROM contact_sync_links l
+            WHERE l.tenant_id = $1 AND l.contact_id = ANY($2)
+            ORDER BY l.contact_id, (l.unlinked_at IS NULL) DESC, l.created_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut origin_by_contact: std::collections::HashMap<Uuid, ContactOrigin> = origin_rows
+            .into_iter()
+            .map(
+                |(contact_id, provider, account_email, linked, deleted_in_source)| {
+                    (
+                        contact_id,
+                        ContactOrigin {
+                            provider,
+                            account_email,
+                            linked,
+                            deleted_in_source,
+                        },
+                    )
+                },
+            )
+            .collect();
+
         let mut phones_by_contact: std::collections::HashMap<Uuid, Vec<ContactPhone>> =
             std::collections::HashMap::new();
         for row in phone_rows {
@@ -2808,6 +2854,7 @@ impl ContactService {
         for contact in contacts.iter_mut() {
             contact.phones = phones_by_contact.remove(&contact.id).unwrap_or_default();
             contact.companies = links_by_contact.remove(&contact.id).unwrap_or_default();
+            contact.imported_from = origin_by_contact.remove(&contact.id);
         }
         Ok(contacts)
     }
@@ -3232,6 +3279,62 @@ impl ContactService {
         if filter.status.is_some() {
             data_conds.push(format!("c.status = ${data_idx}"));
             count_conds.push(format!("status = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
+        }
+        // PMS-1261: both were deserialized and never applied, so the list's
+        // "Portal users only" filter returned everyone and said nothing.
+        if filter.is_portal_user.is_some() {
+            data_conds.push(format!("c.is_portal_user = ${data_idx}"));
+            count_conds.push(format!("is_portal_user = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
+        }
+        // Comma-separated; a contact carrying ANY of them matches. Blank
+        // entries are dropped, and a filter of only blanks filters nothing.
+        let tags: Vec<String> = filter
+            .tags
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !tags.is_empty() {
+            data_conds.push(format!("c.tags && ${data_idx}::text[]"));
+            count_conds.push(format!("tags && ${count_idx}::text[]"));
+        }
+        // PMS-1260: origin takes no bind - the provider is a closed enum, so
+        // its literal is written from a match, never from the request.
+        match filter.origin {
+            Some(ContactOriginFilter::Manual) => {
+                data_conds.push(
+                    "NOT EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = c.tenant_id AND sl.contact_id = c.id)"
+                        .to_string(),
+                );
+                count_conds.push(
+                    "NOT EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = contacts.tenant_id AND sl.contact_id = contacts.id)"
+                        .to_string(),
+                );
+            }
+            Some(ContactOriginFilter::Google) => {
+                data_conds.push(
+                    "EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = c.tenant_id AND sl.contact_id = c.id \
+                       AND sl.provider = 'google')"
+                        .to_string(),
+                );
+                count_conds.push(
+                    "EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = contacts.tenant_id AND sl.contact_id = contacts.id \
+                       AND sl.provider = 'google')"
+                        .to_string(),
+                );
+            }
+            None => {}
         }
 
         let data_where = data_conds.join(" AND ");
@@ -3280,6 +3383,14 @@ impl ContactService {
         if let Some(ref status) = filter.status {
             query_builder = query_builder.bind(status.as_str());
             count_builder = count_builder.bind(status.as_str());
+        }
+        if let Some(portal) = filter.is_portal_user {
+            query_builder = query_builder.bind(portal);
+            count_builder = count_builder.bind(portal);
+        }
+        if !tags.is_empty() {
+            query_builder = query_builder.bind(tags.clone());
+            count_builder = count_builder.bind(tags);
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -3768,6 +3879,29 @@ impl ContactService {
         // idempotent when nothing changed and self-healing when it did.
         self.recompute_contact_mirrors(&mut tx, tenant_id, contact_id)
             .await?;
+
+        // PMS-1236: a company-scoped portal role assignment must be dropped
+        // when the contact's company changes, or the contact keeps a role
+        // (and the capabilities it grants) scoped to a Company they no
+        // longer belong to. `contact_role_assignments` only ever validated
+        // scope AT WRITE time (`grant_portal_access`,
+        // `replace_portal_role_assignments`); nothing re-checked it here.
+        // Tenant-wide roles (`portal_roles.company_id IS NULL`) are
+        // unaffected. Unconditional and cheap: a no-op when the company did
+        // not change or the contact holds no company-scoped role.
+        sqlx::query(
+            "DELETE FROM contact_role_assignments cra \
+             USING portal_roles pr, contacts c \
+             WHERE cra.role_id = pr.id \
+               AND c.tenant_id = cra.tenant_id AND c.id = cra.contact_id \
+               AND cra.tenant_id = $1 AND cra.contact_id = $2 \
+               AND pr.company_id IS NOT NULL \
+               AND pr.company_id IS DISTINCT FROM c.company_id",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
 
         // PMS-136: a false -> true transition mints a single-use setup token
         // and (after commit) emails the contact a `/portal/set-password` link.
@@ -4429,6 +4563,7 @@ impl From<ContactRow> for Contact {
             // child table; a bare row conversion leaves them empty.
             phones: Vec::new(),
             companies: Vec::new(),
+            imported_from: None,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
