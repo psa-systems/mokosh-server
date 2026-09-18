@@ -847,6 +847,18 @@ pub struct DirectoryEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct UserResponse {
     pub id: Uuid,
+    /// MAPPS-877: the tenant this user belongs to. Serialised on
+    /// `/api/v1/auth/me` so the SPA can decode the response into
+    /// [`CurrentUser`] directly - that struct requires `tenant_id`
+    /// with no serde default, and every code path that decodes the
+    /// `/auth/me` body into `CurrentUser` (currently the tenant-
+    /// switcher grant path) used to fail with a decode error because
+    /// this field was missing. Every other consumer already had it
+    /// out of band (the login and switch-tenant responses carry
+    /// `tenant_id` alongside the user), so this field only surfaces
+    /// what was already true; adding it is additive and other
+    /// decoders that ignore unknown fields continue to work.
+    pub tenant_id: Uuid,
     pub email: String,
     pub first_name: String,
     pub last_name: String,
@@ -893,6 +905,7 @@ impl From<User> for UserResponse {
     fn from(user: User) -> Self {
         Self {
             id: user.id,
+            tenant_id: user.tenant_id,
             email: user.email,
             first_name: user.first_name.clone(),
             last_name: user.last_name.clone(),
