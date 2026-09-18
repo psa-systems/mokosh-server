@@ -13,7 +13,6 @@ use uuid::Uuid;
 
 use super::google::GoogleContactsProvider;
 use super::oauth::{self, OauthClient, Pkce, TokenError};
-use super::provider::{ContactSyncProvider, SourceGroup};
 use super::runs::{RunStatus, RUN_COLUMNS};
 use super::sync::{external_id_digest, fields, ContactSyncEngine, ImportPreview, SyncReport};
 use crate::db::Database;
@@ -151,17 +150,6 @@ pub struct ConnectionStatus {
     pub open_reviews: i64,
     /// The most recent run, active or not.
     pub latest_run: Option<RunStatus>,
-}
-
-/// One label, as the import picker offers it (PSA-70 E).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct GroupOption {
-    pub id: String,
-    pub name: String,
-    /// Google's own count, which is what the preview shows before anything
-    /// is written. A contact in two selected labels is counted in both.
-    pub member_count: Option<u32>,
-    pub selected: bool,
 }
 
 /// One incoming record waiting on a reviewer, with every Mokosh contact it
@@ -749,12 +737,6 @@ impl ContactSyncService {
         ))
     }
 
-    /// The labels an admin can choose from, with their counts (PSA-70 E).
-    pub async fn source_groups(&self, tenant_id: TenantId) -> AppResult<Vec<SourceGroup>> {
-        let (_, source) = self.source(tenant_id).await?;
-        Ok(source.list_groups().await?)
-    }
-
     /// Run one sync of the tenant's live connection now (PMS-1213). The
     /// scheduled worker and the run rows that make it resumable are PMS-1215.
     pub async fn sync_now(&self, tenant_id: TenantId) -> AppResult<SyncReport> {
@@ -762,21 +744,6 @@ impl ContactSyncService {
         ContactSyncEngine::new(self.db.clone())
             .run(tenant_id, connection.id, &source)
             .await
-    }
-
-    /// The labels to choose from, marked with the current selection.
-    pub async fn groups(&self, tenant_id: TenantId) -> AppResult<Vec<GroupOption>> {
-        let connection = self.live_connection(tenant_id).await?;
-        let groups = self.source_groups(tenant_id).await?;
-        Ok(groups
-            .into_iter()
-            .map(|g| GroupOption {
-                selected: connection.selected_groups.contains(&g.id),
-                id: g.id,
-                name: g.name,
-                member_count: g.member_count,
-            })
-            .collect())
     }
 
     /// What importing would do, without importing (PMS-1242). `group_ids`
