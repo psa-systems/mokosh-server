@@ -80,6 +80,7 @@ impl TestApp {
 /// `common::` and not every one seeds a company.
 #[allow(dead_code)]
 pub async fn seed_company(pool: &PgPool) -> Uuid {
+    init_tracing();
     seed_company_named(pool, "Acme Co").await
 }
 
@@ -87,6 +88,7 @@ pub async fn seed_company(pool: &PgPool) -> Uuid {
 /// so a test needing a second company has to name it.
 #[allow(dead_code)]
 pub async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
+    init_tracing();
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
@@ -111,6 +113,7 @@ pub async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
 /// most test binaries and several of them assert a company's contact count.
 #[allow(dead_code)]
 pub async fn seed_billing_contact(pool: &PgPool, company_id: Uuid) -> Uuid {
+    init_tracing();
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
@@ -146,6 +149,7 @@ pub async fn seed_billing_contact(pool: &PgPool, company_id: Uuid) -> Uuid {
 /// reason as the other helpers.
 #[allow(dead_code)]
 pub async fn seed_ticket_and_note(pool: &PgPool, admin_id: Uuid, company_id: Uuid) -> (Uuid, Uuid) {
+    init_tracing();
     let status_id: Uuid =
         sqlx::query_scalar("SELECT id FROM ticket_statuses WHERE tenant_id = $1 LIMIT 1")
             .bind(DEFAULT_TENANT_ID)
@@ -202,6 +206,7 @@ pub async fn seed_ticket_and_note(pool: &PgPool, admin_id: Uuid, company_id: Uui
 /// that bind money columns. Panics on malformed input (test-only).
 #[allow(dead_code)]
 pub fn dec(s: &str) -> Decimal {
+    init_tracing();
     s.parse().expect("parse Decimal literal")
 }
 
@@ -233,6 +238,7 @@ pub fn dec(s: &str) -> Decimal {
 /// tree under `/tmp` that the OS reclaims.
 #[allow(dead_code)]
 pub fn storage_root() -> &'static std::path::Path {
+    init_tracing();
     static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
 
     let dir = ROOT.get_or_init(|| {
@@ -245,6 +251,35 @@ pub fn storage_root() -> &'static std::path::Path {
     // storage env beside this one, and the cost of being sure is one setenv.
     std::env::set_var("ATTACHMENT_DIR", dir.path());
     dir.path()
+}
+
+/// Route the server's tracing events to libtest's per-test capture so a
+/// panicking Postgres-backed test prints the real cause (e.g. the sqlx error
+/// `AppError::Database` collapses to "Database operation failed" for the
+/// client, per `src/utils/error.rs`) instead of nothing. PMS-1258: every
+/// helper below that a non-booting suite (one that drives a service directly
+/// against `Database::from_pool` rather than over HTTP) is known to call
+/// invokes this as its first statement, so such a suite gets a subscriber
+/// without booting the HTTP app. `boot`/`boot_with_bunyip`/`boot_rls` reach it
+/// through `boot_with_db`.
+///
+/// `Once` rather than relying solely on `try_init`'s own idempotency: this is
+/// called from many small helpers rather than one boot path, so it must be
+/// unconditionally cheap and safe under the concurrent `#[sqlx::test]` cases
+/// within a binary that share the global subscriber.
+#[allow(dead_code)]
+pub fn init_tracing() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("error,mokosh_server=info")
+                }),
+            )
+            .try_init();
+    });
 }
 
 /// Bring up the API against `pool` on a random localhost port.
@@ -296,6 +331,7 @@ pub async fn boot_rls(pool: PgPool) -> TestApp {
 /// neither RLS nor the `tenants`-root carve-out: exactly the production posture.
 #[allow(dead_code)]
 pub async fn build_app_role_pool(superuser_pool: &PgPool) -> PgPool {
+    init_tracing();
     let role = format!("mokosh_app_test_{}", Uuid::new_v4().simple());
     let password = "app-role-test-pw";
 
@@ -354,18 +390,7 @@ async fn boot_with_db(
     // each suite means a suite only has to set the variable before it boots,
     // which is what every one of them already does.
     mokosh_server::config::refresh();
-    // Route the server's tracing events to libtest's per-thread capture so
-    // a failing test surfaces the real cause in its panic output (e.g. the
-    // sqlx error swallowed by `AppError::Database("Database operation
-    // failed")` in `src/utils/error.rs`). `try_init` because concurrent
-    // tests in the same binary share the global subscriber.
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("error,mokosh_server=info")),
-        )
-        .try_init();
+    init_tracing();
 
     // create_api_router now takes the swappable handle (PMS-638); wrap the
     // test LogMailer so the signature matches. Tests never swap it.
@@ -458,6 +483,7 @@ async fn boot_with_db(
 /// (e.g. `tests/dispatch_stub.rs` hits an unauthenticated stub).
 #[allow(dead_code)]
 pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
+    init_tracing();
     let email = "test-admin@example.com".to_string();
     let password = "test-password-12345".to_string();
     let password_hash =
@@ -515,6 +541,7 @@ pub async fn seed_user(
     email: &str,
     role: &str,
 ) -> (Uuid, String, String) {
+    init_tracing();
     let password = "test-password-12345".to_string();
     let password_hash =
         mokosh_server::utils::crypto::hash_password(&password).expect("hash seeded user password");
@@ -553,6 +580,7 @@ pub async fn seed_user_in_tenant(
     email: &str,
     role: &str,
 ) {
+    init_tracing();
     let password_hash =
         mokosh_server::utils::crypto::hash_password("test-password-12345").expect("hash password");
 
@@ -584,6 +612,7 @@ pub async fn seed_tenant_with_admin(
     pool: &PgPool,
     tenant_label: &str,
 ) -> (Uuid, Uuid, String, String) {
+    init_tracing();
     let tenant_id = Uuid::new_v4();
     sqlx::query(
         r#"
@@ -633,6 +662,7 @@ pub async fn seed_tenant_with_admin(
 /// [`seed_admin`]: not every integration-test binary authenticates.
 #[allow(dead_code)]
 pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
+    init_tracing();
     // PMS-728 AC1: the local password path rejects a credential presented
     // without an explicit tenant identifier. This helper backs the whole
     // suite's default-admin login path (which uses `seed_admin`, populating
@@ -671,6 +701,7 @@ pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
 /// get_tenant_admin, update_tenant_admin).
 #[allow(dead_code)]
 pub async fn platform_login(app: &TestApp, email: &str, password: &str) -> String {
+    init_tracing();
     let resp = app
         .client
         .post(app.url("/api/v1/platform/login"))
@@ -700,6 +731,7 @@ pub async fn seed_team(
     name: &str,
     manager_id: Option<Uuid>,
 ) -> Uuid {
+    init_tracing();
     let team_id = Uuid::new_v4();
     sqlx::query(
         r#"
@@ -728,6 +760,7 @@ pub async fn seed_team_member(
     user_id: Uuid,
     role: &str,
 ) {
+    init_tracing();
     sqlx::query(
         r#"
         INSERT INTO team_members (tenant_id, team_id, user_id, role)
@@ -756,6 +789,7 @@ pub async fn seed_ticket_for_team(
     ticket_number: &str,
     team_id: Option<Uuid>,
 ) -> Uuid {
+    init_tracing();
     let status_id: Uuid =
         sqlx::query_scalar("SELECT id FROM ticket_statuses WHERE tenant_id = $1 LIMIT 1")
             .bind(DEFAULT_TENANT_ID)
@@ -854,6 +888,7 @@ pub async fn seed_portal_contact_in_tenant(
     email: &str,
     role_names: &[&str],
 ) -> PortalContact {
+    init_tracing();
     let minted = format!("co-{}", &Uuid::new_v4().simple().to_string()[..12]);
     let slug: String = sqlx::query_scalar(
         "UPDATE companies SET portal_slug = COALESCE(portal_slug, $2) \
@@ -920,6 +955,7 @@ pub async fn contact_login_response(
     contact: &PortalContact,
     password: &str,
 ) -> reqwest::Response {
+    init_tracing();
     app.client
         .post(app.url("/api/v1/contact/auth/login"))
         .json(&serde_json::json!({
