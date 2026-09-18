@@ -37,23 +37,22 @@ use mokosh_types::auth::UserRole;
 /// value so the middleware refuses to place the caller rather than
 /// silently granting one of the seven mokosh roles by accident.
 ///
-/// `read_only` maps to [`UserRole::Technician`], the least-privilege
-/// mokosh role that already exists. This is deliberately over-
-/// privileged for now: mokosh has no first-class read-only tier, and
-/// a real one is a follow-up (a ticket separately opened once the
-/// grant surface has enough traffic to justify the schema move).
-/// Until then a `read_only` grantee has technician-level WRITE
-/// access on the granted tenant; a grant issuer who needs strict
-/// read-only should not issue this role yet.
+/// MAPPS-877 (2026-09-18): `read_only` now projects onto the
+/// first-class [`UserRole::ReadOnly`] variant that landed alongside
+/// migration 225. Before this it deliberately mapped to
+/// [`UserRole::Technician`] because mokosh had no read-only tier;
+/// that gave every `read_only` grantee technician-level WRITE access
+/// on the granted workspace, so a viewer could create companies,
+/// invoices and tickets. `ReadOnly::can_write` returns false and
+/// every mutating handler that carries the `RequireWriteAccess`
+/// extractor refuses that role at the router boundary.
 pub fn map_grant_role(vocab: &str) -> Option<UserRole> {
     match vocab {
         "admin" => Some(UserRole::Admin),
         "manager" => Some(UserRole::Manager),
         "technician" => Some(UserRole::Technician),
         "finance" => Some(UserRole::Finance),
-        // See the note above: intentionally maps to Technician until
-        // a first-class read-only tier lands.
-        "read_only" => Some(UserRole::Technician),
+        "read_only" => Some(UserRole::ReadOnly),
         _ => None,
     }
 }
