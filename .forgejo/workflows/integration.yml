@@ -120,6 +120,14 @@ jobs:
         # file, so the archive's SHA-256 is pinned here and verified with
         # `sha256sum --check --strict`, the same pattern the MinIO step below
         # uses for the same reason.
+        #
+        # `ghcr.io/niceguyit/rust-builder-glibc` sets CARGO_HOME=/usr/local/cargo
+        # and puts only that on PATH, not `~/.cargo/bin` (`~` is `/root` in
+        # this image but `/root/.cargo/bin` is never added to PATH). Installing
+        # there left the binary on disk but invisible to `cargo`, which reports
+        # a plain "no such command: `nextest`" with no hint that the install
+        # step ran at all. `${CARGO_HOME:-$HOME/.cargo}/bin` is where `cargo`
+        # actually looks.
         env:
           NEXTEST_VERSION: "0.9.145"
           NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
@@ -128,8 +136,9 @@ jobs:
           curl --silent --fail --location --output /tmp/nextest.tar.gz \
             "https://get.nexte.st/${NEXTEST_VERSION}/linux"
           echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
-          mkdir -p ~/.cargo/bin
-          tar --extract --gzip --file /tmp/nextest.tar.gz --directory ~/.cargo/bin
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          mkdir -p "${cargo_bin}"
+          tar --extract --gzip --file /tmp/nextest.tar.gz --directory "${cargo_bin}"
 
       - name: Cap build parallelism
         # nproc/2 cap: never claim more than half the host (see "Concurrency
