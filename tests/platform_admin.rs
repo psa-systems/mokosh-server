@@ -48,7 +48,9 @@ async fn seed_admin_is_backfilled_into_platform_admins(pool: PgPool) {
 async fn platform_login_returns_access_token(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     // Backfill this admin.
-    let hash = mokosh_server::utils::crypto::hash_password(&password).expect("hash pw");
+    let hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash pw");
     sqlx::query(
         "INSERT INTO platform_admins (email, password_hash, first_name, last_name, status) \
          VALUES ($1, $2, 'Test', 'Admin', 'active') ON CONFLICT DO NOTHING",
@@ -80,7 +82,9 @@ async fn platform_login_returns_access_token(pool: PgPool) {
 #[sqlx::test]
 async fn platform_login_wrong_password_returns_401(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let hash = mokosh_server::utils::crypto::hash_password(&password).expect("hash pw");
+    let hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash pw");
     sqlx::query(
         "INSERT INTO platform_admins (email, password_hash, first_name, last_name, status) \
          VALUES ($1, $2, 'Test', 'Admin', 'active') ON CONFLICT DO NOTHING",
@@ -109,7 +113,9 @@ async fn platform_change_password_isolates_from_identity_plane(pool: PgPool) {
     // Assert platform_admins.password_hash changed and identities.password_hash
     // did NOT (super-admin persona is isolated from the tenant identity plane).
     let (admin_id, email, password) = common::seed_admin(&pool).await;
-    let hash = mokosh_server::utils::crypto::hash_password(&password).expect("hash pw");
+    let hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash pw");
     sqlx::query(
         "INSERT INTO platform_admins (email, password_hash, first_name, last_name, status) \
          VALUES ($1, $2, 'Test', 'Admin', 'active') ON CONFLICT DO NOTHING",
@@ -214,8 +220,12 @@ async fn platform_login_rejects_stale_identity_hash_after_rotation(pool: PgPool)
     let email = "rotated@example.com".to_string();
     let password_old = "PLATFORM-OLD-STALE".to_string();
     let password_new = "PLATFORM-NEW-ROTATED".to_string();
-    let hash_old = mokosh_server::utils::crypto::hash_password(&password_old).expect("hash old");
-    let hash_new = mokosh_server::utils::crypto::hash_password(&password_new).expect("hash new");
+    let hash_old = mokosh_server::utils::crypto::hash_password(&password_old)
+        .await
+        .expect("hash old");
+    let hash_new = mokosh_server::utils::crypto::hash_password(&password_new)
+        .await
+        .expect("hash new");
 
     let admin_id = Uuid::new_v4();
     sqlx::query(
@@ -294,7 +304,9 @@ async fn platform_login_rejects_stale_identity_hash_after_rotation(pool: PgPool)
 async fn platform_login_no_identity_row_still_works(pool: PgPool) {
     let email = "solo-platform@example.com".to_string();
     let password_a = "SOLO-A-12345".to_string();
-    let hash_a = mokosh_server::utils::crypto::hash_password(&password_a).expect("hash A");
+    let hash_a = mokosh_server::utils::crypto::hash_password(&password_a)
+        .await
+        .expect("hash A");
 
     let admin_id = Uuid::new_v4();
     sqlx::query(

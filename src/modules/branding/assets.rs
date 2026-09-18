@@ -246,6 +246,24 @@ impl BrandingAssetStore {
             .unwrap_or_else(|| kind.default_max_bytes())
     }
 
+    /// The largest cap across every [`BrandAssetKind`] for a scope VARIANT
+    /// (the id inside `scope` is not read; `Uuid::nil()` is fine). One route
+    /// accepts all three kinds through the `{asset}` path segment and only
+    /// resolves which cap applies inside `store`, after axum has already
+    /// buffered the body, so the route's `DefaultBodyLimit` (PMS-1233) has to
+    /// cover whichever of the three this request turns out to name.
+    pub fn max_bytes_for_scope(&self, scope: AssetScope) -> u64 {
+        [
+            BrandAssetKind::Logo,
+            BrandAssetKind::Favicon,
+            BrandAssetKind::Background,
+        ]
+        .into_iter()
+        .map(|kind| self.max_bytes(kind, scope))
+        .max()
+        .unwrap_or(0)
+    }
+
     fn dir_for(&self, scope: AssetScope, kind: BrandAssetKind) -> PathBuf {
         self.root
             .join(format!("{}-{}", scope.subdir_prefix(), kind.kind_dir()))

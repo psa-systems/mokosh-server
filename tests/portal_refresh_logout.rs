@@ -335,14 +335,14 @@ async fn refresh_with_empty_body_is_validation_error(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-// AC (H1+H2 access token independence): after logout, the ACCESS token
-// stays valid until its own expiry (15 min). Only the ability to REFRESH
-// is revoked. Documents the intentional trade-off: access-token
-// revocation would require a server-side lookup per request. (MAPPS-532
-// chose the same for the retired portal, and the contact middleware
-// likewise reads no session row.)
+// AC (PMS-1224): logout revokes the ACCESS token too, on the very next
+// request, not merely at its own 15-min expiry. `portal_contact_middleware`
+// re-checks `contact_sessions.revoked_at` for the token's `sid` on every
+// hit, so a logout kills the bearer immediately rather than only closing
+// the refresh path. Supersedes the old `access_token_survives_logout_until_expiry`
+// assertion, which documented the gap this issue closes.
 #[sqlx::test]
-async fn access_token_survives_logout_until_expiry(pool: PgPool) {
+async fn access_token_is_rejected_immediately_after_logout(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
     let login_body = login(&app, &contact).await;
@@ -352,7 +352,8 @@ async fn access_token_survives_logout_until_expiry(pool: PgPool) {
     let out = logout(&app, rt).await;
     assert_eq!(out.status(), reqwest::StatusCode::NO_CONTENT);
 
-    // Access token is still valid.
+    // The access token minted alongside the now-revoked session is
+    // rejected on its very next use, well before its own 15-min TTL.
     let me = app
         .client
         .get(app.url("/api/v1/contact/auth/me"))
@@ -360,9 +361,13 @@ async fn access_token_survives_logout_until_expiry(pool: PgPool) {
         .send()
         .await
         .expect("me");
-    assert!(me.status().is_success(), "access token survives logout");
+    assert_eq!(
+        me.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "access token must die with its session on logout"
+    );
 
-    // But the refresh path is dead.
+    // The refresh path is dead too.
     let dead = refresh(&app, rt).await;
     assert_unauthorized_envelope(dead, "refresh after logout").await;
 }

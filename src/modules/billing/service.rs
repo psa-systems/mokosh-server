@@ -3311,6 +3311,25 @@ impl BillingService {
             ));
         };
 
+        // PMS-1235: the early check above uses the MAX across every active
+        // provider, which is deliberately the friendliest floor when the
+        // provider is not yet known (a value at or above it is safe no
+        // matter which one gets picked). Now that one has, re-check against
+        // its OWN minimum: on a dual-provider tenant the max-across-active
+        // floor can be another provider's higher minimum, which would
+        // wrongly refuse a partial payment this resolved provider accepts.
+        if let Some(v) = amount_override {
+            let floor = self
+                .provider_min_partial_amount(tenant_id, provider.id())
+                .await?;
+            if v < floor {
+                return Err(AppError::BadRequest(format!(
+                    "The requested amount {v} is below the minimum partial payment {floor} for {}.",
+                    provider.id()
+                )));
+            }
+        }
+
         // Prefer the invoice's billing contact email so the checkout page is
         // pre-filled; absent that, leave it for the payer to enter.
         let customer_email = match invoice.billing_contact_id {
@@ -3360,23 +3379,60 @@ impl BillingService {
         Ok(configured.max(DEFAULT_MIN_PARTIAL_AMOUNT))
     }
 
+    /// PMS-1235: the floor for a SPECIFIC resolved provider, once one is
+    /// known. Unlike [`Self::min_partial_amount_across_active`] this never
+    /// clamps up to another provider's higher minimum on a dual-provider
+    /// tenant, because by this point the payment is committed to the one
+    /// gateway named.
+    async fn provider_min_partial_amount(
+        &self,
+        tenant_id: TenantId,
+        provider_id: &str,
+    ) -> AppResult<Decimal> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(Option<Decimal>,)> = sqlx::query_as(
+            "SELECT min_partial_amount FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND provider = $2 AND is_active = TRUE",
+        )
+        .bind(tenant_id)
+        .bind(provider_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let configured = row.and_then(|(v,)| v).unwrap_or(DEFAULT_MIN_PARTIAL_AMOUNT);
+        Ok(configured.max(DEFAULT_MIN_PARTIAL_AMOUNT))
+    }
+
     /// PMS-711: record a gateway-confirmed payment from a verified webhook.
     /// Idempotent on the provider reference (the unique partial index on
     /// `payments(tenant_id, gateway_transaction_id)`): a redelivered event
     /// inserts nothing and returns `Ok(false)`. On first sight it inserts the
-    /// `payments` row (method `credit_card`, `gateway_transaction_id` = the
-    /// provider reference, `gateway_response` = the raw event, `currency`
-    /// recorded) under the invoice row lock and recomputes the invoice's
-    /// payment state, returning `Ok(true)`.
+    /// `payments` row (method resolved from `provider_id`, PMS-1235;
+    /// `gateway_transaction_id` = the provider reference, `gateway_response` =
+    /// the raw event, `currency` recorded) under the invoice row lock and
+    /// recomputes the invoice's payment state, returning `Ok(true)`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_gateway_payment(
         &self,
         tenant_id: TenantId,
+        provider_id: &str,
         invoice_id: Uuid,
         provider_reference: &str,
         amount: Decimal,
         currency: &str,
         raw: &serde_json::Value,
     ) -> AppResult<bool> {
+        // PMS-1235: the resolved provider decides the recorded method, not a
+        // literal that assumed every gateway was Stripe. A provider this
+        // build does not recognise as a payment method still needs a value
+        // the CHECK constraint accepts, so it falls back to `other` rather
+        // than failing to record a payment that was actually taken.
+        let payment_method = match provider_id {
+            "paypal" => super::models::PaymentMethod::Paypal,
+            "stripe" => super::models::PaymentMethod::CreditCard,
+            _ => super::models::PaymentMethod::Other,
+        }
+        .as_str();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Lock the invoice so this read-modify-write serialises with manual
         // payments and concurrent webhook deliveries (PMS-695).
@@ -3396,7 +3452,7 @@ impl BillingService {
                 id, tenant_id, invoice_id, company_id, payment_date, amount,
                 currency, payment_method, gateway_transaction_id, gateway_response
             )
-            SELECT $1, $2, $3, i.company_id, CURRENT_DATE, $4, $5, 'credit_card', $6, $7
+            SELECT $1, $2, $3, i.company_id, CURRENT_DATE, $4, $5, $6, $7, $8
             FROM invoices i
             WHERE i.id = $3 AND i.tenant_id = $2
             ON CONFLICT (tenant_id, gateway_transaction_id)
@@ -3409,6 +3465,7 @@ impl BillingService {
         .bind(invoice_id)
         .bind(amount)
         .bind(currency)
+        .bind(payment_method)
         .bind(provider_reference)
         .bind(raw)
         .fetch_optional(&mut *tx)
@@ -3459,6 +3516,7 @@ impl BillingService {
     pub async fn record_gateway_refunds(
         &self,
         tenant_id: TenantId,
+        provider_id: &str,
         provider_reference: &str,
         currency: &str,
         refunds: &[super::provider::RefundLine],
@@ -3497,7 +3555,7 @@ impl BillingService {
                     id, tenant_id, payment_id, invoice_id, amount, currency,
                     provider, provider_reference, gateway_response
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, 'stripe', $7, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (tenant_id, provider_reference) DO NOTHING
                 "#,
             )
@@ -3507,6 +3565,7 @@ impl BillingService {
             .bind(invoice_id)
             .bind(refund.amount)
             .bind(currency)
+            .bind(provider_id)
             .bind(&refund.provider_reference)
             .bind(raw)
             .execute(&mut *tx)
@@ -3639,6 +3698,23 @@ impl BillingService {
                     "Payment amount {} exceeds invoice balance due {}",
                     request.amount, remaining
                 )));
+            }
+
+            // PMS-1235: `company_id` is caller-supplied and otherwise
+            // unchecked against the invoice it is recording a payment
+            // against, so a payment for one company could be filed under
+            // another's ledger while still linking a real invoice row.
+            let invoice_company_id: Uuid = sqlx::query_scalar(
+                "SELECT company_id FROM invoices WHERE id = $1 AND tenant_id = $2",
+            )
+            .bind(invoice_id)
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if invoice_company_id != request.company_id {
+                return Err(AppError::BadRequest(
+                    "Payment company_id does not match the invoice's company".to_string(),
+                ));
             }
         }
 
@@ -4093,9 +4169,10 @@ impl BillingService {
             .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant_id.get(), issuer).await;
             let bytes = crate::pdf::render(
-                &crate::modules::billing::documents::invoice(&document, issuer, &bill_to, logo),
+                crate::modules::billing::documents::invoice(&document, issuer, &bill_to, logo),
                 document.invoice_date,
-            )?;
+            )
+            .await?;
             crate::modules::billing::documents::store_issued(
                 &mut tx,
                 tenant_id.get(),
@@ -4260,7 +4337,7 @@ impl BillingService {
             crate::modules::tenants::logo::TenantLogoConfig::from_env(),
         );
         Ok(
-            crate::modules::billing::issuer::freeze(tenant_id.get(), &name, &branding, &logos)
+            crate::modules::billing::issuer::freeze(tx, tenant_id.get(), &name, &branding, &logos)
                 .await,
         )
     }
@@ -5138,6 +5215,22 @@ impl BillingService {
                 status.as_str()
             )));
         }
+        // PMS-1235: a write-off already says the MSP will not collect this
+        // (PMS-1036); a credit note says the customer never owed it. Issuing
+        // both records the same debt going away twice, the way a recovery
+        // payment did before `total_recovered` (see `build_statement`), except
+        // here nothing downstream can net it back out because the write-off's
+        // `write_off_amount` is frozen and this invoice's own correction path
+        // is the credit note itself. Write-offs have no reversal in v1, so
+        // there is no "reverse it first" to defer to: the write-off stands and
+        // this credit note is refused outright.
+        if status == InvoiceStatus::WrittenOff {
+            return Err(AppError::BadRequest(
+                "This invoice has been written off; issuing a credit note against it would \
+                 remove the same debt twice"
+                    .to_string(),
+            ));
+        }
 
         // Capped at the invoice's own total, less what is already credited, and
         // deliberately NOT less what has been paid: an invoice the customer has
@@ -5236,9 +5329,10 @@ impl BillingService {
         let credit_to = Self::bill_to_in_tx(&mut tx, tenant_id, note.company_id, contact).await?;
         let logo = crate::modules::billing::issuer::live_logo_bytes(tenant_id.get(), &issuer).await;
         let bytes = crate::pdf::render(
-            &crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
+            crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
             note.issue_date,
-        )?;
+        )
+        .await?;
         crate::modules::billing::documents::store_issued(
             &mut tx,
             tenant_id.get(),
@@ -5523,8 +5617,24 @@ impl BillingService {
         // computed here rather than carried on the company, because a stored
         // running total is a third home for a number that already has one and
         // the only one that can be silently wrong.
-        let opening: (Decimal, Decimal, Decimal, Decimal, Decimal) = sqlx::query_as(&format!(
-            r#"
+        //
+        // PMS-1235: `open_recovered` undoes the double deduction a "recovery"
+        // payment would otherwise cause. `write_off_amount` is frozen at the
+        // invoice's `write_off_amount` bucket the moment it is written off, and
+        // stays there undiscounted (it is the true historical event: this is
+        // what the MSP gave up on collecting, and the write-off list below
+        // shows exactly that). A later payment against that same invoice is a
+        // recovery (PMS-1036: "a later payment is a recovery, kept, with the
+        // status standing"), and it lands in `payments` and is summed into
+        // `open_paid`/`total_paid` like any other payment. Both are correct on
+        // their own; added together they subtract the same debt twice. This
+        // bucket sums exactly the recovery payments and is added back in, so a
+        // fully recovered write-off nets to the one deduction its
+        // `total_invoiced` entry actually earned, however the write-off and
+        // its recovery split across periods.
+        let opening: (Decimal, Decimal, Decimal, Decimal, Decimal, Decimal) =
+            sqlx::query_as(&format!(
+                r#"
             SELECT
                 COALESCE((SELECT SUM(total) FROM invoices
                           WHERE tenant_id = $1 AND company_id = $2
@@ -5542,18 +5652,33 @@ impl BillingService {
                 COALESCE((SELECT SUM(write_off_amount) FROM invoices
                           WHERE tenant_id = $1 AND company_id = $2
                             AND written_off_at IS NOT NULL
-                            AND written_off_at::date < $3), 0)
+                            AND written_off_at::date < $3), 0),
+                COALESCE((SELECT SUM(p.amount) FROM payments p
+                          JOIN invoices i ON i.id = p.invoice_id
+                          WHERE p.tenant_id = $1 AND p.company_id = $2
+                            AND p.payment_date < $3
+                            AND i.written_off_at IS NOT NULL
+                            AND p.payment_date >= i.written_off_at::date), 0)
             "#,
-            issued = Self::STATEMENT_ISSUED_INVOICE,
-        ))
-        .bind(tenant_id)
-        .bind(query.company_id)
-        .bind(query.period_start)
-        .fetch_one(&mut *tx)
-        .await?;
-        let (open_invoiced, open_paid, open_refunded, open_credited, open_written_off) = opening;
-        let opening_balance =
-            open_invoiced + open_refunded - open_paid - open_credited - open_written_off;
+                issued = Self::STATEMENT_ISSUED_INVOICE,
+            ))
+            .bind(tenant_id)
+            .bind(query.company_id)
+            .bind(query.period_start)
+            .fetch_one(&mut *tx)
+            .await?;
+        let (
+            open_invoiced,
+            open_paid,
+            open_refunded,
+            open_credited,
+            open_written_off,
+            open_recovered,
+        ) = opening;
+        let opening_balance = open_invoiced + open_refunded + open_recovered
+            - open_paid
+            - open_credited
+            - open_written_off;
 
         let invoices: Vec<StatementInvoiceRow> = sqlx::query_as(&format!(
             r#"
@@ -5652,6 +5777,25 @@ impl BillingService {
         .fetch_all(&mut *tx)
         .await?;
 
+        // PMS-1235: the in-period twin of `open_recovered` above, for a
+        // recovery payment dated inside this period rather than before it.
+        let (total_recovered,): (Decimal,) = sqlx::query_as(
+            r#"
+            SELECT COALESCE((SELECT SUM(p.amount) FROM payments p
+                              JOIN invoices i ON i.id = p.invoice_id
+                              WHERE p.tenant_id = $1 AND p.company_id = $2
+                                AND p.payment_date BETWEEN $3 AND $4
+                                AND i.written_off_at IS NOT NULL
+                                AND p.payment_date >= i.written_off_at::date), 0)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query.company_id)
+        .bind(query.period_start)
+        .bind(query.period_end)
+        .fetch_one(&mut *tx)
+        .await?;
+
         let total_invoiced: Decimal = invoices.iter().map(|i| i.total).sum();
         let total_paid: Decimal = payments.iter().map(|p| p.amount).sum();
         let total_refunded: Decimal = refunds.iter().map(|r| r.amount).sum();
@@ -5677,7 +5821,8 @@ impl BillingService {
             total_refunded,
             total_credited,
             total_written_off,
-            closing_balance: opening_balance + total_invoiced + total_refunded
+            total_recovered,
+            closing_balance: opening_balance + total_invoiced + total_refunded + total_recovered
                 - total_paid
                 - total_credited
                 - total_written_off,

@@ -356,7 +356,9 @@ async fn last_login_stamp_fans_out_across_memberships(pool: PgPool) {
     // would then propagate that bogus hash BACK to every users row -
     // breaking the login step below).
     let tenant_b = insert_tenant(&pool, "Beta Co", "beta-500").await;
-    let real_hash = mokosh_server::utils::crypto::hash_password(&password).expect("hash pw");
+    let real_hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash pw");
     let user_b_id = uuid::Uuid::new_v4();
     sqlx::query(
         "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \

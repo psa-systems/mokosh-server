@@ -22,7 +22,9 @@ use crate::modules::audit::{audit_portal_event, AuditAction};
 use crate::modules::auth::mfa_secret;
 use crate::modules::auth::TenantId;
 use crate::modules::notifications::NotificationsService;
-use crate::utils::crypto::{generate_token, hash_password, verify_password};
+use crate::utils::crypto::{
+    generate_token, hash_password, sha256_hex, verify_password, verify_password_or_dummy,
+};
 use crate::utils::error::{AppError, AppResult};
 
 use super::models::*;
@@ -222,7 +224,7 @@ impl ContactAuthService {
         }
 
         let stored_hash = password_hash.ok_or(AppError::Unauthorized)?;
-        if !verify_password(password, &stored_hash)? {
+        if !verify_password(password, &stored_hash).await? {
             // Best-effort: bump the failed-login counter + arm lockout
             // if we cross the threshold. Errors here do not fail the
             // response - they just skip the lockout write.
@@ -377,7 +379,7 @@ impl ContactAuthService {
         let Some((tenant_id, contact_id, hash, revoked_at, expires_at, family_id)) = row else {
             return Err(AppError::Unauthorized);
         };
-        if !verify_password(secret, &hash)? {
+        if !verify_password(secret, &hash).await? {
             return Err(AppError::Unauthorized);
         }
         if revoked_at.is_some() {
@@ -524,7 +526,7 @@ impl ContactAuthService {
         let Some((hash, family_id, tenant_id, contact_id)) = row else {
             return Ok(());
         };
-        if !verify_password(secret, &hash)? {
+        if !verify_password(secret, &hash).await? {
             return Ok(());
         }
         self.revoke_session_family(family_id).await?;
@@ -601,57 +603,57 @@ impl ContactAuthService {
             }
         };
 
-        let candidates =
-            sqlx::query_as::<_, (Uuid, Uuid, String, Option<DateTime<Utc>>, DateTime<Utc>)>(
-                r#"
+        // PMS-1244: look the row up by its equality-matchable SHA-256
+        // `lookup_hash` instead of scanning every row for the contact, so
+        // exactly one Argon2 verify runs per redemption attempt regardless
+        // of how many other rows the contact has (candidate_count is still
+        // logged as `0 or 1` in spirit - `row.is_some()` - since there is
+        // now at most one row to find).
+        let row = sqlx::query_as::<_, (Uuid, Uuid, String, Option<DateTime<Utc>>, DateTime<Utc>)>(
+            r#"
                 SELECT id, tenant_id, token_hash, used_at, expires_at
                 FROM portal_setup_tokens
-                WHERE contact_id = $1
-                ORDER BY created_at DESC
+                WHERE contact_id = $1 AND lookup_hash = $2
                 "#,
-            )
-            .bind(contact_id)
-            .fetch_all(self.db.migrator_pool())
-            .await?;
-        let candidate_count = candidates.len();
+        )
+        .bind(contact_id)
+        .bind(sha256_hex(secret))
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
 
-        let mut matched: Option<(Uuid, Uuid)> = None;
-        for (token_id, tenant_id, token_hash, used_at, expires_at) in &candidates {
-            if verify_password(secret, token_hash)? {
-                if used_at.is_some() {
-                    tracing::warn!(
-                        contact_id = %contact_id,
-                        token_id = %token_id,
-                        "setup_password rejected: token hash matched but row is already used"
-                    );
-                    return Err(AppError::Gone("Setup token already used".to_string()));
-                }
-                if *expires_at <= Utc::now() {
-                    tracing::warn!(
-                        contact_id = %contact_id,
-                        token_id = %token_id,
-                        expires_at = %expires_at,
-                        now = %Utc::now(),
-                        "setup_password rejected: token hash matched but row is past expiry"
-                    );
-                    return Err(AppError::BadRequest(
-                        "Invalid or expired setup token".to_string(),
-                    ));
-                }
-                matched = Some((*token_id, *tenant_id));
-                break;
-            }
-        }
-        let Some((token_id, tenant_id)) = matched else {
+        let row_hash = row
+            .as_ref()
+            .map(|(_, _, token_hash, _, _)| token_hash.as_str());
+        let verified = verify_password_or_dummy(secret, row_hash).await?;
+        let Some((token_id, tenant_id, _, used_at, expires_at)) = row.filter(|_| verified) else {
             tracing::warn!(
                 contact_id = %contact_id,
-                candidate_count = candidate_count,
-                "setup_password rejected: no portal_setup_tokens row's hash verified against the presented secret"
+                "setup_password rejected: no portal_setup_tokens row's lookup hash matched the presented secret"
             );
             return Err(AppError::BadRequest(
                 "Invalid or expired setup token".to_string(),
             ));
         };
+        if used_at.is_some() {
+            tracing::warn!(
+                contact_id = %contact_id,
+                token_id = %token_id,
+                "setup_password rejected: token hash matched but row is already used"
+            );
+            return Err(AppError::Gone("Setup token already used".to_string()));
+        }
+        if expires_at <= Utc::now() {
+            tracing::warn!(
+                contact_id = %contact_id,
+                token_id = %token_id,
+                expires_at = %expires_at,
+                now = %Utc::now(),
+                "setup_password rejected: token hash matched but row is past expiry"
+            );
+            return Err(AppError::BadRequest(
+                "Invalid or expired setup token".to_string(),
+            ));
+        }
 
         // Enforce the shared password policy. mokosh-contact-login
         // prompt 004: same rule as the staff setup + reset flows -
@@ -669,7 +671,7 @@ impl ContactAuthService {
             AppError::BadRequest(m)
         })?;
 
-        let hash = hash_password(new_password)?;
+        let hash = hash_password(new_password).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE contacts SET portal_password_hash = $1, is_portal_user = TRUE, \
@@ -759,17 +761,19 @@ impl ContactAuthService {
         // table so `setup_password` / `reset_password` can share the
         // same verify path. 30-min TTL.
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
+        let lookup_hash = sha256_hex(&secret);
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::minutes(RESET_TOKEN_TTL_MIN);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
-            "INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, lookup_hash, expires_at) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(tenant_id)
         .bind(contact_id)
         .bind(&token_hash)
+        .bind(&lookup_hash)
         .bind(expires_at)
         .execute(&mut *tx)
         .await?;
@@ -1239,7 +1243,7 @@ impl ContactAuthService {
 
             let intent_id = Uuid::new_v4();
             let secret = generate_token(32);
-            let secret_hash = hash_password(&secret)?;
+            let secret_hash = hash_password(&secret).await?;
             let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
             let ip_text = ip.map(|ip| ip.to_string()).unwrap_or_default();
             sqlx::query(
@@ -1398,7 +1402,7 @@ impl ContactAuthService {
             );
             return Err(invalid());
         }
-        if !verify_password(secret, &secret_hash)? {
+        if !verify_password(secret, &secret_hash).await? {
             tracing::warn!(
                 intent_id = %intent_id,
                 "redeem_login_link rejected: secret hash did not verify against the row"
@@ -1617,7 +1621,8 @@ impl ContactAuthService {
         portal_slug: &str,
     ) -> AppResult<String> {
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
+        let lookup_hash = sha256_hex(&secret);
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::hours(72);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1630,12 +1635,13 @@ impl ContactAuthService {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, lookup_hash, expires_at) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(tenant_id)
         .bind(contact_id)
         .bind(&token_hash)
+        .bind(&lookup_hash)
         .bind(expires_at)
         .execute(&mut *tx)
         .await?;
@@ -1727,6 +1733,68 @@ impl ContactAuthService {
             Some("active") => Ok(()),
             _ => Err(AppError::Forbidden("This portal is not active".to_string())),
         }
+    }
+
+    /// PMS-1224: fail-closed check that the `contact_sessions` row an
+    /// access token's `sid` names is still live. Called by the
+    /// middleware on every authenticated /api/v1/contact/* request so
+    /// `revoke_session`, the revoke inside `change_password`, and
+    /// `revoke_portal_access` (`contacts::service`) all kick the
+    /// bearer on its next use rather than only at its next refresh: a
+    /// missing row (revoked-and-purged) or a `revoked_at` already set
+    /// is treated the same as an unauthenticated request.
+    pub async fn ensure_session_active(&self, tenant_id: Uuid, session_id: Uuid) -> AppResult<()> {
+        let revoked_at: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
+            "SELECT revoked_at FROM contact_sessions WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(session_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        match revoked_at {
+            Some(None) => Ok(()),
+            _ => Err(AppError::Unauthorized),
+        }
+    }
+
+    /// PMS-1222: re-check, on every request, the subset of `login`'s
+    /// gates that stays meaningful after a token has been minted.
+    /// `login` (lines 160-210 before this change) resolves a company,
+    /// then requires the contact row to still be `is_portal_user = TRUE`
+    /// for that tenant, then refuses a locked-out contact; the
+    /// middleware used to check none of that, only the owning tenant's
+    /// status, so revoking portal access at the contact level (or
+    /// locking the account) had no effect until the 15-min access
+    /// token expired. Portal_id/slug resolution and the password/MFA
+    /// checks stay login-only: they establish a NEW session and have
+    /// no per-request analogue to re-check against one already minted.
+    ///
+    /// Fails closed: any error (row gone, tenant gone) reads as `false`
+    /// rather than propagating, so a caller only needs one bool check.
+    pub async fn contact_access_ok(&self, tenant_id: Uuid, contact_id: Uuid) -> AppResult<bool> {
+        if self.ensure_tenant_active(tenant_id).await.is_err() {
+            return Ok(false);
+        }
+        let row: Option<(bool, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT is_portal_user, portal_locked_until FROM contacts \
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some((is_portal_user, locked_until)) = row else {
+            return Ok(false);
+        };
+        if !is_portal_user {
+            return Ok(false);
+        }
+        if let Some(until) = locked_until {
+            if until > Utc::now() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// mokosh-contact-login prompt 004: decode a Bearer token from
@@ -2011,7 +2079,7 @@ impl ContactAuthService {
         ip: Option<IpAddr>,
     ) -> AppResult<String> {
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
         let expires_at = Utc::now() + Duration::days(REFRESH_TOKEN_TTL_DAYS);
         let ip_text = ip.map(|ip| ip.to_string()).unwrap_or_default();
         sqlx::query(
@@ -2154,7 +2222,7 @@ impl ContactAuthService {
             return Err(AppError::Unauthorized);
         };
         let hash = password_hash.ok_or(AppError::Unauthorized)?;
-        if !verify_password(current_password, &hash)? {
+        if !verify_password(current_password, &hash).await? {
             return Err(AppError::Unauthorized);
         }
         Ok((enabled, secret, email.unwrap_or_default()))
@@ -2193,7 +2261,7 @@ impl ContactAuthService {
             let crate::utils::password_policy::PasswordPolicyError::UserMessage(m) = e;
             AppError::BadRequest(m)
         })?;
-        let hash = hash_password(new_password)?;
+        let hash = hash_password(new_password).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE contacts SET portal_password_hash = $1, updated_at = NOW() \
@@ -2204,10 +2272,17 @@ impl ContactAuthService {
         .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
+        // PMS-1236: `<>` against a subquery that returns NULL (the current
+        // session row was purged by retention) evaluates to NULL for every
+        // row, so the UPDATE matched nothing and "revoke every other
+        // session" silently revoked zero. `IS DISTINCT FROM` treats a NULL
+        // right-hand side as distinct from any family_id, so a missing
+        // current-session row now means "revoke everything" instead of
+        // "revoke nothing".
         sqlx::query(
             "UPDATE contact_sessions SET revoked_at = NOW() \
              WHERE contact_id = $1 AND tenant_id = $2 AND revoked_at IS NULL \
-               AND family_id <> (SELECT family_id FROM contact_sessions WHERE id = $3)",
+               AND family_id IS DISTINCT FROM (SELECT family_id FROM contact_sessions WHERE id = $3)",
         )
         .bind(contact_id)
         .bind(tenant_id)

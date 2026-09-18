@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
@@ -55,7 +55,7 @@ use crate::db::Database;
 use crate::modules::auth::{RequireManager, TenantId, TenantScoped};
 use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider, ObjectReader};
 use crate::utils::error::{AppError, AppResult};
-use crate::utils::upload_limits::oversized_upload_error;
+use crate::utils::upload_limits::{body_limit_bytes, oversized_upload_error};
 // PMS-941: one allowlist for every publicly-readable image route. SVG is
 // refused there, for the reason the module header of `inline_image` states.
 use crate::utils::inline_image::check_inline_image_mime;
@@ -382,13 +382,19 @@ pub struct KbAttachmentRouterState {
 
 /// Authenticated routes: upload, list, delete.
 pub fn kb_attachment_routes(service: KbAttachmentService) -> Router {
+    // PMS-1233: read before `service` moves into the state, so the route's
+    // `DefaultBodyLimit` matches the cap `create` enforces rather than axum's
+    // undocumented 2 MiB default.
+    let max_bytes = service.config.max_bytes;
     let state = KbAttachmentRouterState {
         service: Arc::new(service),
     };
     Router::new()
         .route(
             "/kb/articles/{id}/attachments",
-            get(list_attachments).post(upload_attachment),
+            get(list_attachments)
+                .post(upload_attachment)
+                .layer(DefaultBodyLimit::max(body_limit_bytes(max_bytes))),
         )
         .route(
             "/kb/articles/{id}/attachments/{attachment_id}",
