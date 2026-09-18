@@ -434,23 +434,27 @@ async fn find_bunyip_principal_in_tenant_returns_the_row_for_that_tenant(pool: P
     assert!(absent.is_none());
 }
 
-/// BUNYIP-674 option B phase 2: the vocab mapper carries the whole
-/// PMS-1162 role set onto Mokosh's [`UserRole`]. Not every mapping is
-/// a bijection - `read_only` is deliberately mapped to Technician for
-/// now (mokosh has no first-class read-only tier) - so this pins the
-/// intended shape so the fallback is a deliberate act.
+/// BUNYIP-674 option B phase 2 / MAPPS-877: the vocab mapper carries
+/// the whole PMS-1162 role set onto Mokosh's [`UserRole`]. Every
+/// mapping is now a bijection - `read_only` promotes to the
+/// first-class [`UserRole::ReadOnly`] variant that landed alongside
+/// migration 225, and `RequireWriteAccess` (and the request-path
+/// `require_write_for_mutations` middleware) refuse mutations from
+/// that role.
 #[test]
 fn map_grant_role_covers_the_pms_1162_vocabulary() {
     assert_eq!(map_grant_role("admin"), Some(UserRole::Admin));
     assert_eq!(map_grant_role("manager"), Some(UserRole::Manager));
     assert_eq!(map_grant_role("technician"), Some(UserRole::Technician));
     assert_eq!(map_grant_role("finance"), Some(UserRole::Finance));
-    // Intentional over-privilege: read_only lands as Technician until
-    // a first-class read-only tier ships. The comment on the mapper
-    // spells this out; this assertion is the pin that would fail if a
-    // future edit collapsed the arm and the fallback silently became
-    // Admin or Manager.
-    assert_eq!(map_grant_role("read_only"), Some(UserRole::Technician));
+    // MAPPS-877: promoted to the first-class ReadOnly role. Before
+    // this it deliberately mapped to Technician for lack of a
+    // read-only tier, so a read_only grantee had technician-level
+    // WRITE access on the granted tenant (they could create
+    // companies, invoices, tickets). `ReadOnly::can_write` returns
+    // false and the middleware refuses their POST / PUT / PATCH /
+    // DELETE requests at the router boundary.
+    assert_eq!(map_grant_role("read_only"), Some(UserRole::ReadOnly));
     // Anything outside the vocab returns None so the middleware
     // refuses the request rather than picking a fallback role for the
     // caller.

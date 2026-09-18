@@ -660,6 +660,22 @@ pub fn create_api_router(
             },
             crate::modules::seed::seed_middleware,
         ))
+        // MAPPS-877: refuse a `ReadOnly` caller on any non-safe HTTP
+        // method. Runs AFTER `auth_middleware` (auth_middleware is
+        // added below, so it wraps this one; request flow is:
+        // auth_middleware -> require_write_for_mutations -> seed ->
+        // route) so the `AuthState` this layer reads has already been
+        // written. GET / HEAD / OPTIONS pass through unchanged; every
+        // POST / PUT / PATCH / DELETE by a caller whose role is
+        // `ReadOnly` is refused here with 403, before the handler
+        // runs. Handlers that already gate on `RequireAdmin` /
+        // `RequireManager` / `RequireFinance` refuse `ReadOnly` by
+        // construction (their allowlists do not include it); this
+        // layer catches the mutating handlers whose only auth gate
+        // was `RequireAuth`.
+        .layer(middleware::from_fn(
+            crate::modules::auth::middleware::require_write_for_mutations,
+        ))
         // Apply auth middleware
         .layer(middleware::from_fn_with_state(
             auth_middleware.clone(),

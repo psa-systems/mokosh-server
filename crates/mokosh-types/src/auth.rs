@@ -31,6 +31,13 @@ pub enum UserRole {
     Sales,
     /// Billing and invoicing
     Finance,
+    /// MAPPS-877: view-only role. Cannot POST, PUT, or DELETE
+    /// against the API - `can_write` returns false and the
+    /// `RequireWriteAccess` extractor refuses at the router
+    /// boundary. Backing the BUNYIP-674 `read_only` grant role,
+    /// which used to project onto `Technician` because mokosh had
+    /// no first-class read-only tier.
+    ReadOnly,
 }
 
 impl UserRole {
@@ -53,7 +60,7 @@ impl UserRole {
             Self::SuperAdmin => 3,
             Self::Admin => 2,
             Self::Manager => 1,
-            Self::Technician | Self::Dispatcher | Self::Sales | Self::Finance => 0,
+            Self::Technician | Self::Dispatcher | Self::Sales | Self::Finance | Self::ReadOnly => 0,
         }
     }
 
@@ -77,6 +84,15 @@ impl UserRole {
         matches!(self, Self::SuperAdmin | Self::Admin | Self::Finance)
     }
 
+    /// MAPPS-877: whether this role may make mutating requests
+    /// (POST / PUT / PATCH / DELETE). Every existing role passes;
+    /// only `ReadOnly` fails. Consumed by the `RequireWriteAccess`
+    /// extractor on write endpoints and by the SPA to hide creation
+    /// affordances the server would refuse.
+    pub fn can_write(&self) -> bool {
+        !matches!(self, Self::ReadOnly)
+    }
+
     /// Parse from string
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -87,6 +103,7 @@ impl UserRole {
             "dispatcher" => Some(Self::Dispatcher),
             "sales" => Some(Self::Sales),
             "finance" => Some(Self::Finance),
+            "read_only" => Some(Self::ReadOnly),
             _ => None,
         }
     }
@@ -101,6 +118,7 @@ impl UserRole {
             Self::Dispatcher => "dispatcher",
             Self::Sales => "sales",
             Self::Finance => "finance",
+            Self::ReadOnly => "read_only",
         }
     }
 }
@@ -1045,6 +1063,34 @@ mod tests {
         assert!(UserRole::Admin.is_admin());
         assert!(!UserRole::Manager.is_admin());
         assert!(!UserRole::Technician.is_admin());
+        assert!(!UserRole::ReadOnly.is_admin());
+    }
+
+    /// MAPPS-877: `can_write` is the single source of truth for the
+    /// mutation-gate middleware, so pin it explicitly. Every existing
+    /// role passes; only `ReadOnly` fails. `from_str` + `as_str`
+    /// round-trip through the `read_only` wire value so the DB
+    /// column can hold it after migration 225.
+    #[test]
+    fn read_only_role_cannot_write_and_round_trips_to_wire() {
+        assert!(UserRole::SuperAdmin.can_write());
+        assert!(UserRole::Admin.can_write());
+        assert!(UserRole::Manager.can_write());
+        assert!(UserRole::Technician.can_write());
+        assert!(UserRole::Dispatcher.can_write());
+        assert!(UserRole::Sales.can_write());
+        assert!(UserRole::Finance.can_write());
+        assert!(!UserRole::ReadOnly.can_write());
+
+        assert_eq!(UserRole::from_str("read_only"), Some(UserRole::ReadOnly));
+        assert_eq!(UserRole::ReadOnly.as_str(), "read_only");
+        // read_only sits at the bottom of the privilege ladder, so a
+        // read_only caller cannot grant any of the higher roles.
+        assert_eq!(UserRole::ReadOnly.privilege_rank(), 0);
+        assert!(!UserRole::ReadOnly.is_admin());
+        assert!(!UserRole::ReadOnly.can_manage_users());
+        assert!(!UserRole::ReadOnly.can_view_financials());
+        assert!(!UserRole::ReadOnly.can_manage_billing());
     }
 
     #[test]

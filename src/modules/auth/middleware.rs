@@ -472,6 +472,52 @@ pub async fn auth_middleware(
     next.run(request).await
 }
 
+/// MAPPS-877: refuse a `ReadOnly` caller on any request whose method
+/// changes state. Runs after [`auth_middleware`] so it can read the
+/// `AuthState` the auth pass wrote to the request extensions; a
+/// caller who is not authenticated at all skips this check (their
+/// request will be refused by the extractors downstream with an
+/// ordinary 401, which is the right shape). Non-mutating methods
+/// (GET / HEAD / OPTIONS) pass through unchanged, so a read-only
+/// grantee can still browse the workspace.
+///
+/// Reasoning for the middleware shape rather than per-handler
+/// extractor swaps: mokosh has ~60 mutating endpoints across ~30
+/// files, and touching each of them individually would leave the
+/// enforcement scattered and hard to audit. One layer at the router
+/// root, tested in one place, is both smaller and easier to reason
+/// about. Handlers that gate on a specific role (RequireAdmin /
+/// RequireManager / RequireFinance) already refuse `ReadOnly`
+/// because their allowlist does not include it; this middleware is
+/// what catches the mutating handlers that only asked for
+/// `RequireAuth`.
+pub async fn require_write_for_mutations(request: Request, next: Next) -> Response {
+    use axum::http::Method;
+    let method = request.method().clone();
+    // Safe methods only ever read; let them through with no lookup.
+    if matches!(&method, &Method::GET | &Method::HEAD | &Method::OPTIONS) {
+        return next.run(request).await;
+    }
+    // Look up the caller's role from the AuthState the auth pass
+    // wrote. Nothing here = no bearer or a bearer the auth pass did
+    // not accept; the downstream extractor answers 401 with the
+    // proper `WWW-Authenticate` challenge, so passing through is
+    // correct.
+    let is_read_only = request
+        .extensions()
+        .get::<AuthState>()
+        .and_then(|s| s.user.as_ref())
+        .map(|u| !u.role.can_write())
+        .unwrap_or(false);
+    if is_read_only {
+        return AppError::Forbidden(
+            "This account is read-only and cannot make changes here.".to_string(),
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
 fn bearer(req: &Request) -> Option<&str> {
     req.headers()
         .get("Authorization")?
@@ -534,10 +580,48 @@ where
     }
 }
 
+/// MAPPS-877: extractor that requires an authenticated caller AND
+/// refuses any role whose `can_write()` returns false. Wraps
+/// `RequireAuth` so a signed-out request still 401s and a signed-in
+/// `ReadOnly` request 403s at the router boundary, before the
+/// handler runs and before any database write. Handlers that used
+/// `RequireAuth` to gate a mutation (POST / PUT / PATCH / DELETE)
+/// switch to `RequireWriteAccess` with no other change; role-gated
+/// mutations (`RequireAdmin`, `RequireManager`, etc.) already refuse
+/// `ReadOnly` by construction because their allowlist does not
+/// include it, so no change is needed there.
+///
+/// The rejection is `AppError::Forbidden` with a message that names
+/// the role, so a SPA that renders the button anyway can surface a
+/// specific reason rather than a generic 403.
+#[derive(Clone)]
+pub struct RequireWriteAccess(pub CurrentUser);
+
+impl<S> axum::extract::FromRequestParts<S> for RequireWriteAccess
+where
+    S: Send + Sync,
+{
+    type Rejection = AuthRejection;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let RequireAuth(user) = RequireAuth::from_request_parts(parts, state).await?;
+        if !user.role.can_write() {
+            return Err(AppError::Forbidden(
+                "This account is read-only and cannot make changes here.".to_string(),
+            )
+            .into());
+        }
+        Ok(RequireWriteAccess(user))
+    }
+}
+
 /// MAPPS-491 (MAPPS-474 phase 2): extractor that surfaces the FULL
 /// authenticated `AuthState` (identity_id, active_membership_id,
 /// memberships, plus the user + tenant). Handlers that need the
-/// membership set — currently `GET /auth/memberships` — reach for this
+/// membership set - currently `GET /auth/memberships` - reach for this
 /// instead of `RequireAuth`, which only exposes `CurrentUser`.
 #[derive(Clone)]
 pub struct RequireAuthState(pub AuthState);
