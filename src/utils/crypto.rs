@@ -168,40 +168,59 @@ pub fn generate_numeric_code(length: usize) -> String {
         .collect()
 }
 
-/// Hash a password using Argon2id
+/// Hash a password using Argon2id.
+///
+/// Argon2 is deliberately CPU-expensive, so this runs on the blocking pool
+/// via `spawn_blocking` (PMS-1245) rather than inline on the Tokio worker
+/// thread handling the request: without that, one hash stalls every other
+/// request the worker is multiplexing for the full hashing duration.
 #[cfg(feature = "server")]
-pub fn hash_password(password: &str) -> AppResult<String> {
+pub async fn hash_password(password: &str) -> AppResult<String> {
     use argon2::{
         password_hash::{rand_core::OsRng, SaltString},
         Argon2, PasswordHasher,
     };
 
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
+    let password = password.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        let argon2 = Argon2::default();
 
-    let hash = argon2
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| AppError::Internal(format!("Password hashing error: {}", e)))?;
+        let hash = argon2
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|e| AppError::Internal(format!("Password hashing error: {}", e)))?;
 
-    Ok(hash.to_string())
+        Ok(hash.to_string())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Password hashing task panicked: {}", e)))?
 }
 
-/// Verify a password against a hash
+/// Verify a password against a hash.
+///
+/// Runs on the blocking pool for the same reason as [`hash_password`]
+/// (PMS-1245).
 #[cfg(feature = "server")]
-pub fn verify_password(password: &str, hash: &str) -> AppResult<bool> {
+pub async fn verify_password(password: &str, hash: &str) -> AppResult<bool> {
     use argon2::{Argon2, PasswordHash, PasswordVerifier};
 
-    let parsed_hash = PasswordHash::new(hash)
-        .map_err(|e| AppError::Internal(format!("Invalid password hash: {}", e)))?;
+    let password = password.to_owned();
+    let hash = hash.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let parsed_hash = PasswordHash::new(&hash)
+            .map_err(|e| AppError::Internal(format!("Invalid password hash: {}", e)))?;
 
-    match Argon2::default().verify_password(password.as_bytes(), &parsed_hash) {
-        Ok(()) => Ok(true),
-        Err(argon2::password_hash::Error::Password) => Ok(false),
-        Err(e) => Err(AppError::Internal(format!(
-            "Password verification error: {}",
-            e
-        ))),
-    }
+        match Argon2::default().verify_password(password.as_bytes(), &parsed_hash) {
+            Ok(()) => Ok(true),
+            Err(argon2::password_hash::Error::Password) => Ok(false),
+            Err(e) => Err(AppError::Internal(format!(
+                "Password verification error: {}",
+                e
+            ))),
+        }
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Password verification task panicked: {}", e)))?
 }
 
 #[cfg(test)]
@@ -327,12 +346,12 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
-    #[test]
-    fn test_password_hash_verify() {
+    #[tokio::test]
+    async fn test_password_hash_verify() {
         let password = "secure_password_123";
-        let hash = hash_password(password).unwrap();
+        let hash = hash_password(password).await.unwrap();
 
-        assert!(verify_password(password, &hash).unwrap());
-        assert!(!verify_password("wrong_password", &hash).unwrap());
+        assert!(verify_password(password, &hash).await.unwrap());
+        assert!(!verify_password("wrong_password", &hash).await.unwrap());
     }
 }

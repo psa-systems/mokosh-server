@@ -538,6 +538,66 @@ async fn contact_tenant_suspend_kicks_session(pool: PgPool) {
     );
 }
 
+/// PMS-1224: revoking a contact's `contact_sessions` row mid-TTL kicks
+/// its access token on the very next request, the same way a tenant
+/// suspend does above. Before this fix `portal_contact_middleware`
+/// decoded the JWT, called only `ensure_tenant_active`, and built the
+/// `ContactSession` straight from claims: a `revoke-portal-access` (or
+/// any other revoke path) at 10:00:30 left the bearer minted at
+/// 10:00:00 valid for every contact route until its own 10:15:00
+/// expiry.
+#[sqlx::test]
+async fn contact_session_revoke_kicks_the_access_token_mid_ttl(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (_company_id, _contact_id, _email, _slug, token) = seed_portal_contact_with_roles(
+        &app,
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "session-revoke",
+        &["Support Contact"],
+    )
+    .await;
+
+    // Pre-revoke: request works.
+    let resp = app
+        .client
+        .get(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("pre-revoke list");
+    assert_eq!(resp.status(), StatusCode::OK, "PMS-1224: pre-revoke 200");
+
+    // Mirrors what every revoke path (revoke-portal-access,
+    // ContactAuthService::revoke_session, the change_password revoke)
+    // already does to the row: flip revoked_at.
+    let revoked: u64 = sqlx::query(
+        "UPDATE contact_sessions SET revoked_at = NOW() \
+         WHERE tenant_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("revoke session")
+    .rows_affected();
+    assert_eq!(revoked, 1, "exactly the one live session should be revoked");
+
+    // Same token, next call: the middleware's ensure_session_active
+    // fires and drops the request to 401, not at 10:15:00 but now.
+    let resp = app
+        .client
+        .get(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("post-revoke list");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "PMS-1224: revoked session must 401 mid-TTL (no stale window)",
+    );
+}
+
 /// mokosh-contact-login prompt 009: documented-intent test on the
 /// access-token TTL. If a future change extends the 15-min window,
 /// this fails loudly instead of silently widening the stolen-token

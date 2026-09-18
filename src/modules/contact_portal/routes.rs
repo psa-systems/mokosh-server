@@ -372,14 +372,22 @@ async fn me(
 async fn mfa_setup(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ContactMfaSetupRequest>,
 ) -> AppResult<Json<ContactMfaSetupResponse>> {
     request.validate()?;
-    let resp = state
+    // PMS-1236: shares the reauth failure budget with mfa_disable /
+    // change_password (PMS-881), so a stolen access token cannot grind the
+    // current password at full rate through this endpoint either.
+    let ip = reauth_client_ip(addr, &headers);
+    check_reauth_budget(&state, ip, session.id)?;
+    let result = state
         .service
         .start_mfa_enrollment(session.tenant_id, session.id, &request.current_password)
-        .await?;
-    Ok(Json(resp))
+        .await;
+    spend_reauth_budget_on_refusal(&state, ip, session.id, &result);
+    Ok(Json(result?))
 }
 
 /// PMS-1063: finish MFA enrolment. Verifies one live code against the
@@ -388,10 +396,15 @@ async fn mfa_setup(
 async fn mfa_enable(
     State(state): State<ContactRouterState>,
     RequireContactAuth(session): RequireContactAuth,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ContactMfaEnableRequest>,
 ) -> AppResult<Json<ContactMfaEnableResponse>> {
     request.validate()?;
-    let resp = state
+    // PMS-1236: same reauth budget as mfa_setup above.
+    let ip = reauth_client_ip(addr, &headers);
+    check_reauth_budget(&state, ip, session.id)?;
+    let result = state
         .service
         .enable_mfa(
             session.tenant_id,
@@ -399,8 +412,9 @@ async fn mfa_enable(
             &request.code,
             &request.current_password,
         )
-        .await?;
-    Ok(Json(resp))
+        .await;
+    spend_reauth_budget_on_refusal(&state, ip, session.id, &result);
+    Ok(Json(result?))
 }
 
 /// PMS-1063: remove MFA. Needs the current password and a live code
@@ -733,6 +747,12 @@ struct StartAddPaymentMethodBody {
     /// Where the provider returns the contact if they cancel out of the
     /// setup page. Same rationale as `success_url`.
     cancel_url: String,
+    /// PMS-1235: which gateway to save the card on, when the tenant has more
+    /// than one connected. `active_provider` refuses to guess between two
+    /// active providers the same way `pay_invoice` does, so a dual-provider
+    /// tenant needs this to add a card at all.
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 /// Response from `POST /api/v1/contact/payment-methods`: the hosted-page URL
@@ -789,7 +809,13 @@ async fn start_add_payment_method(
     let tenant = crate::modules::auth::TenantId::from_trusted(session.tenant_id);
     let session_out = state
         .payment_methods
-        .start_add(tenant, session.id, &body.success_url, &body.cancel_url)
+        .start_add(
+            tenant,
+            session.id,
+            body.provider.as_deref(),
+            &body.success_url,
+            &body.cancel_url,
+        )
         .await?;
     Ok(Json(StartAddPaymentMethodResponse {
         checkout_url: session_out.url,

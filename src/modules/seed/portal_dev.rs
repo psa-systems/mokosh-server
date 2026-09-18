@@ -435,6 +435,7 @@ async fn upsert_agent_user(
     }
 
     let hash = crate::utils::crypto::hash_password(AGENT_DEV_PASSWORD)
+        .await
         .map_err(|e| anyhow!("hash agent seed password: {e}"))?;
     let (first_name, last_name) = derive_agent_name(slug);
     sqlx::query(
@@ -496,6 +497,7 @@ async fn upsert_portal_contact(
     }
 
     let hash = crate::utils::crypto::hash_password(PORTAL_DEV_PASSWORD)
+        .await
         .map_err(|e| anyhow!("hash portal seed password: {e}"))?;
     let contact_id = Uuid::new_v4();
     let mut tx = pool.begin().await?;

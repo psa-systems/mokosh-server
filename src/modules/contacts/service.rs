@@ -1047,9 +1047,16 @@ impl ContactService {
         ctx: &AuditCtx,
     ) -> AppResult<PortalAccessRequestRow> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1236: lock the row before deciding anything. Without this, a
+        // concurrent grant and decline both read `status = 'open'`, both pass
+        // the check below, and both apply their side effects (the grant's
+        // role INSERT included) before either commits its UPDATE - leaving
+        // the request's final status disagreeing with what actually happened.
+        // The lock serializes the second caller behind the first's commit, so
+        // it re-reads the now-resolved status and takes the conflict branch.
         let existing: Option<(Uuid, String, String)> = sqlx::query_as(
             "SELECT contact_id, area, status FROM portal_access_requests \
-             WHERE tenant_id = $1 AND id = $2",
+             WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
         )
         .bind(tenant_id)
         .bind(request_id)
@@ -1103,7 +1110,7 @@ impl ContactService {
         let row = sqlx::query_as::<_, PortalAccessRequestRow>(
             "UPDATE portal_access_requests \
              SET status = $3, resolved_by_id = $4, resolved_at = NOW() \
-             WHERE tenant_id = $1 AND id = $2 \
+             WHERE tenant_id = $1 AND id = $2 AND status = 'open' \
              RETURNING id, contact_id, company_id, area, note, status, requested_at, \
                        resolved_by_id, resolved_at",
         )
@@ -1111,8 +1118,13 @@ impl ContactService {
         .bind(request_id)
         .bind(if grant { "granted" } else { "declined" })
         .bind(resolved_by)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        let Some(row) = row else {
+            return Err(AppError::Conflict(
+                "This request was already resolved.".to_string(),
+            ));
+        };
 
         audit_write(
             &mut *tx,
@@ -1428,7 +1440,7 @@ impl ContactService {
         contact_id: Uuid,
     ) -> AppResult<String> {
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::hours(PORTAL_SETUP_TOKEN_TTL_HOURS);
         sqlx::query(
@@ -2465,7 +2477,7 @@ impl ContactService {
         const LOGIN_INTENT_TTL_MIN: i64 = 15;
         let intent_id = Uuid::new_v4();
         let secret = crate::utils::crypto::generate_token(32);
-        let secret_hash = crate::utils::crypto::hash_password(&secret)?;
+        let secret_hash = crate::utils::crypto::hash_password(&secret).await?;
         let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
         // SAFETY (PMS-285): grant email is called post-commit from
         // `grant_portal_access` and there is no `app.current_tenant`
@@ -3766,6 +3778,29 @@ impl ContactService {
         // idempotent when nothing changed and self-healing when it did.
         self.recompute_contact_mirrors(&mut tx, tenant_id, contact_id)
             .await?;
+
+        // PMS-1236: a company-scoped portal role assignment must be dropped
+        // when the contact's company changes, or the contact keeps a role
+        // (and the capabilities it grants) scoped to a Company they no
+        // longer belong to. `contact_role_assignments` only ever validated
+        // scope AT WRITE time (`grant_portal_access`,
+        // `replace_portal_role_assignments`); nothing re-checked it here.
+        // Tenant-wide roles (`portal_roles.company_id IS NULL`) are
+        // unaffected. Unconditional and cheap: a no-op when the company did
+        // not change or the contact holds no company-scoped role.
+        sqlx::query(
+            "DELETE FROM contact_role_assignments cra \
+             USING portal_roles pr, contacts c \
+             WHERE cra.role_id = pr.id \
+               AND c.tenant_id = cra.tenant_id AND c.id = cra.contact_id \
+               AND cra.tenant_id = $1 AND cra.contact_id = $2 \
+               AND pr.company_id IS NOT NULL \
+               AND pr.company_id IS DISTINCT FROM c.company_id",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .execute(&mut *tx)
+        .await?;
 
         // PMS-136: a false -> true transition mints a single-use setup token
         // and (after commit) emails the contact a `/portal/set-password` link.

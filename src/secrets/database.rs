@@ -75,6 +75,24 @@ impl SecretProvider for DatabaseSecretProvider {
         Ok(())
     }
 
+    async fn put_if_absent(&self, key: &SecretKey, value: &str) -> AppResult<bool> {
+        let name = key.name()?;
+        let ciphertext = crate::utils::crypto::encrypt(value, &self.encryption_key)?;
+        let mut tx = self.db.begin_with_tenant(key.tenant_id()).await?;
+        let inserted: Option<i32> = sqlx::query_scalar(
+            "INSERT INTO secrets (tenant_id, name, value_encrypted) VALUES ($1, $2, $3) \
+             ON CONFLICT (tenant_id, name) DO NOTHING \
+             RETURNING 1",
+        )
+        .bind(key.tenant_id())
+        .bind(&name)
+        .bind(&ciphertext)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(inserted.is_some())
+    }
+
     async fn delete(&self, key: &SecretKey) -> AppResult<()> {
         let name = key.name()?;
         let mut tx = self.db.begin_with_tenant(key.tenant_id()).await?;
