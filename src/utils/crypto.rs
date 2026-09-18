@@ -160,6 +160,25 @@ pub fn generate_portal_id() -> i64 {
     rand::rng().random_range(100_000_000..1_000_000_000)
 }
 
+/// Lowercase hex SHA-256 of an arbitrary string. Used as an
+/// equality-matchable lookup key alongside a slow (Argon2) hash of the same
+/// secret, so a redemption can `SELECT ... WHERE lookup_hash = $1` for the
+/// exact row instead of Argon2-verifying every candidate row (PMS-1244).
+/// Not a substitute for Argon2 verification: SHA-256 is fast and offers no
+/// protection against an offline guess of a low-entropy secret, so it locates
+/// the row only, and the actual credential check stays the Argon2 compare
+/// against that one row's slow hash.
+pub fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Generate a short numeric code (for MFA, etc.)
 pub fn generate_numeric_code(length: usize) -> String {
     let mut rng = rand::rng();
@@ -196,6 +215,20 @@ pub async fn hash_password(password: &str) -> AppResult<String> {
     .map_err(|e| AppError::Internal(format!("Password hashing task panicked: {}", e)))?
 }
 
+/// Count of every `verify_password` call made in this process. PMS-1244:
+/// the token-redemption paths must run Argon2 verification exactly once per
+/// redemption attempt, not once per candidate row; integration tests read
+/// this counter around a redemption call to prove it rather than relying on
+/// a mock.
+#[cfg(feature = "server")]
+static VERIFY_PASSWORD_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "server")]
+pub fn verify_password_call_count() -> usize {
+    VERIFY_PASSWORD_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Verify a password against a hash.
 ///
 /// Runs on the blocking pool for the same reason as [`hash_password`]
@@ -203,6 +236,8 @@ pub async fn hash_password(password: &str) -> AppResult<String> {
 #[cfg(feature = "server")]
 pub async fn verify_password(password: &str, hash: &str) -> AppResult<bool> {
     use argon2::{Argon2, PasswordHash, PasswordVerifier};
+
+    VERIFY_PASSWORD_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let password = password.to_owned();
     let hash = hash.to_owned();
@@ -221,6 +256,44 @@ pub async fn verify_password(password: &str, hash: &str) -> AppResult<bool> {
     })
     .await
     .map_err(|e| AppError::Internal(format!("Password verification task panicked: {}", e)))?
+}
+
+/// A fixed, validly-formatted Argon2 hash with no real secret behind it.
+/// Memoized: hashing is the expensive part, and every caller needs the same
+/// constant-cost stand-in, not a fresh one per call. `hash_password` is
+/// async (PMS-1245), so the memoization uses `tokio::sync::OnceCell` rather
+/// than `std::sync::OnceLock`, whose `get_or_init` closure cannot `.await`.
+#[cfg(feature = "server")]
+async fn dummy_password_hash() -> &'static str {
+    static DUMMY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    DUMMY
+        .get_or_init(|| async {
+            hash_password("pms-1244-no-token-row-matched")
+                .await
+                .expect("dummy hash always succeeds")
+        })
+        .await
+}
+
+/// Verify `secret` against `row_hash` when a redemption lookup found a
+/// candidate row, or against a fixed dummy hash when it found none, so a
+/// redemption attempt that matches no row costs the same single Argon2
+/// verify as one that does (PMS-1244). Without this, looking a token up by
+/// its `lookup_hash` before verifying would make "no row matched" return
+/// near-instantly while "a row matched but the token was still wrong" pays
+/// a ~50ms Argon2 verify, turning that timing gap into an oracle for
+/// whether a submitted token's lookup hash exists in the table at all.
+/// Always returns `Ok(false)` for the no-row case; the dummy verify's own
+/// result is never a match.
+#[cfg(feature = "server")]
+pub async fn verify_password_or_dummy(secret: &str, row_hash: Option<&str>) -> AppResult<bool> {
+    match row_hash {
+        Some(hash) => verify_password(secret, hash).await,
+        None => {
+            verify_password(secret, dummy_password_hash().await).await?;
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +418,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sha256_hex_is_deterministic_and_hex() {
+        let a = sha256_hex("some-secret");
+        let b = sha256_hex("some-secret");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, sha256_hex("some-other-secret"));
+    }
+
     #[cfg(feature = "server")]
     #[tokio::test]
     async fn test_password_hash_verify() {
@@ -353,5 +436,18 @@ mod tests {
 
         assert!(verify_password(password, &hash).await.unwrap());
         assert!(!verify_password("wrong_password", &hash).await.unwrap());
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn verify_password_or_dummy_matches_a_real_row_and_rejects_a_missing_one() {
+        let secret = "correct-secret";
+        let hash = hash_password(secret).await.unwrap();
+
+        assert!(verify_password_or_dummy(secret, Some(&hash)).await.unwrap());
+        assert!(!verify_password_or_dummy("wrong-secret", Some(&hash))
+            .await
+            .unwrap());
+        assert!(!verify_password_or_dummy(secret, None).await.unwrap());
     }
 }

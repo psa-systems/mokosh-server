@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
-use crate::utils::crypto::{generate_token, hash_password};
+use crate::utils::crypto::{generate_token, hash_password, sha256_hex};
 use crate::utils::email::salutation;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -1441,17 +1441,19 @@ impl ContactService {
     ) -> AppResult<String> {
         let secret = generate_token(64);
         let token_hash = hash_password(&secret).await?;
+        let lookup_hash = sha256_hex(&secret);
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::hours(PORTAL_SETUP_TOKEN_TTL_HOURS);
         sqlx::query(
             r#"
-            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, lookup_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(tenant_id)
         .bind(contact_id)
         .bind(&token_hash)
+        .bind(&lookup_hash)
         .bind(expires_at)
         .execute(conn)
         .await?;
