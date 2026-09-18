@@ -6,11 +6,13 @@
 //! dev and prod and driven only by environment variables.
 //!
 //! Before connecting the request pools and running migrations, the server
-//! checks whether the `mokosh_migrator` role can already log in. If it can,
+//! checks whether the `mokosh_migrator` role can already log in AND has
+//! `CREATE` on schema `public` in the current database. If both hold,
 //! provisioning is skipped entirely, so production may drop the privileged
-//! admin credentials after the first boot. If it cannot, the server connects
-//! with the privileged `MOKOSH_ADMIN_DATABASE_URL` and idempotently creates
-//! the two roles:
+//! admin credentials after the first boot. If either does not, the server
+//! connects with the privileged `MOKOSH_ADMIN_DATABASE_URL` and
+//! idempotently creates (or reconciles) the two roles and their
+//! per-database GRANTs:
 //!
 //! - `mokosh_migrator` (`LOGIN BYPASSRLS`) owns the schema and runs DDL /
 //!   migrations / bootstrap. It is also granted `CREATE ON DATABASE` so the
@@ -67,12 +69,26 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     let probe = roles_probe(migrator_url).await;
     match probe {
         RolesProbe::BothExist => {
-            tracing::info!("mokosh_app present and able to log in; skipping role provisioning");
+            tracing::info!(
+                "mokosh_app present and per-database grants applied; skipping role provisioning"
+            );
             return Ok(());
         }
         RolesProbe::MigratorConnectsAppMissing => {
             tracing::warn!(
                 "DATABASE_URL connects but mokosh_app is missing or cannot log in; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
+            );
+        }
+        RolesProbe::PerDatabaseGrantsMissing => {
+            // Cluster-wide roles are fine (a previous deployment on this
+            // cluster provisioned them); the current database is new to
+            // them and none of the GRANTs / ALTER DEFAULT PRIVILEGES
+            // targets `public` here have run yet. The full-provision path
+            // below is entirely idempotent, so re-running it applies the
+            // per-database statements without disturbing the existing
+            // roles or any other database.
+            tracing::warn!(
+                "DATABASE_URL connects and both roles exist, but per-database grants are missing in the current database; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
             );
         }
         RolesProbe::MigratorCannotConnect => {
@@ -86,10 +102,7 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
             // No admin credentials to create or reconcile the roles with. Fail
             // loud now rather than let the later request-pool connect fail with
             // a bare auth error.
-            return Err(AppError::Database(admin_unset_message(matches!(
-                probe,
-                RolesProbe::MigratorConnectsAppMissing
-            ))));
+            return Err(AppError::Database(admin_unset_message(&probe)));
         }
     };
 
@@ -176,14 +189,20 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
 }
 
 /// The result of the boot-time role probe: does the migrator role log in,
-/// and can the `mokosh_app` role log in?
+/// can the `mokosh_app` role log in, and are the per-database GRANTs
+/// applied in the current database?
 ///
 /// [`RolesProbe::BothExist`] is the fast path a healthy deployment takes on
 /// every subsequent boot. [`RolesProbe::MigratorConnectsAppMissing`] is the
 /// state staging hit on 2026-09-10, where the migrator was fine but every
-/// GRANT to `mokosh_app` in a new migration failed. [`RolesProbe::MigratorCannotConnect`]
-/// is the first-boot state, or a deployment that has never provisioned the
-/// split roles.
+/// GRANT to `mokosh_app` in a new migration failed. [`RolesProbe::PerDatabaseGrantsMissing`]
+/// is the state a NEW database on an EXISTING cluster reaches: the roles
+/// live cluster-wide so the pre-fix probe returned `BothExist`, but none of
+/// the per-database GRANTs / ALTER DEFAULT PRIVILEGES have run against
+/// this database yet, so the migrator cannot create objects in `public`
+/// and the very first migration fails with `permission denied for schema
+/// public`. [`RolesProbe::MigratorCannotConnect`] is the first-boot state,
+/// or a deployment that has never provisioned the split roles.
 ///
 /// PMS-1163: `MigratorConnectsAppMissing` also fires when the `mokosh_app`
 /// row exists but is `NOLOGIN`. That is what staging landed in after
@@ -196,6 +215,15 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
 enum RolesProbe {
     BothExist,
     MigratorConnectsAppMissing,
+    /// Cluster-wide roles are healthy, but the current database is new
+    /// to them: `mokosh_migrator` does not have `CREATE` on schema
+    /// `public` in this database, so the migrator cannot install
+    /// extensions or run the first migration. Routes to the same full
+    /// provision path as `MigratorConnectsAppMissing` because every
+    /// GRANT / ALTER DEFAULT PRIVILEGES statement on that path is
+    /// idempotent, so re-running heals the missing per-database state
+    /// without disturbing the existing roles.
+    PerDatabaseGrantsMissing,
     MigratorCannotConnect,
 }
 
@@ -244,11 +272,8 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
         tracing::warn!("mokosh_app existence probe failed: {e}");
         false
     });
-    pool.close().await;
 
-    if app_can_login {
-        RolesProbe::BothExist
-    } else {
+    if !app_can_login {
         // Covers both "row missing" and "row exists but NOLOGIN". The
         // downstream branch runs the same ALTER either way, so one variant
         // covers both, but log the reason so an operator reading the boot
@@ -256,7 +281,44 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
         tracing::info!(
             "mokosh_app row missing or cannot log in; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
         );
-        RolesProbe::MigratorConnectsAppMissing
+        pool.close().await;
+        return RolesProbe::MigratorConnectsAppMissing;
+    }
+
+    // Per-database check: pg_roles and rolcanlogin are cluster-wide, so
+    // both survive the creation of a new database on a cluster that has
+    // already served a previous deployment. The GRANTs in
+    // `provision_roles` are per-database, and none of them run against
+    // the new database until the full-provision path fires. Ask the
+    // current database directly whether `mokosh_migrator` can create in
+    // `public`: on a healthy repeat boot this is TRUE and the fast path
+    // stands; on a new database it is FALSE (whoever created the
+    // database owns `public`, and the migrator has no grants on it),
+    // and the caller routes to the full provision path where the
+    // idempotent GRANTs heal the missing state. `has_schema_privilege`
+    // accepts a role name and answers for the current database; it
+    // needs no extra grants, so the migrator's own connection answers.
+    let migrator_can_create: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege('mokosh_migrator', 'public', 'CREATE')")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("mokosh_migrator per-database privilege probe failed: {e}");
+                // Same fail-open shape as the app_can_login probe above:
+                // return the "provisioning needed" state so the admin
+                // URL branch surfaces the underlying error if it is
+                // unset, rather than silently claiming the fast path.
+                false
+            });
+    pool.close().await;
+
+    if migrator_can_create {
+        RolesProbe::BothExist
+    } else {
+        tracing::info!(
+            "mokosh_migrator lacks CREATE on schema public in the current database; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
+        );
+        RolesProbe::PerDatabaseGrantsMissing
     }
 }
 
@@ -268,21 +330,37 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
 /// staging reached in September 2026, where `DATABASE_URL` connected fine and
 /// `mokosh_app` was the thing missing (and, after PMS-1163, present but
 /// `NOLOGIN`). An operator told the wrong problem fixes the wrong thing.
-fn admin_unset_message(database_url_connected: bool) -> String {
-    if database_url_connected {
-        format!(
+///
+/// The `PerDatabaseGrantsMissing` branch is the new-DB-on-existing-cluster
+/// state: the roles connect, but the per-database GRANTs never ran, so the
+/// admin URL is needed to apply them here without disturbing anything else.
+fn admin_unset_message(state: &RolesProbe) -> String {
+    match state {
+        RolesProbe::MigratorConnectsAppMissing => format!(
             "DATABASE_URL connects, but mokosh_app is missing or cannot log in, and \
              {ADMIN_DATABASE_URL_VAR} is unset; set {ADMIN_DATABASE_URL_VAR} to a privileged \
              (superuser) connection string so the server can create mokosh_app, or reconcile \
              an existing one to LOGIN with MOKOSH_APP_PASSWORD. A hand-created NOLOGIN \
              mokosh_app is not enough when MOKOSH_APP_DATABASE_URL logs in as it."
-        )
-    } else {
-        format!(
+        ),
+        RolesProbe::PerDatabaseGrantsMissing => format!(
+            "DATABASE_URL connects and both roles exist, but mokosh_migrator has no CREATE on \
+             schema public in the current database (a new database on a cluster that already \
+             served a previous deployment), and {ADMIN_DATABASE_URL_VAR} is unset; set \
+             {ADMIN_DATABASE_URL_VAR} to a privileged (superuser) connection string so the \
+             server can apply the per-database GRANTs to this database. The idempotent \
+             GRANT / ALTER DEFAULT PRIVILEGES statements do not disturb any other database."
+        ),
+        RolesProbe::MigratorCannotConnect => format!(
             "mokosh_migrator cannot connect and {ADMIN_DATABASE_URL_VAR} is unset; set \
              {ADMIN_DATABASE_URL_VAR} to a privileged (superuser) connection string so the \
              server can create the mokosh_migrator / mokosh_app roles on first boot"
-        )
+        ),
+        RolesProbe::BothExist => format!(
+            "the fast path returned BothExist and no provisioning is needed; if you are \
+             reading this line, `provision_roles` was called with an unexpected shape. \
+             {ADMIN_DATABASE_URL_VAR} is unset."
+        ),
     }
 }
 
@@ -321,7 +399,7 @@ mod tests {
     /// which is exactly the state staging reached.
     #[test]
     fn the_admin_unset_error_does_not_say_a_connection_failed_when_it_did_not() {
-        let connected = admin_unset_message(true);
+        let connected = admin_unset_message(&RolesProbe::MigratorConnectsAppMissing);
         assert!(!connected.contains("cannot connect"), "{connected}");
         assert!(
             connected.contains("mokosh_app is missing or cannot log in"),
@@ -330,10 +408,31 @@ mod tests {
         assert!(connected.contains("NOLOGIN"), "names the trap: {connected}");
         assert!(connected.contains(ADMIN_DATABASE_URL_VAR), "{connected}");
 
-        let first_boot = admin_unset_message(false);
+        let first_boot = admin_unset_message(&RolesProbe::MigratorCannotConnect);
         assert!(
             first_boot.contains("mokosh_migrator cannot connect"),
             "{first_boot}"
+        );
+    }
+
+    /// The new-DB-on-existing-cluster branch: DATABASE_URL connects, both
+    /// roles exist, but the current database has never had the
+    /// per-database GRANTs applied. The message names this exact state so
+    /// an operator does not go hunt for a role that already exists.
+    #[test]
+    fn the_admin_unset_error_names_the_per_database_grants_missing_state() {
+        let msg = admin_unset_message(&RolesProbe::PerDatabaseGrantsMissing);
+        assert!(!msg.contains("cannot connect"), "{msg}");
+        assert!(!msg.contains("mokosh_app is missing"), "{msg}");
+        assert!(
+            msg.contains("no CREATE on schema public"),
+            "names the missing privilege: {msg}"
+        );
+        assert!(msg.contains("new database"), "names the situation: {msg}");
+        assert!(msg.contains(ADMIN_DATABASE_URL_VAR), "{msg}");
+        assert!(
+            msg.contains("do not disturb any other database"),
+            "reassures on blast radius: {msg}"
         );
     }
 
