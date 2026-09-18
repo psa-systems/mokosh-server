@@ -87,6 +87,7 @@ async fn seed_portal_contact(pool: &PgPool, email: &str) -> (Uuid, Uuid, String)
 /// passing.
 async fn stamp_password_hash(pool: &PgPool, contact_id: Uuid) {
     let hash = mokosh_server::utils::crypto::hash_password("test-fixture-password-x9")
+        .await
         .expect("hash test-fixture password");
     sqlx::query("UPDATE contacts SET portal_password_hash = $1 WHERE id = $2")
         .bind(hash)
@@ -150,7 +151,9 @@ async fn mint_intent_direct(
 ) -> String {
     let intent_id = Uuid::new_v4();
     let secret = mokosh_server::utils::crypto::generate_token(32);
-    let hash = mokosh_server::utils::crypto::hash_password(&secret).expect("hash");
+    let hash = mokosh_server::utils::crypto::hash_password(&secret)
+        .await
+        .expect("hash");
     let expires = expires_at_override.unwrap_or_else(|| Utc::now() + Duration::minutes(15));
     sqlx::query(
         "INSERT INTO portal_login_intents \
@@ -591,7 +594,9 @@ async fn mfa_on_the_magic_link_completes_on_the_second_post(pool: PgPool) {
     let (contact_id, _co_id, _slug) = seed_portal_contact(&pool, "mfa@mcl.example").await;
     let secret = mokosh_server::utils::totp::generate_secret();
     let secret_b32 = mokosh_server::utils::totp::base32_encode(&secret);
-    let pwd = mokosh_server::utils::crypto::hash_password("Xy9#pQ4v!Lm2wRt7").expect("hash");
+    let pwd = mokosh_server::utils::crypto::hash_password("Xy9#pQ4v!Lm2wRt7")
+        .await
+        .expect("hash");
     sqlx::query(
         "UPDATE contacts SET portal_mfa_enabled = TRUE, portal_mfa_secret = $1, \
          portal_password_hash = $2 WHERE id = $3",
@@ -706,7 +711,9 @@ async fn a_recovery_code_completes_the_magic_link_once(pool: PgPool) {
     let (contact_id, _co_id, _slug) = seed_portal_contact(&pool, "recover@mcl.example").await;
     let secret_b32 =
         mokosh_server::utils::totp::base32_encode(&mokosh_server::utils::totp::generate_secret());
-    let pwd = mokosh_server::utils::crypto::hash_password("Xy9#pQ4v!Lm2wRt7").expect("hash");
+    let pwd = mokosh_server::utils::crypto::hash_password("Xy9#pQ4v!Lm2wRt7")
+        .await
+        .expect("hash");
     let recovery = mokosh_server::utils::recovery::generate_code();
     let hashes = vec![mokosh_server::utils::recovery::hash_code_hex(&recovery)];
     sqlx::query(

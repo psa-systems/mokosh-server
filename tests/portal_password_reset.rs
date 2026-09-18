@@ -59,7 +59,9 @@ async fn seed_reset_token(
     secret: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
 ) -> (Uuid, String) {
-    let hash = mokosh_server::utils::crypto::hash_password(secret).expect("hash");
+    let hash = mokosh_server::utils::crypto::hash_password(secret)
+        .await
+        .expect("hash");
     let token_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO portal_setup_tokens (id, tenant_id, contact_id, token_hash, expires_at) \
@@ -143,7 +145,9 @@ async fn reset_password_happy_path(pool: PgPool) {
             .expect("select hash");
     let new_hash = new_hash.expect("hash written after reset");
     assert!(
-        mokosh_server::utils::crypto::verify_password(STRONG, &new_hash).expect("verify"),
+        mokosh_server::utils::crypto::verify_password(STRONG, &new_hash)
+            .await
+            .expect("verify"),
         "new password verifies"
     );
     let login = common::contact_login_response(&app, &contact, STRONG).await;

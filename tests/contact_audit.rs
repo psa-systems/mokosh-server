@@ -209,7 +209,9 @@ async fn password_reset_and_change_write_rows(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
 
     let secret = "reset-secret-abcdefghij";
-    let hash = mokosh_server::utils::crypto::hash_password(secret).unwrap();
+    let hash = mokosh_server::utils::crypto::hash_password(secret)
+        .await
+        .unwrap();
     let token_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO portal_setup_tokens (id, tenant_id, contact_id, token_hash, expires_at) \
@@ -417,7 +419,9 @@ async fn a_wrong_second_factor_on_the_magic_link_writes_mfa_failed(pool: PgPool)
     .unwrap();
     let intent_id = Uuid::new_v4();
     let link_secret = mokosh_server::utils::crypto::generate_token(32);
-    let hash = mokosh_server::utils::crypto::hash_password(&link_secret).unwrap();
+    let hash = mokosh_server::utils::crypto::hash_password(&link_secret)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO portal_login_intents (id, tenant_id, email, secret_hash, expires_at) \
          VALUES ($1, $2, $3, $4, NOW() + INTERVAL '15 minutes')",

@@ -1440,7 +1440,7 @@ impl ContactService {
         contact_id: Uuid,
     ) -> AppResult<String> {
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::hours(PORTAL_SETUP_TOKEN_TTL_HOURS);
         sqlx::query(
@@ -2477,7 +2477,7 @@ impl ContactService {
         const LOGIN_INTENT_TTL_MIN: i64 = 15;
         let intent_id = Uuid::new_v4();
         let secret = crate::utils::crypto::generate_token(32);
-        let secret_hash = crate::utils::crypto::hash_password(&secret)?;
+        let secret_hash = crate::utils::crypto::hash_password(&secret).await?;
         let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
         // SAFETY (PMS-285): grant email is called post-commit from
         // `grant_portal_access` and there is no `app.current_tenant`

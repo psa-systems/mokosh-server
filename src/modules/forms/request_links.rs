@@ -163,7 +163,7 @@ impl FormsService {
 
         let token_id = Uuid::new_v4();
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
         let expires_at = Utc::now() + Duration::days(REQUEST_LINK_TTL_DAYS);
 
         sqlx::query(
@@ -316,7 +316,7 @@ impl FormsService {
 
         let row = row.ok_or_else(invalid)?;
 
-        if !verify_password(secret, &row.token_hash)? {
+        if !verify_password(secret, &row.token_hash).await? {
             return Err(invalid());
         }
         if row.used_at.is_some() {
