@@ -56,7 +56,9 @@ the runner up and check nothing, so no recipe mirrors them.
   `server` container. `just check` is where they belong.
 - **`cargo machete` needs a host install.** `check-unused-deps` fails with the
   `cargo install --locked cargo-machete` hint rather than installing it for you;
-  `check.yml` installs it in the step (a no-op once `rust-cache` restores it).
+  `check.yml` downloads a pinned, checksum-verified release binary instead
+  (PMS-1251), so the CI version is not necessarily what a local `cargo install`
+  gets you.
 - **`check-migration-immutability` needs `origin/main` with history.**
   `check.yml` clones with `fetch-depth: 0`. On a shallow local clone, run
   `git fetch origin main` first or the script fails loud rather than passing.
@@ -68,6 +70,6 @@ These are gates in their own right, and no step of `check.yml` covers them.
 | Recipe | Covered in CI by | Why it is not in `just check` |
 | --- | --- | --- |
 | `check-docker` | [`build-oci-image.yml`](../../.forgejo/workflows/build-oci-image.yml) | Builds the OCI builder stage: minutes per run, needs a Docker builder and the crates.io network. Run it by hand when touching `oci-build/Dockerfile`. |
-| `test-integration` | [`integration.yml`](../../.forgejo/workflows/integration.yml) | Needs a Postgres container. PMS-267 split it out of `check.yml` for the same reason. Both run `cargo nextest` with the `ci` profile in [`.config/nextest.toml`](../../.config/nextest.toml) (PMS-1177): CI builds a nextest archive in a step of its own and runs the suite from it with `cargo nextest run --archive-file`, which cannot recompile, so the timed step never recompiles what the build step just built; the recipe runs `cargo nextest run` directly, install-and-run, in the dev compose `server` container. Budget is 10 minutes wall clock for the whole CI job on a warm cache; a stuck case is reported and terminated by nextest's own `slow-timeout`/`terminate-after` rather than a shell `timeout` wrapper. |
+| `test-integration` | [`integration.yml`](../../.forgejo/workflows/integration.yml) | Needs a Postgres container. PMS-267 split it out of `check.yml` for the same reason. Both run `cargo nextest` with the `ci` profile in [`.config/nextest.toml`](../../.config/nextest.toml) (PMS-1177): CI builds a nextest archive in a step of its own and runs the suite from it with `cargo nextest run --archive-file`, which cannot recompile, so the timed step never recompiles what the build step just built; the recipe runs `cargo nextest run` directly, install-and-run, in the dev compose `server` container. Budget is 10 minutes wall clock for the whole CI job on a warm cache; a stuck case is reported and terminated by nextest's own `slow-timeout`/`terminate-after` rather than a shell `timeout` wrapper. CI installs nextest from a pinned, checksum-verified release archive rather than `cargo install` (PMS-1251, avoids compiling nextest's ~330-crate dependency tree from source on a cache miss); the recipe still uses `cargo install`, but pinned to the same version with `--version`, so the two do not drift apart silently. The Postgres service in `integration.yml` also runs with `fsync`/`synchronous_commit`/`full_page_writes` off (PMS-1251), because that instance is destroyed with the job; the dev cluster `test-integration` runs against keeps full durability, which is why that change lives in `integration.yml` and not in `scripts/test-db-roles.sql`. |
 | `verify-demo` | none | Targeted subset of `test-integration` (`seed_demo` + `data_transfer`), same Postgres requirement (PMS-677). |
 | `test-e2e` | [`e2e.yml`](../../.forgejo/workflows/e2e.yml) | Playwright against staging or `$E2E_BASE_URL`: needs a deployed environment (PMS-140). |

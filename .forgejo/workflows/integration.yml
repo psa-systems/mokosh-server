@@ -110,10 +110,35 @@ jobs:
         # PMS-1177: nextest schedules test CASES from every archived binary
         # concurrently instead of running one `tests/*.rs` binary to
         # completion before starting the next, which is where most of the
-        # previous wall clock went. Same pattern check.yml uses for
-        # cargo-machete: `cargo install` is a no-op once `rust-cache`
-        # restores the binary.
-        run: cargo install --locked cargo-nextest
+        # previous wall clock went.
+        #
+        # PMS-1251: `cargo install --locked cargo-nextest` compiled nextest
+        # and its dependency tree from source on every cache-miss run (717
+        # `Compiling` lines total, 333 of them nextest's own tree; every run
+        # logged `No cache found` on 2026-09-17, per DEV-758). A pinned
+        # release archive replaces it. get.nexte.st publishes no checksum
+        # file, so the archive's SHA-256 is pinned here and verified with
+        # `sha256sum --check --strict`, the same pattern the MinIO step below
+        # uses for the same reason.
+        #
+        # `ghcr.io/niceguyit/rust-builder-glibc` sets CARGO_HOME=/usr/local/cargo
+        # and puts only that on PATH, not `~/.cargo/bin` (`~` is `/root` in
+        # this image but `/root/.cargo/bin` is never added to PATH). Installing
+        # there left the binary on disk but invisible to `cargo`, which reports
+        # a plain "no such command: `nextest`" with no hint that the install
+        # step ran at all. `${CARGO_HOME:-$HOME/.cargo}/bin` is where `cargo`
+        # actually looks.
+        env:
+          NEXTEST_VERSION: "0.9.145"
+          NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
+        run: |
+          set -euo pipefail
+          curl --silent --fail --location --output /tmp/nextest.tar.gz \
+            "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          mkdir -p "${cargo_bin}"
+          tar --extract --gzip --file /tmp/nextest.tar.gz --directory "${cargo_bin}"
 
       - name: Cap build parallelism
         # nproc/2 cap: never claim more than half the host (see "Concurrency
@@ -196,6 +221,27 @@ jobs:
             echo "S3_ACCESS_KEY_ID=mokosh"
             echo "S3_SECRET_ACCESS_KEY=mokosh-ci-password"
           } >> "$GITHUB_ENV"
+
+      - name: Disable Postgres durability
+        # PMS-1251: this `postgres` service is thrown away with the job, so
+        # fsync/synchronous_commit/full_page_writes buy crash safety this
+        # database never needs to survive into. Measured locally against
+        # postgres:18.2-alpine3.23 on 2026-09-17: the 229-migration run drops
+        # from 1.12-1.32s to 0.60-0.71s and `CREATE DATABASE ... TEMPLATE`
+        # from 104-146ms to 35-39ms, a cost `#[sqlx::test]` pays about 1,300
+        # times per run (one database per invocation). Kept out of
+        # scripts/test-db-roles.sql, which also runs against the dev cluster,
+        # whose data a developer keeps. All three settings are reloadable, so
+        # no restart is needed. ON_ERROR_STOP is not optional, for the same
+        # reason the DB-roles step below sets it.
+        run: |
+          psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 <<'SQL'
+          ALTER SYSTEM SET fsync = off;
+          ALTER SYSTEM SET synchronous_commit = off;
+          ALTER SYSTEM SET full_page_writes = off;
+          SELECT pg_reload_conf();
+          SQL
+          psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --command 'SHOW fsync'
 
       - name: Create the DB roles the migrations grant to
         # PMS-988: migration 207 (`app_secrets`) ends with `GRANT ... TO
