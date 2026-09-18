@@ -342,4 +342,76 @@ mod tests {
         assert_eq!(quote_ident("mokosh"), "\"mokosh\"");
         assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
     }
+
+    /// PMS-1265: a migration that creates a table grants it to `mokosh_app`
+    /// in the same file.
+    ///
+    /// The provisioner only reaches the app role for tables `mokosh_migrator`
+    /// creates (default privileges) or that exist at a full provision. A
+    /// deployment whose migrations run as another owner, which staging's do,
+    /// leaves every later table invisible to the app pool: that is how
+    /// contact create and list went 500 there with `permission denied for
+    /// table contact_sync_links`. Migration 235 healed every table up to it;
+    /// this keeps the next one from repeating it. Earlier migrations are
+    /// immutable and covered by 235, so only those after it are read.
+    #[test]
+    fn every_new_table_is_granted_to_the_app_role() {
+        const HEALED_UP_TO: u32 = 235;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut read = 0;
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read migrations") {
+            let path = entry.expect("entry").path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(number) = name.split('_').next().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            read += 1;
+            if number <= HEALED_UP_TO {
+                continue;
+            }
+            let sql = std::fs::read_to_string(&path)
+                .expect("read migration")
+                .to_lowercase();
+            let code: String = sql
+                .lines()
+                .map(|l| l.split("--").next().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for created in code.split("create table").skip(1) {
+                let table = created
+                    .trim_start()
+                    .trim_start_matches("if not exists")
+                    .trim_start()
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                    .next()
+                    .unwrap_or_default()
+                    .trim_start_matches("public.")
+                    .to_string();
+                let granted = code.split("grant").skip(1).any(|g| {
+                    let statement = g.split(';').next().unwrap_or_default();
+                    statement.contains("to mokosh_app")
+                        && (statement.contains(&format!(" {table} "))
+                            || statement.contains(&format!(" {table},"))
+                            || statement.contains(&format!(",{table} "))
+                            || statement.contains(&format!(" {table}\n"))
+                            || statement.contains("all tables in schema public"))
+                });
+                if !granted {
+                    offenders.push(format!("{name}: {table}"));
+                }
+            }
+        }
+        assert!(
+            read > HEALED_UP_TO as usize / 2,
+            "only {read} migrations were read"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these migrations create a table without `GRANT SELECT, INSERT, UPDATE, DELETE ON <table> TO mokosh_app;` in the same file, so a deployment whose migrations run as another owner cannot read it (PMS-1265):\n{}",
+            offenders.join("\n")
+        );
+    }
 }
