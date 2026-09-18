@@ -62,7 +62,7 @@ where
 impl TenantOrPlatformCaller {
     /// Read-side gate: platform admin can read any tenant; a tenant
     /// caller can read only their own.
-    fn require_read_access(&self, tenant_id: Uuid) -> AppResult<()> {
+    pub(crate) fn require_read_access(&self, tenant_id: Uuid) -> AppResult<()> {
         match self {
             TenantOrPlatformCaller::Platform => Ok(()),
             TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id => Ok(()),
@@ -74,7 +74,7 @@ impl TenantOrPlatformCaller {
 
     /// Write-side gate: platform admin can write any tenant; a tenant
     /// caller must be the admin of their own tenant.
-    fn require_admin_write_access(&self, tenant_id: Uuid) -> AppResult<()> {
+    pub(crate) fn require_admin_write_access(&self, tenant_id: Uuid) -> AppResult<()> {
         match self {
             TenantOrPlatformCaller::Platform => Ok(()),
             TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id && u.role.is_admin() => {

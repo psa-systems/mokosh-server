@@ -40,6 +40,6 @@ pub use identity::OrgIdentity;
 pub use logo_move::TenantLogoMover;
 pub use models::*;
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
-pub use routes::{public_tenant_routes, tenant_routes};
+pub use routes::{public_tenant_routes, tenant_routes, TenantOrPlatformCaller};
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
 pub use service::TenantService;
