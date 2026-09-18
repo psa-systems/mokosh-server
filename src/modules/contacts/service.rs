@@ -2783,6 +2783,40 @@ impl ContactService {
         .fetch_all(&mut *conn)
         .await?;
 
+        // PMS-1260: provenance, one row per imported contact - its live link
+        // if it has one, else its most recent - in the same pass.
+        let origin_rows: Vec<(Uuid, String, String, bool, bool)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT ON (l.contact_id)
+                   l.contact_id, l.provider, l.source_account_email,
+                   l.unlinked_at IS NULL AND l.connection_id IS NOT NULL AS linked,
+                   l.deleted_in_source_at IS NOT NULL AS deleted_in_source
+            FROM contact_sync_links l
+            WHERE l.tenant_id = $1 AND l.contact_id = ANY($2)
+            ORDER BY l.contact_id, (l.unlinked_at IS NULL) DESC, l.created_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut origin_by_contact: std::collections::HashMap<Uuid, ContactOrigin> = origin_rows
+            .into_iter()
+            .map(
+                |(contact_id, provider, account_email, linked, deleted_in_source)| {
+                    (
+                        contact_id,
+                        ContactOrigin {
+                            provider,
+                            account_email,
+                            linked,
+                            deleted_in_source,
+                        },
+                    )
+                },
+            )
+            .collect();
+
         let mut phones_by_contact: std::collections::HashMap<Uuid, Vec<ContactPhone>> =
             std::collections::HashMap::new();
         for row in phone_rows {
@@ -2818,6 +2852,7 @@ impl ContactService {
         for contact in contacts.iter_mut() {
             contact.phones = phones_by_contact.remove(&contact.id).unwrap_or_default();
             contact.companies = links_by_contact.remove(&contact.id).unwrap_or_default();
+            contact.imported_from = origin_by_contact.remove(&contact.id);
         }
         Ok(contacts)
     }
@@ -3242,6 +3277,37 @@ impl ContactService {
         if filter.status.is_some() {
             data_conds.push(format!("c.status = ${data_idx}"));
             count_conds.push(format!("status = ${count_idx}"));
+        }
+        // PMS-1260: origin takes no bind - the provider is a closed enum, so
+        // its literal is written from a match, never from the request.
+        match filter.origin {
+            Some(ContactOriginFilter::Manual) => {
+                data_conds.push(
+                    "NOT EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = c.tenant_id AND sl.contact_id = c.id)"
+                        .to_string(),
+                );
+                count_conds.push(
+                    "NOT EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = contacts.tenant_id AND sl.contact_id = contacts.id)"
+                        .to_string(),
+                );
+            }
+            Some(ContactOriginFilter::Google) => {
+                data_conds.push(
+                    "EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = c.tenant_id AND sl.contact_id = c.id \
+                       AND sl.provider = 'google')"
+                        .to_string(),
+                );
+                count_conds.push(
+                    "EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = contacts.tenant_id AND sl.contact_id = contacts.id \
+                       AND sl.provider = 'google')"
+                        .to_string(),
+                );
+            }
+            None => {}
         }
 
         let data_where = data_conds.join(" AND ");
@@ -4462,6 +4528,7 @@ impl From<ContactRow> for Contact {
             // child table; a bare row conversion leaves them empty.
             phones: Vec::new(),
             companies: Vec::new(),
+            imported_from: None,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
