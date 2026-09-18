@@ -1,8 +1,11 @@
 import { authenticator } from 'otplib';
-import { expect, type APIRequestContext, type Locator, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import { env } from './env';
 import { routes } from './api';
 import { mainFrameResponseLog } from './page-diagnostics';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { TOTP_LAST_STEP_FILE } from './auth-state';
 
 // What one credentials submit did, as seen from the hub's response. 'no-form'
 // is the PMS-721 case: the hub never rendered the credential form at all (the
@@ -352,6 +355,45 @@ function rateLimitBackoffMs(reason: string | null): number | null {
 // module). Fill it into the 2FA form and submit. Selectors are deliberately
 // permissive because the hub's markup may evolve; the regex on the submit
 // button covers "Verify" copy in addition to the standard login verbs.
+/** The TOTP step (30s window) the clock is in now. */
+function currentTotpStep(): number {
+  return Math.floor(Date.now() / 1_000 / 30);
+}
+
+/** The last step this run submitted a code in, from any project. */
+function lastUsedStep(): number {
+  try {
+    return Number.parseInt(readFileSync(TOTP_LAST_STEP_FILE, 'utf8').trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function rememberStep(step: number): void {
+  mkdirSync(dirname(TOTP_LAST_STEP_FILE), { recursive: true });
+  writeFileSync(TOTP_LAST_STEP_FILE, String(step));
+}
+
+/**
+ * Sleep until the clock is in a step later than any this run has submitted,
+ * plus a second of margin so the code is generated inside the new window.
+ */
+async function waitForUnusedStep(page: Page): Promise<void> {
+  const used = lastUsedStep();
+  while (currentTotpStep() <= used) {
+    const waitMs = (currentTotpStep() + 1) * 30_000 - Date.now() + 1_000;
+    // The wait is the clock, not the app: give it back to the test so a login
+    // that had to wait out a step does not spend the test's own budget.
+    try {
+      const info = test.info();
+      info.setTimeout(info.timeout + waitMs);
+    } catch {
+      // Outside a running test there is no budget to extend.
+    }
+    await page.waitForTimeout(waitMs);
+  }
+}
+
 async function fillTotpStep(page: Page): Promise<void> {
   const form = page.locator('form').first();
   const codeInput = form
@@ -398,6 +440,13 @@ async function fillTotpStep(page: Page): Promise<void> {
     if (remaining < 5) {
       await page.waitForTimeout((remaining + 1) * 1_000);
     }
+    // PMS-1266: bunyip refuses a code from a step this account already used
+    // (TOTP replay protection), and the browser projects sign in back to back,
+    // so a login landing in the previous login's step is refused. Wait for a
+    // step nobody in this run has used; on the retry that is always the next
+    // one, since the step just tried was either used or rejected.
+    await waitForUnusedStep(page);
+    rememberStep(currentTotpStep());
     await setInputValue(codeInput, authenticator.generate(env.totpSecret));
     if (await leftTwoFa(15_000)) {
       return;
