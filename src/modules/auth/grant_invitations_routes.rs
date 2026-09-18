@@ -161,15 +161,33 @@ pub fn grant_invitations_owner_routes(
 }
 
 /// Grantee-facing mount. Sits under `/api/v1/my-grants/invitations`.
-pub fn grant_invitations_grantee_routes(db: Arc<Database>) -> Router {
+///
+/// The id-scoped accept/decline routes live here alongside the inbox
+/// read: the caller is already authenticated as the grantee, the id
+/// comes from THEIR own inbox row, and the service's `accept_by_id` /
+/// `decline_by_id` refuse anything not addressed to `caller.id`. The
+/// SPA switcher never sees the plaintext token (that lives only in
+/// the invitation email); before this the switcher was posting the
+/// invitation id to the by-token endpoint and every accept returned
+/// 404 "invitation not found".
+///
+/// `bunyip_directory` is threaded through so the SaaS-mode accept
+/// path can register the grant on bunyip inside `accept_by_id` (same
+/// contract the by-token mount enforces at line 193 comments).
+pub fn grant_invitations_grantee_routes(
+    db: Arc<Database>,
+    bunyip_directory: Option<Arc<BunyipUserDirectory>>,
+) -> Router {
     let state = GrantInvitationsState {
         db,
         spa_base_url: Arc::new(String::new()),
         notifications: None,
-        bunyip_directory: None,
+        bunyip_directory,
     };
     Router::new()
         .route("/", get(list_grantee_inbox))
+        .route("/{id}/accept", post(accept_by_id_handler))
+        .route("/{id}/decline", post(decline_by_id_handler))
         .with_state(state)
 }
 
@@ -560,6 +578,82 @@ async fn accept_invitation(
         )),
         Err(AcceptRefusal::Declined) => Err(AppError::conflict(
             "This invitation was declined.".to_string(),
+        )),
+        Err(AcceptRefusal::WrongCaller) => Err(AppError::Forbidden(
+            "This invitation was sent to a different account.".to_string(),
+        )),
+    }
+}
+
+/// Grantee-scoped accept by invitation id, mounted at
+/// `POST /api/v1/my-grants/invitations/{id}/accept`. The SPA switcher
+/// posts the id it read from the grantee inbox
+/// (`GET /my-grants/invitations`), which never carries a plaintext
+/// token; the service layer's `accept_by_id` enforces the strict
+/// invitee-vs-caller match and reuses the same guarded UPDATE + mirror
+/// upsert as the by-token path.
+async fn accept_by_id_handler(
+    State(state): State<GrantInvitationsState>,
+    RequireAuth(caller): RequireAuth,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<InvitationResponse>> {
+    // SAFETY (PMS-285): grantee-plane path, no owner-tenant scope
+    // available here. `accept_by_id` re-reads by id and gates on
+    // (invitee_bunyip_user_id = caller.id) before any write, so a
+    // foreign id 404s (well, WrongCaller-Forbidden's) rather than
+    // leaking a row.
+    let outcome = GrantInvitationsService::accept_by_id(
+        state.db.pool(),
+        id,
+        caller.id,
+        state.bunyip_directory.as_deref(),
+    )
+    .await?;
+    match outcome {
+        Ok(invitation) => Ok(Json(invitation.into())),
+        Err(AcceptRefusal::NotFound) => Err(AppError::NotFound("invitation".to_string())),
+        Err(AcceptRefusal::Expired) => Err(AppError::Gone(
+            "This invitation has expired. Ask the owner to send a new one.".to_string(),
+        )),
+        Err(AcceptRefusal::Canceled) => Err(AppError::Gone(
+            "This invitation has been canceled by the owner.".to_string(),
+        )),
+        Err(AcceptRefusal::AlreadyAccepted) => Err(AppError::conflict(
+            "This invitation has already been accepted.".to_string(),
+        )),
+        Err(AcceptRefusal::Declined) => Err(AppError::conflict(
+            "This invitation was declined.".to_string(),
+        )),
+        Err(AcceptRefusal::WrongCaller) => Err(AppError::Forbidden(
+            "This invitation was sent to a different account.".to_string(),
+        )),
+    }
+}
+
+/// Grantee-scoped decline by invitation id. Same shape as
+/// [`accept_by_id_handler`] minus the bunyip register and mirror
+/// upsert.
+async fn decline_by_id_handler(
+    State(state): State<GrantInvitationsState>,
+    RequireAuth(caller): RequireAuth,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<InvitationResponse>> {
+    // SAFETY (PMS-285): same shape as `accept_by_id_handler`.
+    let outcome = GrantInvitationsService::decline_by_id(state.db.pool(), id, caller.id).await?;
+    match outcome {
+        Ok(invitation) => Ok(Json(invitation.into())),
+        Err(AcceptRefusal::NotFound) => Err(AppError::NotFound("invitation".to_string())),
+        Err(AcceptRefusal::Expired) => {
+            Err(AppError::Gone("This invitation has expired.".to_string()))
+        }
+        Err(AcceptRefusal::Canceled) => Err(AppError::Gone(
+            "This invitation has been canceled by the owner.".to_string(),
+        )),
+        Err(AcceptRefusal::AlreadyAccepted) => Err(AppError::conflict(
+            "This invitation has already been accepted.".to_string(),
+        )),
+        Err(AcceptRefusal::Declined) => Err(AppError::conflict(
+            "This invitation was already declined.".to_string(),
         )),
         Err(AcceptRefusal::WrongCaller) => Err(AppError::Forbidden(
             "This invitation was sent to a different account.".to_string(),

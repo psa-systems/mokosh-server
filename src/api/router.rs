@@ -417,7 +417,7 @@ pub fn create_api_router(
         )
         .nest(
             "/my-grants/invitations",
-            grant_invitations_grantee_routes(Arc::new(db.clone())),
+            grant_invitations_grantee_routes(Arc::new(db.clone()), bunyip_directory.clone()),
         )
         // MAPPS-875: owner-side grant management. Two routes:
         //   GET  /grants?role=owner  - pending + active outbox

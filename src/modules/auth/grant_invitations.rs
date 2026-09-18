@@ -150,6 +150,28 @@ impl GrantInvitationsService {
         })
     }
 
+    /// Resolve an invitation by its primary-key `id`. Used by the
+    /// grantee-scoped id endpoints, which do not carry the plaintext
+    /// token (that lives only on the invitation email) and instead
+    /// gate on `RequireAuth` + a caller-vs-invitee check made by the
+    /// route handler. `Ok(None)` covers "no such id", the same shape
+    /// `find_by_token` uses for "no such row".
+    pub async fn find_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<GrantInvitation>> {
+        let row: Option<GrantInvitation> = sqlx::query_as(
+            r#"
+            SELECT id, tenant_id, inviter_bunyip_user_id, invitee_bunyip_user_id,
+                   invitee_email, role, status, invited_at, expires_at,
+                   accepted_at, declined_at, canceled_at, updated_at
+            FROM mokosh_grant_invitations
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Resolve a plaintext token from the invitation email link
     /// to a row. `Ok(None)` covers a malformed token, an unknown
     /// id, and a mismatched secret; only a real match returns the
@@ -295,12 +317,74 @@ impl GrantInvitationsService {
         owner_bunyip_user_id_fallback: Uuid,
         bunyip_directory: Option<&super::bunyip_directory::BunyipUserDirectory>,
     ) -> AppResult<Result<GrantInvitation, AcceptRefusal>> {
-        use super::mokosh_bunyip_grants::MokoshBunyipGrantService;
-
         let invitation = match Self::find_by_token(pool, token).await? {
             Some(inv) => inv,
             None => return Ok(Err(AcceptRefusal::NotFound)),
         };
+        Self::accept_loaded(
+            pool,
+            invitation,
+            caller_bunyip_user_id,
+            owner_bunyip_user_id_fallback,
+            bunyip_directory,
+        )
+        .await
+    }
+
+    /// Grantee-scoped accept by invitation id. Used by the SPA
+    /// switcher's Accept button on the pending-inbox row: that surface
+    /// never sees the plaintext token (the token rides the invitation
+    /// email only) and instead authenticates the grantee via
+    /// `RequireAuth`. The caller check is stricter than the token
+    /// path's: the invitation MUST already name a bunyip_user_id AND
+    /// it MUST match the caller. A NULL invitee_bunyip_user_id (a
+    /// standalone-mode by-email invitation) is refused here because
+    /// the grantee inbox only lists rows already bound to the caller,
+    /// so an unbound row reaching this endpoint is an id spoof.
+    pub async fn accept_by_id(
+        pool: &PgPool,
+        id: Uuid,
+        caller_bunyip_user_id: Uuid,
+        bunyip_directory: Option<&super::bunyip_directory::BunyipUserDirectory>,
+    ) -> AppResult<Result<GrantInvitation, AcceptRefusal>> {
+        let invitation = match Self::find_by_id(pool, id).await? {
+            Some(inv) => inv,
+            None => return Ok(Err(AcceptRefusal::NotFound)),
+        };
+        // Strict caller check: refuse if the row is not addressed to
+        // this caller. `accept_loaded` also refuses when the row's
+        // invitee id is set and does not match, but not when it is
+        // NULL - so cover NULL here so an id spoof cannot bind an
+        // unbound row to a caller who is not the intended invitee.
+        match invitation.invitee_bunyip_user_id {
+            Some(existing) if existing == caller_bunyip_user_id => {}
+            _ => return Ok(Err(AcceptRefusal::WrongCaller)),
+        }
+        let owner = invitation.inviter_bunyip_user_id;
+        Self::accept_loaded(
+            pool,
+            invitation,
+            caller_bunyip_user_id,
+            owner,
+            bunyip_directory,
+        )
+        .await
+    }
+
+    /// Shared body of the two accept entry points. Assumes the
+    /// invitation has been loaded and the caller is proved (by token
+    /// for `accept`, by RequireAuth + id-caller match for
+    /// `accept_by_id`). Status / expiry / WrongCaller checks and the
+    /// guarded UPDATE + mirror upsert are the same on both paths.
+    async fn accept_loaded(
+        pool: &PgPool,
+        invitation: GrantInvitation,
+        caller_bunyip_user_id: Uuid,
+        owner_bunyip_user_id_fallback: Uuid,
+        bunyip_directory: Option<&super::bunyip_directory::BunyipUserDirectory>,
+    ) -> AppResult<Result<GrantInvitation, AcceptRefusal>> {
+        use super::mokosh_bunyip_grants::MokoshBunyipGrantService;
+
         let now = Utc::now();
         if invitation.status == "canceled" {
             return Ok(Err(AcceptRefusal::Canceled));
@@ -391,8 +475,10 @@ impl GrantInvitationsService {
 
         let Some(accepted) = updated else {
             // Lost the race; re-read to answer the caller
-            // precisely on what happened.
-            let refreshed = Self::find_by_token(pool, token)
+            // precisely on what happened. Uses `find_by_id` because
+            // this helper serves both the token and the id entry
+            // paths and does not carry the plaintext token.
+            let refreshed = Self::find_by_id(pool, invitation.id)
                 .await?
                 .ok_or(AppError::internal("Invitation vanished during accept"))?;
             return Ok(Err(match refreshed.status.as_str() {
@@ -438,6 +524,34 @@ impl GrantInvitationsService {
             Some(inv) => inv,
             None => return Ok(Err(AcceptRefusal::NotFound)),
         };
+        Self::decline_loaded(pool, invitation, caller_bunyip_user_id).await
+    }
+
+    /// Grantee-scoped decline by invitation id. Same shape as
+    /// [`Self::accept_by_id`]: RequireAuth authenticates the grantee
+    /// and the caller must already be named on the row's
+    /// `invitee_bunyip_user_id`.
+    pub async fn decline_by_id(
+        pool: &PgPool,
+        id: Uuid,
+        caller_bunyip_user_id: Uuid,
+    ) -> AppResult<Result<GrantInvitation, AcceptRefusal>> {
+        let invitation = match Self::find_by_id(pool, id).await? {
+            Some(inv) => inv,
+            None => return Ok(Err(AcceptRefusal::NotFound)),
+        };
+        match invitation.invitee_bunyip_user_id {
+            Some(existing) if existing == caller_bunyip_user_id => {}
+            _ => return Ok(Err(AcceptRefusal::WrongCaller)),
+        }
+        Self::decline_loaded(pool, invitation, caller_bunyip_user_id).await
+    }
+
+    async fn decline_loaded(
+        pool: &PgPool,
+        invitation: GrantInvitation,
+        caller_bunyip_user_id: Uuid,
+    ) -> AppResult<Result<GrantInvitation, AcceptRefusal>> {
         let now = Utc::now();
         if invitation.status == "canceled" {
             return Ok(Err(AcceptRefusal::Canceled));
