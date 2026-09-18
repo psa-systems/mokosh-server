@@ -3277,6 +3277,31 @@ impl ContactService {
         if filter.status.is_some() {
             data_conds.push(format!("c.status = ${data_idx}"));
             count_conds.push(format!("status = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
+        }
+        // PMS-1261: both were deserialized and never applied, so the list's
+        // "Portal users only" filter returned everyone and said nothing.
+        if filter.is_portal_user.is_some() {
+            data_conds.push(format!("c.is_portal_user = ${data_idx}"));
+            count_conds.push(format!("is_portal_user = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
+        }
+        // Comma-separated; a contact carrying ANY of them matches. Blank
+        // entries are dropped, and a filter of only blanks filters nothing.
+        let tags: Vec<String> = filter
+            .tags
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !tags.is_empty() {
+            data_conds.push(format!("c.tags && ${data_idx}::text[]"));
+            count_conds.push(format!("tags && ${count_idx}::text[]"));
         }
         // PMS-1260: origin takes no bind - the provider is a closed enum, so
         // its literal is written from a match, never from the request.
@@ -3356,6 +3381,14 @@ impl ContactService {
         if let Some(ref status) = filter.status {
             query_builder = query_builder.bind(status.as_str());
             count_builder = count_builder.bind(status.as_str());
+        }
+        if let Some(portal) = filter.is_portal_user {
+            query_builder = query_builder.bind(portal);
+            count_builder = count_builder.bind(portal);
+        }
+        if !tags.is_empty() {
+            query_builder = query_builder.bind(tags.clone());
+            count_builder = count_builder.bind(tags);
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
