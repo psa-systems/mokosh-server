@@ -9,7 +9,7 @@
 mod common;
 
 use reqwest::StatusCode;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -269,4 +269,188 @@ async fn reconnecting_the_same_account_keeps_the_connection(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(connections, 1);
+}
+
+/// PMS-1264: the deployment's Google client set in the app, by an admin of
+/// the system tenant. The secret goes to the secret provider and never comes
+/// back; the connect flow uses the stored client; clearing it falls back to
+/// env (unset here, so "not configured").
+#[sqlx::test]
+async fn the_google_client_is_set_in_the_app_and_the_secret_never_returns(pool: PgPool) {
+    let (_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let client_path = "/api/v1/integrations/contact-sync/google/client";
+    let put = |body: Value| {
+        let app = &app;
+        let token = &token;
+        async move {
+            let resp = app
+                .client
+                .put(app.url(client_path))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("put client");
+            let status = resp.status();
+            (status, resp.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let get = |path: &'static str| {
+        let app = &app;
+        let token = &token;
+        async move {
+            app.client
+                .get(app.url(path))
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("get")
+                .json::<Value>()
+                .await
+                .expect("json")
+        }
+    };
+
+    let empty = get(client_path).await;
+    assert_eq!(empty["source"], "none", "{empty}");
+    assert_eq!(empty["secret_set"], false);
+    assert_eq!(
+        empty["redirect_uri"], "http://api.localhost/api/v1/public/contact-sync/google/callback",
+        "the form shows what to register in the Google Cloud console"
+    );
+    let overview = get("/api/v1/integrations/contact-sync").await;
+    assert_eq!(overview["client_editable"], true);
+    assert_eq!(overview["configured"], false);
+
+    let id = "1234-abc.apps.googleusercontent.com";
+    let (status, _) = put(json!({ "client_id": id })).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an id needs its secret"
+    );
+    let (status, _) = put(json!({ "client_id": "not-a-client", "client_secret": "s3cret" })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, saved) = put(json!({ "client_id": id, "client_secret": "GOCSPX-s3cret" })).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(
+        (
+            saved["source"].as_str(),
+            saved["client_id"].as_str(),
+            saved["secret_set"].as_bool()
+        ),
+        (Some("database"), Some(id), Some(true))
+    );
+    assert!(
+        !saved.to_string().contains("GOCSPX"),
+        "the secret never returns: {saved}"
+    );
+    let stored_plain: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tenant_settings WHERE value::text LIKE '%GOCSPX%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored_plain, 0, "the secret is not a tenant setting");
+    assert_eq!(
+        get("/api/v1/integrations/contact-sync").await["configured"],
+        true
+    );
+
+    // The connect flow now uses the stored client.
+    let resp = app
+        .client
+        .post(app.url("/api/v1/integrations/contact-sync/google/authorize"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("authorize");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["authorize_url"].as_str().unwrap().contains(id),
+        "{body}"
+    );
+
+    // Keep the secret while renaming nothing; then clear back to env.
+    let (status, kept) = put(json!({})).await;
+    assert_eq!(
+        (status, kept["source"].as_str()),
+        (StatusCode::OK, Some("database"))
+    );
+    let (status, cleared) = put(json!({ "client_id": "" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cleared["source"], "none", "{cleared}");
+    assert_eq!(
+        cleared["secret_set"], false,
+        "clearing the id clears its secret"
+    );
+    assert_eq!(
+        get("/api/v1/integrations/contact-sync").await["configured"],
+        false
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE new_values->>'event' = 'contact_sync.client_changed' \
+         AND new_values::text NOT LIKE '%GOCSPX%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audited, 3, "every change is audited, without the secret");
+}
+
+/// An admin of any other organisation cannot read or swap the client every
+/// tenant on the deployment connects through.
+#[sqlx::test]
+async fn only_the_system_tenant_configures_the_google_client(pool: PgPool) {
+    let (_tenant, _user, email, password) =
+        common::seed_tenant_with_admin(&pool, "customer-msp").await;
+    let app = common::boot(pool.clone()).await;
+    let login: Value = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&json!({ "email": email, "password": password, "tenant_slug": "customer-msp" }))
+        .send()
+        .await
+        .expect("login")
+        .json()
+        .await
+        .expect("login json");
+    let token = login["access_token"]
+        .as_str()
+        .expect("an admin of the customer tenant signs in")
+        .to_string();
+    let path = "/api/v1/integrations/contact-sync/google/client";
+
+    let get = app
+        .client
+        .get(app.url(path))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::FORBIDDEN);
+    let put = app
+        .client
+        .put(app.url(path))
+        .bearer_auth(&token)
+        .json(&json!({ "client_id": "1-x.apps.googleusercontent.com", "client_secret": "s" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::FORBIDDEN);
+    let overview: Value = app
+        .client
+        .get(app.url("/api/v1/integrations/contact-sync"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["client_editable"], false);
 }
