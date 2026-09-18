@@ -42,6 +42,11 @@ export const OP_STORAGE_STATE_FILE = resolve(here, '..', '.auth', 'op-state.json
 // foreign-tenant company id when the operator pinned E2E_FOREIGN_COMPANY_ID,
 // otherwise a random, well-formed UUID the E2E tenant cannot own.
 export const FOREIGN_COMPANY_FILE = resolve(here, '..', '.auth', 'foreign-company.txt');
+// PMS-1266: the last TOTP step (Unix seconds / 30) this run submitted. Shared
+// through a file because the setup project and the browser projects are
+// separate module instances, and bunyip refuses a second code from a step the
+// account already used.
+export const TOTP_LAST_STEP_FILE = resolve(here, '..', '.auth', 'totp-last-step');
 
 export function readToken(): string {
   if (!existsSync(TOKEN_FILE)) {
