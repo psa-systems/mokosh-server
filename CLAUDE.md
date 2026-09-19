@@ -66,6 +66,8 @@ OIDC client registration recipes (`register-client`, etc.) were removed with mok
 
 `just dev` requires the shared external `network-traefik-public` to already exist. (Before PMS-295 it also needed a local Ed25519 keypair for mokosh-auth's OP signing; that subsystem is gone, so no key material is provisioned now. The bunyip-as-OP Resource-Server path verifies tokens against bunyip's JWKS over the network.)
 
+The compose project name is `dev-mokosh-${USER}` (PMS-1281), not the bare `dev-mokosh` it used to be: every container, volume and network was already `${USER}`-suffixed, but the project name itself was shared, so `docker compose`'s own orphan/volume cleanup (`just down`'s `--remove-orphans`, `just dev-clean`'s volume removal) could treat another developer's resources as belonging to the same project. A developer updating past this change must run `just down` once under the OLD name first, or it never stops: `docker compose -p dev-mokosh down` (no `-v`, to keep volumes). After that, `just down` / `just dev` address only the per-user project.
+
 ## Architecture
 
 ### Top-level layout

@@ -6,11 +6,15 @@
 # Traefik-routed `*.a8n.run` stack is now the only dev stack.
 #
 # Naming convention (see ~/.claude/CLAUDE.md):
-# - Project name `dev-mokosh` namespaces every resource under the
-#   `dev-mokosh-` prefix in `docker ps`, `docker volume ls`, and
-#   `docker network ls`. Service keys are short and descriptive
-#   (`server`, `infisical`, `infisical-postgres`, `valkey`) - they do not
-#   repeat the `mokosh` segment, since the project name already carries it.
+# - Project name `dev-mokosh-${USER}` (PMS-1281) namespaces every resource
+#   under the `dev-mokosh-` prefix in `docker ps`, `docker volume ls`, and
+#   `docker network ls`, AND is itself per-developer, so a `docker compose`
+#   command run by one developer never lists or removes another's resources
+#   (an unqualified project name previously let `just down` / `just
+#   dev-clean` treat another developer's network as an orphan of the same
+#   project). Service keys are short and descriptive (`server`, `infisical`,
+#   `infisical-postgres`, `valkey`) - they do not repeat the `mokosh` segment,
+#   since the project name already carries it.
 # - `container_name:` is set explicitly on every service with the
 #   `dev-mokosh-{descriptive}-${USER}` shape so multiple developers can
 #   run their own dev stacks on a shared host without colliding on
@@ -53,7 +57,7 @@
 # Required-but-empty values use the `${VAR:?...}` form so compose fails
 # loudly with a helpful message instead of starting a misconfigured stack.
 
-name: dev-mokosh
+name: dev-mokosh-${USER:?USER missing - run via just dev}
 
 services:
 
