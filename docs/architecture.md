@@ -69,12 +69,15 @@ Two Dockerfiles, two purposes.
 ```
 src/
   api/             Axum router composition: create_api_router builds every /api/v1 nest.
+  app_secrets/     Application-tier secret selection (database, file, env, or Infisical) behind one governed-secret registry, chosen by SECRET_BACKEND.
   bin/             Standalone CLI binaries (mokosh-bootstrap).
   cli.rs           Operator subcommands the mokosh-server binary dispatches before it binds a port.
+  config/          Configuration provider selection and the declared key registry, the one configuration read path.
   db/              Database wrapper around sqlx::PgPool, plus the per-tenant transaction helpers.
   infisical/       Infisical HTTP client + first-run bootstrap.
   modules/         Feature modules (tickets, contracts, billing, ...).
   pdf/             Document model, and the one place it becomes PDF bytes.
+  providers/       Provider status collection and reporting across every capability kind; not itself a selectable provider.
   scheduler/       Registry for the interval background jobs.
   secrets/         Secret backend selection (database or Infisical) behind one store trait.
   storage/         Upload root and file storage, the single reader of ATTACHMENT_DIR.
