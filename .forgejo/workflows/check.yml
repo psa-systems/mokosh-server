@@ -37,10 +37,9 @@ on:
 jobs:
   check:
     name: fmt + clippy + build + tests
-    # Dev label: this job compiles Rust natively on the runner, and only the
-    # dev image carries `cc` / `gcc` / `ld` plus the OpenSSL headers openssl-sys
-    # probes. Base fails at `linker cc not found` (PMS-705, CLAUDE-203).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    # Heavy: compiles Rust natively, which needs the dev image's cc/ld and
+    # OpenSSL headers (base fails at `linker cc not found`, PMS-705).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Backstop, not a target (PMS-829): 38 green runs between 2026-08-22 and
     # 2026-08-24 took 1.9-9.0 minutes, median 3.5. The headroom is for a cold
@@ -57,11 +56,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Cap build parallelism
-        # nproc/2 cap: never claim more than half the host (see "Concurrency
-        # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
-        # this repository).
-        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
+      - name: Start job metrics sampler
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
+
+      - name: Build parallelism from the runner
+        # DEV-769: the runner sets CARGO_BUILD_JOBS; this warns and falls back
+        # to a low CPU-derived value when it did not; it never fails the job.
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/build-parallelism@main
 
       - name: Cache Rust build
         uses: https://github.com/Swatinem/rust-cache@v2
@@ -143,10 +144,10 @@ jobs:
           nu scripts/check-rate-limit-helper.nu
 
       - name: Runner labels
-        # PMS-719: a job that compiles on the runner must request the dev label
-        # (the only image with cc/gcc/ld + OpenSSL headers); base is for
-        # everything else. Fails loud if a compiling job drifts back to base or
-        # if someone re-adds a run-time `zypper install gcc` workaround.
+        # PMS-719, DEV-769: a job that compiles, builds an image or runs
+        # Playwright requests the heavy label (the dev image with cc/ld, OpenSSL
+        # headers and browsers); every other job requests medium. Fails loud on
+        # a mismatch, a retired *_LATEST label, or a run-time `zypper install gcc`.
         shell: nu {0}
         run: |
           nu scripts/check-runner-labels.nu
@@ -284,3 +285,7 @@ jobs:
         # pins "a raw Uuid cannot be passed where a TenantId is required".
         # `--lib` above does not execute doctests.
         run: cargo test --workspace --doc
+
+      - name: Report job metrics
+        if: always()
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main

@@ -7,6 +7,11 @@ RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static lld
 
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
+# Parallel rustc jobs: CI passes the runner's value (DEV-769), `default` is every
+# CPU. Stable per runner host, so it does not churn the per-host layer cache.
+ARG CARGO_BUILD_JOBS=default
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
 # PMS-781: dependency layer. Only the manifests land here, so the expensive
 # third-party compile below is an image layer that no change under `src/` or
 # `crates/*/src/` can invalidate - and, unlike a `target/` cache mount, a layer

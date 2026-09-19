@@ -18,10 +18,9 @@ on:
 jobs:
   integration:
     name: integration tests
-    # Dev label: `cargo test --tests` compiles natively on the runner, and only
-    # the dev image ships the C toolchain + OpenSSL headers that needs. Base
-    # fails at `linker cc not found` (PMS-706, same cause as check.yml).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    # Heavy: compiles every test binary natively (dev image's cc/ld and OpenSSL
+    # headers) and runs them against Postgres (PMS-706).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Outer backstop. nextest's own `slow-timeout`/`terminate-after`
     # (`.config/nextest.toml`) is what produces a diagnostic for a stuck
@@ -66,14 +65,24 @@ jobs:
       - name: Clone the repository
         uses: https://code.forgejo.org/actions/checkout@v5
 
+      - name: Start job metrics sampler
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
+        with:
+          postgres-url: ${{ env.DATABASE_URL }}
+
+      - name: Build parallelism from the runner
+        # DEV-769: CARGO_BUILD_JOBS and NEXTEST_TEST_THREADS come from the runner,
+        # with a warned low fallback when it did not set them.
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/build-parallelism@main
+
       - name: Require disk headroom for the link step
         # Runs BEFORE the cache restore on purpose: a runner too full to link
         # is also too full to usefully restore a multi-GB cargo cache, so
         # failing first saves that download and leaves less on disk for
         # whatever runs next.
         # PMS-740. `cargo test --tests` links one debug binary per `tests/*.rs`
-        # suite, each several hundred MB, several concurrently under
-        # CARGO_BUILD_JOBS.
+        # suite, each several hundred MB, several concurrently under the
+        # runner's CARGO_BUILD_JOBS.
         # When the runner filesystem fills mid-write, `rust-lld` writes its
         # output through an mmap and takes SIGBUS, which surfaces as:
         #
@@ -139,13 +148,6 @@ jobs:
           cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "${cargo_bin}"
           tar --extract --gzip --file /tmp/nextest.tar.gz --directory "${cargo_bin}"
-
-      - name: Cap build parallelism
-        # nproc/2 cap: never claim more than half the host (see "Concurrency
-        # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
-        # this repository).
-        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
-
 
       - name: Start MinIO for the S3 storage suite
         # PMS-958. `tests/s3_storage.rs` round-trips the S3 backend against a
@@ -297,8 +299,8 @@ jobs:
       - name: Integration tests
         # PMS-1177: `cargo nextest run --archive-file` runs every case from
         # every archived binary (all `tests/*.rs` suites plus the lib unit
-        # tests) at once, scheduled across `test-threads` from the `ci`
-        # profile in `.config/nextest.toml`, instead of one binary running
+        # tests) at once, scheduled across the runner's NEXTEST_TEST_THREADS
+        # (`.config/nextest.toml` sets no count), instead of one binary running
         # to completion before the next starts. That cross-suite parallelism
         # is where the wall clock the old `cargo test --tests` invocation
         # spent waiting is recovered; new suites are still picked up
@@ -321,3 +323,7 @@ jobs:
           set -e
           echo "Test run took $(( $(date +%s) - started ))s"
           exit "${status}"
+
+      - name: Report job metrics
+        if: always()
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main

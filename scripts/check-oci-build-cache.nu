@@ -17,14 +17,16 @@
 # Comment lines are excluded on purpose: the workflow's own comments name the
 # retired backends when explaining why they were dropped.
 
+# Each row passes when ANY of its patterns is present. The common setup-buildx
+# action always creates a docker-container driver builder (DEV-769).
 const REQUIRED = [
-    [what pattern];
-    ["docker-container buildx driver" "--driver docker-container"]
-    ["Actions runtime-env export step" "crazy-max/ghaction-github-runtime@v3"]
-    ["gha cache_from" 'cache_from = "type=gha"']
-    ["gha cache_to with mode=max,ignore-error" 'cache_to = "type=gha,mode=max,ignore-error=true"']
-    ["--cache-from on the buildx build" "--cache-from"]
-    ["--cache-to on the buildx build" "--cache-to"]
+    [what patterns];
+    ["docker-container buildx driver" ["--driver docker-container" "psa-systems/common/.forgejo/actions/setup-buildx@"]]
+    ["Actions runtime-env export step" ["crazy-max/ghaction-github-runtime@v3"]]
+    ["gha cache_from" ['cache_from = "type=gha"']]
+    ["gha cache_to with mode=max,ignore-error" ['cache_to = "type=gha,mode=max,ignore-error=true"']]
+    ["--cache-from on the buildx build" ["--cache-from"]]
+    ["--cache-to on the buildx build" ["--cache-to"]]
 ]
 
 const FORBIDDEN = [
@@ -58,8 +60,8 @@ def main [] {
         let body = ($code | each {|row| $row.item } | str join "\n")
 
         for req in $REQUIRED {
-            if not ($body | str contains $req.pattern) {
-                $errors = ($errors | append $"($file): missing ($req.what) \(expected `($req.pattern)`\)")
+            if not ($req.patterns | any {|p| $body | str contains $p }) {
+                $errors = ($errors | append $"($file): missing ($req.what) \(expected one of `($req.patterns | str join '`, `')`\)")
             }
         }
 

@@ -9,13 +9,9 @@
 # `cargo test --tests` did), which is the whole point of the switch: most of
 # the previous wall clock was one binary waiting on the previous one.
 #
-# 12 is chosen against the Postgres service's default `max_connections` of
-# 100, the same budget the old `--test-threads=4` (per binary) comment
-# guarded. Each in-flight `#[sqlx::test]` case holds a per-test database pool
-# plus the shared sqlx-test maintenance pool, and this is now the ONLY
-# concurrency knob (global, not per-binary), so it is set well under the
-# limit rather than at it. Lower it if `PoolTimedOut` appears in a run.
-test-threads = 12
+# No thread count here: nextest reads NEXTEST_TEST_THREADS from the runner
+# (DEV-769). Each running case holds a per-test pool, so a value above about 40
+# can exhaust Postgres' default `max_connections` of 100 (`PoolTimedOut`).
 fail-fast = false
 
 # Replaces the shell `timeout --signal=QUIT` wrapper and the grep for "has

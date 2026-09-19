@@ -41,8 +41,9 @@ one alone and you have not.
 | Unit tests | `cargo test --workspace --lib` | no | yes |
 | Doc tests | `cargo test --workspace --doc` | no | yes |
 
-`check.yml`'s remaining steps (clone, `CARGO_BUILD_JOBS` cap, `rust-cache`) set
-the runner up and check nothing, so no recipe mirrors them.
+`check.yml`'s remaining steps (clone, job metrics, the shared `build-parallelism`
+action that takes `CARGO_BUILD_JOBS` from the runner, `rust-cache`) set the
+runner up and check nothing, so no recipe mirrors them.
 
 ## Where the two sides deliberately differ
 

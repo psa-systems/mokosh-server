@@ -176,10 +176,11 @@ check-mail-copy:
 check-rate-limit-helper:
     nu scripts/check-rate-limit-helper.nu
 
-# Keep CI jobs on the right runner label (PMS-719). Fails if a compiling job
-# requests the base label, if a workflow installs a C toolchain at run time,
-# or if a runs-on carries no comment justifying its label.
-[doc("Fail if a CI job requests the wrong runner label (PMS-719).")]
+# Keep CI jobs on the right runner label (PMS-719, DEV-769). Fails if a job that
+# compiles, builds an image or runs Playwright is not on the heavy label, if any
+# other job is not on the medium label, if a retired *_LATEST label is used, if a
+# workflow installs a C toolchain at run time, or if a runs-on has no comment.
+[doc("Fail if a CI job requests the wrong runner label (PMS-719, DEV-769).")]
 [group: 'check']
 check-runner-labels:
     nu scripts/check-runner-labels.nu
@@ -329,7 +330,7 @@ verify-providers *args:
 [doc("Run the demo-critical subset of the integration suite: seed_demo plus data_transfer (PMS-677).")]
 [group: 'test']
 verify-demo: ensure-env ensure-test-db-roles
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --test seed_demo --test data_transfer -- --test-threads=4'
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo test --test seed_demo --test data_transfer'
 
 # Run the Playwright E2E suite against staging (or $E2E_BASE_URL). Trailing args
 # pass through to `playwright test`, e.g. `just test-e2e --headed`. PMS-140.
@@ -354,7 +355,8 @@ check-docker:
     let git_hash = (^git rev-parse --short=12 HEAD | str trim)
     let git_describe = (^git describe --tags --always --dirty | str trim)
     let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
-    docker buildx build --target builder --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
+    let jobs = ($env.CARGO_BUILD_JOBS? | default "" | if ($in | is-empty) { "default" } else { $in })
+    docker buildx build --target builder --build-arg $"CARGO_BUILD_JOBS=($jobs)" --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:check --file oci-build/Dockerfile .
 
 # Create .env from the committed .env.example if missing, generating a strong
 # random value for every self-owned secret so a generic password never lands in
@@ -570,7 +572,8 @@ build-docker:
     let git_hash = (^git rev-parse --short=12 HEAD | str trim)
     let git_describe = (^git describe --tags --always --dirty | str trim)
     let build_date = (date now | format date '%Y-%m-%dT%H:%M:%SZ')
-    docker buildx build --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:local --file oci-build/Dockerfile .
+    let jobs = ($env.CARGO_BUILD_JOBS? | default "" | if ($in | is-empty) { "default" } else { $in })
+    docker buildx build --build-arg $"CARGO_BUILD_JOBS=($jobs)" --build-arg $"MOKOSH_GIT_HASH=($git_hash)" --build-arg $"MOKOSH_GIT_DESCRIBE=($git_describe)" --build-arg $"MOKOSH_BUILD_DATE=($build_date)" --tag mokosh-server:local --file oci-build/Dockerfile .
 
 # Run database migrations against the running database
 [group: 'db']

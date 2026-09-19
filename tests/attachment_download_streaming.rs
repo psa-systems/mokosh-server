@@ -3,8 +3,9 @@
 //!
 //! This lives in its own test binary on purpose. The probe is a
 //! `#[global_allocator]` recording the largest single allocation the PROCESS
-//! has made, and `cargo test` runs four cases per binary concurrently
-//! (`--test-threads=4` in `just test-integration` and integration.yml), so any
+//! has made, and the test harness runs several cases of a binary at once
+//! (nextest's runner-set thread count in `just test-integration` and
+//! integration.yml), so any
 //! sibling case here would have its allocations charged to the download. That
 //! is exactly how PMS-822 failed CI: argon2's 19 MiB hash buffer, allocated by
 //! another case's `seed_admin` / `login`, tripped a probe watching a handler

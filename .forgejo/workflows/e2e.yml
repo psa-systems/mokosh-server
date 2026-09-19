@@ -65,10 +65,9 @@ concurrency:
 jobs:
   e2e:
     name: Playwright against staging
-    # Dev label, deliberate (PMS-423): the dev image pre-bakes bun, nodejs24 and
-    # the Playwright browser binaries plus their system libraries. Nothing here
-    # compiles, but base carries none of that toolchain.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    # Heavy: runs Playwright, whose browsers and system libraries only the dev
+    # image pre-bakes (PMS-423, DEV-769).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Backstop, not a target (PMS-829): 42 green runs over the same window took
     # 1.2-4.2 minutes, median 2.0. The bound is generous against that because
@@ -124,6 +123,14 @@ jobs:
           # most recent commit that touched a build-trigger path. A shallow
           # clone would stop at depth 1 and the walk would miss or fail.
           fetch-depth: 0
+
+      - name: Start job metrics sampler
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
+
+      - name: Build parallelism from the runner
+        # DEV-769: exports the runner's CI_JOBS; Playwright stays at `workers: 1`
+        # in e2e/playwright.config.ts because the tests share one account.
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/build-parallelism@main
 
       # No Node setup step: the opensuse-dev runner image (PMS-423) ships
       # nodejs24 and bun, so the runtime is already on disk. Using the
@@ -190,3 +197,7 @@ jobs:
             e2e/test-results/
           retention-days: 14
           if-no-files-found: ignore
+
+      - name: Report job metrics
+        if: always()
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main

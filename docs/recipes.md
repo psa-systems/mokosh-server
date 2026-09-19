@@ -29,7 +29,7 @@ just check-pool-safety      # fail if a serving `.pool()` call lacks its `// SAF
 just check-validate-parity  # fail if a Create*Request and its Update*Request validate a field differently
 just check-mail-copy        # fail if a `Mailer` helper duplicates a seeded template's copy
 just check-rate-limit-helper # fail if a 429 response is built outside the shared builder
-just check-runner-labels    # fail if a CI job requests the wrong runner label
+just check-runner-labels    # fail if a CI job is not on the heavy/medium label its work needs
 just check-oci-cache        # fail if the OCI build leaves the type=gha runner cache
 just check-oci-publish-tags # fail if the publish tags drift from oci-build/get-tags.nu
 just check-single-build     # fail if a compiling workflow builds the same tree twice

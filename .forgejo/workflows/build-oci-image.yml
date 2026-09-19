@@ -49,9 +49,9 @@ jobs:
     # branches appended to it publish their own branch tag only; the mode
     # computation below never resolves `latest` off main (PMS-733).
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-    # Base label: the musl compile happens inside `docker buildx`, so the runner
-    # only needs docker, nu and git. Nothing compiles natively here.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    # Heavy: `docker buildx build` runs the full release compile of the
+    # workspace inside the builder (DEV-769).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Backstop, not a target (PMS-829): 10 green runs took 6.3-20.5 minutes,
     # median 14.8. The headroom is for a cold `type=gha` cache, where the
@@ -73,6 +73,14 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
           fetch-depth: 0
+
+      - name: Start job metrics sampler
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-start@main
+
+      - name: Build parallelism from the runner
+        # DEV-769: CARGO_BUILD_JOBS comes from the runner (warned low fallback
+        # when unset) and is passed into the image build below.
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/build-parallelism@main
 
       - name: Verify Docker availability
         run: |
@@ -144,12 +152,11 @@ jobs:
           print $"git_hash=($git_hash) git_describe=($git_describe) build_date=($build_date)"
 
       - name: Set up buildx builder
-        # The `docker-container` driver is required for any cache export;
-        # the default `docker` driver only carries inline metadata, which
-        # misses the dependency-build layer ("OCI build workflow" in CI.md of
-        # dev.a8n.run/niceguyit/governance, GOV-20; not a file in this
-        # repository).
-        run: docker buildx create --name container-builder --driver docker-container --use
+        # setup-buildx creates a `docker-container` driver builder, which the
+        # type=gha cache export needs (GOV-20; the `docker` driver exports none).
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/setup-buildx@main
+        with:
+          name: build-oci-image
 
       - name: Export Actions runtime env for buildx gha cache
         # A raw `docker buildx build` (unlike docker/build-push-action) does
@@ -195,6 +202,7 @@ jobs:
             "--build-arg" $"MOKOSH_GIT_DESCRIBE=($env.MOKOSH_GIT_DESCRIBE)"
             "--build-arg" $"MOKOSH_BUILD_DATE=($env.MOKOSH_BUILD_DATE)"
             "--build-arg" $"SOURCE_DATE_EPOCH=($env.SOURCE_DATE_EPOCH)"
+            "--build-arg" $"CARGO_BUILD_JOBS=($env.CARGO_BUILD_JOBS)"
           ]
           ^docker buildx build ...$push_args --cache-from $cache_from ...$build_args ...$tag_args -f oci-build/Dockerfile .
 
@@ -207,3 +215,7 @@ jobs:
           let image = "mokosh-server"
           let registry = $env.IMAGE_REGISTRY
           print $"($prefix) ($registry)/($image):($tag)"
+
+      - name: Report job metrics
+        if: always()
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/job-metrics-report@main
