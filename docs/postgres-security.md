@@ -1,5 +1,8 @@
 # Postgres provisioning and RLS: a working conversation
 
+Recorded 2026-09-10 (the date this file was added to the repository); answers describe
+the system as it was then, not necessarily as it is now.
+
 A summarized transcription of a design conversation about how Mokosh provisions its
 Postgres roles, installs extensions, and enforces row-level security (RLS) in dev and
 prod. It is preserved in question/answer form because the *path* to the answer (and one
