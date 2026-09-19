@@ -20,18 +20,20 @@
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde_json::json;
 use std::sync::Arc;
+use tokio_stream::StreamExt;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::auth::{RequireAuth, TenantScoped};
 use crate::modules::branding::assets::{
-    asset_path, AssetScope, BrandAssetKind, BrandingAssetStore,
+    asset_path, AssetMeta, AssetScope, BrandAssetKind, BrandingAssetStore,
 };
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::upload_limits::body_limit_bytes;
@@ -266,8 +268,13 @@ pub struct PublicBrandingState {
 /// Mount at `/api/v1/public` (via `.merge(...)`). No auth.
 pub fn public_routes(db: Database) -> Router {
     let state = PublicBrandingState {
-        db,
-        store: Arc::new(BrandingAssetStore::from_env()),
+        db: db.clone(),
+        // PMS-1246: the tenant-logo branch of `BrandingAssetStore::stat`
+        // reads the `files` ledger for its size, so this reader needs the
+        // same ledger the writers do, not the ledger-less store the doc
+        // comment on `ledger` describes for "the public read router" from
+        // before that method existed.
+        store: Arc::new(BrandingAssetStore::from_env().with_ledger(db)),
     };
     Router::new()
         .route("/companies/{company_id}/{asset}", get(serve_company_asset))
@@ -284,6 +291,7 @@ pub fn public_routes(db: Database) -> Router {
 
 async fn serve_company_asset(
     State(state): State<PublicBrandingState>,
+    headers: HeaderMap,
     Path((company_id, asset)): Path<(Uuid, String)>,
 ) -> AppResult<Response> {
     let kind =
@@ -297,15 +305,13 @@ async fn serve_company_asset(
     .await?
     .flatten();
     let mime = mime.ok_or_else(|| AppError::NotFound("Asset".to_string()))?;
-    let bytes = state
-        .store
-        .read(AssetScope::Company(company_id), kind, &mime)
-        .await?;
-    Ok(image_response(bytes, &mime))
+    let scope = AssetScope::Company(company_id);
+    serve_asset(&state.store, scope, kind, &mime, &headers).await
 }
 
 async fn serve_tenant_asset(
     State(state): State<PublicBrandingState>,
+    headers: HeaderMap,
     Path((tenant_id, asset)): Path<(Uuid, String)>,
 ) -> AppResult<Response> {
     let kind =
@@ -319,11 +325,68 @@ async fn serve_tenant_asset(
     .await?
     .flatten();
     let mime = mime.ok_or_else(|| AppError::NotFound("Asset".to_string()))?;
-    let bytes = state
-        .store
-        .read(AssetScope::Tenant(tenant_id), kind, &mime)
-        .await?;
-    Ok(image_response(bytes, &mime))
+    let scope = AssetScope::Tenant(tenant_id);
+    serve_asset(&state.store, scope, kind, &mime, &headers).await
+}
+
+/// PMS-1246: streamed rather than buffered whole into memory, mirroring
+/// `knowledge_base::attachments::get_public_attachment`. A matching
+/// `If-None-Match` gets a 304 with no blob read at all; see
+/// `BrandingAssetStore::stat` for what the ETag is built from and its
+/// tradeoff.
+async fn serve_asset(
+    store: &BrandingAssetStore,
+    scope: AssetScope,
+    kind: BrandAssetKind,
+    mime: &str,
+    headers: &HeaderMap,
+) -> AppResult<Response> {
+    let AssetMeta { size, etag } = store.stat(scope, kind, mime).await?;
+    if if_none_match_matches(headers, &etag) {
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
+                (header::ETAG, etag),
+            ],
+        )
+            .into_response());
+    }
+
+    let reader = store.open(scope, kind, mime).await?;
+    let stream = ReaderStream::new(reader).map(move |chunk| {
+        chunk.inspect_err(|e| {
+            tracing::error!("branding asset stream read failed: {e}");
+        })
+    });
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime.to_string()),
+            (header::CONTENT_LENGTH, size.to_string()),
+            (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
+            (header::ETAG, etag),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+/// RFC 9110 compares `If-None-Match` with the WEAK function, so `W/"x"`
+/// matches `"x"`, `*` matches any existing representation, and the value may
+/// be a list. Mirrors `tickets::attachments::if_none_match_matches`;
+/// duplicated for the same reason the KB module's copy is.
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(raw) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    raw.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
 }
 
 // ============================================================================
@@ -381,18 +444,6 @@ fn segment_for(kind: BrandAssetKind) -> &'static str {
         BrandAssetKind::Favicon => "favicon",
         BrandAssetKind::Background => "background",
     }
-}
-
-fn image_response(bytes: Vec<u8>, mime: &str) -> Response {
-    let mut resp = Response::new(Body::from(bytes));
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_str(mime).unwrap());
-    resp.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600"),
-    );
-    *resp.status_mut() = StatusCode::OK;
-    resp
 }
 
 /// Pull the first multipart field named `"file"`; error otherwise.

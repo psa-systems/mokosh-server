@@ -4,6 +4,7 @@
 
 use crate::modules::auth::TenantId;
 use chrono::{DateTime, Datelike, Utc};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -214,6 +215,53 @@ impl CalendarService {
             Some(id) => self.validate_fk(tenant_id, table, id).await,
             None => Ok(()),
         }
+    }
+
+    /// Validate every named foreign id in ONE query inside ONE transaction,
+    /// rather than [`Self::validate_fk_opt`]'s one transaction per id
+    /// (PMS-1246). `checks` pairs each table with the id a request named for
+    /// it; a `None` id is skipped, matching `validate_fk_opt`. Reports the
+    /// same `"Referenced {table} not found in this tenant"` error the
+    /// per-key checks did, for the first table (in `checks` order) whose id
+    /// was not found.
+    async fn validate_fks(
+        &self,
+        tenant_id: TenantId,
+        checks: &[(&'static str, Option<Uuid>)],
+    ) -> AppResult<()> {
+        let present: Vec<(&'static str, Uuid)> = checks
+            .iter()
+            .filter_map(|(table, id)| id.map(|id| (*table, id)))
+            .collect();
+        if present.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::from("SELECT ");
+        for (i, (table, _)) in present.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = ${})",
+                i + 2
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let mut query = sqlx::query(&sql).bind(tenant_id);
+        for (_, id) in &present {
+            query = query.bind(id);
+        }
+        let row = query.fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        for (i, (table, _)) in present.iter().enumerate() {
+            let exists: bool = row.try_get(i)?;
+            if !exists {
+                return Err(AppError::BadRequest(format!(
+                    "Referenced {table} not found in this tenant"
+                )));
+            }
+        }
+        Ok(())
     }
 
     // ========================================================================
@@ -513,24 +561,22 @@ impl CalendarService {
         }
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked.
-        self.validate_fk(tenant_id, "users", request.assigned_to_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "companies", request.company_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "sites", request.site_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "tickets", request.ticket_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "projects", request.project_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "tasks", request.task_id)
-            .await?;
         // PMS-791 phase 3: reject a cross-tenant team_id (mirrors the
         // MAPPS-461 F1/F2 pattern on the teams surface).
-        self.validate_fk_opt(tenant_id, "teams", request.team_id)
-            .await?;
+        self.validate_fks(
+            tenant_id,
+            &[
+                ("users", Some(request.assigned_to_id)),
+                ("companies", request.company_id),
+                ("contacts", request.contact_id),
+                ("sites", request.site_id),
+                ("tickets", request.ticket_id),
+                ("projects", request.project_id),
+                ("tasks", request.task_id),
+                ("teams", request.team_id),
+            ],
+        )
+        .await?;
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
@@ -617,11 +663,15 @@ impl CalendarService {
     ) -> AppResult<AppointmentResponse> {
         // PSA audit: validate the foreign id being set so an update cannot
         // re-link this appointment to another tenant's user.
-        self.validate_fk_opt(tenant_id, "users", request.assigned_to_id)
-            .await?;
         // PMS-791 phase 3: same cross-tenant guard for team_id.
-        self.validate_fk_opt(tenant_id, "teams", request.team_id)
-            .await?;
+        self.validate_fks(
+            tenant_id,
+            &[
+                ("users", request.assigned_to_id),
+                ("teams", request.team_id),
+            ],
+        )
+        .await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // PMS-343: a partial update may carry only one of start_time / end_time,
         // so validate the *effective* range (the request value when provided,

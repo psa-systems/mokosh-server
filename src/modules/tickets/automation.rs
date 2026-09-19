@@ -104,35 +104,51 @@ impl AutomationEngine {
         }
     }
 
-    /// Process automation rules for a trigger type
+    /// Process automation rules for a trigger type.
+    ///
+    /// PMS-1246: one transaction for the whole run (rule fetch, the ticket
+    /// read every rule's conditions share, and every DB-writing action),
+    /// rather than one per rule (`evaluate_conditions`) plus one per action
+    /// (`execute_actions`) as before. A ticket update that fires 5 rules with
+    /// 3 actions each used to cost 1 + 5 + 15 = 21 transactions; it now costs
+    /// one.
     pub async fn process_rules(
         &self,
         tenant_id: TenantId,
         ticket_id: Uuid,
         trigger: AutomationTrigger,
     ) -> AppResult<()> {
-        // Get active rules for this trigger type
-        let rules = self.get_active_rules(tenant_id, trigger).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        for rule in rules {
-            if self
-                .evaluate_conditions(tenant_id, ticket_id, &rule)
-                .await?
-            {
-                self.execute_actions(tenant_id, ticket_id, &rule).await?;
+        // Get active rules for this trigger type
+        let rules = self.get_active_rules(&mut tx, tenant_id, trigger).await?;
+        if rules.is_empty() {
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        // Read once: every rule's conditions evaluate against the same
+        // ticket data, so there is nothing rule-specific to re-fetch.
+        let ticket = self.load_ticket_data(&mut tx, tenant_id, ticket_id).await?;
+
+        for rule in &rules {
+            if self.evaluate_conditions(ticket.as_ref(), rule) {
+                self.execute_actions(&mut tx, tenant_id, ticket_id, rule)
+                    .await?;
             }
         }
 
+        tx.commit().await?;
         Ok(())
     }
 
     /// Get active automation rules for a trigger type
     async fn get_active_rules(
         &self,
+        tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         trigger: AutomationTrigger,
     ) -> AppResult<Vec<AutomationRule>> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = sqlx::query_as::<_, AutomationRuleRow>(
             r#"
             SELECT id, tenant_id, name, description, is_active, trigger_type,
@@ -151,23 +167,14 @@ impl AutomationEngine {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Evaluate if rule conditions match the ticket
-    async fn evaluate_conditions(
+    /// The ticket data every rule's conditions evaluate against, read once
+    /// per [`Self::process_rules`] call rather than once per rule.
+    async fn load_ticket_data(
         &self,
+        tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         ticket_id: Uuid,
-        rule: &AutomationRule,
-    ) -> AppResult<bool> {
-        // Parse conditions from JSON
-        let conditions: Vec<AutomationCondition> =
-            serde_json::from_value(rule.conditions.clone()).unwrap_or_default();
-
-        if conditions.is_empty() {
-            return Ok(true); // No conditions means always match
-        }
-
-        // Get ticket data
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+    ) -> AppResult<Option<TicketDataRow>> {
         let ticket = sqlx::query_as::<_, TicketDataRow>(
             r#"
             SELECT t.*, s.name as status_name, p.name as priority_name
@@ -182,18 +189,28 @@ impl AutomationEngine {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let Some(ticket) = ticket else {
-            return Ok(false);
-        };
+        Ok(ticket)
+    }
 
-        // Evaluate each condition
-        for condition in conditions {
-            if !self.evaluate_condition(&ticket, &condition) {
-                return Ok(false);
-            }
+    /// Evaluate if rule conditions match the ticket. Pure (no DB access): the
+    /// ticket data is read once by [`Self::load_ticket_data`] and shared
+    /// across every rule in the run.
+    fn evaluate_conditions(&self, ticket: Option<&TicketDataRow>, rule: &AutomationRule) -> bool {
+        // Parse conditions from JSON
+        let conditions: Vec<AutomationCondition> =
+            serde_json::from_value(rule.conditions.clone()).unwrap_or_default();
+
+        if conditions.is_empty() {
+            return true; // No conditions means always match
         }
 
-        Ok(true)
+        let Some(ticket) = ticket else {
+            return false;
+        };
+
+        conditions
+            .iter()
+            .all(|condition| self.evaluate_condition(ticket, condition))
     }
 
     /// Evaluate a single condition against ticket data
@@ -226,9 +243,14 @@ impl AutomationEngine {
         }
     }
 
-    /// Execute automation rule actions
+    /// Execute automation rule actions.
+    ///
+    /// `tx` is the single connection [`Self::process_rules`] opened for the
+    /// whole run: every DB-writing action here runs on it rather than
+    /// opening its own transaction (PMS-1246).
     async fn execute_actions(
         &self,
+        tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         ticket_id: Uuid,
         rule: &AutomationRule,
@@ -242,7 +264,6 @@ impl AutomationEngine {
                     if let Some(status_id) = action.params.get("status_id").and_then(|v| v.as_str())
                     {
                         if let Ok(id) = Uuid::parse_str(status_id) {
-                            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                             sqlx::query(
                                 "UPDATE tickets SET status_id = $1, updated_at = NOW() WHERE id = $2",
                             )
@@ -250,7 +271,6 @@ impl AutomationEngine {
                             .bind(ticket_id)
                             .execute(&mut *tx)
                             .await?;
-                            tx.commit().await?;
                         }
                     }
                 }
@@ -259,7 +279,6 @@ impl AutomationEngine {
                         action.params.get("priority_id").and_then(|v| v.as_str())
                     {
                         if let Ok(id) = Uuid::parse_str(priority_id) {
-                            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                             sqlx::query(
                                 "UPDATE tickets SET priority_id = $1, updated_at = NOW() WHERE id = $2",
                             )
@@ -267,14 +286,12 @@ impl AutomationEngine {
                             .bind(ticket_id)
                             .execute(&mut *tx)
                             .await?;
-                            tx.commit().await?;
                         }
                     }
                 }
                 "assign_to" => {
                     if let Some(user_id) = action.params.get("user_id").and_then(|v| v.as_str()) {
                         if let Ok(id) = Uuid::parse_str(user_id) {
-                            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                             sqlx::query(
                                 "UPDATE tickets SET assigned_to_id = $1, updated_at = NOW() WHERE id = $2",
                             )
@@ -282,14 +299,12 @@ impl AutomationEngine {
                             .bind(ticket_id)
                             .execute(&mut *tx)
                             .await?;
-                            tx.commit().await?;
                         }
                     }
                 }
                 "set_queue" => {
                     if let Some(queue_id) = action.params.get("queue_id").and_then(|v| v.as_str()) {
                         if let Ok(id) = Uuid::parse_str(queue_id) {
-                            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                             sqlx::query(
                                 "UPDATE tickets SET queue_id = $1, updated_at = NOW() WHERE id = $2",
                             )
@@ -297,7 +312,6 @@ impl AutomationEngine {
                             .bind(ticket_id)
                             .execute(&mut *tx)
                             .await?;
-                            tx.commit().await?;
                         }
                     }
                 }
@@ -308,7 +322,6 @@ impl AutomationEngine {
                             .get("note_type")
                             .and_then(|v| v.as_str())
                             .unwrap_or("internal");
-                        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                         sqlx::query(
                             "INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type, content, created_by_id) VALUES ($1, $2, $3, $4, $5, $6)",
                         )
@@ -320,7 +333,6 @@ impl AutomationEngine {
                         .bind(Uuid::nil()) // System-generated
                         .execute(&mut *tx)
                         .await?;
-                        tx.commit().await?;
                     }
                 }
                 "send_notification" => {
@@ -462,14 +474,12 @@ impl AutomationEngine {
         }
 
         // Update rule stats
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE ticket_automation_rules SET last_run_at = NOW(), run_count = run_count + 1 WHERE id = $1",
         )
         .bind(rule.id)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
 
         Ok(())
     }
