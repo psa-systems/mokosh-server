@@ -127,6 +127,7 @@ is manual-dispatch only (see [CI](#ci)).
 | `E2E_OIDC_REDIRECT_URI` | redirect_uri registered for that client (no default; must match exactly or the OP returns `invalid_redirect_uri`). Only the `code` is captured, the URL is never loaded |
 | `E2E_TOTP_SECRET` | base32 TOTP secret for the E2E account. Setup generates the second-factor code at runtime; same string you pasted into your authenticator when enrolling 2FA on the account |
 | `E2E_FOREIGN_COMPANY_ID` | *optional*, and genuinely so - a company id in **another** tenant. The cross-tenant company canary always runs and is never skipped; setting this strengthens it (an existing, foreign-owned company must still 403/404). When unset, `global.setup.ts` falls back to a random, well-formed UUID the E2E tenant cannot own, so the canary then only proves a non-existent company is unreadable |
+| `E2E_ENVIRONMENT` | *optional* - target environment name, `staging` or `production`, default `staging` (`e2e/.env.example`). CI sets it from the dispatch input; `tests/external-guard.spec.ts` reads it to assert `@external`-tagged tests never run against production ([Production-safe subset](#production-safe-subset-pms-608)). Leave unset locally (treated as non-production) |
 
 ## One-time staging provisioning (manual)
 
