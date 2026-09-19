@@ -9,7 +9,7 @@ The crate builds two binaries, and one of them doubles as an operator CLI.
 
 ## Operator subcommands
 
-`mokosh-server` inspects `argv` before binding a port (`src/cli.rs`): when the first token is one of these it runs the task and exits instead of serving.
+`mokosh-server` inspects `argv` before binding a port (`src/cli/mod.rs`): when the first token is one of these it runs the task and exits instead of serving.
 
 | Subcommand | Purpose |
 | --- | --- |
@@ -19,6 +19,10 @@ The crate builds two binaries, and one of them doubles as an operator CLI.
 | `showcase-seed` | Create the richer showcase demo dataset in the tenant named by `--tenant <uuid>` or `MOKOSH_SHOWCASE_TENANT_ID`. |
 | `showcase-refresh` | Tear the showcase dataset down and re-seed it in one step. |
 | `showcase-teardown` | Remove the showcase dataset. |
+| `provider-status` | Render the per-key, per-provider presence matrix: every declared key, per provider, plus which provider is currently serving each. Values are never printed. |
+| `provider-migrate` | Copy every key the source provider holds into the target, one key at a time, with a write-then-read-back compare. The source is never cleared. |
+| `provider-purge` | Delete every key a named provider holds, but only where the provider is disabled and the key is verified live in the provider serving it now. Dry-run by default. |
+| `verify-providers` | Boot every provider seam (configuration, application-tier secrets, tenant-tier secrets, storage, authentication, email) and report whether each capability is live. |
 
 Both seeds are fail-closed and write nothing unless the target tenant is explicitly marked: `settings.is_qa` for `qa-*`, `settings.is_showcase` for `showcase-*`. That is what keeps them off a production tenant. Each needs a privileged `DATABASE_URL`.
 

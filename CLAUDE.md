@@ -76,7 +76,7 @@ src/
   lib.rs                library crate root
   api/router.rs         create_api_router: builds every /api/v1 nest (see "Routing model"), wires middleware + CORS
   bin/mokosh-bootstrap.rs CLI: bootstrap-infisical, qa-seed/qa-teardown, normalize-company-industries
-  cli.rs                Operator subcommands mokosh-server dispatches before binding a port (PMS-494)
+  cli/                  Operator subcommands mokosh-server dispatches before binding a port (PMS-494); providers.rs and verify.rs add the four provider subcommands (PMS-1012/1013)
   config/               ConfigProvider: the declared key registry and the one configuration read path (PMS-982)
   db/                   Database wrapper around sqlx::PgPool
   infisical/            Infisical HTTP client + first-run bootstrap
