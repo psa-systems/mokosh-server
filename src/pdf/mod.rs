@@ -786,7 +786,18 @@ fn document_date(date: NaiveDate) -> PdfOffsetDateTime {
 ///
 /// Fails only when the vendored faces will not parse, which is a broken build
 /// rather than a bad document: see [`faces`].
-pub fn render(document: &Document, generated_on: NaiveDate) -> AppResult<Vec<u8>> {
+///
+/// Rendering is CPU-bound (layout plus font subsetting), so it runs on the
+/// blocking pool via `spawn_blocking` (PMS-1245) rather than inline on the
+/// Tokio worker thread handling the request. The document is taken by value
+/// because the blocking closure needs `'static` data to move into the pool.
+pub async fn render(document: Document, generated_on: NaiveDate) -> AppResult<Vec<u8>> {
+    tokio::task::spawn_blocking(move || render_sync(&document, generated_on))
+        .await
+        .map_err(|e| AppError::Internal(format!("PDF render task panicked: {}", e)))?
+}
+
+fn render_sync(document: &Document, generated_on: NaiveDate) -> AppResult<Vec<u8>> {
     let faces = faces()?;
     let theme = Theme::resolve(document.template, document.accent.as_deref());
     // The title also goes in the document information dictionary, which
@@ -1575,7 +1586,7 @@ mod tests {
     }
 
     fn render_dated(document: &Document) -> AppResult<Vec<u8>> {
-        render(document, test_date())
+        render_sync(document, test_date())
     }
 
     fn sample() -> Document {
@@ -1613,6 +1624,16 @@ mod tests {
             "not an empty shell: {} bytes",
             bytes.len()
         );
+    }
+
+    /// PMS-1245: the public `render` runs the same layout on the blocking
+    /// pool and produces the same bytes as the synchronous path the rest of
+    /// this module's tests exercise directly.
+    #[tokio::test]
+    async fn render_runs_on_the_blocking_pool_and_matches_the_sync_path() {
+        let sync_bytes = render_dated(&sample()).expect("render");
+        let async_bytes = render(sample(), test_date()).await.expect("render");
+        assert_eq!(sync_bytes, async_bytes);
     }
 
     /// A one-pixel PNG: a real image of a type `utils::inline_image` accepts,
@@ -1664,7 +1685,7 @@ mod tests {
     #[test]
     fn the_rendered_pdf_is_stamped_with_the_given_date() {
         let bytes =
-            render(&sample(), NaiveDate::from_ymd_opt(2026, 3, 7).unwrap()).expect("render");
+            render_sync(&sample(), NaiveDate::from_ymd_opt(2026, 3, 7).unwrap()).expect("render");
         let text = String::from_utf8_lossy(&bytes);
         assert!(
             text.contains("/CreationDate(D:20260307"),

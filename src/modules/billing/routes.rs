@@ -880,9 +880,10 @@ async fn get_invoice_pdf(
                 .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
             crate::pdf::render(
-                &crate::modules::billing::documents::invoice(&invoice, &issuer, &bill_to, logo),
+                crate::modules::billing::documents::invoice(&invoice, &issuer, &bill_to, logo),
                 invoice.invoice_date,
-            )?
+            )
+            .await?
         }
     };
     Ok(pdf_response(
@@ -1129,9 +1130,10 @@ async fn get_credit_note_pdf(
             let logo =
                 crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
             crate::pdf::render(
-                &crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
+                crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
                 note.issue_date,
-            )?
+            )
+            .await?
         }
     };
     Ok(pdf_response(
@@ -1166,9 +1168,10 @@ async fn get_statement_pdf(
     // PMS-1206: a statement stores nothing (PMS-954), so there is no issue
     // date to reuse; it is generated the moment this request is answered.
     let bytes = crate::pdf::render(
-        &crate::modules::billing::documents::statement(&statement, &issuer, &account, logo),
+        crate::modules::billing::documents::statement(&statement, &issuer, &account, logo),
         chrono::Utc::now().date_naive(),
-    )?;
+    )
+    .await?;
     Ok(pdf_response(
         bytes,
         &format!(

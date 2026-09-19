@@ -14,10 +14,11 @@
 //!   branding field-by-field (Company wins where set).
 //!
 //! Multipart upload endpoints (PUT /companies/{id}/logo etc.) are
-//! covered by the module's own unit tests
-//! (`modules::branding::assets`); asserting them here would need a
-//! multipart-request builder and adds little coverage the unit tests
-//! don't already give. The one exception is the tenant logo
+//! covered by the module's own unit tests (`modules::branding::assets`)
+//! for the field-level behavior, and by `tests/upload_body_limit_branding.rs`
+//! (PMS-1233) at the HTTP level for the route's `DefaultBodyLimit` sizing,
+//! which a pure-function unit test cannot exercise because it never builds
+//! an axum `Router`. The one exception covered here is the tenant logo
 //! (PMS-1234, below): it has a second, older entry point
 //! (`PUT /tenants/current/logo`) that must write the same object, so
 //! that convergence needs an HTTP-level test rather than a unit one.

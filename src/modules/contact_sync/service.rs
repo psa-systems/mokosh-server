@@ -103,7 +103,51 @@ impl From<ConnectionRow> for ConnectionStatus {
     }
 }
 
-/// What a completed consent did.
+/// The system tenant, which holds deployment-wide configuration (the email
+/// settings' `system_tenant`, `OIDC_DEFAULT_TENANT_ID`).
+fn system_tenant() -> TenantId {
+    TenantId::from_trusted(Uuid::from_u128(1))
+}
+
+/// Where the stored client id lives on the system tenant (PMS-1264).
+const CLIENT_SETTING_CATEGORY: &str = "integrations";
+const CLIENT_SETTING_KEY: &str = "google_contacts_client_id";
+
+/// Where the OAuth client in force comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientSource {
+    /// Set in the app (PMS-1264).
+    Database,
+    /// `GOOGLE_CONTACTS_CLIENT_ID` and `GOOGLE_CONTACTS_CLIENT_SECRET`.
+    Environment,
+    /// An id is stored in the app with no secret beside it.
+    Incomplete,
+    None,
+}
+
+/// `GET /integrations/contact-sync/google/client`. The secret never leaves.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientSettingsView {
+    pub source: ClientSource,
+    pub client_id: Option<String>,
+    pub secret_set: bool,
+    /// What to register as an authorized redirect URI in the Google Cloud
+    /// console. `None` when `PUBLIC_API_BASE_URL` is not set, which the form
+    /// says, because nothing can connect until it is.
+    pub redirect_uri: Option<String>,
+}
+
+/// `PUT /integrations/contact-sync/google/client`: `None` keeps, `""` clears.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ClientSettingsInput {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
+/// What a completed consent did./// What a completed consent did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectOutcome {
     Connected(Uuid),
@@ -124,6 +168,9 @@ pub struct ContactSyncOverview {
     pub configured: bool,
     /// `null` when never connected, or disconnected.
     pub connection: Option<ConnectionStatus>,
+    /// The caller may set the deployment's OAuth client (PMS-1264): an admin
+    /// of the system tenant. Filled by the route, which knows the caller.
+    pub client_editable: bool,
 }
 
 /// What one connection looks like to the Settings card.
@@ -301,15 +348,11 @@ impl ContactSyncService {
     /// that, not a Google error page.
     pub async fn begin_connect(&self, tenant_id: TenantId, user_id: Uuid) -> AppResult<String> {
         self.assert_enabled(tenant_id).await?;
-        let client = OauthClient::from_config().ok_or_else(|| {
-            AppError::Configuration(
-                "Google Contacts is not configured on this deployment.".to_string(),
-            )
-        })?;
+        let client = self.require_oauth_client().await?;
         let redirect_uri = self.redirect_uri()?;
         let pkce = Pkce::generate();
         let secret = generate_token(48);
-        let state_hash = hash_password(&secret)?;
+        let state_hash = hash_password(&secret).await?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let state_id: Uuid = sqlx::query_scalar(
@@ -345,11 +388,7 @@ impl ContactSyncService {
     /// the state row, which the caller proved possession of. Every write below
     /// is scoped to that tenant.
     pub async fn complete_connect(&self, state: &str, code: &str) -> AppResult<String> {
-        let client = OauthClient::from_config().ok_or_else(|| {
-            AppError::Configuration(
-                "Google Contacts is not configured on this deployment.".to_string(),
-            )
-        })?;
+        let client = self.require_oauth_client().await?;
         let (state_id, secret) = state
             .split_once('.')
             .ok_or_else(|| AppError::BadRequest("That sign-in link is not valid.".to_string()))?;
@@ -386,7 +425,7 @@ impl ContactSyncService {
         // probing state ids learns nothing from the difference.
         let usable = consumed_at.is_none()
             && expires_at > Utc::now()
-            && verify_password(secret, &state_hash).unwrap_or(false);
+            && verify_password(secret, &state_hash).await.unwrap_or(false);
         if !usable {
             return Err(AppError::BadRequest(
                 "That connection attempt is no longer valid. Start again from Settings."
@@ -583,9 +622,207 @@ impl ContactSyncService {
         Ok(ContactSyncOverview {
             enabled: crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id)
                 .await?,
-            configured: OauthClient::from_config().is_some(),
+            configured: self.oauth_client().await?.is_some(),
             connection: self.connection(tenant_id).await?,
+            client_editable: false,
         })
+    }
+
+    /// Whether `user` may set the deployment's OAuth client: an admin of the
+    /// system tenant, the deployment's own organisation. Not any tenant's
+    /// admin: on a multi-tenant deployment a customer organisation must not be
+    /// able to swap the client every other tenant connects through.
+    pub fn may_configure_client(user: &mokosh_types::auth::CurrentUser) -> bool {
+        user.tenant_id == system_tenant().get() && user.role.is_admin()
+    }
+
+    /// The system tenant's id, for the platform-or-tenant gate.
+    pub fn system_tenant_id() -> Uuid {
+        system_tenant().get()
+    }
+
+    /// The OAuth client this deployment connects with (PMS-1264): the one set
+    /// in the app, else operator env, else none. A stored client is used as a
+    /// PAIR, never mixed field by field with env: an id from one Google project
+    /// and a secret from another fail at Google with an error nobody can place.
+    /// A stored id with no stored secret is half a client and reads as none.
+    pub async fn oauth_client(&self) -> AppResult<Option<OauthClient>> {
+        Ok(self.resolve_client().await?.0)
+    }
+
+    async fn require_oauth_client(&self) -> AppResult<OauthClient> {
+        self.oauth_client().await?.ok_or_else(|| {
+            AppError::Configuration(
+                "Google Contacts is not configured on this deployment.".to_string(),
+            )
+        })
+    }
+
+    async fn stored_client_id(&self) -> AppResult<Option<String>> {
+        let mut tx = self.db.begin_with_tenant(system_tenant()).await?;
+        let value: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT value FROM tenant_settings \
+             WHERE tenant_id = $1 AND category = $2 AND key = $3",
+        )
+        .bind(system_tenant())
+        .bind(CLIENT_SETTING_CATEGORY)
+        .bind(CLIENT_SETTING_KEY)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(value
+            .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
+            .filter(|v| !v.is_empty()))
+    }
+
+    async fn resolve_client(&self) -> AppResult<(Option<OauthClient>, ClientSource)> {
+        if let Some(client_id) = self.stored_client_id().await? {
+            let secret = self
+                .secrets
+                .get(&SecretKey::oauth_client(system_tenant().get(), GOOGLE))
+                .await?
+                .filter(|s| !s.trim().is_empty());
+            return Ok(match secret {
+                Some(client_secret) => (
+                    Some(OauthClient {
+                        client_id,
+                        client_secret,
+                    }),
+                    ClientSource::Database,
+                ),
+                None => (None, ClientSource::Incomplete),
+            });
+        }
+        Ok(match OauthClient::from_config() {
+            Some(client) => (Some(client), ClientSource::Environment),
+            None => (None, ClientSource::None),
+        })
+    }
+
+    /// What the client settings form shows. The secret never leaves.
+    pub async fn client_settings(&self) -> AppResult<ClientSettingsView> {
+        let (client, source) = self.resolve_client().await?;
+        let stored_id = self.stored_client_id().await?;
+        let secret_set = self
+            .secrets
+            .get(&SecretKey::oauth_client(system_tenant().get(), GOOGLE))
+            .await?
+            .is_some_and(|s| !s.trim().is_empty());
+        Ok(ClientSettingsView {
+            source,
+            client_id: stored_id.or_else(|| {
+                (source == ClientSource::Environment)
+                    .then(|| client.map(|c| c.client_id))
+                    .flatten()
+            }),
+            secret_set: secret_set || source == ClientSource::Environment,
+            redirect_uri: self.redirect_uri().ok(),
+        })
+    }
+
+    /// Set or clear the in-app client (PMS-1264). `None` keeps a field, an
+    /// empty string clears it; clearing the id clears the stored secret with
+    /// it, and falls back to env. The secret goes to the secret provider, never
+    /// to `tenant_settings`.
+    pub async fn put_client_settings(
+        &self,
+        input: &ClientSettingsInput,
+        actor: &str,
+    ) -> AppResult<ClientSettingsView> {
+        let key = SecretKey::oauth_client(system_tenant().get(), GOOGLE);
+        let new_id = input.client_id.as_deref().map(str::trim);
+        let new_secret = input.client_secret.as_deref().map(str::trim);
+        if let Some(id) = new_id.filter(|id| !id.is_empty()) {
+            if !id.ends_with(".apps.googleusercontent.com") || id.chars().any(char::is_whitespace) {
+                return Err(AppError::validation_field(
+                    "client_id",
+                    "must be a Google OAuth client id, ending in .apps.googleusercontent.com",
+                ));
+            }
+        }
+        if let Some(secret) = new_secret.filter(|s| !s.is_empty()) {
+            if secret.len() > 255 || secret.chars().any(char::is_whitespace) {
+                return Err(AppError::validation_field(
+                    "client_secret",
+                    "must be the client secret from the Google Cloud console, with no spaces",
+                ));
+            }
+        }
+        let current_id = self.stored_client_id().await?;
+        let resulting_id = match new_id {
+            Some("") => None,
+            Some(id) => Some(id.to_string()),
+            None => current_id.clone(),
+        };
+        let secret_stored = self
+            .secrets
+            .get(&key)
+            .await?
+            .is_some_and(|s| !s.trim().is_empty());
+        let resulting_secret = match new_secret {
+            Some("") => false,
+            Some(_) => true,
+            None => secret_stored,
+        };
+        if resulting_id.is_some() && !resulting_secret {
+            return Err(AppError::validation_field(
+                "client_secret",
+                "a client id needs its client secret",
+            ));
+        }
+
+        // Secret first, the PMS-968 ordering: an orphaned secret is harmless, a
+        // stored id pointing at no secret is a client that cannot connect.
+        match (resulting_id.as_ref(), new_secret) {
+            (Some(_), Some(secret)) if !secret.is_empty() => self.secrets.put(&key, secret).await?,
+            (None, _) | (_, Some("")) => self.secrets.delete(&key).await?,
+            _ => {}
+        }
+        let mut tx = self.db.begin_with_tenant(system_tenant()).await?;
+        match resulting_id.as_ref() {
+            Some(id) => {
+                sqlx::query(
+                    "INSERT INTO tenant_settings (tenant_id, category, key, value) \
+                     VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (tenant_id, category, key) \
+                     DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+                )
+                .bind(system_tenant())
+                .bind(CLIENT_SETTING_CATEGORY)
+                .bind(CLIENT_SETTING_KEY)
+                .bind(serde_json::json!(id))
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "DELETE FROM tenant_settings WHERE tenant_id = $1 AND category = $2 AND key = $3",
+                )
+                .bind(system_tenant())
+                .bind(CLIENT_SETTING_CATEGORY)
+                .bind(CLIENT_SETTING_KEY)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        audit_write(
+            &mut *tx,
+            system_tenant(),
+            &AuditCtx::system(system_tenant().get()),
+            AuditAction::Update,
+            "contact_sync_oauth_client",
+            None,
+            Some(serde_json::json!({ "client_id": current_id })),
+            Some(serde_json::json!({
+                "event": "contact_sync.client_changed",
+                "provider": GOOGLE,
+                "client_id": resulting_id,
+                "secret_changed": new_secret.is_some(),
+                "changed_by": actor,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        self.client_settings().await
     }
 
     /// Refuse while `integrations/google_contacts_enabled` is off (PSA-70 K).
@@ -1429,11 +1666,7 @@ impl ContactSyncService {
         connection_id: Uuid,
         provider: &str,
     ) -> AppResult<String> {
-        let client = OauthClient::from_config().ok_or_else(|| {
-            AppError::Configuration(
-                "Google Contacts is not configured on this deployment.".to_string(),
-            )
-        })?;
+        let client = self.require_oauth_client().await?;
         let refresh_token = self
             .secrets
             .get(&SecretKey::contact_sync(

@@ -32,12 +32,14 @@ use uuid::Uuid;
 
 use super::runs::RunStatus;
 use super::service::{
-    ConnectionStatus, ContactProvenance, ContactSyncOverview, ContactSyncService, DataRemoval,
-    GroupOption, Resolution, Resolved, ReviewItem,
+    ClientSettingsInput, ClientSettingsView, ConnectionStatus, ContactProvenance,
+    ContactSyncOverview, ContactSyncService, DataRemoval, GroupOption, Resolution, Resolved,
+    ReviewItem,
 };
 use super::sync::ImportPreview;
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
+use crate::modules::tenants::TenantOrPlatformCaller;
 use crate::utils::error::AppResult;
 
 #[derive(Clone)]
@@ -57,6 +59,10 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
         .route(
             "/integrations/contact-sync/google/disconnect",
             post(disconnect),
+        )
+        .route(
+            "/integrations/contact-sync/google/client",
+            get(get_client).put(put_client),
         )
         .route("/integrations/contact-sync/groups", get(list_groups))
         .route("/integrations/contact-sync/selection", put(set_selection))
@@ -103,7 +109,34 @@ async fn get_connection(
     State(state): State<ContactSyncRouterState>,
     RequireAuth(user): RequireAuth,
 ) -> AppResult<Json<ContactSyncOverview>> {
-    Ok(Json(state.service.overview(user.tenant()).await?))
+    let mut overview = state.service.overview(user.tenant()).await?;
+    overview.client_editable = ContactSyncService::may_configure_client(&user);
+    Ok(Json(overview))
+}
+
+/// The deployment's Google OAuth client (PMS-1264). Read and written by a
+/// platform admin, or by an admin of the system tenant.
+async fn get_client(
+    State(state): State<ContactSyncRouterState>,
+    caller: TenantOrPlatformCaller,
+) -> AppResult<Json<ClientSettingsView>> {
+    caller.require_admin_write_access(ContactSyncService::system_tenant_id())?;
+    Ok(Json(state.service.client_settings().await?))
+}
+
+async fn put_client(
+    State(state): State<ContactSyncRouterState>,
+    caller: TenantOrPlatformCaller,
+    Json(input): Json<ClientSettingsInput>,
+) -> AppResult<Json<ClientSettingsView>> {
+    caller.require_admin_write_access(ContactSyncService::system_tenant_id())?;
+    let actor = match &caller {
+        TenantOrPlatformCaller::Platform => "platform admin".to_string(),
+        TenantOrPlatformCaller::Tenant(user) => user.email.clone(),
+    };
+    Ok(Json(
+        state.service.put_client_settings(&input, &actor).await?,
+    ))
 }
 
 #[derive(Debug, serde::Serialize)]

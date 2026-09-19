@@ -50,7 +50,7 @@ pub async fn maybe_bootstrap_admin(db: &Database) -> AppResult<()> {
     // reset can never clobber the platform admin credential.
     let _default_tenant_id = Uuid::from_u128(1);
     let email = email.trim().to_ascii_lowercase();
-    let password_hash = hash_password(&password)?;
+    let password_hash = hash_password(&password).await?;
     let admin_id = Uuid::new_v4();
     let (first_name, last_name) = derive_name(&email);
 

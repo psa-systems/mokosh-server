@@ -173,6 +173,8 @@ async fn a_contact_page_reads_each_child_table_once(pool: PgPool) {
     for (table, label) in [
         ("contact_phones", "phones"),
         ("contact_companies", "company links"),
+        // PMS-1260: provenance for the list's badge.
+        ("contact_sync_links", "import provenance"),
     ] {
         let reads: Vec<&String> = statements
             .iter()

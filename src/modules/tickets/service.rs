@@ -3,6 +3,7 @@
 use crate::modules::auth::TenantId;
 use chrono::Utc;
 use mokosh_types::auth::CurrentUser;
+use sqlx::Row;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -176,6 +177,53 @@ impl TicketService {
         }
     }
 
+    /// Validate every named foreign id in ONE query inside ONE transaction,
+    /// rather than [`Self::validate_fk_opt`]'s one transaction per id
+    /// (PMS-1246). `checks` pairs each table with the id a request named for
+    /// it; a `None` id is skipped, matching `validate_fk_opt`. Reports the
+    /// same `"Referenced {table} not found in this tenant"` error the
+    /// per-key checks did, for the first table (in `checks` order) whose id
+    /// was not found.
+    async fn validate_fks(
+        &self,
+        tenant_id: TenantId,
+        checks: &[(&'static str, Option<Uuid>)],
+    ) -> AppResult<()> {
+        let present: Vec<(&'static str, Uuid)> = checks
+            .iter()
+            .filter_map(|(table, id)| id.map(|id| (*table, id)))
+            .collect();
+        if present.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::from("SELECT ");
+        for (i, (table, _)) in present.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = ${})",
+                i + 2
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let mut query = sqlx::query(&sql).bind(tenant_id);
+        for (_, id) in &present {
+            query = query.bind(id);
+        }
+        let row = query.fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        for (i, (table, _)) in present.iter().enumerate() {
+            let exists: bool = row.try_get(i)?;
+            if !exists {
+                return Err(AppError::BadRequest(format!(
+                    "Referenced {table} not found in this tenant"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Generate next ticket number for tenant
     async fn next_ticket_number(&self, tenant_id: TenantId) -> AppResult<String> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -247,26 +295,22 @@ impl TicketService {
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked, so a request cannot point a
         // ticket at another tenant's company/contact/site/etc.
-        self.validate_fk(tenant_id, "companies", request.company_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "ticket_types", request.type_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "ticket_categories", request.category_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "sites", request.site_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "users", request.assigned_to_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "teams", request.team_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "contracts", request.contract_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "assets", request.asset_id)
-            .await?;
+        self.validate_fks(
+            tenant_id,
+            &[
+                ("companies", Some(request.company_id)),
+                ("ticket_types", request.type_id),
+                ("ticket_categories", request.category_id),
+                ("contacts", request.contact_id),
+                ("sites", request.site_id),
+                ("users", request.assigned_to_id),
+                ("teams", request.team_id),
+                ("contracts", request.contract_id),
+                ("sla_policies", request.sla_id),
+                ("assets", request.asset_id),
+            ],
+        )
+        .await?;
 
         // Insert + audit row in one transaction: capture the new row
         // with Postgres to_jsonb and write the audit entry on the same
@@ -567,28 +611,25 @@ impl TicketService {
         // PSA audit: validate any foreign id being set so an update cannot
         // re-link this ticket to another tenant's rows. Option fields are
         // only checked when present.
-        self.validate_fk_opt(tenant_id, "ticket_priorities", request.priority_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "ticket_queues", request.queue_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "contacts", request.contact_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "sites", request.site_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "users", request.assigned_to_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "teams", request.team_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "contracts", request.contract_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
-            .await?;
         // PMS-344 follow-up: asset_id is now PATCH-nullable
         // (Option<Option<Uuid>>); only the inner Some(uuid) needs an FK
         // validation. Some(None) means "clear to NULL", which is always
         // safe; None means "leave unchanged".
-        self.validate_fk_opt(tenant_id, "assets", request.asset_id.flatten())
-            .await?;
+        self.validate_fks(
+            tenant_id,
+            &[
+                ("ticket_priorities", request.priority_id),
+                ("ticket_queues", request.queue_id),
+                ("contacts", request.contact_id),
+                ("sites", request.site_id),
+                ("users", request.assigned_to_id),
+                ("teams", request.team_id),
+                ("contracts", request.contract_id),
+                ("sla_policies", request.sla_id),
+                ("assets", request.asset_id.flatten()),
+            ],
+        )
+        .await?;
 
         // Mutation + audit row in one transaction: snapshot the row
         // before and after (Postgres to_jsonb captures exact stored
