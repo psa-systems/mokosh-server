@@ -89,6 +89,44 @@ async fn every_exportable_report_serves_a_pdf(pool: PgPool) {
     }
 }
 
+/// PMS-1200: `pdf_for_billing` used to print a raw `Decimal` with
+/// `.to_string()`, so a whole-dollar total read as `1200` with no `.00` and
+/// no currency. It now goes through the promoted `money()` formatter like
+/// every other money value this repo renders.
+#[sqlx::test]
+async fn billing_pdf_prints_money_through_the_shared_formatter(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    sqlx::query(
+        r#"INSERT INTO invoices
+           (id, tenant_id, invoice_number, company_id, status,
+            invoice_date, due_date, subtotal, total, amount_paid, balance_due, currency)
+           VALUES ($1, $2, 'PDF-BILL-1', $3, 'sent',
+                   CURRENT_DATE, CURRENT_DATE + 30, 1200, 1200, 0, 1200, 'USD')"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed a whole-dollar invoice");
+
+    let (status, _headers, body) = export(&app, &token, "billing", "pdf").await;
+    assert_eq!(status, StatusCode::OK);
+    let text = extracted_text(&body);
+    assert!(
+        text.contains("1200.00 USD"),
+        "PMS-1200: a whole-dollar total must render as 1200.00 USD, not a bare 1200: {text}"
+    );
+    assert!(
+        !text.contains("Invoiced: 1200\n") && !text.contains("Invoiced 1200"),
+        "PMS-1200: the raw Decimal must not appear unformatted: {text}"
+    );
+}
+
 /// The custom report still refuses, and for the reason it always did: adding a
 /// second format does not give a GET a body to carry a report spec in.
 #[sqlx::test]
