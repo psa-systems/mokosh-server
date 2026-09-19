@@ -84,7 +84,7 @@ src/
   pdf/                  Document model, and the one place it becomes PDF bytes (PMS-876)
   scheduler/            Registry for the interval background jobs (PMS-135)
   secrets/              SecretProvider: database (default) or Infisical, chosen by SECRET_BACKEND (PMS-967)
-  storage/              File storage seam; the single reader of ATTACHMENT_DIR (PMS-910)
+  storage/              File storage seam; the provider of record for ATTACHMENT_DIR (PMS-910); branding/ also reads it through the config seam for local-path assets
   utils/                error, email (Mailer trait + SmtpMailer/LogMailer), crypto, validation, pagination
   version.rs            VersionInfo (build-time git hash/describe via build.rs)
   version_check.rs      Opt-in self-hosted update check against MOKOSH_UPDATE_CHECK_URL (PMS-238)
