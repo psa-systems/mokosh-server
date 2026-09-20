@@ -49,7 +49,9 @@ async fn contact_token(
 ) -> String {
     let contact_id = Uuid::new_v4();
     let email = format!("{contact_id}@client.example");
-    let hash = mokosh_server::utils::crypto::hash_password(CONTACT_PASSWORD).expect("hash");
+    let hash = mokosh_server::utils::crypto::hash_password(CONTACT_PASSWORD)
+        .await
+        .expect("hash");
     sqlx::query(
         "INSERT INTO contacts \
             (id, tenant_id, company_id, first_name, last_name, email, \

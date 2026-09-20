@@ -130,6 +130,27 @@ impl FileLedger {
         Ok(())
     }
 
+    /// The size most recently recorded for a ledgered object, by what it
+    /// belongs to rather than by its id. PMS-1246: the branding public read
+    /// needs the tenant logo's size to build an ETag before it opens the
+    /// blob, and the logo's id is the tenant's own, so `entity_type` is the
+    /// only way to ask for "the current logo" without threading an object
+    /// id the caller does not otherwise need.
+    pub async fn latest_file_size(
+        &self,
+        tenant_id: Uuid,
+        entity_type: &str,
+    ) -> AppResult<Option<i64>> {
+        let size: Option<i64> = sqlx::query_scalar(
+            "SELECT file_size FROM files WHERE tenant_id = $1 AND entity_type = $2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(entity_type)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        Ok(size)
+    }
+
     /// Forget a file that is no longer stored.
     ///
     /// Best effort, like the blob removal it accompanies: the feature's own row

@@ -156,6 +156,7 @@ async fn a_password_reaches_the_hasher_byte_identical(pool: PgPool) {
         .expect("read the stored hash");
     assert!(
         mokosh_server::utils::crypto::verify_password(&new_password, &hash)
+            .await
             .expect("verify original bytes"),
         "the stored hash must verify against the password as sent",
     );
@@ -167,6 +168,7 @@ async fn a_password_reaches_the_hasher_byte_identical(pool: PgPool) {
     );
     assert!(
         !mokosh_server::utils::crypto::verify_password(&sanitized, &hash)
+            .await
             .expect("verify sanitized bytes"),
         "the sanitized form must NOT be what was stored",
     );

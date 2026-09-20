@@ -2,10 +2,11 @@
 
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use validator::Validate;
 
@@ -13,6 +14,7 @@ use super::models::*;
 use super::service::SettingsService;
 use crate::db::Database;
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
+use crate::modules::tenants::DeploymentOperator;
 use crate::utils::email::SharedMailer;
 use crate::utils::error::AppResult;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -89,11 +91,14 @@ pub fn settings_routes(
         .with_state(state)
 }
 
-/// PMS-638: read the deployment-wide email settings (admin only). The SMTP
+/// PMS-638: read the deployment-wide email settings. PMS-1280: the
+/// deployment's operator only ([`DeploymentOperator`]), as are the other five
+/// deployment-wide handlers below; `RequireAdmin` let any organisation's admin
+/// read and repoint the relay every organisation sends through. The SMTP
 /// password is never returned, only whether one is set.
 async fn get_email(
     State(s): State<SettingsRouterState>,
-    _admin: RequireAdmin,
+    _operator: DeploymentOperator,
 ) -> AppResult<Json<super::email::EmailSettingsView>> {
     Ok(Json(super::email::get_email_settings(&s.db).await?))
 }
@@ -102,7 +107,7 @@ async fn get_email(
 /// and hot-swap the live mailer so the change takes effect without a restart.
 async fn put_email(
     State(s): State<SettingsRouterState>,
-    _admin: RequireAdmin,
+    _operator: DeploymentOperator,
     Json(input): Json<super::email::EmailSettingsInput>,
 ) -> AppResult<Json<super::email::EmailSettingsView>> {
     let view = super::email::put_email_settings(&s.db, &s.enc_key, input).await?;
@@ -116,7 +121,7 @@ async fn put_email(
 /// rather than being swallowed.
 async fn post_email_test_send(
     State(s): State<SettingsRouterState>,
-    _admin: RequireAdmin,
+    _operator: DeploymentOperator,
     Json(req): Json<super::email::TestEmailRequest>,
 ) -> AppResult<axum::http::StatusCode> {
     use crate::utils::email::Mailer;
@@ -139,7 +144,7 @@ async fn post_email_test_send(
 /// receive a test message; LogMailer's `verify` is trivially Ok.
 async fn post_email_verify(
     State(s): State<SettingsRouterState>,
-    _admin: RequireAdmin,
+    _operator: DeploymentOperator,
 ) -> AppResult<axum::http::StatusCode> {
     use crate::utils::email::Mailer;
     s.shared_mailer.verify().await?;
@@ -149,7 +154,7 @@ async fn post_email_verify(
 /// PMS-789: read the deployment-wide product name (admin only).
 async fn get_app_name(
     State(s): State<SettingsRouterState>,
-    _admin: RequireAdmin,
+    _operator: DeploymentOperator,
 ) -> AppResult<Json<super::app_name::AppNameView>> {
     Ok(Json(super::app_name::get_app_name_settings(&s.db).await?))
 }
@@ -159,7 +164,7 @@ async fn get_app_name(
 /// rendered carry the new name with no restart.
 async fn put_app_name(
     State(s): State<SettingsRouterState>,
-    _admin: RequireAdmin,
+    _operator: DeploymentOperator,
     Json(input): Json<super::app_name::AppNameInput>,
 ) -> AppResult<Json<super::app_name::AppNameView>> {
     Ok(Json(

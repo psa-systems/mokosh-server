@@ -83,6 +83,7 @@ async fn insert_session_row(pool: &PgPool, session_id: Uuid, tenant_id: Uuid, us
 async fn insert_user_row(pool: &PgPool, tenant_id: Uuid, email: &str, role: &str) -> Uuid {
     let id = Uuid::new_v4();
     let password_hash = mokosh_server::utils::crypto::hash_password("test-password-12345")
+        .await
         .expect("hash test password");
     sqlx::query(
         "INSERT INTO users \

@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::config::{self, registry as keys, ConfigKey};
 use crate::db::Database;
-use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider};
+use crate::storage::{FileLedger, FileRecord, ObjectKey, ObjectProvider, ObjectReader};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::upload_limits::oversized_upload_error;
 
@@ -183,6 +183,13 @@ pub fn check_mime(raw: &str) -> AppResult<&'static str> {
         })
 }
 
+/// What [`BrandingAssetStore::stat`] can tell a caller about the currently
+/// stored asset without opening it.
+pub struct AssetMeta {
+    pub size: u64,
+    pub etag: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct BrandingAssetStore {
     root: PathBuf,
@@ -192,8 +199,10 @@ pub struct BrandingAssetStore {
     /// tenant logo the same writer `TenantLogoStore` uses.
     logo_store: Arc<dyn ObjectProvider>,
     /// PMS-1234, PMS-957: one row per stored tenant logo, the same ledger
-    /// `TenantLogoStore::with_ledger` writes. `None` for the public read
-    /// router, which has no database and only ever reads.
+    /// `TenantLogoStore::with_ledger` writes. PMS-1246: also read by
+    /// `stat`, so the public read router now attaches one too; `None` is
+    /// still valid wherever a caller only stores or removes and never
+    /// serves the tenant-logo pair.
     ledger: Option<FileLedger>,
 }
 
@@ -350,6 +359,84 @@ impl BrandingAssetStore {
         tokio::fs::read(self.path_for(scope, kind, mime))
             .await
             .map_err(|_| AppError::NotFound("Asset".to_string()))
+    }
+
+    /// Size and an ETag for the currently-stored asset, without reading its
+    /// bytes. PMS-1246: the public read needs this BEFORE it opens the blob,
+    /// so a matching `If-None-Match` never touches the file at all.
+    ///
+    /// Unlike a ticket or KB attachment, a branding asset is mutable in
+    /// place: the same key is overwritten on every re-upload, so there is no
+    /// fresh id to build a validator from. The size is what is cheaply
+    /// available on both storage shapes here (a local `stat`, or the
+    /// `files` ledger row PMS-1234 already writes for the tenant logo), so
+    /// the ETag is a weak validator over it: two uploads that land on the
+    /// exact same byte count within the asset's cache window are
+    /// indistinguishable. That is an accepted tradeoff, not an oversight -
+    /// closing it needs a stored digest this table does not carry yet.
+    pub async fn stat(
+        &self,
+        scope: AssetScope,
+        kind: BrandAssetKind,
+        mime: &str,
+    ) -> AppResult<AssetMeta> {
+        let mime = check_mime(mime)?;
+
+        if let Some(tenant_id) = Self::tenant_logo_id(scope, kind) {
+            let Some(ledger) = &self.ledger else {
+                return Err(AppError::NotFound("Asset".to_string()));
+            };
+            let size = ledger
+                .latest_file_size(tenant_id, "tenant_logo")
+                .await?
+                .ok_or_else(|| AppError::NotFound("Asset".to_string()))?
+                as u64;
+            return Ok(AssetMeta {
+                size,
+                etag: format!("\"{tenant_id}-logo-{size}\""),
+            });
+        }
+
+        let path = self.path_for(scope, kind, mime);
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .map_err(|_| AppError::NotFound("Asset".to_string()))?;
+        let size = meta.len();
+        Ok(AssetMeta {
+            size,
+            etag: format!("\"{}-{}-{}\"", scope.id(), kind.kind_dir(), size),
+        })
+    }
+
+    /// Stream the currently-stored asset's bytes.
+    pub async fn open(
+        &self,
+        scope: AssetScope,
+        kind: BrandAssetKind,
+        mime: &str,
+    ) -> AppResult<ObjectReader> {
+        let mime = check_mime(mime)?;
+
+        if let Some(tenant_id) = Self::tenant_logo_id(scope, kind) {
+            let extension = extension_for(mime);
+            if let Ok(reader) = self
+                .logo_store
+                .open(&ObjectKey::tenant_logo(tenant_id, extension))
+                .await
+            {
+                return Ok(reader);
+            }
+            return self
+                .logo_store
+                .open(&ObjectKey::legacy_tenant_logo(tenant_id, extension))
+                .await
+                .map_err(|_| AppError::NotFound("Asset".to_string()));
+        }
+
+        let file = tokio::fs::File::open(self.path_for(scope, kind, mime))
+            .await
+            .map_err(|_| AppError::NotFound("Asset".to_string()))?;
+        Ok(Box::pin(file))
     }
 
     /// Remove every stored format for a (scope, kind) pair. Best-

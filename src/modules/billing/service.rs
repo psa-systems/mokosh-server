@@ -1678,9 +1678,17 @@ impl BillingService {
     /// the pay link when a gateway is connected, the PMS-991 shape.
     ///
     /// `invoice_reminders` is the idempotency guard: the row is claimed with
-    /// `ON CONFLICT DO NOTHING` before the send, inside the transaction, so a
-    /// worker that fires twice in the hour sends once, and a relay that
-    /// refuses the message releases the claim so the next run tries again.
+    /// `ON CONFLICT DO NOTHING` before the send, so a worker that fires twice
+    /// in the hour sends once, and a relay that refuses the message releases
+    /// the claim so the next run tries again.
+    ///
+    /// PMS-1246: claiming and sending are two separate transactions, mirroring
+    /// the notifications dispatcher's PMS-782 shape. The claim phase opens one
+    /// `begin_with_tenant` transaction, reads settings/candidates and inserts
+    /// every claim, then commits; the send phase runs with no transaction
+    /// open, so an SMTP round trip never holds a tenant connection (or the
+    /// invoice_reminders row locks) for the whole batch. A failed send
+    /// releases its own claim in its own short transaction.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn send_due_reminders(
         &self,
@@ -1690,6 +1698,86 @@ impl BillingService {
         let Some(mailer) = self.mailer.as_ref() else {
             return Ok(Vec::new());
         };
+
+        let claims = self.claim_due_reminders(tenant_id, now).await?;
+        if claims.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
+        let contact_line = org.contact_line("Questions about this invoice?", None);
+        let gateway = matches!(self.has_active_gateway(tenant_id).await, Ok(true));
+
+        let mut sent = Vec::new();
+        for claim in claims {
+            let pdf = super::documents::read_issued(tenant_id.get(), claim.invoice.id).await;
+            let portal_link = match (self.portal_origin.as_ref(), gateway) {
+                (Some(origin), true) => {
+                    // PMS-1168: same builder as the send path, so the two
+                    // cannot drift from the router separately again.
+                    let portal_id = self
+                        .company_portal_id(tenant_id, claim.invoice.company_id)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(target: "mokosh_server.billing", invoice_id = %claim.invoice.id, error = %e, "invoice reminder: portal id lookup failed, linking the generic login");
+                            None
+                        });
+                    Self::portal_pay_link(origin, portal_id)
+                }
+                _ => None,
+            };
+            let currency = claim.invoice.currency.as_deref().unwrap_or("USD");
+            let amount_due = format!("{} {}", claim.invoice.balance_due, currency);
+            let due_date = claim.invoice.due_date.to_string();
+            let from = crate::utils::email::SenderIdentity {
+                org_name: org.name(),
+                contact_line: &contact_line,
+            };
+            let outcome = mailer
+                .send_invoice_reminder(
+                    &claim.recipient,
+                    from,
+                    crate::utils::email::InvoiceReminder {
+                        invoice_number: &claim.invoice.invoice_number,
+                        amount_due: &amount_due,
+                        due_date: &due_date,
+                        days_overdue: claim.days,
+                        portal_link: portal_link.as_deref(),
+                        pdf: pdf.as_deref(),
+                    },
+                )
+                .await;
+            match outcome {
+                Ok(()) => sent.push(claim.invoice.id),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mokosh_server.billing",
+                        invoice_id = %claim.invoice.id,
+                        error = %e,
+                        "invoice reminder: send refused, the claim is released"
+                    );
+                    let mut release_tx = self.db.begin_with_tenant(tenant_id).await?;
+                    sqlx::query("DELETE FROM invoice_reminders WHERE id = $1")
+                        .bind(claim.claim_id)
+                        .execute(&mut *release_tx)
+                        .await?;
+                    release_tx.commit().await?;
+                }
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Phase one of [`Self::send_due_reminders`]: in one transaction, read the
+    /// schedule, pick the due invoices, resolve each recipient and claim its
+    /// `invoice_reminders` row. Returns only the invoices that were actually
+    /// claimed (an invoice already reminded for this offset today is skipped,
+    /// same as before).
+    async fn claim_due_reminders(
+        &self,
+        tenant_id: TenantId,
+        now: DateTime<Utc>,
+    ) -> AppResult<Vec<ClaimedReminder>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let settings = read_invoice_reminder_settings(&mut tx, tenant_id).await?;
         if !settings.enabled || settings.schedule.is_empty() {
@@ -1722,11 +1810,7 @@ impl BillingService {
             return Ok(Vec::new());
         }
 
-        let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
-        let contact_line = org.contact_line("Questions about this invoice?", None);
-        let gateway = matches!(self.has_active_gateway(tenant_id).await, Ok(true));
-
-        let mut sent = Vec::new();
+        let mut claims = Vec::new();
         for invoice in candidates {
             let days = (today - invoice.due_date).num_days();
             if !settings.schedule.contains(&days) {
@@ -1767,65 +1851,18 @@ impl BillingService {
             .bind(&recipient)
             .fetch_optional(&mut *tx)
             .await?;
-            let Some(claim) = claimed else {
+            let Some(claim_id) = claimed else {
                 continue;
             };
-
-            let pdf = super::documents::read_issued(tenant_id.get(), invoice.id).await;
-            let portal_link = match (self.portal_origin.as_ref(), gateway) {
-                (Some(origin), true) => {
-                    // PMS-1168: same builder as the send path, so the two
-                    // cannot drift from the router separately again.
-                    let portal_id = self
-                        .company_portal_id(tenant_id, invoice.company_id)
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(target: "mokosh_server.billing", invoice_id = %invoice.id, error = %e, "invoice reminder: portal id lookup failed, linking the generic login");
-                            None
-                        });
-                    Self::portal_pay_link(origin, portal_id)
-                }
-                _ => None,
-            };
-            let currency = invoice.currency.as_deref().unwrap_or("USD");
-            let amount_due = format!("{} {}", invoice.balance_due, currency);
-            let due_date = invoice.due_date.to_string();
-            let from = crate::utils::email::SenderIdentity {
-                org_name: org.name(),
-                contact_line: &contact_line,
-            };
-            let outcome = mailer
-                .send_invoice_reminder(
-                    &recipient,
-                    from,
-                    crate::utils::email::InvoiceReminder {
-                        invoice_number: &invoice.invoice_number,
-                        amount_due: &amount_due,
-                        due_date: &due_date,
-                        days_overdue: days,
-                        portal_link: portal_link.as_deref(),
-                        pdf: pdf.as_deref(),
-                    },
-                )
-                .await;
-            match outcome {
-                Ok(()) => sent.push(invoice.id),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "mokosh_server.billing",
-                        invoice_id = %invoice.id,
-                        error = %e,
-                        "invoice reminder: send refused, the claim is released"
-                    );
-                    sqlx::query("DELETE FROM invoice_reminders WHERE id = $1")
-                        .bind(claim)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-            }
+            claims.push(ClaimedReminder {
+                invoice,
+                days,
+                recipient,
+                claim_id,
+            });
         }
         tx.commit().await?;
-        Ok(sent)
+        Ok(claims)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4132,9 +4169,10 @@ impl BillingService {
             .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant_id.get(), issuer).await;
             let bytes = crate::pdf::render(
-                &crate::modules::billing::documents::invoice(&document, issuer, &bill_to, logo),
+                crate::modules::billing::documents::invoice(&document, issuer, &bill_to, logo),
                 document.invoice_date,
-            )?;
+            )
+            .await?;
             crate::modules::billing::documents::store_issued(
                 &mut tx,
                 tenant_id.get(),
@@ -5291,9 +5329,10 @@ impl BillingService {
         let credit_to = Self::bill_to_in_tx(&mut tx, tenant_id, note.company_id, contact).await?;
         let logo = crate::modules::billing::issuer::live_logo_bytes(tenant_id.get(), &issuer).await;
         let bytes = crate::pdf::render(
-            &crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
+            crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
             note.issue_date,
-        )?;
+        )
+        .await?;
         crate::modules::billing::documents::store_issued(
             &mut tx,
             tenant_id.get(),
@@ -6332,6 +6371,16 @@ struct ReminderCandidateRow {
     balance_due: Decimal,
     currency: Option<String>,
     emailed_to: Option<String>,
+}
+
+/// One invoice whose `invoice_reminders` row was claimed by
+/// [`BillingService::claim_due_reminders`], carrying everything the send
+/// phase needs without touching the claiming transaction again (PMS-1246).
+struct ClaimedReminder {
+    invoice: ReminderCandidateRow,
+    days: i64,
+    recipient: String,
+    claim_id: Uuid,
 }
 
 #[derive(sqlx::FromRow)]

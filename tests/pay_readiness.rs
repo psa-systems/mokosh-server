@@ -132,6 +132,29 @@ async fn seed_sent_invoice(pool: &PgPool, tenant_id: Uuid, company_id: Uuid) -> 
     id
 }
 
+async fn seed_sent_invoice_with_currency(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    company_id: Uuid,
+    currency: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO invoices (id, tenant_id, invoice_number, company_id, status, \
+         invoice_date, due_date, subtotal, total, amount_paid, balance_due, currency) \
+         VALUES ($1, $2, $3, $4, 'sent', CURRENT_DATE, CURRENT_DATE + 30, 100, 100, 0, 100, $5)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(format!("PR-INV-{}", &id.simple().to_string()[..8]))
+    .bind(company_id)
+    .bind(currency)
+    .execute(pool)
+    .await
+    .expect("seed sent invoice with currency");
+    id
+}
+
 async fn seed_draft_invoice(pool: &PgPool, tenant_id: Uuid, company_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -229,6 +252,54 @@ async fn readiness_ready_when_gateway_and_payable(pool: PgPool) {
             .as_str()
             .is_some_and(|s| s.contains("100")),
         "MAPPS-666: balance_due_display carries the amount"
+    );
+}
+
+/// PMS-1200: `min_partial_amount_display` goes through the promoted
+/// `money()` formatter like `balance_due_display`, which never special-cases
+/// `$` for USD, so a non-USD tenant's amounts must carry their own currency
+/// code rather than a dollar sign borrowed from the old hand-rolled format.
+#[sqlx::test]
+async fn readiness_min_partial_amount_display_carries_its_own_currency(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "ready-aud", &["Billing Contact"]).await;
+    let invoice_id =
+        seed_sent_invoice_with_currency(&pool, common::DEFAULT_TENANT_ID, own_company, "AUD").await;
+    seed_stripe_gateway(&pool, common::DEFAULT_TENANT_ID).await;
+
+    let resp = app
+        .client
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("readiness");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+
+    let balance_due_display = body["balance_due_display"]
+        .as_str()
+        .expect("balance_due_display present");
+    assert!(
+        balance_due_display.ends_with("AUD"),
+        "PMS-1200: balance_due_display must carry AUD, got {balance_due_display}"
+    );
+    assert!(
+        !balance_due_display.contains('$'),
+        "PMS-1200: balance_due_display must not special-case $, got {balance_due_display}"
+    );
+
+    let min_partial_amount_display = body["min_partial_amount_display"]
+        .as_str()
+        .expect("min_partial_amount_display present for a Billing Contact with pay_partial");
+    assert!(
+        min_partial_amount_display.ends_with("AUD"),
+        "PMS-1200: min_partial_amount_display must carry AUD, not $, got {min_partial_amount_display}"
+    );
+    assert!(
+        !min_partial_amount_display.contains('$'),
+        "PMS-1200: min_partial_amount_display must not special-case $, got {min_partial_amount_display}"
     );
 }
 

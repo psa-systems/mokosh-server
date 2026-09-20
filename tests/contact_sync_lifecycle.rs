@@ -647,3 +647,86 @@ async fn only_an_admin_removes_imported_data_and_says_why(pool: PgPool) {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 1);
 }
+
+/// PMS-1260: the list says where each contact came from in the same page
+/// read, and filters by it. An unlinked contact still came from Google.
+#[sqlx::test]
+async fn the_list_says_where_a_contact_came_from_and_filters_by_it(pool: PgPool) {
+    let f = Fixture::new(pool).await;
+    let source = FakeSource::new();
+    source.next(
+        vec![person(
+            "people/i",
+            "e1",
+            "Imported",
+            "imported@acme.example",
+        )],
+        false,
+    );
+    f.sync(&source).await;
+    let imported = f.linked_contact("people/i").await;
+    let manual = Uuid::new_v4();
+    sqlx::query("INSERT INTO contacts (id, tenant_id, first_name, last_name) VALUES ($1, $2, 'Hand', 'Entered')")
+        .bind(manual)
+        .bind(common::DEFAULT_TENANT_ID)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+    let f = &f;
+    let list = |query: &'static str| async move {
+        let path = format!("/api/v1/contacts/contacts{query}");
+        f.call(reqwest::Method::GET, &path, None).await
+    };
+    let ids = |body: &Value| -> Vec<String> {
+        body["data"]
+            .as_array()
+            .expect("a page")
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let (status, all) = list("").await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    let row = |id: Uuid| {
+        all["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == json!(id))
+            .cloned()
+            .expect("listed")
+    };
+    assert_eq!(
+        row(imported)["imported_from"],
+        json!({
+            "provider": "google",
+            "account_email": "ops@msp.example",
+            "linked": true,
+            "deleted_in_source": false,
+        })
+    );
+    assert!(row(manual)["imported_from"].is_null());
+
+    let (_, google) = list("?origin=google").await;
+    assert_eq!(ids(&google), vec![imported.to_string()]);
+    let (_, hand) = list("?origin=manual").await;
+    assert!(ids(&hand).contains(&manual.to_string()));
+    assert!(!ids(&hand).contains(&imported.to_string()));
+    assert_eq!(list("?origin=elsewhere").await.0, StatusCode::BAD_REQUEST);
+
+    f.call(
+        reqwest::Method::POST,
+        &format!("/api/v1/contacts/contacts/{imported}/sync/unlink"),
+        None,
+    )
+    .await;
+    let (_, after) = list("?origin=google").await;
+    assert_eq!(
+        ids(&after),
+        vec![imported.to_string()],
+        "unlinked, still imported"
+    );
+    assert_eq!(after["data"][0]["imported_from"]["linked"], false);
+}

@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
-use crate::utils::crypto::{generate_token, hash_password};
+use crate::utils::crypto::{generate_token, hash_password, sha256_hex};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::validation::slugify;
 
@@ -714,7 +714,7 @@ impl TenantService {
         };
 
         let secret = generate_token(64);
-        let token_hash = match hash_password(&secret) {
+        let token_hash = match hash_password(&secret).await {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(
@@ -726,6 +726,7 @@ impl TenantService {
                 return;
             }
         };
+        let lookup_hash = sha256_hex(&secret);
         let token = format!("{}.{}", contact_id, secret);
         // 72h TTL mirrors PMS-136's PORTAL_SETUP_TOKEN_TTL_HOURS. Deliberately
         // shorter than the pre-554 7-day users-welcome window: the portal
@@ -748,13 +749,14 @@ impl TenantService {
         };
         let insert = sqlx::query(
             r#"
-            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, lookup_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(tenant_id)
         .bind(contact_id)
         .bind(&token_hash)
+        .bind(&lookup_hash)
         .bind(expires_at)
         .execute(&mut *tx)
         .await;

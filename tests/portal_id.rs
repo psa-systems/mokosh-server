@@ -479,7 +479,9 @@ async fn login_link_finder_scoped_to_portal_id_returns_single_match(pool: PgPool
     // redeem endpoint with it. Uses the same {intent_id}.{secret}
     // shape the service parses.
     let secret = "test-secret-scope-1234";
-    let secret_hash = mokosh_server::utils::crypto::hash_password(secret).expect("hash secret");
+    let secret_hash = mokosh_server::utils::crypto::hash_password(secret)
+        .await
+        .expect("hash secret");
     sqlx::query("UPDATE portal_login_intents SET secret_hash = $1 WHERE id = $2")
         .bind(secret_hash)
         .bind(intent_id)
