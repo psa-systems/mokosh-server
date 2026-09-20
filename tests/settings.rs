@@ -664,3 +664,93 @@ async fn disabled_billing_404s_a_non_finance_role_rather_than_403(pool: PgPool) 
         );
     }
 }
+
+/// PMS-1280: the deployment-wide settings belong to the deployment's
+/// operator. An admin of another organisation is refused on all six routes;
+/// the system tenant's admin keeps them.
+#[sqlx::test]
+async fn only_the_deployment_operator_touches_deployment_settings(pool: PgPool) {
+    let (_id, email, password) = common::seed_admin(&pool).await;
+    let (_tenant, _user, other_email, other_password) =
+        common::seed_tenant_with_admin(&pool, "customer-msp").await;
+    let app = common::boot(pool.clone()).await;
+    let operator = common::login(&app, &email, &password).await;
+    let login: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": other_email,
+            "password": other_password,
+            "tenant_slug": "customer-msp",
+        }))
+        .send()
+        .await
+        .expect("login")
+        .json()
+        .await
+        .expect("login json");
+    let customer = login["access_token"]
+        .as_str()
+        .expect("the customer organisation's admin signs in")
+        .to_string();
+
+    let calls: [(reqwest::Method, &str, Option<serde_json::Value>); 6] = [
+        (reqwest::Method::GET, "/api/v1/settings/email", None),
+        (
+            reqwest::Method::PUT,
+            "/api/v1/settings/email",
+            Some(serde_json::json!({ "host": "mail.attacker.example" })),
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/v1/settings/email/test-send",
+            Some(serde_json::json!({ "to": "someone@example.com" })),
+        ),
+        (reqwest::Method::POST, "/api/v1/settings/email/verify", None),
+        (reqwest::Method::GET, "/api/v1/settings/app-name", None),
+        (
+            reqwest::Method::PUT,
+            "/api/v1/settings/app-name",
+            Some(serde_json::json!({ "app_name": "Hijacked" })),
+        ),
+    ];
+    for (method, path, body) in calls.iter().cloned() {
+        let mut request = app
+            .client
+            .request(method.clone(), app.url(path))
+            .bearer_auth(&customer);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let status = request.send().await.expect("request").status();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::FORBIDDEN,
+            "{method} {path} must refuse another organisation's admin"
+        );
+    }
+    let host: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT value FROM tenant_settings WHERE category = 'email' AND key = 'smtp'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(
+        host.map(|v| !v.to_string().contains("attacker"))
+            .unwrap_or(true),
+        "the refused write changed nothing"
+    );
+
+    // The operator keeps the read side of both.
+    for path in ["/api/v1/settings/email", "/api/v1/settings/app-name"] {
+        let status = app
+            .client
+            .get(app.url(path))
+            .bearer_auth(&operator)
+            .send()
+            .await
+            .expect("request")
+            .status();
+        assert_eq!(status, reqwest::StatusCode::OK, "{path} for the operator");
+    }
+}

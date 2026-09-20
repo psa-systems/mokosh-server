@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ use super::service::*;
 use crate::modules::auth::{RequireFinance, RequireReports, TenantScoped};
 use crate::pdf;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::money::money;
 
 #[derive(Clone)]
 pub struct ReportsRouterState {
@@ -747,9 +749,9 @@ fn pdf_for_billing(r: &BillingReportResponse, title: &str) -> pdf::Document {
         .fields(
             "Totals",
             vec![
-                ("Invoiced".into(), r.invoiced.to_string()),
-                ("Paid".into(), r.paid.to_string()),
-                ("Outstanding".into(), r.outstanding.to_string()),
+                ("Invoiced".into(), money(r.invoiced, None)),
+                ("Paid".into(), money(r.paid, None)),
+                ("Outstanding".into(), money(r.outstanding, None)),
             ],
         )
         .table(
@@ -757,7 +759,7 @@ fn pdf_for_billing(r: &BillingReportResponse, title: &str) -> pdf::Document {
             vec!["Bucket".into(), "Total".into()],
             r.aging
                 .iter()
-                .map(|b| vec![b.bucket.clone(), b.total.to_string()])
+                .map(|b| vec![b.bucket.clone(), money(b.total, None)])
                 .collect(),
         )
 }
@@ -773,9 +775,9 @@ fn pdf_for_projects(r: &ProjectsReportResponse, title: &str) -> pdf::Document {
             "Budget and actuals",
             vec![
                 ("Budget hours".into(), r.budget_hours.to_string()),
-                ("Budget amount".into(), r.budget_amount.to_string()),
+                ("Budget amount".into(), money(r.budget_amount, None)),
                 ("Actual hours".into(), r.actual_hours.to_string()),
-                ("Actual amount".into(), r.actual_amount.to_string()),
+                ("Actual amount".into(), money(r.actual_amount, None)),
                 ("Tasks total".into(), r.tasks_total.to_string()),
                 ("Tasks completed".into(), r.tasks_completed.to_string()),
                 ("Overdue".into(), r.overdue.to_string()),

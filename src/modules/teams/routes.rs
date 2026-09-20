@@ -12,12 +12,13 @@
 //!
 //! Read endpoints gate on `RequireAuth`.
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, put},
-    Json, Router,
+    Router,
 };
 use std::sync::Arc;
 use uuid::Uuid;

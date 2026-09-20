@@ -30,12 +30,12 @@
 
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::{
     body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use uuid::Uuid;
 

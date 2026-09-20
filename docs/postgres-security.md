@@ -163,9 +163,10 @@ Three issues were filed:
 
 ## Q13. Remove the whole binary unless there is hidden functionality to surface. Production is always Docker - managed Postgres is not supported.
 
-There *was* hidden functionality: `mokosh-bootstrap` has three other subcommands beyond
-`provision-roles` (`bootstrap-infisical`, `clients register`, `qa-seed`/`qa-teardown`), each
-wired into `just` recipes. So the binary cannot simply be deleted. The managed-Postgres
+There *was* hidden functionality: `mokosh-bootstrap` dispatches `bootstrap-infisical`,
+`qa-seed`, `qa-teardown`, `dev-seed-portal` and `normalize-company-industries` (see
+[`docs/binaries.md`](binaries.md) for the current set), each wired into `just` recipes. So
+the binary cannot simply be deleted. The managed-Postgres
 caveats were removed from the issues, since prod always runs Postgres in-container with a
 true superuser available.
 

@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::pdf::{Align, Document, Logo};
 use crate::storage::{FileLedger, FileRecord, ObjectKey};
 use crate::utils::error::AppResult;
+use crate::utils::money::money;
 
 use super::issuer::Issuer;
 use super::models::{CreditNoteResponse, InvoiceResponse, StatementResponse};
@@ -122,16 +123,6 @@ fn items_align() -> Vec<Align> {
 /// the page.
 const LOGO_WIDTH_MM: f32 = 45.0;
 const LOGO_HEIGHT_MM: f32 = 20.0;
-
-/// Money, as a document shows it.
-///
-/// Two decimals always, because an invoice that reads `1200` where it means
-/// `1200.00` looks like a rounding, and the currency beside it because a
-/// document leaving the building has to say which dollars it means.
-fn money(amount: Decimal, currency: Option<&str>) -> String {
-    let code = currency.unwrap_or("USD");
-    format!("{amount:.2} {code}")
-}
 
 fn logo(bytes: Option<Vec<u8>>) -> Option<Logo> {
     bytes.map(|bytes| Logo {
@@ -729,13 +720,5 @@ mod tests {
             vec!["Sydney"]
         );
         assert!(postal_lines(None, None, None, None, None, None).is_empty());
-    }
-
-    /// Two decimals and a currency, because `1200` where `1200.00` is meant
-    /// reads as a rounding.
-    #[test]
-    fn money_says_what_it_means() {
-        assert_eq!(money(Decimal::new(120000, 2), Some("AUD")), "1200.00 AUD");
-        assert_eq!(money(Decimal::new(1200, 0), None), "1200.00 USD");
     }
 }
