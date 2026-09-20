@@ -12,7 +12,7 @@ into child tables or stay JSONB.
 ## Context
 
 - `business_hours.schedule` `JSONB` (`migrations/005_tickets.sql:303`): the weekly open/close schedule.
-- `holiday_calendars.holidays` `JSONB` (`:318`): an array of `{date, name}` (bare `"YYYY-MM-DD"` also tolerated).
+- `holiday_calendars.holidays` `JSONB` (`migrations/005_tickets.sql::holiday_calendars`): an array of `{date, name}` (bare `"YYYY-MM-DD"` also tolerated).
 - By contrast `sla_policies` (`:325`) and `sla_targets` (`:339`) are already normalized relational tables (`first_response_hours DECIMAL`, `operational_hours CHECK IN ('business_hours','24x7')`, etc.). The layer that needs relational querying and constraints is already relational; only the nested weekly schedule and the holiday list are JSON.
 
 ## How the data is actually used (grounding)
@@ -20,7 +20,7 @@ into child tables or stay JSONB.
 Verified across the SLA module (`src/modules/sla/`):
 
 - **No SQL ever reaches into the JSON.** There is no `->`, `->>`, `@>`, `?`, `jsonb_array_elements`, or json-path `WHERE` against `schedule` or `holidays` anywhere in the codebase. Every read SELECTs the whole column (`service.rs:368`, `:515`, `:744`, `:762`).
-- **Parse-whole, compute-in-Rust.** The due-time engine (`clock.rs::due_at`) loads a profile's entire `schedule` blob and the entire `holidays` blob of each referenced calendar, parses them into `BusinessSchedule` (`clock.rs:93`) and a `HashSet<NaiveDate>` (`parse_holidays`, `clock.rs:222`), then walks the week day-by-day in Rust and writes back plain `first_response_due` / `resolution_due` timestamp columns. The SLA worker only compares `now` to those timestamps; it never touches the JSON.
+- **Parse-whole, compute-in-Rust.** The due-time engine (`clock.rs::due_at`) loads a profile's entire `schedule` blob and the entire `holidays` blob of each referenced calendar, parses them into `BusinessSchedule` (`clock.rs::BusinessSchedule`) and a `HashSet<NaiveDate>` (`clock.rs::parse_holidays`), then walks the week day-by-day in Rust and writes back plain `first_response_due` / `resolution_due` timestamp columns. The SLA worker only compares `now` to those timestamps; it never touches the JSON.
 - **Whole-blob writes.** Upserts bind the `serde_json::Value` straight into the column (`service.rs:405/466` schedule, `:544/588` holidays). No partial JSON update (`jsonb_set`, `||`).
 - **Bounded + read-mostly.** `schedule` is ~7 weekday entries; `holidays` is a short per-tenant list. No pagination or per-row access into individual days/holidays; pagination is only at the calendar/profile row level.
 - **No cross-row JSON needs.** Nothing queries across calendars/days ("which calendars include date X", holiday reporting, etc.). The only cross-row touch is `id = ANY($2)` over `holiday_calendars` by primary key, never by JSON contents.

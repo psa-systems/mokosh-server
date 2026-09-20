@@ -71,7 +71,7 @@ src/
   api/             Axum router composition: create_api_router builds every /api/v1 nest.
   app_secrets/     Application-tier secret selection (database, file, env, or Infisical) behind one governed-secret registry, chosen by SECRET_BACKEND.
   bin/             Standalone CLI binaries (mokosh-bootstrap).
-  cli.rs           Operator subcommands the mokosh-server binary dispatches before it binds a port.
+  cli/             Operator subcommands the mokosh-server binary dispatches before it binds a port.
   config/          Configuration provider selection and the declared key registry, the one configuration read path.
   db/              Database wrapper around sqlx::PgPool, plus the per-tenant transaction helpers.
   infisical/       Infisical HTTP client + first-run bootstrap.
@@ -80,7 +80,7 @@ src/
   providers/       Provider status collection and reporting across every capability kind; not itself a selectable provider.
   scheduler/       Registry for the interval background jobs.
   secrets/         Secret backend selection (database or Infisical) behind one store trait.
-  storage/         Upload root and file storage, the single reader of ATTACHMENT_DIR.
+  storage/         Upload root and file storage, the provider of record for ATTACHMENT_DIR; branding/ also reads it through the config seam for local-path assets.
   utils/           Shared helpers (errors, email, crypto, validation, pagination).
   version.rs       VersionInfo (build-time git hash/describe via build.rs).
   version_check.rs Opt-in self-hosted update check against MOKOSH_UPDATE_CHECK_URL.

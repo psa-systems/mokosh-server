@@ -21,6 +21,9 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 | [`rls-per-user-isolation.md`](rls-per-user-isolation.md) | The per-user data isolation reference: schema inventory, the chosen model, and the table classification. |
 | [`invoice-lifecycle.md`](invoice-lifecycle.md) | The invoice status model, and what void means here as against cancel. |
 | [`e2e.md`](e2e.md) | The end-to-end suite: how it is wired, how to run it, and the failure modes you will actually hit. |
+| [`providers.md`](providers.md) | The selectable-implementation seam every provider follows: provider kinds, the three bootstrap-order tiers, priority, boot classifications, refresh, and the migrate-verify-purge workflow. |
+| [`ROADMAP.md`](ROADMAP.md) | Durable narrative: goals, phases, sequencing and the reasoning behind the order for the provider rollout. |
+| [`operator-provider-runbook.md`](operator-provider-runbook.md) | The six-step operator workflow for moving a governed secret to a new provider. |
 
 ## Internal notes
 
