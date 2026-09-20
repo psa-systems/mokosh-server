@@ -1,11 +1,12 @@
 //! Authentication API routes
 
+use crate::utils::json::Json;
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
+    Router,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
