@@ -31,8 +31,9 @@ async fn insert_tenant(pool: &PgPool, name: &str, slug: &str) -> Uuid {
 
 async fn insert_user_row(pool: &PgPool, tenant_id: Uuid, email: &str, role: &str) -> Uuid {
     let id = Uuid::new_v4();
-    let hash =
-        mokosh_server::utils::crypto::hash_password("test-password-12345").expect("hash test pw");
+    let hash = mokosh_server::utils::crypto::hash_password("test-password-12345")
+        .await
+        .expect("hash test pw");
     sqlx::query(
         "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
          VALUES ($1, $2, $3, $4, 'First', 'Last', $5, 'active', NOW())",
@@ -53,8 +54,9 @@ async fn insert_identity_no_membership(pool: &PgPool, email: &str) -> Uuid {
     // into `identities` to model the zero-membership case (the phase-4
     // create-org flow will attach one).
     let id = Uuid::new_v4();
-    let hash =
-        mokosh_server::utils::crypto::hash_password("test-password-12345").expect("hash test pw");
+    let hash = mokosh_server::utils::crypto::hash_password("test-password-12345")
+        .await
+        .expect("hash test pw");
     sqlx::query(
         "INSERT INTO identities \
          (id, email, password_hash, first_name, last_name, status, email_verified_at) \
@@ -200,7 +202,9 @@ async fn identity_first_mfa_burns_totp_step(pool: PgPool) {
     let identity_id = uuid::Uuid::new_v4();
     let email = "mfa-replay@example.com";
     let password = "test-password-12345";
-    let hash = mokosh_server::utils::crypto::hash_password(password).expect("hash pw");
+    let hash = mokosh_server::utils::crypto::hash_password(password)
+        .await
+        .expect("hash pw");
     sqlx::query(
         "INSERT INTO identities \
          (id, email, password_hash, first_name, last_name, status, email_verified_at, \
@@ -379,8 +383,12 @@ async fn identity_first_finds_the_matching_membership_when_hashes_diverged(pool:
     let email = "diverged@example.com".to_string();
     let password_a = "TENANT-A-PW-12345".to_string();
     let password_b = "TENANT-B-PW-67890".to_string();
-    let hash_a = mokosh_server::utils::crypto::hash_password(&password_a).expect("hash A");
-    let hash_b = mokosh_server::utils::crypto::hash_password(&password_b).expect("hash B");
+    let hash_a = mokosh_server::utils::crypto::hash_password(&password_a)
+        .await
+        .expect("hash A");
+    let hash_b = mokosh_server::utils::crypto::hash_password(&password_b)
+        .await
+        .expect("hash B");
 
     let tenant_a = Uuid::new_v4();
     sqlx::query(

@@ -49,7 +49,9 @@ fn service(pool: &PgPool, mode: DeploymentMode, sso_mounted: bool) -> AuthServic
 /// the only shape that can reach the password branch at all.
 async fn seed_local_user(pool: &PgPool, email: &str) -> Uuid {
     let id = Uuid::new_v4();
-    let hash = mokosh_server::utils::crypto::hash_password(PASSWORD).expect("hash");
+    let hash = mokosh_server::utils::crypto::hash_password(PASSWORD)
+        .await
+        .expect("hash");
     sqlx::query(
         r#"
         INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status)

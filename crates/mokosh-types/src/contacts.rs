@@ -990,6 +990,10 @@ pub struct Contact {
     /// mirrors the primary link (`None` when there are no links).
     #[serde(default)]
     pub companies: Vec<ContactCompanyLink>,
+    /// PMS-1260: where an imported contact came from, `None` for one nobody
+    /// imported. Filled by the same batched hydration as `phones`.
+    #[serde(default)]
+    pub imported_from: Option<ContactOrigin>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1170,6 +1174,9 @@ pub struct ContactResponse {
     /// the `phone` / `mobile` / `company_id` mirrors above.
     pub phones: Vec<ContactPhone>,
     pub companies: Vec<ContactCompanyLink>,
+    /// PMS-1260 (PSA-70 C): where this contact was imported from, `null` for
+    /// one entered by hand. The list's provenance badge reads it.
+    pub imported_from: Option<ContactOrigin>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1197,6 +1204,7 @@ impl From<Contact> for ContactResponse {
             status: c.status,
             phones: c.phones,
             companies: c.companies,
+            imported_from: c.imported_from,
             created_at: c.created_at,
         }
     }
@@ -1308,6 +1316,31 @@ pub struct CompanyFilter {
     pub tags: Option<String>,
 }
 
+/// PMS-1260: an imported contact's provenance, from its most relevant
+/// `contact_sync_links` row (a live one, else the most recent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactOrigin {
+    /// `google`.
+    pub provider: String,
+    /// The account it was imported from, kept after a disconnect.
+    pub account_email: String,
+    /// Still synced. `false` once unlinked or disconnected: the contact is a
+    /// local record that remembers where it came from.
+    pub linked: bool,
+    /// The source deleted it; the contact is kept.
+    pub deleted_in_source: bool,
+}
+
+/// PMS-1260: the list's origin filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactOriginFilter {
+    /// Never imported: no link row at all.
+    Manual,
+    /// Imported from Google, linked or not.
+    Google,
+}
+
 /// Contact filter parameters
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct ContactFilter {
@@ -1319,6 +1352,8 @@ pub struct ContactFilter {
     pub is_portal_user: Option<bool>,
     #[validate(length(max = 500))]
     pub tags: Option<String>,
+    /// PMS-1260: `manual` or a provider (`google`).
+    pub origin: Option<ContactOriginFilter>,
 }
 
 /// PMS-583: which free-text contact field to pull distinct values for.

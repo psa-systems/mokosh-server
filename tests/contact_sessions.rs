@@ -186,6 +186,14 @@ async fn revoking_the_current_session_is_refused(pool: PgPool) {
 
 // Another contact's session id is a silent 204 and that session
 // survives; so is an id that names nothing.
+//
+// PMS-1224: the middleware now refuses an access token whose sid names
+// a revoked `contact_sessions` row, so the access token minted before
+// `refresh(refresh_bob)` is legitimately dead after that rotate step
+// (rotation revokes the current row and mints its successor, PMS-1062).
+// The check the assertion cares about ("Bob's session family survives
+// Alice's attempt") reads the freshly rotated access token, not the
+// one whose sid the refresh just retired.
 #[sqlx::test]
 async fn another_contacts_session_cannot_be_revoked(pool: PgPool) {
     let alice = seed_portal_contact(&pool, "alice@example.com").await;
@@ -197,14 +205,19 @@ async fn another_contacts_session_cannot_be_revoked(pool: PgPool) {
 
     let resp = revoke(&app, &access_alice, &bobs).await;
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "silent");
-    assert!(
-        refresh(&app, &refresh_bob).await.status().is_success(),
-        "Bob survives"
-    );
+    let rotated: serde_json::Value = refresh(&app, &refresh_bob)
+        .await
+        .json()
+        .await
+        .expect("refresh JSON");
+    let access_bob_rotated = rotated["access_token"]
+        .as_str()
+        .expect("access_token on refresh")
+        .to_string();
     let unknown = revoke(&app, &access_alice, &Uuid::new_v4().to_string()).await;
     assert_eq!(unknown.status(), reqwest::StatusCode::NO_CONTENT);
     assert_eq!(
-        list(&app, &access_bob).await.len(),
+        list(&app, &access_bob_rotated).await.len(),
         1,
         "Bob still lists his session"
     );

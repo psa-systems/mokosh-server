@@ -288,10 +288,12 @@ ensure-test-db-roles: ensure-env
 # subcommands at build time, so the recipe installs nextest in the container
 # on each run; it is a fast no-op once `/root/.cargo/bin` already has it in a
 # session that reused the container's filesystem, and a normal `cargo
-# install` otherwise, unlike CI where `rust-cache` restores it.
+# install` otherwise. PMS-1251: pinned to the same version integration.yml
+# downloads as a release binary, via `--version`, so a local run and CI
+# exercise the same nextest release; update both in the same change.
 [group: 'test']
 test-integration: ensure-env ensure-test-db-roles
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
 
 # Exercise every provider seam - configuration, application-tier secrets,
 # tenant-tier secrets, storage, authentication, email - against the running

@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
     routing::{delete, get, put},
-    Json, Router,
+    Router,
 };
 use uuid::Uuid;
 use validator::Validate;
@@ -21,6 +22,7 @@ use crate::modules::auth::{
 use crate::modules::contact_portal::capabilities as caps;
 use crate::modules::settings::SettingsService;
 use crate::utils::error::{rate_limited_response, AppError, AppResult};
+use crate::utils::money::money;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 /// PMS-1182: narrow the delivery list to one provider, and cap it.
@@ -879,9 +881,10 @@ async fn get_invoice_pdf(
                 .await?;
             let logo = crate::modules::billing::issuer::logo_bytes(tenant.get(), &issuer).await;
             crate::pdf::render(
-                &crate::modules::billing::documents::invoice(&invoice, &issuer, &bill_to, logo),
+                crate::modules::billing::documents::invoice(&invoice, &issuer, &bill_to, logo),
                 invoice.invoice_date,
-            )?
+            )
+            .await?
         }
     };
     Ok(pdf_response(
@@ -1059,11 +1062,7 @@ async fn get_invoice_payment_readiness(
         InvoiceStatus::Pending | InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid
     ) && invoice.balance_due > rust_decimal::Decimal::ZERO;
     let currency = invoice.currency.as_deref().unwrap_or("USD");
-    let balance_due_display = if currency.eq_ignore_ascii_case("USD") {
-        format!("${:.2}", invoice.balance_due)
-    } else {
-        format!("{:.2} {}", invoice.balance_due, currency)
-    };
+    let balance_due_display = money(invoice.balance_due, Some(currency));
     // MAPPS-673: partial-payment gating for the amount input. Requires the
     // gateway is ready, the invoice is payable AND the caller holds
     // `invoices:pay_partial` (or is staff, which `has_capability` returns
@@ -1080,11 +1079,7 @@ async fn get_invoice_payment_readiness(
             .service
             .min_partial_amount_across_active(tenant)
             .await?;
-        Some(if currency.eq_ignore_ascii_case("USD") {
-            format!("${floor:.2}")
-        } else {
-            format!("{floor:.2} {currency}")
-        })
+        Some(money(floor, Some(currency)))
     } else {
         None
     };
@@ -1128,9 +1123,10 @@ async fn get_credit_note_pdf(
             let logo =
                 crate::modules::billing::issuer::live_logo_bytes(tenant.get(), &issuer).await;
             crate::pdf::render(
-                &crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
+                crate::modules::billing::documents::credit_note(&note, &issuer, &credit_to, logo),
                 note.issue_date,
-            )?
+            )
+            .await?
         }
     };
     Ok(pdf_response(
@@ -1165,9 +1161,10 @@ async fn get_statement_pdf(
     // PMS-1206: a statement stores nothing (PMS-954), so there is no issue
     // date to reuse; it is generated the moment this request is answered.
     let bytes = crate::pdf::render(
-        &crate::modules::billing::documents::statement(&statement, &issuer, &account, logo),
+        crate::modules::billing::documents::statement(&statement, &issuer, &account, logo),
         chrono::Utc::now().date_naive(),
-    )?;
+    )
+    .await?;
     Ok(pdf_response(
         bytes,
         &format!(

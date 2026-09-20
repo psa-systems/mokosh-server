@@ -34,7 +34,9 @@ async fn insert_user_row(
     role: &str,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    let hash = mokosh_server::utils::crypto::hash_password(password).expect("hash pw");
+    let hash = mokosh_server::utils::crypto::hash_password(password)
+        .await
+        .expect("hash pw");
     sqlx::query(
         "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
          VALUES ($1, $2, $3, $4, 'First', 'Last', $5, 'active', NOW())",

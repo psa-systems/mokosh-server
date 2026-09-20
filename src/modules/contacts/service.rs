@@ -2,12 +2,13 @@
 
 use crate::modules::auth::TenantId;
 use chrono::{Duration, Utc};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
-use crate::utils::crypto::{generate_token, hash_password};
+use crate::utils::crypto::{generate_token, hash_password, sha256_hex};
 use crate::utils::email::salutation;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -271,6 +272,53 @@ impl ContactService {
         }
     }
 
+    /// Validate every named foreign id in ONE query inside ONE transaction,
+    /// rather than [`Self::validate_fk_opt`]'s one transaction per id
+    /// (PMS-1246). `checks` pairs each table with the id a request named for
+    /// it; a `None` id is skipped, matching `validate_fk_opt`. Reports the
+    /// same `"Referenced {table} not found in this tenant"` error the
+    /// per-key checks did, for the first table (in `checks` order) whose id
+    /// was not found.
+    async fn validate_fks(
+        &self,
+        tenant_id: TenantId,
+        checks: &[(&'static str, Option<Uuid>)],
+    ) -> AppResult<()> {
+        let present: Vec<(&'static str, Uuid)> = checks
+            .iter()
+            .filter_map(|(table, id)| id.map(|id| (*table, id)))
+            .collect();
+        if present.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::from("SELECT ");
+        for (i, (table, _)) in present.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "EXISTS(SELECT 1 FROM {table} WHERE tenant_id = $1 AND id = ${})",
+                i + 2
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let mut query = sqlx::query(&sql).bind(tenant_id);
+        for (_, id) in &present {
+            query = query.bind(id);
+        }
+        let row = query.fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        for (i, (table, _)) in present.iter().enumerate() {
+            let exists: bool = row.try_get(i)?;
+            if !exists {
+                return Err(AppError::BadRequest(format!(
+                    "Referenced {table} not found in this tenant"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// PMS-993: `validate_fk` proves a contact is in the tenant; this proves it
     /// is a contact OF this company. The billing contact is both the invoice
     /// recipient and the portal invoice grant, so a stranger in the pointer
@@ -328,12 +376,15 @@ impl ContactService {
 
         // PSA audit: every foreign id from the request body must belong to
         // this tenant before it is linked.
-        self.validate_fk_opt(tenant_id, "companies", request.parent_company_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "users", request.account_manager_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
-            .await?;
+        self.validate_fks(
+            tenant_id,
+            &[
+                ("companies", request.parent_company_id),
+                ("users", request.account_manager_id),
+                ("sla_policies", request.sla_id),
+            ],
+        )
+        .await?;
 
         // Mutation + audit row in one transaction so a rollback drops
         // both. CREATE: old = None, after captured by the new row id.
@@ -670,19 +721,21 @@ impl ContactService {
 
         // PSA audit: validate any foreign id being set so an update cannot
         // re-link this company to another tenant's rows.
-        self.validate_fk_opt(tenant_id, "companies", request.parent_company_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "users", request.account_manager_id)
-            .await?;
-        self.validate_fk_opt(tenant_id, "sla_policies", request.sla_id)
-            .await?;
         // PMS-993 / PMS-1186: assigning the billing contact IS the role grant
         // again, so it is checked harder than a plain foreign id - tenant AND
         // company. It stopped being one when PMS-1064 retired the portal
         // router that read this column as the gate, and the grant below is
         // what makes the sentence true a second time.
-        self.validate_fk_opt(tenant_id, "contacts", request.default_billing_contact_id)
-            .await?;
+        self.validate_fks(
+            tenant_id,
+            &[
+                ("companies", request.parent_company_id),
+                ("users", request.account_manager_id),
+                ("sla_policies", request.sla_id),
+                ("contacts", request.default_billing_contact_id),
+            ],
+        )
+        .await?;
         self.assert_contact_of_company(tenant_id, company_id, request.default_billing_contact_id)
             .await?;
 
@@ -1440,18 +1493,20 @@ impl ContactService {
         contact_id: Uuid,
     ) -> AppResult<String> {
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
+        let lookup_hash = sha256_hex(&secret);
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::hours(PORTAL_SETUP_TOKEN_TTL_HOURS);
         sqlx::query(
             r#"
-            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, expires_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, lookup_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(tenant_id)
         .bind(contact_id)
         .bind(&token_hash)
+        .bind(&lookup_hash)
         .bind(expires_at)
         .execute(conn)
         .await?;
@@ -2477,7 +2532,7 @@ impl ContactService {
         const LOGIN_INTENT_TTL_MIN: i64 = 15;
         let intent_id = Uuid::new_v4();
         let secret = crate::utils::crypto::generate_token(32);
-        let secret_hash = crate::utils::crypto::hash_password(&secret)?;
+        let secret_hash = crate::utils::crypto::hash_password(&secret).await?;
         let expires_at = Utc::now() + Duration::minutes(LOGIN_INTENT_TTL_MIN);
         // SAFETY (PMS-285): grant email is called post-commit from
         // `grant_portal_access` and there is no `app.current_tenant`
@@ -2514,17 +2569,19 @@ impl ContactService {
 
     /// Reject any `company_id` in a link list that does not belong to this
     /// tenant. Runs BEFORE the write transaction opens, so a foreign id never
-    /// reaches an INSERT.
+    /// reaches an INSERT. PMS-1246: every link is checked in the one query
+    /// `validate_fks` builds, rather than one `validate_fk` transaction per
+    /// link, so a contact linked to N companies costs one round trip.
     async fn validate_company_links(
         &self,
         tenant_id: TenantId,
         links: &[ContactCompanyLinkInput],
     ) -> AppResult<()> {
-        for link in links {
-            self.validate_fk(tenant_id, "companies", link.company_id)
-                .await?;
-        }
-        Ok(())
+        let checks: Vec<(&'static str, Option<Uuid>)> = links
+            .iter()
+            .map(|link| ("companies", Some(link.company_id)))
+            .collect();
+        self.validate_fks(tenant_id, &checks).await
     }
 
     /// Replace a contact's phone rows with `phones`, in list order.
@@ -2783,6 +2840,40 @@ impl ContactService {
         .fetch_all(&mut *conn)
         .await?;
 
+        // PMS-1260: provenance, one row per imported contact - its live link
+        // if it has one, else its most recent - in the same pass.
+        let origin_rows: Vec<(Uuid, String, String, bool, bool)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT ON (l.contact_id)
+                   l.contact_id, l.provider, l.source_account_email,
+                   l.unlinked_at IS NULL AND l.connection_id IS NOT NULL AS linked,
+                   l.deleted_in_source_at IS NOT NULL AS deleted_in_source
+            FROM contact_sync_links l
+            WHERE l.tenant_id = $1 AND l.contact_id = ANY($2)
+            ORDER BY l.contact_id, (l.unlinked_at IS NULL) DESC, l.created_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut origin_by_contact: std::collections::HashMap<Uuid, ContactOrigin> = origin_rows
+            .into_iter()
+            .map(
+                |(contact_id, provider, account_email, linked, deleted_in_source)| {
+                    (
+                        contact_id,
+                        ContactOrigin {
+                            provider,
+                            account_email,
+                            linked,
+                            deleted_in_source,
+                        },
+                    )
+                },
+            )
+            .collect();
+
         let mut phones_by_contact: std::collections::HashMap<Uuid, Vec<ContactPhone>> =
             std::collections::HashMap::new();
         for row in phone_rows {
@@ -2818,6 +2909,7 @@ impl ContactService {
         for contact in contacts.iter_mut() {
             contact.phones = phones_by_contact.remove(&contact.id).unwrap_or_default();
             contact.companies = links_by_contact.remove(&contact.id).unwrap_or_default();
+            contact.imported_from = origin_by_contact.remove(&contact.id);
         }
         Ok(contacts)
     }
@@ -3242,6 +3334,62 @@ impl ContactService {
         if filter.status.is_some() {
             data_conds.push(format!("c.status = ${data_idx}"));
             count_conds.push(format!("status = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
+        }
+        // PMS-1261: both were deserialized and never applied, so the list's
+        // "Portal users only" filter returned everyone and said nothing.
+        if filter.is_portal_user.is_some() {
+            data_conds.push(format!("c.is_portal_user = ${data_idx}"));
+            count_conds.push(format!("is_portal_user = ${count_idx}"));
+            data_idx += 1;
+            count_idx += 1;
+        }
+        // Comma-separated; a contact carrying ANY of them matches. Blank
+        // entries are dropped, and a filter of only blanks filters nothing.
+        let tags: Vec<String> = filter
+            .tags
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !tags.is_empty() {
+            data_conds.push(format!("c.tags && ${data_idx}::text[]"));
+            count_conds.push(format!("tags && ${count_idx}::text[]"));
+        }
+        // PMS-1260: origin takes no bind - the provider is a closed enum, so
+        // its literal is written from a match, never from the request.
+        match filter.origin {
+            Some(ContactOriginFilter::Manual) => {
+                data_conds.push(
+                    "NOT EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = c.tenant_id AND sl.contact_id = c.id)"
+                        .to_string(),
+                );
+                count_conds.push(
+                    "NOT EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = contacts.tenant_id AND sl.contact_id = contacts.id)"
+                        .to_string(),
+                );
+            }
+            Some(ContactOriginFilter::Google) => {
+                data_conds.push(
+                    "EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = c.tenant_id AND sl.contact_id = c.id \
+                       AND sl.provider = 'google')"
+                        .to_string(),
+                );
+                count_conds.push(
+                    "EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = contacts.tenant_id AND sl.contact_id = contacts.id \
+                       AND sl.provider = 'google')"
+                        .to_string(),
+                );
+            }
+            None => {}
         }
 
         let data_where = data_conds.join(" AND ");
@@ -3290,6 +3438,14 @@ impl ContactService {
         if let Some(ref status) = filter.status {
             query_builder = query_builder.bind(status.as_str());
             count_builder = count_builder.bind(status.as_str());
+        }
+        if let Some(portal) = filter.is_portal_user {
+            query_builder = query_builder.bind(portal);
+            count_builder = count_builder.bind(portal);
+        }
+        if !tags.is_empty() {
+            query_builder = query_builder.bind(tags.clone());
+            count_builder = count_builder.bind(tags);
         }
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -4462,6 +4618,7 @@ impl From<ContactRow> for Contact {
             // child table; a bare row conversion leaves them empty.
             phones: Vec::new(),
             companies: Vec::new(),
+            imported_from: None,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
