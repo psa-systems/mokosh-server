@@ -1,5 +1,5 @@
 # Mokosh Server - production OCI image
-FROM ghcr.io/niceguyit/rust-builder-musl:v1.0.0-rust1.94-alpine AS builder
+FROM ghcr.io/niceguyit/rust-builder-musl:v1.1.0-rust1.98.1-alpine AS builder
 
 WORKDIR /build
 
