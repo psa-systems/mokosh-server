@@ -6,11 +6,15 @@
 # Traefik-routed `*.a8n.run` stack is now the only dev stack.
 #
 # Naming convention (see ~/.claude/CLAUDE.md):
-# - Project name `dev-mokosh` namespaces every resource under the
-#   `dev-mokosh-` prefix in `docker ps`, `docker volume ls`, and
-#   `docker network ls`. Service keys are short and descriptive
-#   (`server`, `infisical`, `infisical-postgres`, `valkey`) - they do not
-#   repeat the `mokosh` segment, since the project name already carries it.
+# - Project name `dev-mokosh-${USER}` (PMS-1281) namespaces every resource
+#   under the `dev-mokosh-` prefix in `docker ps`, `docker volume ls`, and
+#   `docker network ls`, AND is itself per-developer, so a `docker compose`
+#   command run by one developer never lists or removes another's resources
+#   (an unqualified project name previously let `just down` / `just
+#   dev-clean` treat another developer's network as an orphan of the same
+#   project). Service keys are short and descriptive (`server`, `infisical`,
+#   `infisical-postgres`, `valkey`) - they do not repeat the `mokosh` segment,
+#   since the project name already carries it.
 # - `container_name:` is set explicitly on every service with the
 #   `dev-mokosh-{descriptive}-${USER}` shape so multiple developers can
 #   run their own dev stacks on a shared host without colliding on
@@ -53,7 +57,7 @@
 # Required-but-empty values use the `${VAR:?...}` form so compose fails
 # loudly with a helpful message instead of starting a misconfigured stack.
 
-name: dev-mokosh
+name: dev-mokosh-${USER:?USER missing - run via just dev}
 
 services:
 
@@ -241,13 +245,12 @@ services:
       # the routed hostname below (same value as OIDC_AUDIENCE).
       BASE_URL: https://${USER}-mokosh-api.a8n.run
 
-      # Serialise rustc so the final mokosh_server lib compile does
-      # not race a codegen unit against another peaking process on a
-      # memory-constrained dev box (earlyoom SIGTERMs the whole
-      # container at ~1.5 GB free). Paired with the profile.dev
-      # tuning in Cargo.toml (debug=0, codegen-units=256): together
-      # they keep rustc peak RSS under the OOM ceiling.
-      CARGO_BUILD_JOBS: "1"
+      # Memory cap, not CPU sizing: serialise rustc so the final mokosh_server
+      # lib compile does not race another peaking process on a memory-constrained
+      # dev box (earlyoom SIGTERMs the container at ~1.5 GB free), paired with the
+      # profile.dev tuning in Cargo.toml (debug=0, codegen-units=256). A box with
+      # headroom can set CARGO_BUILD_JOBS in .env to a higher value or `default`.
+      CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-1}
 
       # Reach the in-stack postgres by service-DNS name. PMS-285: the split
       # roles activate RLS at runtime. DATABASE_URL connects as the privileged

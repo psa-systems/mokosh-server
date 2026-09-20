@@ -4,6 +4,14 @@
 //! `mokosh-apps` WASM client all reach one definition instead of three copies.
 //! `mokosh_server::utils::text` re-exports it and layers the HTTP middleware
 //! that applies it to every JSON request body.
+//!
+//! Public surface: [`sanitize_invisible`] is the ready-made sanitizer, and
+//! [`is_removed`] plus [`is_exotic_space`] are exported for a consumer that
+//! needs to compose its own sanitizer from the same character classifications
+//! (for example a caller that must not edge-trim, or that answers a plain
+//! `bool` rather than a [`Cow`]). `is_edge_trim` stays private: it is trim
+//! policy specific to this module's edge semantics, not a character
+//! classification, and no consumer composes on it.
 
 use std::borrow::Cow;
 
@@ -12,7 +20,7 @@ use std::borrow::Cow;
 ///
 /// U+200C (ZWNJ) and U+200D (ZWJ) are deliberately absent: see
 /// [`sanitize_invisible`].
-fn is_removed(c: char) -> bool {
+pub fn is_removed(c: char) -> bool {
     matches!(c,
         '\u{00AD}'                  // soft hyphen
         | '\u{200B}'                // zero width space
@@ -28,7 +36,7 @@ fn is_removed(c: char) -> bool {
 /// U+2007 (figure space), U+202F (narrow no-break space), U+3000 (ideographic
 /// space), the U+2000-U+200A range, U+0085 (NEL), and friends. These reach a
 /// validator looking like a space without being one.
-fn is_exotic_space(c: char) -> bool {
+pub fn is_exotic_space(c: char) -> bool {
     !c.is_ascii() && c.is_whitespace()
 }
 

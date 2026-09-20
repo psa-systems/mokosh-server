@@ -46,6 +46,18 @@ async fn list(app: &common::TestApp, access: &str) -> Vec<serde_json::Value> {
         .expect("sessions JSON")
 }
 
+/// The status of a plain authenticated read, for the cases that assert
+/// on the refusal rather than on the body (`list` asserts 200 itself).
+async fn sessions_status(app: &common::TestApp, access: &str) -> reqwest::StatusCode {
+    app.client
+        .get(app.url("/api/v1/contact/auth/me/sessions"))
+        .bearer_auth(access)
+        .send()
+        .await
+        .expect("list sessions")
+        .status()
+}
+
 async fn revoke(app: &common::TestApp, access: &str, id: &str) -> reqwest::Response {
     app.client
         .delete(app.url(&format!("/api/v1/contact/auth/me/sessions/{id}")))
@@ -174,6 +186,14 @@ async fn revoking_the_current_session_is_refused(pool: PgPool) {
 
 // Another contact's session id is a silent 204 and that session
 // survives; so is an id that names nothing.
+//
+// PMS-1224: the middleware now refuses an access token whose sid names
+// a revoked `contact_sessions` row, so the access token minted before
+// `refresh(refresh_bob)` is legitimately dead after that rotate step
+// (rotation revokes the current row and mints its successor, PMS-1062).
+// The check the assertion cares about ("Bob's session family survives
+// Alice's attempt") reads the freshly rotated access token, not the
+// one whose sid the refresh just retired.
 #[sqlx::test]
 async fn another_contacts_session_cannot_be_revoked(pool: PgPool) {
     let alice = seed_portal_contact(&pool, "alice@example.com").await;
@@ -185,17 +205,66 @@ async fn another_contacts_session_cannot_be_revoked(pool: PgPool) {
 
     let resp = revoke(&app, &access_alice, &bobs).await;
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "silent");
-    assert!(
-        refresh(&app, &refresh_bob).await.status().is_success(),
-        "Bob survives"
-    );
+    let rotated: serde_json::Value = refresh(&app, &refresh_bob)
+        .await
+        .json()
+        .await
+        .expect("refresh JSON");
+    let access_bob_rotated = rotated["access_token"]
+        .as_str()
+        .expect("access_token on refresh")
+        .to_string();
     let unknown = revoke(&app, &access_alice, &Uuid::new_v4().to_string()).await;
     assert_eq!(unknown.status(), reqwest::StatusCode::NO_CONTENT);
     assert_eq!(
-        list(&app, &access_bob).await.len(),
+        list(&app, &access_bob_rotated).await.len(),
         1,
         "Bob still lists his session"
     );
+}
+
+// PMS-1259: rotation supersedes a session, it does not revoke it.
+// `refresh` stamps `revoked_at` on the row it was handed before
+// minting the successor, so a middleware that reads that one row
+// killed the still-unexpired access token the SPA had already sent
+// with other requests. The check is asked of the rotation family
+// instead: the pre-refresh token keeps serving while the family holds
+// a live row, and dies the moment the family is actually revoked.
+#[sqlx::test]
+async fn rotation_keeps_the_previous_access_token_alive(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
+    let app = common::boot(pool).await;
+    let (access, refresh_token) = login(&app, &contact).await;
+
+    let rotated = refresh(&app, &refresh_token).await;
+    assert!(rotated.status().is_success(), "rotation succeeds");
+    let rotated: serde_json::Value = rotated.json().await.unwrap();
+    let access_after = rotated["access_token"].as_str().unwrap().to_string();
+    let refresh_after = rotated["refresh_token"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        sessions_status(&app, &access).await,
+        reqwest::StatusCode::OK,
+        "the pre-refresh access token still serves its own TTL out"
+    );
+
+    // Signing out revokes the whole family (PMS-1062), which is the
+    // revocation PMS-1224 exists to enforce: both tokens go.
+    let out = app
+        .client
+        .post(app.url("/api/v1/contact/auth/logout"))
+        .json(&serde_json::json!({ "refresh_token": refresh_after }))
+        .send()
+        .await
+        .expect("logout");
+    assert_eq!(out.status(), reqwest::StatusCode::NO_CONTENT);
+    for (label, token) in [("pre-refresh", &access), ("post-refresh", &access_after)] {
+        assert_eq!(
+            sessions_status(&app, token).await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{label} token is refused once the family is revoked"
+        );
+    }
 }
 
 // Both routes need a session.

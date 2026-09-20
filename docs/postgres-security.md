@@ -1,5 +1,8 @@
 # Postgres provisioning and RLS: a working conversation
 
+Recorded 2026-09-10 (the date this file was added to the repository); answers describe
+the system as it was then, not necessarily as it is now.
+
 A summarized transcription of a design conversation about how Mokosh provisions its
 Postgres roles, installs extensions, and enforces row-level security (RLS) in dev and
 prod. It is preserved in question/answer form because the *path* to the answer (and one
@@ -163,9 +166,10 @@ Three issues were filed:
 
 ## Q13. Remove the whole binary unless there is hidden functionality to surface. Production is always Docker - managed Postgres is not supported.
 
-There *was* hidden functionality: `mokosh-bootstrap` has three other subcommands beyond
-`provision-roles` (`bootstrap-infisical`, `clients register`, `qa-seed`/`qa-teardown`), each
-wired into `just` recipes. So the binary cannot simply be deleted. The managed-Postgres
+There *was* hidden functionality: `mokosh-bootstrap` dispatches `bootstrap-infisical`,
+`qa-seed`, `qa-teardown`, `dev-seed-portal` and `normalize-company-industries` (see
+[`docs/binaries.md`](binaries.md) for the current set), each wired into `just` recipes. So
+the binary cannot simply be deleted. The managed-Postgres
 caveats were removed from the issues, since prod always runs Postgres in-container with a
 true superuser available.
 
