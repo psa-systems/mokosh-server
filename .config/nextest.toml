@@ -27,3 +27,14 @@ fail-fast = false
 [profile.ci.slow-timeout]
 period = "60s"
 terminate-after = 3
+
+# The p99 assertion in this test measures /health latency against a 30ms
+# bound while 15 concurrent logins run; under the shared 12-thread budget
+# above it contends with up to 11 other DB-heavy cases, so a loaded runner
+# can push its wall-clock p99 past the bound with no code regression (PMS-1283,
+# observed in PR #837 #824 #839 #843 #844 #846). Reserving the whole
+# test-thread budget for it means its p99 measures the code and not its
+# neighbours; the bound and the test body stay unchanged.
+[[profile.ci.overrides]]
+filter = 'test(health_p99_does_not_regress_under_concurrent_argon2_burst)'
+threads-required = "num-test-threads"

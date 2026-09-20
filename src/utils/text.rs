@@ -140,7 +140,7 @@ mod server_impl {
     use crate::utils::error::AppError;
     use axum::body::{Body, Bytes};
     use axum::extract::Request;
-    use axum::http::{header, HeaderValue};
+    use axum::http::header;
     use axum::middleware::Next;
     use axum::response::{IntoResponse, Response};
 
@@ -228,8 +228,15 @@ mod server_impl {
     ///
     /// Pass-through cases, all byte-identical: a non-JSON content type, a
     /// signature-verified path in [`RAW_BODY_PATHS`], a body larger than
-    /// [`MAX_SANITIZED_JSON_BYTES`], a body that is not valid JSON (the `Json`
-    /// extractor owns that 400), and a body that is already clean.
+    /// [`MAX_SANITIZED_JSON_BYTES`], and a body that is not valid JSON (the
+    /// `Json` extractor owns that 400).
+    ///
+    /// A body that parses forwards the parsed (and, where needed, sanitized)
+    /// tree as a request extension instead (PMS-1243): the body itself is
+    /// replaced with an empty one, since [`crate::utils::json::Json`] reads
+    /// the extension rather than re-buffering and re-parsing the bytes,
+    /// which removes the second `serde_json` parse every JSON request used
+    /// to pay for.
     pub async fn sanitize_json_body(request: Request, next: Next) -> Response {
         let path = request.uri().path();
         if RAW_BODY_PATHS.iter().any(|p| path.starts_with(p)) {
@@ -274,26 +281,37 @@ mod server_impl {
             }
         };
 
-        let sanitized = sanitize_bytes(&bytes, &path);
-        let len = sanitized.len();
-        if len != bytes.len() {
-            // `DefaultBodyLimit` reads `Content-Length` as a fast path, so a
-            // stale value here would reject a body that is now smaller.
-            parts
-                .headers
-                .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
-        }
-        next.run(Request::from_parts(parts, Body::from(sanitized)))
-            .await
+        // An empty body, and one that is not valid JSON, is forwarded
+        // byte-identical so the `Json` extractor's own rejection (EOF, or a
+        // syntax error) is what the caller sees; there is nothing to cache
+        // for either case.
+        let parsed = (!bytes.is_empty())
+            .then(|| parse_and_sanitize(&bytes, &path))
+            .flatten();
+        let Some((value, _)) = parsed else {
+            return next
+                .run(Request::from_parts(parts, Body::from(bytes)))
+                .await;
+        };
+
+        // PMS-1243: `crate::utils::json::Json<T>` reads this parsed tree
+        // instead of re-buffering and re-parsing the body, which is the
+        // second `serde_json` parse this removes. The body itself is no
+        // longer needed downstream of this layer, so it is dropped here
+        // rather than carried alongside the tree it was parsed into.
+        parts
+            .extensions
+            .insert(crate::utils::json::ParsedJsonBody(value));
+        parts.headers.remove(header::CONTENT_LENGTH);
+        next.run(Request::from_parts(parts, Body::empty())).await
     }
 
-    /// Parse, sanitize and re-serialize `bytes`, or hand them back unchanged.
-    /// Split out from the middleware so the unit tests below can drive it
-    /// without standing up a router.
-    fn sanitize_bytes(bytes: &Bytes, path: &str) -> Bytes {
-        if bytes.is_empty() {
-            return bytes.clone();
-        }
+    /// Parse and sanitize `bytes` into a JSON tree, or `None` when `bytes` is
+    /// not valid JSON. The `bool` says whether sanitizing changed anything.
+    fn parse_and_sanitize(bytes: &Bytes, path: &str) -> Option<(serde_json::Value, bool)> {
+        #[cfg(test)]
+        crate::utils::json::parse_counters::MIDDLEWARE_PARSES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut value: serde_json::Value = match serde_json::from_slice(bytes) {
             Ok(value) => value,
             Err(err) => {
@@ -305,10 +323,28 @@ mod server_impl {
                     error = %err,
                     "request body is not valid JSON; forwarding unsanitized",
                 );
-                return bytes.clone();
+                return None;
             }
         };
-        if !sanitize_json_tree(&mut value) {
+        let changed = sanitize_json_tree(&mut value);
+        Some((value, changed))
+    }
+
+    /// Parse, sanitize and re-serialize `bytes`, or hand them back unchanged.
+    /// Split out from the middleware so the unit tests below can drive it
+    /// without standing up a router. The middleware itself no longer calls
+    /// this (PMS-1243): it forwards the parsed tree instead of re-serialized
+    /// bytes, so this exists only to exercise [`parse_and_sanitize`] and
+    /// [`sanitize_json_tree`] byte-for-byte in the tests below.
+    #[cfg(test)]
+    fn sanitize_bytes(bytes: &Bytes, path: &str) -> Bytes {
+        if bytes.is_empty() {
+            return bytes.clone();
+        }
+        let Some((value, changed)) = parse_and_sanitize(bytes, path) else {
+            return bytes.clone();
+        };
+        if !changed {
             return bytes.clone();
         }
         match serde_json::to_vec(&value) {
@@ -332,6 +368,11 @@ mod server_impl {
         use super::*;
 
         fn sanitize(json: &str) -> String {
+            // `sanitize_bytes` calls `parse_and_sanitize`, which increments the
+            // PMS-1243 parse counters in `crate::utils::json::parse_counters`;
+            // this shares that module's lock so those counts stay meaningful
+            // against the tests that assert on them directly.
+            let _guard = crate::utils::json::parse_counters::blocking_lock();
             let out = sanitize_bytes(&Bytes::from(json.to_owned()), "/test");
             String::from_utf8(out.to_vec()).expect("sanitized body is UTF-8")
         }

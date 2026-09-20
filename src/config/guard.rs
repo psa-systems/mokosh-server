@@ -88,8 +88,9 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
     },
     EntryPoint {
         path: "src/storage/mod.rs",
-        reason: "the one reader of STORAGE_BACKEND and of ATTACHMENT_DIR (PMS-910), the root a \
-                 storage provider is built from, for the same reason as SECRET_BACKEND",
+        reason: "the one reader of STORAGE_BACKEND and the provider of record for ATTACHMENT_DIR \
+                 (PMS-910), the root a storage provider is built from, for the same reason as \
+                 SECRET_BACKEND; branding also reads ATTACHMENT_DIR through the config seam",
     },
     EntryPoint {
         path: "src/storage/s3.rs",
