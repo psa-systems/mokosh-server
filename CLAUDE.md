@@ -78,7 +78,7 @@ src/
   lib.rs                library crate root
   api/router.rs         create_api_router: builds every /api/v1 nest (see "Routing model"), wires middleware + CORS
   bin/mokosh-bootstrap.rs CLI: bootstrap-infisical, qa-seed/qa-teardown, normalize-company-industries
-  cli.rs                Operator subcommands mokosh-server dispatches before binding a port (PMS-494)
+  cli/                  Operator subcommands mokosh-server dispatches before binding a port (PMS-494); providers.rs and verify.rs add the four provider subcommands (PMS-1012/1013)
   config/               ConfigProvider: the declared key registry and the one configuration read path (PMS-982)
   db/                   Database wrapper around sqlx::PgPool
   infisical/            Infisical HTTP client + first-run bootstrap
@@ -86,7 +86,7 @@ src/
   pdf/                  Document model, and the one place it becomes PDF bytes (PMS-876)
   scheduler/            Registry for the interval background jobs (PMS-135)
   secrets/              SecretProvider: database (default) or Infisical, chosen by SECRET_BACKEND (PMS-967)
-  storage/              File storage seam; the single reader of ATTACHMENT_DIR (PMS-910)
+  storage/              File storage seam; the provider of record for ATTACHMENT_DIR (PMS-910); branding/ also reads it through the config seam for local-path assets
   utils/                error, email (Mailer trait + SmtpMailer/LogMailer), crypto, validation, pagination
   version.rs            VersionInfo (build-time git hash/describe via build.rs)
   version_check.rs      Opt-in self-hosted update check against MOKOSH_UPDATE_CHECK_URL (PMS-238)
