@@ -691,11 +691,6 @@ async fn admins_start_imports_and_staff_follow_them(pool: PgPool) {
             None,
         ),
         (
-            Method::GET,
-            "/api/v1/integrations/contact-sync/groups".to_string(),
-            None,
-        ),
-        (
             Method::POST,
             "/api/v1/integrations/contact-sync/preview".to_string(),
             Some(json!({})),
@@ -759,11 +754,6 @@ async fn the_off_switch_stops_every_sync_and_keeps_the_data(pool: PgPool) {
             Method::POST,
             "/api/v1/integrations/contact-sync/review-queue/resolve",
             Some(json!({ "action": "skip", "external_id": "people/c1" })),
-        ),
-        (
-            Method::GET,
-            "/api/v1/integrations/contact-sync/groups",
-            None,
         ),
     ] {
         let (status, body) = f.call(method.clone(), path, body).await;

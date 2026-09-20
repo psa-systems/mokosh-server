@@ -3,10 +3,12 @@
 //! Two planes, deliberately:
 //!
 //! * `/api/v1/integrations/contact-sync/*` is staff. Connecting, choosing
-//!   labels, starting or cancelling an import and listing the Google labels are
-//!   admin-gated, the gate the RMM connection routes carry. Reading status and
-//!   run progress, and reading and answering the review queue, carry
-//!   `RequireAuth` (PMS-1215).
+//!   labels and starting or cancelling an import are admin-gated, the gate the
+//!   RMM connection routes carry. There is no standalone label-listing route:
+//!   the picker gets the Google labels from the `preview` response it already
+//!   calls (PMS-1262), which carries everything a dedicated `GET .../groups`
+//!   would have. Reading status and run progress, and reading and answering
+//!   the review queue, carry `RequireAuth` (PMS-1215).
 //! * `/api/v1/contacts/contacts/{contact_id}/sync*` is one contact's
 //!   provenance, its locks, unlinking it, and removing its imported data
 //!   (PMS-1214). The doubled segment is the contacts module's own `/contacts`
@@ -33,8 +35,7 @@ use uuid::Uuid;
 use super::runs::RunStatus;
 use super::service::{
     ClientSettingsInput, ClientSettingsView, ConnectionStatus, ContactProvenance,
-    ContactSyncOverview, ContactSyncService, DataRemoval, GroupOption, Resolution, Resolved,
-    ReviewItem,
+    ContactSyncOverview, ContactSyncService, DataRemoval, Resolution, Resolved, ReviewItem,
 };
 use super::sync::ImportPreview;
 use crate::modules::audit::AuditCtx;
@@ -64,7 +65,6 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
             "/integrations/contact-sync/google/client",
             get(get_client).put(put_client),
         )
-        .route("/integrations/contact-sync/groups", get(list_groups))
         .route("/integrations/contact-sync/selection", put(set_selection))
         .route("/integrations/contact-sync/preview", post(preview))
         .route(
@@ -166,16 +166,6 @@ async fn disconnect(
 ) -> AppResult<StatusCode> {
     state.service.disconnect(user.tenant(), &ctx).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// The labels with Google's counts, for the picker and its preview. Admin:
-/// it spends the tenant's grant on a read of their Google account.
-async fn list_groups(
-    State(state): State<ContactSyncRouterState>,
-    _admin: RequireAdmin,
-    RequireAuth(user): RequireAuth,
-) -> AppResult<Json<Vec<GroupOption>>> {
-    Ok(Json(state.service.groups(user.tenant()).await?))
 }
 
 #[derive(Debug, Default, Deserialize)]
