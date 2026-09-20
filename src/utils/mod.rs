@@ -25,6 +25,10 @@ pub mod money;
 // PMS-941: the one image allowlist every publicly-readable image route shares
 // (tenant logo, KB article image, ticket inline image). SVG is refused there.
 pub mod inline_image;
+// PMS-1243: `Json<T>` extractor that reads the `sanitize_json_body`
+// middleware's already-parsed tree instead of re-parsing the raw body.
+#[cfg(feature = "server")]
+pub mod json;
 // Shared IP classification (PMS-805): one `is_non_public_ip`, used by the
 // login-location check and by the website probe's SSRF guard.
 pub mod net;

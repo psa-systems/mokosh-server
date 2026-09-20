@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
     routing::{delete, get, put},
-    Json, Router,
+    Router,
 };
 use uuid::Uuid;
 use validator::Validate;
