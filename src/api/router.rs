@@ -1,11 +1,12 @@
 //! API router configuration
 
+use crate::utils::json::Json;
 use axum::{
     http::{header, Method, StatusCode},
     middleware,
     response::{Html, IntoResponse},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use std::sync::Arc;
 use tower_http::{

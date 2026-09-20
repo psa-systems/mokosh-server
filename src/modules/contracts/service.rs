@@ -1276,7 +1276,7 @@ impl ContractsService {
         let item = sqlx::query_as::<_, BlockItemRow>(
             r#"SELECT ci.id, ci.included_hours, ci.overage_rate,
                       ci.rollover_enabled, ci.max_rollover_hours,
-                      c.billing_cycle, c.start_date
+                      c.billing_cycle, c.start_date, c.end_date
                FROM contract_items ci
                INNER JOIN contracts c ON c.id = ci.contract_id
                WHERE ci.tenant_id = $1 AND ci.contract_id = $2
