@@ -556,8 +556,9 @@ infisical-bootstrap: ensure-env
 # PMS-729: seed the client-portal login fixture set into the running dev
 # database (three tenants + one portal contact each, sharing a fixed dev
 # password). Idempotent. Refuses if ENVIRONMENT is not development/dev/test.
-# Run once after `just dev` boots to exercise the host-derived portal login
-# at http://{slug}.client.localhost:4301/portal/login.
+# Run once after `just dev` boots to exercise the path-based portal login
+# at http://localhost:4301/portal/{portal_id}/login (portal_id from the
+# seeded Company row).
 [doc("Seed the PMS-729 client-portal fixture tenants + contacts into the running dev DB (idempotent, dev-only).")]
 [group: 'dev']
 dev-seed-portal: ensure-env
