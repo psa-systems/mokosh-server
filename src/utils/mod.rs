@@ -19,6 +19,9 @@ pub mod error;
 pub mod geoip;
 pub mod html;
 pub mod login_location;
+// PMS-1200: the one money formatter every rendered surface calls (a report
+// PDF cell, a JSON `_display` field).
+pub mod money;
 // PMS-941: the one image allowlist every publicly-readable image route shares
 // (tenant logo, KB article image, ticket inline image). SVG is refused there.
 pub mod inline_image;
