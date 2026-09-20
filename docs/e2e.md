@@ -73,6 +73,7 @@ Set via `e2e/.env` locally (copy from `e2e/.env.example`) or Forgejo Actions sec
 | `E2E_OIDC_REDIRECT_URI` | yes | redirect_uri registered for that client. Must match EXACTLY or the OP returns `invalid_redirect_uri`. Only the `code` is captured; the URL is never loaded. |
 | `E2E_TOTP_SECRET` | yes | base32 TOTP secret for the account; the second factor is computed at runtime. |
 | `E2E_FOREIGN_COMPANY_ID` | no | A company id in ANOTHER tenant, to strengthen the cross-tenant leak canary. Genuinely optional: the canary in `tests/contacts.spec.ts` always runs and is never skipped. When unset, `global.setup.ts` substitutes a random, well-formed UUID, so the canary only proves a NON-EXISTENT company is unreadable; set it and the canary proves a real, foreign-owned company is unreadable, which is the leak worth catching. |
+| `E2E_ENVIRONMENT` | no | Target environment name, `staging` or `production`, default `staging` (`e2e/.env.example`). CI sets it from the dispatch input; `tests/external-guard.spec.ts` reads it to assert `@external`-tagged tests never run against production. Leave unset locally (treated as non-production). |
 
 In CI the three vars with a deployment equivalent use the deployment's own names (`MOKOSH_OIDC_CLIENT_ID` single shared; `MOKOSH_APPS_REDIRECT_URIS_STAGING`/`_PRODUCTION`; `OIDC_ISSUER_STAGING`/`_PRODUCTION`); test-only vars use `E2E_STAGING_*` / `E2E_PRODUCTION_*`. Automatic runs (push, PR) always resolve to staging; production is manual-dispatch only.
 

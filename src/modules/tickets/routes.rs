@@ -1,9 +1,10 @@
 //! Ticket API routes
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, State},
     routing::{delete, get, patch, post, put},
-    Json, Router,
+    Router,
 };
 use std::sync::Arc;
 use uuid::Uuid;

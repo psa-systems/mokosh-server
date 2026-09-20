@@ -8,11 +8,12 @@
 //! path from the tenant `auth_middleware` — a platform bearer is
 //! never treated as a tenant user (or vice versa).
 
+use crate::utils::json::Json;
 use axum::{
     extract::State,
     http::HeaderMap,
     routing::{post, put},
-    Json, Router,
+    Router,
 };
 use std::sync::Arc;
 use uuid::Uuid;
