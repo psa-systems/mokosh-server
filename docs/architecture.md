@@ -70,7 +70,7 @@ Two Dockerfiles, two purposes.
 src/
   api/             Axum router composition: create_api_router builds every /api/v1 nest.
   bin/             Standalone CLI binaries (mokosh-bootstrap).
-  cli.rs           Operator subcommands the mokosh-server binary dispatches before it binds a port.
+  cli/             Operator subcommands the mokosh-server binary dispatches before it binds a port.
   db/              Database wrapper around sqlx::PgPool, plus the per-tenant transaction helpers.
   infisical/       Infisical HTTP client + first-run bootstrap.
   modules/         Feature modules (tickets, contracts, billing, ...).
