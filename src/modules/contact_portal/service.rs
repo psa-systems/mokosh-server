@@ -1735,25 +1735,47 @@ impl ContactAuthService {
         }
     }
 
-    /// PMS-1224: fail-closed check that the `contact_sessions` row an
-    /// access token's `sid` names is still live. Called by the
-    /// middleware on every authenticated /api/v1/contact/* request so
-    /// `revoke_session`, the revoke inside `change_password`, and
-    /// `revoke_portal_access` (`contacts::service`) all kick the
-    /// bearer on its next use rather than only at its next refresh: a
-    /// missing row (revoked-and-purged) or a `revoked_at` already set
-    /// is treated the same as an unauthenticated request.
+    /// PMS-1224: fail-closed check that the access token's `sid` still
+    /// carries authority. Called by the middleware on every
+    /// authenticated /api/v1/contact/* request so `revoke_session`, the
+    /// revoke inside `change_password`, and `revoke_portal_access`
+    /// (`contacts::service`) all kick the bearer on its next use rather
+    /// than only at its next refresh.
+    ///
+    /// PMS-1259: the question is asked of the ROTATION FAMILY, not of
+    /// the one row. `revoked_at` carries two meanings, and rotation is
+    /// the odd one out: `refresh` stamps it on the presented row before
+    /// minting the successor, which means SUPERSEDED, while every other
+    /// writer (`revoke_session_family` and its five callers,
+    /// `set_password_with_token`, `change_password`,
+    /// `revoke_portal_access`) stamps a whole family or every row the
+    /// contact holds, which means REVOKED. Reading the row alone
+    /// conflated the two and killed a still-unexpired access token the
+    /// moment its sibling refresh token rotated, so any request the SPA
+    /// had in flight across a refresh came back 401. Asking the family
+    /// refuses every real revocation exactly as before, because all of
+    /// them take the family or wider.
+    ///
+    /// A `sid` naming no row leaves the sub-select NULL, which matches
+    /// no family, so a purged session stays a refusal.
     pub async fn ensure_session_active(&self, tenant_id: Uuid, session_id: Uuid) -> AppResult<()> {
-        let revoked_at: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
-            "SELECT revoked_at FROM contact_sessions WHERE id = $1 AND tenant_id = $2",
+        let family_live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(\
+               SELECT 1 FROM contact_sessions live \
+               WHERE live.tenant_id = $2 \
+                 AND live.revoked_at IS NULL \
+                 AND live.family_id = ( \
+                       SELECT family_id FROM contact_sessions \
+                       WHERE id = $1 AND tenant_id = $2))",
         )
         .bind(session_id)
         .bind(tenant_id)
-        .fetch_optional(self.db.migrator_pool())
+        .fetch_one(self.db.migrator_pool())
         .await?;
-        match revoked_at {
-            Some(None) => Ok(()),
-            _ => Err(AppError::Unauthorized),
+        if family_live {
+            Ok(())
+        } else {
+            Err(AppError::Unauthorized)
         }
     }
 

@@ -2117,7 +2117,7 @@ async fn set_tenant_entitlement_rejects_unknown_status(pool: PgPool) {
 }
 
 /// Migration 104: the seeded ticket-note copy names the organisation. The keys
-/// are supplied by `TicketsService::send_note_email`; an unresolved one would
+/// are supplied by `TicketService::send_note_email`; an unresolved one would
 /// reach the client as literal braces, so template and context are asserted
 /// against each other here rather than trusted to stay in step.
 #[sqlx::test]
