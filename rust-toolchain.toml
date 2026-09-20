@@ -1,7 +1,7 @@
-# Pin the Rust toolchain to the EXACT patch version (rustc 1.94.1 / rustfmt
-# 1.8.0) of the rust 1.94 line that BOTH builder images are built on:
-# `rust-builder-glibc:v1.0.1-rust1.94-trixie` (dev `Dockerfile`) and
-# `rust-builder-musl:v1.0.0-rust1.94-alpine` (`oci-build/Dockerfile`). The two
+# Pin the Rust toolchain to the EXACT patch version (rustc 1.98.1) of the
+# rust 1.98 line that BOTH builder images are built on:
+# `rust-builder-glibc:v1.2.0-rust1.98.1-trixie` (dev `Dockerfile`) and
+# `rust-builder-musl:v1.1.0-rust1.98.1-alpine` (`oci-build/Dockerfile`). The two
 # tags move independently. This keeps the rustfmt/clippy that
 # `just check`, the `just pre-commit` hook, and CI run identical, so formatting
 # done in the dev container always passes CI.
@@ -14,5 +14,5 @@
 # image moves to a newer rust, update `channel` here in the same PR and fix any
 # newly-promoted clippy/rustfmt lints alongside it.
 [toolchain]
-channel = "1.94.1"
+channel = "1.98.1"
 components = ["clippy", "rustfmt"]

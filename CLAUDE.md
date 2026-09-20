@@ -11,7 +11,7 @@ Mokosh Server: PSA (Professional Services Automation) REST API for MSPs. Rust + 
 
 ## Common commands
 
-All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0.112.2`, Docker + Compose v2, Rust `1.94.1` (the exact patch `rust-toolchain.toml` pins, so rustfmt and clippy match CI), `sqlx-cli` for migrations, `cargo-machete` for the unused-dependency gate (`cargo install --locked cargo-machete`).
+All driven through `just` (see `justfile`). Required tooling: `just`, Nushell `0.112.2`, Docker + Compose v2, Rust `1.98.1` (the exact patch `rust-toolchain.toml` pins, so rustfmt and clippy match CI), `sqlx-cli` for migrations, `cargo-machete` for the unused-dependency gate (`cargo install --locked cargo-machete`).
 
 ```
 just                       # list recipes
