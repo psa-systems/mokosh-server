@@ -28,7 +28,9 @@ use crate::modules::audit::{audit_auth_event, audit_write, AuditAction, AuditCtx
 #[cfg(feature = "server")]
 use crate::modules::notifications::NotificationsService;
 #[cfg(feature = "server")]
-use crate::utils::crypto::{generate_token, hash_password, verify_password};
+use crate::utils::crypto::{
+    generate_token, hash_password, sha256_hex, verify_password, verify_password_or_dummy,
+};
 use crate::utils::deployment::DeploymentMode;
 #[cfg(feature = "server")]
 use crate::utils::email::{salutation, LogMailer, Mailer};
@@ -781,7 +783,7 @@ impl AuthService {
         // Verify password
         let password_hash = user.password_hash.as_ref().ok_or(AppError::Unauthorized)?;
 
-        if !verify_password(&request.password, password_hash)? {
+        if !verify_password(&request.password, password_hash).await? {
             // Record the failed attempt (PMS-117 AC3) before bailing.
             let ctx = AuditCtx {
                 tenant_id: Some(user.tenant_id),
@@ -1416,7 +1418,8 @@ impl AuthService {
         // `{user_id}.{secret}`; only the secret is hashed and stored so
         // reset_password can scope its lookup to this user.
         let secret = generate_token(64);
-        let token_hash = hash_password(&secret)?;
+        let token_hash = hash_password(&secret).await?;
+        let lookup_hash = sha256_hex(&secret);
         let token = format!("{}.{}", user.id, secret);
         let expires_at = Utc::now() + Duration::hours(24);
 
@@ -1424,13 +1427,14 @@ impl AuthService {
         let mut tx = self.db.begin_with_tenant(user.tenant_id).await?;
         sqlx::query(
             r#"
-            INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, lookup_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(user.tenant_id)
         .bind(user.id)
         .bind(&token_hash)
+        .bind(&lookup_hash)
         .bind(expires_at)
         .execute(&mut *tx)
         .await?;
@@ -1498,27 +1502,33 @@ impl AuthService {
     pub async fn set_password_context(&self, token: &str) -> AppResult<(String, String)> {
         let (user_id, secret) =
             parse_user_bound_token(token).ok_or_else(|| AppError::NotFound("token".to_string()))?;
-        let candidates = sqlx::query_as::<_, (Uuid, String)>(
+        // PMS-1244: look the row up by its equality-matchable SHA-256
+        // `lookup_hash` instead of scanning every candidate row, so exactly
+        // one Argon2 verify runs per redemption attempt.
+        let row: Option<(Uuid, String)> = sqlx::query_as(
             r#"
             SELECT tenant_id, token_hash
             FROM password_reset_tokens
-            WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()
-            ORDER BY created_at DESC
+            WHERE user_id = $1 AND lookup_hash = $2 AND used_at IS NULL AND expires_at > NOW()
             "#,
         )
         .bind(user_id)
-        .fetch_all(self.db.migrator_pool())
+        .bind(sha256_hex(secret))
+        .fetch_optional(self.db.migrator_pool())
         .await
         .map_err(|_| AppError::NotFound("token".to_string()))?;
 
-        let mut matched_tenant: Option<Uuid> = None;
-        for (tenant_id, token_hash) in &candidates {
-            if verify_password(secret, token_hash).unwrap_or(false) {
-                matched_tenant = Some(*tenant_id);
-                break;
-            }
-        }
-        let tenant_id = matched_tenant.ok_or_else(|| AppError::NotFound("token".to_string()))?;
+        let (candidate_tenant, row_hash) = match &row {
+            Some((tenant_id, token_hash)) => (Some(*tenant_id), Some(token_hash.as_str())),
+            None => (None, None),
+        };
+        let verified = verify_password_or_dummy(secret, row_hash)
+            .await
+            .unwrap_or(false);
+        let tenant_id = match (verified, candidate_tenant) {
+            (true, Some(tenant_id)) => tenant_id,
+            _ => return Err(AppError::NotFound("token".to_string())),
+        };
 
         let row: Option<(String, String)> =
             sqlx::query_as("SELECT name, slug FROM tenants WHERE id = $1")
@@ -1564,37 +1574,36 @@ impl AuthService {
             .ok_or_else(|| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
 
         // Pull tenant_id alongside the token hash so the subsequent
-        // user UPDATE can bind it (PMS-4 AC6). Multiple candidate rows
-        // are possible if the user requested several resets and none
-        // expired yet; verify each in turn.
+        // user UPDATE can bind it (PMS-4 AC6). PMS-1244: look the row up by
+        // its equality-matchable SHA-256 `lookup_hash` instead of scanning
+        // every candidate row for the user, so exactly one Argon2 verify
+        // runs per redemption attempt.
         // SAFETY (PMS-285): password reset runs pre-auth - the user is not in a
         // session, so there is no `app.current_tenant` to set, and the row's
         // tenant is exactly what this lookup resolves (the user can live under
         // one tenant only via the user-bound token's `user_id`). Runs on the
         // migrator pool; `password_reset_tokens` is RLS-covered, so an app-pool
         // read with no GUC would fail closed and break reset entirely.
-        let candidates = sqlx::query_as::<_, (Uuid, String)>(
+        let row: Option<(Uuid, String)> = sqlx::query_as(
             r#"
             SELECT tenant_id, token_hash
             FROM password_reset_tokens
-            WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()
-            ORDER BY created_at DESC
+            WHERE user_id = $1 AND lookup_hash = $2 AND used_at IS NULL AND expires_at > NOW()
             "#,
         )
         .bind(user_id)
-        .fetch_all(self.db.migrator_pool())
+        .bind(sha256_hex(secret))
+        .fetch_optional(self.db.migrator_pool())
         .await?;
 
-        let mut matched: Option<Uuid> = None;
-        for (tenant_id, token_hash) in &candidates {
-            if verify_password(secret, token_hash)? {
-                matched = Some(*tenant_id);
-                break;
-            }
-        }
-        let tenant_id = match matched {
-            Some(t) => t,
-            None => {
+        let (candidate_tenant, row_hash) = match &row {
+            Some((tenant_id, token_hash)) => (Some(*tenant_id), Some(token_hash.as_str())),
+            None => (None, None),
+        };
+        let verified = verify_password_or_dummy(secret, row_hash).await?;
+        let tenant_id = match (verified, candidate_tenant) {
+            (true, Some(tenant_id)) => tenant_id,
+            _ => {
                 return Err(AppError::BadRequest(
                     "Invalid or expired reset token".to_string(),
                 ));
@@ -1602,7 +1611,7 @@ impl AuthService {
         };
 
         // Hash new password
-        let new_hash = hash_password(&request.new_password)?;
+        let new_hash = hash_password(&request.new_password).await?;
 
         // MAPPS-551: password_hash lives per-tenant on `users`. The
         // MAPPS-498 mirror no longer touches password (see migration
@@ -1703,7 +1712,7 @@ impl AuthService {
         })?;
 
         // Verify current password
-        if !verify_password(&request.current_password, &current_hash)? {
+        if !verify_password(&request.current_password, &current_hash).await? {
             return Err(AppError::validation_field(
                 "current_password",
                 "Current password is incorrect",
@@ -1711,7 +1720,7 @@ impl AuthService {
         }
 
         // Hash and update new password
-        let new_hash = hash_password(&request.new_password)?;
+        let new_hash = hash_password(&request.new_password).await?;
 
         // MAPPS-551: retire the identity write. Password lives on the
         // per-tenant users row only; migration 135's mirror no longer
@@ -1863,19 +1872,21 @@ impl AuthService {
             // Same user-bound `{user_id}.{secret}` token shape as
             // request_password_reset so reset_password can scope the lookup.
             let secret = generate_token(64);
-            let token_hash = hash_password(&secret)?;
+            let token_hash = hash_password(&secret).await?;
+            let lookup_hash = sha256_hex(&secret);
             let token = format!("{}.{}", user_id, secret);
             let expires_at = Utc::now() + Duration::days(7);
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
             sqlx::query(
                 r#"
-                INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, lookup_hash, expires_at)
+                VALUES ($1, $2, $3, $4, $5)
                 "#,
             )
             .bind(tenant_id)
             .bind(user_id)
             .bind(&token_hash)
+            .bind(&lookup_hash)
             .bind(expires_at)
             .execute(&mut *tx)
             .await?;
@@ -2331,7 +2342,7 @@ impl AuthService {
             .password_hash
             .as_ref()
             .ok_or_else(|| AppError::BadRequest("This account has no password".to_string()))?;
-        if !verify_password(password, hash)? {
+        if !verify_password(password, hash).await? {
             return Err(AppError::Unauthorized);
         }
 
@@ -2381,7 +2392,7 @@ impl AuthService {
         let raw_key = generate_api_key();
         // `psa_` + 40 alnum = 44 chars; prefix is 10 chars.
         let key_prefix: String = raw_key.chars().take(10).collect();
-        let key_hash = hash_password(&raw_key)?;
+        let key_hash = hash_password(&raw_key).await?;
 
         let id = Uuid::new_v4();
         let scopes = request
@@ -3915,7 +3926,7 @@ impl AuthService {
                 .password_hash
                 .as_deref()
                 .ok_or(AppError::Unauthorized)?;
-            if !verify_password(&request.password, identity_hash)? {
+            if !verify_password(&request.password, identity_hash).await? {
                 return Err(AppError::Unauthorized);
             }
         } else {
@@ -3930,7 +3941,7 @@ impl AuthService {
                 let Some(hash) = user.password_hash.as_deref() else {
                     continue;
                 };
-                match verify_password(&request.password, hash) {
+                match verify_password(&request.password, hash).await {
                     Ok(true) => {
                         matched_memberships.push(m.clone());
                         if any_verified_user.is_none() {
@@ -4563,20 +4574,6 @@ fn parse_user_bound_token(token: &str) -> Option<(Uuid, &str)> {
     }
     let user_id = Uuid::parse_str(id).ok()?;
     Some((user_id, secret))
-}
-
-/// Lowercase hex SHA-256 of an arbitrary string (avoids storing a plaintext
-/// secret in a `TEXT` column such as `user_sessions.token_hash`).
-#[cfg(feature = "server")]
-fn sha256_hex(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(input.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        use std::fmt::Write;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
 }
 
 /// Hex SHA-256 of the canonical MFA recovery code form. Mirrors

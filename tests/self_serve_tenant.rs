@@ -14,8 +14,9 @@ use uuid::Uuid;
 
 async fn insert_identity_no_membership(pool: &PgPool, email: &str) -> Uuid {
     let id = Uuid::new_v4();
-    let hash =
-        mokosh_server::utils::crypto::hash_password("test-password-12345").expect("hash test pw");
+    let hash = mokosh_server::utils::crypto::hash_password("test-password-12345")
+        .await
+        .expect("hash test pw");
     sqlx::query(
         "INSERT INTO identities \
          (id, email, password_hash, first_name, last_name, status, email_verified_at) \
@@ -110,7 +111,9 @@ async fn self_serve_refuses_when_identity_already_has_membership(pool: PgPool) {
     .execute(&app.pool)
     .await
     .expect("insert 2nd tenant");
-    let hash = mokosh_server::utils::crypto::hash_password(&password).expect("hash pw");
+    let hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash pw");
     sqlx::query(
         "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
          VALUES ($1, $2, $3, $4, 'First', 'Last', 'admin', 'active', NOW())",

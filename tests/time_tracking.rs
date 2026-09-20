@@ -22,8 +22,9 @@ use uuid::Uuid;
 async fn seed_technician(pool: &PgPool) -> (Uuid, String, String) {
     let email = "test-tech@example.com".to_string();
     let password = "tech-password-12345".to_string();
-    let password_hash =
-        mokosh_server::utils::crypto::hash_password(&password).expect("hash technician password");
+    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash technician password");
     let user_id = Uuid::new_v4();
     sqlx::query(
         r#"

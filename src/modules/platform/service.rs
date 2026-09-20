@@ -102,7 +102,7 @@ impl PlatformAdminService {
         // overwrite the rotated hash back to the old one. There is
         // no live case where a real platform_admins row should trust
         // an older hash from another plane.
-        if !verify_password(password, hash)? {
+        if !verify_password(password, hash).await? {
             return Err(AppError::Unauthorized);
         }
 
@@ -234,13 +234,13 @@ impl PlatformAdminService {
             .password_hash
             .as_deref()
             .ok_or(AppError::Unauthorized)?;
-        if !verify_password(current, hash)? {
+        if !verify_password(current, hash).await? {
             return Err(AppError::validation_field(
                 "current_password",
                 "Current password is incorrect",
             ));
         }
-        let new_hash = hash_password(new)?;
+        let new_hash = hash_password(new).await?;
         PlatformAdminRepo::update_password_hash(pool, admin_id, &new_hash)
             .await
             .map_err(|_| AppError::Internal("Failed to update password".to_string()))?;

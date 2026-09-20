@@ -94,6 +94,10 @@ pub enum SecretKind {
         provider: String,
         connection_id: Uuid,
     },
+    /// PMS-1264: the deployment's own OAuth client secret for a provider, set
+    /// in the app rather than in operator env. Held under the system tenant,
+    /// because there is one per deployment and not one per organisation.
+    OauthClient { provider: String },
 }
 
 impl SecretKind {
@@ -102,6 +106,7 @@ impl SecretKind {
         match self {
             SecretKind::PaymentGateway { .. } => "PAYMENT_GATEWAY",
             SecretKind::ContactSync { .. } => "CONTACT_SYNC",
+            SecretKind::OauthClient { .. } => "OAUTH_CLIENT",
         }
     }
 
@@ -118,6 +123,7 @@ impl SecretKind {
                 provider,
                 connection_id,
             } => Cow::Owned(format!("{provider}_{}", connection_id.simple())),
+            SecretKind::OauthClient { provider } => Cow::Borrowed(provider),
         }
     }
 }
@@ -142,6 +148,17 @@ impl SecretKey {
             kind: SecretKind::ContactSync {
                 provider: provider.into(),
                 connection_id,
+            },
+        }
+    }
+
+    /// PMS-1264: the deployment's OAuth client secret for `provider`, under the
+    /// system tenant that holds deployment-wide configuration.
+    pub fn oauth_client(system_tenant: Uuid, provider: impl Into<String>) -> Self {
+        Self {
+            tenant_id: system_tenant,
+            kind: SecretKind::OauthClient {
+                provider: provider.into(),
             },
         }
     }

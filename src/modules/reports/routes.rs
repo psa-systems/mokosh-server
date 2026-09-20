@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ use super::service::*;
 use crate::modules::auth::{RequireFinance, RequireReports, TenantScoped};
 use crate::pdf;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::money::money;
 
 #[derive(Clone)]
 pub struct ReportsRouterState {
@@ -322,21 +324,24 @@ async fn export_report(
                 .await?,
             csv_for_dashboard,
             pdf_for_dashboard,
-        ),
+        )
+        .await,
         ReportKind::Tickets => emit(
             format,
             descriptor,
             &s.service.tickets(u.tenant(), &u.timezone, q.from, q.to).await?,
             csv_for_tickets,
             pdf_for_tickets,
-        ),
+        )
+        .await,
         ReportKind::Time => emit(
             format,
             descriptor,
             &s.service.time(u.tenant(), &u.timezone, q.from, q.to).await?,
             csv_for_time,
             pdf_for_time,
-        ),
+        )
+        .await,
         ReportKind::RequestTypes => emit(
             format,
             descriptor,
@@ -345,7 +350,8 @@ async fn export_report(
                 .await?,
             csv_for_request_types,
             pdf_for_request_types,
-        ),
+        )
+        .await,
         // The one registered key a GET export cannot serve: the spec travels
         // in a POST body. Say so rather than 404ing a report that exists.
         // Unchanged by PMS-876: adding a second format does not give a GET a
@@ -372,6 +378,7 @@ async fn export_report(
                 csv_for_billing,
                 pdf_for_billing,
             )
+            .await
         }
         ReportKind::Projects => emit(
             format,
@@ -379,7 +386,8 @@ async fn export_report(
             &s.service.projects(u.tenant()).await?,
             csv_for_projects,
             pdf_for_projects,
-        ),
+        )
+        .await,
         ReportKind::Clients => {
             // The clients export is Client Profitability (invoiced / paid /
             // outstanding), the same financial data as GET /reports/clients,
@@ -398,6 +406,7 @@ async fn export_report(
                 csv_for_clients,
                 pdf_for_clients,
             )
+            .await
         }
     }
 }
@@ -436,7 +445,7 @@ impl ExportFormat {
 /// acquire a CSV writer and no PDF one, because there is nowhere to put a
 /// half-pair, and `export_report` still matches `ReportKind` exhaustively so a
 /// new registry entry fails to compile until both exist (PMS-839).
-fn emit<T>(
+async fn emit<T>(
     format: ExportFormat,
     descriptor: &ReportDescriptor,
     data: &T,
@@ -453,9 +462,10 @@ fn emit<T>(
             // PMS-1206: a report stores nothing and is generated the moment
             // this request is answered, so that moment is its own date.
             let bytes = pdf::render(
-                &to_pdf(data, descriptor.name),
+                to_pdf(data, descriptor.name),
                 chrono::Utc::now().date_naive(),
-            )?;
+            )
+            .await?;
             Ok((
                 [
                     (
@@ -739,9 +749,9 @@ fn pdf_for_billing(r: &BillingReportResponse, title: &str) -> pdf::Document {
         .fields(
             "Totals",
             vec![
-                ("Invoiced".into(), r.invoiced.to_string()),
-                ("Paid".into(), r.paid.to_string()),
-                ("Outstanding".into(), r.outstanding.to_string()),
+                ("Invoiced".into(), money(r.invoiced, None)),
+                ("Paid".into(), money(r.paid, None)),
+                ("Outstanding".into(), money(r.outstanding, None)),
             ],
         )
         .table(
@@ -749,7 +759,7 @@ fn pdf_for_billing(r: &BillingReportResponse, title: &str) -> pdf::Document {
             vec!["Bucket".into(), "Total".into()],
             r.aging
                 .iter()
-                .map(|b| vec![b.bucket.clone(), b.total.to_string()])
+                .map(|b| vec![b.bucket.clone(), money(b.total, None)])
                 .collect(),
         )
 }
@@ -765,9 +775,9 @@ fn pdf_for_projects(r: &ProjectsReportResponse, title: &str) -> pdf::Document {
             "Budget and actuals",
             vec![
                 ("Budget hours".into(), r.budget_hours.to_string()),
-                ("Budget amount".into(), r.budget_amount.to_string()),
+                ("Budget amount".into(), money(r.budget_amount, None)),
                 ("Actual hours".into(), r.actual_hours.to_string()),
-                ("Actual amount".into(), r.actual_amount.to_string()),
+                ("Actual amount".into(), money(r.actual_amount, None)),
                 ("Tasks total".into(), r.tasks_total.to_string()),
                 ("Tasks completed".into(), r.tasks_completed.to_string()),
                 ("Overdue".into(), r.overdue.to_string()),

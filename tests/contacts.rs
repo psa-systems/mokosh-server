@@ -2950,3 +2950,74 @@ async fn unlinking_the_billing_contact_clears_the_role(pool: PgPool) {
         "unlinking the contact clears the billing role it held"
     );
 }
+
+/// PMS-1261: `is_portal_user` and `tags` filter the list and its total. Both
+/// were deserialized and never applied, so "Portal users only" returned every
+/// contact and the count agreed.
+#[sqlx::test]
+async fn the_list_filters_by_portal_access_and_tags(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    for (name, portal, tags) in [
+        ("Portal", true, vec!["vip"]),
+        ("Billing", false, vec!["billing", "vip"]),
+        ("Plain", false, vec![]),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO contacts (id, tenant_id, first_name, last_name, is_portal_user, tags) \
+             VALUES ($1, $2, $3, 'Filter', $4, $5)",
+        )
+        .bind(id)
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(name)
+        .bind(portal)
+        .bind(tags.iter().map(|t| t.to_string()).collect::<Vec<_>>())
+        .execute(&pool)
+        .await
+        .expect("seed contact");
+    }
+
+    let listed = |query: &'static str| {
+        let app = &app;
+        let token = &token;
+        async move {
+            let body: serde_json::Value = app
+                .client
+                .get(app.url(&format!("/api/v1/contacts/contacts?per_page=100&{query}")))
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("list")
+                .json()
+                .await
+                .expect("json");
+            let mut names: Vec<String> = body["data"]
+                .as_array()
+                .expect("page")
+                .iter()
+                .filter(|c| c["last_name"] == "Filter")
+                .map(|c| c["first_name"].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            (names, body["meta"]["total"].as_u64().unwrap_or_default())
+        }
+    };
+
+    let (portal, total) = listed("is_portal_user=true").await;
+    assert_eq!(portal, vec!["Portal"]);
+    assert_eq!(total, 1, "the total counts the filtered set");
+    let (not_portal, _) = listed("is_portal_user=false").await;
+    assert_eq!(not_portal, vec!["Billing", "Plain"]);
+    let (vip, total) = listed("tags=vip").await;
+    assert_eq!(vip, vec!["Billing", "Portal"]);
+    assert_eq!(total, 2);
+    let (any_of, _) = listed("tags=billing,%20nothing").await;
+    assert_eq!(any_of, vec!["Billing"], "any listed tag matches");
+    let (both, _) = listed("tags=vip&is_portal_user=false").await;
+    assert_eq!(both, vec!["Billing"], "filters combine");
+    let (blank, _) = listed("tags=%20,").await;
+    assert_eq!(blank.len(), 3, "a filter of blanks filters nothing");
+}

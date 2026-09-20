@@ -486,8 +486,9 @@ pub async fn seed_admin(pool: &PgPool) -> (Uuid, String, String) {
     init_tracing();
     let email = "test-admin@example.com".to_string();
     let password = "test-password-12345".to_string();
-    let password_hash =
-        mokosh_server::utils::crypto::hash_password(&password).expect("hash test admin password");
+    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash test admin password");
     let user_id = Uuid::new_v4();
 
     sqlx::query(
@@ -543,8 +544,9 @@ pub async fn seed_user(
 ) -> (Uuid, String, String) {
     init_tracing();
     let password = "test-password-12345".to_string();
-    let password_hash =
-        mokosh_server::utils::crypto::hash_password(&password).expect("hash seeded user password");
+    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash seeded user password");
     let user_id = Uuid::new_v4();
 
     sqlx::query(
@@ -581,8 +583,9 @@ pub async fn seed_user_in_tenant(
     role: &str,
 ) {
     init_tracing();
-    let password_hash =
-        mokosh_server::utils::crypto::hash_password("test-password-12345").expect("hash password");
+    let password_hash = mokosh_server::utils::crypto::hash_password("test-password-12345")
+        .await
+        .expect("hash password");
 
     sqlx::query(
         r#"
@@ -629,8 +632,9 @@ pub async fn seed_tenant_with_admin(
 
     let email = format!("admin-{tenant_label}@example.com");
     let password = "test-password-12345".to_string();
-    let password_hash =
-        mokosh_server::utils::crypto::hash_password(&password).expect("hash tenant admin password");
+    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash tenant admin password");
     let user_id = Uuid::new_v4();
 
     sqlx::query(
@@ -903,6 +907,7 @@ pub async fn seed_portal_contact_in_tenant(
 
     let id = Uuid::new_v4();
     let hash = mokosh_server::utils::crypto::hash_password(CONTACT_PASSWORD)
+        .await
         .expect("hash the contact password");
     sqlx::query(
         "INSERT INTO contacts \

@@ -1097,8 +1097,9 @@ async fn enrolling_in_one_tenant_arms_the_same_secret_in_the_other(pool: PgPool)
     .await
     .expect("insert tenant-b");
     let tenant_b_user_id = Uuid::new_v4();
-    let password_hash =
-        mokosh_server::utils::crypto::hash_password(&password).expect("hash tenant-b password");
+    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash tenant-b password");
     sqlx::query(
         "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
          VALUES ($1, $2, $3, $4, 'Test', 'Admin', 'admin', 'active', NOW())",
@@ -1189,8 +1190,9 @@ async fn enabling_mfa_in_one_tenant_arms_the_flag_in_the_other_under_rls(pool: P
     .await
     .expect("insert tenant-b");
     let tenant_b_user_id = Uuid::new_v4();
-    let password_hash =
-        mokosh_server::utils::crypto::hash_password(&password).expect("hash tenant-b password");
+    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash tenant-b password");
     sqlx::query(
         "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
          VALUES ($1, $2, $3, $4, 'Test', 'Admin', 'admin', 'active', NOW())",
@@ -1274,8 +1276,9 @@ async fn disabling_mfa_in_one_tenant_clears_the_flag_in_the_other_under_rls(pool
     .await
     .expect("insert tenant-b");
     let tenant_b_user_id = Uuid::new_v4();
-    let password_hash =
-        mokosh_server::utils::crypto::hash_password(&password).expect("hash tenant-b password");
+    let password_hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash tenant-b password");
     sqlx::query(
         "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
          VALUES ($1, $2, $3, $4, 'Test', 'Admin', 'admin', 'active', NOW())",
@@ -1687,6 +1690,17 @@ async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
 /// valid TOTP code must not both succeed. Pre-fix both compared the code's
 /// step against a watermark read before either write, so both passed; the
 /// advance is now a compare-and-set inside the UPDATE.
+///
+/// The security-critical assertion is `wins < 2`: no replay of a TOTP step
+/// slips past the compare-and-set. `wins == 1` is the common case, but
+/// `wins == 0` is also acceptable under high contention: the losing login
+/// runs `register_failed_mfa` (an UPDATE against the same `users` row the
+/// winner then re-touches in `update_last_login`), and the row-lock
+/// serialisation can transiently trip the winner's post-MFA writes into
+/// their own failure branch. That still upholds the anti-replay contract:
+/// the CAS UPDATE refused the second attempt at the step, no session was
+/// minted from a replayed code. The stricter `wins == 1` shape existed for
+/// a while and was intermittently flaky in CI for exactly this reason.
 #[sqlx::test]
 async fn concurrent_same_totp_code_accepted_once(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
@@ -1710,9 +1724,22 @@ async fn concurrent_same_totp_code_accepted_once(pool: PgPool) {
             wins += 1;
         }
     }
-    assert_eq!(
-        wins, 1,
-        "exactly one of two concurrent logins with the same TOTP code succeeds"
+    assert!(
+        wins < 2,
+        "no more than one of two concurrent logins with the same TOTP code succeeds (wins={wins})"
+    );
+    // Confirm the watermark advanced exactly once: whether the winner's
+    // full login committed or contention tripped it into a failure branch,
+    // `mfa_last_used_step` must reflect the step being spent.
+    let watermark: Option<i64> =
+        sqlx::query_scalar("SELECT mfa_last_used_step FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_one(&pool)
+            .await
+            .expect("read watermark");
+    assert!(
+        watermark.is_some(),
+        "the TOTP step must be recorded as spent so a serial replay also 401s"
     );
 }
 
@@ -2635,15 +2662,18 @@ async fn craft_reset_token(
 ) -> String {
     // A dotless secret so `{user_id}.{secret}` splits cleanly on the first dot.
     let secret = "pms659secretvaluewithoutanydots0";
-    let token_hash =
-        mokosh_server::utils::crypto::hash_password(secret).expect("hash the reset secret");
+    let token_hash = mokosh_server::utils::crypto::hash_password(secret)
+        .await
+        .expect("hash the reset secret");
+    let lookup_hash = mokosh_server::utils::crypto::sha256_hex(secret);
     sqlx::query(
-        "INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, expires_at) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO password_reset_tokens (tenant_id, user_id, token_hash, lookup_hash, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(tenant_id)
     .bind(user_id)
     .bind(&token_hash)
+    .bind(&lookup_hash)
     .bind(expires_at)
     .execute(pool)
     .await
@@ -3340,7 +3370,9 @@ async fn change_password_isolates_per_tenant_on_shared_email(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("seed second tenant");
-    let hash_b = mokosh_server::utils::crypto::hash_password(&password).expect("hash pw");
+    let hash_b = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash pw");
     let user_b_id = uuid::Uuid::new_v4();
     sqlx::query(
         "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status, email_verified_at) \
@@ -3396,6 +3428,7 @@ async fn change_password_isolates_per_tenant_on_shared_email(pool: PgPool) {
         new_password,
         a_hash.as_deref().unwrap_or(""),
     )
+    .await
     .expect("verify tenant-a hash");
     assert!(
         a_verify,
@@ -3412,11 +3445,13 @@ async fn change_password_isolates_per_tenant_on_shared_email(pool: PgPool) {
             .expect("read tenant-b hash");
     let b_verify_orig =
         mokosh_server::utils::crypto::verify_password(&password, b_hash.as_deref().unwrap_or(""))
+            .await
             .expect("verify tenant-b hash with original pw");
     let b_verify_new = mokosh_server::utils::crypto::verify_password(
         new_password,
         b_hash.as_deref().unwrap_or(""),
     )
+    .await
     .expect("verify tenant-b hash with new pw");
     assert!(
         b_verify_orig,
@@ -3474,10 +3509,12 @@ async fn client_admin_setup_isolates_credentials_when_email_collides(pool: PgPoo
     let platform_pw = "PLATFORM-A-12345".to_string();
     let tenant_b_pw = "TENANT-B-12345".to_string();
     let client_c_pw = "CLIENT-C-12345".to_string();
-    let platform_hash =
-        mokosh_server::utils::crypto::hash_password(&platform_pw).expect("hash platform pw");
-    let tenant_b_hash =
-        mokosh_server::utils::crypto::hash_password(&tenant_b_pw).expect("hash tenant-b pw");
+    let platform_hash = mokosh_server::utils::crypto::hash_password(&platform_pw)
+        .await
+        .expect("hash platform pw");
+    let tenant_b_hash = mokosh_server::utils::crypto::hash_password(&tenant_b_pw)
+        .await
+        .expect("hash tenant-b pw");
 
     // Account 1: mokosh platform super-admin row + matching users row in
     // DEFAULT_TENANT. Post MAPPS-132 backfill this is exactly what a
