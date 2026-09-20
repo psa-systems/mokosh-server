@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post, put},
-    Json, Router,
+    Router,
 };
 use chrono::NaiveDate;
 use uuid::Uuid;

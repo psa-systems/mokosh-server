@@ -14,10 +14,11 @@
 //! (see `crate::modules::contacts::routes`); it delegates into the
 //! same `PortalRoleService` methods.
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, State},
     routing::{delete, get, post, put},
-    Json, Router,
+    Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;

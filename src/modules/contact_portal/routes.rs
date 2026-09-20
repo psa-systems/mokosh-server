@@ -8,12 +8,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::utils::json::Json;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use axum::{Json, Router};
+use axum::Router;
 use validator::Validate;
 
 use super::middleware::{portal_contact_middleware, ContactAuthMiddleware, RequireContactAuth};
