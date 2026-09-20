@@ -1,11 +1,12 @@
 //! Tenant API routes (Super Admin only)
 
+use crate::utils::json::Json;
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
+    Router,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -59,10 +60,40 @@ where
     }
 }
 
+/// PMS-1280: the deployment's operator, for configuration that belongs to the
+/// whole deployment rather than to one organisation (the SMTP relay, the
+/// product name, the Google OAuth client). A platform-admin bearer, or an
+/// admin of the system tenant (the deployment's own organisation, where that
+/// configuration is stored). `RequireAdmin` is satisfied by an admin of ANY
+/// organisation, which on a multi-tenant deployment let a customer read and
+/// replace settings every other organisation depends on.
+pub struct DeploymentOperator;
+
+/// The tenant deployment-wide configuration is stored on (the email settings'
+/// `system_tenant`, `OIDC_DEFAULT_TENANT_ID`).
+pub const SYSTEM_TENANT_ID: Uuid = Uuid::from_u128(1);
+
+impl<S> axum::extract::FromRequestParts<S> for DeploymentOperator
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        TenantOrPlatformCaller::from_request_parts(parts, state)
+            .await?
+            .require_admin_write_access(SYSTEM_TENANT_ID)?;
+        Ok(DeploymentOperator)
+    }
+}
+
 impl TenantOrPlatformCaller {
     /// Read-side gate: platform admin can read any tenant; a tenant
     /// caller can read only their own.
-    fn require_read_access(&self, tenant_id: Uuid) -> AppResult<()> {
+    pub(crate) fn require_read_access(&self, tenant_id: Uuid) -> AppResult<()> {
         match self {
             TenantOrPlatformCaller::Platform => Ok(()),
             TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id => Ok(()),
@@ -74,7 +105,7 @@ impl TenantOrPlatformCaller {
 
     /// Write-side gate: platform admin can write any tenant; a tenant
     /// caller must be the admin of their own tenant.
-    fn require_admin_write_access(&self, tenant_id: Uuid) -> AppResult<()> {
+    pub(crate) fn require_admin_write_access(&self, tenant_id: Uuid) -> AppResult<()> {
         match self {
             TenantOrPlatformCaller::Platform => Ok(()),
             TenantOrPlatformCaller::Tenant(u) if u.tenant_id == tenant_id && u.role.is_admin() => {

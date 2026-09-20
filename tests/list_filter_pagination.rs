@@ -9,11 +9,11 @@
 //! remaining `count_query` / where-placeholder family members the
 //! original PR never audited:
 //!
-//!   * `time_tracking::list_time_entries`  (service.rs:228)
-//!   * `time_tracking::list_timesheets`    (service.rs:467)
-//!   * `calendar::list_appointments`       (service.rs:164)
-//!   * `knowledge_base::list_articles`     (service.rs:205)
-//!   * `contracts::list_contracts`         (service.rs:48)
+//!   * `time_tracking::service::TimeTrackingService::list_time_entries`
+//!   * `time_tracking::service::TimeTrackingService::list_timesheets`
+//!   * `calendar::service::CalendarService::list_appointments`
+//!   * `knowledge_base::service::KbService::list_articles`
+//!   * `contracts::service::ContractsService::list_contracts`
 //!
 //! Each test drives the service directly (no HTTP layer needed - the bug
 //! lives at the query layer, before any row mapping) against a per-test

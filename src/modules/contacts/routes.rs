@@ -1,12 +1,13 @@
 //! Contact API routes
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, Query, Request, State},
     middleware,
     middleware::Next,
     response::Response,
     routing::{delete, get, post, put},
-    Json, Router,
+    Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;

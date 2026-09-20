@@ -20,8 +20,8 @@ delete a value that is not safely somewhere else.
 
 Mokosh had the same exposure. `src/secrets/` and `src/storage/` were the right shape already, but configuration,
 application secrets, authentication and email each reached their dependencies a different way, and every
-environment read went around whatever seam existed. Phase 3 closed the configuration half of that; application
-secrets, authentication and email are still open.
+environment read went around whatever seam existed. Phase 3 below covers the configuration half of that; phases 5
+and 9 cover application secrets, authentication and email.
 
 ### Sequencing
 

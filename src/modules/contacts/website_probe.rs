@@ -298,9 +298,16 @@ fn www_change(requested: &str, final_host: &str) -> WwwChange {
 // ============================================================================
 
 /// Run both scheme attempts against `target` and classify the pair.
+///
+/// PMS-1246: the two attempts are independent (different schemes, different
+/// connections) and were awaited one after the other, doubling the wall-clock
+/// cost of a probe that ends up reachable on both. `tokio::join!` runs them
+/// concurrently instead.
 pub async fn probe<F: WebsiteFetcher + ?Sized>(fetcher: &F, target: &ProbeTarget) -> WebsiteProbe {
-    let https = timed_attempt(fetcher, &target.host, "https").await;
-    let http = timed_attempt(fetcher, &target.host, "http").await;
+    let (https, http) = tokio::join!(
+        timed_attempt(fetcher, &target.host, "https"),
+        timed_attempt(fetcher, &target.host, "http"),
+    );
     classify(&target.input, &target.host, &https, &http)
 }
 
@@ -545,14 +552,28 @@ impl WebsiteProbeService {
     /// Probe `input`, serving a cached result for the same host when one is
     /// still fresh. The cache is keyed on the host, so the echoed `input` is
     /// re-stamped from this call rather than served from the earlier one.
+    ///
+    /// PMS-1246: `get_with` single-flights concurrent misses for the same key,
+    /// so two callers racing an uncached host share the one probe underneath
+    /// rather than each firing their own pair of requests.
     pub async fn probe_input(&self, input: &str) -> Result<WebsiteProbe, AppError> {
         let target = parse_target(input)?;
-        if let Some(mut cached) = self.cache.get(&target.host).await {
-            cached.input = target.input.clone();
-            return Ok(cached);
-        }
-        let result = probe(self.fetcher.as_ref(), &target).await;
-        self.cache.insert(target.host.clone(), result.clone()).await;
+        let host = target.host.clone();
+        let fetcher = self.fetcher.clone();
+        let mut result = self
+            .cache
+            .get_with(host.clone(), async move {
+                probe(
+                    fetcher.as_ref(),
+                    &ProbeTarget {
+                        input: host.clone(),
+                        host,
+                    },
+                )
+                .await
+            })
+            .await;
+        result.input = target.input;
         Ok(result)
     }
 }
@@ -802,6 +823,9 @@ mod tests {
         addresses: HashMap<String, Result<Vec<IpAddr>, String>>,
         responses: HashMap<String, Result<HopResponse, FetchError>>,
         requested: Mutex<Vec<String>>,
+        /// Held before every response, so a test can force two concurrent
+        /// callers to overlap instead of racing to completion.
+        delay: Option<Duration>,
     }
 
     impl FakeFetcher {
@@ -810,7 +834,13 @@ mod tests {
                 addresses: HashMap::new(),
                 responses: HashMap::new(),
                 requested: Mutex::new(Vec::new()),
+                delay: None,
             }
+        }
+
+        fn delayed(mut self, delay: Duration) -> Self {
+            self.delay = Some(delay);
+            self
         }
 
         fn resolving(mut self, host: &str, ip: &str) -> Self {
@@ -859,6 +889,9 @@ mod tests {
                 .lock()
                 .expect("lock is not poisoned")
                 .push(url.to_string());
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
             self.responses
                 .get(url.as_str())
                 .cloned()
@@ -1031,5 +1064,36 @@ mod tests {
         assert_eq!(fetcher.requested().len(), count, "second probe hit the net");
         assert_eq!(first.canonical_url, second.canonical_url);
         assert_eq!(second.input, "EXAMPLE.com", "echoed input came from cache");
+    }
+
+    /// PMS-1246: two callers racing an uncached host must share one probe.
+    /// The fetcher delays every response, so both `probe_input` calls are
+    /// guaranteed to be in flight before either completes; if `probe_input`
+    /// deduplicated by key it would issue exactly one https and one http
+    /// request in total rather than one pair per caller.
+    #[tokio::test]
+    async fn service_single_flights_concurrent_probes_of_the_same_host() {
+        let fetcher = Arc::new(
+            FakeFetcher::new()
+                .delayed(Duration::from_millis(50))
+                .resolving("example.com", "93.184.216.34")
+                .answering("https://example.com/", 200, None)
+                .answering("http://example.com/", 200, None),
+        );
+        let service = WebsiteProbeService::new(fetcher.clone());
+
+        let (first, second) = tokio::join!(
+            service.probe_input("example.com"),
+            service.probe_input("example.com"),
+        );
+
+        assert!(first.expect("probes").reachable);
+        assert!(second.expect("probes").reachable);
+        assert_eq!(
+            fetcher.requested().len(),
+            2,
+            "one https and one http request total, not one pair per caller: {:?}",
+            fetcher.requested()
+        );
     }
 }
