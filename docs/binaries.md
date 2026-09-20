@@ -26,4 +26,4 @@ The crate builds two binaries, and one of them doubles as an operator CLI.
 
 Both seeds are fail-closed and write nothing unless the target tenant is explicitly marked: `settings.is_qa` for `qa-*`, `settings.is_showcase` for `showcase-*`. That is what keeps them off a production tenant. Each needs a privileged `DATABASE_URL`.
 
-`mokosh-bootstrap` dispatches its own overlapping set (`bootstrap-infisical`, `qa-seed`, `qa-teardown`, plus `normalize-company-industries`); it has no `showcase-*` subcommands. Run `mokosh-bootstrap` with no arguments for its help text.
+`mokosh-bootstrap` dispatches its own overlapping set (`bootstrap-infisical`, `qa-seed`, `qa-teardown`, plus `dev-seed-portal` and `normalize-company-industries`); it has no `showcase-*` subcommands. Run `mokosh-bootstrap` with no arguments for its help text.

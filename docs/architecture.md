@@ -77,7 +77,7 @@ src/
   pdf/             Document model, and the one place it becomes PDF bytes.
   scheduler/       Registry for the interval background jobs.
   secrets/         Secret backend selection (database or Infisical) behind one store trait.
-  storage/         Upload root and file storage, the single reader of ATTACHMENT_DIR.
+  storage/         Upload root and file storage, the provider of record for ATTACHMENT_DIR; branding/ also reads it through the config seam for local-path assets.
   utils/           Shared helpers (errors, email, crypto, validation, pagination).
   version.rs       VersionInfo (build-time git hash/describe via build.rs).
   version_check.rs Opt-in self-hosted update check against MOKOSH_UPDATE_CHECK_URL.
