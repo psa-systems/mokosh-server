@@ -46,6 +46,18 @@ async fn list(app: &common::TestApp, access: &str) -> Vec<serde_json::Value> {
         .expect("sessions JSON")
 }
 
+/// The status of a plain authenticated read, for the cases that assert
+/// on the refusal rather than on the body (`list` asserts 200 itself).
+async fn sessions_status(app: &common::TestApp, access: &str) -> reqwest::StatusCode {
+    app.client
+        .get(app.url("/api/v1/contact/auth/me/sessions"))
+        .bearer_auth(access)
+        .send()
+        .await
+        .expect("list sessions")
+        .status()
+}
+
 async fn revoke(app: &common::TestApp, access: &str, id: &str) -> reqwest::Response {
     app.client
         .delete(app.url(&format!("/api/v1/contact/auth/me/sessions/{id}")))
@@ -209,6 +221,50 @@ async fn another_contacts_session_cannot_be_revoked(pool: PgPool) {
         1,
         "Bob still lists his session"
     );
+}
+
+// PMS-1259: rotation supersedes a session, it does not revoke it.
+// `refresh` stamps `revoked_at` on the row it was handed before
+// minting the successor, so a middleware that reads that one row
+// killed the still-unexpired access token the SPA had already sent
+// with other requests. The check is asked of the rotation family
+// instead: the pre-refresh token keeps serving while the family holds
+// a live row, and dies the moment the family is actually revoked.
+#[sqlx::test]
+async fn rotation_keeps_the_previous_access_token_alive(pool: PgPool) {
+    let contact = seed_portal_contact(&pool, "user@example.com").await;
+    let app = common::boot(pool).await;
+    let (access, refresh_token) = login(&app, &contact).await;
+
+    let rotated = refresh(&app, &refresh_token).await;
+    assert!(rotated.status().is_success(), "rotation succeeds");
+    let rotated: serde_json::Value = rotated.json().await.unwrap();
+    let access_after = rotated["access_token"].as_str().unwrap().to_string();
+    let refresh_after = rotated["refresh_token"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        sessions_status(&app, &access).await,
+        reqwest::StatusCode::OK,
+        "the pre-refresh access token still serves its own TTL out"
+    );
+
+    // Signing out revokes the whole family (PMS-1062), which is the
+    // revocation PMS-1224 exists to enforce: both tokens go.
+    let out = app
+        .client
+        .post(app.url("/api/v1/contact/auth/logout"))
+        .json(&serde_json::json!({ "refresh_token": refresh_after }))
+        .send()
+        .await
+        .expect("logout");
+    assert_eq!(out.status(), reqwest::StatusCode::NO_CONTENT);
+    for (label, token) in [("pre-refresh", &access), ("post-refresh", &access_after)] {
+        assert_eq!(
+            sessions_status(&app, token).await,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{label} token is refused once the family is revoked"
+        );
+    }
 }
 
 // Both routes need a session.
