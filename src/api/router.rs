@@ -385,7 +385,10 @@ pub fn create_api_router(
         // endpoints) can resolve it.
         .nest(
             "/platform",
-            platform_routes(PlatformAdminService::new(db.clone(), jwt_secret.clone())),
+            platform_routes(
+                PlatformAdminService::new(db.clone(), jwt_secret.clone())
+                    .with_encryption_key(encryption_key),
+            ),
         )
         // Tenant management. Only mounted in multi-tenant builds: in a
         // single-tenant deployment there is exactly one tenant and the
@@ -851,6 +854,13 @@ pub fn create_api_router(
             )
             .with_abuse_contact(abuse_contact_email)
             .with_public_api_base(public_api_base_url),
+        ))
+        // PMS-1299 (F7b): per-IP budget over the whole unauthenticated nest.
+        .layer(middleware::from_fn_with_state(
+            crate::modules::auth::rate_limit::PublicIpLimiter::new(
+                crate::modules::auth::rate_limit::PUBLIC_API_PER_MIN,
+            ),
+            crate::modules::auth::rate_limit::public_ip_limit,
         ))
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
