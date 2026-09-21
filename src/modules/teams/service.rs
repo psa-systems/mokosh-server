@@ -173,7 +173,7 @@ impl TeamsService {
         if let Some(color) = request.color.as_deref() {
             validate_hex_color(color)?;
         }
-        if let Some(mgr_id) = request.manager_id {
+        if let Some(Some(mgr_id)) = request.manager_id {
             self.assert_user_in_tenant(*tenant_id, mgr_id, "manager_id")
                 .await?;
         }

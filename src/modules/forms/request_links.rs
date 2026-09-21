@@ -400,11 +400,17 @@ impl FormsService {
     /// Redeem a resolved link: validate the payload against the definition,
     /// store the submission, create the ticket, and mark the link used.
     ///
-    /// Ordering matters. The submission and the ticket are created first and
-    /// the token is marked used LAST, inside the same transaction, so a
-    /// failure anywhere rolls the whole thing back and the client can retry
-    /// with the link still live. Marking the token first would burn a
-    /// single-use link on a request that never produced a ticket.
+    /// Ordering matters, and this is THREE transactions, not one
+    /// (PMS-1238): the submission commits, then `TicketService::create_ticket`
+    /// commits the ticket in its own transaction, then the ticket link and the
+    /// token burn commit together. The ticket service owns its transaction, so
+    /// they cannot be merged without reworking it. The token is marked used
+    /// LAST so a failure before that leaves the link live and the client can
+    /// retry; marking it first would burn a single-use link on a request that
+    /// never produced a ticket. The cost of the split is that a failure after
+    /// the first commit leaves an orphan `form_submissions` row, and one after
+    /// the ticket commit leaves a ticket whose retry files a second one; both
+    /// are visible to the MSP and neither loses a customer's request.
     pub async fn submit_via_request_link(
         &self,
         resolved: &ResolvedRequestToken,

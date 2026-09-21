@@ -41,8 +41,8 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use super::provider::{
-    ContactSyncProvider, SourceChanges, SourceContact, SourceError, SourceGroup, SourcePhone,
-    SourceResult,
+    ContactSyncProvider, SourceChanges, SourceContact, SourceEmail, SourceError, SourceGroup,
+    SourcePhone, SourceResult,
 };
 
 /// The People API origin. Fixed rather than configured, and not screened by
@@ -374,6 +374,11 @@ struct Name {
 #[serde(rename_all = "camelCase")]
 struct EmailAddress {
     value: Option<String>,
+    /// `home`, `work`, `other` or the user's own label. Inside the
+    /// `emailAddresses` field already requested, so reading it does not
+    /// change the mask.
+    #[serde(rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     metadata: FieldMetadata,
 }
@@ -492,7 +497,12 @@ impl Person {
             family_name,
             emails: primary_first(self.email_addresses, |e| e.metadata.primary)
                 .into_iter()
-                .filter_map(|e| non_empty(e.value))
+                .filter_map(|e| {
+                    Some(SourceEmail {
+                        address: non_empty(e.value)?,
+                        label: non_empty(e.kind).map(|k| k.to_lowercase()),
+                    })
+                })
                 .collect(),
             phones: self
                 .phone_numbers
@@ -514,7 +524,9 @@ impl Person {
                 .into_iter()
                 .filter_map(|m| m.contact_group_membership?.contact_group_resource_name)
                 .collect(),
-            photo_url: None,
+            note: None,
+            photo: None,
+            dropped_properties: vec![],
             deleted: self.metadata.deleted,
         }
     }
@@ -596,8 +608,8 @@ mod tests {
             {"displayName": "Ada Lovelace", "givenName": "Ada", "familyName": "Lovelace", "metadata": {"primary": true}}
         ],
         "emailAddresses": [
-            {"value": "ada@home.example"},
-            {"value": "ada@work.example", "metadata": {"primary": true}}
+            {"value": "ada@home.example", "type": "Home"},
+            {"value": "ada@work.example", "type": "Billing desk", "metadata": {"primary": true}}
         ],
         "phoneNumbers": [{"value": "(415) 555-1234", "canonicalForm": "+14155551234", "type": "workFax"}],
         "organizations": [{"name": "Acme Ltd", "title": "Analyst", "department": "Engines", "metadata": {"primary": true}}],
@@ -649,7 +661,11 @@ mod tests {
         assert_eq!(contact.external_id, "people/c1");
         assert_eq!(contact.given_name.as_deref(), Some("Ada"));
         assert_eq!(contact.display_name.as_deref(), Some("Ada Lovelace"));
-        assert_eq!(contact.emails, vec!["ada@work.example", "ada@home.example"]);
+        let addresses: Vec<&str> = contact.emails.iter().map(|e| e.address.as_str()).collect();
+        assert_eq!(addresses, vec!["ada@work.example", "ada@home.example"]);
+        // PMS-1288: a user's own label rides along, lowercased like a phone's.
+        assert_eq!(contact.emails[0].label.as_deref(), Some("billing desk"));
+        assert_eq!(contact.emails[1].label.as_deref(), Some("home"));
         assert_eq!(contact.phones[0].canonical.as_deref(), Some("+14155551234"));
         assert_eq!(contact.phones[0].label.as_deref(), Some("workfax"));
         assert_eq!(contact.organization.as_deref(), Some("Acme Ltd"));

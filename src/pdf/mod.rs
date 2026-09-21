@@ -1354,7 +1354,14 @@ impl Layout {
         for (label, value) in pairs {
             self.keep_together(row);
             self.text_at(MARGIN_MM, label, Weight::Regular, body);
-            self.text_at(MARGIN_MM + LABEL_WIDTH_MM, value, Weight::Bold, body);
+            // PMS-1238: a long value (a credit-note reason) is cut with an
+            // ellipsis at the right margin rather than printed off the page.
+            let value = truncate_to(
+                value,
+                PAGE_WIDTH_MM - 2.0 * MARGIN_MM - LABEL_WIDTH_MM,
+                body,
+            );
+            self.text_at(MARGIN_MM + LABEL_WIDTH_MM, &value, Weight::Bold, body);
             self.advance(row);
         }
     }
@@ -1525,16 +1532,19 @@ fn column_widths(
     let flexible_count = wanted.iter().filter(|w| !narrow(w)).count() as f32;
     let room = available - fixed;
     if flexible_count > 0.0 && room >= MIN_COLUMN_MM * flexible_count {
-        return wanted
-            .iter()
-            .map(|w| {
-                if narrow(w) {
-                    w.max(MIN_COLUMN_MM)
-                } else {
-                    (w * room / flexible).max(MIN_COLUMN_MM)
-                }
-            })
-            .collect();
+        return fit_to(
+            wanted
+                .iter()
+                .map(|w| {
+                    if narrow(w) {
+                        w.max(MIN_COLUMN_MM)
+                    } else {
+                        (w * room / flexible).max(MIN_COLUMN_MM)
+                    }
+                })
+                .collect(),
+            available,
+        );
     }
     // Every column is wide, or the narrow ones alone overflow the page: scale
     // down, then lift anything under the floor and take the difference back
@@ -1552,6 +1562,20 @@ fn column_widths(
                 let room = (*w - MIN_COLUMN_MM).max(0.0);
                 *w -= over * (room / slack);
             }
+        }
+    }
+    fit_to(widths, available)
+}
+
+/// PMS-1238: last resort once the column floor has been applied. When every
+/// column is already at its floor there is no slack to take back, so the
+/// widths are scaled down uniformly rather than overflowing the margin.
+fn fit_to(mut widths: Vec<f32>, available: f32) -> Vec<f32> {
+    let sum: f32 = widths.iter().sum();
+    if sum > available + 0.001 && sum > 0.0 {
+        let scale = available / sum;
+        for w in widths.iter_mut() {
+            *w *= scale;
         }
     }
     widths

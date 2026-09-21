@@ -269,9 +269,10 @@ impl KbAttachmentService {
             return Err(AppError::NotFound("Attachment".to_string()));
         }
         tx.commit().await?;
-        // Best effort: a file with no row is unreachable, so a failed unlink
-        // must not fail the request that already removed the reference.
-        let _ = self
+        // PMS-1238: a failed unlink is reported rather than swallowed; the
+        // legacy key and the ledger row are still cleared first so a retry
+        // has nothing else left to do.
+        let unlinked = self
             .store
             .delete(&ObjectKey::kb_attachment(tenant_id.get(), attachment_id))
             .await;
@@ -286,7 +287,7 @@ impl KbAttachmentService {
             ))
             .await;
         let _ = self.ledger.forget(tenant_id.get(), attachment_id).await;
-        Ok(())
+        unlinked
     }
 
     /// Metadata for an id, for the PUBLIC read path: enough to answer a

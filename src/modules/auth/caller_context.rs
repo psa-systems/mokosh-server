@@ -160,7 +160,7 @@ impl CallerContext {
             Self::Staff(_) => return Ok(()),
             Self::Contact(session) => session,
         };
-        let caps = load_contact_capabilities(db, session.tenant_id, session.id).await?;
+        let caps = session_capabilities(session, db).await?;
         if caps.iter().any(|c| c == cap) {
             Ok(())
         } else {
@@ -178,9 +178,27 @@ impl CallerContext {
             Self::Staff(_) => return Ok(true),
             Self::Contact(session) => session,
         };
-        let caps = load_contact_capabilities(db, session.tenant_id, session.id).await?;
+        let caps = session_capabilities(session, db).await?;
         Ok(caps.iter().any(|c| c == cap))
     }
+}
+
+/// PMS-1247: how many times `load_contact_capabilities` has hit the database
+/// in this process. A test reads the delta around one request to prove the
+/// per-request cache holds.
+pub static CAPABILITY_LOADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The session's capability set, loaded on the first check of a request and
+/// reused for every later one.
+async fn session_capabilities<'a>(
+    session: &'a ContactSession,
+    db: &Database,
+) -> AppResult<&'a Vec<String>> {
+    session
+        .role_cache
+        .get_or_try_init(|| load_contact_capabilities(db, session.tenant_id, session.id))
+        .await
 }
 
 /// mokosh-contact-login prompt 008: reload the effective capability set
@@ -197,6 +215,7 @@ pub async fn load_contact_capabilities(
     tenant_id: Uuid,
     contact_id: Uuid,
 ) -> AppResult<Vec<String>> {
+    CAPABILITY_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rows: Vec<(String,)> = sqlx::query_as(
         r#"
         SELECT DISTINCT cap

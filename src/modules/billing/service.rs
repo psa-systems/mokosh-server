@@ -1347,27 +1347,28 @@ impl BillingService {
         // 5. One line per time entry, carrying `time_entry_ids` so the
         //    line traces back to its source. `sort_order` follows the
         //    select order.
-        for (idx, (entry_id, description, quantity, unit_price, line_total, ticket_id)) in
-            lines.iter().enumerate()
-        {
+        if !lines.is_empty() {
             sqlx::query(
                 r#"
                 INSERT INTO invoice_lines (
                     id, invoice_id, line_type, description, quantity, unit_price,
                     total, time_entry_ids, ticket_id, sort_order
                 )
-                VALUES ($1, $2, 'time_entry', $3, $4, $5, $6, ARRAY[$7]::uuid[], $8, $9)
+                SELECT gen_random_uuid(), $1, 'time_entry', t.description, t.quantity,
+                       t.unit_price, t.total, ARRAY[t.entry_id]::uuid[], t.ticket_id, t.sort_order
+                FROM UNNEST($2::uuid[], $3::text[], $4::numeric[], $5::numeric[], $6::numeric[],
+                            $7::uuid[], $8::int[])
+                     AS t(entry_id, description, quantity, unit_price, total, ticket_id, sort_order)
                 "#,
             )
-            .bind(Uuid::new_v4())
             .bind(invoice_id)
-            .bind(description)
-            .bind(quantity)
-            .bind(unit_price)
-            .bind(line_total)
-            .bind(entry_id)
-            .bind(ticket_id)
-            .bind(idx as i32)
+            .bind(lines.iter().map(|l| l.0).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.1.clone()).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.2).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.3).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.4).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.5).collect::<Vec<_>>())
+            .bind((0..lines.len() as i32).collect::<Vec<_>>())
             .execute(&mut *tx)
             .await?;
         }
@@ -1376,27 +1377,35 @@ impl BillingService {
         //     continues after the time-entry lines. Mileage lines do not set
         //     `time_entry_ids` (that column references time_entries only); the
         //     source is traced back via the matched mileage rows below.
-        let time_line_count = lines.len();
-        for (offset, (_mileage_id, description, quantity, unit_price, line_total, ticket_id)) in
-            mileage_lines.iter().enumerate()
-        {
+        let time_line_count = lines.len() as i32;
+        if !mileage_lines.is_empty() {
             sqlx::query(
                 r#"
                 INSERT INTO invoice_lines (
                     id, invoice_id, line_type, description, quantity, unit_price,
                     total, ticket_id, sort_order
                 )
-                VALUES ($1, $2, 'mileage', $3, $4, $5, $6, $7, $8)
+                SELECT gen_random_uuid(), $1, 'mileage', t.description, t.quantity,
+                       t.unit_price, t.total, t.ticket_id, t.sort_order
+                FROM UNNEST($2::text[], $3::numeric[], $4::numeric[], $5::numeric[],
+                            $6::uuid[], $7::int[])
+                     AS t(description, quantity, unit_price, total, ticket_id, sort_order)
                 "#,
             )
-            .bind(Uuid::new_v4())
             .bind(invoice_id)
-            .bind(description)
-            .bind(quantity)
-            .bind(unit_price)
-            .bind(line_total)
-            .bind(ticket_id)
-            .bind((time_line_count + offset) as i32)
+            .bind(
+                mileage_lines
+                    .iter()
+                    .map(|l| l.1.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .bind(mileage_lines.iter().map(|l| l.2).collect::<Vec<_>>())
+            .bind(mileage_lines.iter().map(|l| l.3).collect::<Vec<_>>())
+            .bind(mileage_lines.iter().map(|l| l.4).collect::<Vec<_>>())
+            .bind(mileage_lines.iter().map(|l| l.5).collect::<Vec<_>>())
+            .bind(
+                (time_line_count..time_line_count + mileage_lines.len() as i32).collect::<Vec<_>>(),
+            )
             .execute(&mut *tx)
             .await?;
         }
@@ -4206,6 +4215,19 @@ impl BillingService {
                     ctx,
                 )
                 .await?;
+                if let Some(user_id) = ctx.user_id {
+                    static INVOICE_MAIL_LIMITER: std::sync::LazyLock<
+                        std::sync::Arc<crate::modules::auth::rate_limit::UserMailLimiter>,
+                    > = std::sync::LazyLock::new(|| {
+                        crate::modules::auth::rate_limit::UserMailLimiter::new(
+                            crate::modules::auth::rate_limit::USER_MAIL_PER_HOUR,
+                        )
+                    });
+                    // PMS-1299 (F7c): per-user hourly budget on invoice mail.
+                    INVOICE_MAIL_LIMITER
+                        .check(user_id)
+                        .map_err(|retry_after| AppError::rate_limited(Some(retry_after)))?;
+                }
                 self.email_invoice(tenant_id, &document, address, &bytes)
                     .await?;
                 sqlx::query(

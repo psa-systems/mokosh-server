@@ -306,9 +306,10 @@ impl SavedReportsService {
         // PMS-690: the SELECT aliases are whitelist-derived column keys,
         // so re-key each row to the operator's display headers here. The
         // wire shape (rows keyed by header) is unchanged.
+        let aliases = dedupe_headers(compiled.aliases);
         let rows: Vec<serde_json::Value> = rows
             .into_iter()
-            .map(|r| relabel_row(r, &compiled.columns, &compiled.aliases))
+            .map(|r| relabel_row(r, &compiled.columns, &aliases))
             .collect();
 
         Ok(ExecuteReportResponse {
@@ -316,7 +317,7 @@ impl SavedReportsService {
             total,
             page,
             per_page: limit,
-            aliases: compiled.aliases,
+            aliases,
         })
     }
 }
@@ -329,6 +330,24 @@ impl SavedReportsService {
 /// asking them to page; anything larger should go through the
 /// scheduled-delivery path (PMS-478) which streams to S3 / email.
 const MAX_REPORT_ROWS_PER_PAGE: u32 = 10_000;
+
+/// PMS-1238: two columns may share a display header; the second would
+/// overwrite the first when rows are keyed by header, so repeats get a
+/// numeric suffix (`Name`, `Name (2)`).
+fn dedupe_headers(aliases: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        let mut candidate = alias.clone();
+        let mut n = 2;
+        while !seen.insert(candidate.clone()) {
+            candidate = format!("{alias} ({n})");
+            n += 1;
+        }
+        out.push(candidate);
+    }
+    out
+}
 
 /// Re-key one `row_to_json` object from the compiler's SQL output
 /// names to the display headers, keeping the declared column order.

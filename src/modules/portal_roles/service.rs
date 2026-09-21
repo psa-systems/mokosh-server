@@ -165,6 +165,11 @@ impl PortalRoleService {
                 "Role name must be between 1 and 64 characters".to_string(),
             ));
         }
+        if capabilities.is_empty() {
+            return Err(AppError::BadRequest(
+                "A role must carry at least one capability".to_string(),
+            ));
+        }
         if let Err(bad) = validate_capabilities(&capabilities) {
             return Err(AppError::BadRequest(format!("Unknown capability: {bad}")));
         }
@@ -284,6 +289,13 @@ impl PortalRoleService {
     ) -> AppResult<PortalRole> {
         let existing = self.get_role(tenant_id, role_id).await?;
 
+        // PMS-1238: runtime grant lookups and the migration backfills find a
+        // built-in role by its display name, so that name is not editable.
+        if existing.is_builtin && name.is_some() {
+            return Err(AppError::BadRequest(
+                "Cannot rename a built-in role".to_string(),
+            ));
+        }
         if let Some(ref new_name) = name {
             let trimmed = new_name.trim();
             if trimmed.is_empty() || trimmed.chars().count() > 64 {

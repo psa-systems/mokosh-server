@@ -80,9 +80,32 @@ def struct-bodies [source: string] {
 # keyed by field name. Attributes accumulate until a field line consumes them,
 # which is what makes a multi-attribute field (a `length` and a `custom` on the
 # same field) compare as the set it is.
-def field-validators [lines: list<string>] {
+def field-validators [raw_lines: list<string>] {
     mut pending = []
     mut fields = {}
+
+    # PMS-1238: rustfmt wraps a long `#[validate(...)]` across lines, which the
+    # one-line attribute match below cannot see. Rejoin a wrapped attribute into
+    # one line first, and normalise comma spacing so a wrapped attribute compares
+    # equal to the same attribute written on one line.
+    mut lines = []
+    mut buffer = ''
+    for raw in $raw_lines {
+        let piece = ($raw | str trim)
+        if $buffer != '' {
+            $buffer = $"($buffer) ($piece)"
+        } else if ($piece | str starts-with '#[validate(') and not ($piece | str ends-with ')]') {
+            $buffer = $piece
+        } else {
+            $lines = ($lines | append $raw)
+            continue
+        }
+        if ($buffer | str ends-with ')]') {
+            let joined = ($buffer | str replace --all --regex '\s*,\s*\)' ')' | str replace --all --regex '\(\s+' '(' | str replace --all --regex '\s+\)' ')' | str replace --all --regex ',\s*' ', ')
+            $lines = ($lines | append $joined)
+            $buffer = ''
+        }
+    }
 
     for line in $lines {
         let trimmed = ($line | str trim)

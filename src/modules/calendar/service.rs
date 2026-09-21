@@ -1041,6 +1041,8 @@ impl CalendarService {
         request: &UpsertOnCallScheduleRequest,
         ctx: &AuditCtx,
     ) -> AppResult<OnCallScheduleResponse> {
+        self.validate_fks(tenant_id, &[("teams", request.team_id)])
+            .await?;
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
@@ -1093,6 +1095,8 @@ impl CalendarService {
         id: Uuid,
         request: &UpsertOnCallScheduleRequest,
     ) -> AppResult<OnCallScheduleResponse> {
+        self.validate_fks(tenant_id, &[("teams", request.team_id)])
+            .await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let n = sqlx::query(
             r#"UPDATE on_call_schedules SET
