@@ -199,9 +199,7 @@ async fn issue_request_link(
     body.validate()?;
     s.mail_limiter
         .check(u.id)
-        .map_err(|retry_after| AppError::RateLimited {
-            retry_after_seconds: Some(retry_after),
-        })?;
+        .map_err(|retry_after| AppError::rate_limited(Some(retry_after)))?;
     Ok(Json(
         s.service
             .issue_request_link(u.tenant(), u.id, &body, &s.app_url)

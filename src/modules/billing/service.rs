@@ -4215,11 +4215,9 @@ impl BillingService {
                         )
                     });
                     // PMS-1299 (F7c): per-user hourly budget on invoice mail.
-                    INVOICE_MAIL_LIMITER.check(user_id).map_err(|retry_after| {
-                        AppError::RateLimited {
-                            retry_after_seconds: Some(retry_after),
-                        }
-                    })?;
+                    INVOICE_MAIL_LIMITER
+                        .check(user_id)
+                        .map_err(|retry_after| AppError::rate_limited(Some(retry_after)))?;
                 }
                 self.email_invoice(tenant_id, &document, address, &bytes)
                     .await?;
