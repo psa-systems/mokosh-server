@@ -402,6 +402,16 @@ impl TimeTrackingService {
             Some(value) => value,
         };
 
+        // PMS-1238: `date` is the person's local day, which is never more than
+        // one calendar day from the UTC day of the instant the segment
+        // started (zones run from -12 to +14), so a date further out cannot
+        // be the day this interval belongs to.
+        if (date - started_at.date_naive()).num_days().abs() > 1 {
+            return Err(AppError::BadRequest(
+                "A segment's date must be the day it starts on".to_string(),
+            ));
+        }
+
         if let Some(end) = ended_at {
             if end < started_at {
                 return Err(AppError::BadRequest(

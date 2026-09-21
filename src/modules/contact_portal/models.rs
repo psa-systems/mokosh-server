@@ -464,9 +464,10 @@ pub struct PortalAccessRequestResponse {
 /// to know that `invoices:pay` and `invoices:download_pdf` are separate
 /// capability strings, and the column must never hold free text an MSP has to
 /// interpret.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PortalAccessRequest {
     pub area: String,
     #[serde(default)]
+    #[validate(length(max = 2000))]
     pub note: Option<String>,
 }

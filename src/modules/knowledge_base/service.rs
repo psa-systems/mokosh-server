@@ -1091,6 +1091,15 @@ impl KbService {
         // PMS-1126: the row as it was is the only trace a hard delete
         // leaves (versions, drafts, attachments and votes cascade with it).
         let before = Self::article_snapshot(&mut tx, tenant_id, id).await?;
+        // PMS-1238: attachment rows cascade with the article; remove their
+        // blobs and ledger rows after the delete commits.
+        let attachment_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM kb_article_attachments WHERE tenant_id = $1 AND article_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
         let n = sqlx::query("DELETE FROM kb_articles WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(id)
@@ -1112,6 +1121,8 @@ impl KbService {
         )
         .await?;
         tx.commit().await?;
+        crate::storage::purge_attachment_blobs(&self.db, tenant_id.get(), &attachment_ids, true)
+            .await;
         Ok(())
     }
 
