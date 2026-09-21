@@ -93,7 +93,9 @@ fn person(external_id: &str, etag: &str, given: &str, family: &str) -> SourceCon
         title: None,
         department: None,
         group_ids: vec![CLIENTS.into()],
-        photo_url: None,
+        note: None,
+        photo: None,
+        dropped_properties: vec![],
         deleted: false,
     }
 }
