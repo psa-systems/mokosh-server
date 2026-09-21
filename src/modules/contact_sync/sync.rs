@@ -168,11 +168,35 @@ impl SyncReport {
 struct ConnectionRow {
     provider: String,
     sync_status: String,
+    /// What a link records as the source it came from. For a `vcard` run
+    /// (PMS-1290) this is overwritten with the uploaded file's name, which is
+    /// what "imported from" means for a file.
     account_email: String,
     is_active: bool,
     sync_token: Option<String>,
     selected_groups: serde_json::Value,
     disconnected_at: Option<DateTime<Utc>>,
+    /// The upload a `vcard` run or a review answer is importing. Never read
+    /// from the connection row; set from the run, or from a review snapshot.
+    #[sqlx(skip)]
+    import_file_id: Option<Uuid>,
+}
+
+impl ConnectionRow {
+    /// A review answer lands after its run is over, so the file it came from
+    /// rides in the snapshot the reviewer compared (see [`source_snapshot`]).
+    fn adopt_snapshot_source(&mut self, snapshot: &serde_json::Value) {
+        let file = snapshot
+            .get("import_file_id")
+            .and_then(|v| v.as_str())
+            .and_then(|v| Uuid::parse_str(v).ok());
+        if let Some(file) = file {
+            self.import_file_id = Some(file);
+            if let Some(label) = snapshot.get("source_label").and_then(|v| v.as_str()) {
+                self.account_email = label.to_string();
+            }
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -488,7 +512,7 @@ impl ContactSyncEngine {
         source: &dyn ContactSyncProvider,
         run_id: Option<Uuid>,
     ) -> AppResult<SyncReport> {
-        let connection = self.load_connection(tenant_id, connection_id).await?;
+        let mut connection = self.load_connection(tenant_id, connection_id).await?;
         if connection.provider != source.id() {
             return Err(AppError::Internal(format!(
                 "a {} provider was handed a {} connection",
@@ -509,8 +533,36 @@ impl ContactSyncEngine {
         // An empty selection is "not chosen yet", never "everything" (PSA-70 E).
         if selected.is_empty() {
             return Err(AppError::Conflict(
-                "Choose at least one Google label to import before syncing.".to_string(),
+                if source.lists_everything() {
+                    "Choose at least one Google label to import before syncing."
+                } else {
+                    "Choose at least one category to import before importing."
+                }
+                .to_string(),
             ));
+        }
+        // PMS-1290: a file run links its contacts to the file it imports.
+        if connection.provider == super::file_import::VCARD {
+            let file: Option<(Uuid, String)> = match run_id {
+                Some(run_id) => {
+                    let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+                    sqlx::query_as(
+                        "SELECT f.id, f.filename FROM contact_sync_runs r \
+                         JOIN contact_import_files f ON f.id = r.import_file_id \
+                         WHERE r.tenant_id = $1 AND r.id = $2",
+                    )
+                    .bind(tenant_id)
+                    .bind(run_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                }
+                None => None,
+            };
+            let (file_id, filename) = file.ok_or_else(|| {
+                AppError::Internal("a vCard run names no uploaded file".to_string())
+            })?;
+            connection.import_file_id = Some(file_id);
+            connection.account_email = filename;
         }
 
         self.set_status(tenant_id, connection_id, "in_progress", None)
@@ -541,7 +593,10 @@ impl ContactSyncEngine {
             labels.into_iter().map(|l| (l.id, l.name)).collect();
 
         let mut report = SyncReport {
-            full_read: connection.sync_token.is_none() || changes.was_full_resync,
+            // A source that is not the whole directory (an uploaded file) is
+            // never a full read, so nothing absent from it is flagged.
+            full_read: source.lists_everything()
+                && (connection.sync_token.is_none() || changes.was_full_resync),
             total: u32::try_from(changes.contacts.len()).unwrap_or(u32::MAX),
             ..SyncReport::default()
         };
@@ -659,9 +714,14 @@ impl ContactSyncEngine {
                 connection_id,
                 "failed",
                 Some(format!(
-                    "{} of {} contacts could not be imported. The next sync retries them.",
+                    "{} of {} contacts could not be imported. {}",
                     report.failed,
-                    changes.contacts.len()
+                    changes.contacts.len(),
+                    if source.lists_everything() {
+                        "The next sync retries them."
+                    } else {
+                        "Import the file again to retry them."
+                    }
                 )),
             )
             .await?;
@@ -684,7 +744,8 @@ impl ContactSyncEngine {
         contact_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
-        let connection = Self::connection_in(&mut *conn, tenant_id, connection_id).await?;
+        let mut connection = Self::connection_in(&mut *conn, tenant_id, connection_id).await?;
+        connection.adopt_snapshot_source(snapshot);
         let (record, mapped, labels) = from_snapshot(external_id, etag, snapshot);
         self.apply_fields(
             &mut *conn,
@@ -725,7 +786,8 @@ impl ContactSyncEngine {
         snapshot: &serde_json::Value,
         ctx: &AuditCtx,
     ) -> AppResult<Uuid> {
-        let connection = Self::connection_in(&mut *conn, tenant_id, connection_id).await?;
+        let mut connection = Self::connection_in(&mut *conn, tenant_id, connection_id).await?;
+        connection.adopt_snapshot_source(snapshot);
         let (record, mapped, labels) = from_snapshot(external_id, etag, snapshot);
         let suggestion = match mapped.company_name.as_deref().and_then(name_key) {
             Some(key) => {
@@ -1006,6 +1068,8 @@ impl ContactSyncEngine {
                 .group_ids
                 .iter()
                 .filter(|g| selected.contains(*g))
+                // "No category" selects records; it is not a label to store.
+                .filter(|g| g.as_str() != super::provider::UNGROUPED_ID)
                 .filter_map(|g| label_names.get(g).cloned())
                 .collect()
         };
@@ -1079,7 +1143,7 @@ impl ContactSyncEngine {
                 Ok(Outcome::Linked { contact_id, link })
             }
             Plan::Review(open) => {
-                let snapshot_json = source_snapshot(record, &mapped, &labels());
+                let snapshot_json = source_snapshot(record, &mapped, &labels(), connection);
                 let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 let mut inserted = 0;
                 for (candidate, reason) in open {
@@ -1255,8 +1319,8 @@ impl ContactSyncEngine {
         let link: LinkRow = sqlx::query_as(
             "INSERT INTO contact_sync_links \
              (tenant_id, connection_id, provider, source_account_email, external_id, etag, \
-              contact_id, last_synced_at, suggested_company_id, origin) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9) \
+              contact_id, last_synced_at, suggested_company_id, origin, import_file_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10) \
              RETURNING id, external_id, contact_id, etag, deleted_in_source_at",
         )
         .bind(tenant_id)
@@ -1268,6 +1332,7 @@ impl ContactSyncEngine {
         .bind(contact_id)
         .bind(suggested_company_id)
         .bind(origin.as_str())
+        .bind(connection.import_file_id)
         .fetch_one(&mut *conn)
         .await?;
         audit_write(
@@ -1724,8 +1789,9 @@ fn source_snapshot(
     record: &SourceContact,
     mapped: &MappedContact,
     labels: &[String],
+    connection: &ConnectionRow,
 ) -> serde_json::Value {
-    json!({
+    let mut snapshot = json!({
         "external_id": record.external_id,
         "display_name": record.display_name,
         "first_name": mapped.first_name,
@@ -1743,7 +1809,14 @@ fn source_snapshot(
         "notes": mapped.notes,
         "labels": labels,
         "dropped": mapped.dropped,
-    })
+    });
+    // PMS-1290: which upload proposed this record, so the reviewer can see it
+    // and the link an answer writes says where the contact came from.
+    if let (Some(file), Some(object)) = (connection.import_file_id, snapshot.as_object_mut()) {
+        object.insert("import_file_id".to_string(), json!(file));
+        object.insert("source_label".to_string(), json!(connection.account_email));
+    }
+    snapshot
 }
 
 #[cfg(test)]
