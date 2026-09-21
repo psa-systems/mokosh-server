@@ -71,3 +71,69 @@ test.describe('cross-tenant isolation', () => {
     expect([403, 404], `foreign company read -> ${res.status()}`).toContain(res.status());
   });
 });
+
+// MAPPS-915 / PMS-1290: the calls the vCard Import page makes, against the
+// deployed stack. Upload and preview only: the import itself writes contacts,
+// which the teardown sweep would have to learn, and its behaviour is pinned by
+// the server's Postgres suite (tests/contact_import_vcard.rs). The upload row
+// this leaves is discarded by the server a day later.
+test.describe('vCard file import', () => {
+  const card = (body: string) => `BEGIN:VCARD\r\nVERSION:3.0\r\n${body}END:VCARD\r\n`;
+
+  test('an uploaded .vcf previews without writing a contact', async ({ request }) => {
+    const suffix = runSuffix();
+    const category = `${suffix}-clients`;
+    const first = `${suffix}-ada@e2e.example`;
+    const second = `${suffix}-grace@e2e.example`;
+    const file = [
+      card(`FN:Ada ${suffix}\r\nEMAIL:${first}\r\nCATEGORIES:${category}\r\n`),
+      // A card with no END:VCARD: reported, and its neighbour still read.
+      `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Broken ${suffix}\r\n`,
+      card(`FN:Grace ${suffix}\r\nEMAIL:${second}\r\n`),
+    ].join('');
+
+    const upload = await request.post(routes.vcardUploads, {
+      multipart: {
+        file: { name: `${suffix}.vcf`, mimeType: 'text/vcard', buffer: Buffer.from(file) },
+      },
+    });
+    expect(upload.status(), `upload failed: ${await upload.text()}`).toBe(201);
+    const body = (await upload.json()) as {
+      file: { id: string; filename: string; contacts: number; failures: Array<{ card: number }> };
+      preview: { groups: Array<{ id: string }>; totals: { create: number } };
+    };
+    expect(body.file.filename).toBe(`${suffix}.vcf`);
+    expect(body.file.contacts).toBe(2);
+    expect(body.file.failures.map((f) => f.card)).toEqual([2]);
+    expect(body.preview.groups.map((g) => g.id).sort()).toEqual(
+      [category, 'mokosh:ungrouped'].sort(),
+    );
+    expect(body.preview.totals.create).toBe(2);
+
+    // Exact figures for one category, as the review step asks.
+    const preview = await request.post(routes.vcardPreview(body.file.id), {
+      data: { group_ids: [category] },
+    });
+    expect(preview.status(), `preview failed: ${await preview.text()}`).toBe(200);
+    const totals = ((await preview.json()) as { totals: { contacts: number; create: number } })
+      .totals;
+    expect(totals).toMatchObject({ contacts: 1, create: 1 });
+
+    // Nothing was written.
+    for (const email of [first, second]) {
+      const list = await request.get(`${routes.contacts}?q=${encodeURIComponent(email)}`);
+      expect(list.status()).toBe(200);
+      expect(((await list.json()) as { data: unknown[] }).data).toHaveLength(0);
+    }
+  });
+
+  test('a file that is not a vCard is refused with a reason', async ({ request }) => {
+    const upload = await request.post(routes.vcardUploads, {
+      multipart: {
+        file: { name: `${runSuffix()}.txt`, mimeType: 'text/plain', buffer: Buffer.from('just some text') },
+      },
+    });
+    expect(upload.status()).toBe(422);
+    expect(await upload.text()).toContain('BEGIN:VCARD');
+  });
+});

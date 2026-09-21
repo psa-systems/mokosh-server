@@ -23,6 +23,9 @@ export const routes = {
   company: (id: string) => `${API_V1}/contacts/companies/${id}`,
   contacts: `${API_V1}/contacts/contacts`,
   contact: (id: string) => `${API_V1}/contacts/contacts/${id}`,
+  // MAPPS-915 / PMS-1290: an uploaded .vcf file.
+  vcardUploads: `${API_V1}/integrations/contact-sync/vcard/uploads`,
+  vcardPreview: (id: string) => `${API_V1}/integrations/contact-sync/vcard/uploads/${id}/preview`,
   tenants: `${API_V1}/tenants`,
   tenant: (id: string) => `${API_V1}/tenants/${id}`,
   authMe: `${API_V1}/auth/me`,
