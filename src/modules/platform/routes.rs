@@ -10,27 +10,34 @@
 
 use crate::utils::json::Json;
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::HeaderMap,
+    response::{IntoResponse, Response},
     routing::{post, put},
     Router,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
 
 use super::models::{PlatformChangePasswordRequest, PlatformLoginRequest, PlatformLoginResponse};
 use super::service::PlatformAdminService;
-use crate::utils::error::{AppError, AppResult};
+use crate::modules::auth::rate_limit::AuthRateLimiter;
+use crate::utils::error::{rate_limited_response, AppError, AppResult};
 
 #[derive(Clone)]
 pub struct PlatformRouterState {
     pub platform_service: Arc<PlatformAdminService>,
+    /// PMS-1293: its own instance, so platform traffic never spends the staff
+    /// login budget. Same numbers as staff: 20/min per IP, 5/min per email.
+    pub login_limiter: Arc<AuthRateLimiter>,
 }
 
 pub fn platform_routes(platform_service: PlatformAdminService) -> Router {
     let state = PlatformRouterState {
         platform_service: Arc::new(platform_service),
+        login_limiter: AuthRateLimiter::new(20, 5),
     };
     Router::new()
         .route("/login", post(login))
@@ -40,14 +47,25 @@ pub fn platform_routes(platform_service: PlatformAdminService) -> Router {
 
 async fn login(
     State(state): State<PlatformRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<PlatformLoginRequest>,
-) -> AppResult<Json<PlatformLoginResponse>> {
+) -> Result<Response, AppError> {
     request.validate()?;
+    if let Err(retry_after) = state.login_limiter.check(addr.ip(), &request.email) {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many login attempts, please try again later",
+        ));
+    }
     let response = state
         .platform_service
-        .authenticate(&request.email, &request.password)
+        .authenticate(
+            &request.email,
+            &request.password,
+            request.mfa_code.as_deref(),
+        )
         .await?;
-    Ok(Json(response))
+    Ok(Json::<PlatformLoginResponse>(response).into_response())
 }
 
 async fn change_password(
