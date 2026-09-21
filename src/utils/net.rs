@@ -38,13 +38,22 @@ use crate::config::{self, registry as keys, ConfigKey};
 pub fn is_non_public_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_private()
                 || v4.is_loopback()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                // 100.64.0.0/10 (carrier-grade NAT), 192.0.0.0/24, 198.18.0.0/15.
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)
         }
         IpAddr::V6(v6) => {
+            // `::ffff:a.b.c.d` reaches the IPv4 peer, so it takes the IPv4 verdict.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_non_public_ip(&IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_unique_local()
@@ -288,6 +297,12 @@ mod tests {
             "::",
             "fd00::1",
             "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.5",
+            "::ffff:169.254.169.254",
+            "100.64.0.1",
+            "192.0.0.1",
+            "198.18.0.1",
         ];
         for ip in non_public {
             assert!(
@@ -296,7 +311,12 @@ mod tests {
             );
         }
 
-        let public = ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"];
+        let public = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ];
         for ip in public {
             assert!(
                 !is_non_public_ip(&ip.parse().unwrap()),
@@ -360,6 +380,15 @@ mod tests {
         assert_eq!(
             guard(&resolver, "http://hook.internal/t").await,
             Err(UrlGuardError::Blocked("127.0.0.1".parse().unwrap()))
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_refuses_an_ipv4_mapped_loopback_literal() {
+        let resolver = FakeResolver::answering(&["::ffff:127.0.0.1"]);
+        assert_eq!(
+            guard(&resolver, "http://[::ffff:127.0.0.1]/").await,
+            Err(UrlGuardError::Blocked("::ffff:127.0.0.1".parse().unwrap()))
         );
     }
 

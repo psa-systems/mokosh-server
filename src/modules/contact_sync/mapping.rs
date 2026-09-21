@@ -1,25 +1,39 @@
 //! PMS-1213 (PSA-70 F): a source contact, as Mokosh can hold it.
 //!
+//! This is the ONE canonical-to-Mokosh mapping (PMS-1288). It reads only the
+//! canonical [`SourceContact`]; which source fed a field, and under what name,
+//! is the table in `provider`.
+//!
 //! # The mapping table
 //!
-//! | Google People field | Mokosh field | Policy |
+//! | Canonical field (vCard) | Mokosh field | Policy |
 //! |---|---|---|
-//! | `names[].givenName` | `first_name` | Primary name. |
-//! | `names[].familyName` | `last_name` | Primary name. Empty for a single-name person. |
-//! | `names[].displayName` | `first_name` | Only when there is no given or family name: a single-name or display-only record keeps its whole name rather than being split by a guess. |
-//! | `emailAddresses[]` | `email` | **Primary email wins** (PSA-70, decided): the one Google marks primary, else the first. Every other address is DROPPED and counted in [`MappedContact::dropped`]. |
-//! | `phoneNumbers[]` | `contact_phones` | All kept, typed: `mobile`, `work`, `home`, `*Fax` to `fax`, anything else to `other`. Stored as Google's E.164 `canonicalForm` when present, else the formatting-stripped `value`; a number that is neither valid E.164 nor plain digits is DROPPED rather than failing the contact. |
-//! | `organizations[].name` | `company_name` | Free text only. NEVER a `companies` row (PSA-70 G); a matching company is a suggestion for a human. |
-//! | `organizations[].title` | `title` | |
-//! | `organizations[].department` | `department` | |
-//! | `memberships[]` | `tags` | The opt-in label filter (PSA-70 E): a record carrying no selected label is not imported. The names of the SELECTED labels it carries are added to `tags` by the sync; an unselected label is never stored. |
+//! | `given_name` (`N` given) | `first_name` | Primary name. |
+//! | `family_name` (`N` family) | `last_name` | Primary name. Empty for a single-name person. |
+//! | `display_name` (`FN`) | `first_name` | Only when there is no given or family name: a single-name or display-only record keeps its whole name rather than being split by a guess. |
+//! | `emails` (`EMAIL`) | `email` | **Primary email wins** (PSA-70, decided): the first, which each source orders primary first (Google's primary flag, vCard `PREF`). Every other address is DROPPED and counted in [`MappedContact::dropped`]. |
+//! | `phones` (`TEL`) | `contact_phones` | All kept, typed: `mobile`, `work`, `home`, `*Fax` to `fax`, anything else to `other`. Stored as the source's E.164 `canonical` when present, else the formatting-stripped number; a number that is neither valid E.164 nor plain digits is DROPPED rather than failing the contact. |
+//! | `organization` (`ORG`) | `company_name` | Free text only. NEVER a `companies` row (PSA-70 G); a matching company is a suggestion for a human. |
+//! | `title` (`TITLE`) | `title` | |
+//! | `department` (`ORG` second unit) | `department` | |
+//! | `group_ids` (`CATEGORIES`) | `tags` | The opt-in label filter (PSA-70 E): a record carrying no selected label is not imported. The names of the SELECTED labels it carries are added to `tags` by the sync; an unselected label is never stored. |
+//! | `note` (`NOTE`) | `notes` | Lockable like the rest. Line breaks kept. Google does not feed it (see `provider`). |
+//! | `photo` (`PHOTO`) | none | DROPPED and counted, and never fetched: a URI in an uploaded file can name any address (PMS-805). |
+//! | `dropped_properties` (`ADR`, `BDAY`, ...) | none | Counted, so the preview says what the record leaves behind. Contacts have no address table (PSA-70 audit). |
+//!
+//! Every text value passes [`sanitize_invisible`], the rule every JSON request
+//! body gets (PMS-924), because an imported file never passes through that
+//! middleware and a zero-width space in a name is the same silent-mismatch bug
+//! whichever way it arrived.
 //!
 //! # Dropped, explicitly
 //!
-//! [`DROPPED_FIELDS`] lists every People field with no Mokosh home. Photos are
-//! among them in v1: referencing Google's image URL would make every staff
-//! browser that opens a contact fetch from a third party, and fetching a copy
-//! is storage and a retention question the epic did not settle.
+//! [`DROPPED_FIELDS`] lists every Google People field with no Mokosh home,
+//! which Google's field mask therefore never requests. A vCard record says
+//! what it dropped itself, in `dropped_properties`. Photos are dropped from
+//! both in v1: referencing a third party's image URL would make every staff
+//! browser that opens a contact fetch from it, and fetching a copy is storage
+//! and a retention question the epic did not settle.
 //!
 //! # A record with no name at all
 //!
@@ -29,9 +43,10 @@
 //! visible, which is the point: a silently invented name would read as a
 //! real one.
 
-use super::provider::SourceContact;
+use super::provider::{SourceContact, SourcePhoto};
+use crate::utils::text::sanitize_invisible;
 
-/// People fields that have no home in Mokosh and are never imported.
+/// Google People fields that have no home in Mokosh and are never imported.
 ///
 /// Stated as data so the list is the documentation, and so a UI can show a
 /// person what an import leaves behind instead of leaving them to discover it.
@@ -111,6 +126,7 @@ pub struct MappedContact {
     pub company_name: Option<String>,
     pub title: Option<String>,
     pub department: Option<String>,
+    pub notes: Option<String>,
     /// What this particular record lost in the collapse, beyond the fields
     /// no record keeps: additional emails and unstorable phone numbers.
     pub dropped: Vec<String>,
@@ -122,11 +138,15 @@ const EMAIL_MAX: usize = 255;
 const COMPANY_NAME_MAX: usize = 255;
 const TITLE_MAX: usize = 100;
 const PHONE_MAX: usize = 50;
+/// `contacts.notes` is TEXT, so this is a sanity bound rather than a column
+/// width: a note longer than this is almost certainly not a note.
+const NOTES_MAX: usize = 10_000;
 
-/// Trim, and cut at a character boundary so a multi-byte name is never split
-/// mid-character.
+/// Sanitize, trim, and cut at a character boundary so a multi-byte name is
+/// never split mid-character.
 fn fit(value: Option<&str>, max: usize) -> Option<String> {
-    let trimmed = value?.trim();
+    let clean = sanitize_invisible(value?);
+    let trimmed = clean.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -163,13 +183,13 @@ pub fn map_contact(source: &SourceContact) -> MappedContact {
         (None, None) => {
             let fallback = fit(source.display_name.as_deref(), NAME_MAX)
                 .or_else(|| fit(source.organization.as_deref(), NAME_MAX))
-                .or_else(|| fit(source.emails.first().map(String::as_str), NAME_MAX))
+                .or_else(|| fit(source.emails.first().map(|e| e.address.as_str()), NAME_MAX))
                 .unwrap_or_else(|| "(no name)".to_string());
             (fallback, String::new())
         }
     };
 
-    let email = fit(source.emails.first().map(String::as_str), EMAIL_MAX);
+    let email = fit(source.emails.first().map(|e| e.address.as_str()), EMAIL_MAX);
     if source.emails.len() > 1 {
         dropped.push(format!(
             "{} additional email address(es)",
@@ -206,6 +226,13 @@ pub fn map_contact(source: &SourceContact) -> MappedContact {
         }
     }
 
+    match &source.photo {
+        Some(SourcePhoto::Uri(_)) => dropped.push("photo (a link, not fetched)".to_string()),
+        Some(SourcePhoto::Inline { .. }) => dropped.push("photo".to_string()),
+        None => {}
+    }
+    dropped.extend(source.dropped_properties.iter().cloned());
+
     MappedContact {
         first_name,
         last_name,
@@ -214,6 +241,7 @@ pub fn map_contact(source: &SourceContact) -> MappedContact {
         company_name: fit(source.organization.as_deref(), COMPANY_NAME_MAX),
         title: fit(source.title.as_deref(), TITLE_MAX),
         department: fit(source.department.as_deref(), TITLE_MAX),
+        notes: fit(source.note.as_deref(), NOTES_MAX),
         dropped,
     }
 }
@@ -236,7 +264,9 @@ mod tests {
             title: None,
             department: None,
             group_ids: vec![],
-            photo_url: None,
+            note: None,
+            photo: None,
+            dropped_properties: vec![],
             deleted: false,
         }
     }
@@ -383,6 +413,79 @@ mod tests {
         s.given_name = Some("Ada".into());
         s.organization = Some("  Acme Ltd ".into());
         assert_eq!(map_contact(&s).company_name.as_deref(), Some("Acme Ltd"));
+    }
+
+    /// PMS-1288: a record shaped the way a vCard reader builds one maps
+    /// through the same function as a Google one. The remote photo is carried
+    /// as text and reported, never followed; a custom email label survives on
+    /// the canonical record; `ADR` is counted as left behind; `NOTE` lands in
+    /// `notes` with its line break intact.
+    #[test]
+    fn a_vcard_shaped_record_maps_through_the_one_mapping() {
+        use super::super::provider::{SourceEmail, SourcePhoto};
+        let mut s = source();
+        s.external_id = "urn:uuid:8f2c".into();
+        s.display_name = Some("王小明".into());
+        s.emails = vec![SourceEmail {
+            address: "wang@example.cn".into(),
+            label: Some("billing desk".into()),
+        }];
+        s.note = Some("Prefers email.\nCall after 3pm.".into());
+        s.photo = Some(SourcePhoto::Uri("https://attacker.example/x.png".into()));
+        s.dropped_properties = vec!["ADR".into()];
+
+        assert_eq!(s.emails[0].label.as_deref(), Some("billing desk"));
+        let m = map_contact(&s);
+        assert_eq!(m.first_name, "王小明");
+        assert_eq!(m.email.as_deref(), Some("wang@example.cn"));
+        assert_eq!(m.notes.as_deref(), Some("Prefers email.\nCall after 3pm."));
+        assert!(
+            m.dropped.iter().any(|d| d == "photo (a link, not fetched)"),
+            "{:?}",
+            m.dropped
+        );
+        assert!(m.dropped.iter().any(|d| d == "ADR"), "{:?}", m.dropped);
+        assert!(
+            !format!("{m:?}").contains("attacker.example"),
+            "the photo link must not reach anything Mokosh stores"
+        );
+    }
+
+    /// An inline photo is reported the same way, without its bytes.
+    #[test]
+    fn an_inline_photo_is_reported_and_not_kept() {
+        use super::super::provider::SourcePhoto;
+        let mut s = source();
+        s.given_name = Some("Ada".into());
+        s.photo = Some(SourcePhoto::Inline {
+            media_type: Some("image/jpeg".into()),
+            byte_len: 20_000,
+        });
+        assert!(map_contact(&s).dropped.iter().any(|d| d == "photo"));
+    }
+
+    /// Imported text never passed the PMS-924 request-body middleware, so the
+    /// mapping applies the same rule: a zero-width space in a name or a note is
+    /// gone before it can defeat a match or a search.
+    #[test]
+    fn imported_text_is_sanitized_like_a_request_body() {
+        let mut s = source();
+        s.given_name = Some("Ada\u{200B}".into());
+        s.organization = Some("Acme\u{00AD} Ltd".into());
+        s.note = Some("\u{FEFF}hello".into());
+        let m = map_contact(&s);
+        assert_eq!(m.first_name, "Ada");
+        assert_eq!(m.company_name.as_deref(), Some("Acme Ltd"));
+        assert_eq!(m.notes.as_deref(), Some("hello"));
+    }
+
+    /// A note far past any real note is cut rather than refused.
+    #[test]
+    fn an_overlong_note_is_cut_at_a_character_boundary() {
+        let mut s = source();
+        s.given_name = Some("Ada".into());
+        s.note = Some("é".repeat(NOTES_MAX + 50));
+        assert_eq!(map_contact(&s).notes.unwrap().chars().count(), NOTES_MAX);
     }
 
     /// `storable_phone` agrees with the validator Mokosh stores phones under.

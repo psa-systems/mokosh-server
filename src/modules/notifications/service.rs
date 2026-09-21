@@ -1437,7 +1437,7 @@ impl NotificationsService {
             // (which could have been edited after the row was queued).
             let (body_html, html_unresolved) = match template.body_html.as_deref() {
                 Some(raw) => {
-                    let (rendered, unresolved) = render_template(raw, context);
+                    let (rendered, unresolved) = render_template_as(raw, context, Escape::Html);
                     (Some(rendered), unresolved)
                 }
                 None => (None, Vec::new()),
@@ -1703,7 +1703,35 @@ fn require_template_id(request: &UpsertNotificationRuleRequest) -> AppResult<Uui
         .ok_or_else(|| AppError::validation_field("template_id", "is required"))
 }
 
+/// PMS-1296: how a substituted value is written into the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escape {
+    /// Subject and plain-text body: the value is written as given.
+    Text,
+    /// `body_html`: the value is HTML-escaped unless its key is in
+    /// `MARKUP_KEYS`.
+    Html,
+}
+
+/// Context keys built as markup in Rust, so escaping them would print tags.
+const MARKUP_KEYS: &[&str] = &["logo_html", "abuse_notice_html", "msp_footer_line_html"];
+
 pub fn render_template(input: &str, context: &serde_json::Value) -> (String, Vec<String>) {
+    render_template_as(input, context, Escape::Text)
+}
+
+pub fn render_template_as(
+    input: &str,
+    context: &serde_json::Value,
+    escape: Escape,
+) -> (String, Vec<String>) {
+    let emit = |out: &mut String, key: &str, value: &str| {
+        if escape == Escape::Html && !MARKUP_KEYS.contains(&key) {
+            out.push_str(&crate::utils::html::html_escape(value));
+        } else {
+            out.push_str(value);
+        }
+    };
     // PMS-782: one trace event per substitution pass, so the render count of a
     // dispatch is observable (it used to be one pass per channel of the same
     // rule, rendering byte-identical output N times).
@@ -1721,8 +1749,8 @@ pub fn render_template(input: &str, context: &serde_json::Value) -> (String, Vec
         };
         let key = rest[..close].trim();
         match context.get(key) {
-            Some(serde_json::Value::String(s)) => out.push_str(s),
-            Some(v) => out.push_str(&v.to_string()),
+            Some(serde_json::Value::String(s)) => emit(&mut out, key, s),
+            Some(v) => emit(&mut out, key, &v.to_string()),
             None => {
                 if !unresolved.iter().any(|k| k == key) {
                     unresolved.push(key.to_string());
@@ -1741,11 +1769,24 @@ pub fn render_template(input: &str, context: &serde_json::Value) -> (String, Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        render_template, require_template_id, rule_conditions_match, UpsertNotificationRuleRequest,
+        render_template, render_template_as, require_template_id, rule_conditions_match, Escape,
+        UpsertNotificationRuleRequest,
     };
     use serde_json::json;
     use uuid::Uuid;
     use validator::Validate;
+
+    #[test]
+    fn html_mode_escapes_values_but_not_markup_keys_and_text_mode_never() {
+        let ctx = json!({"note": "<img src=x onerror=alert(1)>", "logo_html": "<img src=\"l\">"});
+        let (h, _) = render_template_as("<p>{{note}}</p>{{logo_html}}", &ctx, Escape::Html);
+        assert_eq!(
+            h,
+            "<p>&lt;img src=x onerror=alert(1)&gt;</p><img src=\"l\">"
+        );
+        let (t, _) = render_template_as("{{note}}", &ctx, Escape::Text);
+        assert_eq!(t, "<img src=x onerror=alert(1)>");
+    }
 
     #[test]
     fn empty_conditions_match_every_context() {

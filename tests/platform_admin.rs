@@ -347,3 +347,131 @@ async fn platform_login_no_identity_row_still_works(pool: PgPool) {
         .expect("send bad login");
     assert_eq!(bad.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
+
+async fn seed_platform_admin(pool: &PgPool, mfa_secret_b32: Option<&str>) -> (String, String) {
+    let (_id, email, password) = common::seed_admin(pool).await;
+    let hash = mokosh_server::utils::crypto::hash_password(&password)
+        .await
+        .expect("hash pw");
+    sqlx::query(
+        "INSERT INTO platform_admins (email, password_hash, first_name, last_name, status, \
+         mfa_enabled, mfa_secret) VALUES ($1, $2, 'Test', 'Admin', 'active', $3, $4) \
+         ON CONFLICT (lower(email)) DO UPDATE SET password_hash = $2, mfa_enabled = $3, \
+         mfa_secret = $4",
+    )
+    .bind(&email)
+    .bind(&hash)
+    .bind(mfa_secret_b32.is_some())
+    .bind(mfa_secret_b32)
+    .execute(pool)
+    .await
+    .expect("insert platform admin");
+    (email, password)
+}
+
+async fn platform_post(app: &common::TestApp, body: Value) -> reqwest::Response {
+    app.client
+        .post(app.url("/api/v1/platform/login"))
+        .json(&body)
+        .send()
+        .await
+        .expect("send")
+}
+
+#[sqlx::test]
+async fn platform_login_is_rate_limited_and_isolated_from_staff_budget(pool: PgPool) {
+    let (email, password) = seed_platform_admin(&pool, None).await;
+    let app = common::boot(pool).await;
+
+    let mut last = None;
+    for _ in 0..6 {
+        last = Some(
+            platform_post(
+                &app,
+                serde_json::json!({ "email": email, "password": "wrong" }),
+            )
+            .await,
+        );
+    }
+    let resp = last.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert!(resp.headers().get("retry-after").is_some());
+
+    // Platform failures spent none of the staff budget.
+    let staff = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({ "email": email, "password": "wrong" }))
+        .send()
+        .await
+        .expect("send");
+    assert_ne!(staff.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
+    // And the staff attempts spent none of the platform budget for a fresh email.
+    for _ in 0..6 {
+        let _ = app
+            .client
+            .post(app.url("/api/v1/auth/login"))
+            .json(&serde_json::json!({ "email": "other@example.com", "password": "wrong" }))
+            .send()
+            .await;
+    }
+    let fresh = platform_post(
+        &app,
+        serde_json::json!({ "email": "other@example.com", "password": "wrong" }),
+    )
+    .await;
+    assert_eq!(fresh.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let _ = password;
+}
+
+#[sqlx::test]
+async fn platform_login_enforces_mfa_and_refuses_replay(pool: PgPool) {
+    let secret = mokosh_server::utils::totp::generate_secret();
+    let b32 = mokosh_server::utils::totp::base32_encode(&secret);
+    let (email, password) = seed_platform_admin(&pool, Some(&b32)).await;
+    let app = common::boot(pool).await;
+
+    // Password alone: 401, no bearer.
+    let resp = platform_post(
+        &app,
+        serde_json::json!({ "email": email, "password": password }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let missing_body: Value = resp.json().await.expect("json");
+    assert!(missing_body.get("access_token").is_none());
+
+    // Bad code is indistinguishable from the missing code and from a bad password.
+    let resp = platform_post(
+        &app,
+        serde_json::json!({ "email": email, "password": password, "mfa_code": "000000" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let bad_code_body: Value = resp.json().await.expect("json");
+    assert_eq!(missing_body, bad_code_body);
+    let resp = platform_post(
+        &app,
+        serde_json::json!({ "email": email, "password": "nope" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let bad_pw_body: Value = resp.json().await.expect("json");
+    assert_eq!(missing_body, bad_pw_body);
+
+    // Valid code succeeds; the same code again is a replay.
+    let code = mokosh_server::utils::totp::code_at(&secret, chrono::Utc::now());
+    let ok = platform_post(
+        &app,
+        serde_json::json!({ "email": email, "password": password, "mfa_code": code }),
+    )
+    .await;
+    assert!(ok.status().is_success(), "got {}", ok.status());
+    let replay = platform_post(
+        &app,
+        serde_json::json!({ "email": email, "password": password, "mfa_code": code }),
+    )
+    .await;
+    assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
