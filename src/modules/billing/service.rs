@@ -4206,6 +4206,21 @@ impl BillingService {
                     ctx,
                 )
                 .await?;
+                if let Some(user_id) = ctx.user_id {
+                    static INVOICE_MAIL_LIMITER: std::sync::LazyLock<
+                        std::sync::Arc<crate::modules::auth::rate_limit::UserMailLimiter>,
+                    > = std::sync::LazyLock::new(|| {
+                        crate::modules::auth::rate_limit::UserMailLimiter::new(
+                            crate::modules::auth::rate_limit::USER_MAIL_PER_HOUR,
+                        )
+                    });
+                    // PMS-1299 (F7c): per-user hourly budget on invoice mail.
+                    INVOICE_MAIL_LIMITER.check(user_id).map_err(|retry_after| {
+                        AppError::RateLimited {
+                            retry_after_seconds: Some(retry_after),
+                        }
+                    })?;
+                }
                 self.email_invoice(tenant_id, &document, address, &bytes)
                     .await?;
                 sqlx::query(
