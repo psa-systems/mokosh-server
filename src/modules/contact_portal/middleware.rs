@@ -105,6 +105,7 @@ pub async fn portal_contact_middleware(
                                 company_id: claims.cid,
                                 email: claims.email,
                                 sid: claims.sid,
+                                role_cache: Default::default(),
                             })
                         }
                     }
