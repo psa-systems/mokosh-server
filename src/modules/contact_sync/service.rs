@@ -34,7 +34,7 @@ const GOOGLE: &str = "google";
 
 #[derive(Clone)]
 pub struct ContactSyncService {
-    db: Database,
+    pub(super) db: Database,
     http: reqwest::Client,
     secrets: Arc<dyn SecretProvider>,
     /// `PUBLIC_API_BASE_URL`: the origin GOOGLE reaches this deployment at,
@@ -203,6 +203,13 @@ pub struct ConnectionStatus {
 /// might be (PSA-70 D).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReviewItem {
+    /// The source the record came from. Since PMS-1290 the queue spans every
+    /// live source, so an answer names it back.
+    pub connection_id: Uuid,
+    /// `google` or `vcard`.
+    pub provider: String,
+    /// The Google account, or the uploaded file's name.
+    pub source_label: String,
     pub external_id: String,
     /// The record as the sync saw it, for the side-by-side.
     pub source: serde_json::Value,
@@ -233,11 +240,24 @@ pub enum Resolution {
     Link {
         external_id: String,
         contact_id: Uuid,
+        /// Which source's record (PMS-1290). Needed only when the same
+        /// external id waits in two sources at once; omitted, the one source
+        /// holding it is used.
+        #[serde(default)]
+        connection_id: Option<Uuid>,
     },
     /// This record is nobody Mokosh holds.
-    Create { external_id: String },
+    Create {
+        external_id: String,
+        #[serde(default)]
+        connection_id: Option<Uuid>,
+    },
     /// Do not import this record.
-    Skip { external_id: String },
+    Skip {
+        external_id: String,
+        #[serde(default)]
+        connection_id: Option<Uuid>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -260,6 +280,7 @@ pub struct ContactProvenance {
 pub struct ProvenanceLink {
     pub id: Uuid,
     pub provider: String,
+    /// The Google account, or for a `vcard` link the uploaded file's name.
     pub source_account_email: String,
     pub external_id: String,
     /// `created` or `linked`; absent on a link older than migration 228.
@@ -272,6 +293,13 @@ pub struct ProvenanceLink {
     pub suggested_company_id: Option<Uuid>,
     pub suggested_company_name: Option<String>,
     pub created_at: chrono::DateTime<Utc>,
+    /// PMS-1290: for a file import, the upload it came from - "imported from
+    /// `{import_file_name}` by `{import_file_uploaded_by_name}` on
+    /// `{import_file_uploaded_at}`". Absent for Google.
+    pub import_file_id: Option<Uuid>,
+    pub import_file_name: Option<String>,
+    pub import_file_uploaded_by_name: Option<String>,
+    pub import_file_uploaded_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -280,6 +308,13 @@ pub struct FieldLock {
     pub locked_by_user_id: Option<Uuid>,
     pub locked_by_name: Option<String>,
     pub locked_at: chrono::DateTime<Utc>,
+}
+
+/// The source a review answer is about.
+#[derive(sqlx::FromRow)]
+struct ReviewSource {
+    id: Uuid,
+    provider: String,
 }
 
 /// What a removal of imported data did.
@@ -827,7 +862,11 @@ impl ContactSyncService {
         }
     }
 
-    /// The tenant's live connection, if any.
+    /// The tenant's live Google connection, if any.
+    ///
+    /// Google by name: since PMS-1290 a tenant also has a `vcard` source row
+    /// for uploaded files, and every caller of this - the Settings card, the
+    /// connect and disconnect, the label selection - means the account.
     pub async fn connection(&self, tenant_id: TenantId) -> AppResult<Option<ConnectionStatus>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<ConnectionRow> = sqlx::query_as(
@@ -840,9 +879,10 @@ impl ContactSyncService {
                     (SELECT count(DISTINCT k.external_id) FROM contact_sync_candidates k \
                      WHERE k.connection_id = c.id AND k.status = 'open') AS open_reviews \
              FROM contact_sync_connections c \
-             WHERE c.tenant_id = $1 AND c.disconnected_at IS NULL",
+             WHERE c.tenant_id = $1 AND c.provider = $2 AND c.disconnected_at IS NULL",
         )
         .bind(tenant_id)
+        .bind(GOOGLE)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
@@ -1183,16 +1223,22 @@ impl ContactSyncService {
     pub async fn review_queue(&self, tenant_id: TenantId) -> AppResult<Vec<ReviewItem>> {
         #[derive(sqlx::FromRow)]
         struct Row {
+            connection_id: Uuid,
+            provider: String,
+            source_label: String,
             external_id: String,
             source_snapshot: serde_json::Value,
             created_at: chrono::DateTime<Utc>,
             #[sqlx(flatten)]
             candidate: ReviewCandidate,
         }
-        let connection = self.live_connection(tenant_id).await?;
+        // Every live source (PMS-1290): a tenant that only ever uploaded a
+        // file has a queue and no Google connection.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT k.external_id, k.source_snapshot, k.created_at, \
+            "SELECT k.connection_id, cn.provider, \
+                    COALESCE(k.source_snapshot->>'source_label', cn.account_email) AS source_label, \
+                    k.external_id, k.source_snapshot, k.created_at, \
                     k.candidate_contact_id AS contact_id, k.match_reason, \
                     c.first_name, c.last_name, c.email, c.title, \
                     COALESCE(co.name, c.company_name) AS company_name, \
@@ -1203,20 +1249,26 @@ impl ContactSyncService {
                               AND l.unlinked_at IS NULL AND l.external_id <> k.external_id) \
                         AS already_linked \
              FROM contact_sync_candidates k \
+             JOIN contact_sync_connections cn ON cn.id = k.connection_id \
              JOIN contacts c ON c.id = k.candidate_contact_id \
              LEFT JOIN companies co ON co.id = c.company_id \
-             WHERE k.tenant_id = $1 AND k.connection_id = $2 AND k.status = 'open' \
+             WHERE k.tenant_id = $1 AND k.status = 'open' AND cn.disconnected_at IS NULL \
              ORDER BY k.created_at, k.external_id, k.candidate_contact_id",
         )
         .bind(tenant_id)
-        .bind(connection.id)
         .fetch_all(&mut *tx)
         .await?;
         let mut items: Vec<ReviewItem> = Vec::new();
         for row in rows {
-            match items.iter_mut().find(|i| i.external_id == row.external_id) {
+            match items
+                .iter_mut()
+                .find(|i| i.external_id == row.external_id && i.connection_id == row.connection_id)
+            {
                 Some(item) => item.candidates.push(row.candidate),
                 None => items.push(ReviewItem {
+                    connection_id: row.connection_id,
+                    provider: row.provider,
+                    source_label: row.source_label,
                     external_id: row.external_id,
                     source: row.source_snapshot,
                     queued_at: row.created_at,
@@ -1236,13 +1288,37 @@ impl ContactSyncService {
         resolution: &Resolution,
         ctx: &AuditCtx,
     ) -> AppResult<Resolved> {
-        self.assert_enabled(tenant_id).await?;
-        let external_id = match resolution {
-            Resolution::Link { external_id, .. }
-            | Resolution::Create { external_id }
-            | Resolution::Skip { external_id } => external_id.clone(),
+        let (external_id, named_connection) = match resolution {
+            Resolution::Link {
+                external_id,
+                connection_id,
+                ..
+            }
+            | Resolution::Create {
+                external_id,
+                connection_id,
+            }
+            | Resolution::Skip {
+                external_id,
+                connection_id,
+            } => (external_id.clone(), *connection_id),
         };
-        let connection = self.live_connection(tenant_id).await?;
+        // The Google switch governs everything but a file's records
+        // (PMS-1290): an answer about a record it cannot place is refused by
+        // the switch first, as it always was, rather than 404ing past it.
+        let connection = match self
+            .review_source(tenant_id, &external_id, named_connection)
+            .await
+        {
+            Err(AppError::NotFound(what)) => {
+                self.assert_enabled(tenant_id).await?;
+                return Err(AppError::NotFound(what));
+            }
+            other => other?,
+        };
+        if connection.provider == GOOGLE {
+            self.assert_enabled(tenant_id).await?;
+        }
         let engine = ContactSyncEngine::new(self.db.clone());
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let open: Vec<(Uuid, Option<String>, serde_json::Value)> = sqlx::query_as(
@@ -1340,6 +1416,38 @@ impl ContactSyncService {
         })
     }
 
+    /// The live source a queued record waits in. An external id waiting in two
+    /// sources at once needs the answer to name one.
+    async fn review_source(
+        &self,
+        tenant_id: TenantId,
+        external_id: &str,
+        named: Option<Uuid>,
+    ) -> AppResult<ReviewSource> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let sources: Vec<ReviewSource> = sqlx::query_as(
+            "SELECT DISTINCT k.connection_id AS id, cn.provider FROM contact_sync_candidates k \
+             JOIN contact_sync_connections cn ON cn.id = k.connection_id \
+             WHERE k.tenant_id = $1 AND k.external_id = $2 AND k.status = 'open' \
+               AND cn.disconnected_at IS NULL AND ($3::uuid IS NULL OR k.connection_id = $3)",
+        )
+        .bind(tenant_id)
+        .bind(external_id)
+        .bind(named)
+        .fetch_all(&mut *tx)
+        .await?;
+        match <[ReviewSource; 1]>::try_from(sources) {
+            Ok([only]) => Ok(only),
+            Err(sources) if sources.is_empty() => {
+                Err(AppError::NotFound("Review item".to_string()))
+            }
+            Err(_) => Err(AppError::validation_field(
+                "connection_id",
+                "this record is waiting in more than one source; name the one you are answering",
+            )),
+        }
+    }
+
     /// Refuse a contact id that is not this tenant's, so every per-contact
     /// method below 404s the same way the contact routes do.
     async fn assert_contact(
@@ -1373,9 +1481,15 @@ impl ContactSyncService {
         let links: Vec<ProvenanceLink> = sqlx::query_as(
             "SELECT l.id, l.provider, l.source_account_email, l.external_id, l.origin, \
                     l.last_synced_at, l.deleted_in_source_at, l.unlinked_at, l.unlink_reason, \
-                    l.suggested_company_id, co.name AS suggested_company_name, l.created_at \
+                    l.suggested_company_id, co.name AS suggested_company_name, l.created_at, \
+                    l.import_file_id, f.filename AS import_file_name, \
+                    NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') \
+                        AS import_file_uploaded_by_name, \
+                    f.uploaded_at AS import_file_uploaded_at \
              FROM contact_sync_links l \
              LEFT JOIN companies co ON co.id = l.suggested_company_id AND co.tenant_id = l.tenant_id \
+             LEFT JOIN contact_import_files f ON f.id = l.import_file_id \
+             LEFT JOIN users u ON u.id = f.uploaded_by_user_id \
              WHERE l.tenant_id = $1 AND l.contact_id = $2 \
              ORDER BY (l.unlinked_at IS NULL) DESC, l.created_at DESC",
         )
