@@ -3398,6 +3398,21 @@ impl ContactService {
                         .to_string(),
                 );
             }
+            // PMS-1290: an uploaded vCard file, the same shape as Google.
+            Some(ContactOriginFilter::Vcard) => {
+                data_conds.push(
+                    "EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = c.tenant_id AND sl.contact_id = c.id \
+                       AND sl.provider = 'vcard')"
+                        .to_string(),
+                );
+                count_conds.push(
+                    "EXISTS (SELECT 1 FROM contact_sync_links sl \
+                     WHERE sl.tenant_id = contacts.tenant_id AND sl.contact_id = contacts.id \
+                       AND sl.provider = 'vcard')"
+                        .to_string(),
+                );
+            }
             None => {}
         }
 

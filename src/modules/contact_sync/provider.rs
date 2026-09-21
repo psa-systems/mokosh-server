@@ -58,7 +58,17 @@ use crate::utils::error::AppError;
 /// The narrow, honest list, the way `billing::provider::SUPPORTED` is: the
 /// column's CHECK and this constant are two statements of the same fact, and a
 /// connection naming anything else cannot be built.
-pub const SUPPORTED: &[&str] = &["google"];
+///
+/// `vcard` is an uploaded file (PMS-1290): one tenant-level source row whose
+/// reads are the file a run imports, so it is never scheduled and has no
+/// credential.
+pub const SUPPORTED: &[&str] = &["google", "vcard"];
+
+/// A group a source may offer for the records that carry no group at all, so
+/// they can be selected like any other (PMS-1290: a `.vcf` card with no
+/// `CATEGORIES`). Selecting it imports those records; it is never written to a
+/// contact as a tag, because "no category" is not a label anyone gave them.
+pub const UNGROUPED_ID: &str = "mokosh:ungrouped";
 
 /// Whether [`build`] can produce a provider for this discriminator.
 pub fn is_supported(provider: &str) -> bool {
@@ -276,6 +286,15 @@ pub trait ContactSyncProvider: Send + Sync {
     /// pages it managed to fetch before an error would tombstone every contact
     /// on the pages it did not.
     async fn changes_since(&self, sync_token: Option<&str>) -> SourceResult<SourceChanges>;
+
+    /// Whether a full read is the WHOLE source, so a linked record absent from
+    /// it was deleted there. True for an address book. False for an uploaded
+    /// file (PMS-1290), which holds whatever someone exported: a contact
+    /// missing from today's file is not a contact deleted anywhere, and
+    /// reading it as one would flag every contact the last file imported.
+    fn lists_everything(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -289,9 +308,11 @@ mod tests {
     /// this codebase before (PMS-966), so the guard reads the migration.
     #[test]
     fn the_supported_list_matches_the_migration_check() {
-        const MIGRATION: &str = include_str!("../../../migrations/220_contact_sync.sql");
+        // The latest statement of the CHECK: migration 220 created it and
+        // 238 widened it for `vcard`.
+        const MIGRATION: &str = include_str!("../../../migrations/238_contact_import_files.sql");
         let check = MIGRATION
-            .split("provider VARCHAR(32) NOT NULL CHECK (provider IN (")
+            .split("CHECK (provider IN (")
             .nth(1)
             .and_then(|rest| rest.split("))").next())
             .expect("the connection table CHECKs its provider column");
@@ -314,7 +335,7 @@ mod tests {
     /// be silently skipped.
     #[test]
     fn an_unknown_provider_is_not_supported() {
-        for unknown in ["microsoft", "icloud", "", "Google"] {
+        for unknown in ["microsoft", "icloud", "carddav", "", "Google"] {
             assert!(!is_supported(unknown), "{unknown:?} must not be supported");
         }
     }

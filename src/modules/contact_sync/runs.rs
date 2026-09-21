@@ -35,6 +35,15 @@
 //! Each failure adds one to `consecutive_failures`. At [`NOTIFY_AFTER`] in a
 //! row, or at once when the grant was revoked (the one state only a human can
 //! fix), `contact_sync.failing` is dispatched once per streak.
+//!
+//! # An uploaded file (PMS-1290)
+//!
+//! A `vcard` run imports the upload its row names, read from storage by
+//! [`file_import::load_source`]. It is never scheduled, the Google on/off
+//! switch does not govern it, and it has no failure streak: a file that did
+//! not import is the person's to upload again, not a connection going bad.
+//! Whatever its outcome, the held upload is discarded once the run ends, and
+//! each tick discards any upload held past its day.
 
 use std::sync::Arc;
 
@@ -42,6 +51,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use super::file_import::{self, VCARD};
 use super::google::GoogleContactsProvider;
 use super::provider::ContactSyncProvider;
 use super::service::ContactSyncService;
@@ -209,6 +219,11 @@ impl ContactSyncRunner {
             scheduled: self.schedule_due().await?,
             executed: 0,
         };
+        match file_import::discard_expired(&self.db).await {
+            Ok(0) => {}
+            Ok(discarded) => tracing::info!(discarded, "contact import: discarded expired uploads"),
+            Err(e) => tracing::warn!("contact import: the expired-upload sweep failed: {e}"),
+        }
         for _ in 0..RUNS_PER_TICK {
             let Some(claimed) = self.claim().await? else {
                 break;
@@ -246,6 +261,7 @@ impl ContactSyncRunner {
             "INSERT INTO contact_sync_runs (tenant_id, connection_id, trigger) \
              SELECT c.tenant_id, c.id, 'scheduled' FROM contact_sync_connections c \
              WHERE c.disconnected_at IS NULL AND c.is_active \
+               AND c.provider <> 'vcard' \
                AND jsonb_array_length(c.selected_groups) > 0 \
                AND NOT EXISTS (SELECT 1 FROM tenant_settings s \
                                WHERE s.tenant_id = c.tenant_id AND s.category = 'integrations' \
@@ -315,25 +331,34 @@ impl ContactSyncRunner {
     }
 
     async fn attempt(&self, tenant_id: TenantId, claimed: &Claimed) -> AppResult<SyncReport> {
-        // Turned off after the run was queued (PMS-1241): no token refresh, no
-        // read of the account. `settle` records the run as cancelled.
-        if !crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await? {
-            return Err(AppError::Conflict(TURNED_OFF.to_string()));
-        }
-        let provider: String = {
+        let (provider, import_file_id): (String, Option<Uuid>) = {
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-            sqlx::query_scalar(
-                "SELECT provider FROM contact_sync_connections WHERE tenant_id = $1 AND id = $2",
+            sqlx::query_as(
+                "SELECT c.provider, r.import_file_id FROM contact_sync_runs r \
+                 JOIN contact_sync_connections c ON c.id = r.connection_id \
+                 WHERE r.tenant_id = $1 AND r.id = $2",
             )
             .bind(tenant_id)
-            .bind(claimed.connection_id)
+            .bind(claimed.id)
             .fetch_one(&mut *tx)
             .await?
         };
-        let source = self
-            .sources
-            .source(tenant_id, claimed.connection_id, &provider)
-            .await?;
+        let source: Box<dyn ContactSyncProvider> = if provider == VCARD {
+            let file_id = import_file_id.ok_or_else(|| {
+                AppError::Internal("a vCard run names no uploaded file".to_string())
+            })?;
+            Box::new(file_import::load_source(tenant_id, file_id).await?)
+        } else {
+            // Turned off after the run was queued (PMS-1241): no token
+            // refresh, no read of the account. `settle` records the run as
+            // cancelled.
+            if !crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await? {
+                return Err(AppError::Conflict(TURNED_OFF.to_string()));
+            }
+            self.sources
+                .source(tenant_id, claimed.connection_id, &provider)
+                .await?
+        };
         self.engine
             .run_tracked(
                 tenant_id,
@@ -351,17 +376,28 @@ impl ContactSyncRunner {
         outcome: AppResult<SyncReport>,
     ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let (connection_status, disconnected, turned_off): (String, bool, bool) = sqlx::query_as(
+        let (connection_status, disconnected, turned_off, provider, import_file_id): (
+            String,
+            bool,
+            bool,
+            String,
+            Option<Uuid>,
+        ) = sqlx::query_as(
             "SELECT c.sync_status, c.disconnected_at IS NOT NULL, \
-                    EXISTS (SELECT 1 FROM tenant_settings s \
+                    c.provider = 'google' AND EXISTS (SELECT 1 FROM tenant_settings s \
                             WHERE s.tenant_id = c.tenant_id AND s.category = 'integrations' \
-                              AND s.key = 'google_contacts_enabled' AND s.value = 'false'::jsonb) \
+                              AND s.key = 'google_contacts_enabled' AND s.value = 'false'::jsonb), \
+                    c.provider, \
+                    (SELECT r.import_file_id FROM contact_sync_runs r \
+                     WHERE r.tenant_id = c.tenant_id AND r.id = $3) \
              FROM contact_sync_connections c WHERE c.tenant_id = $1 AND c.id = $2",
         )
         .bind(tenant_id)
         .bind(claimed.connection_id)
+        .bind(claimed.id)
         .fetch_one(&mut *tx)
         .await?;
+        let from_file = provider == VCARD;
 
         // (run status, error, whether this counts toward the failure streak)
         let (status, error, failure): (&str, Option<String>, Option<bool>) = match &outcome {
@@ -374,14 +410,22 @@ impl ContactSyncRunner {
             Ok(report) => (
                 "failed",
                 Some(format!(
-                    "{} of {} contacts could not be imported. The rest landed; the next sync retries these.",
-                    report.failed, report.total
+                    "{} of {} contacts could not be imported. The rest landed; {}",
+                    report.failed,
+                    report.total,
+                    if from_file {
+                        "upload the file again to retry these."
+                    } else {
+                        "the next sync retries these."
+                    }
                 )),
                 Some(true),
             ),
             Err(_) if connection_status == "throttled" => ("queued", None, None),
             Err(e) => ("failed", Some(e.to_string()), Some(true)),
         };
+        // A file has no streak to count: nothing will retry it by itself.
+        let failure = if from_file { None } else { failure };
 
         if status == "queued" {
             // Wait longer each time the provider says wait, up to an hour.
@@ -477,6 +521,16 @@ impl ContactSyncRunner {
 
         if let Some(streak) = notify {
             self.notify_failing(tenant_id, streak, error).await;
+        }
+        // The run is over, so the upload has served its purpose. After the
+        // commit and best effort: the sweep retries a discard that fails.
+        if let (true, Some(file_id), false) = (from_file, import_file_id, status == "queued") {
+            if let Err(e) = file_import::discard(&self.db, tenant_id, file_id).await {
+                tracing::warn!(
+                    file_id = %file_id,
+                    "contact import: could not discard an imported upload: {e}"
+                );
+            }
         }
         Ok(())
     }

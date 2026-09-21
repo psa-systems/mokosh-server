@@ -84,6 +84,10 @@ mod tests {
                 .join("attachments.rs"),
             src.join("modules").join("tenants").join("logo.rs"),
             src.join("modules").join("branding").join("assets.rs"),
+            // PMS-1290: an uploaded vCard file.
+            src.join("modules")
+                .join("contact_sync")
+                .join("file_import.rs"),
         ];
         for site in &sites {
             let source = std::fs::read_to_string(site)
@@ -123,6 +127,7 @@ mod tests {
                 .join("attachments.rs"),
             src.join("modules").join("tenants").join("routes.rs"),
             src.join("modules").join("branding").join("routes.rs"),
+            src.join("modules").join("contact_sync").join("routes.rs"),
         ];
         for site in &sites {
             let source = std::fs::read_to_string(site)

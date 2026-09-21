@@ -184,6 +184,16 @@ pub enum ObjectKind {
     ///
     /// Delete this variant once no deployment can still hold a file under it.
     LegacyTenantLogo { extension: String },
+    /// PMS-1290: an uploaded `.vcf` file, held between its upload and the end
+    /// of the import that reads it.
+    ///
+    /// Personal data kept only as long as it is needed: the contact-sync
+    /// runner discards it when the import run ends and sweeps any upload older
+    /// than a day, deleting the object and stamping its row. That is
+    /// [`Retention::WhileReferenced`] with the row's lifetime decided by the
+    /// feature, the same bargain a ticket attachment makes, not a sweep in
+    /// this module. `{tenant}/contact-imports/{id}`.
+    ContactImport { id: Uuid },
 }
 
 /// How long an object has to be kept (PMS-959).
@@ -221,6 +231,7 @@ impl ObjectKind {
             | ObjectKind::KbAttachment { .. }
             | ObjectKind::LegacyKbAttachment { .. }
             | ObjectKind::LegacyTenantLogo { .. }
+            | ObjectKind::ContactImport { .. }
             // A frozen logo lives as long as the documents that show it, which
             // is the financial retention above; it is content-addressed and
             // shared, so it cannot be reasoned about on its own and no sweep
@@ -263,6 +274,13 @@ impl ObjectKey {
     }
 
     /// PMS-959: the issued PDF of an invoice or a credit note.
+    pub fn contact_import(tenant_id: Uuid, id: Uuid) -> Self {
+        Self {
+            tenant_id,
+            kind: ObjectKind::ContactImport { id },
+        }
+    }
+
     pub fn financial_document(tenant_id: Uuid, id: Uuid) -> Self {
         Self {
             tenant_id,
@@ -459,6 +477,9 @@ impl ObjectKey {
             ObjectKind::LegacyKbAttachment { id } => {
                 PathBuf::from("kb-articles").join(id.to_string())
             }
+            ObjectKind::ContactImport { id } => PathBuf::from(self.tenant_id.to_string())
+                .join("contact-imports")
+                .join(id.to_string()),
             ObjectKind::LegacyTenantLogo { extension } => {
                 validate_segment(extension)?;
                 PathBuf::from("tenant-logos").join(format!("{}.{extension}", self.tenant_id))
@@ -804,6 +825,14 @@ mod tests {
                 .unwrap(),
             PathBuf::from(format!("/data/attachments/{TENANT}/branding/{DIGEST}"))
         );
+        // PMS-1290: an uploaded vCard file, under its tenant.
+        assert_eq!(
+            s.path_for(&ObjectKey::contact_import(TENANT, OBJECT))
+                .unwrap(),
+            PathBuf::from(format!(
+                "/data/attachments/{TENANT}/contact-imports/{OBJECT}"
+            ))
+        );
     }
 
     /// A digest is machine-generated, so anything that is not one is refused
@@ -1091,6 +1120,7 @@ mod tests {
             ObjectKind::BrandingLogo {
                 digest: DIGEST.into(),
             },
+            ObjectKind::ContactImport { id: OBJECT },
         ] {
             assert_eq!(kind.retention(), Retention::WhileReferenced, "{kind:?}");
         }

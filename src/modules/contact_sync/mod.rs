@@ -18,7 +18,10 @@
 //!   decides whether a person trusts the integration (PMS-1214).
 //! * `vcard`: an uploaded `.vcf` file read into the same canonical records,
 //!   bounded and never fetching what a card links to (PMS-1289).
+//! * `file_import`: that file uploaded, previewed and imported through the
+//!   same engine, run queue and review queue as Google (PMS-1290).
 
+pub mod file_import;
 pub mod google;
 pub mod locks;
 pub mod mapping;

@@ -1320,9 +1320,10 @@ pub struct CompanyFilter {
 /// `contact_sync_links` row (a live one, else the most recent).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactOrigin {
-    /// `google`.
+    /// `google`, or `vcard` for an uploaded `.vcf` file (PMS-1290).
     pub provider: String,
-    /// The account it was imported from, kept after a disconnect.
+    /// Where it was imported from, kept after a disconnect: the Google
+    /// account, or for a `vcard` import the uploaded file's name.
     pub account_email: String,
     /// Still synced. `false` once unlinked or disconnected: the contact is a
     /// local record that remembers where it came from.
@@ -1339,6 +1340,8 @@ pub enum ContactOriginFilter {
     Manual,
     /// Imported from Google, linked or not.
     Google,
+    /// PMS-1290: imported from an uploaded `.vcf` file.
+    Vcard,
 }
 
 /// Contact filter parameters
@@ -1352,7 +1355,7 @@ pub struct ContactFilter {
     pub is_portal_user: Option<bool>,
     #[validate(length(max = 500))]
     pub tags: Option<String>,
-    /// PMS-1260: `manual` or a provider (`google`).
+    /// PMS-1260: `manual` or a provider (`google`, `vcard`).
     pub origin: Option<ContactOriginFilter>,
 }
 

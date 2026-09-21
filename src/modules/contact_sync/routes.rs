@@ -16,6 +16,12 @@
 //!   lock and unlinking carry `RequireAuth`, the gate editing the contact
 //!   itself carries, since each is a smaller act than an edit. Removing
 //!   imported data deletes a person and is admin-only.
+//! * `/api/v1/integrations/contact-sync/vcard/uploads*` is an uploaded `.vcf`
+//!   file (PMS-1290): upload and preview, preview again for a choice of
+//!   categories, import, and the list of recent uploads. All admin-gated like
+//!   the Google import they mirror. The upload raises axum's body limit to
+//!   the reader's own cap (PMS-1233), so an oversized file reaches the shared
+//!   413 rather than a framework 400.
 //! * `/api/v1/public/contact-sync/google/callback` is the browser redirect
 //!   Google performs, which carries no session by construction. Its credential
 //!   is the single-use state parameter (migration 221); it is listed in the
@@ -24,7 +30,7 @@
 use std::sync::Arc;
 
 use crate::utils::json::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{delete, get, post, put};
@@ -32,6 +38,7 @@ use axum::Router;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::file_import::{max_upload_bytes, ImportFileView, UploadedFile};
 use super::runs::RunStatus;
 use super::service::{
     ClientSettingsInput, ClientSettingsView, ConnectionStatus, ContactProvenance,
@@ -41,7 +48,8 @@ use super::sync::ImportPreview;
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::modules::tenants::TenantOrPlatformCaller;
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
+use crate::utils::upload_limits::body_limit_bytes;
 
 #[derive(Clone)]
 pub struct ContactSyncRouterState {
@@ -80,6 +88,24 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
         .route(
             "/integrations/contact-sync/review-queue/resolve",
             post(resolve),
+        )
+        .route(
+            "/integrations/contact-sync/vcard/uploads",
+            get(list_vcard_uploads)
+                .post(upload_vcard)
+                .layer(DefaultBodyLimit::max(body_limit_bytes(max_upload_bytes()))),
+        )
+        .route(
+            "/integrations/contact-sync/vcard/uploads/{file_id}",
+            get(get_vcard_upload),
+        )
+        .route(
+            "/integrations/contact-sync/vcard/uploads/{file_id}/preview",
+            post(preview_vcard),
+        )
+        .route(
+            "/integrations/contact-sync/vcard/uploads/{file_id}/import",
+            post(import_vcard),
         )
         .route("/contacts/contacts/{contact_id}/sync", get(get_provenance))
         .route(
@@ -263,6 +289,99 @@ async fn cancel_run(
             .cancel_run(user.tenant(), run_id, &ctx)
             .await?,
     ))
+}
+
+/// Take the `file` part of a multipart upload. 201 with the stored upload and
+/// what importing it would do; nothing is imported yet.
+async fn upload_vcard(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+    mut multipart: Multipart,
+) -> AppResult<(StatusCode, Json<UploadedFile>)> {
+    let mut file: Option<(Option<String>, Vec<u8>)> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Multipart parse: {e}")))?
+    {
+        if field.name().unwrap_or_default() != "file" {
+            continue;
+        }
+        let name = field.file_name().map(str::to_string);
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Multipart read: {e}")))?;
+        file = Some((name, bytes.to_vec()));
+        break;
+    }
+    let (name, bytes) =
+        file.ok_or_else(|| AppError::BadRequest("Missing 'file' part in multipart body".into()))?;
+    let uploaded = state
+        .service
+        .upload_vcard(user.tenant(), name.as_deref(), bytes, &ctx)
+        .await?;
+    Ok((StatusCode::CREATED, Json(uploaded)))
+}
+
+async fn list_vcard_uploads(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Query(query): Query<RunsQuery>,
+) -> AppResult<Json<Vec<ImportFileView>>> {
+    Ok(Json(
+        state
+            .service
+            .vcard_files(user.tenant(), query.limit.unwrap_or(20))
+            .await?,
+    ))
+}
+
+async fn get_vcard_upload(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Path(file_id): Path<Uuid>,
+) -> AppResult<Json<ImportFileView>> {
+    Ok(Json(
+        state.service.vcard_file(user.tenant(), file_id).await?,
+    ))
+}
+
+/// POST for the same reason as Google's preview: it reads a whole address
+/// book. Writes nothing.
+async fn preview_vcard(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Path(file_id): Path<Uuid>,
+    Json(request): Json<PreviewRequest>,
+) -> AppResult<Json<ImportPreview>> {
+    Ok(Json(
+        state
+            .service
+            .preview_vcard(user.tenant(), file_id, request.group_ids.as_deref())
+            .await?,
+    ))
+}
+
+/// 202, like a Google import: the answer is the run to poll.
+async fn import_vcard(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+    Path(file_id): Path<Uuid>,
+    Json(request): Json<SelectionRequest>,
+) -> AppResult<(StatusCode, Json<RunStatus>)> {
+    let run = state
+        .service
+        .import_vcard(user.tenant(), file_id, &request.group_ids, &ctx)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
 /// Reading and answering the queue carry `RequireAuth`, the gate on reading
