@@ -28,7 +28,8 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::models::{
-    ApprovalResponse, ApprovalTarget, CreateApprovalRequest, DecideApprovalRequest,
+    ApprovalCountResponse, ApprovalResponse, ApprovalTarget, CreateApprovalRequest,
+    DecideApprovalRequest,
 };
 use super::service::ApprovalsService;
 use crate::db::Database;
@@ -73,6 +74,15 @@ pub fn approval_routes(service: ApprovalsService) -> Router {
         // every target; the response carries `target` + `entity_id`
         // so the SPA can render an entity link per row.
         .route("/approvals/pending", get(pending_for_caller))
+        // MAPPS-872: count-only surface for `ApprovalsBadge`. Same
+        // dual-plane rule as `/approvals/pending`, returning
+        // `{ "count": N }` instead of the full row set so the
+        // per-render badge stops paying for a Vec it only calls
+        // `.len()` on.
+        .route(
+            "/approvals/pending/count",
+            get(pending_count_for_caller),
+        )
         // Decision + cancel paths. Cancel is DELETE because the row
         // remains in the DB with status='cancelled'; matches the
         // soft-delete posture across the rest of the API.
@@ -255,6 +265,35 @@ async fn pending_for_caller(
         }
     };
     Ok(Json(rows))
+}
+
+/// MAPPS-872: the count-only surface for `pending_for_caller`. Same
+/// dual-plane split, same WHERE inside the service, returned as
+/// `ApprovalCountResponse` so the `ApprovalsBadge` on every render
+/// stops fetching and deserializing the full pending list.
+async fn pending_count_for_caller(
+    State(s): State<ApprovalsRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+) -> AppResult<Json<ApprovalCountResponse>> {
+    let count = match &caller {
+        CallerContext::Staff(auth) => {
+            let u = staff_user(auth)?;
+            let roles = vec![u.role.as_str().to_string()];
+            s.service
+                .pending_count_for_user(u.tenant_id, u.id, &roles)
+                .await?
+        }
+        CallerContext::Contact(session) => {
+            caller
+                .require_capability(caps::APPROVALS_DECIDE, &db)
+                .await?;
+            s.service
+                .pending_count_for_contact(session.tenant_id, session.id)
+                .await?
+        }
+    };
+    Ok(Json(ApprovalCountResponse { count }))
 }
 
 /// PMS-1084: dual-plane, the same split as `pending_for_caller`. The

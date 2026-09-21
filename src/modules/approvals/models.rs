@@ -70,6 +70,19 @@ pub struct ApprovalResponse {
     pub decided_at: Option<DateTime<Utc>>,
 }
 
+/// MAPPS-872: the count-only response for `GET /approvals/pending/count`.
+/// A dedicated shape so the SPA does not read a bare number and so a
+/// later addition (a breakdown by target, say) is a field on this rather
+/// than a wire break.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalCountResponse {
+    /// Number of pending approvals addressed to the caller. `i64`
+    /// because that is what Postgres' `count(*)` returns and the SPA
+    /// serde's default number type is fine with it; the value is
+    /// non-negative in practice.
+    pub count: i64,
+}
+
 /// PMS-470: parent entity kinds the approvals surface supports.
 /// Each variant maps 1:1 to the `target` column's CHECK values; the
 /// route layer mounts a per-entity prefix that resolves into this
