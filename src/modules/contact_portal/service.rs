@@ -593,7 +593,7 @@ impl ContactAuthService {
         let (contact_id, secret) = match parse_contact_bound_token(token) {
             Some(pair) => pair,
             None => {
-                tracing::warn!(
+                tracing::debug!(
                     token_len = token_len,
                     "setup_password rejected: token did not parse as `{{uuid}}.{{secret}}`"
                 );
@@ -626,7 +626,7 @@ impl ContactAuthService {
             .map(|(_, _, token_hash, _, _)| token_hash.as_str());
         let verified = verify_password_or_dummy(secret, row_hash).await?;
         let Some((token_id, tenant_id, _, used_at, expires_at)) = row.filter(|_| verified) else {
-            tracing::warn!(
+            tracing::debug!(
                 contact_id = %contact_id,
                 "setup_password rejected: no portal_setup_tokens row's lookup hash matched the presented secret"
             );
@@ -635,7 +635,7 @@ impl ContactAuthService {
             ));
         };
         if used_at.is_some() {
-            tracing::warn!(
+            tracing::debug!(
                 contact_id = %contact_id,
                 token_id = %token_id,
                 "setup_password rejected: token hash matched but row is already used"
@@ -643,7 +643,7 @@ impl ContactAuthService {
             return Err(AppError::Gone("Setup token already used".to_string()));
         }
         if expires_at <= Utc::now() {
-            tracing::warn!(
+            tracing::debug!(
                 contact_id = %contact_id,
                 token_id = %token_id,
                 expires_at = %expires_at,
@@ -1388,14 +1388,14 @@ impl ContactAuthService {
         let Some((_, tenant_id, intent_email, secret_hash, used_at, expires_at, scope_company_id)) =
             intent
         else {
-            tracing::warn!(
+            tracing::debug!(
                 intent_id = %intent_id,
                 "redeem_login_link rejected: no portal_login_intents row for that intent id"
             );
             return Err(invalid());
         };
         if used_at.is_some() {
-            tracing::warn!(
+            tracing::debug!(
                 intent_id = %intent_id,
                 used_at = ?used_at,
                 "redeem_login_link rejected: intent row is already used"
@@ -1403,7 +1403,7 @@ impl ContactAuthService {
             return Err(invalid());
         }
         if expires_at <= Utc::now() {
-            tracing::warn!(
+            tracing::debug!(
                 intent_id = %intent_id,
                 expires_at = %expires_at,
                 now = %Utc::now(),
@@ -1412,7 +1412,7 @@ impl ContactAuthService {
             return Err(invalid());
         }
         if !verify_password(secret, &secret_hash).await? {
-            tracing::warn!(
+            tracing::debug!(
                 intent_id = %intent_id,
                 "redeem_login_link rejected: secret hash did not verify against the row"
             );
@@ -1463,10 +1463,9 @@ impl ContactAuthService {
         .fetch_all(&mut *tx)
         .await?;
         if candidates.is_empty() {
-            tracing::warn!(
+            tracing::debug!(
                 intent_id = %intent_id,
                 tenant_id = %tenant_id,
-                intent_email = %intent_email,
                 scope_company_id = ?scope_company_id,
                 "redeem_login_link rejected: intent verified but no portal contact matches (email/is_portal_user/tenant active/portal_slug present)"
             );
