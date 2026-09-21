@@ -31,6 +31,12 @@ pub struct ContactSession {
     /// `contact_sessions.id` - the refresh-token session row this
     /// access token was minted from. Used by the logout + rotate paths.
     pub sid: Uuid,
+    /// PMS-1247: the effective role set for THIS request, resolved on the
+    /// first check and shared by every clone of the session (the extractor
+    /// hands handlers clones). The session is built per request by the
+    /// middleware, so this never outlives the request and a role revoke still
+    /// lands on the next one.
+    pub role_cache: std::sync::Arc<tokio::sync::OnceCell<Vec<String>>>,
 }
 
 /// JWT claims for the `typ: "contact"` token. Mirrors the shape of the
