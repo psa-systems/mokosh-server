@@ -19,7 +19,7 @@ use super::models::{
 };
 use super::service::FormsService;
 use crate::modules::auth::{RequireAdminUser, RequireAuth, TenantScoped};
-use crate::utils::error::AppResult;
+use crate::utils::error::{AppError, AppResult};
 
 #[derive(Clone)]
 struct FormsRouterState {
@@ -27,6 +27,8 @@ struct FormsRouterState {
     /// SPA origin the emailed request link is built from (PMS-730), the same
     /// base the portal setup link uses.
     app_url: String,
+    /// PMS-1299 (F7c): per-user mail budget for `issue_request_link`.
+    mail_limiter: Arc<crate::modules::auth::rate_limit::UserMailLimiter>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,6 +43,9 @@ pub fn forms_routes(service: FormsService, app_url: String) -> Router {
     let state = FormsRouterState {
         service: Arc::new(service),
         app_url,
+        mail_limiter: crate::modules::auth::rate_limit::UserMailLimiter::new(
+            crate::modules::auth::rate_limit::USER_MAIL_PER_HOUR,
+        ),
     };
     Router::new()
         .route("/forms", get(list).post(create))
@@ -192,6 +197,9 @@ async fn issue_request_link(
     Json(body): Json<IssueRequestLinkRequest>,
 ) -> AppResult<Json<RequestLinkResponse>> {
     body.validate()?;
+    s.mail_limiter
+        .check(u.id)
+        .map_err(|retry_after| AppError::rate_limited(Some(retry_after)))?;
     Ok(Json(
         s.service
             .issue_request_link(u.tenant(), u.id, &body, &s.app_url)
