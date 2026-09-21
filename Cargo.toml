@@ -141,6 +141,13 @@ sha1 = "0.10"
 sha2 = "0.10"
 constant_time_eq = "0.3"
 
+# vCard parsing for the `.vcf` contact import (PMS-1289). The parser behind
+# Stalwart's CardDAV server, lenient by design; default features off, which
+# drops its JMAP and serde stack. `encoding_rs` transcodes an Outlook card
+# written as raw 8-bit bytes before the parser, which takes `&str`, sees it.
+calcard = { version = "0.3", default-features = false }
+encoding_rs = "0.8"
+
 # CIDR parsing for the trusted-proxy allowlist that gates X-Forwarded-For
 # client-IP extraction (PMS-587).
 ipnetwork = { workspace = true }

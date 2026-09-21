@@ -442,7 +442,7 @@ async fn update_team_with_wrong_tenant_manager_returns_400(pool: PgPool) {
     let upd = UpdateTeamRequest {
         name: None,
         description: None,
-        manager_id: Some(user_b),
+        manager_id: Some(Some(user_b)),
         color: None,
         is_active: None,
     };
@@ -791,7 +791,7 @@ async fn update_team_clearing_manager_id_with_null(pool: PgPool) {
         tenant(),
         team.id,
         &UpdateTeamRequest {
-            manager_id: Some(other_id),
+            manager_id: Some(Some(other_id)),
             name: None,
             description: None,
             color: None,
@@ -803,6 +803,23 @@ async fn update_team_clearing_manager_id_with_null(pool: PgPool) {
     .unwrap();
     let after = s.get_team(tenant(), team.id).await.unwrap();
     assert_eq!(after.manager_id, Some(other_id));
+    // Explicit null clears the lead.
+    s.update_team(
+        tenant(),
+        team.id,
+        &UpdateTeamRequest {
+            manager_id: Some(None),
+            name: None,
+            description: None,
+            color: None,
+            is_active: None,
+        },
+        &ctx(),
+    )
+    .await
+    .unwrap();
+    let cleared = s.get_team(tenant(), team.id).await.unwrap();
+    assert_eq!(cleared.manager_id, None);
 }
 
 /// 34. add_member_to_archived_team_succeeds

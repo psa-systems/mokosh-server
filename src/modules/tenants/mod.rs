@@ -45,4 +45,4 @@ pub use routes::{
     SYSTEM_TENANT_ID,
 };
 #[cfg(all(feature = "server", feature = "multi-tenant"))]
-pub use service::TenantService;
+pub use service::{forget_seeded_tenant, TenantService};

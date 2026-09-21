@@ -470,9 +470,26 @@ pub struct PortalAccessRequestResponse {
 /// to know that `invoices:pay` and `invoices:download_pdf` are separate
 /// capability strings, and the column must never hold free text an MSP has to
 /// interpret.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PortalAccessRequest {
     pub area: String,
     #[serde(default)]
+    #[validate(length(max = 500))]
     pub note: Option<String>,
+}
+
+#[cfg(test)]
+mod access_request_tests {
+    use super::PortalAccessRequest;
+    use validator::Validate;
+
+    #[test]
+    fn note_over_500_chars_is_rejected() {
+        let req = |n: usize| PortalAccessRequest {
+            area: "invoices".into(),
+            note: Some("a".repeat(n)),
+        };
+        assert!(req(500).validate().is_ok());
+        assert!(req(501).validate().is_err());
+    }
 }

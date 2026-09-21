@@ -141,6 +141,24 @@ pub struct TenantService {
     seeded_tenants: moka::future::Cache<Uuid, ()>,
 }
 
+/// PMS-1238: the memo is shared by every `TenantService` in the process so a
+/// data-transfer wipe, which has no service handle, can invalidate it.
+fn seeded_tenants_cache() -> &'static moka::future::Cache<Uuid, ()> {
+    static CACHE: std::sync::OnceLock<moka::future::Cache<Uuid, ()>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            .max_capacity(SEEDED_TENANT_CAPACITY)
+            .time_to_live(SEEDED_TENANT_TTL)
+            .build()
+    })
+}
+
+/// Drop a tenant's "already seeded" memo. Call after anything that wipes the
+/// tenant's lookup tables, so the next request re-runs the guarded seed.
+pub async fn forget_seeded_tenant(tenant_id: Uuid) {
+    seeded_tenants_cache().invalidate(&tenant_id).await;
+}
+
 impl TenantService {
     pub fn new(db: Database) -> Self {
         Self {
@@ -148,10 +166,7 @@ impl TenantService {
             notifications: None,
             frontend_base_url: None,
             max_tenants: None,
-            seeded_tenants: moka::future::Cache::builder()
-                .max_capacity(SEEDED_TENANT_CAPACITY)
-                .time_to_live(SEEDED_TENANT_TTL)
-                .build(),
+            seeded_tenants: seeded_tenants_cache().clone(),
         }
     }
 

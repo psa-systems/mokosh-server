@@ -76,6 +76,10 @@ pub struct TenantBranding {
     pub favicon_mime: Option<String>,
     pub primary_color: Option<String>,
     pub secondary_color: Option<String>,
+    /// Deprecated alias the settings endpoint still writes (PMS-703 F18);
+    /// the effective-branding merge reads it as a `secondary_color` fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_color: Option<String>,
     /// MAPPS-617: solid-color background for the portal (`#RRGGBB` or
     /// `#RRGGBBAA`). Set alongside `background_url` at most one at a time; the
     /// SPA prefers `background_url` when both are present.

@@ -81,9 +81,19 @@ pub struct UpdateTeamRequest {
     #[validate(length(min = 1, max = 255))]
     pub name: Option<String>,
     pub description: Option<String>,
-    pub manager_id: Option<Uuid>,
+    /// Absent leaves the lead alone; an explicit `null` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub manager_id: Option<Option<Uuid>>,
     pub color: Option<String>,
     pub is_active: Option<bool>,
+}
+
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 /// Request body for `POST /api/v1/teams/{id}/members`.

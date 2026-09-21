@@ -872,6 +872,16 @@ impl TicketService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        // PMS-1238: the attachment rows cascade away with the ticket, so note
+        // their ids now and remove the blobs once the delete commits.
+        let attachment_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM ticket_attachments WHERE tenant_id = $1 AND ticket_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(ticket_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
         if let Err(e) = sqlx::query("DELETE FROM tickets WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(ticket_id)
@@ -905,6 +915,8 @@ impl TicketService {
         )
         .await?;
         tx.commit().await?;
+        crate::storage::purge_attachment_blobs(&self.db, tenant_id.get(), &attachment_ids, false)
+            .await;
 
         Ok(())
     }
@@ -2685,7 +2697,7 @@ impl TicketService {
             }
             _ => "Ticket reopened by customer.".to_string(),
         };
-        let _ = sqlx::query(
+        sqlx::query(
             "INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type,
                                        content, created_by_id, created_by_contact_id)
              VALUES ($1, $2, $3, 'public', $4, $5, $6)",
@@ -2697,7 +2709,7 @@ impl TicketService {
         .bind(creator_id)
         .bind(contact_id)
         .execute(&mut *tx)
-        .await;
+        .await?;
 
         tx.commit().await?;
 
@@ -3070,8 +3082,8 @@ fn build_ticket_filter_sql(
         count_conds.push("t.assigned_to_id IS NULL".to_string());
     }
     if filter.is_overdue == Some(true) {
-        data_conds.push("t.sla_due_date < NOW() AND t.closed_at IS NULL".to_string());
-        count_conds.push("t.sla_due_date < NOW() AND t.closed_at IS NULL".to_string());
+        data_conds.push("t.sla_due_date < NOW() AND t.resolved_at IS NULL AND t.closed_at IS NULL AND NOT COALESCE((SELECT is_closed FROM ticket_statuses s WHERE s.id = t.status_id), FALSE)".to_string());
+        count_conds.push("t.sla_due_date < NOW() AND t.resolved_at IS NULL AND t.closed_at IS NULL AND NOT COALESCE((SELECT is_closed FROM ticket_statuses s WHERE s.id = t.status_id), FALSE)".to_string());
     }
     if filter.is_open == Some(true) {
         data_conds.push(is_open_fragment.to_string());

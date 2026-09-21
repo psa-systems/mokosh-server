@@ -40,6 +40,12 @@ pub const PUBLIC_TENANT_PATH_PREFIX: &str = "/api/v1/public/tenants/";
 /// on a Company row too, pointing at this prefix instead.
 pub const PUBLIC_COMPANY_PATH_PREFIX: &str = "/api/v1/public/companies/";
 
+/// PMS-1238: the complete set of prefixes an image path may start with. The
+/// check below reads this list, and `the_public_path_prefixes_are_pinned`
+/// fails when it changes, so widening it is a deliberate act.
+const ALLOWED_PUBLIC_PATH_PREFIXES: [&str; 2] =
+    [PUBLIC_TENANT_PATH_PREFIX, PUBLIC_COMPANY_PATH_PREFIX];
+
 /// Caps, in characters, for the free-text keys. Chosen from where each value is
 /// rendered rather than from the column: the contact sentence and the form
 /// page's contact line are one line in a client's mail client.
@@ -200,7 +206,9 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
         // which prefix is right depends on which row it lands in.
         "logo_url" | "favicon_url" | "background_url" => {
             let s = text(label, value, MAX_PATH)?;
-            if s.starts_with(PUBLIC_TENANT_PATH_PREFIX) || s.starts_with(PUBLIC_COMPANY_PATH_PREFIX)
+            if ALLOWED_PUBLIC_PATH_PREFIXES
+                .iter()
+                .any(|prefix| s.starts_with(prefix))
             {
                 Ok(())
             } else {
@@ -334,6 +342,16 @@ mod tests {
 
     fn patch(v: Value) -> Result<(), String> {
         validate_branding_patch(&v).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn the_public_path_prefixes_are_pinned() {
+        assert_eq!(
+            ALLOWED_PUBLIC_PATH_PREFIXES,
+            ["/api/v1/public/tenants/", "/api/v1/public/companies/"]
+        );
+        assert!(patch(json!({ "logo_url": "/api/v1/public/kb/attachments/x" })).is_err());
+        assert!(patch(json!({ "logo_url": "https://evil.example/x.png" })).is_err());
     }
 
     #[test]

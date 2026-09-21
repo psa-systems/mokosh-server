@@ -421,3 +421,118 @@ mod tests {
         );
     }
 }
+
+/// PMS-1299 (audit F7c): a per-user hourly budget for the authenticated
+/// endpoints that send mail to a caller-supplied address, so a signed-in user
+/// cannot use the mailer as an unbounded relay. Same in-memory, per-replica
+/// caveat as the sibling limiters.
+pub struct UserMailLimiter {
+    by_user: UuidLimiter,
+    clock: DefaultClock,
+}
+
+impl UserMailLimiter {
+    /// Build a limiter allowing `per_hour` sends per user id. Must be non-zero.
+    pub fn new(per_hour: u32) -> Arc<Self> {
+        let quota =
+            Quota::per_hour(NonZeroU32::new(per_hour).expect("mail quota must be non-zero"));
+        Arc::new(Self {
+            by_user: RateLimiter::keyed(quota),
+            clock: DefaultClock::default(),
+        })
+    }
+
+    /// Returns `Err(retry_after_seconds)` (at least 1) when the user's budget
+    /// is spent.
+    pub fn check(&self, user: Uuid) -> Result<(), u64> {
+        self.by_user
+            .check_key(&user)
+            .map_err(|neg| seconds_until(&neg, &self.clock))
+    }
+}
+
+/// Sends per user per hour on `issue_request_link` and `email_invoice`.
+pub const USER_MAIL_PER_HOUR: u32 = 20;
+
+/// PMS-1299 (audit F7b): requests per minute per client IP across the merged
+/// `/api/v1/public` router.
+pub const PUBLIC_API_PER_MIN: u32 = 60;
+
+/// Per-IP limiter for the unauthenticated public nest.
+pub struct PublicIpLimiter {
+    by_ip: IpLimiter,
+    clock: DefaultClock,
+}
+
+impl PublicIpLimiter {
+    pub fn new(per_min: u32) -> Arc<Self> {
+        let quota = Quota::per_minute(NonZeroU32::new(per_min).expect("quota must be non-zero"));
+        Arc::new(Self {
+            by_ip: RateLimiter::keyed(quota),
+            clock: DefaultClock::default(),
+        })
+    }
+
+    pub fn check(&self, ip: IpAddr) -> Result<(), u64> {
+        self.by_ip
+            .check_key(&ip)
+            .map_err(|neg| seconds_until(&neg, &self.clock))
+    }
+}
+
+/// Middleware: 429 with `Retry-After` past the per-IP budget.
+pub async fn public_ip_limit(
+    axum::extract::State(limiter): axum::extract::State<Arc<PublicIpLimiter>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let ip = crate::utils::client_ip::extract_client_ip(
+        addr.ip(),
+        request.headers(),
+        crate::utils::client_ip::trusted_proxies(),
+    );
+    match limiter.check(ip) {
+        Ok(()) => next.run(request).await,
+        Err(retry_after) => crate::utils::error::rate_limited_response(
+            retry_after,
+            "Too many requests, please try again shortly",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod pms_1299_tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    #[test]
+    fn user_mail_budget_is_per_user() {
+        let l = UserMailLimiter::new(2);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert!(l.check(a).is_ok());
+        assert!(l.check(a).is_ok());
+        assert!(l.check(a).unwrap_err() >= 1);
+        assert!(l.check(b).is_ok());
+    }
+
+    #[tokio::test]
+    async fn public_router_answers_429_with_retry_after_past_budget() {
+        let app = Router::new().route("/x", get(|| async { "ok" })).layer(
+            axum::middleware::from_fn_with_state(PublicIpLimiter::new(2), public_ip_limit),
+        );
+        let send = || {
+            let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(
+                "203.0.113.9:1".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            app.clone().oneshot(req)
+        };
+        assert_eq!(send().await.unwrap().status(), 200);
+        assert_eq!(send().await.unwrap().status(), 200);
+        let third = send().await.unwrap();
+        assert_eq!(third.status(), 429);
+        assert!(third.headers().contains_key("retry-after"));
+    }
+}

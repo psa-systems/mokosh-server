@@ -535,8 +535,11 @@ impl ObjectProvider for LocalProvider {
 
     async fn delete(&self, key: &ObjectKey) -> AppResult<()> {
         let path = self.path_for(key)?;
-        let _ = tokio::fs::remove_file(&path).await;
-        Ok(())
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(AppError::Internal(format!("object delete failed: {e}"))),
+        }
     }
 
     async fn exists(&self, key: &ObjectKey) -> AppResult<bool> {
@@ -700,6 +703,36 @@ pub fn init_from_env(profile_default: &str) -> AppResult<(StorageProviderKind, E
 /// [`init_from_env`], which is the test and CLI path; a configuration that
 /// cannot build is a panic there, because there is no request to answer with a
 /// 500 and no startup to end.
+/// PMS-1238: remove the blobs and ledger rows of attachments whose rows a
+/// cascade delete (ticket, KB article) already took, best effort after commit.
+pub async fn purge_attachment_blobs(
+    db: &crate::db::Database,
+    tenant_id: Uuid,
+    ids: &[Uuid],
+    kb: bool,
+) {
+    let store = shared();
+    let ledger = FileLedger::new(db.clone());
+    for &id in ids {
+        let mut keys = vec![if kb {
+            ObjectKey::kb_attachment(tenant_id, id)
+        } else {
+            ObjectKey::ticket_attachment(tenant_id, id)
+        }];
+        if kb {
+            keys.push(ObjectKey::legacy_kb_attachment(tenant_id, id));
+        }
+        for key in keys {
+            if let Err(e) = store.delete(&key).await {
+                tracing::warn!(?e, %tenant_id, %id, "attachment blob delete failed after cascade");
+            }
+        }
+        if let Err(e) = ledger.forget(tenant_id, id).await {
+            tracing::warn!(?e, %tenant_id, %id, "attachment ledger delete failed after cascade");
+        }
+    }
+}
+
 pub fn shared() -> Arc<dyn ObjectProvider> {
     SHARED
         .get_or_init(|| {

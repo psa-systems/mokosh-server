@@ -168,6 +168,7 @@ async fn request_access(
     RequireContactAuth(session): RequireContactAuth,
     Json(request): Json<PortalAccessRequest>,
 ) -> AppResult<Json<PortalAccessRequestResponse>> {
+    request.validate()?;
     let response = state
         .service
         .request_access(&session, &request.area, request.note.as_deref())

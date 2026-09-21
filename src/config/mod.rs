@@ -1309,9 +1309,18 @@ impl ConfigProviderChain {
         let mut also_held_by: Vec<ConfigProviderKind> = Vec::new();
         for (kind, provider) in &self.providers {
             if provider.has(name) {
-                if served_by.is_none() {
+                // PMS-1238: a provider that holds the key but cannot decode it
+                // (a non-UTF-8 environment value) must not be taken as the
+                // serving copy, or `provider-purge` would treat the decodable
+                // copy further down the chain as the redundant one.
+                let decoded = if served_by.is_none() {
+                    provider.get(name)
+                } else {
+                    None
+                };
+                if decoded.is_some() {
                     served_by = Some(*kind);
-                    value = provider.get(name);
+                    value = decoded;
                 } else {
                     also_held_by.push(*kind);
                 }

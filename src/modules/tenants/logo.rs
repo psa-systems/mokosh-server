@@ -162,9 +162,11 @@ impl TenantLogoStore {
             return Err(oversized_upload_error("logo", self.config.max_bytes));
         }
 
-        self.remove(tenant_id).await;
+        // PMS-1238: write first, then clear the other formats, so a failed
+        // write leaves the old logo in place.
         let key = ObjectKey::tenant_logo(tenant_id, extension_for(mime));
         self.store.put(&key, bytes).await?;
+        self.remove_except(tenant_id, Some(&key)).await;
         if let Some(ledger) = &self.ledger {
             // Keyed on the TENANT, not a fresh id: there is one logo per tenant
             // and replacing it must not add a second row to the rollup.
@@ -219,11 +221,16 @@ impl TenantLogoStore {
     /// cleared only the new path would leave the pre-move file behind, and the
     /// read above would serve it as if the logo had never been replaced.
     pub async fn remove(&self, tenant_id: Uuid) {
+        self.remove_except(tenant_id, None).await;
+    }
+
+    /// Delete every stored format except `keep` (the object just written).
+    async fn remove_except(&self, tenant_id: Uuid, keep: Option<&ObjectKey>) {
         for (_, extension) in EXTENSIONS {
-            let _ = self
-                .store
-                .delete(&ObjectKey::tenant_logo(tenant_id, *extension))
-                .await;
+            let current = ObjectKey::tenant_logo(tenant_id, *extension);
+            if keep != Some(&current) {
+                let _ = self.store.delete(&current).await;
+            }
             let _ = self
                 .store
                 .delete(&ObjectKey::legacy_tenant_logo(tenant_id, *extension))

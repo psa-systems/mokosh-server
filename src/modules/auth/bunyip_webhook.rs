@@ -232,10 +232,14 @@ const EVENT_MOKOSH_GRANT_CHANGED: &str = "mokosh_grant_changed";
 /// `crates/bunyip-domain/src/services/webhook.rs` (see the
 /// `mokosh_grant_changed_payload_carries_the_documented_fields` test).
 ///
-/// `role` is `Some` on a `granted` event and `None` on a `revoked` one;
-/// the emitter drops it on revoke so a late-arriving `granted` cannot
-/// accidentally reinstate the role after Mokosh has seen a `revoked`.
-/// The migration's CHECK constraint pins the role-vs-revoked_at
+/// `role` is `Some` on a `granted` event and `None` on a `revoked` one.
+///
+/// Ordering (PMS-1295): `at` is the event's time and the row keeps the
+/// newest one as `event_at`. An event applies only when its `at` is
+/// strictly newer than the stored value, so a late `granted` after a
+/// `revoked`, a duplicate delivery or a replayed body changes nothing.
+/// An `at` more than five minutes ahead of the server clock is refused
+/// with 400, so a forged-future event cannot pin the row. The migration's CHECK constraint pins the role-vs-revoked_at
 /// coupling, so an inconsistent payload fails at write time.
 #[derive(Debug, Deserialize)]
 struct MokoshGrantChangedPayload {
@@ -299,7 +303,13 @@ pub async fn mokosh_grant_changed(
         }
     };
 
-    MokoshBunyipGrantService::upsert(
+    if payload.at > chrono::Utc::now() + chrono::Duration::minutes(5) {
+        return Err(AppError::BadRequest(
+            "Event timestamp is too far in the future.".to_string(),
+        ));
+    }
+
+    let changed = MokoshBunyipGrantService::upsert(
         &state.pool,
         payload.grant_id,
         payload.owner_bunyip_user_id,
@@ -329,7 +339,7 @@ pub async fn mokosh_grant_changed(
     // by design: the placement row is JIT-provisioned on the
     // grantee's first request (there is no email or name in the
     // webhook payload to seed the row with).
-    if payload.state == "revoked" {
+    if changed && payload.state == "revoked" {
         if let Err(e) = sqlx::query(
             "UPDATE users SET deleted_at = COALESCE(deleted_at, NOW()), updated_at = NOW() \
              WHERE bunyip_user_id = $1 \

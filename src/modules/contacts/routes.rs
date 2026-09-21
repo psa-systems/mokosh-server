@@ -296,6 +296,7 @@ async fn company_deletion_preview(
 async fn delete_company(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    _manager: crate::modules::auth::RequireManager,
     ctx: crate::modules::audit::AuditCtx,
     Path(company_id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -476,6 +477,7 @@ async fn update_contact(
 async fn delete_contact(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    _manager: crate::modules::auth::RequireManager,
     ctx: crate::modules::audit::AuditCtx,
     Path(contact_id): Path<Uuid>,
 ) -> AppResult<()> {
@@ -538,6 +540,7 @@ async fn update_site(
 async fn delete_site(
     State(state): State<ContactRouterState>,
     RequireAuth(user): RequireAuth,
+    _manager: crate::modules::auth::RequireManager,
     ctx: crate::modules::audit::AuditCtx,
     Path(site_id): Path<Uuid>,
 ) -> AppResult<()> {

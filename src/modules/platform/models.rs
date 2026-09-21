@@ -12,6 +12,9 @@ pub struct PlatformLoginRequest {
     pub email: String,
     #[validate(length(min = 1, message = "Password is required"))]
     pub password: String,
+    /// TOTP code; required when the admin has MFA enabled.
+    #[serde(default)]
+    pub mfa_code: Option<String>,
 }
 
 /// `POST /api/v1/platform/login` response. Mirrors the shape of

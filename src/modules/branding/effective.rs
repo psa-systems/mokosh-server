@@ -45,7 +45,8 @@ pub fn effective_branding(tenant: &TenantBranding, company: &CompanyBranding) ->
         secondary_color: company
             .secondary_color
             .clone()
-            .or_else(|| tenant.secondary_color.clone()),
+            .or_else(|| tenant.secondary_color.clone())
+            .or_else(|| tenant.accent_color.clone()),
         background_color: company
             .background_color
             .clone()
@@ -239,6 +240,7 @@ mod tests {
             "favicon_mime",
             "primary_color",
             "secondary_color",
+            "accent_color",
             "background_color",
             "background_url",
             "background_mime",
