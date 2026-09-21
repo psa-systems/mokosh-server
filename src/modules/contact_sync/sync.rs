@@ -69,7 +69,7 @@ use uuid::Uuid;
 use super::mapping::{map_contact, MappedContact};
 use super::matching::{decide, IncomingKeys, LocalContact, MatchDecision};
 use super::normalize::{name_key, phone_key};
-use super::provider::{ContactSyncProvider, SourceContact, SourceError};
+use super::provider::{ContactSyncProvider, SourceContact, SourceEmail, SourceError};
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
@@ -87,6 +87,8 @@ pub mod fields {
     pub const COMPANY_NAME: &str = "company_name";
     pub const PHONES: &str = "phones";
     pub const TAGS: &str = "tags";
+    /// PMS-1288: the canonical `note` (vCard `NOTE`).
+    pub const NOTES: &str = "notes";
 
     pub const ALL: &[&str] = &[
         FIRST_NAME,
@@ -97,6 +99,7 @@ pub mod fields {
         COMPANY_NAME,
         PHONES,
         TAGS,
+        NOTES,
     ];
 }
 
@@ -203,6 +206,7 @@ struct ContactRow {
     company_id: Option<Uuid>,
     company_name: Option<String>,
     tags: Option<Vec<String>>,
+    notes: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -304,7 +308,7 @@ fn plan<'a>(
         return Plan::AlreadyReviewed;
     }
     let incoming = IncomingKeys::from_values(
-        record.emails.iter().map(String::as_str),
+        record.emails.iter().map(|e| e.address.as_str()),
         record.phones.iter().flat_map(|p| {
             p.canonical
                 .as_deref()
@@ -1340,7 +1344,7 @@ impl ContactSyncEngine {
         ctx: &AuditCtx,
     ) -> AppResult<bool> {
         let current: ContactRow = sqlx::query_as(
-            "SELECT first_name, last_name, email, title, department, company_id, company_name, tags \
+            "SELECT first_name, last_name, email, title, department, company_id, company_name, tags, notes \
              FROM contacts WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
         )
         .bind(tenant_id)
@@ -1422,6 +1426,12 @@ impl ContactSyncEngine {
             mapped.department.as_deref(),
             fill_only,
         );
+        let notes = choose(
+            fields::NOTES,
+            current.notes.as_deref(),
+            mapped.notes.as_deref(),
+            fill_only,
+        );
         let company_name = if has_company_link {
             None
         } else {
@@ -1473,6 +1483,7 @@ impl ContactSyncEngine {
             || title.is_some()
             || department.is_some()
             || company_name.is_some()
+            || notes.is_some()
             || !new_tags.is_empty();
         if !scalar_change && added.is_empty() {
             return Ok(false);
@@ -1495,6 +1506,7 @@ impl ContactSyncEngine {
                     department = COALESCE($7, department), \
                     company_name = COALESCE($8, company_name), \
                     tags = COALESCE(tags, '{}') || $9::text[], \
+                    notes = COALESCE($10, notes), \
                     updated_at = NOW() \
                  WHERE tenant_id = $1 AND id = $2",
             )
@@ -1507,6 +1519,7 @@ impl ContactSyncEngine {
             .bind(department)
             .bind(company_name)
             .bind(&new_tags)
+            .bind(notes)
             .execute(&mut *conn)
             .await?;
         }
@@ -1605,7 +1618,7 @@ fn create_request(mapped: &MappedContact, labels: &[String]) -> CreateContactReq
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
-        notes: None,
+        notes: mapped.notes.clone(),
         create_portal_access: false,
         phones: Some(
             mapped
@@ -1680,6 +1693,7 @@ fn from_snapshot(
         company_name: text("company_name"),
         title: text("title"),
         department: text("department"),
+        notes: text("notes"),
         dropped: strings("dropped"),
     };
     let record = SourceContact {
@@ -1688,13 +1702,18 @@ fn from_snapshot(
         display_name: text("display_name"),
         given_name: text("first_name"),
         family_name: text("last_name"),
-        emails: strings("emails"),
+        emails: strings("emails")
+            .into_iter()
+            .map(SourceEmail::from)
+            .collect(),
         phones: vec![],
         organization: mapped.company_name.clone(),
         title: mapped.title.clone(),
         department: mapped.department.clone(),
         group_ids: vec![],
-        photo_url: None,
+        note: mapped.notes.clone(),
+        photo: None,
+        dropped_properties: vec![],
         deleted: false,
     };
     (record, mapped, strings("labels"))
@@ -1712,7 +1731,7 @@ fn source_snapshot(
         "first_name": mapped.first_name,
         "last_name": mapped.last_name,
         "email": mapped.email,
-        "emails": record.emails,
+        "emails": record.emails.iter().map(|e| e.address.as_str()).collect::<Vec<_>>(),
         "phones": mapped.phones.iter().map(|p| json!({
             "number": p.number,
             "phone_type": p.phone_type.as_str(),
@@ -1721,6 +1740,7 @@ fn source_snapshot(
         "company_name": mapped.company_name,
         "title": mapped.title,
         "department": mapped.department,
+        "notes": mapped.notes,
         "labels": labels,
         "dropped": mapped.dropped,
     })

@@ -8,6 +8,38 @@
 //! specific - the field mask, the pagination, the sync-token semantics - lives
 //! behind here; everything above it works in [`SourceContact`].
 //!
+//! # One canonical contact model (PMS-1288)
+//!
+//! [`SourceContact`] is the ONE shape every source normalizes into, and it is
+//! shaped after vCard (RFC 6350) because that is the contact standard the
+//! other sources approximate: Google's People API through `google`, an
+//! uploaded `.vcf` file, and later CardDAV (whose payload IS vCard) and
+//! Microsoft 365. There is then exactly one canonical-to-Mokosh mapping
+//! (`mapping::map_contact`) and one matching and review pipeline (`matching`,
+//! `sync`), so a rule decided once - primary email wins, phones typed, an
+//! organisation is a suggestion and never a company - holds for every source
+//! without a second copy that could drift.
+//!
+//! | vCard property | Field | Google People field |
+//! |---|---|---|
+//! | `UID` (else the provider's own id) | [`SourceContact::external_id`] | `resourceName` |
+//! | `REV`, a DAV `getetag`, or a content hash | [`SourceContact::etag`] | `etag` |
+//! | `FN` | [`SourceContact::display_name`] | `names[].displayName` |
+//! | `N` (given; family) | [`SourceContact::given_name`], [`SourceContact::family_name`] | `names[].givenName`, `familyName` |
+//! | `EMAIL` | [`SourceContact::emails`] | `emailAddresses[]` |
+//! | `TEL` | [`SourceContact::phones`] | `phoneNumbers[]` |
+//! | `ORG` (first unit; second unit) | [`SourceContact::organization`], [`SourceContact::department`] | `organizations[].name`, `department` |
+//! | `TITLE` | [`SourceContact::title`] | `organizations[].title` |
+//! | `CATEGORIES` | [`SourceContact::group_ids`] | `memberships[]` |
+//! | `NOTE` | [`SourceContact::note`] | not read: `biographies` is outside the field mask |
+//! | `PHOTO` | [`SourceContact::photo`] | not read: `photos` is outside the field mask |
+//! | `ADR`, `BDAY`, `URL`, and the rest | [`SourceContact::dropped_properties`] | outside the field mask |
+//!
+//! Google's `biographies` stays outside the mask on purpose. A sync token is
+//! only redeemable with the mask that minted it, so widening the mask would
+//! put every live connection's stored token in front of a refusal the client
+//! does not classify as an expiry.
+//!
 //! # One-way, at the permission level
 //!
 //! There is no write method on this trait, and there will not be one. The
@@ -63,6 +95,57 @@ pub struct SourcePhone {
     pub is_primary: bool,
 }
 
+/// One email address as the source holds it.
+///
+/// The address and its label only: which address is primary is carried by
+/// ORDER, primary first, because that is what every source can say and the
+/// mapping's "primary email wins" rule reads the first entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceEmail {
+    pub address: String,
+    /// The source's own label, lowercased: a vCard `TYPE=`, an Apple
+    /// `X-ABLabel` such as `billing desk`, or Google's `type`. Carried so a
+    /// future `contact_emails` table has it; today only the primary address is
+    /// kept and its label is not stored.
+    pub label: Option<String>,
+}
+
+impl From<&str> for SourceEmail {
+    fn from(address: &str) -> Self {
+        Self {
+            address: address.to_string(),
+            label: None,
+        }
+    }
+}
+
+impl From<String> for SourceEmail {
+    fn from(address: String) -> Self {
+        Self {
+            address,
+            label: None,
+        }
+    }
+}
+
+/// A contact's photo, as a source can describe one.
+///
+/// Neither variant carries bytes Mokosh keeps, and neither is ever fetched:
+/// photos are dropped (PSA-70 F), and a URI a `.vcf` names can point anywhere,
+/// so dereferencing it server-side is an SSRF vector (PMS-805). The variant is
+/// kept so the preview can say a photo was left behind, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourcePhoto {
+    /// A link to the image. Stored as text at most, never requested.
+    Uri(String),
+    /// Image bytes embedded in the record (a vCard base64 `PHOTO`), already
+    /// decoded by the reader and measured; the bytes themselves are not kept.
+    Inline {
+        media_type: Option<String>,
+        byte_len: usize,
+    },
+}
+
 /// One contact as the source holds it, before any Mokosh policy is applied.
 ///
 /// Deliberately close to the wire and deliberately lossless about what arrived:
@@ -85,7 +168,7 @@ pub struct SourceContact {
     pub family_name: Option<String>,
     /// Every email the source holds, in the source's order, primary first.
     /// The collapse to one is the mapping layer's, not this layer's.
-    pub emails: Vec<String>,
+    pub emails: Vec<SourceEmail>,
     pub phones: Vec<SourcePhone>,
     /// The source's organisation name. FREE TEXT, and never a company id:
     /// turning it into a `companies` row is a suggestion for a human to
@@ -97,9 +180,18 @@ pub struct SourceContact {
     /// The groups this contact belongs to, as provider group ids. The opt-in
     /// selection (PSA-70 E) is checked against these.
     pub group_ids: Vec<String>,
-    /// Where the provider serves the photo. A URL, not bytes: whether Mokosh
-    /// fetches and stores it is the mapping layer's decision (PSA-70 F).
-    pub photo_url: Option<String>,
+    /// Free text about the person (vCard `NOTE`). Untrusted like every
+    /// other field: the mapping passes it through the same invisible-character
+    /// rule as a request body before it is stored.
+    pub note: Option<String>,
+    /// The photo the source described, if any. Never fetched; see
+    /// [`SourcePhoto`].
+    pub photo: Option<SourcePhoto>,
+    /// Properties this record carried that have no home in Mokosh, by their
+    /// source name (`ADR`, `BDAY`, ...), so the preview can say what an import
+    /// leaves behind. A provider that never requests such fields (Google's
+    /// mask) leaves it empty and lists them statically instead.
+    pub dropped_properties: Vec<String>,
     /// The source says this record is gone. Surfaced, never acted on as a
     /// delete (PSA-70 I).
     pub deleted: bool,
