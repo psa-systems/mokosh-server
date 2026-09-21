@@ -234,9 +234,11 @@ impl MokoshBunyipGrantService {
     /// coupling so a webhook that ships an inconsistent pair fails at
     /// write time rather than reading back inconsistently.
     ///
-    /// Every write invalidates the cache entry for the (grantee,
-    /// account) pair so the next reader sees the fresh value without
-    /// waiting for the TTL.
+    /// `granted_at` is the event's `at`. It is stored as `event_at` and an
+    /// event only applies when it is strictly newer than the stored one, so
+    /// a late, duplicate or replayed event changes nothing (PMS-1295).
+    /// Returns `true` when a row was inserted or changed; only then is the
+    /// cache entry for the (grantee, account) pair invalidated.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         pool: &PgPool,
@@ -247,12 +249,12 @@ impl MokoshBunyipGrantService {
         role: Option<&str>,
         granted_at: DateTime<Utc>,
         revoked_at: Option<DateTime<Utc>>,
-    ) -> AppResult<()> {
-        sqlx::query(
+    ) -> AppResult<bool> {
+        let result = sqlx::query(
             "INSERT INTO mokosh_bunyip_grants (\
                  bunyip_grant_id, owner_bunyip_user_id, grantee_bunyip_user_id, \
-                 mokosh_account_id, role, granted_at, revoked_at, updated_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
+                 mokosh_account_id, role, granted_at, revoked_at, event_at, updated_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $6, NOW()) \
              ON CONFLICT (grantee_bunyip_user_id, mokosh_account_id) \
              DO UPDATE SET \
                  bunyip_grant_id = EXCLUDED.bunyip_grant_id, \
@@ -260,7 +262,9 @@ impl MokoshBunyipGrantService {
                  role = EXCLUDED.role, \
                  granted_at = EXCLUDED.granted_at, \
                  revoked_at = EXCLUDED.revoked_at, \
-                 updated_at = NOW()",
+                 event_at = EXCLUDED.event_at, \
+                 updated_at = NOW() \
+             WHERE mokosh_bunyip_grants.event_at < EXCLUDED.event_at",
         )
         .bind(bunyip_grant_id)
         .bind(owner_bunyip_user_id)
@@ -272,11 +276,14 @@ impl MokoshBunyipGrantService {
         .execute(pool)
         .await?;
 
-        invalidate_cache(&GrantKey {
-            grantee_bunyip_user_id,
-            mokosh_account_id: mokosh_account_id.to_string(),
-        });
-        Ok(())
+        let changed = result.rows_affected() > 0;
+        if changed {
+            invalidate_cache(&GrantKey {
+                grantee_bunyip_user_id,
+                mokosh_account_id: mokosh_account_id.to_string(),
+            });
+        }
+        Ok(changed)
     }
 }
 

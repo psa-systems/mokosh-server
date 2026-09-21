@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::db::platform_admin::{PlatformAdminRepo, PlatformAdminRow};
 use crate::db::Database;
+use crate::modules::auth::mfa_secret;
 use crate::utils::crypto::{hash_password, verify_password};
 use crate::utils::error::{AppError, AppResult};
 
@@ -46,11 +47,22 @@ pub struct PlatformJwtClaims {
 pub struct PlatformAdminService {
     db: Database,
     jwt_secret: String,
+    /// Opens `platform_admins.mfa_secret` (same PMS-871 sealing as `users`).
+    encryption_key: [u8; 32],
 }
 
 impl PlatformAdminService {
     pub fn new(db: Database, jwt_secret: String) -> Self {
-        Self { db, jwt_secret }
+        Self {
+            db,
+            jwt_secret,
+            encryption_key: [0u8; 32],
+        }
+    }
+
+    pub fn with_encryption_key(mut self, key: [u8; 32]) -> Self {
+        self.encryption_key = key;
+        self
     }
 
     #[allow(dead_code)]
@@ -78,6 +90,7 @@ impl PlatformAdminService {
         &self,
         email: &str,
         password: &str,
+        mfa_code: Option<&str>,
     ) -> AppResult<PlatformLoginResponse> {
         let pool = self.db.migrator_pool();
         let admin = PlatformAdminRepo::find_by_email(pool, email)
@@ -104,6 +117,29 @@ impl PlatformAdminService {
         // an older hash from another plane.
         if !verify_password(password, hash).await? {
             return Err(AppError::Unauthorized);
+        }
+
+        // PMS-1293: an enrolled admin needs a valid second factor. A missing
+        // code, a wrong code and a replayed step all answer the same 401 as a
+        // bad password, so the response does not reveal which factor failed.
+        if admin.mfa_enabled {
+            let code = mfa_code.ok_or(AppError::Unauthorized)?;
+            let stored = admin
+                .mfa_secret
+                .as_deref()
+                .ok_or_else(|| AppError::Internal("MFA enabled without secret".to_string()))?;
+            let stored = mfa_secret::open(stored, &self.encryption_key)?;
+            let secret = crate::utils::totp::base32_decode(stored.secret_b32())
+                .map_err(|_| AppError::Internal("stored MFA secret is corrupt".to_string()))?;
+            let accepted = match crate::utils::totp::verify(&secret, code, Utc::now(), 1) {
+                Some(step) => PlatformAdminRepo::advance_totp_step(pool, admin.id, step)
+                    .await
+                    .map_err(|_| AppError::Unauthorized)?,
+                None => false,
+            };
+            if !accepted {
+                return Err(AppError::Unauthorized);
+            }
         }
 
         // Best-effort last_login stamp; failure does not block the login.

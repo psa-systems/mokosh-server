@@ -159,7 +159,7 @@ async fn a_revoked_row_can_be_reinstated_by_a_later_granted_event(pool: PgPool) 
         grantee,
         account,
         Some("read_only"),
-        now,
+        now + chrono::Duration::seconds(1),
         None,
     )
     .await
@@ -712,4 +712,76 @@ async fn a_row_with_no_bunyip_user_id_is_invisible_to_the_new_resolver(pool: PgP
         .expect("query runs")
         .expect("legacy row is still resolvable by id");
     assert_eq!(via_old.user.id, sub);
+}
+
+/// PMS-1295: a `granted` event older than the stored revoked row leaves
+/// it revoked, and a re-delivery of the same event changes nothing.
+#[sqlx::test]
+async fn a_stale_granted_event_never_reinstates_and_a_duplicate_is_a_no_op(pool: PgPool) {
+    clear_cache_for_tests();
+    let (grant_id, owner, grantee, account) = triple();
+    let t1 = Utc::now() - chrono::Duration::minutes(10);
+    let t2 = t1 + chrono::Duration::minutes(5);
+
+    let applied = MokoshBunyipGrantService::upsert(
+        &pool,
+        grant_id,
+        owner,
+        grantee,
+        account,
+        None,
+        t2,
+        Some(t2),
+    )
+    .await
+    .unwrap();
+    assert!(applied);
+
+    let stale = MokoshBunyipGrantService::upsert(
+        &pool,
+        grant_id,
+        owner,
+        grantee,
+        account,
+        Some("admin"),
+        t1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!stale);
+    assert!(
+        !MokoshBunyipGrantService::is_grant_active(&pool, grantee, account)
+            .await
+            .unwrap()
+    );
+
+    let before: (chrono::DateTime<Utc>,) = sqlx::query_as(
+        "SELECT updated_at FROM mokosh_bunyip_grants WHERE grantee_bunyip_user_id = $1",
+    )
+    .bind(grantee)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let dup = MokoshBunyipGrantService::upsert(
+        &pool,
+        grant_id,
+        owner,
+        grantee,
+        account,
+        None,
+        t2,
+        Some(t2),
+    )
+    .await
+    .unwrap();
+    assert!(!dup);
+    let after: (chrono::DateTime<Utc>,) = sqlx::query_as(
+        "SELECT updated_at FROM mokosh_bunyip_grants WHERE grantee_bunyip_user_id = $1",
+    )
+    .bind(grantee)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before.0, after.0);
 }

@@ -83,6 +83,25 @@ impl PlatformAdminRepo {
         Ok(())
     }
 
+    /// Anti-replay watermark: advances `mfa_last_totp_step` only to a step
+    /// strictly greater than the stored one, so two logins presenting the same
+    /// code cannot both win. Returns whether this call won it.
+    pub async fn advance_totp_step(
+        pool: &PgPool,
+        admin_id: Uuid,
+        step: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE platform_admins SET mfa_last_totp_step = $1, updated_at = NOW() \
+             WHERE id = $2 AND mfa_last_totp_step < $1",
+        )
+        .bind(step)
+        .bind(admin_id)
+        .execute(pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
     pub async fn update_last_login(pool: &PgPool, admin_id: Uuid) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE platform_admins SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1",

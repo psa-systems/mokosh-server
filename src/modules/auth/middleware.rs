@@ -32,6 +32,16 @@ pub enum BearerOutcome {
     Rejected,
 }
 
+/// PMS-1299 (F7a): a rejection any anonymous caller can trigger with a junk
+/// token stays at `debug`; only a JWKS or discovery outage is an operator
+/// problem and stays at `warn`.
+fn is_anonymous_rejection(error: &VerifyError) -> bool {
+    !matches!(
+        error,
+        VerifyError::JwksFetch(_) | VerifyError::DiscoveryFetch(_)
+    )
+}
+
 impl BearerOutcome {
     /// Classify a bunyip verification failure. Only `Expired` is singled out;
     /// every other variant is an ordinary `invalid_token` rejection as far as
@@ -318,7 +328,7 @@ pub async fn auth_middleware(
                     // loud.
                     Err(e) => {
                         outcome = BearerOutcome::from_verify_error(&e);
-                        if outcome == BearerOutcome::Expired {
+                        if is_anonymous_rejection(&e) {
                             tracing::debug!(error = %e, "bunyip bearer rejected");
                         } else {
                             tracing::warn!(error = %e, "bunyip bearer rejected");
@@ -2273,5 +2283,24 @@ mod tests {
         ] {
             assert_eq!(effective_role_from_bunyip(None, local), local);
         }
+    }
+}
+
+#[cfg(test)]
+mod pms_1299_tests {
+    use super::*;
+
+    #[test]
+    fn junk_token_rejections_are_debug_and_outages_are_warn() {
+        assert!(is_anonymous_rejection(&VerifyError::Malformed("x".into())));
+        assert!(is_anonymous_rejection(&VerifyError::InvalidSignature));
+        assert!(is_anonymous_rejection(&VerifyError::UnknownKid));
+        assert!(is_anonymous_rejection(&VerifyError::InvalidIssuer));
+        assert!(is_anonymous_rejection(&VerifyError::InvalidAudience));
+        assert!(is_anonymous_rejection(&VerifyError::Expired));
+        assert!(!is_anonymous_rejection(&VerifyError::JwksFetch("x".into())));
+        assert!(!is_anonymous_rejection(&VerifyError::DiscoveryFetch(
+            "x".into()
+        )));
     }
 }
