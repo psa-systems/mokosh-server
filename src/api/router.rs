@@ -385,7 +385,10 @@ pub fn create_api_router(
         // endpoints) can resolve it.
         .nest(
             "/platform",
-            platform_routes(PlatformAdminService::new(db.clone(), jwt_secret.clone())),
+            platform_routes(
+                PlatformAdminService::new(db.clone(), jwt_secret.clone())
+                    .with_encryption_key(encryption_key),
+            ),
         )
         // Tenant management. Only mounted in multi-tenant builds: in a
         // single-tenant deployment there is exactly one tenant and the
