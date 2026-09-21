@@ -766,6 +766,15 @@ impl ContactAuthService {
         let token = format!("{contact_id}.{secret}");
         let expires_at = Utc::now() + Duration::minutes(RESET_TOKEN_TTL_MIN);
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1297: a new reset link supersedes the earlier ones.
+        sqlx::query(
+            "UPDATE portal_setup_tokens SET used_at = NOW() \
+             WHERE contact_id = $1 AND tenant_id = $2 AND used_at IS NULL",
+        )
+        .bind(contact_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, lookup_hash, expires_at) \
              VALUES ($1, $2, $3, $4, $5)",

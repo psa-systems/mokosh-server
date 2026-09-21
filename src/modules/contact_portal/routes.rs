@@ -22,7 +22,7 @@ use super::models::*;
 use super::service::ContactAuthService;
 use crate::modules::auth::{CallerContext, TenantId};
 use crate::modules::contact_portal::capabilities as caps;
-use crate::utils::error::{AppError, AppResult};
+use crate::utils::error::{rate_limited_response, AppError, AppResult};
 
 const REFRESH_COOKIE_NAME: &str = "mokosh:contact_token";
 const REFRESH_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
@@ -40,6 +40,13 @@ pub struct ContactRouterState {
     /// own saved payment methods. Built at startup so the four routes
     /// below all reach the same service instance.
     pub payment_methods: Arc<super::payment_methods::PaymentMethodsService>,
+    /// PMS-1297: per-(IP, slug+email) budget for `POST /auth/forgot-password`,
+    /// spent before the lookup so a known and an unknown address cost the same.
+    pub forgot_password_limiter: Arc<crate::modules::auth::rate_limit::AuthRateLimiter>,
+    /// PMS-1297: one budget for `set-password` AND `reset-password`, keyed on
+    /// the contact id in the token, because both redeem the same
+    /// `portal_setup_tokens` row.
+    pub reset_password_limiter: Arc<crate::modules::auth::rate_limit::AuthRateLimiter>,
 }
 
 /// Build the `/api/v1/contact/*` sub-router. Layered with
@@ -58,6 +65,8 @@ pub fn contact_routes(
         service: service_arc,
         reauth_limiter: crate::modules::auth::rate_limit::ReauthRateLimiter::new(10, 5),
         payment_methods,
+        forgot_password_limiter: crate::modules::auth::rate_limit::AuthRateLimiter::new(10, 3),
+        reset_password_limiter: crate::modules::auth::rate_limit::AuthRateLimiter::new(10, 3),
     };
     Router::new()
         .route("/auth/login", post(login))
@@ -252,40 +261,95 @@ async fn logout(
     Ok(resp)
 }
 
+/// PMS-1297: spend the shared token-redemption budget for `token`. The
+/// account key is the contact id the token names; an unparseable token
+/// spends only the IP bucket.
+fn redeem_throttle(
+    state: &ContactRouterState,
+    addr: SocketAddr,
+    headers: &HeaderMap,
+    token: &str,
+) -> Option<Response> {
+    let ip = crate::utils::client_ip::extract_client_ip(
+        addr.ip(),
+        headers,
+        crate::utils::client_ip::trusted_proxies(),
+    );
+    let account = super::service::parse_contact_bound_token(token)
+        .map(|(id, _)| id.to_string())
+        .unwrap_or_default();
+    state
+        .reset_password_limiter
+        .check(ip, &account)
+        .err()
+        .map(|retry_after| {
+            rate_limited_response(
+                retry_after,
+                "Too many password attempts, please try again later",
+            )
+        })
+}
+
 async fn set_password(
     State(state): State<ContactRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ContactSetPasswordRequest>,
-) -> AppResult<StatusCode> {
+) -> Result<Response, AppError> {
     request.validate()?;
+    if let Some(resp) = redeem_throttle(&state, addr, &headers, &request.token) {
+        return Ok(resp);
+    }
     state
         .service
         .setup_password(&request.token, &request.password)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn reset_password(
     State(state): State<ContactRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ContactResetPasswordRequest>,
-) -> AppResult<StatusCode> {
+) -> Result<Response, AppError> {
     request.validate()?;
+    if let Some(resp) = redeem_throttle(&state, addr, &headers, &request.token) {
+        return Ok(resp);
+    }
     state
         .service
         .reset_password(&request.token, &request.password)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn forgot_password(
     State(state): State<ContactRouterState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<ContactForgotPasswordRequest>,
-) -> AppResult<StatusCode> {
+) -> Result<Response, AppError> {
     request.validate()?;
+    let ip = crate::utils::client_ip::extract_client_ip(
+        addr.ip(),
+        &headers,
+        crate::utils::client_ip::trusted_proxies(),
+    );
+    // Keyed on (slug, email) because an email is only unique per portal;
+    // spent before the lookup, so a known and an unknown address are identical.
+    let account = format!("{}|{}", request.slug.trim(), request.email);
+    if let Err(retry_after) = state.forgot_password_limiter.check(ip, &account) {
+        return Ok(rate_limited_response(
+            retry_after,
+            "Too many password reset requests, please try again later",
+        ));
+    }
     state
         .service
         .request_password_reset(&request.slug, &request.email)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// mokosh-contact-login prompt 010 (PMS-918): POST /auth/login-link.
