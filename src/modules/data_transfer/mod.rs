@@ -447,6 +447,8 @@ async fn import_tenant_data(
     )
     .await?;
     tx.commit().await?;
+    // PMS-1238: the wipe emptied the lookup tables the memo vouches for.
+    crate::modules::tenants::forget_seeded_tenant(tenant.get()).await;
 
     Ok(Json(json!({
         "status": "imported",

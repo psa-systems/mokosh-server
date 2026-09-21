@@ -1318,6 +1318,8 @@ impl NotificationsService {
             // fallback body was the whole dispatch JSON (recipient
             // addresses, user ids, ticket text) mailed to a real
             // recipient. Skip the rule and log the misconfiguration.
+            // PMS-1238: a deactivated template does not send, whatever its rule says.
+            let template = template.filter(|t| t.is_active.unwrap_or(true));
             let Some(template) = template else {
                 tracing::warn!(
                     %tenant_id,

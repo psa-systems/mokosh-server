@@ -156,10 +156,19 @@ const COMPANY_UNLINKED: &[(&str, &str)] = &[
     ("contacts", "contacts"),
     ("projects", "projects"),
     ("appointments", "appointments"),
+    ("active_timers", "running timers"),
+    ("rmm_device_mappings", "RMM device mappings"),
 ];
 
 /// What a delete destroys outright.
-const COMPANY_REMOVED: &[(&str, &str)] = &[("sites", "sites")];
+const COMPANY_REMOVED: &[(&str, &str)] = &[
+    ("sites", "sites"),
+    ("form_request_tokens", "request form links"),
+    ("contact_companies", "contact company links"),
+    ("portal_exports", "portal exports"),
+    ("portal_login_intents", "portal login links"),
+    ("portal_roles", "company-scoped portal roles"),
+];
 
 fn company_delete_blocked(constraint: Option<&str>) -> AppError {
     let named = constraint.and_then(|c| {

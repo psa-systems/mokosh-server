@@ -64,6 +64,19 @@ fn unknown_sort(requested: &str, allowed: &[&str]) -> AppError {
 }
 
 impl PaginationParams {
+    /// PMS-1238: `sort_dir` other than asc/desc is a 422, not a silent DESC.
+    /// An empty value (the `Default` shape) stays the descending default.
+    fn direction(&self) -> AppResult<&'static str> {
+        match self.sort_dir.to_lowercase().as_str() {
+            "asc" => Ok("ASC"),
+            "" | "desc" => Ok("DESC"),
+            other => Err(AppError::validation_field(
+                "sort_dir",
+                format!("unknown sort direction `{other}`; accepted: asc, desc"),
+            )),
+        }
+    }
+
     /// Maximum allowed items per page
     pub const MAX_PER_PAGE: u32 = 100;
 
@@ -123,7 +136,7 @@ impl PaginationParams {
             None => default_sql,
         };
 
-        let direction = if self.is_ascending() { "ASC" } else { "DESC" };
+        let direction = self.direction()?;
 
         Ok(format!("{} {}", sql, direction))
     }
@@ -153,7 +166,7 @@ impl PaginationParams {
             None => default_field,
         };
 
-        let direction = if self.is_ascending() { "ASC" } else { "DESC" };
+        let direction = self.direction()?;
 
         Ok(format!("{} {}", field, direction))
     }
@@ -407,6 +420,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(zero.per_page(), 1);
+    }
+
+    #[test]
+    fn an_unknown_sort_dir_is_rejected() {
+        let p = PaginationParams {
+            sort_dir: "sideways".to_string(),
+            ..Default::default()
+        };
+        assert!(p.order_by("id", &["id"]).is_err());
     }
 
     #[test]

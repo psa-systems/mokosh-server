@@ -26,6 +26,8 @@ pub use mokosh_types::text::sanitize_invisible;
 /// - `key`: the only request DTO field with this name is
 ///   `UpsertTenantSettingRequest::key`, a settings key the user types. The
 ///   `key` in `CreateApiKeyResponse` is response-only and never parsed here.
+/// - `value`: a configuration item's value is stored encrypted and compared
+///   byte for byte, so the generic field name is exempt (PMS-1238).
 /// - `username`: the credential-vault and SMTP username are login identifiers a
 ///   person retypes, and a stray trailing space in one is the bug, not the data.
 ///
@@ -66,6 +68,7 @@ pub const SECRET_FIELD_NAMES: &[&str] = &[
     "token_hash",
     "totp_code",
     "totp_secret",
+    "value",
     "webhook_secret",
 ];
 

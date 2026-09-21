@@ -90,8 +90,9 @@ impl ReportsService {
         let warn_sql = format!(
             r#"SELECT COUNT(*)::bigint FROM tickets
                WHERE tenant_id = $1 AND sla_due_date < NOW() + INTERVAL '2 hours'
-                 AND sla_due_date > NOW() AND closed_at IS NULL{team}"#,
+                 AND sla_due_date > NOW(){stop}{team}"#,
             team = team_clause("", 2),
+            stop = SLA_CLOCK_RUNNING,
         );
         let mut warn_q = sqlx::query_scalar::<_, i64>(&warn_sql).bind(tenant_id);
         if let Some(team_id) = team_id {
@@ -101,8 +102,9 @@ impl ReportsService {
 
         let breach_sql = format!(
             r#"SELECT COUNT(*)::bigint FROM tickets
-               WHERE tenant_id = $1 AND sla_due_date < NOW() AND closed_at IS NULL{team}"#,
+               WHERE tenant_id = $1 AND sla_due_date < NOW(){stop}{team}"#,
             team = team_clause("", 2),
+            stop = SLA_CLOCK_RUNNING,
         );
         let mut breach_q = sqlx::query_scalar::<_, i64>(&breach_sql).bind(tenant_id);
         if let Some(team_id) = team_id {
@@ -777,3 +779,7 @@ impl ReportsService {
         })
     }
 }
+
+/// PMS-1238: the SLA clock runs only while a ticket is unresolved, unclosed
+/// and not in a closed status, the same definition the SLA worker uses.
+const SLA_CLOCK_RUNNING: &str = " AND resolved_at IS NULL AND closed_at IS NULL AND NOT COALESCE((SELECT is_closed FROM ticket_statuses s WHERE s.id = status_id), FALSE)";

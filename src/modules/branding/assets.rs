@@ -292,11 +292,12 @@ impl BrandingAssetStore {
         if bytes.len() as u64 > cap {
             return Err(oversized_upload_error("image", cap));
         }
-        self.remove(scope, kind).await;
-
+        // PMS-1238: write the new file first and clear the other formats
+        // after, so a failed write leaves the old asset in place.
         if let Some(tenant_id) = Self::tenant_logo_id(scope, kind) {
             let key = ObjectKey::tenant_logo(tenant_id, extension_for(mime));
             self.logo_store.put(&key, bytes).await?;
+            self.remove_except(scope, kind, Some(mime)).await;
             if let Some(ledger) = &self.ledger {
                 // Keyed on the TENANT, not a fresh id: one logo per tenant,
                 // upserted the way `TenantLogoStore::store` does.
@@ -325,6 +326,7 @@ impl BrandingAssetStore {
         tokio::fs::write(self.path_for(scope, kind, mime), bytes)
             .await
             .map_err(|e| AppError::Internal(format!("write asset: {e}")))?;
+        self.remove_except(scope, kind, Some(mime)).await;
         Ok(mime)
     }
 
@@ -443,8 +445,21 @@ impl BrandingAssetStore {
     /// effort: an unreachable file the branding row no longer points
     /// at cannot fail the request that cleared the row.
     pub async fn remove(&self, scope: AssetScope, kind: BrandAssetKind) {
+        self.remove_except(scope, kind, None).await;
+    }
+
+    /// Remove every stored format except `keep_mime`, the one just written.
+    async fn remove_except(
+        &self,
+        scope: AssetScope,
+        kind: BrandAssetKind,
+        keep_mime: Option<&str>,
+    ) {
         if let Some(tenant_id) = Self::tenant_logo_id(scope, kind) {
-            for (_, extension) in ALLOWED_MIME {
+            for (mime, extension) in ALLOWED_MIME {
+                if keep_mime == Some(*mime) {
+                    continue;
+                }
                 let _ = self
                     .logo_store
                     .delete(&ObjectKey::tenant_logo(tenant_id, *extension))
@@ -458,6 +473,9 @@ impl BrandingAssetStore {
         }
 
         for (mime, _) in ALLOWED_MIME {
+            if keep_mime == Some(*mime) {
+                continue;
+            }
             let _ = tokio::fs::remove_file(self.path_for(scope, kind, mime)).await;
         }
     }

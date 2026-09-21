@@ -603,10 +603,10 @@ impl AttachmentService {
         // id rather than by the path the row carried, so a stale or hostile
         // value in that column cannot unlink something else.
         let _ = path;
-        let _ = self
-            .store
+        // PMS-1238: a failed unlink is reported, not swallowed.
+        self.store
             .delete(&ObjectKey::ticket_attachment(tenant_id, attachment_id))
-            .await;
+            .await?;
         let _ = self.ledger.forget(tenant_id, attachment_id).await;
         Ok(())
     }
