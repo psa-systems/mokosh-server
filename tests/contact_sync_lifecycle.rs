@@ -85,7 +85,9 @@ fn person(external_id: &str, etag: &str, given: &str, email: &str) -> SourceCont
         title: None,
         department: None,
         group_ids: vec![CLIENTS.into()],
-        photo_url: None,
+        note: None,
+        photo: None,
+        dropped_properties: vec![],
         deleted: false,
     }
 }
@@ -268,7 +270,7 @@ async fn an_edit_locks_the_field_and_survives_the_next_sync(pool: PgPool) {
     assert_eq!(
         f.call(
             reqwest::Method::DELETE,
-            &format!("/api/v1/contacts/contacts/{contact}/sync/locks/notes"),
+            &format!("/api/v1/contacts/contacts/{contact}/sync/locks/timezone"),
             None
         )
         .await
@@ -288,6 +290,67 @@ async fn an_edit_locks_the_field_and_survives_the_next_sync(pool: PgPool) {
     assert_eq!(
         f.count("SELECT count(*) FROM audit_log WHERE new_values->>'event' IN ('contact_sync.fields_locked', 'contact_sync.lock_released')").await,
         2
+    );
+}
+
+/// PMS-1288: `NOTE` is a canonical field, so the sync writes it on create,
+/// follows the source on update, and a person's edit locks it like any other.
+#[sqlx::test]
+async fn an_imported_note_follows_the_source_until_someone_edits_it(pool: PgPool) {
+    let f = Fixture::new(pool).await;
+    let source = FakeSource::new();
+    let mut ada = person("people/ada", "e1", "Ada", "ada@acme.example");
+    ada.note = Some("Prefers email.\nCall after 3pm.".into());
+    source.next(vec![ada.clone()], false);
+    f.sync(&source).await;
+    let contact = f.linked_contact("people/ada").await;
+    assert_eq!(
+        f.column(contact, "notes").await.as_deref(),
+        Some("Prefers email.\nCall after 3pm."),
+        "created with the note, line break kept"
+    );
+
+    ada.etag = Some("e2".into());
+    ada.note = Some("Prefers phone.".into());
+    source.next(vec![ada.clone()], false);
+    assert_eq!(f.sync(&source).await.updated, 1);
+    assert_eq!(
+        f.column(contact, "notes").await.as_deref(),
+        Some("Prefers phone."),
+        "an unlocked note follows the source"
+    );
+
+    let (status, _) = f
+        .call(
+            reqwest::Method::PUT,
+            &format!("/api/v1/contacts/contacts/{contact}"),
+            Some(json!({ "notes": "VIP. Escalate to Grace." })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, provenance) = f
+        .call(
+            reqwest::Method::GET,
+            &format!("/api/v1/contacts/contacts/{contact}/sync"),
+            None,
+        )
+        .await;
+    let locked: Vec<&str> = provenance["locks"]
+        .as_array()
+        .expect("locks")
+        .iter()
+        .filter_map(|l| l["field"].as_str())
+        .collect();
+    assert_eq!(locked, vec!["notes"], "{provenance}");
+
+    ada.etag = Some("e3".into());
+    ada.note = Some("Something else entirely.".into());
+    source.next(vec![ada], false);
+    f.sync(&source).await;
+    assert_eq!(
+        f.column(contact, "notes").await.as_deref(),
+        Some("VIP. Escalate to Grace."),
+        "the edit survives the next sync"
     );
 }
 

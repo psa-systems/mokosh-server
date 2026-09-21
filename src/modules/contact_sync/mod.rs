@@ -16,6 +16,8 @@
 //! * `locks`: an edit in Mokosh locks the field against the source; the
 //!   service's provenance, unlink and data-removal methods are the rest of what
 //!   decides whether a person trusts the integration (PMS-1214).
+//! * `vcard`: an uploaded `.vcf` file read into the same canonical records,
+//!   bounded and never fetching what a card links to (PMS-1289).
 
 pub mod google;
 pub mod locks;
@@ -28,5 +30,6 @@ pub mod routes;
 pub mod runs;
 pub mod service;
 pub mod sync;
+pub mod vcard;
 
 pub use service::ContactSyncService;

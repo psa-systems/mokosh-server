@@ -97,13 +97,15 @@ fn person(n: usize) -> SourceContact {
         display_name: None,
         given_name: Some(format!("Person{n}")),
         family_name: Some("Imported".into()),
-        emails: vec![format!("person{n}@clients.example")],
+        emails: vec![format!("person{n}@clients.example").into()],
         phones: vec![],
         organization: None,
         title: None,
         department: None,
         group_ids: vec![CLIENTS.into()],
-        photo_url: None,
+        note: None,
+        photo: None,
+        dropped_properties: vec![],
         deleted: false,
     }
 }

@@ -39,6 +39,7 @@ const SCALAR_COLUMNS: &[&str] = &[
     fields::TITLE,
     fields::DEPARTMENT,
     fields::COMPANY_NAME,
+    fields::NOTES,
 ];
 
 impl EditSnapshot {
@@ -74,7 +75,8 @@ impl EditSnapshot {
             "SELECT jsonb_build_object( \
                  'first_name', COALESCE(c.first_name, ''), 'last_name', COALESCE(c.last_name, ''), \
                  'email', COALESCE(c.email, ''), 'title', COALESCE(c.title, ''), \
-                 'department', COALESCE(c.department, ''), 'company_name', COALESCE(c.company_name, '')), \
+                 'department', COALESCE(c.department, ''), 'company_name', COALESCE(c.company_name, ''), \
+                 'notes', COALESCE(c.notes, '')), \
                  COALESCE((SELECT string_agg(t, ',' ORDER BY t) FROM unnest(c.tags) t), ''), \
                  COALESCE((SELECT string_agg(p.phone_type || ':' || p.number || ':' || COALESCE(p.extension, ''), ',' \
                                              ORDER BY p.phone_type, p.number) \
