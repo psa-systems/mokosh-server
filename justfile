@@ -62,7 +62,7 @@ pre-commit: ensure-env
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
 
 # Keep every relative Markdown link pointing at a file that exists (PMS-850).
 # The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and
@@ -160,6 +160,14 @@ ci-stalls-self-test:
 [group: 'check']
 check-validate-parity:
     nu scripts/check-create-update-validate-parity.nu
+
+# Every mounted route needs a caller in mokosh-apps/src/ or a dated "parity
+# record" comment in its routes.rs (PMS-1263). Skips loudly with no sibling
+# mokosh-apps checkout (or $MOKOSH_APPS_DIR).
+[doc("Fail if a route has no SPA caller and no dated parity record (PMS-1263).")]
+[group: 'check']
+check-route-consumers:
+    nu scripts/check-route-consumers.nu
 
 # Keep transactional email body copy in notification_templates, not in Rust
 # (PMS-700). Fails if a `Mailer` helper re-adds a seeded template's wording.

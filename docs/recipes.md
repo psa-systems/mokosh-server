@@ -27,6 +27,7 @@ just check-migration-immutability # fail if a migration already on main is modif
 just check-guarded-content-migrations # fail if a migration after 209 guards a content UPDATE without asserting its row count
 just check-pool-safety      # fail if a serving `.pool()` call lacks its `// SAFETY` note
 just check-validate-parity  # fail if a Create*Request and its Update*Request validate a field differently
+just check-route-consumers # fail if a route has no SPA caller and no dated parity record
 just check-mail-copy        # fail if a `Mailer` helper duplicates a seeded template's copy
 just check-rate-limit-helper # fail if a 429 response is built outside the shared builder
 just check-runner-labels    # fail if a CI job requests the wrong runner label
