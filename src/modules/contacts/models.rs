@@ -17,15 +17,14 @@ use uuid::Uuid;
 /// 555556666" alongside the URL and the operator can dictate it over
 /// the phone. Pinned to i64 to match `companies.portal_id BIGINT`.
 ///
-/// PMS-1327: the setup token used to ride here as `setup_link` so the
-/// SPA could paint the "Copy this link" affordance. That handed the
-/// password-setup capability to anyone who could read the markup.
-/// `setup_link` stays on the struct so the integration suite can
-/// exercise the redemption flow it drives, but is `#[serde(skip)]` on
-/// the response: the SPA never sees it, and the token reaches the
-/// contact only through the registration email `send_grant_email`
-/// dispatches. `password_email_queued` says whether that mail went so
-/// the SPA can still distinguish a fresh grant from a role-only edit.
+/// The setup token used to ride here as `setup_link` so the SPA could
+/// paint a "Copy this link" affordance, which handed password-setup
+/// capability to anyone who could read the markup. `setup_link` stays
+/// on the struct so the integration suite can drive the redemption
+/// flow, but is `#[serde(skip)]` on the response: the SPA never sees
+/// it, and the token reaches the contact only through the setup email
+/// `send_grant_email` dispatches. `password_email_queued` lets the SPA
+/// still distinguish a fresh grant from a role-only edit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortalGrantOutcome {
     pub portal_slug: String,
@@ -40,11 +39,11 @@ pub struct PortalGrantOutcome {
 mod portal_grant_outcome_serde_tests {
     use super::*;
 
-    /// PMS-1327: the setup token is what sets the account password, so the
-    /// SPA must never see it. The wire shape carries `portal_slug`,
-    /// `portal_id` and `password_email_queued` only. Two guards, both
-    /// failing loud: the serialized JSON must NOT hold the field, and it
-    /// must NOT hold the token or the URL that carries it.
+    /// The setup token is what sets the account password, so the SPA
+    /// must never see it. The wire shape carries `portal_slug`,
+    /// `portal_id` and `password_email_queued` only, and this test
+    /// fails loud if the serialized JSON holds the field, the URL or
+    /// the token.
     #[test]
     fn serialised_outcome_does_not_leak_the_setup_link() {
         let outcome = PortalGrantOutcome {
@@ -57,15 +56,15 @@ mod portal_grant_outcome_serde_tests {
         let json = serde_json::to_string(&outcome).expect("serialise outcome");
         assert!(
             !json.contains("setup_link"),
-            "PMS-1327: setup_link field must not reach the wire: {json}"
+            "setup_link field must not reach the wire: {json}"
         );
         assert!(
             !json.contains("set-password"),
-            "PMS-1327: the setup URL must not reach the wire: {json}"
+            "the setup URL must not reach the wire: {json}"
         );
         assert!(
             !json.contains("SECRET"),
-            "PMS-1327: the setup token must not reach the wire: {json}"
+            "the setup token must not reach the wire: {json}"
         );
         assert!(json.contains("\"portal_slug\":\"acme\""));
         assert!(json.contains("\"portal_id\":555556666"));

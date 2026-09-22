@@ -1751,8 +1751,8 @@ impl ContactService {
     /// best-effort AFTER the tx commits so a mailer outage does not
     /// undo the grant. Returns `PortalGrantOutcome { portal_slug,
     /// portal_id, password_email_queued }`; the setup token itself is
-    /// no longer serialised to the SPA (PMS-1327) and reaches the
-    /// contact only through the queued email.
+    /// no longer serialised to the SPA and reaches the contact only
+    /// through the queued email.
     ///
     /// Guards:
     /// - Contact must exist under `tenant_id`.
@@ -1995,10 +1995,10 @@ impl ContactService {
         .await?
         .unwrap_or(false);
 
-        // PMS-1327: the token stays server-side; the response carries only
-        // whether an email was queued so the SPA can distinguish a fresh
-        // grant from a role-only edit. `setup_link` is `#[serde(skip)]`
-        // on the wire and populated for the integration suite's benefit.
+        // The token stays server-side; the response carries only whether
+        // an email was queued so the SPA can distinguish a fresh grant
+        // from a role-only edit. `setup_link` is `#[serde(skip)]` on the
+        // wire and populated for the integration suite's benefit.
         let token_for_email: Option<String> = if already_credentialled {
             audit_write(
                 &mut *tx,
