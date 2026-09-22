@@ -27,9 +27,7 @@ use uuid::Uuid;
 
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
-use crate::modules::contact_portal::capabilities::{
-    BUILTIN_BILLING_CONTACT_KEY, INVOICES_READ,
-};
+use crate::modules::contact_portal::capabilities::{BUILTIN_BILLING_CONTACT_KEY, INVOICES_READ};
 use crate::utils::error::AppResult;
 
 /// Make sure `contact_id` can read invoices, and say whether that changed
