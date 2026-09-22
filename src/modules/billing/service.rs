@@ -3907,7 +3907,18 @@ impl BillingService {
         }
 
         let current = self.get_invoice(tenant_id, invoice_id).await?;
+        let company_change = request
+            .company_id
+            .filter(|company_id| *company_id != current.company_id);
         if current.status.is_frozen() {
+            // PMS-977: said in the company's own words, because "cannot be
+            // edited" does not tell the operator what to do instead.
+            if company_change.is_some() {
+                return Err(AppError::Conflict(format!(
+                    "The company of a {} invoice cannot be changed: the customer already holds it. Issue a credit note against it and invoice the right company instead.",
+                    current.status.as_str()
+                )));
+            }
             return Err(AppError::Conflict(format!(
                 "Invoice in status '{}' cannot be edited",
                 current.status.as_str()
@@ -3998,6 +4009,24 @@ impl BillingService {
             current.subtotal
         };
 
+        // PMS-977: after the lines are replaced, so the check reads the lines
+        // this update leaves on the invoice.
+        let moved_company = match company_change {
+            Some(new_company) => Some(
+                Self::assert_draft_can_move_company(
+                    &mut tx,
+                    tenant_id,
+                    invoice_id,
+                    current.company_id,
+                    new_company,
+                    request.contract_id,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        let company_id = company_change.unwrap_or(current.company_id);
+
         let tax = request.tax_amount.unwrap_or(current.tax_amount);
         let discount = request.discount_amount.unwrap_or(current.discount_amount);
         let total = subtotal + tax - discount;
@@ -4022,13 +4051,8 @@ impl BillingService {
         // could address an invoice to another tenant's contact. Same hole
         // `assert_payment_term_in_tenant` closes next door (PMS-333).
         if let Some(contact_id) = request.billing_contact_id {
-            Self::assert_billing_contact_for_company(
-                &mut tx,
-                tenant_id,
-                current.company_id,
-                contact_id,
-            )
-            .await?;
+            Self::assert_billing_contact_for_company(&mut tx, tenant_id, company_id, contact_id)
+                .await?;
         }
 
         // PMS-990: a term change with no due date re-derives the due date
@@ -4055,10 +4079,14 @@ impl BillingService {
         // emailing on purpose (`skip_email`), which is a hand-delivered invoice
         // and says so.
         let recipient = if just_sent && !request.skip_email {
-            let contact = request.billing_contact_id.or(current.billing_contact_id);
-            match Self::resolve_invoice_recipient(&mut tx, tenant_id, current.company_id, contact)
-                .await?
-            {
+            // A company change drops the old company's contact (below), so
+            // the recipient is resolved from the new company alone.
+            let contact = if company_change.is_some() {
+                request.billing_contact_id
+            } else {
+                request.billing_contact_id.or(current.billing_contact_id)
+            };
+            match Self::resolve_invoice_recipient(&mut tx, tenant_id, company_id, contact).await? {
                 Ok(recipient) => Some(recipient),
                 Err(reason) => return Err(AppError::Conflict(reason)),
             }
@@ -4088,7 +4116,11 @@ impl BillingService {
         sqlx::query(
             r#"
             UPDATE invoices SET
-                billing_contact_id = COALESCE($2, billing_contact_id),
+                -- PMS-977: a company change replaces the contact outright,
+                -- clearing it when none of the new company's is named; the
+                -- old one is the old company's person.
+                billing_contact_id = CASE WHEN $19 THEN $2 ELSE COALESCE($2, billing_contact_id) END,
+                company_id         = COALESCE($18, company_id),
                 contract_id        = COALESCE($3, contract_id),
                 invoice_date       = COALESCE($4, invoice_date),
                 due_date           = COALESCE($5, due_date),
@@ -4134,6 +4166,8 @@ impl BillingService {
                 .transpose()
                 .map_err(|e| AppError::Internal(format!("issuer snapshot: {e}")))?,
         )
+        .bind(company_change)
+        .bind(company_change.is_some())
         .execute(&mut *tx)
         .await?;
         // PMS-1029: replacing the lines or naming a rate re-derives the tax
@@ -4267,10 +4301,136 @@ impl BillingService {
             after,
         )
         .await?;
+        // PMS-977: the move gets its own row, naming both companies, so the
+        // history reads as "moved from A to B by whom" rather than as a
+        // column difference inside a whole-row snapshot.
+        if let Some(moved) = moved_company {
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                ctx,
+                AuditAction::Update,
+                "invoices",
+                Some(invoice_id),
+                Some(serde_json::json!({
+                    "company_id": current.company_id,
+                    "company_name": moved.from_name,
+                })),
+                Some(serde_json::json!({
+                    "event": "invoice.company_changed",
+                    "invoice_number": current.invoice_number,
+                    "company_id": company_id,
+                    "company_name": moved.to_name,
+                    "billing_contact_id": billing_contact_id,
+                })),
+            )
+            .await?;
+        }
 
         tx.commit().await?;
 
         self.get_invoice(tenant_id, invoice_id).await
+    }
+
+    /// PMS-977: whether a draft may move to `to`, and both companies' names.
+    ///
+    /// A draft raised against the wrong company is the case this exists for,
+    /// and there is no invoice delete to recover it otherwise. What it refuses
+    /// is a draft whose CONTENTS belong to the company it is on, because
+    /// moving the header would bill one customer for another's work: billed
+    /// time or mileage (those entries are that company's), a contract (its
+    /// period runs are that company's), a recorded payment (it carries that
+    /// company), or a line naming a ticket or project of a company other than
+    /// `to`. Each refusal names what holds the invoice where it is.
+    ///
+    /// `to` is checked against the tenant explicitly: an FK check bypasses
+    /// RLS (PMS-333), so another tenant's company id would satisfy it.
+    async fn assert_draft_can_move_company(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        from: Uuid,
+        to: Uuid,
+        requested_contract: Option<Uuid>,
+    ) -> AppResult<CompanyMove> {
+        let name_of = |id: Uuid| {
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM companies WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(id)
+        };
+        let to_name = name_of(to).fetch_optional(&mut *tx).await?.ok_or_else(|| {
+            AppError::validation_field("company_id", "must be a company of this organization")
+        })?;
+        let from_name = name_of(from)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or_else(|| "its current company".to_string());
+
+        #[derive(sqlx::FromRow)]
+        struct Holds {
+            payments: i64,
+            time_entries: i64,
+            mileage_entries: i64,
+            contract: bool,
+            foreign_lines: i64,
+        }
+        let holds: Holds = sqlx::query_as(
+            "SELECT \
+                (SELECT count(*) FROM payments p \
+                 WHERE p.tenant_id = $1 AND p.invoice_id = $2) AS payments, \
+                (SELECT count(*) FROM time_entries t \
+                 WHERE t.tenant_id = $1 AND t.invoice_id = $2) AS time_entries, \
+                (SELECT count(*) FROM mileage_entries m \
+                 WHERE m.tenant_id = $1 AND m.invoice_id = $2) AS mileage_entries, \
+                (i.contract_id IS NOT NULL \
+                 OR EXISTS (SELECT 1 FROM contract_invoice_runs r WHERE r.invoice_id = $2)) \
+                    AS contract, \
+                (SELECT count(*) FROM invoice_lines l \
+                 LEFT JOIN tickets tk ON tk.id = l.ticket_id \
+                 LEFT JOIN projects pr ON pr.id = l.project_id \
+                 WHERE l.invoice_id = $2 \
+                   AND (tk.company_id IS DISTINCT FROM $3 AND l.ticket_id IS NOT NULL \
+                        OR pr.company_id IS DISTINCT FROM $3 AND l.project_id IS NOT NULL)) \
+                    AS foreign_lines \
+             FROM invoices i WHERE i.tenant_id = $1 AND i.id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let refuse = |why: String| {
+            Err(AppError::Conflict(format!(
+                "This invoice cannot move from {from_name} to {to_name}: {why}"
+            )))
+        };
+        if holds.payments > 0 {
+            return refuse(format!(
+                "{} payment(s) from {from_name} are recorded against it.",
+                holds.payments
+            ));
+        }
+        if holds.time_entries + holds.mileage_entries > 0 {
+            return refuse(format!(
+                "it bills {} time entr(ies) and {} mileage entr(ies) logged for {from_name}, which are {from_name}'s work. Bill {to_name}'s time on a new invoice.",
+                holds.time_entries, holds.mileage_entries
+            ));
+        }
+        if holds.contract || requested_contract.is_some() {
+            return refuse(format!(
+                "it was generated from, or names, a contract with {from_name}. Change the contract's company, or invoice {to_name} separately."
+            ));
+        }
+        if holds.foreign_lines > 0 {
+            return refuse(format!(
+                "{} line(s) name a ticket or project that does not belong to {to_name}. Edit those lines first.",
+                holds.foreign_lines
+            ));
+        }
+        Ok(CompanyMove { from_name, to_name })
     }
 
     /// PMS-992: who an invoice goes to, or why it cannot go.
@@ -6159,6 +6319,12 @@ impl BillingService {
 }
 
 /// Candidate-contract row for [`BillingService::generate_due_recurring_invoices`].
+/// PMS-977: the two names a company move is recorded under.
+struct CompanyMove {
+    from_name: String,
+    to_name: String,
+}
+
 #[derive(sqlx::FromRow)]
 struct RecurringContractRow {
     id: Uuid,
