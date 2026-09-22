@@ -448,6 +448,7 @@ impl QaSeeder {
                 credited.id,
                 &UpdateInvoiceRequest {
                     tax_rate_id: None,
+                    company_id: None,
                     billing_contact_id: None,
                     contract_id: None,
                     invoice_date: None,
