@@ -340,6 +340,13 @@ pub struct CreateInvoiceFromTimeEntriesRequest {
 /// Header-only update. To replace line items, send `lines = Some(...)`.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct UpdateInvoiceRequest {
+    /// PMS-977: move a draft to another company. Refused once the invoice is
+    /// sent (the customer holds it), and refused on a draft whose contents
+    /// belong to the company it is on: billed time or mileage, a contract, a
+    /// payment, or a line naming another company's ticket or project. The
+    /// billing contact is cleared unless one of the new company's is named in
+    /// the same request, because the old one is the old company's person.
+    pub company_id: Option<Uuid>,
     pub billing_contact_id: Option<Uuid>,
     pub contract_id: Option<Uuid>,
     pub invoice_date: Option<NaiveDate>,
