@@ -1,4 +1,9 @@
 //! PMS-448 AC4: HTTP routes for ticket templates.
+//!
+//! parity record 2026-09-22: ticket-template CRUD is an admin-surface API.
+//! The SPA that lets an admin pick a template when opening a ticket is
+//! deferred; the routes stay mounted so an admin can manage templates
+//! through the API meanwhile.
 
 use std::sync::Arc;
 
