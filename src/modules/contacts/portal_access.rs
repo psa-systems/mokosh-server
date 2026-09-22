@@ -93,9 +93,9 @@ pub(crate) async fn ensure_can_read_invoices(
 
     // The tenant-wide built-in, never a company-scoped role of the same name:
     // a company-scoped one is the MSP's own creation and is not this
-    // function's to hand out. PMS-1302: keyed on the stable `builtin_key`
-    // rather than the display name, so a rename does not silently move
-    // the resolved role.
+    // function's to hand out. Keyed on the stable `builtin_key` rather
+    // than the display name, so a rename does not silently move the
+    // resolved role.
     let role_id: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM portal_roles \
          WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE AND builtin_key = $2",

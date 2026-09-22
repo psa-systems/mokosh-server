@@ -284,18 +284,18 @@ pub const BUILTIN_READ_ONLY: &[&str] = &[
     NOTIFICATIONS_READ,
 ];
 
-/// PMS-1302: the stable identifier every built-in row carries in
-/// `portal_roles.builtin_key`, so a lookup that reaches through code stays on
-/// the intended row even if an admin flipped through a database write and
-/// renamed the display. The migration seeded these values on the rows
-/// migrations 171/197 added; a new built-in also seeds this column.
+/// The stable identifier every built-in row carries in
+/// `portal_roles.builtin_key`, so a code lookup stays on the intended
+/// row even if an admin renamed the display through a database write.
+/// The migration seeded these values on the rows migrations 171/197
+/// added; a new built-in also seeds this column.
 pub const BUILTIN_BILLING_CONTACT_KEY: &str = "billing_contact";
 pub const BUILTIN_SUPPORT_CONTACT_KEY: &str = "support_contact";
 pub const BUILTIN_READ_ONLY_KEY: &str = "read_only";
 
 /// The three built-in roles by the name the migrations seeded, in the
 /// order the seed inserts them. The third element is the `builtin_key`
-/// (PMS-1302) the runtime lookups use in preference to the display name.
+/// the runtime lookups use in preference to the display name.
 pub const BUILTIN_ROLES: &[(&str, &[&str], &str)] = &[
     (
         "Billing Contact",
@@ -330,8 +330,8 @@ pub struct AccessArea {
     pub read_capability: &'static str,
     /// The built-in role that grants it (display name, kept for messages).
     pub granting_role: &'static str,
-    /// PMS-1302: the row's stable `builtin_key`, used by the runtime lookup
-    /// so a rename cannot move the resolved role.
+    /// The row's stable `builtin_key`, used by the runtime lookup so a
+    /// rename cannot move the resolved role.
     pub granting_role_key: &'static str,
 }
 

@@ -1748,8 +1748,8 @@ impl TenantService {
             crate::modules::contact_portal::capabilities::BUILTIN_ROLES
         {
             let capabilities: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
-            // PMS-1302: the row also carries a stable `builtin_key` so the
-            // runtime lookup finds it after a rename.
+            // The row also carries a stable `builtin_key` so the runtime
+            // lookup finds it after a rename.
             sqlx::query(
                 "INSERT INTO portal_roles (tenant_id, name, capabilities, is_builtin, builtin_key) \
                  VALUES ($1, $2, $3, TRUE, $4) \

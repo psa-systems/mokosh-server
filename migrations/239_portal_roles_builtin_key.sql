@@ -1,4 +1,4 @@
--- PMS-1302: give every built-in portal role a stable key that survives a rename.
+-- Give every built-in portal role a stable key that survives a rename.
 --
 -- The three built-in roles are seeded and looked up by display name today
 -- (`portal_roles.name = 'Billing Contact'` / `'Support Contact'` / `'Read-Only'`).

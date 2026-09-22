@@ -1144,7 +1144,7 @@ impl ContactService {
                     "The portal area {area_key:?} no longer exists, so this request cannot be granted."
                 )));
             };
-            // PMS-1302: keyed on the stable `builtin_key` so a rename does not
+            // Keyed on the stable `builtin_key` so a rename does not
             // silently reroute a grant to another role. The message still
             // names the display, which is what an operator reads.
             let role_id: Option<Uuid> = sqlx::query_scalar(
