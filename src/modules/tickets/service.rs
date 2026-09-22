@@ -184,6 +184,43 @@ impl TicketService {
     /// same `"Referenced {table} not found in this tenant"` error the
     /// per-key checks did, for the first table (in `checks` order) whose id
     /// was not found.
+    /// PMS-737: the parent a child may name: this tenant's, the same
+    /// company's, and not itself a child.
+    async fn assert_parent_ticket(
+        &self,
+        tenant_id: TenantId,
+        parent_id: Uuid,
+        company_id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let parent: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT company_id, parent_ticket_id FROM tickets \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(parent_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match parent {
+            None => Err(AppError::validation_field(
+                "parent_ticket_id",
+                "must be a ticket of this organization",
+            )),
+            Some((parent_company, _)) if parent_company != company_id => {
+                Err(AppError::validation_field(
+                    "parent_ticket_id",
+                    "must be a ticket of the same company",
+                ))
+            }
+            Some((_, Some(_))) => Err(AppError::validation_field(
+                "parent_ticket_id",
+                "already has a parent; tickets nest one level only",
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
     async fn validate_fks(
         &self,
         tenant_id: TenantId,
@@ -311,6 +348,14 @@ impl TicketService {
             ],
         )
         .await?;
+        // PMS-737: a child names its parent. Checked rather than left to the
+        // FK, which bypasses RLS, and held to ONE level: a tree of tickets is
+        // not what a multi-person request is, and every reader of
+        // `parent_ticket_id` would otherwise have to learn to walk one.
+        if let Some(parent_id) = request.parent_ticket_id {
+            self.assert_parent_ticket(tenant_id, parent_id, request.company_id)
+                .await?;
+        }
 
         // Insert + audit row in one transaction: capture the new row
         // with Postgres to_jsonb and write the audit entry on the same
@@ -325,11 +370,11 @@ impl TicketService {
                 contract_id, sla_id, scheduled_start, scheduled_end,
                 estimated_hours, is_billable, asset_id, custom_fields, tags,
                 created_by_id, source_kb_article_id, procedure_kb_article_id,
-                email_message_id, email_thread_id
+                email_message_id, email_thread_id, parent_ticket_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26,
-                $27, $28, $29, $30
+                $27, $28, $29, $30, $31
             )
             "#,
         )
@@ -363,6 +408,7 @@ impl TicketService {
         .bind(request.procedure_kb_article_id)
         .bind(&request.email_message_id)
         .bind(&request.email_thread_id)
+        .bind(request.parent_ticket_id)
         .execute(&mut *tx)
         .await?;
 

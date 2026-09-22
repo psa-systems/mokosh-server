@@ -132,6 +132,7 @@ async fn create_ticket_validates_every_fk_in_one_query(pool: PgPool) {
     let tenant_id = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
 
     let request = mokosh_types::tickets::CreateTicketRequest {
+        parent_ticket_id: None,
         title: "FK budget probe".to_string(),
         description: None,
         priority_id: None,

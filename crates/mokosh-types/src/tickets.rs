@@ -387,6 +387,12 @@ pub struct CreateTicketRequest {
     pub site_id: Option<Uuid>,
     pub assigned_to_id: Option<Uuid>,
     pub team_id: Option<Uuid>,
+    /// PMS-737: the ticket this one is a child of. A multi-person client
+    /// request is one parent with a child per person, so every per-ticket
+    /// mechanism (the SLA clock, time, billing, the checklist) keeps working
+    /// per person. One level only: a parent cannot itself be a child.
+    #[serde(default)]
+    pub parent_ticket_id: Option<Uuid>,
     pub contract_id: Option<Uuid>,
     pub sla_id: Option<Uuid>,
     pub scheduled_start: Option<DateTime<Utc>>,
