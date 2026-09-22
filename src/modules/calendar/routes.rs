@@ -1,9 +1,9 @@
 //! Calendar API routes.
 //!
-//! PMS-1263 parity record 2026-09-22 (PMS-1306): `/on-call-schedules` and
+//! parity record 2026-09-22: `/on-call-schedules` and
 //! `/on-call-schedules/{id}` have no SPA caller. On-call rotation is a
-//! deferred product feature; the appointment and template routes below are
-//! consumed. This note covers ONLY the two on-call routes.
+//! deferred product feature; the appointment and template routes below
+//! are consumed. Note covers ONLY the two on-call routes.
 
 use std::sync::Arc;
 

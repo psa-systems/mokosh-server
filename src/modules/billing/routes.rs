@@ -1,10 +1,10 @@
 //! Billing HTTP routes. Endpoints land incrementally across PMS-33.
 //!
-//! PMS-1263 parity record 2026-09-22 (PMS-1306): `/payment-gateways/webhook-
-//! deliveries` has no SPA caller. It is an operator observability surface
-//! (the recent Stripe / PayPal webhook attempts and their outcomes) that the
-//! admin reaches through the API; a Settings > Payment Gateways delivery-log
-//! screen is deferred. Every other route in this file is consumed.
+//! parity record 2026-09-22: `/payment-gateways/webhook-deliveries` has no
+//! SPA caller. It is an operator observability surface (recent Stripe /
+//! PayPal webhook attempts and their outcomes) that the admin reaches
+//! through the API; the delivery-log screen is deferred. Every other route
+//! in this file is consumed.
 
 use std::sync::Arc;
 

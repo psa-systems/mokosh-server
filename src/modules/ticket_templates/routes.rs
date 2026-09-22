@@ -1,10 +1,9 @@
 //! PMS-448 AC4: HTTP routes for ticket templates.
 //!
-//! PMS-1263 parity record 2026-09-22 (PMS-1306): ticket-template CRUD is an
-//! admin-surface API. The SPA that lets an admin pick a template when
-//! opening a ticket is deferred; the routes stay mounted so an admin can
-//! manage templates through the API in the meantime. Remove this note when
-//! the ticket-templates settings page ships in mokosh-apps.
+//! parity record 2026-09-22: ticket-template CRUD is an admin-surface API.
+//! The SPA that lets an admin pick a template when opening a ticket is
+//! deferred; the routes stay mounted so an admin can manage templates
+//! through the API meanwhile.
 
 use std::sync::Arc;
 
