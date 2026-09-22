@@ -123,11 +123,11 @@ impl PlatformAdminService {
             return Err(AppError::Unauthorized);
         }
 
-        // PMS-1293 / PMS-1300: an enrolled admin needs a valid second factor.
-        // A missing code, a wrong code and a replayed step all answer the same
-        // 401 as a bad password, so the response does not reveal which factor
-        // failed. A `mfa_code` alongside a `recovery_code` wins so a live TOTP
-        // does not spend a recovery, and a recovery code is single-use through
+        // An enrolled admin needs a valid second factor. A missing code, a
+        // wrong code and a replayed step all answer the same 401 as a bad
+        // password, so the response does not reveal which factor failed. A
+        // `mfa_code` alongside a `recovery_code` wins so a live TOTP does not
+        // spend a recovery, and a recovery code is single-use through
         // `spend_recovery_code`.
         if admin.mfa_enabled {
             let accepted = match (mfa_code, recovery_code) {
@@ -266,10 +266,10 @@ impl PlatformAdminService {
         Ok(())
     }
 
-    /// PMS-1300: current-password re-auth, shared by every MFA endpoint,
-    /// so a stolen access token cannot enrol an authenticator, finish one
-    /// it started, or remove the factor. The two failure arms both answer
-    /// 401 so a probe cannot map an id to a wrong password.
+    /// Current-password re-auth, shared by every MFA endpoint, so a stolen
+    /// access token cannot enrol an authenticator, finish one it started,
+    /// or remove the factor. The two failure arms both answer 401 so a probe
+    /// cannot map an id to a wrong password.
     async fn reauthenticate(&self, admin_id: Uuid, password: &str) -> AppResult<PlatformAdminRow> {
         let pool = self.db.migrator_pool();
         let admin = PlatformAdminRepo::find_by_id(pool, admin_id)
@@ -286,12 +286,12 @@ impl PlatformAdminService {
         Ok(admin)
     }
 
-    /// PMS-1300: stage a fresh TOTP secret WITHOUT flipping `mfa_enabled`,
-    /// same contract the contact plane's `start_mfa_enrollment` has: only
+    /// Stage a fresh TOTP secret WITHOUT flipping `mfa_enabled`, same
+    /// contract the contact plane's `start_mfa_enrollment` has: only
     /// `enable_mfa`, after a live code verifies, turns MFA on, so a mis-set
-    /// authenticator cannot lock the operator out. Calling this again
-    /// before enable replaces the staged secret. 409 when MFA is already
-    /// on: disable first.
+    /// authenticator cannot lock the operator out. Calling this again before
+    /// enable replaces the staged secret. 409 when MFA is already on:
+    /// disable first.
     #[tracing::instrument(skip_all)]
     pub async fn start_mfa_enrollment(
         &self,
@@ -321,10 +321,9 @@ impl PlatformAdminService {
         })
     }
 
-    /// PMS-1300: finish MFA enrolment. Re-verifies the password, checks
-    /// one live code against the staged secret, flips `mfa_enabled`, and
-    /// mints the single-use recovery codes, returned once and stored as
-    /// hashes.
+    /// Finish MFA enrolment. Re-verifies the password, checks one live code
+    /// against the staged secret, flips `mfa_enabled`, and mints the
+    /// single-use recovery codes, returned once and stored as hashes.
     #[tracing::instrument(skip_all)]
     pub async fn enable_mfa(
         &self,
@@ -360,10 +359,10 @@ impl PlatformAdminService {
         Ok(PlatformMfaEnableResponse { recovery_codes })
     }
 
-    /// PMS-1300: remove MFA. Needs the current password AND a live code
-    /// (TOTP or an unspent recovery code), so a stolen access token
-    /// cannot quietly weaken the account. Not enabled is the same 401 as
-    /// a wrong password, so the response does not say which failed.
+    /// Remove MFA. Needs the current password AND a live code (TOTP or an
+    /// unspent recovery code), so a stolen access token cannot quietly
+    /// weaken the account. Not enabled is the same 401 as a wrong password,
+    /// so the response does not say which failed.
     #[tracing::instrument(skip_all)]
     pub async fn disable_mfa(
         &self,

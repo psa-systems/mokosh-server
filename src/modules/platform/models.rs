@@ -15,9 +15,9 @@ pub struct PlatformLoginRequest {
     /// TOTP code; required when the admin has MFA enabled.
     #[serde(default)]
     pub mfa_code: Option<String>,
-    /// PMS-1300: a single-use recovery code, for the operator who lost
-    /// the authenticator. Spends the code on match; a `mfa_code` alongside
-    /// wins so a live TOTP does not consume a recovery.
+    /// A single-use recovery code, for the operator who lost the
+    /// authenticator. Spends the code on match; a `mfa_code` alongside wins
+    /// so a live TOTP does not consume a recovery.
     #[serde(default)]
     pub recovery_code: Option<String>,
 }
@@ -54,9 +54,9 @@ pub struct PlatformChangePasswordRequest {
     pub confirm_password: String,
 }
 
-/// `POST /api/v1/platform/me/mfa/setup` body. PMS-1300: current password
-/// is re-verified inline so a stolen access token cannot enrol an
-/// attacker's authenticator.
+/// `POST /api/v1/platform/me/mfa/setup` body. Current password is
+/// re-verified inline so a stolen access token cannot enrol an attacker's
+/// authenticator.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PlatformMfaSetupRequest {
     #[validate(length(min = 1, message = "Current password is required"))]
@@ -72,9 +72,9 @@ pub struct PlatformMfaSetupResponse {
     pub provisioning_uri: String,
 }
 
-/// `POST /api/v1/platform/me/mfa/enable` body. PMS-1300: the live TOTP
-/// code the operator sees on their authenticator, plus the same
-/// current-password re-auth as setup.
+/// `POST /api/v1/platform/me/mfa/enable` body. The live TOTP code the
+/// operator sees on their authenticator, plus the same current-password
+/// re-auth as setup.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PlatformMfaEnableRequest {
     #[validate(length(min = 1, message = "Current password is required"))]
@@ -83,17 +83,17 @@ pub struct PlatformMfaEnableRequest {
     pub code: String,
 }
 
-/// `POST /api/v1/platform/me/mfa/enable` response. PMS-1300: the plaintext
-/// recovery codes, returned to the operator EXACTLY ONCE. The server keeps
-/// only their hashes; a lost list cannot be reissued from what is stored.
+/// `POST /api/v1/platform/me/mfa/enable` response. The plaintext recovery
+/// codes, returned to the operator EXACTLY ONCE. The server keeps only
+/// their hashes; a lost list cannot be reissued from what is stored.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlatformMfaEnableResponse {
     pub recovery_codes: Vec<String>,
 }
 
-/// `POST /api/v1/platform/me/mfa/disable` body. PMS-1300: needs the current
-/// password AND a live second factor (TOTP or an unspent recovery code), so
-/// a stolen access token cannot quietly weaken the account.
+/// `POST /api/v1/platform/me/mfa/disable` body. Needs the current password
+/// AND a live second factor (TOTP or an unspent recovery code), so a
+/// stolen access token cannot quietly weaken the account.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct PlatformMfaDisableRequest {
     #[validate(length(min = 1, message = "Current password is required"))]

@@ -115,9 +115,9 @@ impl PlatformAdminRepo {
         Ok(())
     }
 
-    /// PMS-1300: stage a sealed TOTP secret WITHOUT flipping `mfa_enabled`.
-    /// Enable is a second call after a live code proves the authenticator
-    /// works, so a mis-set app cannot lock the operator out of the platform.
+    /// Stage a sealed TOTP secret WITHOUT flipping `mfa_enabled`. Enable is
+    /// a second call after a live code proves the authenticator works, so a
+    /// mis-set app cannot lock the operator out of the platform.
     pub async fn stage_mfa_secret(
         pool: &PgPool,
         admin_id: Uuid,
@@ -136,10 +136,10 @@ impl PlatformAdminRepo {
         Ok(())
     }
 
-    /// PMS-1300: flip `mfa_enabled` and store the recovery-code hashes in
-    /// one write, after the live code confirmed the staged secret. Resets
-    /// the anti-replay watermark so the code the operator just proved
-    /// against does not itself get treated as spent for the next login.
+    /// Flip `mfa_enabled` and store the recovery-code hashes in one write,
+    /// after the live code confirmed the staged secret. Resets the
+    /// anti-replay watermark so the code the operator just proved against
+    /// does not itself get treated as spent for the next login.
     pub async fn enable_mfa(
         pool: &PgPool,
         admin_id: Uuid,
@@ -161,10 +161,10 @@ impl PlatformAdminRepo {
         Ok(())
     }
 
-    /// PMS-1300: clear the whole MFA trio in one write. Same shape the
-    /// contact plane's disable takes: enabled off, secret gone, watermark
-    /// back to zero, recovery codes cleared. Reads that predate a fresh
-    /// enrolment can never see a stale code.
+    /// Clear the whole MFA trio in one write. Same shape the contact plane's
+    /// disable takes: enabled off, secret gone, watermark back to zero,
+    /// recovery codes cleared. Reads that predate a fresh enrolment can
+    /// never see a stale code.
     pub async fn disable_mfa(pool: &PgPool, admin_id: Uuid) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE platform_admins \
@@ -178,10 +178,10 @@ impl PlatformAdminRepo {
         Ok(())
     }
 
-    /// PMS-1300: spend one recovery code by removing its hash from the
-    /// array. Returns true when the row's set actually changed (the code
-    /// was live and is now gone), false when the hash was already absent
-    /// (an unknown code, or a replay after a concurrent login spent it).
+    /// Spend one recovery code by removing its hash from the array. Returns
+    /// true when the row's set actually changed (the code was live and is
+    /// now gone), false when the hash was already absent (an unknown code,
+    /// or a replay after a concurrent login spent it).
     pub async fn spend_recovery_code(
         pool: &PgPool,
         admin_id: Uuid,

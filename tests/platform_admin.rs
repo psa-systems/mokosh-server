@@ -476,9 +476,9 @@ async fn platform_login_enforces_mfa_and_refuses_replay(pool: PgPool) {
     assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-/// PMS-1300: a lost authenticator spends a recovery code. The code is
-/// single-use, so a second login with the same one is refused, and an
-/// unknown code is the same 401 as a wrong TOTP.
+/// A lost authenticator spends a recovery code. The code is single-use, so
+/// a second login with the same one is refused, and an unknown code is the
+/// same 401 as a wrong TOTP.
 #[sqlx::test]
 async fn platform_login_accepts_a_recovery_code_and_refuses_a_replay(pool: PgPool) {
     let secret = mokosh_server::utils::totp::generate_secret();
