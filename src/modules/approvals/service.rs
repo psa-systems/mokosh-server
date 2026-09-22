@@ -213,7 +213,7 @@ impl ApprovalsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// MAPPS-872: the count-only surface for `pending_for_user`. Every
+    /// the count-only surface for `pending_for_user`. Every
     /// hot page-render `ApprovalsBadge` used to fetch the whole list to
     /// call `.len()` on it; a scalar COUNT(*) is what the badge
     /// actually needs. Same WHERE as `pending_for_user` above, so
@@ -241,7 +241,7 @@ impl ApprovalsService {
         Ok(count)
     }
 
-    /// MAPPS-872: the contact arm of `pending_count_for_user`. Same
+    /// the contact arm of `pending_count_for_user`. Same
     /// WHERE as `pending_for_contact`, so the two cannot drift.
     pub async fn pending_count_for_contact(
         &self,

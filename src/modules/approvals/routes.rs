@@ -74,7 +74,7 @@ pub fn approval_routes(service: ApprovalsService) -> Router {
         // every target; the response carries `target` + `entity_id`
         // so the SPA can render an entity link per row.
         .route("/approvals/pending", get(pending_for_caller))
-        // MAPPS-872: count-only surface for `ApprovalsBadge`. Same
+        // count-only surface for `ApprovalsBadge`. Same
         // dual-plane rule as `/approvals/pending`, returning
         // `{ "count": N }` instead of the full row set so the
         // per-render badge stops paying for a Vec it only calls
@@ -267,7 +267,7 @@ async fn pending_for_caller(
     Ok(Json(rows))
 }
 
-/// MAPPS-872: the count-only surface for `pending_for_caller`. Same
+/// the count-only surface for `pending_for_caller`. Same
 /// dual-plane split, same WHERE inside the service, returned as
 /// `ApprovalCountResponse` so the `ApprovalsBadge` on every render
 /// stops fetching and deserializing the full pending list.

@@ -70,7 +70,7 @@ pub struct ApprovalResponse {
     pub decided_at: Option<DateTime<Utc>>,
 }
 
-/// MAPPS-872: the count-only response for `GET /approvals/pending/count`.
+/// the count-only response for `GET /approvals/pending/count`.
 /// A dedicated shape so the SPA does not read a bare number and so a
 /// later addition (a breakdown by target, say) is a field on this rather
 /// than a wire break.
