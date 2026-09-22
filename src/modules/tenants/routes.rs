@@ -1,4 +1,10 @@
 //! Tenant API routes (Super Admin only)
+//!
+//! PMS-1263 parity record 2026-09-22 (PMS-1306): `/{tenant_id}/usage` has no
+//! SPA caller. It is a super-admin observability surface (per-tenant storage
+//! rollup and object counts) reached through the API; the Tenant Management
+//! usage widget that would render it is deferred. Every other route in this
+//! file is consumed.
 
 use crate::utils::json::Json;
 use axum::{

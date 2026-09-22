@@ -1,5 +1,11 @@
 //! PMS-450: HTTP routes for email-to-ticket intake.
 //!
+//! PMS-1263 parity record 2026-09-22 (PMS-1306): none of these routes has a
+//! SPA caller and none is meant to. `POST /email-intake` is called by the
+//! external email gateway, and `/intake-tokens` / `/email-intake-log` are
+//! admin API surfaces for provisioning and troubleshooting that mailer flow.
+//! An operator can reach them through the API; a SPA screen is deferred.
+//!
 //! Two surfaces share this router:
 //! * the gateway-facing `POST /email-intake` (Phase 1, public
 //!   route, bearer-authenticated via `tenant_intake_tokens`);

@@ -1,4 +1,11 @@
 //! Projects HTTP routes.
+//!
+//! PMS-1263 parity record 2026-09-22 (PMS-1306): the phases and task-
+//! dependency routes (`/projects/{id}/phases`, `/phases/{phase_id}`,
+//! `/tasks/{id}/depends-on/{other}`) have no SPA caller. Both surfaces are
+//! deferred to a MAPPS follow-up that renders the Gantt / dependency graph.
+//! Every OTHER route in this file is consumed. This note covers ONLY the
+//! three phase / task-dep routes.
 
 use std::sync::Arc;
 

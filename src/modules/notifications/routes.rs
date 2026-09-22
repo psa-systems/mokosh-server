@@ -1,4 +1,13 @@
 //! Notifications HTTP routes.
+//!
+//! PMS-1263 parity record 2026-09-22 (PMS-1306): every route in this file is
+//! admin-surface API for notification channels, templates, rules and the
+//! per-user preferences page. None has an SPA caller today; the admin screens
+//! that wire them (Settings > Notifications) are deferred, not dead. The
+//! routes stay mounted so a future MAPPS ticket that builds those screens
+//! finds a working backend rather than a re-implementation, and integrations
+//! that manage them out-of-band keep working. When any of these surfaces
+//! ships a SPA caller, remove the corresponding route from this note.
 
 use std::sync::Arc;
 
