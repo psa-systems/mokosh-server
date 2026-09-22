@@ -179,6 +179,109 @@ async fn a_sent_invoice_cannot_move(pool: PgPool) {
     assert_eq!(company, f.acme);
 }
 
+/// PMS-1367: the same check on the paths that CREATE, where the hole was
+/// found. An FK check bypasses RLS, so another tenant's company id satisfies
+/// it; an invoice, a generated invoice and an unapplied payment would each
+/// have named a company the caller cannot see.
+#[sqlx::test]
+async fn a_foreign_company_cannot_be_created_against(pool: PgPool) {
+    let f = Fixture::new(pool).await;
+    let (other_tenant, _, _, _) = common::seed_tenant_with_admin(&f.pool, "other-msp").await;
+    let foreign = Uuid::new_v4();
+    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Foreign Co')")
+        .bind(foreign)
+        .bind(other_tenant)
+        .execute(&f.pool)
+        .await
+        .expect("foreign company");
+
+    for company in [foreign, Uuid::new_v4()] {
+        let (status, body) = f
+            .call(
+                reqwest::Method::POST,
+                "/api/v1/invoices",
+                json!({
+                    "company_id": company,
+                    "invoice_date": "2026-09-01",
+                    "lines": [{
+                        "line_type": "service",
+                        "description": "Work",
+                        "quantity": "1",
+                        "unit_price": "10.00",
+                    }],
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "invoice: {body}");
+        assert!(body.to_string().contains("company_id"), "{body}");
+
+        // Generated from time entries: without the check this refuses for
+        // having no billable time, which is not what is wrong.
+        let (status, body) = f
+            .call(
+                reqwest::Method::POST,
+                "/api/v1/invoices/from-time-entries",
+                json!({ "company_id": company, "invoice_date": "2026-09-01" }),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "generated: {body}"
+        );
+        assert!(
+            !body.to_string().contains("billable"),
+            "the refusal is about the company: {body}"
+        );
+
+        // An unapplied payment names no invoice to be checked against.
+        let (status, body) = f
+            .call(
+                reqwest::Method::POST,
+                "/api/v1/payments",
+                json!({
+                    "company_id": company,
+                    "payment_date": "2026-09-02",
+                    "amount": "50.00",
+                    "payment_method": "check",
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "payment: {body}");
+    }
+
+    let written: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM invoices) + (SELECT count(*) FROM payments)",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .expect("count");
+    assert_eq!(written, 0, "nothing was written");
+}
+
+/// The applied-payment path keeps its own refusal: the company has to match
+/// the invoice's, which already pins it to this tenant (PMS-1235).
+#[sqlx::test]
+async fn a_payment_still_has_to_match_its_invoices_company(pool: PgPool) {
+    let f = Fixture::new(pool).await;
+    let invoice = f.draft(f.acme, None).await;
+    let (status, body) = f
+        .call(
+            reqwest::Method::POST,
+            "/api/v1/payments",
+            json!({
+                "invoice_id": invoice,
+                "company_id": f.globex,
+                "payment_date": "2026-09-02",
+                "amount": "50.00",
+                "payment_method": "check",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("does not match"), "{body}");
+}
+
 /// Another tenant's company, or one that does not exist, is refused: the FK
 /// alone would accept the first, because it bypasses RLS.
 #[sqlx::test]

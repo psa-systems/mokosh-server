@@ -938,6 +938,9 @@ impl BillingService {
         let discount = request.discount_amount.unwrap_or(Decimal::ZERO);
         let total = subtotal + tax - discount;
 
+        // PMS-1367: before anything is written, and before the contact is
+        // resolved against it.
+        Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
         if let Some(pt) = request.payment_term_id {
             Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
         }
@@ -1108,6 +1111,10 @@ impl BillingService {
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // PMS-1367: a company that is not the tenant's matches no entries, so
+        // without this the refusal would be about having no billable time,
+        // which is not what is wrong.
+        Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
 
         // 1. Lock the company's eligible billable entries. The `$3::uuid[]
         //    IS NULL OR id = ANY($3)` guard makes the id filter optional:
@@ -3725,6 +3732,11 @@ impl BillingService {
                     "Payment company_id does not match the invoice's company".to_string(),
                 ));
             }
+        } else {
+            // PMS-1367: an unapplied payment has no invoice to be checked
+            // against, so the company is checked on its own. With an invoice,
+            // the match above already pins it to a company of this tenant.
+            Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
         }
 
         let payment_id = Uuid::new_v4();
@@ -4343,8 +4355,8 @@ impl BillingService {
     /// company), or a line naming a ticket or project of a company other than
     /// `to`. Each refusal names what holds the invoice where it is.
     ///
-    /// `to` is checked against the tenant explicitly: an FK check bypasses
-    /// RLS (PMS-333), so another tenant's company id would satisfy it.
+    /// `to` goes through [`Self::assert_company_in_tenant`] (PMS-1367): an FK
+    /// check bypasses RLS, so another tenant's company id would satisfy it.
     async fn assert_draft_can_move_company(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -4353,20 +4365,12 @@ impl BillingService {
         to: Uuid,
         requested_contract: Option<Uuid>,
     ) -> AppResult<CompanyMove> {
-        let name_of = |id: Uuid| {
-            sqlx::query_scalar::<_, String>(
-                "SELECT name FROM companies WHERE tenant_id = $1 AND id = $2",
-            )
-            .bind(tenant_id)
-            .bind(id)
-        };
-        let to_name = name_of(to).fetch_optional(&mut *tx).await?.ok_or_else(|| {
-            AppError::validation_field("company_id", "must be a company of this organization")
-        })?;
-        let from_name = name_of(from)
-            .fetch_optional(&mut *tx)
-            .await?
-            .unwrap_or_else(|| "its current company".to_string());
+        let to_name = Self::assert_company_in_tenant(&mut *tx, tenant_id, to).await?;
+        // The company it is on now: present by construction, so a missing row
+        // is a deleted company rather than a bad request.
+        let from_name = Self::assert_company_in_tenant(&mut *tx, tenant_id, from)
+            .await
+            .unwrap_or_else(|_| "its current company".to_string());
 
         #[derive(sqlx::FromRow)]
         struct Holds {
@@ -6023,6 +6027,27 @@ impl BillingService {
     /// the constraint and link across tenants silently. Active-checked because
     /// that is what deactivating a product is FOR; a document already written
     /// against it is untouched, since nothing re-validates history.
+    /// PMS-1367: the company is the caller's tenant's, and its name.
+    ///
+    /// An FK check bypasses RLS, so another tenant's company id satisfies the
+    /// constraint and links silently. That is the PMS-333 hole for
+    /// `payment_term_id` and the PMS-955 one for `product_id`; this is the
+    /// same check for the company every billing document hangs off.
+    async fn assert_company_in_tenant(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<String> {
+        sqlx::query_scalar("SELECT name FROM companies WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(company_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::validation_field("company_id", "must be a company of this organization")
+            })
+    }
+
     async fn assert_product_sellable(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
