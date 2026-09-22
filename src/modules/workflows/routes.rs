@@ -1,4 +1,9 @@
 //! PMS-448: HTTP routes for workflow rules.
+//!
+//! parity record 2026-09-22: workflow-rule CRUD and per-ticket run history
+//! serve a Settings > Automation admin surface with no SPA yet. Deferred,
+//! not dead: the rule engine drives ticket automation and the routes let an
+//! admin edit its config out-of-band. Remove this note when the SPA lands.
 
 use std::sync::Arc;
 

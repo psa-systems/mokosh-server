@@ -1,4 +1,10 @@
 //! Notifications HTTP routes.
+//!
+//! parity record 2026-09-22: every route in this file is admin-surface API
+//! for notification channels, templates, rules and the per-user preferences
+//! page. None has a SPA caller today; the Settings > Notifications screens
+//! that would wire them are deferred, not dead. Remove a route from this
+//! note when it ships a SPA caller.
 
 use std::sync::Arc;
 

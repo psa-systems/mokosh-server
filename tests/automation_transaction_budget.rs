@@ -100,6 +100,7 @@ async fn process_rules_opens_one_transaction_for_the_whole_run(pool: PgPool) {
     let tenant_id = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
 
     let request = mokosh_types::tickets::CreateTicketRequest {
+        parent_ticket_id: None,
         title: "Automation budget probe".to_string(),
         description: None,
         priority_id: None,
