@@ -79,10 +79,7 @@ pub fn approval_routes(service: ApprovalsService) -> Router {
         // `{ "count": N }` instead of the full row set so the
         // per-render badge stops paying for a Vec it only calls
         // `.len()` on.
-        .route(
-            "/approvals/pending/count",
-            get(pending_count_for_caller),
-        )
+        .route("/approvals/pending/count", get(pending_count_for_caller))
         // Decision + cancel paths. Cancel is DELETE because the row
         // remains in the DB with status='cancelled'; matches the
         // soft-delete posture across the rest of the API.
