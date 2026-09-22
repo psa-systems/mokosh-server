@@ -213,6 +213,55 @@ impl ApprovalsService {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// the count-only surface for `pending_for_user`. Every
+    /// hot page-render `ApprovalsBadge` used to fetch the whole list to
+    /// call `.len()` on it; a scalar COUNT(*) is what the badge
+    /// actually needs. Same WHERE as `pending_for_user` above, so
+    /// `pending_count_for_user` and `pending_for_user` cannot report a
+    /// different number of rows for the same tenant + user + roles.
+    pub async fn pending_count_for_user(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        roles_held: &[String],
+    ) -> AppResult<i64> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) \
+             FROM ticket_approvals a \
+             WHERE a.tenant_id = $1 AND a.status = 'pending' AND ( \
+                 a.approver_user_id = $2 OR a.approver_role = ANY($3) \
+             )",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(roles_held)
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok(count)
+    }
+
+    /// the contact arm of `pending_count_for_user`. Same
+    /// WHERE as `pending_for_contact`, so the two cannot drift.
+    pub async fn pending_count_for_contact(
+        &self,
+        tenant_id: Uuid,
+        contact_id: Uuid,
+    ) -> AppResult<i64> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) \
+             FROM ticket_approvals a \
+             WHERE a.tenant_id = $1 AND a.status = 'pending' \
+               AND a.approver_contact_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok(count)
+    }
+
     /// PMS-1084: the contact arm of `GET /approvals/pending`. Only the
     /// rows addressed to this contact (`approver_contact_id`), pending
     /// only, the same shape and order as the staff queue so the SPA's
