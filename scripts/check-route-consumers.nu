@@ -70,7 +70,16 @@ def main [--self-test] {
     if $self_test { return (self_test) }
     let dir = ($env.MOKOSH_APPS_DIR? | default '../mokosh-apps')
     if not ($"($dir)/src" | path exists) {
-        print $"route consumers: SKIPPED, no client checkout at ($dir)/src \(set MOKOSH_APPS_DIR\)"
+        # PMS-1304: in CI, no client checkout means the guard is not running,
+        # which is the very drift it was written to catch. Fail loud there,
+        # and keep the skip on a developer box where the sibling is legitimately
+        # absent.
+        let msg = $"route consumers: no client checkout at ($dir)/src \(set MOKOSH_APPS_DIR\)"
+        if ($env.CI? | default '' | is-not-empty) {
+            print $"($msg); refusing to skip under CI"
+            exit 1
+        }
+        print $"($msg): SKIPPED"
         return
     }
     let bad = (unconsumed_in (glob src/modules/*/routes.rs) (read_client $"($dir)/src"))
