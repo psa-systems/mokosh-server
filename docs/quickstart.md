@@ -174,9 +174,9 @@ just dev --detach
 | Service | Reached at | Notes |
 | --- | --- | --- |
 | Mokosh API | `https://<your-username>-mokosh-api.a8n.run` | Traefik is the sole ingress and terminates TLS; the container listens on `MOKOSH_PORT` (`8080`) and publishes no host port. |
-| Mailpit | `http://localhost:8025` | Catches all outbound dev email. Loopback only. |
-| Postgres | `127.0.0.1:5433` (`postgres:5432` in-network) | Database `mokosh`, user `postgres`. The password is generated per clone: read `MOKOSH_PG_PASSWORD` (or the whole `DATABASE_URL`) from `.env`. Loopback only. |
-| Infisical | `http://localhost:28002` | Only when started with `just dev-infisical`. Admin credentials are the ones you put in `.env.infisical`. Loopback only. |
+| Mailpit | `http://localhost:8025` | Catches all outbound dev email. Loopback only; the host port is `MOKOSH_MAILPIT_WEB_HOST_PORT`. |
+| Postgres | `127.0.0.1:5433` (`postgres:5432` in-network) | Database `mokosh`, user `postgres`. The password is generated per clone: read `MOKOSH_PG_PASSWORD` (or the whole `DATABASE_URL`) from `.env`. Loopback only; the host port is `MOKOSH_PG_HOST_PORT`. |
+| Infisical | `http://localhost:28002` | Only when started with `just dev-infisical`. Admin credentials are the ones you put in `.env.infisical`. Loopback only; the host port is `MOKOSH_INFISICAL_HOST_PORT`. |
 
 Everything except the API publishes on `127.0.0.1` alone, so host-side tooling reaches it and the LAN cannot (PMS-496).
 
@@ -225,7 +225,9 @@ just dev-infisical --detach
 ```
 
 **Port collisions on shared hosts**
-The API needs no host port, so it cannot collide. The rest publish on loopback: Postgres `5433`, Infisical UI `28002`, Mailpit UI `8025` and SMTP `1025`. Change `MOKOSH_PG_HOST_PORT` in `.env` after `just dev` generates it; the Infisical and Mailpit ports are pinned in `compose.dev.yml`.
+The API needs no host port, so it cannot collide. Every other published port is loopback-only and reads its HOST side from `.env`, so change the key rather than the compose file (PMS-900): `MOKOSH_PG_HOST_PORT` (`5433`), `MOKOSH_MAILPIT_SMTP_HOST_PORT` (`1025`), `MOKOSH_MAILPIT_WEB_HOST_PORT` (`8025`), `MOKOSH_INFISICAL_HOST_PORT` (`28002`), `MOKOSH_MINIO_API_HOST_PORT` (`29000`) and `MOKOSH_MINIO_CONSOLE_HOST_PORT` (`29001`). The container-side ports never move, so nothing in-network changes with them. Changing the Infisical one means changing `INFISICAL_URL` and `INFISICAL_SITE_URL` to match.
+
+The containers, volumes and network are already per developer, and so is the compose project (`dev-mokosh-${USER}`, PMS-1281), so two checkouts under different users are separate stacks: `just down` in one leaves the other running.
 
 **Server compile takes forever**
 First build hits every crate in the workspace cold. Watch `docker compose --file compose.dev.yml logs --follow server`. Subsequent boots reuse the `dev-mokosh-server-target-${USER}` volume and are about 30 seconds.
