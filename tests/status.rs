@@ -356,3 +356,172 @@ async fn the_company_backup_endpoint_lists_every_system_with_its_current_state(p
     assert!(outcomes.contains(&Some("failure")));
     assert!(outcomes.contains(&Some("success")));
 }
+
+// ============================================================================
+// Trend reports and retention
+// ============================================================================
+
+/// The backup success rate reads the ratio out of the window and reports
+/// the raw counts too, so a caller can tell "no data" from
+/// "everything passed".
+#[sqlx::test]
+async fn the_backup_success_rate_is_the_share_of_successes_in_the_window(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let secret = "hmac-secret-eta";
+    let conn_id = seed_connection(&pool, secret).await;
+    seed_mapping(&pool, conn_id, "device-A", company_id).await;
+
+    let app = common::boot(pool.clone()).await;
+    // Three observations in the window: two successes and one failure.
+    // Rate = 2/3.
+    let base = Utc.with_ymd_and_hms(2026, 9, 1, 4, 0, 0).unwrap();
+    for (offset_hours, outcome) in [(0, "success"), (24, "failure"), (48, "success")] {
+        let observed = base + Duration::hours(offset_hours);
+        let resp = post_status(
+            &app,
+            secret,
+            &status_body(conn_id, "device-A", observed, outcome),
+        )
+        .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+    // A fourth observation OUTSIDE the window: must not enter the ratio.
+    let outside = post_status(
+        &app,
+        secret,
+        &status_body(conn_id, "device-A", base + Duration::days(60), "failure"),
+    )
+    .await;
+    assert_eq!(outside.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let token = common::login(&app, &email, &password).await;
+    let from = base;
+    let to = base + Duration::days(30);
+    let resp = app
+        .client
+        .get(app.url(&format!(
+            "/api/v1/reports/status/backup-success-rate?company_id={company_id}&from={}&to={}",
+            urlencoding::encode(&from.to_rfc3339()),
+            urlencoding::encode(&to.to_rfc3339()),
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send GET");
+    assert!(resp.status().is_success(), "got {}", resp.status());
+    let body: serde_json::Value = resp.json().await.expect("rate JSON");
+    assert_eq!(body["success"].as_u64(), Some(2));
+    assert_eq!(body["total"].as_u64(), Some(3));
+    let rate = body["rate"].as_f64().expect("rate is a number");
+    assert!(
+        (rate - (2.0 / 3.0)).abs() < 1e-9,
+        "rate 2/3 within tolerance, got {rate}"
+    );
+}
+
+/// The uptime aggregate counts every check kind and treats
+/// `success | warning` as up. A window that carried no observations
+/// reports `1.0` so an unmonitored company does not read as totally
+/// down.
+#[sqlx::test]
+async fn the_uptime_report_treats_success_and_warning_as_up(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let secret = "hmac-secret-theta";
+    let conn_id = seed_connection(&pool, secret).await;
+    seed_mapping(&pool, conn_id, "device-A", company_id).await;
+
+    let app = common::boot(pool.clone()).await;
+    let base = Utc.with_ymd_and_hms(2026, 9, 1, 4, 0, 0).unwrap();
+    for (offset_hours, outcome) in [
+        (0, "success"),
+        (12, "warning"),
+        (24, "failure"),
+        (36, "success"),
+    ] {
+        let observed = base + Duration::hours(offset_hours);
+        let resp = post_status(
+            &app,
+            secret,
+            &status_body(conn_id, "device-A", observed, outcome),
+        )
+        .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+
+    let token = common::login(&app, &email, &password).await;
+    let from = base;
+    let to = base + Duration::days(2);
+    let resp = app
+        .client
+        .get(app.url(&format!(
+            "/api/v1/reports/status/uptime?company_id={company_id}&from={}&to={}",
+            urlencoding::encode(&from.to_rfc3339()),
+            urlencoding::encode(&to.to_rfc3339()),
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send GET");
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.expect("uptime JSON");
+    assert_eq!(body["total_observations"].as_u64(), Some(4));
+    assert_eq!(
+        body["up_observations"].as_u64(),
+        Some(3),
+        "three of the four outcomes were success or warning"
+    );
+    let rate = body["rate"].as_f64().expect("rate is a number");
+    assert!(
+        (rate - 0.75).abs() < 1e-9,
+        "3/4 within tolerance, got {rate}"
+    );
+}
+
+/// The retention worker deletes observations older than the cutoff and
+/// leaves everything else alone. Drives the worker directly at a
+/// two-day retention so the fixture does not need thirteen months.
+#[sqlx::test]
+async fn retention_purges_only_observations_older_than_the_cutoff(pool: PgPool) {
+    common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let secret = "hmac-secret-iota";
+    let conn_id = seed_connection(&pool, secret).await;
+    seed_mapping(&pool, conn_id, "device-A", company_id).await;
+
+    let app = common::boot(pool.clone()).await;
+    let now = Utc::now();
+    // One row from a week ago (should be purged at a 2-day retention),
+    // one from an hour ago (should survive).
+    for (offset_hours, outcome) in [(-24 * 7, "success"), (-1, "success")] {
+        let observed = now + Duration::hours(offset_hours);
+        let resp = post_status(
+            &app,
+            secret,
+            &status_body(conn_id, "device-A", observed, outcome),
+        )
+        .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM status_observations")
+        .fetch_one(&pool)
+        .await
+        .expect("count observations");
+    assert_eq!(before, 2, "the fixture writes two rows before purge");
+
+    let worker = mokosh_server::modules::status::StatusRetentionWorker::with_retention(
+        mokosh_server::modules::status::StatusService::new(mokosh_server::Database::from_pool(
+            pool.clone(),
+        )),
+        std::time::Duration::from_secs(2 * 24 * 60 * 60),
+    );
+    let removed = worker.run_tick().await.expect("purge tick");
+    assert_eq!(removed, 1, "only the week-old row is past the cutoff");
+
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM status_observations")
+        .fetch_one(&pool)
+        .await
+        .expect("count observations");
+    assert_eq!(after, 1, "the recent observation survives");
+}

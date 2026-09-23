@@ -86,3 +86,32 @@ pub struct CompanySystemBackup {
     pub system_name: String,
     pub latest: Option<CurrentObservation>,
 }
+
+/// Result of the backup-success-rate aggregate. Carries the numerator
+/// and denominator alongside the ratio so a caller can tell "no data"
+/// (0/0) from "everything succeeded" (n/n).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupSuccessRateResponse {
+    pub company_id: Uuid,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub success: u64,
+    pub total: u64,
+    /// `success / total`, or `1.0` when the window carried no
+    /// observations.
+    pub rate: f64,
+}
+
+/// Result of the uptime aggregate. Same "carry the raw counts too"
+/// shape as the backup rate. The definition of "up" is documented at
+/// the service method: currently the fraction of observations whose
+/// outcome was not `failure`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UptimeResponse {
+    pub company_id: Uuid,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub up_observations: u64,
+    pub total_observations: u64,
+    pub rate: f64,
+}

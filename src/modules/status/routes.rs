@@ -9,20 +9,22 @@
 
 use crate::utils::json::Json;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
     Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
+use serde::Deserialize;
 use sha2::Sha256;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use super::{
-    service::IngestOutcome, CompanyBackupStatusResponse, IngestStatusRequest, StatusService,
-    SystemStatusResponse,
+    service::IngestOutcome, BackupSuccessRateResponse, CompanyBackupStatusResponse,
+    IngestStatusRequest, StatusService, SystemStatusResponse, UptimeResponse,
 };
 use crate::modules::auth::{RequireAuth, TenantId, TenantScoped};
 use crate::modules::rmm::RmmService;
@@ -52,6 +54,15 @@ pub fn status_routes(service: StatusService, rmm_service: Arc<RmmService>) -> Ro
             "/status/companies/{company_id}/backup",
             get(get_company_backup_status),
         )
+        // Trend reports live at `/reports/status/*` so they hang off the
+        // reports surface the SPA already reads for every other rollup,
+        // with the aggregate logic staying next to the store it reads
+        // from.
+        .route(
+            "/reports/status/backup-success-rate",
+            get(backup_success_rate_report),
+        )
+        .route("/reports/status/uptime", get(uptime_report))
         .with_state(state)
 }
 
@@ -140,6 +151,57 @@ async fn get_company_backup_status(
     let response = state
         .service
         .backup_for_company(user.tenant(), company_id)
+        .await?;
+    Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+struct AggregateWindow {
+    company_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+}
+
+impl AggregateWindow {
+    fn validate(&self) -> AppResult<()> {
+        if self.from >= self.to {
+            return Err(AppError::validation_field(
+                "from",
+                "from must be earlier than to",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `GET /reports/status/backup-success-rate?company_id=..&from=..&to=..`.
+/// Both `from` and `to` are RFC 3339 timestamps; the window is a
+/// half-open interval `[from, to)` so a day-by-day report can advance
+/// with no gap and no overlap.
+async fn backup_success_rate_report(
+    State(state): State<StatusRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(window): Query<AggregateWindow>,
+) -> AppResult<Json<BackupSuccessRateResponse>> {
+    window.validate()?;
+    let response = state
+        .service
+        .backup_success_rate(user.tenant(), window.company_id, window.from, window.to)
+        .await?;
+    Ok(Json(response))
+}
+
+/// `GET /reports/status/uptime?company_id=..&from=..&to=..`. Same
+/// window semantics as the rate above.
+async fn uptime_report(
+    State(state): State<StatusRouterState>,
+    RequireAuth(user): RequireAuth,
+    Query(window): Query<AggregateWindow>,
+) -> AppResult<Json<UptimeResponse>> {
+    window.validate()?;
+    let response = state
+        .service
+        .uptime(user.tenant(), window.company_id, window.from, window.to)
         .await?;
     Ok(Json(response))
 }

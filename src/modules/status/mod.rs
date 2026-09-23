@@ -19,12 +19,16 @@
 #[cfg(feature = "server")]
 pub mod models;
 #[cfg(feature = "server")]
+pub mod retention;
+#[cfg(feature = "server")]
 pub mod routes;
 #[cfg(feature = "server")]
 pub mod service;
 
 #[cfg(feature = "server")]
 pub use models::*;
+#[cfg(feature = "server")]
+pub use retention::{StatusRetentionWorker, DEFAULT_RETENTION_DAYS};
 #[cfg(feature = "server")]
 pub use routes::status_routes;
 #[cfg(feature = "server")]

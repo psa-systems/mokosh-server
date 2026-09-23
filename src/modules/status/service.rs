@@ -212,6 +212,117 @@ impl StatusService {
         })
     }
 
+    /// Fraction of backup observations in the given period whose outcome
+    /// was `success`. `1.0` on no observations at all, so the SPA renders
+    /// "nothing to grade" rather than "everything failed"; the numerator
+    /// and denominator are returned alongside the rate so the caller can
+    /// distinguish the two.
+    pub async fn backup_success_rate(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> AppResult<super::models::BackupSuccessRateResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query(
+            "SELECT \
+                 COUNT(*) FILTER (WHERE outcome = 'success')::BIGINT AS success, \
+                 COUNT(*)::BIGINT AS total \
+             FROM status_observations \
+             WHERE tenant_id = $1 AND company_id = $2 AND check_kind = 'backup' \
+               AND observed_at >= $3 AND observed_at < $4",
+        )
+        .bind(*tenant_id)
+        .bind(company_id)
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let success: i64 = row.get("success");
+        let total: i64 = row.get("total");
+        let rate = if total == 0 {
+            1.0
+        } else {
+            success as f64 / total as f64
+        };
+        Ok(super::models::BackupSuccessRateResponse {
+            company_id,
+            from,
+            to,
+            success: success as u64,
+            total: total as u64,
+            rate,
+        })
+    }
+
+    /// Uptime approximation over the given period, across every check
+    /// kind for every system the company owns.
+    ///
+    /// A first-cut definition: the fraction of observations in the window
+    /// whose outcome was NOT `failure` (that is, `success` or `warning`).
+    /// True time-in-state uptime needs interval math over paired up/down
+    /// transitions and is out of scope for the first pass; the reports
+    /// surface documents which of the two this is. `1.0` on no
+    /// observations so a company with no monitored systems does not read
+    /// as "totally down".
+    pub async fn uptime(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> AppResult<super::models::UptimeResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query(
+            "SELECT \
+                 COUNT(*) FILTER (WHERE outcome IN ('success', 'warning'))::BIGINT AS up, \
+                 COUNT(*)::BIGINT AS total \
+             FROM status_observations \
+             WHERE tenant_id = $1 AND company_id = $2 \
+               AND observed_at >= $3 AND observed_at < $4",
+        )
+        .bind(*tenant_id)
+        .bind(company_id)
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let up: i64 = row.get("up");
+        let total: i64 = row.get("total");
+        let rate = if total == 0 {
+            1.0
+        } else {
+            up as f64 / total as f64
+        };
+        Ok(super::models::UptimeResponse {
+            company_id,
+            from,
+            to,
+            up_observations: up as u64,
+            total_observations: total as u64,
+            rate,
+        })
+    }
+
+    /// Delete every observation older than the cutoff. Cross-tenant
+    /// maintenance: there is no `CurrentUser` and no tenant GUC to set,
+    /// so the delete runs on the migrator pool. Bounded by `observed_at`,
+    /// which the primary index covers, and returns the count so the
+    /// worker can log a size per tick.
+    pub async fn purge_older_than(&self, cutoff: DateTime<Utc>) -> AppResult<u64> {
+        // SAFETY (PMS-285): cross-tenant maintenance. The delete is
+        // bounded by `observed_at` and the caller is a background job,
+        // never a request handler.
+        let result = sqlx::query("DELETE FROM status_observations WHERE observed_at < $1")
+            .bind(cutoff)
+            .execute(self.db.migrator_pool())
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Per-company rollup of the CURRENT backup outcome for every system
     /// owned by that company. A system that has never carried a backup
     /// observation still appears, with `latest = None`, so the caller
