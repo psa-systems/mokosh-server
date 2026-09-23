@@ -533,6 +533,11 @@ pub fn create_api_router(
         .merge(notifications_routes(notifications_service.clone()))
         // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
         .merge(rmm_routes(rmm_service))
+        // CRM opportunities: leads through won/lost, with an optional
+        // link to the quote raised from them.
+        .merge(crate::modules::opportunities::opportunities_routes(
+            crate::modules::opportunities::OpportunitiesService::new(db.clone()),
+        ))
         // PMS-1212 (PSA-70): connect, status and disconnect for the Google
         // Contacts import. Admin-gated inside, the RMM shape.
         .merge(crate::modules::contact_sync::routes::contact_sync_routes(
