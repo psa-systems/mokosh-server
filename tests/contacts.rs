@@ -711,6 +711,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
             "company_name": "Bob's Plumbing",
             "first_name": "Bob",
             "last_name": "Smith",
+            "email": "bob@plumbing.example",
         }))
         .send()
         .await
@@ -755,6 +756,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
         .json(&serde_json::json!({
             "first_name": "Lone",
             "last_name": "Person",
+            "email": "lone@example.test",
         }))
         .send()
         .await
@@ -779,6 +781,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
             "company_name": "Acme Typed",
             "first_name": "Clash",
             "last_name": "Case",
+            "email": "clash@example.test",
         }))
         .send()
         .await
@@ -808,6 +811,7 @@ async fn updating_freeform_to_fk_clears_freeform_name(pool: PgPool) {
             "company_name": "Typed Co",
             "first_name": "Mover",
             "last_name": "Upper",
+            "email": "mover@example.test",
         }))
         .send()
         .await
@@ -1267,6 +1271,7 @@ async fn contact_field_validation(pool: PgPool) {
         "company_id": company_id,
         "first_name": "Ada",
         "last_name": "Lovelace",
+        "email": "ada@example.test",
     });
     let with = |k: &str, v: serde_json::Value| {
         let mut b = base.clone();
@@ -2056,6 +2061,25 @@ async fn website_probe_rejects_impossible_input(pool: PgPool) {
 // PMS-806: typed phone list + links to multiple companies
 // ============================================================================
 
+/// Fill in an `email` on a create body that omits one so the caller does not
+/// have to name a placeholder in every fixture. PMS-1329 makes the API path
+/// reject a create with no email, and every test in this file below that
+/// exercises a different shape (phones, links, primary flags); none of them
+/// are about the email rule specifically, so an injected default keeps them
+/// scoped to what they pin. A body that names `email` explicitly (including
+/// `null`, which the required-email cases below use) is left alone.
+fn ensure_email(mut body: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut body {
+        if !map.contains_key("email") {
+            map.insert(
+                "email".to_string(),
+                serde_json::Value::String("fixture@example.test".to_string()),
+            );
+        }
+    }
+    body
+}
+
 /// Helper: create a contact through the API and return the response body.
 async fn create_contact(
     app: &common::TestApp,
@@ -2066,7 +2090,7 @@ async fn create_contact(
         .client
         .post(app.url("/api/v1/contacts/contacts"))
         .bearer_auth(token)
-        .json(&body)
+        .json(&ensure_email(body))
         .send()
         .await
         .expect("send create contact");
@@ -2087,7 +2111,7 @@ async fn post_contact_status(
     app.client
         .post(app.url("/api/v1/contacts/contacts"))
         .bearer_auth(token)
-        .json(&body)
+        .json(&ensure_email(body))
         .send()
         .await
         .expect("send create contact")
@@ -3020,4 +3044,51 @@ async fn the_list_filters_by_portal_access_and_tags(pool: PgPool) {
     assert_eq!(both, vec!["Billing"], "filters combine");
     let (blank, _) = listed("tags=%20,").await;
     assert_eq!(blank.len(), 3, "a filter of blanks filters nothing");
+}
+
+// ============================================================================
+// PMS-1329: a contact create must carry an email address
+// ============================================================================
+
+/// A create body that omits `email` altogether is a 422 with a field-level
+/// error naming `email`. The API path is what closes the reported defect,
+/// so the assertion goes end-to-end (through the extractor's validate call)
+/// rather than at the DTO. Blank / whitespace-only emails are covered by the
+/// unit tests on the validator itself in `mokosh-types`.
+#[sqlx::test]
+async fn contact_create_without_email_is_rejected(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Emailless Co").await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "No",
+            "last_name": "Address",
+        }))
+        .send()
+        .await
+        .expect("send create contact");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a create with no email must 422"
+    );
+    let body: serde_json::Value = resp.json().await.expect("error JSON");
+    let fields: Vec<&str> = body["error"]["errors"]
+        .as_array()
+        .expect("field errors")
+        .iter()
+        .filter_map(|e| e["field"].as_str())
+        .collect();
+    assert!(
+        fields.iter().any(|f| f.contains("email")),
+        "the 422 must name the email field, got {fields:?}"
+    );
 }

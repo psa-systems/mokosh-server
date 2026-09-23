@@ -434,6 +434,13 @@ async fn create_contact(
     token: &str,
     body: serde_json::Value,
 ) -> serde_json::Value {
+    let mut body = body;
+    // PMS-1329 makes email required on create; these tests exercise company
+    // cascades, so fill in a placeholder when the caller does not name one.
+    if let serde_json::Value::Object(map) = &mut body {
+        map.entry("email".to_string())
+            .or_insert_with(|| serde_json::Value::String("fixture@example.test".into()));
+    }
     let resp = app
         .client
         .post(app.url("/api/v1/contacts/contacts"))
