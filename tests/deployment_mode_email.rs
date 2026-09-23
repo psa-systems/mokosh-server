@@ -275,4 +275,3 @@ async fn saas_mints_no_token_whose_only_carrier_was_suppressed(pool: PgPool) {
         );
     }
 }
-
