@@ -4297,12 +4297,57 @@ impl BillingService {
                 .bind(address)
                 .execute(&mut *tx)
                 .await?;
+                // PMS-978: the delivery gets its own audit row, the shape
+                // PMS-977 gave the company move. The whole-row snapshot below
+                // carries `emailed_to` and `emailed_at` too, but only as two
+                // columns that differ between two JSON blobs; "this invoice
+                // was emailed to this address at this time, by this user" is
+                // the question an operator actually asks, and it should not
+                // require diffing a row to answer. Inside the transaction
+                // with the send, so a relay refusal takes the record of it
+                // away as well.
+                audit_write(
+                    &mut *tx,
+                    tenant_id,
+                    ctx,
+                    AuditAction::Update,
+                    "invoices",
+                    Some(invoice_id),
+                    None,
+                    Some(serde_json::json!({
+                        "event": "invoice.sent",
+                        "invoice_number": document.invoice_number,
+                        "emailed_to": address,
+                        "billing_contact_id": contact_id,
+                    })),
+                )
+                .await?;
             } else {
                 tracing::info!(
                     target: "mokosh_server.billing",
                     %invoice_id,
                     "invoice marked sent without emailing (skip_email)",
                 );
+                // PMS-978: the deliberate no-email send says so in the
+                // history too. Without a row of its own it is indistinguishable
+                // afterwards from a send whose mail was lost: both leave a
+                // `sent` invoice with no `emailed_to`, and only one of them
+                // was somebody's decision.
+                audit_write(
+                    &mut *tx,
+                    tenant_id,
+                    ctx,
+                    AuditAction::Update,
+                    "invoices",
+                    Some(invoice_id),
+                    None,
+                    Some(serde_json::json!({
+                        "event": "invoice.marked_sent",
+                        "invoice_number": document.invoice_number,
+                        "emailed_to": serde_json::Value::Null,
+                    })),
+                )
+                .await?;
             }
         }
 
