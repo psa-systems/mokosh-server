@@ -58,6 +58,9 @@ fn claims(sub: Uuid, bunyip_role: Option<&str>) -> AtClaims {
         mokosh_grant_id: None,
         mokosh_grant_role: None,
         mokosh_grant_account_id: None,
+        // PMS-998: no OP session named, so the back-channel logout check
+        // cannot apply to these fixtures.
+        sid: None,
     }
 }
 
