@@ -60,12 +60,16 @@ jobs:
       - name: Clone the mokosh-apps sibling
         # check-route-consumers.nu compares mounted routes against the SPA
         # source. Without this checkout the guard skips loudly and drift
-        # goes unseen in CI.
+        # goes unseen in CI. The cross-repo checkout needs an org-scoped
+        # token: the runner's own credentials are scoped to mokosh-server,
+        # so a bare checkout stalls at "Determining the default branch"
+        # rather than reading anything from psa-systems/mokosh-apps.
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
           repository: psa-systems/mokosh-apps
           path: mokosh-apps
           fetch-depth: 1
+          token: ${{ secrets.FORGEJO_PAT }}
 
       - name: Cap build parallelism
         # nproc/2 cap: never claim more than half the host (see "Concurrency
