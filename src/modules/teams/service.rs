@@ -30,6 +30,7 @@ use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
@@ -351,40 +352,60 @@ impl TeamsService {
         Ok(TeamWithMembers { team, members })
     }
 
-    /// Enumerate teams in the tenant. Active-only by default; filters
-    /// let the caller include or exclude the archived ones.
+    /// Enumerate teams in the tenant, one page at a time. Active-only by
+    /// default; filters let the caller include or exclude the archived ones.
+    ///
+    /// Returns the page's rows and the tenant-wide total that matches the
+    /// same filters, so the client can render a real page count instead of
+    /// the current page's length.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_teams(
         &self,
         tenant_id: TenantId,
         filters: TeamListFilters,
-    ) -> AppResult<Vec<Team>> {
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<Team>, u64)> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        // Compose the WHERE clause with bound parameters only.
-        let mut query = String::from(
-            "SELECT id, tenant_id, name, description, manager_id, color, \
-                    is_active, created_at, updated_at \
-             FROM teams WHERE tenant_id = $1",
-        );
-        let mut idx = 2;
+
+        // Assemble the shared WHERE clause once, so the count and the row
+        // read cannot drift apart over which set they describe.
+        let mut where_clause = String::from("WHERE tenant_id = $1");
+        let mut idx: usize = 2;
         if filters.only_inactive {
-            query.push_str(" AND is_active = FALSE");
+            where_clause.push_str(" AND is_active = FALSE");
         } else if !filters.include_inactive {
-            query.push_str(" AND is_active = TRUE");
+            where_clause.push_str(" AND is_active = TRUE");
         }
         if filters.manager_id.is_some() {
-            query.push_str(&format!(" AND manager_id = ${}", idx));
+            where_clause.push_str(&format!(" AND manager_id = ${}", idx));
             idx += 1;
         }
-        query.push_str(" ORDER BY name");
-        let _ = idx;
 
-        let mut q = sqlx::query_as::<_, TeamRow>(&query).bind(*tenant_id);
+        let count_sql = format!("SELECT COUNT(*) FROM teams {}", where_clause);
+        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql).bind(*tenant_id);
         if let Some(mgr) = filters.manager_id {
-            q = q.bind(mgr);
+            count_q = count_q.bind(mgr);
         }
-        let rows = q.fetch_all(&mut *tx).await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let total: i64 = count_q.fetch_one(&mut *tx).await?;
+
+        let rows_sql = format!(
+            "SELECT id, tenant_id, name, description, manager_id, color, \
+                    is_active, created_at, updated_at \
+             FROM teams {} ORDER BY name LIMIT ${} OFFSET ${}",
+            where_clause,
+            idx,
+            idx + 1,
+        );
+        let mut rows_q = sqlx::query_as::<_, TeamRow>(&rows_sql).bind(*tenant_id);
+        if let Some(mgr) = filters.manager_id {
+            rows_q = rows_q.bind(mgr);
+        }
+        rows_q = rows_q
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64);
+        let rows = rows_q.fetch_all(&mut *tx).await?;
+
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
     /// Member roster for a team, joined to `users` so the client gets
