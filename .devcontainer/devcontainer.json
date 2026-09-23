@@ -5,7 +5,7 @@
   "name": "openSUSE Leap 16.0",
   // Use a Dockerfile or Docker Compose file: https://containers.dev/guide/dockerfile
   // Use an image: https://github.com/devcontainers/images/blob/main/src/base-debian/history/1.0.9.md
-  // Custom image based on openSUSE Leap 15.6: https://github.com/niceguyit/oci-images/pkgs/container/opensuse-base
+  // Custom image based on openSUSE Leap 16.0: https://github.com/niceguyit/oci-images/pkgs/container/opensuse-base
   "image": "ghcr.io/niceguyit/opensuse-dev:v0.7.0-leap-16.0",
   // "image": "opensuse-dev:v0.6.0-leap-16.0",
   // For application development
