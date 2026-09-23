@@ -148,7 +148,7 @@ fn claims(sub: Uuid) -> AtClaims {
 const QUERY_BUDGET: usize = 2;
 
 #[sqlx::test]
-async fn an_authenticated_bunyip_request_costs_three_statements(pool: PgPool) {
+async fn an_authenticated_bunyip_request_costs_two_statements(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry().with(RecordingLayer(recorder.clone())),
