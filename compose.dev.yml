@@ -36,13 +36,11 @@
 # https://${USER}-mokosh-api.a8n.run to the container's $MOKOSH_PORT (see the
 # server's `labels` below).
 #
-# MOKOSH_HOST_BIND_IP is still discovered and written to .env by `just dev`, but
-# nothing in this file consumes it. It is deliberately NOT used to publish any
-# host port: postgres and mailpit publish on loopback only (PMS-496), so
-# host-side tooling (sqlx-cli, the mail UI) reaches them via localhost while the
-# LAN/internet cannot, and the server is reachable through Traefik alone.
-# Discover the host IP with:
-#   sys net | where name =~ 'eth0|br0' | get ip.0 | where protocol == 'ipv4'
+# No service here publishes a host port on a LAN address, and none should:
+# postgres and mailpit publish on loopback only (PMS-496), so host-side tooling
+# (sqlx-cli, the mail UI) reaches them via localhost while the LAN/internet
+# cannot, and the server is reachable through Traefik alone. The LAN-IP variable
+# that once carried such a bind was removed in PMS-863 once nothing read it.
 #
 # The Mokosh application database runs inside this stack as the
 # `postgres` service (separate from `infisical-postgres`, which is for
@@ -189,11 +187,11 @@ services:
       # PMS-496: published on LOOPBACK ONLY. host-side sqlx-cli (just
       # migrate-run) connects via localhost:${MOKOSH_PG_HOST_PORT}; sibling
       # containers reach this DB by in-network DNS `postgres:5432` and need no
-      # host publish at all. Do NOT reintroduce MOKOSH_HOST_BIND_IP here: that
-      # var is derived from the first non-loopback interface (which can be
-      # public), so binding the port to it exposed the app DB - and the
-      # BYPASSRLS mokosh_migrator role reachable through it - to the LAN/internet
-      # with weak default credentials. If a non-loopback bind is ever genuinely
+      # host publish at all. Do NOT reintroduce a LAN-IP bind here: the var
+      # that carried one was derived from the first non-loopback interface
+      # (which can be public), so binding the port to it exposed the app DB -
+      # and the BYPASSRLS mokosh_migrator role reachable through it - to the
+      # LAN/internet with weak default credentials. If a non-loopback bind is ever genuinely
       # required, introduce an explicit private-IP env var with NO default
       # (e.g. `${MOKOSH_PG_PRIVATE_BIND_IP:?...}`) and only after a host firewall
       # is confirmed to deny 5432/5433 inbound on every non-loopback interface.
