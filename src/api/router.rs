@@ -383,6 +383,20 @@ pub fn create_api_router(
         // cheap Arc bump. PMS-837 removed the Google OAuth popup routes and
         // their `google_oauth` / `cookie_secure` parameters.
         .nest("/auth", auth_routes(auth_service.clone()))
+        // PMS-1210: the grantee-side "Leave account" endpoint. Placed at
+        // the top of `/api/v1` rather than under `/auth` because the
+        // gesture is a caller acting on themselves through the identity
+        // plane, not part of the auth-of-record surface.
+        .nest(
+            "/my-grants",
+            // SAFETY (PMS-285): the my-grants router owns the connection
+            // pool because its one write (grantee-leave) touches the
+            // cross-tenant `mokosh_bunyip_grants` table (RLS-exempt, see
+            // `mokosh_bunyip_grants.rs`) and the identity-plane `users`
+            // row. Neither is served on a tenant GUC, so the router takes
+            // the pool directly and threads it through the service call.
+            crate::modules::auth::my_grants::my_grants_routes(db.pool().clone()),
+        )
         // MAPPS-513: platform super-admin routes. Distinct credential
         // store (`platform_admins`) and distinct JWT typ so the
         // super-admin persona is isolated from the tenant identity
