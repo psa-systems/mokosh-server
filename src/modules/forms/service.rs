@@ -469,6 +469,10 @@ impl FormsService {
         let org = crate::modules::tenants::OrgIdentity::load(&self.db, tenant_id).await?;
         let contact_info = def.contact_info.clone().or_else(|| org.phrase());
         Ok(super::models::PublicFormResponse {
+            // PMS-737: multi-person is a property of a request LINK. A portal
+            // form is filled in by one signed-in contact, once.
+            people: 1,
+            person_number: 1,
             name: def.name,
             description: def.description,
             tenant_name: org.name().to_string(),

@@ -27,12 +27,8 @@ use uuid::Uuid;
 
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
-use crate::modules::contact_portal::capabilities::INVOICES_READ;
+use crate::modules::contact_portal::capabilities::{BUILTIN_BILLING_CONTACT_KEY, INVOICES_READ};
 use crate::utils::error::AppResult;
-
-/// The built-in role a billing contact is given, by the name
-/// `seed_builtin_portal_roles` inserts.
-const BILLING_CONTACT_ROLE: &str = "Billing Contact";
 
 /// Make sure `contact_id` can read invoices, and say whether that changed
 /// anything.
@@ -95,13 +91,15 @@ pub(crate) async fn ensure_can_read_invoices(
 
     // The tenant-wide built-in, never a company-scoped role of the same name:
     // a company-scoped one is the MSP's own creation and is not this
-    // function's to hand out.
+    // function's to hand out. Keyed on the stable `builtin_key` rather
+    // than the display name, so a rename does not silently move the
+    // resolved role.
     let role_id: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM portal_roles \
-         WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE AND name = $2",
+         WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE AND builtin_key = $2",
     )
     .bind(tenant_id)
-    .bind(BILLING_CONTACT_ROLE)
+    .bind(BUILTIN_BILLING_CONTACT_KEY)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(role_id) = role_id else {
@@ -136,7 +134,7 @@ pub(crate) async fn ensure_can_read_invoices(
         Some(contact_id),
         None,
         Some(serde_json::json!({
-            "portal_role_granted": BILLING_CONTACT_ROLE,
+            "portal_role_granted": "Billing Contact",
             "reason": "designated as a billing contact",
             "role_id": role_id,
         })),

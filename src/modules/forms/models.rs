@@ -24,6 +24,12 @@ pub struct ResolvedRequestToken {
     /// `created_by_id`, since the submitter is a client with no `users` row
     /// and that column is NOT NULL.
     pub created_by_id: Uuid,
+    /// PMS-737: how many people the link covers, how many submissions are
+    /// still open, and the parent the children are filed under. `1`, `1` and
+    /// `None` for the single-person link that has always existed.
+    pub people: i32,
+    pub uses_remaining: i32,
+    pub parent_ticket_id: Option<Uuid>,
 }
 
 /// PMS-729 phase 2 §7 slice B / I8: one row on `GET /portal/forms`. Just
