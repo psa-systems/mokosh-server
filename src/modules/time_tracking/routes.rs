@@ -1,4 +1,9 @@
 //! Time-tracking HTTP routes.
+//!
+//! parity record 2026-09-22: the item timer routes (`/timers/active`,
+//! `/timers/start`, `/timers/{id}/stop`) have no SPA caller. `WorkDayPage`
+//! uses the segment routes; the item-timer UI is deferred. Note covers
+//! ONLY the three timer routes; every other route in this file is consumed.
 
 use std::sync::Arc;
 
