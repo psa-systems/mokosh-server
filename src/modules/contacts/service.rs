@@ -1144,12 +1144,16 @@ impl ContactService {
                     "The portal area {area_key:?} no longer exists, so this request cannot be granted."
                 )));
             };
+            // Keyed on the stable `builtin_key` so a rename does not
+            // silently reroute a grant to another role. The message still
+            // names the display, which is what an operator reads.
             let role_id: Option<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM portal_roles \
-                 WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE AND name = $2",
+                 WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE \
+                   AND builtin_key = $2",
             )
             .bind(tenant_id)
-            .bind(area.granting_role)
+            .bind(area.granting_role_key)
             .fetch_optional(&mut *tx)
             .await?;
             let Some(role_id) = role_id else {
