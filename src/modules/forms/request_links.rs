@@ -15,8 +15,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::models::{
-    IssueRequestLinkRequest, PublicFormField, PublicFormResponse, PublicSubmissionReceipt,
-    RequestLinkResponse, ResolvedRequestToken,
+    FormDefinitionResponse, IssueRequestLinkRequest, PublicFormField, PublicFormResponse,
+    PublicSubmissionReceipt, RequestLinkResponse, ResolvedRequestToken,
 };
 use super::service::FormsService;
 use crate::modules::auth::TenantId;
@@ -30,6 +30,11 @@ use crate::utils::html::{html_escape, urlencoded};
 /// anger. Long enough for a client to get to it after a weekend, short enough
 /// that a link forwarded onward goes stale.
 const REQUEST_LINK_TTL_DAYS: i64 = 7;
+
+/// PMS-737: the most people one request link may cover. A bulk intake is an
+/// acquisition or a hiring round, not an unbounded list, and the cap is what
+/// stops one leaked link from filing an unbounded number of tickets.
+const MAX_PEOPLE_PER_LINK: i32 = 50;
 
 /// Everything the `forms.request_link` template renders.
 ///
@@ -161,16 +166,49 @@ impl FormsService {
             }
         };
 
+        // PMS-737: a link for several people. One is the default and is the
+        // single-use link that has always existed.
+        let people = req.people.unwrap_or(1);
+        if !(1..=MAX_PEOPLE_PER_LINK).contains(&people) {
+            return Err(AppError::validation_field(
+                "people",
+                format!("must be between 1 and {MAX_PEOPLE_PER_LINK}"),
+            ));
+        }
+
         let token_id = Uuid::new_v4();
         let secret = generate_token(64);
         let token_hash = hash_password(&secret).await?;
         let expires_at = Utc::now() + Duration::days(REQUEST_LINK_TTL_DAYS);
 
+        // PMS-737: the parent exists from the moment the request is issued,
+        // not from the first submission. It is created here, in the request
+        // the MSP is making, so there is no race between two clients
+        // submitting at once over who creates it, and so the MSP can see and
+        // chase a request nobody has filled in yet. It carries NO SLA, no
+        // assignee and no time: every child carries its own, which is what
+        // keeps the PMS-732 measured duration an average over people.
+        let parent = match people > 1 {
+            true => Some(
+                self.create_request_parent(
+                    tenant_id,
+                    created_by,
+                    &definition,
+                    req.company_id,
+                    contact_id,
+                    people,
+                )
+                .await?,
+            ),
+            false => None,
+        };
+
         sqlx::query(
             "INSERT INTO form_request_tokens \
                (id, tenant_id, form_definition_id, company_id, contact_id, \
-                recipient_email, token_hash, expires_at, created_by_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                recipient_email, token_hash, expires_at, created_by_id, \
+                uses_allowed, uses_remaining, parent_ticket_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11)",
         )
         .bind(token_id)
         .bind(tenant_id)
@@ -181,6 +219,8 @@ impl FormsService {
         .bind(&token_hash)
         .bind(expires_at)
         .bind(created_by)
+        .bind(people)
+        .bind(parent.as_ref().map(|(id, _)| *id))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -217,7 +257,70 @@ impl FormsService {
             expires_at,
             used_at: None,
             submission_id: None,
+            people,
+            submissions_remaining: people,
+            parent_ticket_id: parent.as_ref().map(|(id, _)| *id),
+            parent_ticket_number: parent.map(|(_, number)| number),
         })
+    }
+
+    /// PMS-737: the container ticket a multi-person request hangs off.
+    ///
+    /// Deliberately bare: no SLA, no assignee, no estimate, no time. It says
+    /// what was asked for and how many people it covers, and the children
+    /// carry the work. Returns its id and number.
+    async fn create_request_parent(
+        &self,
+        tenant_id: TenantId,
+        created_by: Uuid,
+        definition: &FormDefinitionResponse,
+        company_id: Uuid,
+        contact_id: Option<Uuid>,
+        people: i32,
+    ) -> AppResult<(Uuid, String)> {
+        let Some(tickets) = self.tickets.as_ref() else {
+            return Err(AppError::Internal(
+                "no ticket service wired into the forms service".to_string(),
+            ));
+        };
+        let request = mokosh_types::tickets::CreateTicketRequest {
+            title: format!("{}: {people} people", definition.name),
+            description: Some(format!(
+                "A request for {people} people. Each person is a child ticket of this one, \
+                 created as the client submits them. Track the work, the time and the SLA on \
+                 the children; this ticket is the request itself."
+            )),
+            company_id,
+            contact_id,
+            source: mokosh_types::tickets::TicketSource::Portal,
+            procedure_kb_article_id: definition.kb_article_id,
+            custom_fields: serde_json::json!({}),
+            ..Default::default()
+        };
+        let ctx = crate::modules::audit::AuditCtx::system(tenant_id.get());
+        let parent = tickets
+            .create_ticket(tenant_id, created_by, &request, &ctx)
+            .await?;
+        // `create_ticket` applies the tenant's SLA to every ticket it makes
+        // (`calculate_sla_dates`). A container must not carry a clock: the
+        // work happens on the children, each with its own SLA, and a parent
+        // with a response deadline would breach while every person's request
+        // was being handled on time. Cleared here rather than by a flag on
+        // the shared create path, so the exception stays where the decision
+        // is. The SLA worker only ever looks at tickets that have due dates,
+        // so this takes the parent out of it entirely.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE tickets SET sla_id = NULL, sla_due_date = NULL, \
+                 first_response_due = NULL, resolution_due = NULL \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(parent.id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((parent.id, parent.ticket_number))
     }
 
     async fn queue_request_link_email(&self, tenant_id: TenantId, mail: RequestLinkEmail<'_>) {
@@ -298,7 +401,8 @@ impl FormsService {
 
         let row = sqlx::query_as::<_, TokenRow>(
             "SELECT tenant_id, form_definition_id, company_id, contact_id, token_hash, \
-                        used_at, expires_at, created_by_id \
+                        expires_at, created_by_id, uses_allowed, uses_remaining, \
+                        parent_ticket_id \
                  FROM form_request_tokens WHERE id = $1",
         )
         .bind(token_id)
@@ -319,7 +423,10 @@ impl FormsService {
         if !verify_password(secret, &row.token_hash).await? {
             return Err(invalid());
         }
-        if row.used_at.is_some() {
+        // PMS-737: a spent link is one with nothing left, whether it was
+        // issued for one person or five. The wording stays what a single-use
+        // link has always said, because that is what it means to the client.
+        if row.uses_remaining <= 0 {
             return Err(AppError::Gone(
                 "This request link has already been submitted".to_string(),
             ));
@@ -333,6 +440,9 @@ impl FormsService {
             company_id,
             contact_id,
             created_by_id,
+            uses_allowed,
+            uses_remaining,
+            parent_ticket_id,
             ..
         } = row;
 
@@ -343,6 +453,9 @@ impl FormsService {
             company_id,
             contact_id,
             created_by_id,
+            people: uses_allowed,
+            uses_remaining,
+            parent_ticket_id,
         })
     }
 
@@ -376,6 +489,9 @@ impl FormsService {
             tenant_name: org.name().to_string(),
             contact_info,
             logo_url: org.logo_path().map(str::to_string),
+            people: resolved.people,
+            // The one being filled in now: the first unspent use.
+            person_number: resolved.people - resolved.uses_remaining + 1,
             rules: definition.rules,
             fields: definition
                 .fields
@@ -469,6 +585,10 @@ impl FormsService {
             company_id: resolved.company_id,
             contact_id: resolved.contact_id,
             source: mokosh_types::tickets::TicketSource::Portal,
+            // PMS-737: one child per person, under the parent the link was
+            // issued with. `None` for a single-person link, which stays the
+            // one ticket it has always been.
+            parent_ticket_id: resolved.parent_ticket_id,
             // PMS-730 AC: the ticket carries the article describing how to
             // perform this change, selected by the request type. The form
             // definition IS the request type, so the mapping is its column.
@@ -490,21 +610,37 @@ impl FormsService {
             .bind(ticket.id)
             .execute(&mut *tx)
             .await?;
-        let burned = sqlx::query(
-            "UPDATE form_request_tokens SET used_at = NOW(), submission_id = $3 \
-             WHERE tenant_id = $1 AND id = $2 AND used_at IS NULL",
+        sqlx::query(
+            "UPDATE form_submissions SET request_token_id = $3 WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(submission_id)
+        .bind(resolved.token_id)
+        .execute(&mut *tx)
+        .await?;
+        // PMS-737: one use is spent. `used_at` is stamped on the LAST one, so
+        // a single-use link behaves exactly as it did, and `submission_id`
+        // keeps pointing at the FIRST submission the link produced.
+        let remaining: Option<i32> = sqlx::query_scalar(
+            "UPDATE form_request_tokens \
+             SET uses_remaining = uses_remaining - 1, \
+                 used_at = CASE WHEN uses_remaining - 1 = 0 THEN NOW() ELSE used_at END, \
+                 submission_id = COALESCE(submission_id, $3) \
+             WHERE tenant_id = $1 AND id = $2 AND uses_remaining > 0 \
+             RETURNING uses_remaining",
         )
         .bind(tenant_id)
         .bind(resolved.token_id)
         .bind(submission_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        .fetch_optional(&mut *tx)
+        .await?;
+        let burned = usize::from(remaining.is_some());
         tx.commit().await?;
 
-        // `used_at IS NULL` in the UPDATE is the race guard: two submissions
-        // arriving together both pass the earlier resolve check, but only one
-        // updates a row. The loser is reported as already submitted rather
+        // `uses_remaining > 0` in the UPDATE is the race guard: two
+        // submissions arriving together both pass the earlier resolve check,
+        // but the row is locked by the first, and a link with nothing left
+        // updates nothing. The loser is reported as already submitted rather
         // than quietly accepted.
         if burned == 0 {
             return Err(AppError::Gone(
@@ -514,6 +650,7 @@ impl FormsService {
 
         Ok(PublicSubmissionReceipt {
             ticket_number: ticket.ticket_number,
+            submissions_remaining: remaining.unwrap_or(0),
         })
     }
 }
@@ -628,10 +765,13 @@ impl FormsService {
         let rows = sqlx::query_as::<_, LinkRow>(
             "SELECT t.id, t.form_definition_id, d.name AS form_name, t.company_id, \
                     c.name AS company_name, t.contact_id, t.recipient_email, \
-                    t.expires_at, t.used_at, t.submission_id \
+                    t.expires_at, t.used_at, t.submission_id, \
+                    t.uses_allowed, t.uses_remaining, t.parent_ticket_id, \
+                    p.ticket_number AS parent_ticket_number \
              FROM form_request_tokens t \
              JOIN form_definitions d ON d.id = t.form_definition_id \
              JOIN companies c ON c.id = t.company_id \
+             LEFT JOIN tickets p ON p.id = t.parent_ticket_id AND p.tenant_id = t.tenant_id \
              WHERE t.tenant_id = $1 AND ($2::uuid IS NULL OR t.company_id = $2) \
              ORDER BY t.created_at DESC",
         )
@@ -654,9 +794,13 @@ struct TokenRow {
     company_id: Uuid,
     contact_id: Option<Uuid>,
     token_hash: String,
-    used_at: Option<chrono::DateTime<Utc>>,
     expires_at: chrono::DateTime<Utc>,
     created_by_id: Uuid,
+    // PMS-737: what is left decides whether the link is spent; `used_at` is
+    // the stamp on the last one and is not read here.
+    uses_allowed: i32,
+    uses_remaining: i32,
+    parent_ticket_id: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -671,6 +815,11 @@ struct LinkRow {
     expires_at: chrono::DateTime<Utc>,
     used_at: Option<chrono::DateTime<Utc>>,
     submission_id: Option<Uuid>,
+    // PMS-737: how many people, how many left, and the parent they file under.
+    uses_allowed: i32,
+    uses_remaining: i32,
+    parent_ticket_id: Option<Uuid>,
+    parent_ticket_number: Option<String>,
 }
 
 impl From<LinkRow> for RequestLinkResponse {
@@ -686,6 +835,10 @@ impl From<LinkRow> for RequestLinkResponse {
             expires_at: r.expires_at,
             used_at: r.used_at,
             submission_id: r.submission_id,
+            people: r.uses_allowed,
+            submissions_remaining: r.uses_remaining,
+            parent_ticket_id: r.parent_ticket_id,
+            parent_ticket_number: r.parent_ticket_number,
         }
     }
 }

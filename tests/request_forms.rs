@@ -527,8 +527,13 @@ async fn a_valid_submission_creates_a_ticket_carrying_the_data_and_the_article(p
         .to_string();
     assert_eq!(
         receipt.as_object().map(|o| o.len()),
-        Some(1),
-        "the receipt carries the ticket number and nothing else about the tenant"
+        Some(2),
+        "the receipt carries the ticket number and, since PMS-737, how many \
+         submissions the link has left, and nothing else about the tenant"
+    );
+    assert_eq!(
+        receipt["submissions_remaining"], 0,
+        "a single-person link is spent by this submission"
     );
 
     let (
