@@ -1408,6 +1408,41 @@ pub struct UpsertCompanyIndustryRequest {
     pub is_active: bool,
 }
 
+/// Response body of `POST /api/v1/contacts/{id}/grant-portal-access`. Carries
+/// the Company's portal slug + the 9-digit `portal_id` so the SPA can render
+/// "Portal ID: 555556666" alongside the URL and the operator can dictate it
+/// over the phone. Pinned to `i64` to match `companies.portal_id BIGINT`.
+///
+/// The setup token used to ride here as `setup_link` so the SPA could paint a
+/// "Copy this link" affordance, which handed password-setup capability to
+/// anyone who could read the markup. `setup_link` stays on the struct so the
+/// integration suite can drive the redemption flow, but is `#[serde(skip)]`
+/// on the response: the SPA never sees it, and the token reaches the contact
+/// only through the setup email `send_grant_email` dispatches.
+/// `password_email_queued` lets the SPA still distinguish a fresh grant from
+/// a role-only edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortalGrantOutcome {
+    pub portal_slug: String,
+    pub portal_id: i64,
+    #[serde(default)]
+    pub password_email_queued: bool,
+    #[serde(skip)]
+    pub setup_link: String,
+}
+
+/// Request body of `POST /api/v1/contacts/{id}/grant-portal-access` and
+/// `PUT /api/v1/contacts/{id}/portal-roles`. `role_ids` REPLACES any prior
+/// assignment set rather than adding to it. A grant with no roles is refused;
+/// the length rule reaches every caller (agent-side edit through the role
+/// picker, roster-page bulk grant, or a hand-crafted API call) so the SPA's
+/// "Pick at least one role." check has one enforced home.
+#[derive(Debug, Clone, Serialize, Deserialize, validator::Validate)]
+pub struct GrantPortalAccessRequest {
+    #[validate(length(min = 1))]
+    pub role_ids: Vec<Uuid>,
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================
@@ -2028,5 +2063,49 @@ mod tests {
         // Still rejects a genuinely bad number.
         let req = contact_req(serde_json::json!({ "phone": "not-a-phone\u{200B}" }));
         assert!(req.validate().is_err());
+    }
+
+    /// The setup token is what sets the account password, so the SPA must
+    /// never see it. The wire shape carries `portal_slug`, `portal_id` and
+    /// `password_email_queued` only; this test fails loud if the serialised
+    /// JSON holds the `setup_link` field, the URL or the raw token.
+    #[test]
+    fn serialised_outcome_does_not_leak_the_setup_link() {
+        let outcome = PortalGrantOutcome {
+            portal_slug: "acme".to_string(),
+            portal_id: 555_556_666,
+            password_email_queued: true,
+            setup_link: "https://portal.example/portal/acme/set-password?token=c.SECRET"
+                .to_string(),
+        };
+        let json = serde_json::to_string(&outcome).expect("serialise outcome");
+        assert!(
+            !json.contains("setup_link"),
+            "setup_link field must not reach the wire: {json}"
+        );
+        assert!(
+            !json.contains("set-password"),
+            "the setup URL must not reach the wire: {json}"
+        );
+        assert!(
+            !json.contains("SECRET"),
+            "the setup token must not reach the wire: {json}"
+        );
+        assert!(json.contains("\"portal_slug\":\"acme\""));
+        assert!(json.contains("\"portal_id\":555556666"));
+        assert!(json.contains("\"password_email_queued\":true"));
+    }
+
+    /// Empty `role_ids` is refused server-side, so a hand-crafted call cannot
+    /// grant portal access without picking any role. The SPA-side "Pick at
+    /// least one role." check has one enforced home instead of two.
+    #[test]
+    fn grant_portal_access_refuses_an_empty_role_set() {
+        let empty = GrantPortalAccessRequest { role_ids: vec![] };
+        assert!(empty.validate().is_err());
+        let picked = GrantPortalAccessRequest {
+            role_ids: vec![Uuid::new_v4()],
+        };
+        assert!(picked.validate().is_ok());
     }
 }
