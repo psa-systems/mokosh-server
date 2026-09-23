@@ -488,6 +488,11 @@ pub struct UpdateTicketRequest {
 pub struct TicketResponse {
     pub id: Uuid,
     pub ticket_number: String,
+    /// PMS-1368: the ticket this one is a child of, so a list row can say
+    /// what it belongs to without a second read. `None` for an ordinary
+    /// ticket, which is nearly all of them.
+    #[serde(default)]
+    pub parent_ticket_id: Option<Uuid>,
     pub title: String,
     pub description: Option<String>,
     pub status: TicketStatusSummary,
@@ -781,6 +786,9 @@ pub struct TicketFilter {
     /// detail page consumes this to render a Related Tickets section
     /// (`GET /api/v1/tickets?asset_id=<uuid>`).
     pub asset_id: Option<Uuid>,
+    /// PMS-1368: the children of one ticket. A multi-person client request
+    /// (PMS-737) is a parent with a child per person, and its page lists them.
+    pub parent_ticket_id: Option<Uuid>,
     pub is_unassigned: Option<bool>,
     pub is_overdue: Option<bool>,
     pub is_open: Option<bool>,

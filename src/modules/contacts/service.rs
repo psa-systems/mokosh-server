@@ -1144,12 +1144,16 @@ impl ContactService {
                     "The portal area {area_key:?} no longer exists, so this request cannot be granted."
                 )));
             };
+            // Keyed on the stable `builtin_key` so a rename does not
+            // silently reroute a grant to another role. The message still
+            // names the display, which is what an operator reads.
             let role_id: Option<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM portal_roles \
-                 WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE AND name = $2",
+                 WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE \
+                   AND builtin_key = $2",
             )
             .bind(tenant_id)
-            .bind(area.granting_role)
+            .bind(area.granting_role_key)
             .fetch_optional(&mut *tx)
             .await?;
             let Some(role_id) = role_id else {
@@ -1750,9 +1754,9 @@ impl ContactService {
     /// assignments and the token row); the email dispatch is
     /// best-effort AFTER the tx commits so a mailer outage does not
     /// undo the grant. Returns `PortalGrantOutcome { portal_slug,
-    /// setup_link }` so the SPA can display + copy the URL to the
-    /// operator (useful when email delivery is delayed or the
-    /// operator wants to relay it via chat).
+    /// portal_id, password_email_queued }`; the setup token itself is
+    /// no longer serialised to the SPA and reaches the contact only
+    /// through the queued email.
     ///
     /// Guards:
     /// - Contact must exist under `tenant_id`.
@@ -1995,7 +1999,11 @@ impl ContactService {
         .await?
         .unwrap_or(false);
 
-        let (setup_link, token_for_email) = if already_credentialled {
+        // The token stays server-side; the response carries only whether
+        // an email was queued so the SPA can distinguish a fresh grant
+        // from a role-only edit. `setup_link` is `#[serde(skip)]` on the
+        // wire and populated for the integration suite's benefit.
+        let token_for_email: Option<String> = if already_credentialled {
             audit_write(
                 &mut *tx,
                 tenant_id,
@@ -2011,7 +2019,7 @@ impl ContactService {
             )
             .await?;
             tx.commit().await?;
-            (String::new(), None)
+            None
         } else {
             // Fresh grant OR re-grant of a previously revoked account
             // whose password was cleared: mint a token + queue the
@@ -2043,26 +2051,29 @@ impl ContactService {
             )
             .await?;
             tx.commit().await?;
-
-            let link = format!(
-                "{}/portal/{}/set-password?token={}",
-                self.app_url.trim_end_matches('/'),
-                portal_slug,
-                token,
-            );
-            (link, Some(token))
+            Some(token)
         };
 
         // Fire the setup email ONLY on the fresh-grant branch. A
         // role edit stays silent as promised in the client toast.
-        if let Some(t) = token_for_email.as_ref() {
+        let password_email_queued = token_for_email.is_some();
+        let setup_link = if let Some(t) = token_for_email.as_ref() {
             self.send_grant_email(&contact, &portal_slug, portal_id, t)
                 .await;
-        }
+            format!(
+                "{}/portal/{}/set-password?token={}",
+                self.app_url.trim_end_matches('/'),
+                portal_slug,
+                t,
+            )
+        } else {
+            String::new()
+        };
 
         Ok(PortalGrantOutcome {
             portal_slug,
             portal_id,
+            password_email_queued,
             setup_link,
         })
     }

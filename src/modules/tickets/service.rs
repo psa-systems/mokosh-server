@@ -3090,6 +3090,16 @@ fn build_ticket_filter_sql(
         count_idx += 1;
         binds.push(TicketFilterBind::Id(asset_id));
     }
+    // PMS-1368: one parent's children, which is what a multi-person client
+    // request looks like (PMS-737). Tenant scoping is the query's own, so a
+    // parent id from another tenant simply matches nothing.
+    if let Some(parent_ticket_id) = filter.parent_ticket_id {
+        data_conds.push(format!("t.parent_ticket_id = ${data_idx}"));
+        count_conds.push(format!("t.parent_ticket_id = ${count_idx}"));
+        data_idx += 1;
+        count_idx += 1;
+        binds.push(TicketFilterBind::Id(parent_ticket_id));
+    }
     // PMS-406: scope tickets to a single team. The IT / HR / service-vendor
     // split is modeled as distinct `teams` rows, not a hardcoded enum, so
     // this is the mechanism the TV-view dashboard uses to show only one
@@ -3150,7 +3160,7 @@ const TICKET_RESPONSE_SELECT: &str = r#"
 SELECT
     t.id, t.ticket_number, t.title, t.description,
     t.source, t.company_id, t.contact_id, t.assigned_to_id,
-    t.asset_id, t.procedure_kb_article_id,
+    t.asset_id, t.procedure_kb_article_id, t.parent_ticket_id,
     t.sla_due_date, t.is_billable, t.billing_status,
     t.estimated_hours, t.actual_hours, t.tags,
     -- PMS-893: `resolved_at` stops the SLA clock, the same way the sweep
@@ -3295,6 +3305,7 @@ impl From<TicketRow> for Ticket {
 struct TicketResponseRow {
     id: Uuid,
     ticket_number: String,
+    parent_ticket_id: Option<Uuid>,
     title: String,
     description: Option<String>,
     source: String,
@@ -3369,6 +3380,7 @@ impl From<TicketResponseRow> for TicketResponse {
         TicketResponse {
             id: r.id,
             ticket_number: r.ticket_number,
+            parent_ticket_id: r.parent_ticket_id,
             title: r.title,
             description: r.description,
             status: TicketStatusSummary {
