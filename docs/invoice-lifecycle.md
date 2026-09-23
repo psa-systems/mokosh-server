@@ -64,6 +64,16 @@ Overdue is derived on every read, never stored: `is_overdue` and `days_overdue` 
 
 Reminders are a worker. `InvoiceReminderWorker` runs hourly; for each tenant with `billing_reminders/enabled` and a `schedule` (day offsets such as `[3, 7, 14, 30]`), at the tenant's local `send_hour` (default 8), it mails every overdue invoice whose `days_overdue` equals a step, to the address the invoice was emailed to (PMS-992) else the resolved billing contact (PMS-993), with the stored document attached (PMS-959) and the pay link when a gateway is connected. `invoice_reminders` records each send per invoice per step and is the idempotency guard, so a run that fires twice in the hour sends once; a refused send releases the claim so the next run tries again. Late fees are deliberately not here: a fee is a new line on a new document, and its own ticket.
 
+## Creating an invoice does not send it (PMS-978)
+
+Creation makes a draft. Nothing is emailed, nothing is frozen, and no document is stored; the customer learns of the invoice when somebody sends it. That is deliberate rather than missing: an invoice is routinely prepared before it is ready to go out, and the alternative, emailing on create, would need a draft state first to get the same behaviour back.
+
+Sending is the `draft`/`pending` -> `sent` transition on `PUT /invoices/{id}`, and it is the one act that emails the customer, freezes the issuer snapshot (PMS-911) and stores the document (PMS-959). It is also the only place `sent` is written, so the state on the invoice answers "has this gone out" without a second flag: `draft` or `pending` means nobody has been told, `sent_at` says when it went, and `emailed_to` with `emailed_at` says to whom. A send the relay refuses rolls all of it back (PMS-992), so a `sent` invoice is never one nobody received.
+
+Two named audit rows record the delivery itself, beside the whole-row `update` snapshot PMS-117 writes: `invoice.sent` with the address, the contact and the actor, and `invoice.marked_sent` for a `skip_email` send, which records that nobody was emailed on purpose. Without that second one, a deliberate no-email send would be indistinguishable afterwards from a send whose mail was lost, since both leave a `sent` invoice with no `emailed_to`. Both are written inside the send's transaction, so a refusal takes the record away with the transition.
+
+The rows are in `audit_log` and readable through the admin audit-log endpoint, not through the per-record history feed: `HISTORY_ENTITY_TYPES` deliberately excludes billing so a technician cannot browse an invoice's trail.
+
 ## Sending requires a recipient
 
 PMS-993. An invoice cannot reach `sent` without a `billing_contact_id`, because an issued invoice with no recipient is a document nobody was ever asked to pay. The recipient is the company's billing contact, `companies.default_billing_contact_id`: per-company and single-valued, so reassigning it replaces the previous holder.
