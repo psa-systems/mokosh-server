@@ -175,7 +175,7 @@ just dev --detach
 | --- | --- | --- |
 | Mokosh API | `https://<your-username>-mokosh-api.a8n.run` | Traefik is the sole ingress and terminates TLS; the container listens on `MOKOSH_PORT` (`8080`) and publishes no host port. |
 | Mailpit | `http://localhost:8025` | Catches all outbound dev email. Loopback only; the host port is `MOKOSH_MAILPIT_WEB_HOST_PORT`. |
-| Postgres | `127.0.0.1:5433` (`postgres:5432` in-network) | Database `mokosh`, user `postgres`. The password is generated per clone: read `MOKOSH_PG_PASSWORD` (or the whole `DATABASE_URL`) from `.env`. Loopback only; the host port is `MOKOSH_PG_HOST_PORT`. |
+| Postgres | `127.0.0.1:5433` (`postgres:5432` in-network) | Database `mokosh`, user `postgres`. The password is generated per clone: read `MOKOSH_PG_PASSWORD` (or the whole `DATABASE_URL`) from `.env`. Loopback only; the host port is `MOKOSH_PG_HOST_PORT`, which the three host-side URLs interpolate rather than repeat. |
 | Infisical | `http://localhost:28002` | Only when started with `just dev-infisical`. Admin credentials are the ones you put in `.env.infisical`. Loopback only; the host port is `MOKOSH_INFISICAL_HOST_PORT`. |
 
 Everything except the API publishes on `127.0.0.1` alone, so host-side tooling reaches it and the LAN cannot (PMS-496).
@@ -225,7 +225,7 @@ just dev-infisical --detach
 ```
 
 **Port collisions on shared hosts**
-The API needs no host port, so it cannot collide. Every other published port is loopback-only and reads its HOST side from `.env`, so change the key rather than the compose file (PMS-900): `MOKOSH_PG_HOST_PORT` (`5433`), `MOKOSH_MAILPIT_SMTP_HOST_PORT` (`1025`), `MOKOSH_MAILPIT_WEB_HOST_PORT` (`8025`), `MOKOSH_INFISICAL_HOST_PORT` (`28002`), `MOKOSH_MINIO_API_HOST_PORT` (`29000`) and `MOKOSH_MINIO_CONSOLE_HOST_PORT` (`29001`). The container-side ports never move, so nothing in-network changes with them. Changing the Infisical one means changing `INFISICAL_URL` and `INFISICAL_SITE_URL` to match.
+The API needs no host port, so it cannot collide. Every other published port is loopback-only and reads its HOST side from `.env`, so change the key rather than the compose file (PMS-900): `MOKOSH_PG_HOST_PORT` (`5433`), `MOKOSH_MAILPIT_SMTP_HOST_PORT` (`1025`), `MOKOSH_MAILPIT_WEB_HOST_PORT` (`8025`), `MOKOSH_INFISICAL_HOST_PORT` (`28002`), `MOKOSH_MINIO_API_HOST_PORT` (`29000`) and `MOKOSH_MINIO_CONSOLE_HOST_PORT` (`29001`). The container-side ports never move, so nothing in-network changes with them. Each key is also the ONE place its port is written: the three host-side Postgres URLs interpolate `MOKOSH_PG_HOST_PORT` (PMS-1376) and the two Infisical URLs interpolate `MOKOSH_INFISICAL_HOST_PORT` (PMS-961), so moving a port moves everything that dials it. That matters most for Postgres, because a URL left on the old port does not fail on a shared host: it reaches another checkout's database, and `just migrate-run` would migrate their data.
 
 The containers, volumes and network are already per developer, and so is the compose project (`dev-mokosh-${USER}`, PMS-1281), so two checkouts under different users are separate stacks: `just down` in one leaves the other running.
 
