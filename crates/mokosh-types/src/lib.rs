@@ -19,6 +19,10 @@
 //! belongs in the server or client crate.
 
 pub mod auth;
+// PMS-1375: the billing status vocabulary, and the rules over it that both
+// sides need. The response and request structs stay server-side; see the
+// module doc for why.
+pub mod billing;
 pub mod contacts;
 pub mod datetime;
 pub mod forms;
