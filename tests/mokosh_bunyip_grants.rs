@@ -285,6 +285,9 @@ fn claims_with_grant(sub: Uuid, mokosh_account_id: Option<&str>) -> AtClaims {
         mokosh_grant_id: mokosh_account_id.map(|_| Uuid::new_v4().to_string()),
         mokosh_grant_role: mokosh_account_id.map(|_| "manager".to_string()),
         mokosh_grant_account_id: mokosh_account_id.map(str::to_string),
+        // PMS-998: no OP session named, so the back-channel logout check
+        // cannot apply to these fixtures.
+        sid: None,
     }
 }
 
