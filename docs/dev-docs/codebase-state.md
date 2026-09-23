@@ -48,6 +48,17 @@ source comments and YouTrack issues cite by number.
 > modules (many are now `merge`d in `api/router.rs`) is still
 > outstanding.
 
+> **Update 2026-09-22 (PMS-831).** Every per-module **Open TODOs**
+> block was re-read against `main`. All ten bullets across the three
+> blocks had shipped, so the blocks now say so rather than sending a
+> reader after wiring that has been there for months. **F1**
+> (`list_users`), **F4** (`update_site`) and **F11** (automation
+> triggers) are closed with it, joining F3 and F8. The F ids and their
+> original text stay, because source comments cite them; only the
+> claim that they are still open is gone. Nothing else in this file
+> was re-audited: every other count, line number and status claim is
+> still the 2026-05-06 one.
+
 > **Update 2026-07-24 (module-status correction, PMS-684).** The
 > "only `auth`/`contacts`/`tenants`/`tickets` have real handlers, most
 > route groups return HTTP 501" framing is obsolete. `api/router.rs`
@@ -164,13 +175,13 @@ Files: [`routes.rs`](../../src/modules/auth/routes.rs) (302),
 | `/api/v1/auth/login` | POST | public | No rate limit; see F2 |
 | `/api/v1/auth/logout` | POST | required | |
 | `/api/v1/auth/refresh` | POST | public | (uses refresh token) |
-| `/api/v1/auth/forgot-password` | POST | public | Email not actually sent (TODO) |
+| `/api/v1/auth/forgot-password` | POST | public | Emails the reset link (since the audit) |
 | `/api/v1/auth/reset-password` | POST | public | |
 | `/api/v1/auth/me` | GET / PUT | required | Sanitizes role/status on PUT |
 | `/api/v1/auth/me/password` | PUT | required | |
 | `/api/v1/auth/me/sessions` | GET | required | |
 | `/api/v1/auth/me/sessions/:session_id` | DELETE | required | |
-| `/api/v1/auth/users` | GET | admin/manager | **Returns empty list (F1)** |
+| `/api/v1/auth/users` | GET | admin/manager | Lists users (F1 fixed) |
 | `/api/v1/auth/users` | POST | admin | |
 | `/api/v1/auth/users/:user_id` | GET / PUT | admin | |
 
@@ -178,19 +189,11 @@ Tech: Argon2 (via [`utils/crypto.rs`](../../src/utils/crypto.rs)) for
 password hashing, JWT HS256 (via `jsonwebtoken`) for access + refresh
 tokens, sessions persisted in the `user_sessions` table.
 
-**Open TODOs:**
-
-- [`service.rs:81`](../../src/modules/auth/service.rs#L81) - MFA TOTP
-  verify not implemented; users with `mfa_enabled = true` can be
-  blocked from logging in entirely.
-- [`service.rs:196`](../../src/modules/auth/service.rs#L196) - password
-  reset token is persisted but no email is sent. The user has no way
-  to learn the token.
-- [`service.rs:345`](../../src/modules/auth/service.rs#L345) - welcome
-  email for newly created users is not sent.
-- [`routes.rs:238`](../../src/modules/auth/routes.rs#L238) - `list_users`
-  hard-codes an empty `PaginatedResponse`. The endpoint advertises
-  listing but does not list. Tracked as **F1**.
+**Open TODOs:** none (re-read 2026-09-22, PMS-831). All four have
+shipped: TOTP verification decides the login (`mfa_required`, a TOTP
+code or a recovery code), the password reset dispatches the
+`auth.password_reset` template, a new user gets `auth.welcome`, and
+`list_users` lists (**F1**).
 
 **Schema touched:** `users`, `user_sessions`, `api_keys` (defined
 but no handler), `password_reset_tokens`, `tenants` (read).
@@ -209,7 +212,7 @@ Files: [`routes.rs`](../../src/modules/tickets/routes.rs) (401),
 | `/api/v1/tickets` | GET / POST | List + create |
 | `/api/v1/tickets/:ticket_id` | GET / PUT | |
 | `/api/v1/tickets/:ticket_id/assign` | POST | |
-| `/api/v1/tickets/:ticket_id/notes` | GET / POST | `add_note` does not send email even when requested (TODO) |
+| `/api/v1/tickets/:ticket_id/notes` | GET / POST | `add_note` emails a public note when asked (since the audit) |
 | `/api/v1/tickets/statuses` | GET | Lookup table |
 | `/api/v1/tickets/priorities` | GET | Lookup table |
 | `/api/v1/tickets/queues` | GET | Lookup table |
@@ -217,7 +220,10 @@ Files: [`routes.rs`](../../src/modules/tickets/routes.rs) (401),
 
 All endpoints require auth.
 
-**Critical defect: shallow response DTOs.** Every ticket-returning
+**Critical defect: shallow response DTOs - FIXED, see F3 below.** The
+paragraph is kept as the audit wrote it, because `tickets/service.rs`
+cites **F3** by id; what it describes is not the current code. Every
+ticket-returning
 handler builds `TicketResponse` with `name: String::new(), // Would
 be joined from DB` for nine string fields:
 
@@ -233,18 +239,13 @@ displays names not UUIDs) will render with blanks. See
 [`routes.rs:71-99,128-159,178-209,231-262,287-318`](../../src/modules/tickets/routes.rs#L71).
 Tracked as **F3** - the highest-impact server fix.
 
-**Open TODOs:**
-
-- [`service.rs:132`](../../src/modules/tickets/service.rs#L132) -
-  `on_create` automation rules not invoked.
-- [`service.rs:409`](../../src/modules/tickets/service.rs#L409) -
-  `on_update` automation rules not invoked.
-- [`service.rs:477`](../../src/modules/tickets/service.rs#L477) -
-  `add_note` ignores `send_email: true`.
-- [`automation.rs:235`](../../src/modules/tickets/automation.rs#L235),
-  [`automation.rs:243`](../../src/modules/tickets/automation.rs#L243) -
-  notification + webhook dispatch from rules unwired (gated on the
-  `notifications` placeholder module).
+**Open TODOs:** none (re-read 2026-09-22, PMS-831). All four have
+shipped: `create_ticket` and `update_ticket` both call
+`AutomationEngine::process_rules` (`OnCreate`, `OnUpdate`), `add_note`
+acts on `send_email` for a public note, and the engine's
+`send_notification` and `webhook` actions are implemented -
+`notifications` is a real module, not the placeholder this block was
+written against (**F11**).
 
 **Schema touched:** `tickets`, `ticket_sequences`, `ticket_notes`,
 `ticket_attachments`, `ticket_statuses`, `ticket_priorities`,
@@ -384,18 +385,17 @@ takes `CurrentContact.company_id`), and email-intake's
 `resolve_or_create_contact` falls back to the tenant's
 `email_intake/default_company_id` setting.
 
-**Defect: `update_site` is a silent no-op.**
+**Defect: `update_site` is a silent no-op - FIXED, see F4 below.** Kept
+as the audit wrote it, because `contacts/service.rs` cites **F4** by
+id; the route now calls `update_site` and returns what it wrote.
 [`routes.rs:273-288`](../../src/modules/contacts/routes.rs#L273) accepts
 the request body, validates it, then calls `get_site` and returns
 the unmodified record. A `200 OK` disguises a missed write. Tracked
 as **F4**.
 
-**Open TODOs:**
-
-- [`routes.rs:281`](../../src/modules/contacts/routes.rs#L281) -
-  `update_site` does not actually update.
-- [`service.rs:332`](../../src/modules/contacts/service.rs#L332) -
-  `create_contact` ignores `create_portal_access: true`.
+**Open TODOs:** none (re-read 2026-09-22, PMS-831). Both have shipped:
+`update_site` writes (**F4**), and `create_contact` acts on
+`create_portal_access`, minting the portal setup token.
 
 **Schema touched:** `companies`, `contacts`, `contact_phones`,
 `contact_companies`, `sites`.
@@ -604,7 +604,11 @@ the infrastructure or shared-helper layer.
 Concrete, scoped patches. IDs are referenced from per-module
 sections above.
 
-### F1. `auth/routes.rs::list_users` - implement instead of returning empty
+### F1. `auth/routes.rs::list_users` - implement instead of returning empty - **DONE (closed 2026-09-22, PMS-831)**
+
+Implemented: `list_users` takes a filter and pagination and answers a
+real `PaginatedResponse<UserResponse>`. Original note kept below for
+history.
 
 Today ([`routes.rs:228-246`](../../src/modules/auth/routes.rs#L228)):
 
@@ -647,7 +651,10 @@ joined row in the service, not the route handler. Today the route
 handler builds the DTO with `String::new()` for every joined name
 ([`routes.rs:71-99,128-159,178-209,231-262,287-318`](../../src/modules/tickets/routes.rs#L71)).
 
-### F4. `contacts/routes.rs::update_site` - actually call update
+### F4. `contacts/routes.rs::update_site` - actually call update - **DONE (closed 2026-09-22, PMS-831)**
+
+Implemented: the handler calls `ContactService::update_site` and
+returns the updated row. Original note kept below for history.
 
 Today ([`routes.rs:273-288`](../../src/modules/contacts/routes.rs#L273)):
 
@@ -773,7 +780,12 @@ tickets create/list/get/update + add note. `testcontainers`-backed
 Postgres is cleanest, but the dev compose
 `host.docker.internal` already gives a real DB.
 
-### F11. Wire automation triggers (depends on `notifications`)
+### F11. Wire automation triggers (depends on `notifications`) - **DONE (closed 2026-09-22, PMS-831)**
+
+Implemented: `notifications` is a real module, the ticket service calls
+`process_rules` on create and on update, and the engine's
+`send_notification` and `webhook` actions dispatch. Original note kept
+below for history.
 
 Once `notifications` becomes a real module, have the ticket service
 call `AutomationEngine::process_rules` on `on_create` and `on_update`
