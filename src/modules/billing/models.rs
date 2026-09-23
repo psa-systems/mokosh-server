@@ -126,6 +126,18 @@ pub struct InvoiceResponse {
     pub written_off_by_name: Option<String>,
     pub write_off_reason: Option<String>,
     pub write_off_amount: Option<Decimal>,
+    /// PMS-1333: the void, when there was one. No frozen amount beside these,
+    /// unlike the write-off above: a void says nothing was ever owed, so there
+    /// is no balance to record as forgiven.
+    pub voided_at: Option<DateTime<Utc>>,
+    pub voided_by_id: Option<Uuid>,
+    /// The display name behind `voided_by_id`, resolved on `GET /:id` exactly
+    /// as `written_off_by_name` is. `None` on list rollups and on a deleted
+    /// user.
+    pub voided_by_name: Option<String>,
+    /// Optional, because a draft withdrawn before anyone saw it often has
+    /// nothing to say.
+    pub void_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
@@ -879,6 +891,19 @@ pub struct WriteOffInvoiceRequest {
     /// Required: the audit trail, and the first thing an auditor reads.
     #[validate(length(min = 1, max = 2000))]
     pub reason: String,
+}
+
+/// PMS-1333: void an invoice that was never issued.
+///
+/// The counterpart to [`WriteOffInvoiceRequest`], and deliberately not its
+/// twin: a write-off forgives a debt the customer owes, so its reason is
+/// required and an auditor reads it first, while a void says the document
+/// never stood at all. A draft withdrawn before anyone saw it often has
+/// nothing to say, so the reason is optional here.
+#[derive(Debug, Clone, Deserialize, Validate, Default)]
+pub struct VoidInvoiceRequest {
+    #[validate(length(max = 2000))]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
