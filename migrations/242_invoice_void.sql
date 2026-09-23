@@ -27,3 +27,19 @@ COMMENT ON COLUMN invoices.voided_by_id IS
     'PMS-1333: the user who voided it. NULL once that user is deleted.';
 COMMENT ON COLUMN invoices.void_reason IS
     'PMS-1333: why it was voided, as the operator typed it. Optional: a draft withdrawn before it was ever sent often has nothing to say.';
+
+-- Correct the rows the old rule already wrote. Nothing but that arm ever set
+-- `void`, so every `void` invoice in an existing database is one a credit note
+-- settled, and under the corrected reading it is `paid`: the balance is zero
+-- and the document stood. Doing it here rather than leaving them is what keeps
+-- the change from being a surprise later, because those rows carry no
+-- `voided_at` and the next payment or credit event on one would re-derive its
+-- status through the ladder and flip it to `paid` with nothing in a log.
+--
+-- `paid_at` is deliberately left NULL: nobody paid. That is the same pair a
+-- newly credited invoice gets, so history and new rows read alike.
+UPDATE invoices
+SET status = 'paid',
+    updated_at = NOW()
+WHERE status = 'void'
+  AND amount_credited >= total;
