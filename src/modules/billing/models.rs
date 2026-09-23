@@ -138,6 +138,11 @@ pub struct InvoiceResponse {
     /// Optional, because a draft withdrawn before anyone saw it often has
     /// nothing to say.
     pub void_reason: Option<String>,
+    /// PMS-979: which numbering scheme produced `invoice_number`. `None` on
+    /// an invoice issued before the column existed, whose number came from
+    /// the tenant-wide counter. Carried so a reader can tell two schemes
+    /// apart without parsing the string.
+    pub number_scheme: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
