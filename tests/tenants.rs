@@ -2364,7 +2364,7 @@ async fn create_tenant_seeds_three_builtin_portal_roles(pool: PgPool) {
         let constant: std::collections::BTreeSet<String> =
             mokosh_server::modules::contact_portal::capabilities::BUILTIN_ROLES
                 .iter()
-                .find(|(n, _)| n == name)
+                .find(|(n, _, _)| n == name)
                 .expect("built-in role in BUILTIN_ROLES")
                 .1
                 .iter()

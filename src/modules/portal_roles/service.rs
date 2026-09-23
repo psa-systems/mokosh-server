@@ -289,13 +289,10 @@ impl PortalRoleService {
     ) -> AppResult<PortalRole> {
         let existing = self.get_role(tenant_id, role_id).await?;
 
-        // PMS-1238: runtime grant lookups and the migration backfills find a
-        // built-in role by its display name, so that name is not editable.
-        if existing.is_builtin && name.is_some() {
-            return Err(AppError::BadRequest(
-                "Cannot rename a built-in role".to_string(),
-            ));
-        }
+        // The stable identifier for a built-in row is `builtin_key`, not the
+        // display, so a rename is safe: runtime lookups key on the column and
+        // future backfills do too. Capabilities on a built-in stay locked
+        // below.
         if let Some(ref new_name) = name {
             let trimmed = new_name.trim();
             if trimmed.is_empty() || trimmed.chars().count() > 64 {
