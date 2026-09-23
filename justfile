@@ -392,6 +392,12 @@ ensure-env:
     let infisical_auth_secret = (^openssl rand -base64 32 | str trim)
     let minio_root_password = (^openssl rand -hex 24 | str trim)
     # Scalar KEY=value replacements plus URL lines rebuilt from the same passwords.
+    # PMS-1376: the three host-side URLs keep `${MOKOSH_PG_HOST_PORT}` as literal
+    # text rather than resolving it here, so the generated .env writes the port
+    # in one place the way the template does. A Nushell interpolated string
+    # substitutes `(expr)` and passes `${...}` through untouched, and every
+    # reader of these three expands it: sqlx-cli (dotenvy) for `just
+    # migrate-run`, Compose when it forwards them, and the bootstrap CLI.
     let overrides = {
         MOKOSH_PG_PASSWORD: $pg_password
         MOKOSH_MIGRATOR_PASSWORD: $migrator_password
@@ -402,9 +408,9 @@ ensure-env:
         INFISICAL_ENCRYPTION_KEY: $infisical_encryption_key
         INFISICAL_AUTH_SECRET: $infisical_auth_secret
         MINIO_ROOT_PASSWORD: $minio_root_password
-        DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
-        MOKOSH_ADMIN_DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:5433/mokosh"
-        MOKOSH_APP_DATABASE_URL: $"postgres://mokosh_app:($app_password)@localhost:5433/mokosh"
+        DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:${MOKOSH_PG_HOST_PORT}/mokosh"
+        MOKOSH_ADMIN_DATABASE_URL: $"postgres://postgres:($pg_password)@localhost:${MOKOSH_PG_HOST_PORT}/mokosh"
+        MOKOSH_APP_DATABASE_URL: $"postgres://mokosh_app:($app_password)@localhost:${MOKOSH_PG_HOST_PORT}/mokosh"
         INFISICAL_DB_CONNECTION_URI: $"postgres://infisical:($infisical_pg_password)@infisical-postgres:5432/infisical"
     }
     let keys = ($overrides | columns)
