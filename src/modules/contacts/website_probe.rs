@@ -430,8 +430,7 @@ async fn attempt<F: WebsiteFetcher + ?Sized>(fetcher: &F, host: &str, scheme: &s
         // redirect on the LAST allowed hop still has a Location we would not
         // follow. Report the URL we just fetched and mark the chain
         // truncated: the client says the address is not settled instead of
-        // reading it as canonical or as a refused connection (MAPPS-480's
-        // acceptance criterion).
+        // reading it as canonical or as a refused connection.
         if hop == MAX_HOPS {
             tracing::warn!(
                 host,
