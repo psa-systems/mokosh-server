@@ -783,3 +783,136 @@ async fn range_query_filtered_by_team_id(pool: PgPool) {
         "total counts only the filtered team's rows (1 one-off + 3 occurrences): {list}"
     );
 }
+
+/// The `my_teams` filter narrows the appointment list to the teams the
+/// caller belongs to. Both the unbounded path and the bounded-range path
+/// honour it, and a caller on no team gets an empty set instead of the
+/// silent full list the DTO used to answer.
+#[sqlx::test]
+async fn list_appointments_filtered_by_my_teams(pool: PgPool) {
+    let (admin_id, admin_email, admin_password) = seed_admin(&pool).await;
+    let (tech_id, tech_email, tech_password) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "tech@example.com",
+        "technician",
+    )
+    .await;
+    let team_mine = seed_team(&pool, common::DEFAULT_TENANT_ID, "My team", None).await;
+    let team_other = seed_team(&pool, common::DEFAULT_TENANT_ID, "Other team", None).await;
+    common::seed_team_member(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        team_mine,
+        tech_id,
+        "member",
+    )
+    .await;
+    let app = boot(pool).await;
+    let admin_token = login(&app, &admin_email, &admin_password).await;
+    let tech_token = login(&app, &tech_email, &tech_password).await;
+
+    for (title, team) in [
+        ("mine-visit", Some(team_mine)),
+        ("other-visit", Some(team_other)),
+        ("no-team", None),
+    ] {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/appointments"))
+            .bearer_auth(&admin_token)
+            .json(&serde_json::json!({
+                "title": title,
+                "assigned_to_id": admin_id,
+                "start_time": "2026-04-01T09:00:00Z",
+                "end_time": "2026-04-01T10:00:00Z",
+                "team_id": team,
+            }))
+            .send()
+            .await
+            .expect("create");
+        assert!(resp.status().is_success(), "seed {title}");
+    }
+
+    // Unbounded path: the technician sees only their own team.
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/appointments?my_teams=true"))
+        .bearer_auth(&tech_token)
+        .send()
+        .await
+        .expect("send list")
+        .json()
+        .await
+        .expect("list json");
+    let titles: Vec<&str> = list["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|a| a["title"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        titles.contains(&"mine-visit"),
+        "the caller's team must appear: {titles:?}"
+    );
+    for excluded in ["other-visit", "no-team"] {
+        assert!(
+            !titles.contains(&excluded),
+            "{excluded} must not appear under my_teams=true: {titles:?}"
+        );
+    }
+
+    // Bounded-range path (delegates to appointments_in_range) honours it
+    // too, because the DTO used to lose the filter there as well.
+    let range: serde_json::Value = app
+        .client
+        .get(app.url(
+            "/api/v1/appointments?from=2026-04-01T00:00:00Z&to=2026-04-02T00:00:00Z&my_teams=true",
+        ))
+        .bearer_auth(&tech_token)
+        .send()
+        .await
+        .expect("send range")
+        .json()
+        .await
+        .expect("range json");
+    let range_titles: Vec<&str> = range["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|a| a["title"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        range_titles.contains(&"mine-visit"),
+        "range path must include the caller's team: {range_titles:?}"
+    );
+    assert!(
+        !range_titles.contains(&"other-visit"),
+        "range path must exclude the other team: {range_titles:?}"
+    );
+
+    // A caller on no team sees an empty set rather than every row.
+    let (_stranger_id, stranger_email, stranger_password) = common::seed_user(
+        &app.pool,
+        common::DEFAULT_TENANT_ID,
+        "stranger@example.com",
+        "technician",
+    )
+    .await;
+    let stranger_token = login(&app, &stranger_email, &stranger_password).await;
+    let stranger_list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/appointments?my_teams=true"))
+        .bearer_auth(&stranger_token)
+        .send()
+        .await
+        .expect("send stranger list")
+        .json()
+        .await
+        .expect("stranger json");
+    assert_eq!(
+        stranger_list["data"].as_array().map(Vec::len),
+        Some(0),
+        "a caller on no team gets no rows: {stranger_list}"
+    );
+}
