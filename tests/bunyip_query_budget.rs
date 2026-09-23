@@ -9,20 +9,20 @@
 //! gate - with three of them wrapped in a `BEGIN` / `set_config` / `ROLLBACK`
 //! transaction, for twenty round trips in all.
 //!
-//! The budget is now three statements: one `users` read (carrying the waiting
-//! -invite flag), the PMS-698 `tenants` status gate, and the MAPPS-459
-//! `tenant_membership_entitlements` read that gate makes right after it. All
-//! three are security-relevant and deliberately NOT cached.
+//! The budget is now two statements: one `users` read (carrying the waiting
+//! -invite flag), and the tenant gate, which reads `tenants.status` and the
+//! `tenant_membership_entitlements` row in ONE round trip via `LEFT JOIN`.
+//! Both are security-relevant and deliberately NOT cached.
 //!
-//! PMS-1042: the budget was two until MAPPS-459 (PMS-728 slice 3) added the
-//! entitlement read inside `AuthService::ensure_tenant_active`, where it runs
-//! unconditionally for every caller in every tenant, right after the `tenants`
-//! status read it extends. That landed while this test was already failing on
-//! its own setup (the abolished JIT self-signup), so nothing reported the third
-//! statement. It is NOT an invitation lookup: the "is an invite waiting" flag is
-//! an `EXISTS` inside the one `users` read, so the invitation this test now
-//! seeds costs no statement of its own. Folding the two tenant-gate reads back
-//! into one round trip is PMS-1059.
+//! MAPPS-459 (PMS-728 slice 3) added the entitlement read inside
+//! `AuthService::ensure_tenant_active` as a separate statement right after the
+//! `tenants` status read; PMS-1042 pinned the budget at three so a statement
+//! nobody chose could not grow into the slack, and PMS-1059 folded the two into
+//! the join above. The `LEFT JOIN` is what preserves MAPPS-459's contract:
+//! `unknown` and an absent row both leave the entitlement columns NULL and
+//! pass through, and only `suspended` or an expired `expires_at` rejects. The
+//! invitation lookup this test seeds costs no statement of its own: the "is an
+//! invite waiting" flag rides as an `EXISTS` inside the one `users` read.
 //!
 //! The count comes from a `tracing` subscriber that records `sqlx::query`
 //! events, which is the in-process equivalent of Postgres `log_statement=all`
@@ -145,7 +145,7 @@ fn claims(sub: Uuid) -> AtClaims {
 /// How many statements one authenticated request may cost before the handler
 /// runs. Raising this number is a throughput regression, not a test failure to
 /// paper over: see the module docs for what each statement is.
-const QUERY_BUDGET: usize = 3;
+const QUERY_BUDGET: usize = 2;
 
 #[sqlx::test]
 async fn an_authenticated_bunyip_request_costs_three_statements(pool: PgPool) {
@@ -258,19 +258,17 @@ async fn an_authenticated_bunyip_request_costs_three_statements(pool: PgPool) {
         invite_reads <= 1,
         "`tenant_invitations` is read at most once: {statements:#?}"
     );
+    // The tenant gate reads both the `tenants.status` and the
+    // `tenant_membership_entitlements` row in one join, so the same statement
+    // has to name both tables. Naming them is what stops a future edit from
+    // splitting the join back into two statements without also spending the
+    // budget it would need to.
     assert!(
-        statements
-            .iter()
-            .any(|s| s.contains("SELECT status FROM tenants")),
-        "the PMS-698 principal gate still runs on every request: {statements:#?}"
-    );
-    // PMS-1042: the third statement is named, so the budget above is spent on a
-    // statement somebody chose rather than on slack a future read can grow into.
-    assert!(
-        statements
-            .iter()
-            .any(|s| s.contains("tenant_membership_entitlements")),
-        "the third statement is the MAPPS-459 entitlement read: {statements:#?}"
+        statements.iter().any(|s| {
+            s.contains("FROM tenants") && s.contains("tenant_membership_entitlements")
+        }),
+        "the PMS-698 principal gate and the MAPPS-459 entitlement read run \
+         in one round trip (PMS-1059): {statements:#?}"
     );
 
     // No transaction: the pre-PMS-777 path wrapped three of its reads in
