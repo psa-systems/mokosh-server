@@ -360,6 +360,13 @@ services:
       # holds no local signing key and exposes no /oauth2/* endpoints.
       OIDC_ISSUER: https://${USER}-bunyip-api.a8n.run
       OIDC_AUDIENCE: https://${USER}-mokosh-api.a8n.run
+      # PMS-998: the client id bunyip addresses a back-channel logout token
+      # to, which is the `client_id` of that same oauth_clients row rather
+      # than its `audience`. Empty in dev, because bunyip only notifies a
+      # client whose `backchannel_logout_uri` is set (BUNYIP-636) and the dev
+      # client row has none; empty means the receiver refuses everything,
+      # which is the right posture for a deployment nothing is notifying.
+      OIDC_BACKCHANNEL_CLIENT_ID: ${OIDC_BACKCHANNEL_CLIENT_ID:-}
 
       # PMS-1193 / BUNYIP-641: Bunyip's suite-wide provider-status aggregator
       # (BUNYIP-634) calls GET /api/v1/admin/providers/status with HTTP Basic

@@ -266,6 +266,12 @@ declare_keys! {
     Application OIDC_JWKS_CACHE_TTL_SECS = "OIDC_JWKS_CACHE_TTL_SECS";
     Application OIDC_LEEWAY_SECONDS = "OIDC_LEEWAY_SECONDS";
     Application OIDC_DEFAULT_TENANT_ID = "OIDC_DEFAULT_TENANT_ID";
+    // PMS-998: the OIDC client id bunyip addresses a back-channel logout
+    // token to. NOT OIDC_AUDIENCE, which is the resource-server audience the
+    // access token carries: bunyip mints a logout token with `aud =
+    // client_id`, so the two are different values and the receiver refuses
+    // everything while this is unset.
+    Application OIDC_BACKCHANNEL_CLIENT_ID = "OIDC_BACKCHANNEL_CLIENT_ID";
     Application ADMIN_EMAIL = "ADMIN_EMAIL";
     Application ADMIN_PASSWORD = "ADMIN_PASSWORD";
     Application LOGIN_APPROVAL_ENABLED = "LOGIN_APPROVAL_ENABLED";
