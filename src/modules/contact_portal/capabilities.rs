@@ -284,12 +284,30 @@ pub const BUILTIN_READ_ONLY: &[&str] = &[
     NOTIFICATIONS_READ,
 ];
 
+/// The stable identifier every built-in row carries in
+/// `portal_roles.builtin_key`, so a code lookup stays on the intended
+/// row even if an admin renamed the display through a database write.
+/// The migration seeded these values on the rows migrations 171/197
+/// added; a new built-in also seeds this column.
+pub const BUILTIN_BILLING_CONTACT_KEY: &str = "billing_contact";
+pub const BUILTIN_SUPPORT_CONTACT_KEY: &str = "support_contact";
+pub const BUILTIN_READ_ONLY_KEY: &str = "read_only";
+
 /// The three built-in roles by the name the migrations seeded, in the
-/// order the seed inserts them.
-pub const BUILTIN_ROLES: &[(&str, &[&str])] = &[
-    ("Billing Contact", BUILTIN_BILLING_CONTACT),
-    ("Support Contact", BUILTIN_SUPPORT_CONTACT),
-    ("Read-Only", BUILTIN_READ_ONLY),
+/// order the seed inserts them. The third element is the `builtin_key`
+/// the runtime lookups use in preference to the display name.
+pub const BUILTIN_ROLES: &[(&str, &[&str], &str)] = &[
+    (
+        "Billing Contact",
+        BUILTIN_BILLING_CONTACT,
+        BUILTIN_BILLING_CONTACT_KEY,
+    ),
+    (
+        "Support Contact",
+        BUILTIN_SUPPORT_CONTACT,
+        BUILTIN_SUPPORT_CONTACT_KEY,
+    ),
+    ("Read-Only", BUILTIN_READ_ONLY, BUILTIN_READ_ONLY_KEY),
 ];
 
 /// PMS-1187: one area a contact can ask for access to.
@@ -310,8 +328,11 @@ pub struct AccessArea {
     pub label: &'static str,
     /// Holding this means the area is already reachable.
     pub read_capability: &'static str,
-    /// The built-in role that grants it.
+    /// The built-in role that grants it (display name, kept for messages).
     pub granting_role: &'static str,
+    /// The row's stable `builtin_key`, used by the runtime lookup so a
+    /// rename cannot move the resolved role.
+    pub granting_role_key: &'static str,
 }
 
 /// Every area a contact can ask for, which is every tab a capability gates.
@@ -325,36 +346,42 @@ pub const ACCESS_AREAS: &[AccessArea] = &[
         label: "invoices",
         read_capability: INVOICES_READ,
         granting_role: "Billing Contact",
+        granting_role_key: BUILTIN_BILLING_CONTACT_KEY,
     },
     AccessArea {
         key: "tickets",
         label: "tickets",
         read_capability: TICKETS_READ,
         granting_role: "Support Contact",
+        granting_role_key: BUILTIN_SUPPORT_CONTACT_KEY,
     },
     AccessArea {
         key: "quotes",
         label: "quotes",
         read_capability: QUOTES_READ,
         granting_role: "Billing Contact",
+        granting_role_key: BUILTIN_BILLING_CONTACT_KEY,
     },
     AccessArea {
         key: "contracts",
         label: "contracts",
         read_capability: CONTRACTS_READ,
         granting_role: "Read-Only",
+        granting_role_key: BUILTIN_READ_ONLY_KEY,
     },
     AccessArea {
         key: "assets",
         label: "assets",
         read_capability: ASSETS_READ,
         granting_role: "Read-Only",
+        granting_role_key: BUILTIN_READ_ONLY_KEY,
     },
     AccessArea {
         key: "projects",
         label: "projects",
         read_capability: PROJECTS_READ,
         granting_role: "Read-Only",
+        granting_role_key: BUILTIN_READ_ONLY_KEY,
     },
     // MAPPS-780: the Payment Methods page (MAPPS-674) had no area to ask for,
     // so a contact without the capability was shown its internal name,
@@ -366,6 +393,7 @@ pub const ACCESS_AREAS: &[AccessArea] = &[
         label: "saved payment methods",
         read_capability: PAYMENT_METHODS_MANAGE_OWN,
         granting_role: "Billing Contact",
+        granting_role_key: BUILTIN_BILLING_CONTACT_KEY,
     },
 ];
 
@@ -405,7 +433,7 @@ mod tests {
         for area in ACCESS_AREAS {
             let role = BUILTIN_ROLES
                 .iter()
-                .find(|(name, _)| *name == area.granting_role)
+                .find(|(_, _, key)| *key == area.granting_role_key)
                 .unwrap_or_else(|| {
                     panic!(
                         "{} is granted by {:?}, which is not a built-in role",
@@ -569,9 +597,9 @@ mod tests {
                     "seed migration references `{cap}` on {name} but it is missing from ALL_CAPABILITIES"
                 );
             }
-            let (_, constant) = BUILTIN_ROLES
+            let (_, constant, _) = BUILTIN_ROLES
                 .iter()
-                .find(|(n, _)| n == name)
+                .find(|(n, _, _)| n == name)
                 .unwrap_or_else(|| panic!("{name} is missing from BUILTIN_ROLES"));
             let constant: BTreeSet<&str> = constant.iter().copied().collect();
             assert_eq!(
