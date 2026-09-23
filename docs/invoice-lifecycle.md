@@ -30,6 +30,18 @@ Voiding is bounded the same way, and since PMS-1333 it has its own endpoint rath
 - `sent` / `partially_paid` (collectible): Record Payment, which runs through `record_payment` (a separate path, not `update_invoice`) and advances the status `sent` -> `partially_paid` -> `paid` as the balance is collected; Credit (a credit note, PMS-953); or Write off (PMS-1036, below).
 - `paid` / `void` / `written_off` (terminal): no further lifecycle actions. A payment recorded against a `written_off` invoice is a recovery: it is kept and the status stands.
 
+## What an invoice number is (PMS-979)
+
+Two schemes, chosen per tenant by `billing_prefs/invoice_numbering`, which is a closed set refused at the write.
+
+`tenant_sequence` is the default and the original: one counter for the whole tenant, `INV-000042`. `company_prefix` is per customer: a four-character prefix, a dash and that customer's own zero-padded sequence, `A7QF-000001`. The default did not change when the second scheme shipped, because an MSP's invoice numbering is an accounting decision and moving every existing tenant onto a new shape mid-year is not something to do on their behalf. What the second scheme buys is that a customer's invoices are visibly theirs and their history reads consecutively, and that the document no longer tells every customer how many invoices the MSP has issued in total.
+
+The prefix is random rather than derived from the company name, for the reason `portal_id` is (migration 174): names collide, names change, and a derived identifier stops being stable the first time a customer rebrands. Its alphabet excludes I, L, O, 0 and 1, so a number read back over the phone cannot become another customer's, which leaves 31 characters and 923,521 prefixes per tenant. It is assigned lazily on the customer's first invoice under this scheme, so a company that is never invoiced never gets one.
+
+Both counters are table rows rather than Postgres sequences, and that is deliberate: a sequence keeps its increment when the transaction that took it rolls back, so a failed create would leave a hole in a customer's numbering, and gap-free is an audit expectation on invoices. A row rolls back with everything else, and concurrent creates queue on it rather than racing.
+
+Switching schemes renumbers nothing. A number is a stored string on the invoice it belongs to, and `invoices.number_scheme` records which scheme produced it (NULL on invoices issued before the column existed), so the next change is a switch as well. The year is deliberately not part of a number: adding it later would restart every customer's sequence each January, which is exactly the renumbering this design avoids.
+
 ## Voiding, and what crediting does instead (PMS-1333)
 
 `POST /invoices/{id}/void` with an optional `{ reason }` moves a `draft` or `pending` invoice to `void` and records `voided_at`, `voided_by_id` and `void_reason`. Finance only. Every other status is refused with a 409 that names it and points at the credit note, because past `pending` the customer holds a copy. The reason is optional where the write-off's is required: a draft withdrawn before anyone saw it often has nothing to say. No amount is frozen beside it either, for the same reason: a write-off forgives a debt that was genuinely owed, while a void says nothing was ever owed.

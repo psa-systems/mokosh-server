@@ -19,6 +19,7 @@ use crate::utils::error::{AppError, AppResult, FieldError};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
+use super::numbering;
 use super::provider::{self, CheckoutParams, CheckoutSession, PaymentProvider};
 
 /// Billing operations: invoices, payments, gateway configs, tax rates.
@@ -209,10 +210,38 @@ impl BillingService {
         })
     }
 
+    /// The number a new invoice gets, and the scheme that produced it.
+    ///
+    /// PMS-979: which scheme is the tenant's setting, defaulting to the
+    /// tenant-wide counter this has always used. An MSP's invoice numbering
+    /// is an accounting decision, so switching every existing tenant to a new
+    /// shape mid-year is not a thing to do on their behalf; a tenant opts in
+    /// with `billing_prefs/invoice_numbering`, and the invoices they already
+    /// issued keep the numbers they have, because a number is a stored string
+    /// on the row it belongs to.
     async fn next_invoice_number(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
-    ) -> AppResult<String> {
+        company_id: Uuid,
+    ) -> AppResult<(String, numbering::NumberScheme)> {
+        if numbering::read_scheme(&mut *tx, tenant_id).await?
+            == numbering::NumberScheme::CompanyPrefix
+        {
+            let prefix = numbering::ensure_company_prefix(&mut *tx, tenant_id, company_id).await?;
+            let sequence = numbering::next_company_number(&mut *tx, tenant_id, company_id).await?;
+            return Ok((
+                numbering::format_company_number(&prefix, sequence),
+                numbering::NumberScheme::CompanyPrefix,
+            ));
+        }
+        Self::next_tenant_invoice_number(tx, tenant_id).await
+    }
+
+    /// The pre-PMS-979 shape: one counter for the whole tenant, `INV-000042`.
+    async fn next_tenant_invoice_number(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+    ) -> AppResult<(String, numbering::NumberScheme)> {
         let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
             r#"
             UPDATE invoice_sequences
@@ -237,10 +266,13 @@ impl BillingService {
                 (1, Some("INV-".to_string()))
             }
         };
-        Ok(format!(
-            "{}{:06}",
-            prefix.unwrap_or_else(|| "INV-".to_string()),
-            next_number
+        Ok((
+            format!(
+                "{}{:06}",
+                prefix.unwrap_or_else(|| "INV-".to_string()),
+                next_number
+            ),
+            numbering::NumberScheme::TenantSequence,
         ))
     }
 
@@ -872,6 +904,7 @@ impl BillingService {
                    created_at, updated_at, emailed_at, emailed_to,
                    written_off_at, written_off_by_id, write_off_reason, write_off_amount,
                    voided_at, voided_by_id, void_reason,
+                   number_scheme,
                    tax_rate_id, tax_rate
             FROM invoices
             WHERE {data_where}
@@ -934,10 +967,12 @@ impl BillingService {
     ) -> AppResult<InvoiceResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        // Per-tenant invoice sequence is row-locked by the shared helper;
-        // concurrent invoice creates serialise on this row so numbers are
-        // dense and unique.
-        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
+        // The sequence row is locked by the shared helper, so concurrent
+        // creates serialise on it and numbers stay dense and unique. Which
+        // sequence, and therefore what the number looks like, is the tenant's
+        // setting (PMS-979).
+        let (invoice_number, number_scheme) =
+            Self::next_invoice_number(&mut tx, tenant_id, request.company_id).await?;
 
         // Compute totals from the supplied lines. Tax / discount are
         // optional - default to 0.
@@ -988,10 +1023,10 @@ impl BillingService {
                 contract_id, status, invoice_date, due_date, payment_terms,
                 payment_term_id,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number
+                balance_due, currency, notes, po_number, number_scheme
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $17, $10, $11,
-                    $12, $13, 0, $13, $14, $15, $16)
+                    $12, $13, 0, $13, $14, $15, $16, $18)
             "#,
         )
         .bind(invoice_id)
@@ -1011,6 +1046,7 @@ impl BillingService {
         .bind(&request.notes)
         .bind(&request.po_number)
         .bind(payment_term_id)
+        .bind(number_scheme.as_str())
         .execute(&mut *tx)
         .await?;
 
@@ -1213,7 +1249,8 @@ impl BillingService {
 
         // 2. Allocate a gapless invoice number (same row-lock as
         //    `create_invoice`). Concurrent creates serialise on this row.
-        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
+        let (invoice_number, number_scheme) =
+            Self::next_invoice_number(&mut tx, tenant_id, request.company_id).await?;
 
         // 3. Build one line per entry, accumulating the subtotal. The
         //    sixty-minute divisor is a Decimal so quantity keeps its
@@ -1337,10 +1374,11 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number, payment_term_id
+                balance_due, currency, notes, po_number, payment_term_id,
+                number_scheme
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11,
-                    $12, $13, 0, $13, $14, $15, $16, $17)
+                    $12, $13, 0, $13, $14, $15, $16, $17, $18)
             "#,
         )
         .bind(invoice_id)
@@ -1360,6 +1398,7 @@ impl BillingService {
         .bind(&request.notes)
         .bind(&request.po_number)
         .bind(payment_term_id)
+        .bind(number_scheme.as_str())
         .execute(&mut *tx)
         .await?;
 
@@ -1952,12 +1991,12 @@ impl BillingService {
         let (due_date, payment_term_id) =
             Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, None).await?;
 
-        // Gapless invoice number: same per-tenant row-lock as
-        // `create_invoice`. NOTE: this increments the sequence even if the
-        // ledger insert below conflicts and we roll back; the rollback
-        // restores the sequence value too (the UPDATE is part of this tx),
-        // so numbers stay gapless.
-        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
+        // Gapless invoice number: same row-lock as `create_invoice`. NOTE:
+        // this increments the sequence even if the ledger insert below
+        // conflicts and we roll back; the rollback restores the sequence
+        // value too (the UPDATE is part of this tx), so numbers stay gapless.
+        let (invoice_number, number_scheme) =
+            Self::next_invoice_number(&mut tx, tenant_id, company_id).await?;
 
         // PMS-1016: this path has no caller to name a contact, so it is the
         // company's default or nobody. A company with no pointer still
@@ -1971,10 +2010,11 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number, payment_term_id
+                balance_due, currency, notes, po_number, payment_term_id,
+                number_scheme
             )
             VALUES ($1, $2, $3, $4, $13, $5, 'draft', $6, $7, 'net30', $8, $9,
-                    $10, $11, 0, $11, $15, $12, NULL, $14)
+                    $10, $11, 0, $11, $15, $12, NULL, $14, $16)
             "#,
         )
         .bind(invoice_id)
@@ -1996,6 +2036,7 @@ impl BillingService {
         // PMS-1028: a recurring invoice names nothing, so it is issued in
         // the tenant's default currency.
         .bind(read_default_currency(&mut tx, tenant_id).await?)
+        .bind(number_scheme.as_str())
         .execute(&mut *tx)
         .await?;
 
@@ -5207,6 +5248,7 @@ impl BillingService {
                    created_at, updated_at, emailed_at, emailed_to,
                    written_off_at, written_off_by_id, write_off_reason, write_off_amount,
                    voided_at, voided_by_id, void_reason,
+                   number_scheme,
                    tax_rate_id, tax_rate
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
@@ -6980,6 +7022,7 @@ struct InvoiceRow {
     voided_at: Option<chrono::DateTime<Utc>>,
     voided_by_id: Option<Uuid>,
     void_reason: Option<String>,
+    number_scheme: Option<String>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -7031,6 +7074,7 @@ impl From<InvoiceRow> for InvoiceResponse {
             voided_by_id: r.voided_by_id,
             voided_by_name: None,
             void_reason: r.void_reason,
+            number_scheme: r.number_scheme,
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,
