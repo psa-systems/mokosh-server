@@ -1,5 +1,11 @@
 //! PMS-451 phase 1 + PMS-470 phase 2 + PMS-484: HTTP routes for approvals.
 //!
+//! parity record 2026-09-22: `/change-requests/{entity_id}/approvals` has
+//! no SPA caller. The routes mount the same handler shape ticket and
+//! time-entry approvals do (kept for parity with the other approval
+//! targets), but the change-request module has no SPA screen yet. Note
+//! covers ONLY the change-request approval routes.
+//!
 //! Phase 1 mounted `/tickets/{ticket_id}/approvals`. Phase 2 added
 //! `/time-entries/{entity_id}/approvals`. PMS-484 fleshes out the
 //! remaining two prefixes - `/change-requests/...` and `/quotes/...` -

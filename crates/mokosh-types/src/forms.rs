@@ -304,6 +304,14 @@ pub struct IssueRequestLinkRequest {
     pub contact_id: Option<Uuid>,
     #[validate(email)]
     pub recipient_email: Option<String>,
+    /// PMS-737: how many people this one request covers. Absent or 1 is the
+    /// single-use link that has always existed. More than one makes the link
+    /// good for that many submissions and files them as children of one
+    /// parent ticket, because every per-ticket mechanism (the SLA clock,
+    /// time, billing, the checklist) is per person.
+    #[serde(default)]
+    #[validate(range(min = 1, max = 50))]
+    pub people: Option<i32>,
 }
 
 /// The issued link as the agent surface sees it. Deliberately WITHOUT the
@@ -320,8 +328,29 @@ pub struct RequestLinkResponse {
     pub contact_id: Option<Uuid>,
     pub recipient_email: String,
     pub expires_at: DateTime<Utc>,
+    /// Stamped when the LAST submission is spent, so a single-use link reads
+    /// exactly as it always has.
     pub used_at: Option<DateTime<Utc>>,
+    /// The FIRST submission this link produced (PMS-737: a multi-person link
+    /// produces several; this stays the one-to-one pointer it was).
     pub submission_id: Option<Uuid>,
+    /// PMS-737: how many people the link was issued for, and how many
+    /// submissions are left.
+    #[serde(default = "one")]
+    pub people: i32,
+    #[serde(default)]
+    pub submissions_remaining: i32,
+    /// The parent ticket the submissions are filed under, for a link issued
+    /// for more than one person.
+    #[serde(default)]
+    pub parent_ticket_id: Option<Uuid>,
+    #[serde(default)]
+    pub parent_ticket_number: Option<String>,
+}
+
+/// A link with no `people` is a link from before PMS-737: one person.
+fn one() -> i32 {
+    1
 }
 
 /// The client-facing view of a form: what is needed to render and validate the
@@ -356,6 +385,13 @@ pub struct PublicFormResponse {
     pub logo_url: Option<String>,
     pub rules: Vec<FormRule>,
     pub fields: Vec<PublicFormField>,
+    /// PMS-737: how many people this link covers, and which submission this
+    /// is. Both 1 for the ordinary single-person link, so a client sees
+    /// nothing new.
+    #[serde(default = "one")]
+    pub people: i32,
+    #[serde(default = "one")]
+    pub person_number: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -376,4 +412,9 @@ pub struct PublicFormField {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PublicSubmissionReceipt {
     pub ticket_number: String,
+    /// PMS-737: submissions still open on this link, so the page can say
+    /// "two more people to go" rather than leaving the client guessing
+    /// whether the link still works. Zero for a spent link.
+    #[serde(default)]
+    pub submissions_remaining: i32,
 }
