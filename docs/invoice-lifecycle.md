@@ -22,13 +22,23 @@ if current.status.is_frozen() {
 }
 ```
 
-Because the status transition to `void` also flows through `update_invoice`, this guard means voiding is only possible while the invoice is still `draft` or `pending`. A `sent` invoice cannot be edited, cannot be cancelled, and cannot be voided through this path.
+Voiding is bounded the same way, and since PMS-1333 it has its own endpoint rather than a status on this PUT (see "Voiding" below): a `sent` invoice cannot be edited, cannot be cancelled, and cannot be voided.
 
 ## What each state can do
 
-- `draft` / `pending` (editable): edit header and lines, Send (-> `sent`, subject to the recipient precondition below), or Void (-> `void`). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
+- `draft` / `pending` (editable): edit header and lines, Send (-> `sent`, subject to the recipient precondition below), or Void (`POST /invoices/{id}/void`, PMS-1333). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
 - `sent` / `partially_paid` (collectible): Record Payment, which runs through `record_payment` (a separate path, not `update_invoice`) and advances the status `sent` -> `partially_paid` -> `paid` as the balance is collected; Credit (a credit note, PMS-953); or Write off (PMS-1036, below).
 - `paid` / `void` / `written_off` (terminal): no further lifecycle actions. A payment recorded against a `written_off` invoice is a recovery: it is kept and the status stands.
+
+## Voiding, and what crediting does instead (PMS-1333)
+
+`POST /invoices/{id}/void` with an optional `{ reason }` moves a `draft` or `pending` invoice to `void` and records `voided_at`, `voided_by_id` and `void_reason`. Finance only. Every other status is refused with a 409 that names it and points at the credit note, because past `pending` the customer holds a copy. The reason is optional where the write-off's is required: a draft withdrawn before anyone saw it often has nothing to say. No amount is frozen beside it either, for the same reason: a write-off forgives a debt that was genuinely owed, while a void says nothing was ever owed.
+
+Crediting an invoice does NOT void it. Until PMS-1333, a credit note covering the invoice's full total moved it to `void` (PMS-953 introduced that as the first writer `void` ever had, and PMS-1226 narrowed the threshold after a 5.00 goodwill credit voided a paid invoice). That read a credited invoice as a cancelled one, which it is not: the document stood, the customer holds it, and the credit note is the correction. A credit that takes the balance to zero now lands on `paid`, which is also what Stripe does - "if a credit note reduces the balance of an open invoice to 0, the invoice status changes to paid" ([Stripe: issue credit notes](https://docs.stripe.com/invoicing/dashboard/credit-notes)) - so a tenant reconciling against their gateway sees the same shape on both sides. Such an invoice carries no `paid_at`: nothing is owed and nobody paid.
+
+Two consequences follow from voiding being allowed only pre-send. A voided invoice never appears on a statement (PMS-954), because it was never issued and never owed; a fully credited one still does, beside the credit note that settled it. And a credit note against a voided invoice is refused, because there is no charge to correct.
+
+`voided_at` leads `recompute_invoice_balance`'s status CASE, just ahead of `written_off_at`, so a payment or credit landing afterwards cannot derive the status back over one somebody chose.
 
 ## Writing off, distinct from crediting (PMS-1036)
 
@@ -97,3 +107,5 @@ An already-sent invoice keeps its stored bytes. PMS-959 writes the rendered PDF 
 ## UI
 
 The invoice detail page (`mokosh-apps`, `src/pages/billing.rs`) mirrors this model: Edit / Send / Void render only while editable (`draft` / `pending`), Record Payment renders only while collectible, and a frozen invoice shows an inline note explaining that it is a finalized record and cannot be edited, cancelled, or voided.
+
+Its Void button still sends `PUT /invoices/{id}` with `{"status":"void"}`, which PMS-1227 made a 422, so voiding a draft has been broken from the client since that landed. Pointing it at `POST /invoices/{id}/void` is MAPPS-937.
