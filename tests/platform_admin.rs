@@ -475,3 +475,61 @@ async fn platform_login_enforces_mfa_and_refuses_replay(pool: PgPool) {
     .await;
     assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
+
+/// A lost authenticator spends a recovery code. The code is single-use, so
+/// a second login with the same one is refused, and an unknown code is the
+/// same 401 as a wrong TOTP.
+#[sqlx::test]
+async fn platform_login_accepts_a_recovery_code_and_refuses_a_replay(pool: PgPool) {
+    let secret = mokosh_server::utils::totp::generate_secret();
+    let b32 = mokosh_server::utils::totp::base32_encode(&secret);
+    let (email, password) = seed_platform_admin(&pool, Some(&b32)).await;
+    let recovery_codes = mokosh_server::utils::recovery::generate_set();
+    let hashes: Vec<String> = recovery_codes
+        .iter()
+        .map(|c| mokosh_server::utils::recovery::hash_code_hex(c))
+        .collect();
+    sqlx::query(
+        "UPDATE platform_admins SET mfa_recovery_codes_hashes = $1, mfa_enabled = TRUE \
+         WHERE lower(email) = lower($2)",
+    )
+    .bind(&hashes)
+    .bind(&email)
+    .execute(&pool)
+    .await
+    .expect("seed recovery hashes");
+    let app = common::boot(pool).await;
+
+    let unknown = platform_post(
+        &app,
+        serde_json::json!({
+            "email": email,
+            "password": password,
+            "recovery_code": "AAAAAAAA-AAAAAAAA",
+        }),
+    )
+    .await;
+    assert_eq!(unknown.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let ok = platform_post(
+        &app,
+        serde_json::json!({
+            "email": email,
+            "password": password,
+            "recovery_code": recovery_codes[0],
+        }),
+    )
+    .await;
+    assert!(ok.status().is_success(), "got {}", ok.status());
+
+    let replay = platform_post(
+        &app,
+        serde_json::json!({
+            "email": email,
+            "password": password,
+            "recovery_code": recovery_codes[0],
+        }),
+    )
+    .await;
+    assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
