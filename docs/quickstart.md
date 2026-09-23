@@ -52,7 +52,7 @@ If you need `just` or Nushell themselves and you do have sudo, install via your 
 
 ## 3. Generate `.env`
 
-You do not hand-author any env file. `just dev` runs the `ensure-env` recipe first, which generates `.env` from the committed `.env.example` when `.env` is missing: it copies the template, then mints fresh random values for every self-owned secret (`MOKOSH_PG_PASSWORD`, `MOKOSH_MIGRATOR_PASSWORD`, `MOKOSH_APP_PASSWORD`, `JWT_SECRET`, `ENCRYPTION_KEY`, `INFISICAL_PG_PASSWORD`, `INFISICAL_ENCRYPTION_KEY` at the correct 16-byte length, `INFISICAL_AUTH_SECRET`) and rebuilds the `postgres://` URL lines from those same generated passwords. `just dev` then stamps `MOKOSH_HOST_BIND_IP` and `USER` on each run (step 4). An existing `.env` is left untouched, so this runs once per clone; edit `.env` directly for anything you want to change after that.
+You do not hand-author any env file. `just dev` runs the `ensure-env` recipe first, which generates `.env` from the committed `.env.example` when `.env` is missing: it copies the template, then mints fresh random values for every self-owned secret (`MOKOSH_PG_PASSWORD`, `MOKOSH_MIGRATOR_PASSWORD`, `MOKOSH_APP_PASSWORD`, `JWT_SECRET`, `ENCRYPTION_KEY`, `INFISICAL_PG_PASSWORD`, `INFISICAL_ENCRYPTION_KEY` at the correct 16-byte length, `INFISICAL_AUTH_SECRET`) and rebuilds the `postgres://` URL lines from those same generated passwords. `just dev` then stamps `USER` on each run (step 4). An existing `.env` is left untouched, so this runs once per clone; edit `.env` directly for anything you want to change after that.
 
 Because the values are generated per clone, nothing outside `.env` can tell you what they are. Read them from the file when you need one:
 
@@ -80,7 +80,7 @@ just dev --detach
 What `just dev` does:
 
 1. Generates `.env` from `.env.example` (via the `ensure-env` recipe) if `.env` is missing, minting fresh self-owned secrets.
-2. Detects your private LAN IP from `sys net | where name =~ 'eth0|br0'` and writes `MOKOSH_HOST_BIND_IP` plus `USER` to `.env`. `USER` is the one that matters: it names your containers, volumes, network and your `${USER}-mokosh-api.a8n.run` route. Nothing publishes a port on `MOKOSH_HOST_BIND_IP` any more (PMS-496).
+2. Writes `USER` to `.env`: it names your containers, volumes, network and your `${USER}-mokosh-api.a8n.run` route. No LAN IP is discovered or written, because no service publishes a host port on one (PMS-496, PMS-863).
 3. Runs `docker compose --file compose.dev.yml up --detach`, starting `server`, `postgres` and `mailpit`. Infisical is behind a compose profile and does NOT start here (step 7). Cold first build compiles every Rust crate inside the `server` container (5 to 15 min). Subsequent boots reuse the `dev-mokosh-server-target-${USER}` volume and are about 30 seconds.
 
 Watch the server compile and boot:
