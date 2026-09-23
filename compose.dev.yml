@@ -114,7 +114,12 @@ services:
     networks:
       - private
     ports:
-      - "127.0.0.1:28002:8080"
+      # PMS-900: host side from .env, for the same reason as the others.
+      # Changing it means changing `INFISICAL_URL` and `INFISICAL_SITE_URL`
+      # in your .env to match: the bootstrap CLI reads the first from the
+      # host and Infisical builds its own links from the second, and neither
+      # can be derived from this line.
+      - "127.0.0.1:${MOKOSH_INFISICAL_HOST_PORT:-28002}:8080"
     depends_on:
       infisical-postgres:
         condition: service_healthy
@@ -148,8 +153,12 @@ services:
     networks:
       - private
     ports:
-      - "127.0.0.1:29000:9000"
-      - "127.0.0.1:29001:9001"
+      # PMS-900: host side from .env, so a second checkout running
+      # `just dev-s3` does not collide. The server reaches MinIO in-network
+      # at `minio:9000`, so these two are host-side tooling only (the console,
+      # and `tests/s3_storage.rs` when it is pointed at localhost).
+      - "127.0.0.1:${MOKOSH_MINIO_API_HOST_PORT:-29000}:9000"
+      - "127.0.0.1:${MOKOSH_MINIO_CONSOLE_HOST_PORT:-29001}:9001"
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
@@ -220,12 +229,15 @@ services:
     networks:
       - private
     ports:
-      # Loopback-only on both ports. Multiple developers on the same
-      # box can collide on the host's 1025/8025; if you hit that,
-      # publish on a different host port (mailpit's internal ports
-      # stay 1025/8025 either way).
-      - "127.0.0.1:1025:1025"  # SMTP submission (mokosh-server -> mailpit)
-      - "127.0.0.1:8025:8025"  # web UI (developer browser)
+      # Loopback-only on both ports, and the HOST side of each comes from
+      # .env (PMS-900). Two checkouts on one box each publish mailpit, so a
+      # literal host port makes the second `just dev` fail with "Bind for
+      # 127.0.0.1:1025 failed: port is already allocated"; the note that used
+      # to sit here told the reader to edit this file, which a shared
+      # committed file cannot absorb. Change the two keys in your own .env
+      # instead. Mailpit's container-side ports stay 1025/8025 either way.
+      - "127.0.0.1:${MOKOSH_MAILPIT_SMTP_HOST_PORT:-1025}:1025"  # SMTP submission (mokosh-server -> mailpit)
+      - "127.0.0.1:${MOKOSH_MAILPIT_WEB_HOST_PORT:-8025}:8025"  # web UI (developer browser)
 
   # Mokosh API server. Built from the dev Dockerfile; source mounted for
   # live reload via `cargo run`.
