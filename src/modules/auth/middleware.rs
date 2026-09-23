@@ -998,10 +998,9 @@ pub enum LocalPlacement {
 ///
 /// `resolve_bunyip_caller` reads the caller's `users` row and the waiting-invite
 /// flag in one statement, and hands that row straight to `place_bunyip_caller`,
-/// which used to re-read both. The other statement left is the tenant gate:
-/// it reads `tenants.status` (PMS-698) and the `tenant_membership_entitlements`
-/// row (MAPPS-459) in one `LEFT JOIN` (PMS-1059), both security-relevant and
-/// deliberately not cached.
+/// which used to re-read both. The other statement left is the tenant gate: it
+/// reads `tenants.status` and the `tenant_membership_entitlements` row in one
+/// `LEFT JOIN`, both security-relevant and deliberately not cached.
 ///
 /// Public because it is the branch production takes for an already-provisioned
 /// caller, and the query-budget regression test

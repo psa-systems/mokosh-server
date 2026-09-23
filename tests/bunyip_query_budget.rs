@@ -14,15 +14,15 @@
 //! `tenant_membership_entitlements` row in ONE round trip via `LEFT JOIN`.
 //! Both are security-relevant and deliberately NOT cached.
 //!
-//! MAPPS-459 (PMS-728 slice 3) added the entitlement read inside
-//! `AuthService::ensure_tenant_active` as a separate statement right after the
-//! `tenants` status read; PMS-1042 pinned the budget at three so a statement
-//! nobody chose could not grow into the slack, and PMS-1059 folded the two into
-//! the join above. The `LEFT JOIN` is what preserves MAPPS-459's contract:
-//! `unknown` and an absent row both leave the entitlement columns NULL and
-//! pass through, and only `suspended` or an expired `expires_at` rejects. The
-//! invitation lookup this test seeds costs no statement of its own: the "is an
-//! invite waiting" flag rides as an `EXISTS` inside the one `users` read.
+//! The entitlement read used to be a separate statement inside
+//! `AuthService::ensure_tenant_active` right after the `tenants` status read;
+//! the budget was briefly pinned at three so a statement nobody chose could
+//! not grow into the slack, then folded into the join above. The `LEFT JOIN`
+//! preserves the contract of the split: `unknown` and an absent row both
+//! leave the entitlement columns NULL and pass through, and only `suspended`
+//! or an expired `expires_at` rejects. The invitation lookup this test seeds
+//! costs no statement of its own: the "is an invite waiting" flag rides as
+//! an `EXISTS` inside the one `users` read.
 //!
 //! The count comes from a `tracing` subscriber that records `sqlx::query`
 //! events, which is the in-process equivalent of Postgres `log_statement=all`
@@ -267,8 +267,8 @@ async fn an_authenticated_bunyip_request_costs_two_statements(pool: PgPool) {
         statements.iter().any(|s| {
             s.contains("FROM tenants") && s.contains("tenant_membership_entitlements")
         }),
-        "the PMS-698 principal gate and the MAPPS-459 entitlement read run \
-         in one round trip (PMS-1059): {statements:#?}"
+        "the tenant-status principal gate and the entitlement read run in one \
+         round trip: {statements:#?}"
     );
 
     // No transaction: the pre-PMS-777 path wrapped three of its reads in

@@ -1230,12 +1230,11 @@ impl AuthService {
     }
 
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
-        // The tenant-status gate (PMS-698) and the per-tenant Bunyip
-        // entitlement gate (MAPPS-459) are read in ONE statement: the auth
-        // path already spends the whole per-request query budget on this
-        // stretch, and two round trips for a check on the same row's id was
-        // the third statement per authenticated call for every caller in
-        // every tenant.
+        // The tenant-status gate and the per-tenant Bunyip entitlement gate
+        // are read in ONE statement: the auth path already spends the whole
+        // per-request query budget on this stretch, and two round trips for
+        // a check on the same row's id was the third statement per
+        // authenticated call for every caller in every tenant.
         //
         // SAFETY (PMS-285 / PMS-692): both `tenants` and
         // `tenant_membership_entitlements` are RLS-exempt. The `tenants`
@@ -1243,16 +1242,14 @@ impl AuthService {
         // (`table_name != 'tenants'`); migration 154's header states the
         // "pre-auth / cross-tenant entitlement lookup path" reason for the
         // second table's exemption, and 038's ENABLE-RLS loop runs at
-        // migration time only. PMS-1040 put both exemptions where they are
-        // enforced rather than only asserted: the two tables are named in
-        // `ALLOWED_WITHOUT_RLS` (`tests/rls_coverage.rs`), so a migration
-        // that gives either a policy fails the guard instead of silently
-        // fail-closing this read.
+        // migration time only. Both tables are named in `ALLOWED_WITHOUT_RLS`
+        // (`tests/rls_coverage.rs`), so a migration that gives either a
+        // policy fails the guard instead of silently fail-closing this read.
         //
-        // The `LEFT JOIN` is what preserves the "no entitlement row passes
-        // through" contract MAPPS-459 wrote down: an unknown entitlement,
-        // and a fresh instance with no integration wired, both leave the
-        // entitlement columns NULL and reach the `None` arm of the match.
+        // The `LEFT JOIN` preserves the "no entitlement row passes through"
+        // contract: an unknown entitlement, and a fresh instance with no
+        // integration wired, both leave the entitlement columns NULL and
+        // reach the `None` arm of the match.
         let row: Option<(
             String,
             Option<String>,
