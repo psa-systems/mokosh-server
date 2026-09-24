@@ -130,6 +130,59 @@ Check the demoted rows before you upgrade: if the newer row is the one the
 customer actually signs in as, demote the older one instead by inverting the
 `ORDER BY`.
 
+### 157, one seat per person per tenant
+
+A different shape from the four above: nothing here is about a name, and the
+index that rejects the row is on `tenant_memberships`, not on the table holding
+the duplicates.
+
+```
+error: while executing migration 157: error returned from database:
+duplicate key value violates unique constraint
+"tenant_memberships_identity_id_tenant_id_key"
+```
+
+`users` has a case-SENSITIVE `UNIQUE (tenant_id, email)`, so one tenant can
+hold `Bob@acme.com` and `bob@acme.com`. Migration 157 folds both into a single
+identity (`DISTINCT ON (lower(email))`) and then gives every `users` row a
+membership, which asks for two `(identity, tenant)` rows where only one may
+exist. The dual-write trigger the same migration installs already carries
+`ON CONFLICT (identity_id, tenant_id) DO UPDATE`, so this is a one-time
+backfill problem and not a live one: a case-variant user created today is
+absorbed rather than rejected.
+
+```sql
+-- DETECT
+SELECT tenant_id, LOWER(email) AS collides_on, count(*), array_agg(email) AS addresses
+FROM users GROUP BY 1, 2 HAVING count(*) > 1;
+```
+
+There is no mechanical repair, because the rows mean something the new model
+cannot express: one human holding two seats in one tenant. Decide which case
+the pair is.
+
+**Two different people, one of whom has a typo'd address.** Correct the wrong
+one. Both keep their seat, their history and their links, and they become two
+identities, which is what they are.
+
+```sql
+UPDATE users SET email = 'the.address.they.actually.use@example.com'
+WHERE id = '<the row with the wrong address>';
+```
+
+**One person with a duplicate row.** Decide which row is the seat they use.
+Give the other a distinct, parked address so the backfill can proceed, then
+retire it through the application (deactivate the user) rather than deleting
+the row: a `users` row is referenced by time entries, tickets and audit rows,
+and deleting it takes their history with it.
+
+```sql
+UPDATE users SET email = 'bob+duplicate@acme.com'
+WHERE id = '<the row that is not the real seat>';
+```
+
+Either way the addresses end up distinct, which is all the backfill needs.
+
 ## After the repair
 
 Run the upgrade again. It resumes at the migration that failed, because a
@@ -137,8 +190,17 @@ failed migration records nothing, and continues to the end.
 
 ## Verified
 
-This procedure was run against a real database for migration 153 (PMS-1229):
-migrated to 152, seeded the documented `Acme Corp` / `Acme corp` pair, watched
-153 abort with the error at the top of this page, applied the repair above, and
-re-ran the upgrade, which then applied every migration through to the head. The
-other four queries are the same shape read off their own index definitions.
+Two of these were run against a real database rather than reasoned about.
+
+Migration 153 (PMS-1229): migrated to 152, seeded the documented `Acme Corp` /
+`Acme corp` pair, watched 153 abort with the error at the top of this page,
+applied the repair, and re-ran the upgrade, which applied every migration
+through to the head.
+
+Migration 157 (PMS-1231): migrated to 156, seeded `Bob@acme.com` and
+`bob@acme.com` in one tenant, watched 157 abort on
+`tenant_memberships_identity_id_tenant_id_key`, made the two addresses
+distinct, and re-ran the upgrade, which again reached the head.
+
+The remaining queries are the same shape, read off their own index
+definitions.
