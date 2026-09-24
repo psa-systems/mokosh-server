@@ -3,9 +3,11 @@
 //! `migrations/006_time_tracking.sql` (timesheets are aggregated from
 //! `time_entries`, not a table). Endpoints land incrementally across PMS-42.
 //!
-//! Shared module: the client (mokosh-apps) carries a byte-identical copy and
-//! compiles only the model types. Routes + service are gated behind the
-//! `server` feature so the WASM build omits the axum/sqlx code.
+//! Shared module: the DTOs come from the shared `mokosh-types` crate, which
+//! both this module and the client (mokosh-apps) re-export, so there is no
+//! hand copy on either side to keep in step (PMS-129, MAPPS-383). Routes +
+//! service are gated behind the `server` feature so the WASM build omits the
+//! axum/sqlx code.
 
 mod models;
 #[cfg(feature = "server")]
