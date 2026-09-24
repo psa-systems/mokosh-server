@@ -46,7 +46,7 @@ use super::service::{
 };
 use super::sync::ImportPreview;
 use crate::modules::audit::AuditCtx;
-use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
+use crate::modules::auth::{RequireAdmin, RequireAuth, RequireManager, TenantScoped};
 use crate::modules::tenants::TenantOrPlatformCaller;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::upload_limits::body_limit_bytes;
@@ -419,6 +419,7 @@ async fn get_provenance(
 
 async fn release_lock(
     State(state): State<ContactSyncRouterState>,
+    _manager: RequireManager,
     RequireAuth(user): RequireAuth,
     ctx: AuditCtx,
     Path((contact_id, field)): Path<(Uuid, String)>,

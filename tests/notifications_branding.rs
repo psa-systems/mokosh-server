@@ -14,10 +14,20 @@
 //! PMS-1139: the first test used to borrow the migrated `auth.password_reset`
 //! copy and assert what that copy SAYS before dispatching it. That is a
 //! different question from whether the dispatcher injects branding, and it is
-//! the question migration 139 lost and PMS-1140 has still to settle, so it
-//! stood red on `main` and reddened every pull request's integration run.
+//! the question migration 139 lost, so it stood red on `main` and reddened
+//! every pull request's integration run.
 //! `a_seeded_template_carries_the_branding_placeholders` below keeps the half
-//! that is worth pinning, pointed at the template where the answer is settled.
+//! that is worth pinning, pointed at a template of its own.
+//!
+//! PMS-1140 settled the other half, and PMS-1119 confirmed it: a mail serves
+//! ONE audience, so `auth.password_reset` and `auth.welcome` are staff mails
+//! that name the deployment through `{{app_name}}` and carry no MSP branding,
+//! while the client-facing `auth.portal_password_reset` names the MSP and
+//! carries none of the product. What migration 139 failed to apply to those
+//! two rows is therefore what they should not have: it was aimed at a
+//! question that had already been answered the other way by migration 116.
+//! `tests/portal_transactional_mail.rs` pins the split itself, and
+//! `tests/app_name_setting.rs` pins how many templates may name the product.
 
 mod common;
 

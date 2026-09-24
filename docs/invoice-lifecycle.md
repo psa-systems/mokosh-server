@@ -22,13 +22,35 @@ if current.status.is_frozen() {
 }
 ```
 
-Because the status transition to `void` also flows through `update_invoice`, this guard means voiding is only possible while the invoice is still `draft` or `pending`. A `sent` invoice cannot be edited, cannot be cancelled, and cannot be voided through this path.
+Voiding is bounded the same way, and since PMS-1333 it has its own endpoint rather than a status on this PUT (see "Voiding" below): a `sent` invoice cannot be edited, cannot be cancelled, and cannot be voided.
 
 ## What each state can do
 
-- `draft` / `pending` (editable): edit header and lines, Send (-> `sent`, subject to the recipient precondition below), or Void (-> `void`). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
+- `draft` / `pending` (editable): edit header and lines, Send (-> `sent`, subject to the recipient precondition below), or Void (`POST /invoices/{id}/void`, PMS-1333). Void here is the pre-send back-out: it preserves the row for audit instead of deleting it.
 - `sent` / `partially_paid` (collectible): Record Payment, which runs through `record_payment` (a separate path, not `update_invoice`) and advances the status `sent` -> `partially_paid` -> `paid` as the balance is collected; Credit (a credit note, PMS-953); or Write off (PMS-1036, below).
 - `paid` / `void` / `written_off` (terminal): no further lifecycle actions. A payment recorded against a `written_off` invoice is a recovery: it is kept and the status stands.
+
+## What an invoice number is (PMS-979)
+
+Two schemes, chosen per tenant by `billing_prefs/invoice_numbering`, which is a closed set refused at the write.
+
+`tenant_sequence` is the default and the original: one counter for the whole tenant, `INV-000042`. `company_prefix` is per customer: a four-character prefix, a dash and that customer's own zero-padded sequence, `A7QF-000001`. The default did not change when the second scheme shipped, because an MSP's invoice numbering is an accounting decision and moving every existing tenant onto a new shape mid-year is not something to do on their behalf. What the second scheme buys is that a customer's invoices are visibly theirs and their history reads consecutively, and that the document no longer tells every customer how many invoices the MSP has issued in total.
+
+The prefix is random rather than derived from the company name, for the reason `portal_id` is (migration 174): names collide, names change, and a derived identifier stops being stable the first time a customer rebrands. Its alphabet excludes I, L, O, 0 and 1, so a number read back over the phone cannot become another customer's, which leaves 31 characters and 923,521 prefixes per tenant. It is assigned lazily on the customer's first invoice under this scheme, so a company that is never invoiced never gets one.
+
+Both counters are table rows rather than Postgres sequences, and that is deliberate: a sequence keeps its increment when the transaction that took it rolls back, so a failed create would leave a hole in a customer's numbering, and gap-free is an audit expectation on invoices. A row rolls back with everything else, and concurrent creates queue on it rather than racing.
+
+Switching schemes renumbers nothing. A number is a stored string on the invoice it belongs to, and `invoices.number_scheme` records which scheme produced it (NULL on invoices issued before the column existed), so the next change is a switch as well. The year is deliberately not part of a number: adding it later would restart every customer's sequence each January, which is exactly the renumbering this design avoids.
+
+## Voiding, and what crediting does instead (PMS-1333)
+
+`POST /invoices/{id}/void` with an optional `{ reason }` moves a `draft` or `pending` invoice to `void` and records `voided_at`, `voided_by_id` and `void_reason`. Finance only. Every other status is refused with a 409 that names it and points at the credit note, because past `pending` the customer holds a copy. The reason is optional where the write-off's is required: a draft withdrawn before anyone saw it often has nothing to say. No amount is frozen beside it either, for the same reason: a write-off forgives a debt that was genuinely owed, while a void says nothing was ever owed.
+
+Crediting an invoice does NOT void it. Until PMS-1333, a credit note covering the invoice's full total moved it to `void` (PMS-953 introduced that as the first writer `void` ever had, and PMS-1226 narrowed the threshold after a 5.00 goodwill credit voided a paid invoice). That read a credited invoice as a cancelled one, which it is not: the document stood, the customer holds it, and the credit note is the correction. A credit that takes the balance to zero now lands on `paid`, which is also what Stripe does - "if a credit note reduces the balance of an open invoice to 0, the invoice status changes to paid" ([Stripe: issue credit notes](https://docs.stripe.com/invoicing/dashboard/credit-notes)) - so a tenant reconciling against their gateway sees the same shape on both sides. Such an invoice carries no `paid_at`: nothing is owed and nobody paid.
+
+Two consequences follow from voiding being allowed only pre-send. A voided invoice never appears on a statement (PMS-954), because it was never issued and never owed; a fully credited one still does, beside the credit note that settled it. And a credit note against a voided invoice is refused, because there is no charge to correct.
+
+`voided_at` leads `recompute_invoice_balance`'s status CASE, just ahead of `written_off_at`, so a payment or credit landing afterwards cannot derive the status back over one somebody chose.
 
 ## Writing off, distinct from crediting (PMS-1036)
 
@@ -41,6 +63,16 @@ A credit note says the customer did not owe this and reduces revenue. A write-of
 Overdue is derived on every read, never stored: `is_overdue` and `days_overdue` on `InvoiceResponse` are `status IN ('sent', 'partially_paid') AND balance_due > 0 AND due_date < today`, computed in the tenant's day (`read_tenant_zone`, PMS-1030), and `GET /invoices?overdue=true` filters on the same predicate. A stored flag would be a second home for a fact `due_date` and `balance_due` already hold, and the only one that could be stale.
 
 Reminders are a worker. `InvoiceReminderWorker` runs hourly; for each tenant with `billing_reminders/enabled` and a `schedule` (day offsets such as `[3, 7, 14, 30]`), at the tenant's local `send_hour` (default 8), it mails every overdue invoice whose `days_overdue` equals a step, to the address the invoice was emailed to (PMS-992) else the resolved billing contact (PMS-993), with the stored document attached (PMS-959) and the pay link when a gateway is connected. `invoice_reminders` records each send per invoice per step and is the idempotency guard, so a run that fires twice in the hour sends once; a refused send releases the claim so the next run tries again. Late fees are deliberately not here: a fee is a new line on a new document, and its own ticket.
+
+## Creating an invoice does not send it (PMS-978)
+
+Creation makes a draft. Nothing is emailed, nothing is frozen, and no document is stored; the customer learns of the invoice when somebody sends it. That is deliberate rather than missing: an invoice is routinely prepared before it is ready to go out, and the alternative, emailing on create, would need a draft state first to get the same behaviour back.
+
+Sending is the `draft`/`pending` -> `sent` transition on `PUT /invoices/{id}`, and it is the one act that emails the customer, freezes the issuer snapshot (PMS-911) and stores the document (PMS-959). It is also the only place `sent` is written, so the state on the invoice answers "has this gone out" without a second flag: `draft` or `pending` means nobody has been told, `sent_at` says when it went, and `emailed_to` with `emailed_at` says to whom. A send the relay refuses rolls all of it back (PMS-992), so a `sent` invoice is never one nobody received.
+
+Two named audit rows record the delivery itself, beside the whole-row `update` snapshot PMS-117 writes: `invoice.sent` with the address, the contact and the actor, and `invoice.marked_sent` for a `skip_email` send, which records that nobody was emailed on purpose. Without that second one, a deliberate no-email send would be indistinguishable afterwards from a send whose mail was lost, since both leave a `sent` invoice with no `emailed_to`. Both are written inside the send's transaction, so a refusal takes the record away with the transition.
+
+The rows are in `audit_log` and readable through the admin audit-log endpoint, not through the per-record history feed: `HISTORY_ENTITY_TYPES` deliberately excludes billing so a technician cannot browse an invoice's trail.
 
 ## Sending requires a recipient
 
@@ -97,3 +129,5 @@ An already-sent invoice keeps its stored bytes. PMS-959 writes the rendered PDF 
 ## UI
 
 The invoice detail page (`mokosh-apps`, `src/pages/billing.rs`) mirrors this model: Edit / Send / Void render only while editable (`draft` / `pending`), Record Payment renders only while collectible, and a frozen invoice shows an inline note explaining that it is a finalized record and cannot be edited, cancelled, or voided.
+
+Its Void button still sends `PUT /invoices/{id}` with `{"status":"void"}`, which PMS-1227 made a 422, so voiding a draft has been broken from the client since that landed. Pointing it at `POST /invoices/{id}/void` is MAPPS-937.

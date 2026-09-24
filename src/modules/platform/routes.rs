@@ -21,7 +21,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 use validator::Validate;
 
-use super::models::{PlatformChangePasswordRequest, PlatformLoginRequest, PlatformLoginResponse};
+use super::models::{
+    PlatformChangePasswordRequest, PlatformLoginRequest, PlatformLoginResponse,
+    PlatformMfaDisableRequest, PlatformMfaEnableRequest, PlatformMfaEnableResponse,
+    PlatformMfaSetupRequest, PlatformMfaSetupResponse,
+};
 use super::service::PlatformAdminService;
 use crate::modules::auth::rate_limit::AuthRateLimiter;
 use crate::utils::error::{rate_limited_response, AppError, AppResult};
@@ -42,6 +46,9 @@ pub fn platform_routes(platform_service: PlatformAdminService) -> Router {
     Router::new()
         .route("/login", post(login))
         .route("/me/password", put(change_password))
+        .route("/me/mfa/setup", post(mfa_setup))
+        .route("/me/mfa/enable", post(mfa_enable))
+        .route("/me/mfa/disable", post(mfa_disable))
         .with_state(state)
 }
 
@@ -63,6 +70,7 @@ async fn login(
             &request.email,
             &request.password,
             request.mfa_code.as_deref(),
+            request.recovery_code.as_deref(),
         )
         .await?;
     Ok(Json::<PlatformLoginResponse>(response).into_response())
@@ -82,6 +90,44 @@ async fn change_password(
             &request.new_password,
             &request.confirm_password,
         )
+        .await
+}
+
+async fn mfa_setup(
+    State(state): State<PlatformRouterState>,
+    caller: RequirePlatformAdmin,
+    Json(request): Json<PlatformMfaSetupRequest>,
+) -> AppResult<Json<PlatformMfaSetupResponse>> {
+    request.validate()?;
+    let response = state
+        .platform_service
+        .start_mfa_enrollment(caller.id, &request.current_password)
+        .await?;
+    Ok(Json(response))
+}
+
+async fn mfa_enable(
+    State(state): State<PlatformRouterState>,
+    caller: RequirePlatformAdmin,
+    Json(request): Json<PlatformMfaEnableRequest>,
+) -> AppResult<Json<PlatformMfaEnableResponse>> {
+    request.validate()?;
+    let response = state
+        .platform_service
+        .enable_mfa(caller.id, &request.current_password, &request.code)
+        .await?;
+    Ok(Json(response))
+}
+
+async fn mfa_disable(
+    State(state): State<PlatformRouterState>,
+    caller: RequirePlatformAdmin,
+    Json(request): Json<PlatformMfaDisableRequest>,
+) -> AppResult<()> {
+    request.validate()?;
+    state
+        .platform_service
+        .disable_mfa(caller.id, &request.current_password, &request.code)
         .await
 }
 

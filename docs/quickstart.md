@@ -52,7 +52,7 @@ If you need `just` or Nushell themselves and you do have sudo, install via your 
 
 ## 3. Generate `.env`
 
-You do not hand-author any env file. `just dev` runs the `ensure-env` recipe first, which generates `.env` from the committed `.env.example` when `.env` is missing: it copies the template, then mints fresh random values for every self-owned secret (`MOKOSH_PG_PASSWORD`, `MOKOSH_MIGRATOR_PASSWORD`, `MOKOSH_APP_PASSWORD`, `JWT_SECRET`, `ENCRYPTION_KEY`, `INFISICAL_PG_PASSWORD`, `INFISICAL_ENCRYPTION_KEY` at the correct 16-byte length, `INFISICAL_AUTH_SECRET`) and rebuilds the `postgres://` URL lines from those same generated passwords. `just dev` then stamps `MOKOSH_HOST_BIND_IP` and `USER` on each run (step 4). An existing `.env` is left untouched, so this runs once per clone; edit `.env` directly for anything you want to change after that.
+You do not hand-author any env file. `just dev` runs the `ensure-env` recipe first, which generates `.env` from the committed `.env.example` when `.env` is missing: it copies the template, then mints fresh random values for every self-owned secret (`MOKOSH_PG_PASSWORD`, `MOKOSH_MIGRATOR_PASSWORD`, `MOKOSH_APP_PASSWORD`, `JWT_SECRET`, `ENCRYPTION_KEY`, `INFISICAL_PG_PASSWORD`, `INFISICAL_ENCRYPTION_KEY` at the correct 16-byte length, `INFISICAL_AUTH_SECRET`) and rebuilds the `postgres://` URL lines from those same generated passwords. `just dev` then stamps `USER` on each run (step 4). An existing `.env` is left untouched, so this runs once per clone; edit `.env` directly for anything you want to change after that.
 
 Because the values are generated per clone, nothing outside `.env` can tell you what they are. Read them from the file when you need one:
 
@@ -80,7 +80,7 @@ just dev --detach
 What `just dev` does:
 
 1. Generates `.env` from `.env.example` (via the `ensure-env` recipe) if `.env` is missing, minting fresh self-owned secrets.
-2. Detects your private LAN IP from `sys net | where name =~ 'eth0|br0'` and writes `MOKOSH_HOST_BIND_IP` plus `USER` to `.env`. `USER` is the one that matters: it names your containers, volumes, network and your `${USER}-mokosh-api.a8n.run` route. Nothing publishes a port on `MOKOSH_HOST_BIND_IP` any more (PMS-496).
+2. Writes `USER` to `.env`: it names your containers, volumes, network and your `${USER}-mokosh-api.a8n.run` route. No LAN IP is discovered or written, because no service publishes a host port on one (PMS-496, PMS-863).
 3. Runs `docker compose --file compose.dev.yml up --detach`, starting `server`, `postgres` and `mailpit`. Infisical is behind a compose profile and does NOT start here (step 7). Cold first build compiles every Rust crate inside the `server` container (5 to 15 min). Subsequent boots reuse the `dev-mokosh-server-target-${USER}` volume and are about 30 seconds.
 
 Watch the server compile and boot:
@@ -174,9 +174,9 @@ just dev --detach
 | Service | Reached at | Notes |
 | --- | --- | --- |
 | Mokosh API | `https://<your-username>-mokosh-api.a8n.run` | Traefik is the sole ingress and terminates TLS; the container listens on `MOKOSH_PORT` (`8080`) and publishes no host port. |
-| Mailpit | `http://localhost:8025` | Catches all outbound dev email. Loopback only. |
-| Postgres | `127.0.0.1:5433` (`postgres:5432` in-network) | Database `mokosh`, user `postgres`. The password is generated per clone: read `MOKOSH_PG_PASSWORD` (or the whole `DATABASE_URL`) from `.env`. Loopback only. |
-| Infisical | `http://localhost:28002` | Only when started with `just dev-infisical`. Admin credentials are the ones you put in `.env.infisical`. Loopback only. |
+| Mailpit | `http://localhost:8025` | Catches all outbound dev email. Loopback only; the host port is `MOKOSH_MAILPIT_WEB_HOST_PORT`. |
+| Postgres | `127.0.0.1:5433` (`postgres:5432` in-network) | Database `mokosh`, user `postgres`. The password is generated per clone: read `MOKOSH_PG_PASSWORD` (or the whole `DATABASE_URL`) from `.env`. Loopback only; the host port is `MOKOSH_PG_HOST_PORT`, which the three host-side URLs interpolate rather than repeat. |
+| Infisical | `http://localhost:28002` | Only when started with `just dev-infisical`. Admin credentials are the ones you put in `.env.infisical`. Loopback only; the host port is `MOKOSH_INFISICAL_HOST_PORT`. |
 
 Everything except the API publishes on `127.0.0.1` alone, so host-side tooling reaches it and the LAN cannot (PMS-496).
 
@@ -225,7 +225,9 @@ just dev-infisical --detach
 ```
 
 **Port collisions on shared hosts**
-The API needs no host port, so it cannot collide. The rest publish on loopback: Postgres `5433`, Infisical UI `28002`, Mailpit UI `8025` and SMTP `1025`. Change `MOKOSH_PG_HOST_PORT` in `.env` after `just dev` generates it; the Infisical and Mailpit ports are pinned in `compose.dev.yml`.
+The API needs no host port, so it cannot collide. Every other published port is loopback-only and reads its HOST side from `.env`, so change the key rather than the compose file (PMS-900): `MOKOSH_PG_HOST_PORT` (`5433`), `MOKOSH_MAILPIT_SMTP_HOST_PORT` (`1025`), `MOKOSH_MAILPIT_WEB_HOST_PORT` (`8025`), `MOKOSH_INFISICAL_HOST_PORT` (`28002`), `MOKOSH_MINIO_API_HOST_PORT` (`29000`) and `MOKOSH_MINIO_CONSOLE_HOST_PORT` (`29001`). The container-side ports never move, so nothing in-network changes with them. Each key is also the ONE place its port is written: the three host-side Postgres URLs interpolate `MOKOSH_PG_HOST_PORT` (PMS-1376) and the two Infisical URLs interpolate `MOKOSH_INFISICAL_HOST_PORT` (PMS-961), so moving a port moves everything that dials it. That matters most for Postgres, because a URL left on the old port does not fail on a shared host: it reaches another checkout's database, and `just migrate-run` would migrate their data.
+
+The containers, volumes and network are already per developer, and so is the compose project (`dev-mokosh-${USER}`, PMS-1281), so two checkouts under different users are separate stacks: `just down` in one leaves the other running.
 
 **Server compile takes forever**
 First build hits every crate in the workspace cold. Watch `docker compose --file compose.dev.yml logs --follow server`. Subsequent boots reuse the `dev-mokosh-server-target-${USER}` volume and are about 30 seconds.
