@@ -57,6 +57,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Clone the mokosh-apps sibling
+        # check-route-consumers.nu compares mounted routes against the SPA
+        # source. Without this checkout the guard skips loudly and drift
+        # goes unseen in CI. The cross-repo checkout needs an org-scoped
+        # token: the runner's own credentials are scoped to mokosh-server,
+        # so a bare checkout stalls at "Determining the default branch"
+        # rather than reading anything from psa-systems/mokosh-apps.
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          repository: psa-systems/mokosh-apps
+          path: mokosh-apps
+          fetch-depth: 1
+          token: ${{ secrets.FORGEJO_PAT }}
+
       - name: Cap build parallelism
         # nproc/2 cap: never claim more than half the host (see "Concurrency
         # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
@@ -260,6 +274,17 @@ jobs:
           mkdir -p "${cargo_bin}"
           install -m 755 "/tmp/cargo-machete-v${MACHETE_VERSION}-x86_64-unknown-linux-musl/cargo-machete" "${cargo_bin}/cargo-machete"
           cargo machete
+
+      - name: Route consumers
+        # Every mounted route needs an SPA caller or a dated parity record.
+        # The mokosh-apps sibling checkout above supplies the SPA source;
+        # MOKOSH_APPS_DIR points the script at it, and the script itself
+        # fails rather than skips when CI is set.
+        shell: nu {0}
+        env:
+          MOKOSH_APPS_DIR: mokosh-apps
+        run: |
+          nu scripts/check-route-consumers.nu
 
       - name: Check formatting
         run: cargo fmt --all --check

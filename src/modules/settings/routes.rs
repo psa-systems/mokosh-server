@@ -200,6 +200,18 @@ async fn upsert_setting(
     // validates. Without this a branding value reached `tenant_settings`
     // unchecked through the older URL shape.
     validate_setting_value(&req.category, &req.key, &req.value)?;
+    if req.category == "branding" {
+        // PMS-1371: the shape check above never looked at whose id follows an
+        // accepted `/api/v1/public/{tenants,companies}/` prefix.
+        crate::modules::tenants::branding::assert_branding_value_owned_by_tenant(
+            &req.key,
+            &req.value,
+            u.tenant().get(),
+            &s.db,
+        )
+        .await
+        .map_err(|message| crate::utils::error::AppError::validation_field("value", message))?;
+    }
     Ok(Json(
         s.service.upsert_tenant_setting(u.tenant(), &req).await?,
     ))
@@ -279,6 +291,18 @@ async fn put_setting(
     Json(req): Json<PutSettingValueRequest>,
 ) -> AppResult<Json<TenantSettingResponse>> {
     validate_setting_value(&category, &key, &req.value)?;
+    if category == "branding" {
+        // PMS-1371: the shape check above never looked at whose id follows an
+        // accepted `/api/v1/public/{tenants,companies}/` prefix.
+        crate::modules::tenants::branding::assert_branding_value_owned_by_tenant(
+            &key,
+            &req.value,
+            u.tenant().get(),
+            &s.db,
+        )
+        .await
+        .map_err(|message| crate::utils::error::AppError::validation_field("value", message))?;
+    }
     Ok(Json(
         s.service
             .put_setting(u.tenant(), &category, &key, req.value)

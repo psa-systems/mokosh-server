@@ -1293,6 +1293,16 @@ impl TenantService {
         // published. Includes the PMS-758 object check.
         if let Some(branding) = request.branding.as_ref() {
             validate_branding_patch(branding)?;
+            // PMS-1371: the prefix check above never looked at whose id
+            // followed it, so a tenant could set `logo_url` to another
+            // tenant's (or another tenant's company's) real, currently-served
+            // asset path and have it accepted.
+            super::branding::assert_branding_patch_owned_by_tenant(
+                branding,
+                tenant_id.get(),
+                &self.db,
+            )
+            .await?;
         }
         if request.branding.is_some() {
             // PMS-758: MERGE, not replace. `branding` is a JSONB document and
