@@ -136,7 +136,7 @@ async fn list_appointments(
     f.validate()?;
     let (items, total) = s
         .service
-        .list_appointments(u.tenant(), &f, &pagination)
+        .list_appointments(u.tenant(), u.id, &f, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         items,
