@@ -12,6 +12,7 @@ mod common;
 
 use common::{boot_rls, dec, seed_company, DEFAULT_TENANT_ID};
 use hmac::{Hmac, Mac};
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -120,7 +121,7 @@ async fn invoice_state(pool: &sqlx::PgPool, id: Uuid) -> (String, Decimal, Decim
         .expect("read invoice state")
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn paid_webhook_marks_invoice_paid_and_is_idempotent(pool: sqlx::PgPool) {
     let app = boot_rls(pool).await;
     let company = seed_company(&app.pool).await;
@@ -181,7 +182,7 @@ async fn paid_webhook_marks_invoice_paid_and_is_idempotent(pool: sqlx::PgPool) {
     assert_eq!(count, 1, "redelivered event must not double-record");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn refund_webhook_walks_the_invoice_back_to_partially_paid(pool: sqlx::PgPool) {
     let app = boot_rls(pool).await;
     let company = seed_company(&app.pool).await;
@@ -244,7 +245,7 @@ async fn refund_webhook_walks_the_invoice_back_to_partially_paid(pool: sqlx::PgP
     assert_eq!(refund_count, 1);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn abandoned_checkout_is_a_no_op(pool: sqlx::PgPool) {
     let app = boot_rls(pool).await;
     let company = seed_company(&app.pool).await;
@@ -298,7 +299,7 @@ async fn abandoned_checkout_is_a_no_op(pool: sqlx::PgPool) {
     assert_eq!(count, 0);
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn bad_signature_is_rejected_and_changes_nothing(pool: sqlx::PgPool) {
     let app = boot_rls(pool).await;
     let company = seed_company(&app.pool).await;

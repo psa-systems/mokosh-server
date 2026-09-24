@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
@@ -259,7 +260,7 @@ fn fixture_account() -> Vec<SourceContact> {
 
 /// The phase's "done when": the expected links, candidates and creates, and a
 /// second run that changes nothing.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_sync_links_queues_and_creates_and_a_second_run_changes_nothing(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let ada = f
@@ -395,7 +396,7 @@ async fn a_sync_links_queues_and_creates_and_a_second_run_changes_nothing(pool: 
 
 /// An expired cursor is a clean full read: what is gone is flagged, and no
 /// Mokosh contact is changed or removed (PSA-70 I).
-#[sqlx::test]
+#[mokosh_test]
 async fn an_expired_cursor_resyncs_and_flags_what_is_gone_without_touching_contacts(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let mut kept = person("people/k", "e1", "Kept", "Person");
@@ -459,7 +460,7 @@ async fn an_expired_cursor_resyncs_and_flags_what_is_gone_without_touching_conta
 
 /// A field a human locked is not overwritten; an unlocked one follows the
 /// source; the address is never replaced (PSA-70 H).
-#[sqlx::test]
+#[mokosh_test]
 async fn a_changed_source_respects_locks_and_never_replaces_the_email(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let mut ada = person("people/c1", "e1", "Ada", "Lovelace");
@@ -515,7 +516,7 @@ async fn a_changed_source_respects_locks_and_never_replaces_the_email(pool: PgPo
 
 /// A rate limit is `throttled` and a refused credential `reconnect_required`;
 /// neither moves the cursor or writes a contact.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_source_failure_is_recorded_by_its_kind_and_keeps_the_cursor(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let source = FakeSource::new(vec![
@@ -540,7 +541,7 @@ async fn a_source_failure_is_recorded_by_its_kind_and_keeps_the_cursor(pool: PgP
 
 /// A blank selection is "not chosen yet", never "import everything"
 /// (PSA-70 E): the source is not even read.
-#[sqlx::test]
+#[mokosh_test]
 async fn nothing_is_imported_before_a_label_is_chosen(pool: PgPool) {
     let f = Fixture::new(pool, &[]).await;
     let source = FakeSource::new(vec![read(fixture_account(), "t1", false)]);
@@ -554,7 +555,7 @@ async fn nothing_is_imported_before_a_label_is_chosen(pool: PgPool) {
 }
 
 /// A question a human answered is not asked again when the record changes.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_answered_question_is_not_asked_again(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let grace = f.contact("Grace", "Hopper", None, None).await;
@@ -586,7 +587,7 @@ async fn an_answered_question_is_not_asked_again(pool: PgPool) {
 
 /// Two source records for one address, neither known to Mokosh: the first is
 /// created, the second is a question, never a second contact.
-#[sqlx::test]
+#[mokosh_test]
 async fn two_records_for_one_address_do_not_create_two_contacts(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let mut one = person("people/a", "e1", "Jo", "Smith");
@@ -606,7 +607,7 @@ async fn two_records_for_one_address_do_not_create_two_contacts(pool: PgPool) {
 
 /// PMS-1242: the preview says what the import will do, and writes nothing.
 /// Previewed, then imported: the counts agree.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_preview_writes_nothing_and_agrees_with_the_import(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     f.contact("Ada", "Lovelace", Some("ada@acme.example"), None)

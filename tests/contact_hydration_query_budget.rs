@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -91,7 +92,7 @@ impl<S: tracing::Subscriber> Layer<S> for RecordingLayer {
 /// against the fixed per-page cost.
 const CONTACTS: usize = 5;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_page_reads_each_child_table_once(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(

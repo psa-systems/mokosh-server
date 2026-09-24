@@ -6,10 +6,11 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn update_writes_audit_entry_with_before_and_after(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -81,7 +82,7 @@ async fn update_writes_audit_entry_with_before_and_after(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn audit_read_is_tenant_scoped(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
 
@@ -129,7 +130,7 @@ async fn audit_read_is_tenant_scoped(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn audit_read_requires_admin(pool: PgPool) {
     // Seed a non-admin user under the default tenant and confirm the
     // read endpoint rejects them (RequireAdmin).
@@ -167,7 +168,7 @@ async fn audit_read_requires_admin(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn login_writes_audit_event(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;

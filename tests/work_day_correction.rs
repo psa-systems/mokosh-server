@@ -11,6 +11,7 @@
 mod common;
 
 use chrono::{DateTime, Duration, Utc};
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -113,7 +114,7 @@ fn id_of(segment: &Value) -> String {
 /// The reason the feature exists: a clock-out entered an hour late is
 /// corrected, and the day's own totals follow, because PMS-950 derives them
 /// from the segments on every read rather than storing them.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_corrected_segment_changes_the_day_it_belongs_to(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -151,7 +152,7 @@ async fn a_corrected_segment_changes_the_day_it_belongs_to(pool: PgPool) {
 
 /// An end before its start is refused by the service with a sentence, not by
 /// the table's CHECK with a constraint name.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_segment_cannot_be_made_to_end_before_it_starts(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -179,7 +180,7 @@ async fn a_segment_cannot_be_made_to_end_before_it_starts(pool: PgPool) {
 /// An explicit null on `ended_at` reopens a segment, which is how a clock-out
 /// tapped by mistake is undone. Absent leaves the end alone; the two are
 /// different requests and the double option is what tells them apart.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_explicit_null_reopens_a_segment_and_an_absent_field_does_not(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -209,7 +210,7 @@ async fn an_explicit_null_reopens_a_segment_and_an_absent_field_does_not(pool: P
 /// Reopening while another segment is open would produce two open segments
 /// for one person, which the partial unique index forbids. The service
 /// refuses first, with a sentence that says what is in the way.
-#[sqlx::test]
+#[mokosh_test]
 async fn reopening_is_refused_while_another_segment_is_open(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -226,7 +227,7 @@ async fn reopening_is_refused_while_another_segment_is_open(pool: PgPool) {
 
 /// Removing the open segment is how a mis-tapped clock-in is undone: it
 /// leaves the person clocked out, which is what they were.
-#[sqlx::test]
+#[mokosh_test]
 async fn removing_the_open_segment_leaves_the_person_clocked_out(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -254,7 +255,7 @@ async fn removing_the_open_segment_leaves_the_person_clocked_out(pool: PgPool) {
 /// `off` means nobody, the person whose day it is included. A tenant that
 /// wants attendance immutable gets that, rather than a rule that quietly
 /// exempts the owner.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_off_policy_refuses_the_owner_too(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     set_policy(&pool, "off").await;
@@ -275,7 +276,7 @@ async fn the_off_policy_refuses_the_owner_too(pool: PgPool) {
 /// Under the default, a technician corrects their own and not someone else's.
 /// 403 rather than 404: the segment exists and they can read the day it
 /// belongs to, so pretending it is absent would be a lie they can disprove.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_technician_corrects_their_own_segment_only(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (_tech_id, tech_email, tech_password) = common::seed_user(
@@ -315,7 +316,7 @@ async fn a_technician_corrects_their_own_segment_only(pool: PgPool) {
 
 /// `owner_or_manager` widens it to anyone who can manage users, which a
 /// technician is not, so the narrowing half of the policy still holds.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_manager_policy_widens_it_without_opening_it(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (_mgr_id, mgr_email, mgr_password) = common::seed_user(
@@ -355,7 +356,7 @@ async fn the_manager_policy_widens_it_without_opening_it(pool: PgPool) {
 /// A correction that happened is distinguishable from a day nobody touched,
 /// which is the whole reason the issue asked for an audit trail from the
 /// first version rather than retrofitted.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_correction_and_a_removal_are_both_recorded(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -410,7 +411,7 @@ async fn a_correction_and_a_removal_are_both_recorded(pool: PgPool) {
 /// A segment id that belongs to nobody is a 404, and one belonging to another
 /// tenant is the same 404: the correction routes are not a cross-tenant
 /// existence oracle.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unknown_segment_is_not_an_existence_oracle(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;

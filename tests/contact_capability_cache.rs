@@ -5,6 +5,7 @@
 //! process-wide `CAPABILITY_LOADS` counter, which a concurrent test in the
 //! same binary would also move.
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::Ordering;
 
 use mokosh_server::modules::auth::caller_context::CAPABILITY_LOADS;
@@ -13,7 +14,7 @@ use mokosh_server::modules::contact_portal::models::ContactSession;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn repeated_capability_checks_issue_one_query(pool: PgPool) {
     let db = mokosh_server::Database::from_pool(pool);
     let caller = CallerContext::Contact(ContactSession {

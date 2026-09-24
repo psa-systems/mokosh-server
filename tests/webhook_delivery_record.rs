@@ -15,6 +15,7 @@ mod common;
 
 use common::{boot_rls, dec, seed_company, DEFAULT_TENANT_ID};
 use hmac::{Hmac, Mac};
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -120,7 +121,7 @@ async fn deliveries(pool: &sqlx::PgPool) -> Vec<DeliveryRow> {
 /// An accepted payment records what arrived and what it settled, under the
 /// provider's own names for the event, so an admin can line this up with the
 /// same delivery in their provider's dashboard.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn an_accepted_delivery_is_recorded_with_its_event_and_invoice(pool: sqlx::PgPool) {
     let app = boot_rls(pool).await;
     let company = seed_company(&app.pool).await;
@@ -155,7 +156,7 @@ async fn an_accepted_delivery_is_recorded_with_its_event_and_invoice(pool: sqlx:
 /// The row that matters most. A delivery this deployment would not accept is
 /// still an event that happened here, and the endpoint answers 401 exactly as
 /// it did before.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn a_refused_delivery_is_recorded_and_still_answers_401(pool: sqlx::PgPool) {
     let app = boot_rls(pool).await;
     let company = seed_company(&app.pool).await;
@@ -199,7 +200,7 @@ async fn a_refused_delivery_is_recorded_and_still_answers_401(pool: sqlx::PgPool
 /// A tenant with no gateway for the route's provider records nothing. The
 /// endpoint is unauthenticated by construction, so anyone who learns the URL
 /// could otherwise write history into any tenant id they can name.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn a_delivery_to_a_tenant_with_no_gateway_records_nothing(pool: sqlx::PgPool) {
     let app = boot_rls(pool).await;
     let body = serde_json::json!({"id": "evt_x", "type": "checkout.session.completed"}).to_string();
@@ -224,7 +225,7 @@ async fn a_delivery_to_a_tenant_with_no_gateway_records_nothing(pool: sqlx::PgPo
 
 /// An event this build does not act on is a normal thing to receive, and reads
 /// as its own outcome rather than as a payment that landed.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn an_event_this_build_ignores_is_recorded_as_ignored(pool: sqlx::PgPool) {
     let app = boot_rls(pool).await;
     seed_stripe_gateway(&app.pool).await;
@@ -251,7 +252,7 @@ async fn an_event_this_build_ignores_is_recorded_as_ignored(pool: sqlx::PgPool) 
 
 /// The read an MSP actually makes, through the finance-gated route, over the
 /// NOBYPASSRLS role so the tenant policy is doing the scoping.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn the_deliveries_endpoint_serves_what_arrived(pool: sqlx::PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = boot_rls(pool).await;

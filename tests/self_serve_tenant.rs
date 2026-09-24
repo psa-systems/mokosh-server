@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -55,7 +56,7 @@ async fn post_self_serve(app: &common::TestApp, body: Value) -> reqwest::Respons
         .expect("send self-serve")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn self_serve_creates_tenant_and_returns_full_session(pool: PgPool) {
     insert_identity_no_membership(&pool, "founder@example.com").await;
     let app = common::boot(pool).await;
@@ -89,7 +90,7 @@ async fn self_serve_creates_tenant_and_returns_full_session(pool: PgPool) {
     assert_eq!(body["needs_setup"], false);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn self_serve_refuses_when_identity_already_has_membership(pool: PgPool) {
     // The seeded admin identity already holds the default-tenant
     // membership. A stale needs_setup identity_token (or a caller who
@@ -138,7 +139,7 @@ async fn self_serve_refuses_when_identity_already_has_membership(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn self_serve_rejects_expired_or_wrong_type_token(pool: PgPool) {
     let app = common::boot(pool).await;
 
@@ -153,7 +154,7 @@ async fn self_serve_rejects_expired_or_wrong_type_token(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn self_serve_slug_collision_returns_409(pool: PgPool) {
     // Seed a tenant that already owns the slug "founder-co", then run
     // self-serve with a name that slugifies to the same value.
@@ -181,7 +182,7 @@ async fn self_serve_slug_collision_returns_409(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn self_serve_accepts_explicit_slug_and_uses_it(pool: PgPool) {
     insert_identity_no_membership(&pool, "founder@example.com").await;
     let app = common::boot(pool).await;
@@ -212,7 +213,7 @@ async fn self_serve_accepts_explicit_slug_and_uses_it(pool: PgPool) {
     assert_eq!(slug, "custom-slug-mapps493");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn self_serve_membership_appears_immediately(pool: PgPool) {
     // After a self-serve create, calling /auth/memberships with the fresh
     // session token must return the new tenant right away (no re-login).

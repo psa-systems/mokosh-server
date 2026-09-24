@@ -34,6 +34,7 @@ use mokosh_server::modules::time_tracking::{
 };
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -56,7 +57,7 @@ fn d(y: i32, m: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, day).unwrap()
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn time_entries_list_handles_every_filter_combination(pool: PgPool) {
     let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();
@@ -91,7 +92,7 @@ async fn time_entries_list_handles_every_filter_combination(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn timesheets_list_handles_every_filter_combination(pool: PgPool) {
     let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();
@@ -118,7 +119,7 @@ async fn timesheets_list_handles_every_filter_combination(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn appointments_list_handles_every_filter_combination(pool: PgPool) {
     let svc = CalendarService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();
@@ -158,7 +159,7 @@ async fn appointments_list_handles_every_filter_combination(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn kb_articles_list_handles_every_filter_combination(pool: PgPool) {
     let svc = KbService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();
@@ -195,7 +196,7 @@ async fn kb_articles_list_handles_every_filter_combination(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contracts_list_handles_every_filter_combination(pool: PgPool) {
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();

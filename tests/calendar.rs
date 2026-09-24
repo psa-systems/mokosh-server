@@ -16,13 +16,14 @@
 mod common;
 
 use common::{boot, login, seed_admin, seed_team, seed_tenant_with_admin};
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Book a one-off appointment, then assert the bounded range query
 /// (`GET /api/v1/appointments?from&to`) returns it unchanged with no
 /// recurrence metadata.
-#[sqlx::test]
+#[mokosh_test]
 async fn book_appointment_then_range_query_returns_it(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -72,7 +73,7 @@ async fn book_appointment_then_range_query_returns_it(pool: PgPool) {
 
 /// Reject a one-off appointment whose end is not strictly after its
 /// start. The service enforces `end_time > start_time` on create.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_appointment_rejects_non_positive_duration(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -102,7 +103,7 @@ async fn create_appointment_rejects_non_positive_duration(pool: PgPool) {
 /// instances inside a range that spans the whole series, each shifted to
 /// its own day and each pointing back at the master via
 /// `recurrence_parent_id`. The master row itself is not emitted.
-#[sqlx::test]
+#[mokosh_test]
 async fn recurring_appointment_expands_within_range(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -182,7 +183,7 @@ async fn recurring_appointment_expands_within_range(pool: PgPool) {
 /// A narrower window clips the same series: querying only the second day
 /// returns exactly one occurrence. This proves expansion is bounded by
 /// the requested range, not the whole series.
-#[sqlx::test]
+#[mokosh_test]
 async fn recurring_expansion_is_bounded_by_range(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -238,7 +239,7 @@ async fn recurring_expansion_is_bounded_by_range(pool: PgPool) {
 /// rejected with 422 and nothing is persisted. The follow-up range query
 /// must surface no appointment at all (neither the master nor any expanded
 /// occurrence), proving the create was a no-op.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_appointment_rejects_invalid_recurrence_rule(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -285,7 +286,7 @@ async fn create_appointment_rejects_invalid_recurrence_rule(pool: PgPool) {
 /// PMS-374: a valid RRULE is still accepted after the create-path guard is
 /// added, and it expands as before. Guards against the validation rejecting
 /// legitimate rules.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_appointment_accepts_valid_recurrence_rule(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -314,7 +315,7 @@ async fn create_appointment_accepts_valid_recurrence_rule(pool: PgPool) {
 
 /// Time off can be approved and rejected through the approval endpoint.
 /// Both transitions are manager-gated; the seeded super_admin qualifies.
-#[sqlx::test]
+#[mokosh_test]
 async fn time_off_approve_and_reject(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -398,7 +399,7 @@ async fn time_off_approve_and_reject(pool: PgPool) {
 /// and the appointments section reflects an expanded recurring series
 /// plus a one-off booking, while approved time off shows up and pending
 /// time off does not.
-#[sqlx::test]
+#[mokosh_test]
 async fn dispatch_view_aggregates_the_range(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -513,7 +514,7 @@ async fn dispatch_view_aggregates_the_range(pool: PgPool) {
 /// PMS-791 phase 3: an appointment created with `team_id` set persists the
 /// column; readback + list response both surface it. Pre-phase-3 this
 /// column existed (migration 008) but no writer populated it.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_appointment_with_team_id_persists(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let team_id = seed_team(
@@ -566,7 +567,7 @@ async fn create_appointment_with_team_id_persists(pool: PgPool) {
 /// belonging to another tenant is rejected 400, mirroring the ticket-side
 /// PMS-406 pattern. The `validate_fk_opt(tenant_id, "teams", ...)` guard
 /// in CalendarService::create_appointment is what catches it.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_appointment_with_wrong_tenant_team_id_returns_400(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     // Team lives in a DIFFERENT tenant.
@@ -599,7 +600,7 @@ async fn create_appointment_with_wrong_tenant_team_id_returns_400(pool: PgPool) 
 /// PMS-791 phase 3: an update carrying `team_id` reassigns the
 /// appointment to the new team. COALESCE semantics: omitting the field
 /// leaves the stored team unchanged; sending a value overwrites.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_appointment_with_team_id_reassigns(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let team_a = seed_team(&pool, common::DEFAULT_TENANT_ID, "Alpha team", None).await;
@@ -649,7 +650,7 @@ async fn update_appointment_with_team_id_reassigns(pool: PgPool) {
 /// PMS-791 phase 4 / MAPPS-465: list appointments filtered by team_id.
 /// Only rows whose team_id matches are returned; NULL-team rows are
 /// excluded when the filter is set.
-#[sqlx::test]
+#[mokosh_test]
 async fn list_appointments_filtered_by_team_id(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let team_a = seed_team(&pool, common::DEFAULT_TENANT_ID, "Filter A", None).await;
@@ -711,7 +712,7 @@ async fn list_appointments_filtered_by_team_id(pool: PgPool) {
 /// their own team was served every team's work with a 200. Both halves
 /// of that read are covered: a one-off row and a recurring series
 /// belonging to the other team must both stay out.
-#[sqlx::test]
+#[mokosh_test]
 async fn range_query_filtered_by_team_id(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let team_a = seed_team(&pool, common::DEFAULT_TENANT_ID, "Range A", None).await;
@@ -788,7 +789,7 @@ async fn range_query_filtered_by_team_id(pool: PgPool) {
 /// caller belongs to. Both the unbounded path and the bounded-range path
 /// honour it, and a caller on no team gets an empty set instead of the
 /// silent full list the DTO used to answer.
-#[sqlx::test]
+#[mokosh_test]
 async fn list_appointments_filtered_by_my_teams(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = seed_admin(&pool).await;
     let (tech_id, tech_email, tech_password) = common::seed_user(

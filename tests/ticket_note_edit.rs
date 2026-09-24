@@ -12,6 +12,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -76,7 +77,7 @@ async fn edit(
         .expect("send note edit")
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn the_author_can_correct_their_own_note(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -119,7 +120,7 @@ async fn the_author_can_correct_their_own_note(pool: PgPool) {
 
 /// What makes editing acceptable at all: the original text survives it. An
 /// audit row with only the new value would let an edit quietly rewrite history.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn the_audit_row_keeps_the_text_that_was_replaced(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -148,7 +149,7 @@ async fn the_audit_row_keeps_the_text_that_was_replaced(pool: PgPool) {
     assert_eq!(new.expect("after image")["content"], "the corrected text");
 }
 
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn an_admin_can_correct_somebody_elses_note(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (tech_id, _, _) = common::seed_user(
@@ -171,7 +172,7 @@ async fn an_admin_can_correct_somebody_elses_note(pool: PgPool) {
 
 /// The half the report actually asked about, from the other side: everyone
 /// else corrects their own and nobody else's.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn a_technician_cannot_edit_a_note_they_did_not_write(pool: PgPool) {
     let (admin_id, _, _) = common::seed_admin(&pool).await;
     let (_, tech_email, tech_password) = common::seed_user(
@@ -206,7 +207,7 @@ async fn a_technician_cannot_edit_a_note_they_did_not_write(pool: PgPool) {
 /// right to edit notes and this particular row is what refuses. Each reason
 /// arrives as a sentence, because "Conflict" alone does not tell an agent
 /// which of the rules they hit.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn a_frozen_note_refuses_with_a_reason(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -254,7 +255,7 @@ async fn a_frozen_note_refuses_with_a_reason(pool: PgPool) {
 /// A public note nobody emailed is still editable. The customer may have read
 /// it in the portal, but there is no copy outside the system to disagree with,
 /// so freezing it would cost the agent a correction for nothing.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn a_public_note_that_was_never_emailed_is_editable(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -271,7 +272,7 @@ async fn a_public_note_that_was_never_emailed_is_editable(pool: PgPool) {
 /// A note id under the wrong ticket is a 404, the same answer an id that does
 /// not exist gets, so the path is not an existence oracle for other tickets'
 /// notes.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn a_note_from_another_ticket_is_not_found(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -295,7 +296,7 @@ async fn a_note_from_another_ticket_is_not_found(pool: PgPool) {
 
 /// The same rule `CreateNoteRequest` applies. An edit that blanks a note is a
 /// delete wearing an edit's clothes, and deleting is not what this endpoint is.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn an_edit_cannot_blank_a_note(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -312,7 +313,7 @@ async fn an_edit_cannot_blank_a_note(pool: PgPool) {
 /// The edit changes the text and nothing else. `note_type` in the body is not a
 /// field the request carries, so an internal note cannot be published by
 /// editing it, and a public one cannot be retracted.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn an_edit_cannot_change_what_kind_of_note_it_is(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -388,7 +389,7 @@ fn can_edit(notes: &[Value], note_id: Uuid) -> bool {
 /// refusal names the setting so the agent knows who can change it. The policy
 /// is a closed set: a value outside it is refused at the write, not read as
 /// the default silently.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn editing_can_be_switched_off_for_the_organisation(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -430,7 +431,7 @@ async fn editing_can_be_switched_off_for_the_organisation(pool: PgPool) {
 /// A manager edits another person's note only when the tenant granted it on
 /// purpose. Under the default the answer is the PMS-931 one, so a tenant that
 /// never opened the setting sees no change.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn a_manager_edits_others_notes_only_under_author_or_manager(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (_, manager_email, manager_password) = common::seed_user(
@@ -471,7 +472,7 @@ async fn a_manager_edits_others_notes_only_under_author_or_manager(pool: PgPool)
 /// `can_edit` is the conjunction of the policy and the row's state, answered
 /// by the rule the PUT enforces, so a client can show an Edit control on it
 /// without mirroring the gates by hand.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn each_note_says_whether_the_caller_may_edit_it(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (tech_id, tech_email, tech_password) = common::seed_user(
@@ -546,7 +547,7 @@ async fn each_note_says_whether_the_caller_may_edit_it(pool: PgPool) {
 /// open: the ticket's history read only `tickets` rows. It now carries the
 /// note edit, typed so the client can say "note edited", with the replaced
 /// text beside the new one.
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn the_tickets_own_history_carries_the_note_edit(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

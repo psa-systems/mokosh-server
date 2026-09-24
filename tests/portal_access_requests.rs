@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -146,7 +147,7 @@ async fn open_requests(pool: &PgPool, contact_id: Uuid) -> Vec<(String, String, 
 
 /// The case this exists for: a contact whose access was set up for tickets
 /// meets an empty Invoices screen and can say so.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_can_ask_for_an_area_they_cannot_reach(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (contact_id, token) = seed_portal_contact(&app, &pool, "asks", &["Support Contact"]).await;
@@ -165,7 +166,7 @@ async fn a_contact_can_ask_for_an_area_they_cannot_reach(pool: PgPool) {
 
 /// Pressing the button twice answers the first request rather than opening a
 /// second one, which is also what stops this being a way to generate mail.
-#[sqlx::test]
+#[mokosh_test]
 async fn asking_twice_is_one_request(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (contact_id, token) = seed_portal_contact(&app, &pool, "twice", &["Support Contact"]).await;
@@ -187,7 +188,7 @@ async fn asking_twice_is_one_request(pool: PgPool) {
 
 /// Asking for what you already hold produces a task with nothing to do, so it
 /// is refused and says why.
-#[sqlx::test]
+#[mokosh_test]
 async fn asking_for_an_area_you_can_already_reach_is_refused(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (contact_id, token) = seed_portal_contact(&app, &pool, "holder", &["Read-Only"]).await;
@@ -203,7 +204,7 @@ async fn asking_for_an_area_you_can_already_reach_is_refused(pool: PgPool) {
 
 /// An area outside the closed set is a client bug, refused rather than stored:
 /// the column must never hold free text an MSP has to interpret.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unknown_area_is_refused(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (contact_id, token) =
@@ -217,7 +218,7 @@ async fn an_unknown_area_is_refused(pool: PgPool) {
 /// Granting assigns the area's built-in role and closes the request in one
 /// action, which is the point: the step most likely to be skipped is the one
 /// that makes anything happen for the customer.
-#[sqlx::test]
+#[mokosh_test]
 async fn granting_a_request_assigns_the_role_and_closes_it(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -273,7 +274,7 @@ async fn granting_a_request_assigns_the_role_and_closes_it(pool: PgPool) {
 
 /// Declining closes the request without granting, and records that somebody
 /// answered rather than leaving it to rot.
-#[sqlx::test]
+#[mokosh_test]
 async fn declining_closes_the_request_without_granting(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -308,7 +309,7 @@ async fn declining_closes_the_request_without_granting(pool: PgPool) {
 }
 
 /// A request that was already answered cannot be answered again.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_resolved_request_cannot_be_resolved_twice(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -338,7 +339,7 @@ async fn a_resolved_request_cannot_be_resolved_twice(pool: PgPool) {
 /// granting it lets them manage their payment methods. Before this the page
 /// could only show them the capability's internal name, and a request naming
 /// the area was refused as unknown.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_can_ask_for_saved_payment_methods(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -111,7 +112,7 @@ async fn quote_row(pool: &PgPool, quote_id: &str) -> (String, Option<Uuid>, Opti
 
 /// The case the issue was filed for: nobody to send to, so the send is
 /// refused and the quote does not move.
-#[sqlx::test]
+#[mokosh_test]
 async fn sending_a_quote_with_no_recipient_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Nobody Home Ltd").await;
@@ -153,7 +154,7 @@ async fn sending_a_quote_with_no_recipient_is_refused(pool: PgPool) {
 /// A quote naming nobody, whose company HAS a billing contact, sends and
 /// records who it went to. Persisted rather than merely resolved, because the
 /// mail reads the recipient back off the quote.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_send_inherits_the_companys_billing_contact_and_records_it(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Has A Contact Ltd").await;
@@ -186,7 +187,7 @@ async fn a_send_inherits_the_companys_billing_contact_and_records_it(pool: PgPoo
 
 /// Even when the draft named nobody at create time, because the company's
 /// billing contact was set afterwards, the send resolves it.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_set_after_the_draft_is_resolved_at_send(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Late Contact Ltd").await;
@@ -215,7 +216,7 @@ async fn a_contact_set_after_the_draft_is_resolved_at_send(pool: PgPool) {
 /// A contact of another company is refused on create and on update. Before
 /// this the check was against the TENANT, so a quote could be addressed to a
 /// different customer's contact: a disclosure rather than a typo.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_of_another_company_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let ours = seed_company_named(&pool, "Ours Ltd").await;

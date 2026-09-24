@@ -25,6 +25,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -158,7 +159,7 @@ async fn grant_branding_cap(pool: &PgPool, contact_id: Uuid) {
 /// block persists AND surfaces on the subsequent GET response. The
 /// pre-fix bug: `CompanyResponse` dropped the field on the wire, so
 /// the SPA editor looked like nothing had saved.
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_put_company_branding_round_trips(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -207,7 +208,7 @@ async fn staff_put_company_branding_round_trips(pool: PgPool) {
 
 /// MAPPS-618: PATCH /contact/companies/self/branding without the
 /// `settings:manage_company_branding` cap must 403.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_patch_branding_without_cap_is_forbidden(pool: PgPool) {
     let (_contact_id, _company_id, slug, _portal_id, token) =
         seed_company_and_contact(&pool, "nocap@brand.example").await;
@@ -226,7 +227,7 @@ async fn contact_patch_branding_without_cap_is_forbidden(pool: PgPool) {
 
 /// MAPPS-618: with the cap, PATCH lands + GET returns the updated
 /// Company block + the tenant/Company/effective triple.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_cap_patches_own_company_branding(pool: PgPool) {
     let (contact_id, _company_id, slug, _portal_id, token) =
         seed_company_and_contact(&pool, "hascap@brand.example").await;
@@ -278,7 +279,7 @@ async fn contact_with_cap_patches_own_company_branding(pool: PgPool) {
 /// MAPPS-617: GET /contact/portal/{portal_id}/host returns
 /// `effective_branding` merged from tenant + Company (Company wins
 /// per-field where set). Pre-auth endpoint, no session needed.
-#[sqlx::test]
+#[mokosh_test]
 async fn portal_host_returns_merged_effective_branding(pool: PgPool) {
     let (_contact_id, company_id, _slug, portal_id, _token) =
         seed_company_and_contact(&pool, "merge@brand.example").await;
@@ -330,7 +331,7 @@ async fn portal_host_returns_merged_effective_branding(pool: PgPool) {
 /// `validate_branding_patch` table the tenant PATCH already does, or a
 /// portal contact could write an arbitrary `primary_color` that then wins
 /// in `effective_branding` everywhere a client is shown it.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_patch_branding_rejects_an_invalid_value(pool: PgPool) {
     let (contact_id, _company_id, slug, _portal_id, token) =
         seed_company_and_contact(&pool, "badcolor@brand.example").await;
@@ -362,7 +363,7 @@ async fn contact_patch_branding_rejects_an_invalid_value(pool: PgPool) {
 
 /// PMS-1197: an unknown key on the same endpoint is refused and the
 /// message names the known keys, matching the tenant PATCH's behaviour.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_patch_branding_rejects_an_unknown_key(pool: PgPool) {
     let (contact_id, _company_id, slug, _portal_id, token) =
         seed_company_and_contact(&pool, "unknownkey@brand.example").await;
@@ -396,7 +397,7 @@ async fn contact_patch_branding_rejects_an_unknown_key(pool: PgPool) {
 
 /// PMS-1197: `portal_domain` and `invoice_template` are tenant-level
 /// concepts and refused on the Company side.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_patch_branding_rejects_a_tenant_only_key(pool: PgPool) {
     let (contact_id, _company_id, slug, _portal_id, token) =
         seed_company_and_contact(&pool, "tenantonly@brand.example").await;
@@ -419,7 +420,7 @@ async fn contact_patch_branding_rejects_a_tenant_only_key(pool: PgPool) {
 /// refuses the identical payloads with the identical messages the contact
 /// endpoint does, since both writers now call
 /// `validate_company_branding_patch`.
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_put_company_branding_rejects_the_same_payloads_the_contact_endpoint_does(
     pool: PgPool,
 ) {
@@ -491,7 +492,7 @@ async fn staff_put_company_branding_rejects_the_same_payloads_the_contact_endpoi
 /// Before this the portal sign-in page read "Mokosh Platform" under the MSP's
 /// logo, because the brand carried no name and the client fell back to the
 /// vendor's. The MSP's emails never had that gap: they use `tenants.name`.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_customer_brand_names_the_msp_when_no_name_is_configured(pool: PgPool) {
     let (_contact_id, _company_id, slug, portal_id, setup_token) =
         seed_company_and_contact(&pool, "named@brand.example").await;
@@ -542,7 +543,7 @@ async fn the_customer_brand_names_the_msp_when_no_name_is_configured(pool: PgPoo
 }
 
 /// A name somebody configured is never replaced by the organization's.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_configured_brand_name_still_wins(pool: PgPool) {
     let (_contact_id, _company_id, _slug, portal_id, _token) =
         seed_company_and_contact(&pool, "configured@brand.example").await;
@@ -579,7 +580,7 @@ async fn a_configured_brand_name_still_wins(pool: PgPool) {
 /// only the prefix, so tenant A could set its `logo_url` to a real,
 /// currently-served public asset path belonging to tenant B and have it
 /// accepted.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_logo_url_naming_another_tenants_path_is_rejected(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (other_tenant_id, _other_admin_id, _other_email, _other_password) =
@@ -605,7 +606,7 @@ async fn a_logo_url_naming_another_tenants_path_is_rejected(pool: PgPool) {
 /// PMS-1371: the same rule for the Company-scoped prefix (PMS-1197): a
 /// company path is only legal when the company belongs to the caller's own
 /// tenant, not any company that currently exists.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_logo_url_naming_another_tenants_company_path_is_rejected(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (other_tenant_id, _other_admin_id, _other_email, _other_password) =
@@ -637,7 +638,7 @@ async fn a_logo_url_naming_another_tenants_company_path_is_rejected(pool: PgPool
 
 /// PMS-1371: the caller's own tenant path and the path of a company it owns
 /// stay accepted, unchanged from before this fix.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_logo_url_naming_the_callers_own_paths_is_accepted(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let own_company_id = Uuid::new_v4();
@@ -681,7 +682,7 @@ async fn a_logo_url_naming_the_callers_own_paths_is_accepted(pool: PgPool) {
 
 /// PMS-1371: the same ownership check runs on `PUT /api/v1/tenants/{id}`'s
 /// whole-document branding merge, not only the per-key settings write.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_branding_patch_naming_another_tenants_path_is_rejected(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (other_tenant_id, _other_admin_id, _other_email, _other_password) =
@@ -711,7 +712,7 @@ async fn a_tenant_branding_patch_naming_another_tenants_path_is_rejected(pool: P
 /// PMS-1371: the same check on the staff-plane Company writer
 /// (`PUT /contacts/companies/{id}`): a company row's own `logo_url` must not
 /// name another tenant's public path.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_company_branding_patch_naming_another_tenants_path_is_rejected(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (other_tenant_id, _other_admin_id, _other_email, _other_password) =
@@ -749,7 +750,7 @@ async fn a_company_branding_patch_naming_another_tenants_path_is_rejected(pool: 
 /// object the older `PUT /tenants/current/logo` route writes, so the public
 /// logo endpoint serves whichever upload happened last regardless of which
 /// route made it.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_branding_route_logo_upload_serves_from_the_public_logo_endpoint(pool: PgPool) {
     const PNG: &[u8] = &[
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,

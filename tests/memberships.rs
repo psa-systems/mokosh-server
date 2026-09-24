@@ -11,6 +11,7 @@ mod common;
 
 use chrono::{Duration, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
+use mokosh_test::mokosh_test;
 use mokosh_types::auth::JwtClaims;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -101,7 +102,7 @@ async fn insert_user_row(pool: &PgPool, tenant_id: Uuid, email: &str, role: &str
     id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn me_memberships_returns_the_admin_membership(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -135,7 +136,7 @@ async fn me_memberships_returns_the_admin_membership(pool: PgPool) {
     assert!(m["tenant_slug"].as_str().is_some());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn me_memberships_returns_every_active_membership_for_the_identity(pool: PgPool) {
     // Same email in two tenants -> phase-1 trigger collapses to one
     // identity with two memberships. /memberships must return both.
@@ -176,7 +177,7 @@ async fn me_memberships_returns_every_active_membership_for_the_identity(pool: P
     assert_eq!(active_tenant["tenant_id"].as_str().unwrap(), default_str);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn legacy_token_without_mid_still_authorizes_and_resolves_membership(pool: PgPool) {
     // Simulates a rolling deploy: a token minted before phase 2 (no
     // `mid` claim) must still authenticate. The middleware's enrich

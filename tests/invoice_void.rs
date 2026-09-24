@@ -16,6 +16,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -101,7 +102,7 @@ async fn get_invoice(app: &common::TestApp, token: &str, invoice_id: &str) -> Va
 
 /// The case the endpoint exists for: a draft raised in error is withdrawn, on
 /// the record, with who and why on the row.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_is_voided_with_who_and_why(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -147,7 +148,7 @@ async fn a_draft_is_voided_with_who_and_why(pool: PgPool) {
 /// The reason is optional, because a draft withdrawn before anyone saw it
 /// often has nothing to say. An empty one is stored as none rather than as a
 /// blank string.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_reason_is_optional_and_blank_is_none(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -170,7 +171,7 @@ async fn the_reason_is_optional_and_blank_is_none(pool: PgPool) {
 /// Past `pending` the customer holds a copy, so the invoice is frozen and the
 /// correction is a credit note. The refusal names the status and says so,
 /// because "cannot be voided" alone does not tell the operator what to do.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_sent_invoice_cannot_be_voided(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -201,7 +202,7 @@ async fn a_sent_invoice_cannot_be_voided(pool: PgPool) {
 
 /// Voiding twice is a conflict, not a silent second no-op: the second caller
 /// is acting on a document that is already gone.
-#[sqlx::test]
+#[mokosh_test]
 async fn voiding_twice_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -220,7 +221,7 @@ async fn voiding_twice_is_refused(pool: PgPool) {
 /// A payment recorded afterwards cannot derive the status back: `voided_at`
 /// leads `recompute_invoice_balance`'s CASE for the reason `written_off_at`
 /// does, because every payment and credit event runs that statement.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_later_payment_does_not_unvoid_it(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -257,7 +258,7 @@ async fn a_later_payment_does_not_unvoid_it(pool: PgPool) {
 
 /// The void is an audit row on the invoice, the way the write-off is: the
 /// question "who cancelled this and when" is answered from the history.
-#[sqlx::test]
+#[mokosh_test]
 async fn voiding_writes_an_audit_row(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

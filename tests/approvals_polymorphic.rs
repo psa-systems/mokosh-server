@@ -14,6 +14,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -93,7 +94,7 @@ async fn seed_time_entry(pool: &PgPool, admin_id: Uuid, company_id: Uuid) -> Uui
     id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn time_entry_approval_round_trip(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool).await;
@@ -172,7 +173,7 @@ async fn time_entry_approval_round_trip(pool: PgPool) {
     assert_eq!(decided["target"], "time_entry");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_approval_carries_target_and_entity_id(pool: PgPool) {
     // The phase-1 ticket-only surface must still produce rows that
     // now carry the new `target` + `entity_id` fields, so the SPA
@@ -310,7 +311,7 @@ async fn round_trip_for(prefix: &str, entity_id: Uuid, app: &common::TestApp, to
     assert_eq!(decided["target"], expected_target);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn change_request_approval_round_trip(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let cr = seed_change_request(&pool, admin_id).await;
@@ -319,7 +320,7 @@ async fn change_request_approval_round_trip(pool: PgPool) {
     round_trip_for("change-requests", cr, &app, &token).await;
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn quote_approval_round_trip(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let quote = seed_quote(&pool, admin_id).await;
@@ -328,7 +329,7 @@ async fn quote_approval_round_trip(pool: PgPool) {
     round_trip_for("quotes", quote, &app, &token).await;
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn unknown_parent_returns_404(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

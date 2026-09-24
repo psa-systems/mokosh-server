@@ -11,6 +11,7 @@ mod common;
 
 use mokosh_server::modules::tenants::TenantService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -26,7 +27,7 @@ async fn count(pool: &PgPool, table: &str, tenant: Uuid) -> i64 {
 
 /// A fresh personal tenant is seeded with the full default lookup set, and two
 /// users' tenants are fully isolated from each other.
-#[sqlx::test]
+#[mokosh_test]
 async fn personal_tenant_seeded_with_full_default_lookups(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
 
@@ -140,7 +141,7 @@ async fn personal_tenant_seeded_with_full_default_lookups(pool: PgPool) {
 /// The reserved system-shared class (migration 039): a `tenant_id IS NULL` row
 /// is read-only to ordinary sessions and globally visible once written by a
 /// privileged session.
-#[sqlx::test]
+#[mokosh_test]
 async fn system_shared_class_guards_global_rows(pool: PgPool) {
     // Opt a lookup table into the class (drops NOT NULL + attaches the guard).
     sqlx::query("SELECT mokosh_enable_system_shared('tax_rates')")
@@ -185,7 +186,7 @@ async fn system_shared_class_guards_global_rows(pool: PgPool) {
 /// subject and in invitation mail, so before this every MSP's clients received
 /// mail from "My workspace" until somebody renamed the tenant by hand. Staging
 /// had eight tenants sharing that one name.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_personal_tenant_is_named_after_its_owner(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
 

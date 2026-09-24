@@ -15,6 +15,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -72,7 +73,7 @@ async fn seed_ticket(pool: &PgPool, company_id: Uuid, admin_id: Uuid, title: &st
     id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn note_dto_carries_contact_attribution(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "PMS-468 Co").await;
@@ -148,7 +149,7 @@ async fn note_dto_carries_contact_attribution(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_notes_feed_lists_all_public_from_contact(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Feed Co").await;
@@ -216,7 +217,7 @@ async fn contact_notes_feed_lists_all_public_from_contact(pool: PgPool) {
     assert!(!contents.contains(&"agent acknowledgement"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_notes_feed_is_tenant_scoped(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     // Seed a second tenant with its own contact + admin. The first
