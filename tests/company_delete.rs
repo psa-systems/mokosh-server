@@ -432,8 +432,11 @@ async fn create_company(app: &common::TestApp, token: &str, name: &str) -> Strin
 async fn create_contact(
     app: &common::TestApp,
     token: &str,
-    body: serde_json::Value,
+    mut body: serde_json::Value,
 ) -> serde_json::Value {
+    if body.get("email").is_none() {
+        body["email"] = serde_json::json!(format!("{}@example.com", uuid::Uuid::new_v4()));
+    }
     let resp = app
         .client
         .post(app.url("/api/v1/contacts/contacts"))
