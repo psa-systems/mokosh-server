@@ -26,6 +26,11 @@ pub mod bootstrap;
 // reach; contact branches gate on `require_capability` (DB-loaded).
 #[cfg(feature = "server")]
 pub mod caller_context;
+// PMS-998: receiver for Bunyip's OIDC back-channel logout, and the revoked
+// session set the bearer path consults. Wired outside the JWT auth chain,
+// beside the webhooks, and authenticated by the token's own signature.
+#[cfg(feature = "server")]
+pub mod backchannel_logout;
 // PMS-591: receiver for Bunyip's `account_deleted` webhook. Wired outside
 // the JWT auth chain in `create_api_router`.
 #[cfg(feature = "server")]

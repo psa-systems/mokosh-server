@@ -45,6 +45,15 @@ pub struct ContactSyncService {
     /// Where the browser is sent after the callback, so the admin lands back
     /// in Settings rather than on a JSON body.
     spa_base_url: String,
+    /// PMS-1369: `remove_imported_data`'s rollback-delete path removes a
+    /// `contacts` row the same way `ContactService::delete_contact` does, so
+    /// it detaches the contact's saved payment methods on the provider side
+    /// first (see `PaymentMethodsService::detach_all_for_contact`), for the
+    /// same reason: the `ON DELETE CASCADE` on `contact_payment_methods`
+    /// must never be the only thing that removes a local reference to a
+    /// card still attached on the provider. `None` in fixtures that never
+    /// seed a payment method before removing imported data.
+    payment_methods: Option<Arc<crate::modules::contact_portal::PaymentMethodsService>>,
 }
 
 /// The in-flight connect, as migration 221 stores it.
@@ -339,7 +348,22 @@ impl ContactSyncService {
             secrets,
             public_api_base,
             spa_base_url,
+            payment_methods: None,
         }
+    }
+
+    /// Attach the payment-methods service so `remove_imported_data`'s
+    /// rollback-delete path can detach a removed contact's saved cards on
+    /// the provider side before the row goes away (PMS-1369). The server
+    /// uses this in `create_api_router`, where the same
+    /// `PaymentMethodsService` instance already serves the portal's own
+    /// payment-method routes.
+    pub fn with_payment_methods(
+        mut self,
+        payment_methods: Arc<crate::modules::contact_portal::PaymentMethodsService>,
+    ) -> Self {
+        self.payment_methods = Some(payment_methods);
+        self
     }
 
     /// Where Google sends the browser back to. One function, because the value
@@ -1697,6 +1721,37 @@ impl ContactSyncService {
             .await?;
 
         if created {
+            // PMS-1369: detach every saved card on the provider side BEFORE
+            // the `DELETE FROM contacts` below, for the same reason
+            // `ContactService::delete_contact` does: the `ON DELETE CASCADE`
+            // on `contact_payment_methods` must not be the only thing that
+            // removes the local row while the card stays attached to the
+            // provider Customer. A detach failure returns the error here,
+            // leaving the transaction unwound and nothing removed.
+            match &self.payment_methods {
+                Some(payment_methods) => {
+                    payment_methods
+                        .detach_all_for_contact(&mut tx, tenant_id, contact_id)
+                        .await?;
+                }
+                None => {
+                    let has_payment_methods: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM contact_payment_methods \
+                          WHERE tenant_id = $1 AND contact_id = $2)",
+                    )
+                    .bind(tenant_id)
+                    .bind(contact_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if has_payment_methods {
+                        return Err(AppError::Configuration(
+                            "This contact has a saved payment method, but the contact sync \
+                             service was not configured to detach it on delete."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
             sqlx::query("DELETE FROM contacts WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
                 .bind(contact_id)

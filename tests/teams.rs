@@ -19,7 +19,19 @@ use mokosh_server::modules::teams::{
     AddTeamMemberRequest, CreateTeamRequest, TeamListFilters, TeamsService,
     UpdateTeamMemberRoleRequest, UpdateTeamRequest,
 };
+use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
+
+/// Ask for every seeded row without paging into a second page: the list
+/// tests are about which rows the filter admits, not about the page split.
+fn all_pages() -> PaginationParams {
+    PaginationParams {
+        page: 1,
+        per_page: PaginationParams::MAX_PER_PAGE,
+        sort: None,
+        sort_dir: String::new(),
+    }
+}
 
 fn svc(pool: PgPool) -> TeamsService {
     TeamsService::new(Database::from_pool(pool))
@@ -89,8 +101,8 @@ async fn list_teams_returns_only_tenant_teams(pool: PgPool) {
     .await
     .unwrap();
 
-    let a_teams = s
-        .list_teams(tenant(), TeamListFilters::default())
+    let (a_teams, _) = s
+        .list_teams(tenant(), TeamListFilters::default(), &all_pages())
         .await
         .unwrap();
     assert!(a_teams.iter().any(|t| t.name == "From-A"));
@@ -107,19 +119,20 @@ async fn list_teams_filters_by_active(pool: PgPool) {
         .unwrap();
     s.soft_delete_team(tenant(), team.id, &ctx()).await.unwrap();
 
-    let active = s
-        .list_teams(tenant(), TeamListFilters::default())
+    let (active, _) = s
+        .list_teams(tenant(), TeamListFilters::default(), &all_pages())
         .await
         .unwrap();
     assert!(!active.iter().any(|t| t.id == team.id));
 
-    let all = s
+    let (all, _) = s
         .list_teams(
             tenant(),
             TeamListFilters {
                 include_inactive: true,
                 ..Default::default()
             },
+            &all_pages(),
         )
         .await
         .unwrap();
@@ -692,8 +705,8 @@ async fn platform_admin_in_default_tenant_does_not_see_other_tenants_teams(pool:
         .await
         .unwrap();
     // Ask as DEFAULT_TENANT_ID (where the platform admin sits).
-    let default_view = s
-        .list_teams(tenant(), TeamListFilters::default())
+    let (default_view, _) = s
+        .list_teams(tenant(), TeamListFilters::default(), &all_pages())
         .await
         .unwrap();
     assert!(!default_view.iter().any(|t| t.name == "Distant"));
@@ -715,13 +728,14 @@ async fn list_teams_manager_id_filter(pool: PgPool) {
         .await
         .unwrap();
 
-    let filtered = s
+    let (filtered, _) = s
         .list_teams(
             tenant(),
             TeamListFilters {
                 manager_id: Some(admin_id),
                 ..Default::default()
             },
+            &all_pages(),
         )
         .await
         .unwrap();

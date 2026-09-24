@@ -65,6 +65,48 @@ pub struct AtClaims {
     /// the BUNYIP-674 mirror before letting the caller act.
     #[serde(default)]
     pub mokosh_grant_account_id: Option<String>,
+    /// PMS-998: the OP session this token was minted under. Present once
+    /// BUNYIP-636 emits it; `None` on every token minted before that, which
+    /// is why the back-channel logout check is a no-op rather than a refusal
+    /// when it is absent - a token with no `sid` names no session to have
+    /// ended, and treating that as a rejection would 401 every caller the
+    /// moment this shipped.
+    #[serde(default)]
+    pub sid: Option<String>,
+}
+
+/// PMS-998: the claims of an OIDC Back-Channel Logout token
+/// (<https://openid.net/specs/openid-connect-backchannel-1_0.html>), as
+/// bunyip mints them in `mint_logout_token`.
+///
+/// Deliberately NOT `AtClaims` with optional fields. A logout token carries
+/// no `exp` and no `scope`, its `aud` is the CLIENT id rather than the
+/// resource-server audience, and it must be rejected if it carries a `nonce`.
+/// One struct for both would make every one of those differences a runtime
+/// `Option` check on a type whose name says access token.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogoutClaims {
+    pub iss: String,
+    pub aud: String,
+    pub iat: i64,
+    /// Unique id for this logout token. Carried for the log line; replay is
+    /// idempotent by construction (revoking an already-revoked session
+    /// changes nothing), so it is not used as a replay key.
+    #[serde(default)]
+    pub jti: Option<String>,
+    pub sub: Option<String>,
+    /// The session being ended. Required: a logout token without one says
+    /// only "somebody logged out somewhere", which this receiver cannot act
+    /// on without ending every session it holds.
+    #[serde(default)]
+    pub sid: Option<String>,
+    /// The event set. Must contain the back-channel logout URI as a key.
+    #[serde(default)]
+    pub events: serde_json::Value,
+    /// MUST be absent: a `nonce` would mean this is an ID token being
+    /// replayed as a logout token (spec section 2.4, validation step 5).
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
 /// Subset of bunyip-api's `/oauth2/userinfo` response. The RS calls this on
@@ -319,6 +361,77 @@ impl Verifier {
                 self.try_validate(token, &kid).await
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// PMS-998: validate a back-channel logout token against the same JWKS
+    /// the access-token path uses.
+    ///
+    /// The differences from [`Self::verify_at_jwt`] are all forced by the
+    /// spec and by what bunyip actually mints. `typ` is `logout+jwt`. There
+    /// is no `exp`, so expiry validation is off and freshness is the `iat`
+    /// window the caller checks instead. And the audience is NOT checked
+    /// here: bunyip addresses a logout token to the CLIENT id
+    /// (`oidc_provider.rs`, `mint_logout_token`) while `OIDC_AUDIENCE` is the
+    /// resource-server audience on the access token, so asserting the
+    /// configured audience here would reject every genuine token. The claim
+    /// checks, audience included, are [`validate_logout_claims`], which is a
+    /// pure function so each rejection can be tested without a JWKS.
+    ///
+    /// What this method DOES establish is the part only the key can: the
+    /// token was signed by the configured issuer's active key, and its `iss`
+    /// matches. Everything else is a claim assertion over verified bytes.
+    pub async fn verify_logout_token(&self, token: &str) -> Result<LogoutClaims, VerifyError> {
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|e| VerifyError::Malformed(format!("decode header: {e}")))?;
+        if header.typ.as_deref() != Some("logout+jwt") {
+            return Err(VerifyError::Malformed(format!(
+                "expected typ=logout+jwt, got {:?}",
+                header.typ
+            )));
+        }
+        let kid = header
+            .kid
+            .ok_or_else(|| VerifyError::Malformed("missing kid".into()))?;
+        match self.try_validate_logout(token, &kid).await {
+            Ok(claims) => Ok(claims),
+            // Same single retry the access-token path takes, and for the same
+            // reason: an unknown kid is the shape a key rotation has, and
+            // nothing else triggers a JWKS refresh.
+            Err(VerifyError::UnknownKid) => {
+                self.force_refresh_jwks().await?;
+                self.try_validate_logout(token, &kid).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn try_validate_logout(
+        &self,
+        token: &str,
+        kid: &str,
+    ) -> Result<LogoutClaims, VerifyError> {
+        self.ensure_cache().await?;
+        let guard = self.cache.read().await;
+        let cache = guard.as_ref().expect("ensure_cache populated");
+        let key = cache.keys.get(kid).ok_or(VerifyError::UnknownKid)?.clone();
+        drop(guard);
+
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_issuer(&[&self.config.issuer]);
+        // A logout token has no `exp` and its `aud` is the client id, so both
+        // built-in checks are off here; `validate_logout_claims` asserts the
+        // audience and the `iat` window instead.
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        validation.leeway = self.config.leeway_seconds;
+
+        match jsonwebtoken::decode::<LogoutClaims>(token, &key, &validation) {
+            Ok(data) => Ok(data.claims),
+            Err(e) => Err(match e.kind() {
+                jsonwebtoken::errors::ErrorKind::InvalidIssuer => VerifyError::InvalidIssuer,
+                _ => VerifyError::InvalidSignature,
+            }),
         }
     }
 

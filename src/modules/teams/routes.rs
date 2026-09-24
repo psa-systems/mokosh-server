@@ -30,6 +30,7 @@ use super::{
 };
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::utils::error::{AppError, AppResult};
+use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 use mokosh_types::auth::CurrentUser;
 
 #[derive(Clone)]
@@ -110,17 +111,25 @@ pub struct GetTeamQuery {
 // Handlers
 // ----------------------------------------------------------------------
 
-/// `GET /api/v1/teams` — list teams in the caller's tenant.
+/// `GET /api/v1/teams` - list teams in the caller's tenant, paginated. The
+/// response carries the tenant-wide total so the client can render a real
+/// page count instead of the current page's length.
 async fn list_teams(
     State(state): State<TeamsRouterState>,
     RequireAuth(user): RequireAuth,
     Query(query): Query<ListTeamsQuery>,
-) -> AppResult<Json<Vec<Team>>> {
-    let teams = state
+    Query(pagination): Query<PaginationParams>,
+) -> AppResult<Json<PaginatedResponse<Team>>> {
+    pagination.reject_unsupported_sort()?;
+    let (items, total) = state
         .teams_service
-        .list_teams(user.tenant(), query.to_filters())
+        .list_teams(user.tenant(), query.to_filters(), &pagination)
         .await?;
-    Ok(Json(teams))
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
 }
 
 /// `POST /api/v1/teams` — RequireAdmin. Creates one team.

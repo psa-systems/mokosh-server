@@ -24,7 +24,7 @@ use super::{
     TenantService, TenantUsage, UpdateTenantAdminRequest, UpdateTenantRequest,
 };
 use crate::modules::auth::{
-    AuthService, CurrentUser, RequireAuth, RequireAuthState, TenantId, TenantScoped,
+    AuthService, CurrentUser, RequireAdmin, RequireAuth, RequireAuthState, TenantId, TenantScoped,
 };
 use crate::modules::platform::RequirePlatformAdmin;
 
@@ -556,14 +556,10 @@ async fn upload_current_logo(
 /// broken image in every email the tenant sends.
 async fn delete_current_logo(
     State(state): State<TenantRouterState>,
+    _admin: RequireAdmin,
     RequireAuth(user): RequireAuth,
     ctx: crate::modules::audit::AuditCtx,
 ) -> AppResult<Json<TenantResponse>> {
-    if !user.role.is_admin() {
-        return Err(AppError::Forbidden(
-            "You do not have permission to do that".to_string(),
-        ));
-    }
     let tenant_id = user.tenant();
     // PMS-758: explicit nulls, which is how a merged document clears a key.
     let branding = serde_json::json!({ "logo_url": null, "logo_mime": null });

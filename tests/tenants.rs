@@ -1449,13 +1449,15 @@ async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    // What the logo upload writes.
+    // What the logo upload writes. PMS-1371: the path must name the caller's
+    // own tenant, since ownership is now checked alongside the prefix.
+    let logo_url = format!("/api/v1/public/tenants/{}/logo", common::DEFAULT_TENANT_ID);
     let resp = app
         .client
         .put(app.url("/api/v1/tenants/current"))
         .bearer_auth(&token)
         .json(&serde_json::json!({
-            "branding": { "logo_url": "/api/v1/public/tenants/x/logo", "logo_mime": "image/png" }
+            "branding": { "logo_url": logo_url, "logo_mime": "image/png" }
         }))
         .send()
         .await
@@ -1484,7 +1486,7 @@ async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool
     );
     assert_eq!(
         after["branding"]["logo_url"].as_str(),
-        Some("/api/v1/public/tenants/x/logo")
+        Some(logo_url.as_str())
     );
     assert_eq!(
         after["branding"]["support_contact_name"].as_str(),
@@ -2364,7 +2366,7 @@ async fn create_tenant_seeds_three_builtin_portal_roles(pool: PgPool) {
         let constant: std::collections::BTreeSet<String> =
             mokosh_server::modules::contact_portal::capabilities::BUILTIN_ROLES
                 .iter()
-                .find(|(n, _)| n == name)
+                .find(|(n, _, _)| n == name)
                 .expect("built-in role in BUILTIN_ROLES")
                 .1
                 .iter()
