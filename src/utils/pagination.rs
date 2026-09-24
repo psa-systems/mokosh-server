@@ -125,6 +125,7 @@ impl PaginationParams {
         default_sql: &str,
         allowed: &[(&str, &str)],
     ) -> AppResult<String> {
+        self.reject_over_cap_per_page()?;
         let sql = match self.sort.as_deref() {
             Some(requested) => match allowed.iter().find(|(key, _)| *key == requested) {
                 Some((_, expr)) => *expr,
@@ -141,6 +142,25 @@ impl PaginationParams {
         Ok(format!("{} {}", sql, direction))
     }
 
+    /// A `per_page` above [`Self::MAX_PER_PAGE`] is a 422 that names the
+    /// requested value and the cap, so a client cannot mistake a truncated
+    /// page for a whole page. `per_page` below 1 keeps its silent clamp to 1
+    /// (a request for zero rows is a different class of mistake), and a
+    /// request that omits `per_page` keeps the default.
+    pub fn reject_over_cap_per_page(&self) -> AppResult<()> {
+        if self.per_page > Self::MAX_PER_PAGE {
+            return Err(AppError::validation_field(
+                "per_page",
+                format!(
+                    "{} exceeds the maximum of {}",
+                    self.per_page,
+                    Self::MAX_PER_PAGE
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// MAPPS-533: an unrecognised `sort` is a 422, not a silent fallback.
     ///
     /// This used to drop the value and sort by the default, answering 200 with
@@ -154,6 +174,7 @@ impl PaginationParams {
     /// A `sort` that is absent is unchanged - it uses `default_field` - so a
     /// caller that never asks to sort can never see a 422.
     pub fn order_by(&self, default_field: &str, allowed_fields: &[&str]) -> AppResult<String> {
+        self.reject_over_cap_per_page()?;
         let default_field = default_field
             .split_whitespace()
             .next()
@@ -182,6 +203,7 @@ impl PaginationParams {
     /// absent is unchanged, exactly as with the two helpers above: a caller
     /// that never asks to sort never sees this.
     pub fn reject_unsupported_sort(&self) -> AppResult<()> {
+        self.reject_over_cap_per_page()?;
         match self.sort.as_deref() {
             Some(requested) => Err(AppError::validation_field(
                 "sort",
@@ -420,6 +442,82 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(zero.per_page(), 1);
+    }
+
+    /// A `per_page` above the cap is a 422 that names the requested value and
+    /// the cap, so a client cannot mistake a truncated page for a whole one.
+    /// The clamp on the getter stays for callers that reach it directly, but
+    /// every handler that goes through `order_by` / `order_by_mapped` /
+    /// `reject_unsupported_sort` gets the rejection instead.
+    #[test]
+    fn per_page_above_the_cap_is_a_422() {
+        let over_cap = PaginationParams {
+            per_page: 500,
+            ..Default::default()
+        };
+        let err = over_cap
+            .reject_over_cap_per_page()
+            .expect_err("500 is above the 100-row cap");
+        assert_eq!(err.status_code(), 422);
+        let message = match &err {
+            AppError::Validation { errors, .. } => errors
+                .iter()
+                .find(|e| e.field == "per_page")
+                .expect("the rejection names the `per_page` field")
+                .message
+                .clone(),
+            other => panic!("expected validation, got {other:?}"),
+        };
+        assert!(
+            message.contains("500") && message.contains("100"),
+            "the 422 names what was asked for and the cap, got {message}"
+        );
+
+        let at_cap = PaginationParams {
+            per_page: PaginationParams::MAX_PER_PAGE,
+            ..Default::default()
+        };
+        at_cap.reject_over_cap_per_page().expect("100 is the cap");
+
+        let under_cap = PaginationParams {
+            per_page: 25,
+            ..Default::default()
+        };
+        under_cap.reject_over_cap_per_page().expect("25 is under");
+
+        let below_min = PaginationParams {
+            per_page: 0,
+            ..Default::default()
+        };
+        below_min
+            .reject_over_cap_per_page()
+            .expect("zero clamps on the getter, does not reject");
+    }
+
+    /// The three sort helpers piggyback on the cap check, so any of the ~69
+    /// list handlers already threading `order_by` gets the 422 for free.
+    #[test]
+    fn order_by_rejects_a_per_page_above_the_cap() {
+        let over_cap = PaginationParams {
+            per_page: 500,
+            sort: Some("name".to_string()),
+            sort_dir: "asc".to_string(),
+            ..Default::default()
+        };
+        let err = over_cap
+            .order_by("name", &["name"])
+            .expect_err("order_by must reject an over-cap per_page");
+        assert_eq!(err.status_code(), 422);
+
+        let err = over_cap
+            .order_by_mapped("t.name", &[("name", "t.name")])
+            .expect_err("order_by_mapped must reject an over-cap per_page");
+        assert_eq!(err.status_code(), 422);
+
+        let err = over_cap
+            .reject_unsupported_sort()
+            .expect_err("reject_unsupported_sort must reject an over-cap per_page");
+        assert_eq!(err.status_code(), 422);
     }
 
     #[test]
