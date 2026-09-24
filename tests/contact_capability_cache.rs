@@ -23,6 +23,7 @@ async fn repeated_capability_checks_issue_one_query(pool: PgPool) {
         email: "cache@example.test".to_string(),
         sid: Uuid::new_v4(),
         role_cache: Default::default(),
+        timezone_cache: Default::default(),
     });
 
     let before = CAPABILITY_LOADS.load(Ordering::Relaxed);

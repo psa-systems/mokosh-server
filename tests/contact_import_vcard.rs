@@ -415,6 +415,7 @@ async fn a_phone_match_is_reviewed_in_the_shared_queue(pool: PgPool) {
             "/api/v1/contacts/contacts",
             Some(json!({
                 "first_name": "Margaret", "last_name": "Hamilton",
+                "email": format!("margaret-{}@example.com", Uuid::new_v4()),
                 "phones": [{ "phone_type": "mobile", "number": "+14155550100", "is_primary": true }]
             })),
         )
