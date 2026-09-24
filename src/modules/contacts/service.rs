@@ -902,6 +902,15 @@ impl ContactService {
             // check is folded into this: an unrecognised shape is
             // refused the same way an invalid value is.
             crate::modules::tenants::branding::validate_company_branding_patch(branding)?;
+            // PMS-1371: confirm the id following an accepted prefix is the
+            // caller's own tenant or one of its own companies, not merely
+            // that the prefix is legal.
+            crate::modules::tenants::branding::assert_branding_patch_owned_by_tenant(
+                branding,
+                tenant_id.get(),
+                &self.db,
+            )
+            .await?;
         }
         if request.branding.is_some() {
             updates.push(format!("branding = branding || ${param_idx}::jsonb"));
