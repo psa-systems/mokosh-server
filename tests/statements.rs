@@ -3,9 +3,13 @@
 //! The acceptance test for a statement is that it reconciles, so these tests
 //! assert the arithmetic rather than the wording: opening plus charges less
 //! receipts equals closing, in every case, including the ones that are easy to
-//! get wrong. A draft invoice that leaks in, a voided invoice dropped along
-//! with its credit note, or an opening balance read off today's `balance_due`
-//! all produce a document that looks right and does not add up.
+//! get wrong. A draft invoice that leaks in, a fully credited invoice dropped
+//! along with its credit note, or an opening balance read off today's
+//! `balance_due` all produce a document that looks right and does not add up.
+//!
+//! PMS-1333: a VOIDED invoice is the opposite case and is excluded, because
+//! voiding is allowed only from `draft` and `pending`, so such an invoice was
+//! never issued and was never owed.
 
 mod common;
 
@@ -269,12 +273,17 @@ async fn a_draft_invoice_is_on_no_statement(pool: PgPool) {
     assert_eq!(s["invoices"].as_array().map(|r| r.len()), Some(1));
 }
 
-/// A voided invoice stays on the statement, with the credit note that voided
-/// it. Dropping both would net to the same closing balance and would take the
-/// correction out of the record, which is exactly what a client reconciling
-/// their own books needs to see.
+/// A fully credited invoice stays on the statement, with the credit note that
+/// settled it. Dropping both would net to the same closing balance and would
+/// take the correction out of the record, which is exactly what a client
+/// reconciling their own books needs to see.
+///
+/// PMS-1333: this invoice used to read `void`, because crediting an invoice
+/// for its whole total was what wrote that status. It reads `paid` now, and
+/// nothing else about the statement moves: the charge and the credit are both
+/// still here, dated, and they still net to zero.
 #[sqlx::test]
-async fn a_voided_invoice_and_its_credit_note_both_appear(pool: PgPool) {
+async fn a_fully_credited_invoice_and_its_credit_note_both_appear(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
@@ -292,7 +301,7 @@ async fn a_voided_invoice_and_its_credit_note_both_appear(pool: PgPool) {
 
     let invoices = s["invoices"].as_array().expect("invoices");
     assert_eq!(invoices.len(), 1);
-    assert_eq!(invoices[0]["status"].as_str(), Some("void"));
+    assert_eq!(invoices[0]["status"].as_str(), Some("paid"));
     assert_eq!(dec(&invoices[0]["total"]), Decimal::from(600));
 
     let credits = s["credit_notes"].as_array().expect("credit notes");
@@ -340,6 +349,44 @@ async fn a_closed_period_is_not_rewritten_by_later_activity(pool: PgPool) {
     assert_eq!(dec(&july["opening_balance"]), Decimal::from(900));
     assert_eq!(dec(&july["total_paid"]), Decimal::from(900));
     assert_eq!(dec(&july["closing_balance"]), Decimal::ZERO);
+}
+
+/// PMS-1333: a voided invoice is not on the statement at all. It was never
+/// issued, so it was never owed, and there is no credit note beside it to
+/// balance a charge that never stood.
+#[sqlx::test]
+async fn a_voided_invoice_is_on_no_statement(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = common::seed_company(&pool).await;
+    common::seed_billing_contact(&pool, company_id).await;
+
+    let real = invoice_on(&app, &token, company_id, "2026-06-05", "400").await;
+    send(&app, &token, &real).await;
+    let withdrawn = invoice_on(&app, &token, company_id, "2026-06-06", "900").await;
+
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/invoices/{withdrawn}/void")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "reason": "Raised against the wrong company" }))
+        .send()
+        .await
+        .expect("send void");
+    assert!(
+        resp.status().is_success(),
+        "void should 2xx: {}",
+        resp.status()
+    );
+
+    let s = statement(&app, &token, company_id, "2026-06-01", "2026-06-30").await;
+    assert_reconciles(&s);
+    let invoices = s["invoices"].as_array().expect("invoices");
+    assert_eq!(invoices.len(), 1, "only the issued invoice: {s}");
+    assert_eq!(dec(&invoices[0]["total"]), Decimal::from(400));
+    assert_eq!(dec(&s["total_invoiced"]), Decimal::from(400));
+    assert_eq!(dec(&s["closing_balance"]), Decimal::from(400));
 }
 
 /// A voided credit note stops counting, on the statement as everywhere else.

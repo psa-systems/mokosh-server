@@ -80,7 +80,10 @@ async fn upsert_revoked_is_seen_as_inactive(pool: PgPool) {
 
     // Then a revoked event. The cache invalidation on write is what
     // makes the very next read see the change without waiting for the
-    // 30s TTL.
+    // 30s TTL. The revoke's `at` must be STRICTLY newer than the grant's
+    // stored `event_at` for the upsert to apply (migration 236); reusing
+    // `now` would leave the row granted.
+    let later = now + chrono::Duration::seconds(1);
     MokoshBunyipGrantService::upsert(
         &pool,
         grant_id,
@@ -88,8 +91,8 @@ async fn upsert_revoked_is_seen_as_inactive(pool: PgPool) {
         grantee,
         account,
         None,
-        now,
-        Some(now),
+        later,
+        Some(later),
     )
     .await
     .expect("revoked");
@@ -130,6 +133,7 @@ async fn a_revoked_row_can_be_reinstated_by_a_later_granted_event(pool: PgPool) 
     )
     .await
     .unwrap();
+    let revoked_at = now + chrono::Duration::seconds(1);
     MokoshBunyipGrantService::upsert(
         &pool,
         grant_id,
@@ -137,8 +141,8 @@ async fn a_revoked_row_can_be_reinstated_by_a_later_granted_event(pool: PgPool) 
         grantee,
         account,
         None,
-        now,
-        Some(now),
+        revoked_at,
+        Some(revoked_at),
     )
     .await
     .unwrap();
@@ -151,6 +155,7 @@ async fn a_revoked_row_can_be_reinstated_by_a_later_granted_event(pool: PgPool) 
     // A `granted` event AFTER the revoked one is Bunyip saying the
     // grant is live again (a revoke-then-regrant on Bunyip mints a new
     // bunyip_grant_id but keeps the same triple). The mirror follows.
+    // Newer than `revoked_at` (migration 236's strictly-newer guard).
     let new_grant_id = Uuid::new_v4();
     MokoshBunyipGrantService::upsert(
         &pool,
@@ -159,7 +164,7 @@ async fn a_revoked_row_can_be_reinstated_by_a_later_granted_event(pool: PgPool) 
         grantee,
         account,
         Some("read_only"),
-        now + chrono::Duration::seconds(1),
+        revoked_at + chrono::Duration::seconds(1),
         None,
     )
     .await
@@ -280,6 +285,9 @@ fn claims_with_grant(sub: Uuid, mokosh_account_id: Option<&str>) -> AtClaims {
         mokosh_grant_id: mokosh_account_id.map(|_| Uuid::new_v4().to_string()),
         mokosh_grant_role: mokosh_account_id.map(|_| "manager".to_string()),
         mokosh_grant_account_id: mokosh_account_id.map(str::to_string),
+        // PMS-998: no OP session named, so the back-channel logout check
+        // cannot apply to these fixtures.
+        sid: None,
     }
 }
 
@@ -328,7 +336,9 @@ async fn ensure_grant_still_active_if_claimed_gates_on_the_mirror(pool: PgPool) 
         .await
         .expect("active grant => pass");
 
-    // Revoke it and the same claim now fails.
+    // Revoke it and the same claim now fails. `at` must be strictly newer
+    // than the row's stored `event_at` (migration 236).
+    let revoked_at = now + chrono::Duration::seconds(1);
     MokoshBunyipGrantService::upsert(
         &pool,
         Uuid::new_v4(),
@@ -336,8 +346,8 @@ async fn ensure_grant_still_active_if_claimed_gates_on_the_mirror(pool: PgPool) 
         grantee,
         account,
         None,
-        now,
-        Some(now),
+        revoked_at,
+        Some(revoked_at),
     )
     .await
     .expect("revoke grant");
@@ -498,7 +508,9 @@ async fn active_grant_role_reads_through_the_shared_cache(pool: PgPool) {
         Some("manager".to_string())
     );
 
-    // Revoked → the role goes away with the activeness.
+    // Revoked → the role goes away with the activeness. `at` must be
+    // strictly newer than the row's stored `event_at` (migration 236).
+    let revoked_at = now + chrono::Duration::seconds(1);
     MokoshBunyipGrantService::upsert(
         &pool,
         grant_id,
@@ -506,8 +518,8 @@ async fn active_grant_role_reads_through_the_shared_cache(pool: PgPool) {
         grantee,
         account,
         None,
-        now,
-        Some(now),
+        revoked_at,
+        Some(revoked_at),
     )
     .await
     .unwrap();

@@ -3,10 +3,12 @@
 use crate::modules::auth::TenantId;
 use chrono::{Duration, Utc};
 use sqlx::Row;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::contact_portal::PaymentMethodsService;
 use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{generate_token, hash_password, sha256_hex};
 use crate::utils::email::salutation;
@@ -215,6 +217,14 @@ pub struct ContactService {
     /// both get the worker's retries. `None` in fixtures built without a
     /// dispatcher, which then queue nothing.
     notifications: Option<NotificationsService>,
+    /// PMS-1369: `delete_contact` detaches every card the contact saved
+    /// (`contact_payment_methods`) on the provider side before removing the
+    /// row, mirroring the standalone portal removal path's contract so the
+    /// `ON DELETE CASCADE` on that table never drops a local reference to a
+    /// card still attached on the provider. `None` in fixtures that never
+    /// seed a payment method before deleting a contact; `delete_contact`
+    /// only reaches for this when the contact actually has rows to detach.
+    payment_methods: Option<Arc<PaymentMethodsService>>,
 }
 
 impl ContactService {
@@ -223,6 +233,7 @@ impl ContactService {
             db,
             app_url: String::new(),
             notifications: None,
+            payment_methods: None,
         }
     }
 
@@ -240,7 +251,18 @@ impl ContactService {
             db,
             app_url,
             notifications: Some(notifications),
+            payment_methods: None,
         }
+    }
+
+    /// Attach the payment-methods service so `delete_contact` can detach a
+    /// contact's saved cards on the provider side before removing the row
+    /// (PMS-1369). The server uses this in `create_api_router`, where the
+    /// same `PaymentMethodsService` instance already serves the portal's own
+    /// payment-method routes.
+    pub fn with_payment_methods(mut self, payment_methods: Arc<PaymentMethodsService>) -> Self {
+        self.payment_methods = Some(payment_methods);
+        self
     }
 
     /// Reject a foreign id that does not belong to this tenant, so a request
@@ -880,6 +902,15 @@ impl ContactService {
             // check is folded into this: an unrecognised shape is
             // refused the same way an invalid value is.
             crate::modules::tenants::branding::validate_company_branding_patch(branding)?;
+            // PMS-1371: confirm the id following an accepted prefix is the
+            // caller's own tenant or one of its own companies, not merely
+            // that the prefix is legal.
+            crate::modules::tenants::branding::assert_branding_patch_owned_by_tenant(
+                branding,
+                tenant_id.get(),
+                &self.db,
+            )
+            .await?;
         }
         if request.branding.is_some() {
             updates.push(format!("branding = branding || ${param_idx}::jsonb"));
@@ -1144,12 +1175,16 @@ impl ContactService {
                     "The portal area {area_key:?} no longer exists, so this request cannot be granted."
                 )));
             };
+            // Keyed on the stable `builtin_key` so a rename does not
+            // silently reroute a grant to another role. The message still
+            // names the display, which is what an operator reads.
             let role_id: Option<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM portal_roles \
-                 WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE AND name = $2",
+                 WHERE tenant_id = $1 AND company_id IS NULL AND is_builtin = TRUE \
+                   AND builtin_key = $2",
             )
             .bind(tenant_id)
-            .bind(area.granting_role)
+            .bind(area.granting_role_key)
             .fetch_optional(&mut *tx)
             .await?;
             let Some(role_id) = role_id else {
@@ -1750,9 +1785,9 @@ impl ContactService {
     /// assignments and the token row); the email dispatch is
     /// best-effort AFTER the tx commits so a mailer outage does not
     /// undo the grant. Returns `PortalGrantOutcome { portal_slug,
-    /// setup_link }` so the SPA can display + copy the URL to the
-    /// operator (useful when email delivery is delayed or the
-    /// operator wants to relay it via chat).
+    /// portal_id, password_email_queued }`; the setup token itself is
+    /// no longer serialised to the SPA and reaches the contact only
+    /// through the queued email.
     ///
     /// Guards:
     /// - Contact must exist under `tenant_id`.
@@ -1995,7 +2030,11 @@ impl ContactService {
         .await?
         .unwrap_or(false);
 
-        let (setup_link, token_for_email) = if already_credentialled {
+        // The token stays server-side; the response carries only whether
+        // an email was queued so the SPA can distinguish a fresh grant
+        // from a role-only edit. `setup_link` is `#[serde(skip)]` on the
+        // wire and populated for the integration suite's benefit.
+        let token_for_email: Option<String> = if already_credentialled {
             audit_write(
                 &mut *tx,
                 tenant_id,
@@ -2011,7 +2050,7 @@ impl ContactService {
             )
             .await?;
             tx.commit().await?;
-            (String::new(), None)
+            None
         } else {
             // Fresh grant OR re-grant of a previously revoked account
             // whose password was cleared: mint a token + queue the
@@ -2043,26 +2082,29 @@ impl ContactService {
             )
             .await?;
             tx.commit().await?;
-
-            let link = format!(
-                "{}/portal/{}/set-password?token={}",
-                self.app_url.trim_end_matches('/'),
-                portal_slug,
-                token,
-            );
-            (link, Some(token))
+            Some(token)
         };
 
         // Fire the setup email ONLY on the fresh-grant branch. A
         // role edit stays silent as promised in the client toast.
-        if let Some(t) = token_for_email.as_ref() {
+        let password_email_queued = token_for_email.is_some();
+        let setup_link = if let Some(t) = token_for_email.as_ref() {
             self.send_grant_email(&contact, &portal_slug, portal_id, t)
                 .await;
-        }
+            format!(
+                "{}/portal/{}/set-password?token={}",
+                self.app_url.trim_end_matches('/'),
+                portal_slug,
+                t,
+            )
+        } else {
+            String::new()
+        };
 
         Ok(PortalGrantOutcome {
             portal_slug,
             portal_id,
+            password_email_queued,
             setup_link,
         })
     }
@@ -4078,6 +4120,37 @@ impl ContactService {
         .bind(contact_id)
         .fetch_optional(&mut *tx)
         .await?;
+
+        // PMS-1369: detach every saved card on the provider side BEFORE the
+        // `DELETE FROM contacts` below, so `contact_payment_methods
+        // .contact_id ON DELETE CASCADE` never removes a local row while the
+        // card stays attached to the provider Customer. A detach failure
+        // returns the error here, leaving the transaction unwound and the
+        // contact (and its payment method rows) in place.
+        match &self.payment_methods {
+            Some(payment_methods) => {
+                payment_methods
+                    .detach_all_for_contact(&mut tx, tenant_id, contact_id)
+                    .await?;
+            }
+            None => {
+                let has_payment_methods: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM contact_payment_methods \
+                      WHERE tenant_id = $1 AND contact_id = $2)",
+                )
+                .bind(tenant_id)
+                .bind(contact_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if has_payment_methods {
+                    return Err(AppError::Configuration(
+                        "This contact has a saved payment method, but the contact service was \
+                         not configured to detach it on delete."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
 
         sqlx::query("DELETE FROM contacts WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)

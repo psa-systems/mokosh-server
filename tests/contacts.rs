@@ -1550,11 +1550,18 @@ async fn grant_portal_access_mints_slug_roles_token_and_email(pool: PgPool) {
     );
     let outcome: serde_json::Value = resp.json().await.expect("outcome JSON");
     let portal_slug = outcome["portal_slug"].as_str().expect("portal_slug");
-    let setup_link = outcome["setup_link"].as_str().expect("setup_link");
     assert_eq!(portal_slug.len(), 16, "slug must be 16 chars");
+    // PMS-1327 / PMS-1374: `setup_link` is `#[serde(skip)]` on the wire so
+    // an operator with only the API response cannot mint a password on the
+    // contact's behalf; the token reaches the contact through the setup
+    // email `send_grant_email` dispatches. The presence of the token is
+    // verified against `portal_setup_tokens` below (line ~1587); the URL
+    // shape is exercised end-to-end by `tests/contact_e2e.rs` where the
+    // suite drives the redemption flow using the raw token it reads out
+    // of the database, not out of the response body.
     assert!(
-        setup_link.contains(&format!("/portal/{portal_slug}/set-password?token=")),
-        "setup_link must carry the slug + query token, got {setup_link}"
+        outcome.get("setup_link").is_none(),
+        "PMS-1327: setup_link must never reach the wire, got {outcome:?}"
     );
 
     // Slug landed on the Company.

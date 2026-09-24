@@ -653,6 +653,7 @@ async fn grant_portal_access(
     Path(contact_id): Path<Uuid>,
     Json(request): Json<GrantPortalAccessRequest>,
 ) -> AppResult<Json<PortalGrantOutcome>> {
+    request.validate()?;
     let outcome = state
         .contact_service
         .grant_portal_access(user.tenant(), contact_id, &request.role_ids, &ctx)
@@ -682,6 +683,7 @@ async fn replace_contact_portal_role_ids(
     Path(contact_id): Path<Uuid>,
     Json(request): Json<GrantPortalAccessRequest>,
 ) -> AppResult<axum::http::StatusCode> {
+    request.validate()?;
     state
         .contact_service
         .replace_portal_role_assignments(user.tenant(), contact_id, &request.role_ids, &ctx)

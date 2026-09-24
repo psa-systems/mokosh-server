@@ -1293,6 +1293,16 @@ impl TenantService {
         // published. Includes the PMS-758 object check.
         if let Some(branding) = request.branding.as_ref() {
             validate_branding_patch(branding)?;
+            // PMS-1371: the prefix check above never looked at whose id
+            // followed it, so a tenant could set `logo_url` to another
+            // tenant's (or another tenant's company's) real, currently-served
+            // asset path and have it accepted.
+            super::branding::assert_branding_patch_owned_by_tenant(
+                branding,
+                tenant_id.get(),
+                &self.db,
+            )
+            .await?;
         }
         if request.branding.is_some() {
             // PMS-758: MERGE, not replace. `branding` is a JSONB document and
@@ -1744,16 +1754,21 @@ impl TenantService {
     /// `portal_roles` RLS WITH CHECK policy sees `app.current_tenant`.
     pub async fn seed_builtin_portal_roles(&self, tenant_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        for (name, capabilities) in crate::modules::contact_portal::capabilities::BUILTIN_ROLES {
+        for (name, capabilities, builtin_key) in
+            crate::modules::contact_portal::capabilities::BUILTIN_ROLES
+        {
             let capabilities: Vec<String> = capabilities.iter().map(|c| c.to_string()).collect();
+            // The row also carries a stable `builtin_key` so the runtime
+            // lookup finds it after a rename.
             sqlx::query(
-                "INSERT INTO portal_roles (tenant_id, name, capabilities, is_builtin) \
-                 VALUES ($1, $2, $3, TRUE) \
+                "INSERT INTO portal_roles (tenant_id, name, capabilities, is_builtin, builtin_key) \
+                 VALUES ($1, $2, $3, TRUE, $4) \
                  ON CONFLICT (tenant_id, LOWER(name)) WHERE company_id IS NULL DO NOTHING",
             )
             .bind(tenant_id)
             .bind(name)
             .bind(&capabilities)
+            .bind(builtin_key)
             .execute(&mut *tx)
             .await?;
         }

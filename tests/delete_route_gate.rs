@@ -12,15 +12,16 @@ const EXEMPT: &[(&str, &str)] = &[
     ("cancel", "approvals: requester-owned check in the service"),
     ("revoke_api_key", "own API key"),
     ("delete_session", "own session"),
-    ("staff_delete_company_asset", "unaudited"),
-    ("staff_delete_tenant_asset", "unaudited"),
-    ("release_lock", "unaudited"),
     ("delete_schedule", "owner-scoped report/dashboard schedule"),
     ("delete_one", "owner-scoped dashboard / saved report"),
-    ("remove_member", "unaudited"),
-    ("soft_delete_team", "unaudited"),
-    ("delete_current_logo", "unaudited"),
-    ("delete_ticket", "unaudited"),
+    (
+        "remove_member",
+        "team-manage check in the service (assert_can_manage_team)",
+    ),
+    (
+        "soft_delete_team",
+        "team-manage check in the service (assert_can_manage_team)",
+    ),
 ];
 
 fn handler_names(src: &str) -> Vec<String> {

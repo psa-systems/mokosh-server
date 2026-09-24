@@ -82,28 +82,6 @@ async fn pay(app: &common::TestApp, token: &str, company_id: Uuid, invoice_id: &
     assert_eq!(resp.status(), StatusCode::OK, "pay");
 }
 
-async fn credit_in_full(app: &common::TestApp, token: &str, invoice_id: &str, amount: &str) {
-    let resp = app
-        .client
-        .post(app.url("/api/v1/credit-notes"))
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "invoice_id": invoice_id,
-            "issue_date": "2026-03-10",
-            "reason": "Should not have been issued",
-            "lines": [{
-                "line_type": "adjustment",
-                "description": "Credit",
-                "quantity": "1",
-                "unit_price": amount,
-            }],
-        }))
-        .send()
-        .await
-        .expect("send credit note");
-    assert_eq!(resp.status(), StatusCode::OK, "credit");
-}
-
 async fn write_off(
     app: &common::TestApp,
     token: &str,
@@ -194,9 +172,19 @@ async fn the_wrong_states_and_a_missing_reason_are_refused(pool: PgPool) {
     let paid = invoice_on(&app, &token, company, "2026-03-01", "100").await;
     send(&app, &token, &paid).await;
     pay(&app, &token, company, &paid, "100").await;
+    // PMS-1333: `void` is reached by voiding, not by crediting in full, which
+    // now leaves the invoice `paid`. A draft is the only shape that can be
+    // voided, which is also why this one is never sent.
     let void = invoice_on(&app, &token, company, "2026-03-01", "100").await;
-    send(&app, &token, &void).await;
-    credit_in_full(&app, &token, &void, "100").await;
+    let voided = app
+        .client
+        .post(app.url(&format!("/api/v1/invoices/{void}/void")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "reason": "Raised in error" }))
+        .send()
+        .await
+        .expect("send void");
+    assert!(voided.status().is_success(), "void: {}", voided.status());
     assert_eq!(get_invoice(&app, &token, &void).await["status"], "void");
 
     for (id, status) in [(&draft, "draft"), (&paid, "paid"), (&void, "void")] {

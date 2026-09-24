@@ -14,6 +14,7 @@
 mod common;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use mokosh_server::utils::email::{EmailAttachment, Mailer};
 use mokosh_server::utils::error::{AppError, AppResult};
 use serde_json::{json, Value};
@@ -460,6 +461,135 @@ async fn a_refused_send_leaves_the_invoice_a_draft(pool: PgPool) {
         200,
         "a draft still previews live"
     );
+}
+
+/// PMS-978: the delivery is in the history as an event, not as two columns
+/// that happen to differ between two row snapshots.
+///
+/// The question an operator asks after a dispute is "was this invoice sent,
+/// to whom, when, and by whom". The whole-row `update` audit row PMS-117
+/// writes carries `emailed_to` and `emailed_at`, but only as part of a diff
+/// of every column on the invoice; this asserts the named row PMS-977 gave
+/// the company move.
+#[sqlx::test]
+async fn a_send_is_a_named_event_in_the_audit_log(pool: PgPool) {
+    install_test_attachment_env();
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let contact = seed_contact(&pool, company_id, Some("ap@client.example")).await;
+    let (app, _mailer) = boot_capturing(pool.clone(), CapturingMailer::default()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let draft = create_draft(&app, &token, company_id, Some(contact)).await;
+    let id = draft["id"].as_str().unwrap().to_string();
+
+    // A created invoice is not a sent one, which is the decision this issue
+    // settles: creation writes no delivery event, because nothing was
+    // delivered.
+    assert!(
+        sent_events(&pool, &id).await.is_empty(),
+        "creating an invoice sends nothing"
+    );
+
+    let resp = send(&app, &token, &id, json!({ "status": "sent" })).await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let sent: Value = resp.json().await.unwrap();
+    let number = sent["invoice_number"].as_str().unwrap().to_string();
+
+    let events = sent_events(&pool, &id).await;
+    assert_eq!(events.len(), 1, "one delivery, one row: {events:?}");
+    let (user_id, at, values) = &events[0];
+    assert_eq!(values["event"], "invoice.sent");
+    assert_eq!(values["emailed_to"], "ap@client.example");
+    assert_eq!(values["invoice_number"], number);
+    assert_eq!(
+        values["billing_contact_id"].as_str(),
+        Some(contact.to_string().as_str()),
+        "the row names the contact, not only the address"
+    );
+    assert_eq!(*user_id, Some(admin_id), "and who sent it");
+    assert!(
+        (Utc::now() - *at).num_seconds().abs() < 120,
+        "stamped when it went: {at}"
+    );
+}
+
+/// The deliberate no-email send says so, because otherwise it is
+/// indistinguishable afterwards from a send whose mail was lost: both leave a
+/// `sent` invoice with no `emailed_to`, and only one of them was a decision.
+#[sqlx::test]
+async fn a_skip_email_send_records_that_nobody_was_emailed(pool: PgPool) {
+    install_test_attachment_env();
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let (app, mailer) = boot_capturing(pool.clone(), CapturingMailer::default()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let draft = create_draft(&app, &token, company_id, None).await;
+    let id = draft["id"].as_str().unwrap().to_string();
+    let resp = send(
+        &app,
+        &token,
+        &id,
+        json!({ "status": "sent", "skip_email": true }),
+    )
+    .await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    assert!(mailer.sent.lock().unwrap().is_empty(), "nobody was emailed");
+
+    let events = sent_events(&pool, &id).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].2["event"], "invoice.marked_sent");
+    assert!(events[0].2["emailed_to"].is_null());
+}
+
+/// A refused send writes no delivery event, for the same reason it leaves the
+/// invoice a draft: the row is written inside the transaction the refusal
+/// rolls back, so the history cannot claim a delivery that did not happen.
+#[sqlx::test]
+async fn a_refused_send_records_no_delivery(pool: PgPool) {
+    install_test_attachment_env();
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let contact = seed_contact(&pool, company_id, Some("ap@client.example")).await;
+    let (app, _mailer) = boot_capturing(
+        pool.clone(),
+        CapturingMailer {
+            sent: Mutex::new(Vec::new()),
+            refuse: Some("relay unreachable".to_string()),
+        },
+    )
+    .await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let draft = create_draft(&app, &token, company_id, Some(contact)).await;
+    let id = draft["id"].as_str().unwrap().to_string();
+    let resp = send(&app, &token, &id, json!({ "status": "sent" })).await;
+    assert_eq!(resp.status().as_u16(), 502, "{}", resp.status());
+
+    assert!(
+        sent_events(&pool, &id).await.is_empty(),
+        "no delivery, no record of one"
+    );
+}
+
+/// The `invoice.sent` / `invoice.marked_sent` rows for one invoice, newest
+/// last, as (actor, when, payload).
+async fn sent_events(
+    pool: &PgPool,
+    invoice_id: &str,
+) -> Vec<(Option<Uuid>, chrono::DateTime<Utc>, Value)> {
+    sqlx::query_as::<_, (Option<Uuid>, chrono::DateTime<Utc>, Value)>(
+        "SELECT user_id, \"timestamp\", new_values FROM audit_log \
+         WHERE tenant_id = $1 AND entity_type = 'invoices' AND entity_id = $2 \
+           AND new_values ->> 'event' IN ('invoice.sent', 'invoice.marked_sent') \
+         ORDER BY \"timestamp\"",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(Uuid::parse_str(invoice_id).expect("invoice id"))
+    .fetch_all(pool)
+    .await
+    .expect("audit rows")
 }
 
 /// PMS-1173: an invoice says who it is billed to by name, on the list and on
