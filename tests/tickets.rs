@@ -1644,3 +1644,100 @@ async fn ticket_list_sorts_by_the_columns_the_client_offers(pool: PgPool) {
         .expect("list tickets with a SQL expression as the sort key");
     assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+/// PMS-1368: a parent's children are asked for, not filtered client-side.
+///
+/// The parent is set here with SQL rather than through the create route,
+/// because that route takes `parent_ticket_id` only from PMS-737; what is
+/// under test is the filter and the column on the list row.
+#[sqlx::test]
+async fn the_ticket_list_filters_by_parent(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let create = |title: &'static str| {
+        let app = &app;
+        let token = &token;
+        async move {
+            let resp = app
+                .client
+                .post(app.url("/api/v1/tickets"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "title": title,
+                    "company_id": company_id,
+                    "custom_fields": {},
+                }))
+                .send()
+                .await
+                .expect("create ticket");
+            assert!(resp.status().is_success(), "create {title}");
+            let body: serde_json::Value = resp.json().await.expect("ticket json");
+            uuid::Uuid::parse_str(body["id"].as_str().expect("id")).expect("uuid")
+        }
+    };
+    let parent = create("New starters: 2 people").await;
+    let first = create("New starter: Jane").await;
+    let second = create("New starter: Omar").await;
+    let unrelated = create("Printer jam").await;
+
+    sqlx::query("UPDATE tickets SET parent_ticket_id = $1 WHERE id = ANY($2)")
+        .bind(parent)
+        .bind(vec![first, second])
+        .execute(&pool)
+        .await
+        .expect("attach the children");
+
+    let children = |parent_id: uuid::Uuid| {
+        let app = &app;
+        let token = &token;
+        async move {
+            let resp = app
+                .client
+                .get(app.url(&format!("/api/v1/tickets?parent_ticket_id={parent_id}")))
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("list children");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            let body: serde_json::Value = resp.json().await.expect("list json");
+            body["data"].as_array().cloned().unwrap_or_default()
+        }
+    };
+
+    let rows = children(parent).await;
+    let ids: Vec<String> = rows
+        .iter()
+        .map(|t| t["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2, "the two children only: {rows:?}");
+    assert!(ids.contains(&first.to_string()) && ids.contains(&second.to_string()));
+    assert!(!ids.contains(&unrelated.to_string()));
+    // The row says what it belongs to, so a list does not need a second read.
+    assert!(rows
+        .iter()
+        .all(|t| t["parent_ticket_id"].as_str() == Some(&parent.to_string())));
+
+    // A parent nobody has, and one from another tenant, both match nothing
+    // rather than reaching across.
+    let (other_tenant, _, _, _) = common::seed_tenant_with_admin(&pool, "other-msp-1368").await;
+    let foreign = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tickets (id, tenant_id, ticket_number, title, company_id, status_id, \
+                              priority_id, queue_id, created_by_id) \
+         SELECT $1, $2, 'T-1368', 'Foreign parent', c.id, s.id, p.id, q.id, u.id \
+         FROM companies c, ticket_statuses s, ticket_priorities p, ticket_queues q, users u \
+         WHERE c.tenant_id = $2 AND s.tenant_id = $2 AND p.tenant_id = $2 \
+           AND q.tenant_id = $2 AND u.tenant_id = $2 LIMIT 1",
+    )
+    .bind(foreign)
+    .bind(other_tenant)
+    .execute(&pool)
+    .await
+    .ok();
+    for absent in [uuid::Uuid::new_v4(), foreign] {
+        assert!(children(absent).await.is_empty(), "{absent} matched rows");
+    }
+}

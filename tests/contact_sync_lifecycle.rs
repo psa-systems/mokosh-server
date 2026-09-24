@@ -10,9 +10,10 @@
 mod common;
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
+use axum::{extract::Path as AxumPath, response::IntoResponse, routing::post, Json, Router};
 use mokosh_server::db::Database;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::contact_sync::provider::{
@@ -25,6 +26,84 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 const CLIENTS: &str = "contactGroups/clients";
+
+const STRIPE_TEST_KEY: [u8; 32] = [0u8; 32];
+
+/// PMS-1369: a call-recording Stripe stub, so the removal test below can
+/// assert the detach was actually invoked, not merely that the row is gone.
+/// Same one-server-per-binary shape as `tests/contact_delete_detaches_payment_method.rs`.
+fn stripe_detach_calls() -> &'static Mutex<Vec<String>> {
+    static CALLS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    CALLS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn stripe_stub_base() -> &'static str {
+    static STUB: OnceLock<String> = OnceLock::new();
+    STUB.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("stub runtime");
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind stub");
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let router = Router::new()
+                    .route(
+                        "/v1/payment_methods/{id}/detach",
+                        post(stripe_detach_handler),
+                    )
+                    .with_state(());
+                tx.send(base).unwrap();
+                axum::serve(listener, router).await.unwrap();
+            });
+        });
+        let base = rx.recv().expect("stub base");
+        std::env::set_var("STRIPE_API_BASE", &base);
+        // PMS-982: the config generation is resolved and held, so the
+        // `set_var` above is not seen until it is rebuilt.
+        mokosh_server::config::refresh();
+        base
+    })
+}
+
+async fn stripe_detach_handler(AxumPath(id): AxumPath<String>) -> impl IntoResponse {
+    stripe_detach_calls().lock().unwrap().push(id);
+    Json(json!({"object": "payment_method"}))
+}
+
+async fn seed_stripe_gateway(pool: &PgPool) {
+    let plaintext = json!({
+        "secret_key": "sk_test_1", "webhook_secret": "whsec_1",
+    })
+    .to_string();
+    let encrypted = mokosh_server::utils::crypto::encrypt(&plaintext, &STRIPE_TEST_KEY).unwrap();
+    sqlx::query(
+        "INSERT INTO payment_gateway_configs \
+         (tenant_id, provider, is_active, is_test_mode, config_encrypted) \
+         VALUES ($1, 'stripe', TRUE, TRUE, $2)",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(encrypted)
+    .execute(pool)
+    .await
+    .expect("seed stripe gateway");
+}
+
+async fn seed_payment_method(pool: &PgPool, contact_id: Uuid, provider_pm_id: &str) {
+    sqlx::query(
+        "INSERT INTO contact_payment_methods \
+         (id, tenant_id, contact_id, provider, provider_pm_id, brand, last4, exp_month, exp_year, is_default) \
+         VALUES ($1, $2, $3, 'stripe', $4, 'visa', '4242', 12, 2030, TRUE)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(contact_id)
+    .bind(provider_pm_id)
+    .execute(pool)
+    .await
+    .expect("seed contact_payment_methods");
+}
 
 struct FakeSource {
     reads: Mutex<VecDeque<SourceChanges>>,
@@ -584,6 +663,49 @@ async fn removing_a_created_contact_deletes_it_and_it_never_comes_back(pool: PgP
     let report = f.sync_connection(reconnected, &source).await;
     assert_eq!((report.excluded, report.created), (1, 0));
     assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
+}
+
+/// PMS-1369: the same rollback-delete `DELETE FROM contacts` that
+/// `removing_a_created_contact_deletes_it_and_it_never_comes_back` exercises
+/// must detach a saved card on the provider side first, exactly like the
+/// staff `delete_contact` path.
+#[sqlx::test]
+async fn removing_a_created_contact_detaches_its_saved_payment_method(pool: PgPool) {
+    stripe_stub_base();
+    seed_stripe_gateway(&pool).await;
+    let f = Fixture::new(pool).await;
+    let source = FakeSource::new();
+    let nora = person("people/nora-pm", "e1", "Nora", "nora-pm@private.example");
+    source.next(vec![nora], false);
+    f.sync(&source).await;
+    let contact = f.linked_contact("people/nora-pm").await;
+
+    let provider_pm_id = format!("pm_sync_remove_{}", Uuid::new_v4().simple());
+    seed_payment_method(&f.pool, contact, &provider_pm_id).await;
+
+    let (status, body) = f
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/v1/contacts/contacts/{contact}/sync/remove-imported-data"),
+            Some(json!({ "reason": "Erasure request by email, 2026-09-16" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "contact_deleted": true, "links_removed": 1 }));
+
+    assert!(
+        stripe_detach_calls()
+            .lock()
+            .unwrap()
+            .contains(&provider_pm_id),
+        "PMS-1369: the rollback-delete must detach the saved card before removing the contact"
+    );
+    assert_eq!(f.count("SELECT count(*) FROM contacts").await, 0);
+    assert_eq!(
+        f.count("SELECT count(*) FROM contact_payment_methods")
+            .await,
+        0
+    );
 }
 
 /// PSA-70 K, the linked case: a contact the CRM already held keeps its record
