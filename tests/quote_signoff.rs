@@ -145,7 +145,7 @@ async fn portal_sees_only_issued_quotes_for_its_own_company(pool: PgPool) {
     let company_a = seed_company_named(&pool, "Client A").await;
     let company_b = seed_company_named(&pool, "Client B").await;
     let contact_a = seed_portal_contact(&pool, company_a, "a@example.com").await;
-    let _contact_b = seed_portal_contact(&pool, company_b, "b@example.com").await;
+    let contact_b = seed_portal_contact(&pool, company_b, "b@example.com").await;
 
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
@@ -177,7 +177,12 @@ async fn portal_sees_only_issued_quotes_for_its_own_company(pool: PgPool) {
     let issued_b = create_quote(
         &app,
         &token,
-        serde_json::json!({ "company_id": company_b, "title": "B issued" }),
+        // PMS-1000: as above, for B's issued quote.
+        serde_json::json!({
+            "company_id": company_b,
+            "billing_contact_id": contact_b.id,
+            "title": "B issued",
+        }),
     )
     .await;
     let issued_b_id = issued_b["id"].as_str().unwrap().to_string();
@@ -499,7 +504,13 @@ async fn a_contact_never_sees_an_unissued_quote(pool: PgPool) {
     let issued = create_quote(
         &app,
         &token,
-        serde_json::json!({ "company_id": company, "title": "Issued" }),
+        // PMS-1000: a send needs a recipient, so name the contact this test
+        // already seeds rather than leaving the company with nobody.
+        serde_json::json!({
+            "company_id": company,
+            "billing_contact_id": contact.id,
+            "title": "Issued",
+        }),
     )
     .await;
     let issued_id = issued["id"].as_str().unwrap().to_string();
