@@ -72,6 +72,11 @@ fn stripe_stub_base() -> &'static str {
     })
 }
 
+/// PMS-1381 (F3): every simulated detach's own latency, used by the
+/// concurrency test below to tell "ran one after another" from "ran at once"
+/// without depending on wall-clock noise beyond this one constant.
+const SLOW_DETACH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
 async fn detach_handler(Path(id): Path<String>, State(()): State<()>) -> impl IntoResponse {
     detach_calls().lock().unwrap().push(id.clone());
     if id.starts_with("pm_fail_") {
@@ -80,6 +85,9 @@ async fn detach_handler(Path(id): Path<String>, State(()): State<()>) -> impl In
             Json(json!({"error": {"code": "card_error", "message": "simulated detach failure"}})),
         )
             .into_response();
+    }
+    if id.starts_with("pm_slow_") {
+        tokio::time::sleep(SLOW_DETACH_DELAY).await;
     }
     Json(json!({"object": "payment_method"})).into_response()
 }
@@ -239,5 +247,82 @@ async fn a_provider_detach_failure_leaves_the_contact_in_place(pool: PgPool) {
     assert_eq!(
         pm_count, 1,
         "PMS-1369: the payment method row must survive a failed detach too"
+    );
+}
+
+/// PMS-1381 (F3): `detach_all_for_contact` must run its gateway calls
+/// concurrently, not one row at a time. Four saved cards, each simulating a
+/// `SLOW_DETACH_DELAY` gateway round trip, must together take close to one
+/// call's latency rather than the sum of all four: a sequential loop would
+/// take at least `4 * SLOW_DETACH_DELAY`, comfortably past the threshold
+/// below, while a concurrent `try_join_all` finishes in roughly one delay
+/// plus scheduling noise.
+#[sqlx::test]
+async fn detaching_a_contacts_saved_cards_runs_the_gateway_calls_concurrently(pool: PgPool) {
+    stripe_stub_base();
+    seed_stripe_gateway(&pool).await;
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let contact_id = seed_contact(&pool).await;
+    const CARD_COUNT: usize = 4;
+    let mut provider_pm_ids = Vec::with_capacity(CARD_COUNT);
+    for i in 0..CARD_COUNT {
+        let provider_pm_id = format!("pm_slow_{}", Uuid::new_v4().simple());
+        if i == 0 {
+            // Only one row may carry `is_default = TRUE` per contact
+            // (`idx_contact_payment_methods_one_default`).
+            seed_payment_method(&pool, contact_id, &provider_pm_id).await;
+        } else {
+            sqlx::query(
+                "INSERT INTO contact_payment_methods \
+                 (id, tenant_id, contact_id, provider, provider_pm_id, brand, last4, exp_month, exp_year, is_default) \
+                 VALUES ($1, $2, $3, 'stripe', $4, 'visa', '4242', 12, 2030, FALSE)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(common::DEFAULT_TENANT_ID)
+            .bind(contact_id)
+            .bind(&provider_pm_id)
+            .execute(&pool)
+            .await
+            .expect("seed non-default contact_payment_methods");
+        }
+        provider_pm_ids.push(provider_pm_id);
+    }
+
+    let started = std::time::Instant::now();
+    let resp = app
+        .client
+        .delete(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send delete contact");
+    let elapsed = started.elapsed();
+    assert!(
+        resp.status().is_success(),
+        "PMS-1381: delete should 2xx once every concurrent detach succeeds, got {}",
+        resp.status()
+    );
+
+    for provider_pm_id in &provider_pm_ids {
+        assert!(
+            detach_calls().lock().unwrap().contains(provider_pm_id),
+            "PMS-1381: every card's detach must have been called"
+        );
+    }
+
+    // A sequential loop over 4 cards would take at least 4 * 200ms = 800ms;
+    // a concurrent run finishes in roughly one 200ms round trip plus
+    // per-call overhead (provider lookup, HTTP client setup) that stacks up
+    // under load even when the sleeps themselves overlap. The threshold sits
+    // well below the sequential floor while staying comfortably above one
+    // call's latency, so it still fails on a sequential loop without being
+    // sensitive to sandboxed-CI scheduling noise.
+    assert!(
+        elapsed < SLOW_DETACH_DELAY * 3,
+        "PMS-1381: {CARD_COUNT} concurrent detach calls took {elapsed:?}, \
+         expected close to one call's latency ({SLOW_DETACH_DELAY:?}), not the sum of all {CARD_COUNT}"
     );
 }
