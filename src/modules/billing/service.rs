@@ -553,31 +553,21 @@ impl BillingService {
     /// `contacts.company_id` scalar (which PMS-806 keeps as the mirror of the
     /// primary link) and a `contact_companies` row for a contact who works at
     /// several companies.
+    ///
+    /// PMS-1000: the rule itself moved to `contacts::billing_contact`, because
+    /// the quote flow asks the same question and two copies would drift on
+    /// what "a contact of this company" means. This stays as the name the
+    /// invoice paths already call.
     async fn assert_billing_contact_for_company(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         company_id: Uuid,
         contact_id: Uuid,
     ) -> AppResult<()> {
-        let found: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM contacts c \
-             WHERE c.tenant_id = $1 AND c.id = $3 \
-               AND (c.company_id = $2 \
-                    OR EXISTS(SELECT 1 FROM contact_companies l \
-                              WHERE l.tenant_id = $1 AND l.contact_id = c.id \
-                                AND l.company_id = $2)))",
+        crate::modules::contacts::billing_contact::assert_for_company(
+            tx, tenant_id, company_id, contact_id,
         )
-        .bind(tenant_id)
-        .bind(company_id)
-        .bind(contact_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !found {
-            return Err(AppError::BadRequest(
-                "billing_contact_id does not reference a contact of this company".to_string(),
-            ));
-        }
-        Ok(())
+        .await
     }
 
     /// PMS-990: the due date, and the term it came from.
@@ -668,27 +658,17 @@ impl BillingService {
     /// A company with no pointer still yields none, and the send-time guard is
     /// unchanged: `resolve_invoice_recipient` still runs and still refuses a
     /// send that resolves nobody.
+    ///
+    /// PMS-1000: shared with the quote flow, which needs the same answer at
+    /// create and at send.
     async fn resolve_billing_contact(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         company_id: Uuid,
         requested: Option<Uuid>,
     ) -> AppResult<Option<Uuid>> {
-        // PMS-993: an explicitly named contact is validated against this
-        // company and tenant first. FK checks bypass RLS, so an unchecked id
-        // could address the invoice to another tenant's contact.
-        if let Some(contact_id) = requested {
-            Self::assert_billing_contact_for_company(tx, tenant_id, company_id, contact_id).await?;
-            return Ok(requested);
-        }
-        let default_contact: Option<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT default_billing_contact_id FROM companies WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        Ok(default_contact.flatten())
+        crate::modules::contacts::billing_contact::resolve(tx, tenant_id, company_id, requested)
+            .await
     }
 
     /// Fill in `company_name` on a batch of invoice responses (PMS-186), and

@@ -132,23 +132,6 @@ impl QuotesService {
             .ok_or_else(|| AppError::BadRequest(format!("Unknown company {company_id}")))
     }
 
-    /// Same cross-tenant guard for the billing contact.
-    async fn assert_contact_in_tenant(
-        tx: &mut sqlx::PgConnection,
-        tenant_id: TenantId,
-        contact_id: Uuid,
-    ) -> AppResult<()> {
-        let exists: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM contacts WHERE tenant_id = $1 AND id = $2")
-                .bind(tenant_id)
-                .bind(contact_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        exists
-            .map(|_| ())
-            .ok_or_else(|| AppError::BadRequest(format!("Unknown contact {contact_id}")))
-    }
-
     /// Resolve company ids to display names so responses never carry a
     /// bare UUID. Mirrors `BillingService::company_name_map`.
     async fn company_name_map(
@@ -435,9 +418,19 @@ impl QuotesService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
-        if let Some(contact_id) = request.billing_contact_id {
-            Self::assert_contact_in_tenant(&mut tx, tenant_id, contact_id).await?;
-        }
+        // PMS-1000: a draft quote carries its recipient from the moment it
+        // exists, the way an invoice does. An explicit contact is checked
+        // against this company rather than merely against the tenant, because
+        // "a contact somewhere in this tenant" is not a person this customer
+        // would expect to receive their quote; naming none inherits the
+        // company's billing contact.
+        let billing_contact_id = crate::modules::contacts::billing_contact::resolve(
+            &mut tx,
+            tenant_id,
+            request.company_id,
+            request.billing_contact_id,
+        )
+        .await?;
 
         let quote_number = Self::next_quote_number(&mut tx, tenant_id).await?;
 
@@ -464,7 +457,7 @@ impl QuotesService {
         .bind(tenant_id)
         .bind(&quote_number)
         .bind(request.company_id)
-        .bind(request.billing_contact_id)
+        .bind(billing_contact_id)
         .bind(&request.title)
         .bind(&request.summary)
         .bind(&request.description)
@@ -590,8 +583,21 @@ impl QuotesService {
             }
         }
 
+        // PMS-1000: the same rule the create path applies. Validating against
+        // the tenant alone let a quote be addressed to a contact of some other
+        // customer, which is a disclosure rather than a typo.
         if let Some(contact_id) = request.billing_contact_id {
-            Self::assert_contact_in_tenant(&mut tx, tenant_id, contact_id).await?;
+            let company_id: Uuid = sqlx::query_scalar(
+                "SELECT company_id FROM quotes WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(quote_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            crate::modules::contacts::billing_contact::assert_for_company(
+                &mut tx, tenant_id, company_id, contact_id,
+            )
+            .await?;
         }
 
         let before: Option<serde_json::Value> =
@@ -770,6 +776,38 @@ impl QuotesService {
             )));
         }
 
+        // PMS-1000: settle the recipient BEFORE the transition, the shape
+        // PMS-992 gave the invoice send. A quote used to reach `sent` with
+        // `billing_contact_id` NULL, stamp `sent_at`, and tell nobody: the
+        // staff page showed it delivered and the only evidence was an `info`
+        // line. Refusing here is the same recovery work as discovering it
+        // later (set a billing contact, send again), minus the wait for a
+        // reply that was never going to come.
+        let (company_id, requested): (Uuid, Option<Uuid>) = sqlx::query_as(
+            "SELECT company_id, billing_contact_id FROM quotes \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(quote_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let recipient = crate::modules::contacts::billing_contact::resolve(
+            &mut tx, tenant_id, company_id, requested,
+        )
+        .await?;
+        let Some(recipient) = recipient else {
+            let company: String =
+                sqlx::query_scalar("SELECT name FROM companies WHERE tenant_id = $1 AND id = $2")
+                    .bind(tenant_id)
+                    .bind(company_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            return Err(AppError::Conflict(format!(
+                "This quote has nobody to send to: {company} has no billing contact. \
+                 Set one on the company, or name a billing contact on the quote, then send it."
+            )));
+        };
+
         let before: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT to_jsonb(t) FROM quotes t WHERE tenant_id = $1 AND id = $2")
                 .bind(tenant_id)
@@ -777,11 +815,16 @@ impl QuotesService {
                 .fetch_optional(&mut *tx)
                 .await?;
 
+        // The resolved recipient is persisted, not merely checked: the mail
+        // below reads it back off the quote, so a send that passed the guard
+        // without storing what it resolved would still mail nobody.
         sqlx::query(
-            "UPDATE quotes SET status = 'sent', sent_at = NOW() WHERE tenant_id = $1 AND id = $2",
+            "UPDATE quotes SET status = 'sent', sent_at = NOW(), billing_contact_id = $3 \
+             WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
         .bind(quote_id)
+        .bind(recipient)
         .execute(&mut *tx)
         .await?;
 
@@ -820,9 +863,14 @@ impl QuotesService {
             return;
         };
         let Some(contact_id) = quote.billing_contact_id else {
-            tracing::info!(
+            // PMS-1000: unreachable through `send_quote`, which refuses a
+            // quote with no recipient and writes the one it resolved. Reaching
+            // it means the guard was bypassed, so it is a warning rather than
+            // the `info` line that made this defect look like normal
+            // operation for as long as it did.
+            tracing::warn!(
                 quote_id = %quote.id,
-                "quote sent with no billing contact; no client mail dispatched"
+                "quote is sent with no billing contact; no client mail dispatched"
             );
             return;
         };

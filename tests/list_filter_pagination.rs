@@ -152,7 +152,7 @@ async fn appointments_list_handles_every_filter_combination(pool: PgPool) {
         },
     ];
     for (i, filter) in combos.iter().enumerate() {
-        svc.list_appointments(tenant(), filter, &page())
+        svc.list_appointments(tenant(), Uuid::nil(), filter, &page())
             .await
             .unwrap_or_else(|e| panic!("list_appointments combo {i} must not error: {e:?}"));
     }
