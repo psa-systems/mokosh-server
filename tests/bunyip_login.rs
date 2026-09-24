@@ -58,6 +58,9 @@ fn claims(sub: Uuid, bunyip_role: Option<&str>) -> AtClaims {
         mokosh_grant_id: None,
         mokosh_grant_role: None,
         mokosh_grant_account_id: None,
+        // PMS-998: no OP session named, so the back-channel logout check
+        // cannot apply to these fixtures.
+        sid: None,
     }
 }
 
@@ -1052,6 +1055,55 @@ async fn userinfo_is_skipped_for_an_existing_placed_user(pool: PgPool) {
     assert!(
         !bunyip_userinfo_needed(&auth, Some(&invitations), sub, &claims(sub, None)).await,
         "an existing placed user with no invite must not trigger a userinfo fetch"
+    );
+}
+
+// PMS-1372: `find_bunyip_principal` failing to read (a transient DB error) is
+// not the same thing as reading no row. Collapsing the two into `Needed`
+// forced the `/oauth2/userinfo` round trip PMS-713 exists to skip, for every
+// request, for as long as the error recurred - reintroducing the multi-second
+// stall for an already-placed user during a DB blip.
+#[sqlx::test]
+async fn a_transient_read_failure_does_not_force_the_userinfo_round_trip(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let (auth, tenants, invitations) = services(&pool);
+
+    let org = tenants
+        .ensure_personal_tenant(Uuid::new_v4(), None, None)
+        .await
+        .expect("org tenant");
+    invitations
+        .create(
+            TenantId::from_trusted(org),
+            admin_id,
+            &invite("placed@example.com", "manager"),
+            &AuditCtx::system(org),
+        )
+        .await
+        .expect("invite");
+
+    let sub = Uuid::new_v4();
+    place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("placed@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await
+    .expect("first placement");
+
+    // Force every subsequent query, including `find_bunyip_principal`'s own
+    // read, to fail the way a DB pool exhaustion or a statement timeout would.
+    pool.close().await;
+
+    assert!(
+        !bunyip_userinfo_needed(&auth, Some(&invitations), sub, &claims(sub, None)).await,
+        "a transient read failure for an otherwise-placed user must not force the userinfo round trip"
     );
 }
 

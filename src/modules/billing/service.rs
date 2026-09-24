@@ -19,6 +19,7 @@ use crate::utils::error::{AppError, AppResult, FieldError};
 use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
+use super::numbering;
 use super::provider::{self, CheckoutParams, CheckoutSession, PaymentProvider};
 
 /// Billing operations: invoices, payments, gateway configs, tax rates.
@@ -209,10 +210,38 @@ impl BillingService {
         })
     }
 
+    /// The number a new invoice gets, and the scheme that produced it.
+    ///
+    /// PMS-979: which scheme is the tenant's setting, defaulting to the
+    /// tenant-wide counter this has always used. An MSP's invoice numbering
+    /// is an accounting decision, so switching every existing tenant to a new
+    /// shape mid-year is not a thing to do on their behalf; a tenant opts in
+    /// with `billing_prefs/invoice_numbering`, and the invoices they already
+    /// issued keep the numbers they have, because a number is a stored string
+    /// on the row it belongs to.
     async fn next_invoice_number(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
-    ) -> AppResult<String> {
+        company_id: Uuid,
+    ) -> AppResult<(String, numbering::NumberScheme)> {
+        if numbering::read_scheme(&mut *tx, tenant_id).await?
+            == numbering::NumberScheme::CompanyPrefix
+        {
+            let prefix = numbering::ensure_company_prefix(&mut *tx, tenant_id, company_id).await?;
+            let sequence = numbering::next_company_number(&mut *tx, tenant_id, company_id).await?;
+            return Ok((
+                numbering::format_company_number(&prefix, sequence),
+                numbering::NumberScheme::CompanyPrefix,
+            ));
+        }
+        Self::next_tenant_invoice_number(tx, tenant_id).await
+    }
+
+    /// The pre-PMS-979 shape: one counter for the whole tenant, `INV-000042`.
+    async fn next_tenant_invoice_number(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+    ) -> AppResult<(String, numbering::NumberScheme)> {
         let seq_row: Option<(i32, Option<String>)> = sqlx::query_as(
             r#"
             UPDATE invoice_sequences
@@ -237,10 +266,13 @@ impl BillingService {
                 (1, Some("INV-".to_string()))
             }
         };
-        Ok(format!(
-            "{}{:06}",
-            prefix.unwrap_or_else(|| "INV-".to_string()),
-            next_number
+        Ok((
+            format!(
+                "{}{:06}",
+                prefix.unwrap_or_else(|| "INV-".to_string()),
+                next_number
+            ),
+            numbering::NumberScheme::TenantSequence,
         ))
     }
 
@@ -256,9 +288,13 @@ impl BillingService {
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         invoice_id: Uuid,
-    ) -> AppResult<Option<(Decimal, Decimal, Decimal)>> {
+    ) -> AppResult<Option<(Decimal, Decimal, Decimal, String)>> {
         Ok(sqlx::query_as(
-            "SELECT total, amount_paid, amount_credited FROM invoices \
+            // PMS-999: the status comes back under the same lock as the
+            // totals, so a caller that has to refuse an unissued invoice
+            // reads it from the row it has already locked rather than in a
+            // second query that could see a different state.
+            "SELECT total, amount_paid, amount_credited, status FROM invoices \
              WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
         )
         .bind(invoice_id)
@@ -285,19 +321,44 @@ impl BillingService {
     /// two writers with two rules is how they come to disagree.
     ///
     /// The status ladder is unchanged for an invoice with no credits: with
-    /// `credited = 0` the first arm cannot fire and the rest reduce to exactly
-    /// the pre-PMS-953 expression, zero-total invoices included. Crediting away
-    /// the invoice's full total moves it to `void`, which is what finally
-    /// gives that status a writer: before this it was a value the model knew
-    /// and no code path could reach. The threshold is `i.total`, not the
-    /// already-paid remainder `i.total - p.paid` (PMS-1226): once an invoice
-    /// is fully paid that remainder is zero, so any credit at all, including
-    /// a small post-payment goodwill adjustment (`service.rs`, `create_credit_note`
-    /// documents crediting a paid invoice as intentional), would satisfy it and
-    /// void an invoice that is still paid in full.
+    /// `credited = 0` the credit sums drop out and the arms reduce to exactly
+    /// the pre-PMS-953 expression, zero-total invoices included.
+    ///
+    /// Crediting NEVER voids (PMS-1333). PMS-953 gave `void` its writer here,
+    /// firing once credits covered the invoice's full total, and PMS-1226
+    /// narrowed the threshold to `i.total` after a 5.00 goodwill credit on a
+    /// paid invoice voided it. Both were treating a credited invoice as a
+    /// cancelled one, and it is not: the document stood, the customer holds it,
+    /// and a credit note against it is the correction. A credit that takes the
+    /// balance to zero therefore lands on the `paid` arm, which is also what
+    /// Stripe does - "if a credit note reduces the balance of an open invoice
+    /// to 0, the invoice status changes to paid"
+    /// (<https://docs.stripe.com/invoicing/dashboard/credit-notes>) - so the
+    /// local state does not diverge from the provider a tenant may be
+    /// reconciling against. Voiding is [`Self::void_invoice`] and nothing else.
+    ///
+    /// `voided_at` leads the CASE for the reason `written_off_at` does: both
+    /// are terminal states owned by an endpoint, and every payment or credit
+    /// event runs this statement, so without the arm the next event on such an
+    /// invoice would derive a status over the top of one somebody chose.
+    ///
+    /// An unissued invoice leads all of them (PMS-999). This statement used to
+    /// fall through to a literal `'sent'` whenever nothing was paid or
+    /// credited, so recording a payment against a `draft` rewrote it to `sent`
+    /// in raw SQL: the only path to that status that did not go through
+    /// `update_invoice`, and so the only one that skipped everything being
+    /// sent means. Such an invoice had no `sent_at`, no frozen issuer snapshot
+    /// (PMS-911), no stored document (PMS-959) and, after PMS-993, no billing
+    /// contact to address the pay-now mail to. `create_payment` and
+    /// `record_gateway_payment` now refuse an unissued invoice outright, and
+    /// this arm is the statement's own invariant rather than an assumption
+    /// about its callers: a recompute derives the consequences of money
+    /// moving, and issuing a document is not one of them.
     ///
     /// `paid_at` stays keyed on payments alone. A credited invoice was not
-    /// paid, and stamping it would put a payment date on money nobody sent.
+    /// paid, and stamping it would put a payment date on money nobody sent, so
+    /// a fully credited invoice reads `paid` with no payment date - which is
+    /// the honest pair: nothing is owed and nobody paid.
     async fn recompute_invoice_balance(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
@@ -311,15 +372,15 @@ impl BillingService {
                 amount_paid     = p.paid,
                 amount_credited = p.credited,
                 balance_due     = i.total - p.paid - p.credited,
-                -- PMS-1036: a write-off is an input to this CASE, not a value
-                -- it derives. Every payment or credit event runs it, so
-                -- without the first arm the next partial payment on a
-                -- written-off invoice would flip it back to partially_paid;
-                -- a late payment is a recovery, recorded and kept, with the
-                -- status standing.
-                status      = CASE WHEN i.written_off_at IS NOT NULL THEN 'written_off'
-                                   WHEN p.credited > 0
-                                    AND p.credited >= i.total THEN 'void'
+                -- PMS-1036 and PMS-1333: a write-off and a void are inputs
+                -- to this CASE, not values it derives. Every payment or credit
+                -- event runs it, so without the first two arms the next
+                -- partial payment on a written-off invoice would flip it back
+                -- to partially_paid; a late payment is a recovery, recorded
+                -- and kept, with the status standing.
+                status      = CASE WHEN i.status IN ('draft', 'pending') THEN i.status
+                                   WHEN i.written_off_at IS NOT NULL THEN 'written_off'
+                                   WHEN i.voided_at IS NOT NULL THEN 'void'
                                    WHEN i.total - p.paid - p.credited <= 0 THEN 'paid'
                                    WHEN p.paid > 0 THEN 'partially_paid'
                                    ELSE 'sent' END,
@@ -860,6 +921,8 @@ impl BillingService {
                    balance_due, currency, notes, po_number, sent_at, paid_at,
                    created_at, updated_at, emailed_at, emailed_to,
                    written_off_at, written_off_by_id, write_off_reason, write_off_amount,
+                   voided_at, voided_by_id, void_reason,
+                   number_scheme,
                    tax_rate_id, tax_rate
             FROM invoices
             WHERE {data_where}
@@ -922,10 +985,12 @@ impl BillingService {
     ) -> AppResult<InvoiceResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        // Per-tenant invoice sequence is row-locked by the shared helper;
-        // concurrent invoice creates serialise on this row so numbers are
-        // dense and unique.
-        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
+        // The sequence row is locked by the shared helper, so concurrent
+        // creates serialise on it and numbers stay dense and unique. Which
+        // sequence, and therefore what the number looks like, is the tenant's
+        // setting (PMS-979).
+        let (invoice_number, number_scheme) =
+            Self::next_invoice_number(&mut tx, tenant_id, request.company_id).await?;
 
         // Compute totals from the supplied lines. Tax / discount are
         // optional - default to 0.
@@ -976,10 +1041,10 @@ impl BillingService {
                 contract_id, status, invoice_date, due_date, payment_terms,
                 payment_term_id,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number
+                balance_due, currency, notes, po_number, number_scheme
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $17, $10, $11,
-                    $12, $13, 0, $13, $14, $15, $16)
+                    $12, $13, 0, $13, $14, $15, $16, $18)
             "#,
         )
         .bind(invoice_id)
@@ -999,6 +1064,7 @@ impl BillingService {
         .bind(&request.notes)
         .bind(&request.po_number)
         .bind(payment_term_id)
+        .bind(number_scheme.as_str())
         .execute(&mut *tx)
         .await?;
 
@@ -1201,7 +1267,8 @@ impl BillingService {
 
         // 2. Allocate a gapless invoice number (same row-lock as
         //    `create_invoice`). Concurrent creates serialise on this row.
-        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
+        let (invoice_number, number_scheme) =
+            Self::next_invoice_number(&mut tx, tenant_id, request.company_id).await?;
 
         // 3. Build one line per entry, accumulating the subtotal. The
         //    sixty-minute divisor is a Decimal so quantity keeps its
@@ -1325,10 +1392,11 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number, payment_term_id
+                balance_due, currency, notes, po_number, payment_term_id,
+                number_scheme
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $10, $11,
-                    $12, $13, 0, $13, $14, $15, $16, $17)
+                    $12, $13, 0, $13, $14, $15, $16, $17, $18)
             "#,
         )
         .bind(invoice_id)
@@ -1348,6 +1416,7 @@ impl BillingService {
         .bind(&request.notes)
         .bind(&request.po_number)
         .bind(payment_term_id)
+        .bind(number_scheme.as_str())
         .execute(&mut *tx)
         .await?;
 
@@ -1940,12 +2009,12 @@ impl BillingService {
         let (due_date, payment_term_id) =
             Self::resolve_due_date(&mut tx, tenant_id, invoice_date, None, None).await?;
 
-        // Gapless invoice number: same per-tenant row-lock as
-        // `create_invoice`. NOTE: this increments the sequence even if the
-        // ledger insert below conflicts and we roll back; the rollback
-        // restores the sequence value too (the UPDATE is part of this tx),
-        // so numbers stay gapless.
-        let invoice_number = Self::next_invoice_number(&mut tx, tenant_id).await?;
+        // Gapless invoice number: same row-lock as `create_invoice`. NOTE:
+        // this increments the sequence even if the ledger insert below
+        // conflicts and we roll back; the rollback restores the sequence
+        // value too (the UPDATE is part of this tx), so numbers stay gapless.
+        let (invoice_number, number_scheme) =
+            Self::next_invoice_number(&mut tx, tenant_id, company_id).await?;
 
         // PMS-1016: this path has no caller to name a contact, so it is the
         // company's default or nobody. A company with no pointer still
@@ -1959,10 +2028,11 @@ impl BillingService {
                 id, tenant_id, invoice_number, company_id, billing_contact_id,
                 contract_id, status, invoice_date, due_date, payment_terms,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number, payment_term_id
+                balance_due, currency, notes, po_number, payment_term_id,
+                number_scheme
             )
             VALUES ($1, $2, $3, $4, $13, $5, 'draft', $6, $7, 'net30', $8, $9,
-                    $10, $11, 0, $11, $15, $12, NULL, $14)
+                    $10, $11, 0, $11, $15, $12, NULL, $14, $16)
             "#,
         )
         .bind(invoice_id)
@@ -1984,6 +2054,7 @@ impl BillingService {
         // PMS-1028: a recurring invoice names nothing, so it is issued in
         // the tenant's default currency.
         .bind(read_default_currency(&mut tx, tenant_id).await?)
+        .bind(number_scheme.as_str())
         .execute(&mut *tx)
         .await?;
 
@@ -3452,12 +3523,30 @@ impl BillingService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Lock the invoice so this read-modify-write serialises with manual
         // payments and concurrent webhook deliveries (PMS-695).
-        if Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id)
-            .await?
-            .is_none()
-        {
+        let Some((_, _, _, status)) =
+            Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?
+        else {
             // Invoice deleted between checkout and webhook. Nothing to
             // reconcile; report handled so the provider stops retrying.
+            return Ok(false);
+        };
+        // PMS-999: the webhook twin of the guard in `create_payment`. It
+        // should be unreachable, because `create_invoice_checkout_session`
+        // refuses a draft, so the customer cannot have been given a pay link
+        // for one. Reported as handled rather than as an error, for the same
+        // reason the deleted-invoice arm above is: the provider retrying
+        // would not change the answer, and this is a state a human has to
+        // look at rather than something the delivery can fix.
+        if matches!(
+            InvoiceStatus::from_str(&status),
+            Some(InvoiceStatus::Draft) | Some(InvoiceStatus::Pending)
+        ) {
+            tracing::error!(
+                %invoice_id,
+                %status,
+                provider_id,
+                "gateway payment for an invoice that was never sent; not recording it"
+            );
             return Ok(false);
         }
 
@@ -3697,11 +3786,29 @@ impl BillingService {
         // whole read-modify-write is serialised and an overpayment rejection
         // does not have to unwind an already-inserted payment row.
         if let Some(invoice_id) = request.invoice_id {
-            let Some((total, prior_paid, prior_credited)) =
+            let Some((total, prior_paid, prior_credited, status)) =
                 Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?
             else {
                 return Err(AppError::NotFound("Invoice".to_string()));
             };
+            // PMS-999: a payment against an invoice the customer has never
+            // been given is a data-entry error, not a state worth
+            // representing. Before this the recompute below laundered it into
+            // a send: the invoice came out `sent` with no `sent_at`, no frozen
+            // issuer and no stored document, which is the one way to reach
+            // that status without going through `update_invoice`. Refusing
+            // here rather than sending for them, because a send emails the
+            // customer and freezes a document, and neither belongs in
+            // recording a payment.
+            if matches!(
+                InvoiceStatus::from_str(&status),
+                Some(InvoiceStatus::Draft) | Some(InvoiceStatus::Pending)
+            ) {
+                return Err(AppError::Conflict(format!(
+                    "Invoice in status '{status}' has not been sent, so a payment cannot be \
+                     recorded against it. Send it first."
+                )));
+            }
             // Reject overpayment so `balance_due` never goes negative
             // (PMS-194, widened in PMS-1225 to account for credits). The
             // remaining balance is `total - prior_paid - prior_credited`,
@@ -4285,12 +4392,57 @@ impl BillingService {
                 .bind(address)
                 .execute(&mut *tx)
                 .await?;
+                // PMS-978: the delivery gets its own audit row, the shape
+                // PMS-977 gave the company move. The whole-row snapshot below
+                // carries `emailed_to` and `emailed_at` too, but only as two
+                // columns that differ between two JSON blobs; "this invoice
+                // was emailed to this address at this time, by this user" is
+                // the question an operator actually asks, and it should not
+                // require diffing a row to answer. Inside the transaction
+                // with the send, so a relay refusal takes the record of it
+                // away as well.
+                audit_write(
+                    &mut *tx,
+                    tenant_id,
+                    ctx,
+                    AuditAction::Update,
+                    "invoices",
+                    Some(invoice_id),
+                    None,
+                    Some(serde_json::json!({
+                        "event": "invoice.sent",
+                        "invoice_number": document.invoice_number,
+                        "emailed_to": address,
+                        "billing_contact_id": contact_id,
+                    })),
+                )
+                .await?;
             } else {
                 tracing::info!(
                     target: "mokosh_server.billing",
                     %invoice_id,
                     "invoice marked sent without emailing (skip_email)",
                 );
+                // PMS-978: the deliberate no-email send says so in the
+                // history too. Without a row of its own it is indistinguishable
+                // afterwards from a send whose mail was lost: both leave a
+                // `sent` invoice with no `emailed_to`, and only one of them
+                // was somebody's decision.
+                audit_write(
+                    &mut *tx,
+                    tenant_id,
+                    ctx,
+                    AuditAction::Update,
+                    "invoices",
+                    Some(invoice_id),
+                    None,
+                    Some(serde_json::json!({
+                        "event": "invoice.marked_sent",
+                        "invoice_number": document.invoice_number,
+                        "emailed_to": serde_json::Value::Null,
+                    })),
+                )
+                .await?;
             }
         }
 
@@ -5016,6 +5168,111 @@ impl BillingService {
         Ok(invoice)
     }
 
+    /// PMS-1333: void an invoice. The document never stood.
+    ///
+    /// The other half of the credit-note fix: `void` had no writer of its own,
+    /// only the arm in [`Self::recompute_invoice_balance`] that fired when
+    /// credits covered an invoice's total, and three comments (here, in
+    /// `update_invoice`, and in the refusal `update_invoice` returns) named a
+    /// `void_invoice` that did not exist. PMS-1227 then closed the one path a
+    /// client had, `PUT /invoices/{id}` with `{"status":"void"}`, so voiding a
+    /// draft answered 422 and pointed at this method. This is it.
+    ///
+    /// Allowed from `draft` and `pending` only, and that bound is the product
+    /// rule rather than a cautious default: once an invoice is `sent` the
+    /// customer holds a copy and can quote its number back, so it is frozen
+    /// (`InvoiceStatus::is_frozen`) and its correction is a credit note
+    /// (PMS-953), which is what `locked_invoice_note` on the client already
+    /// tells the operator. Refused with a 409 naming the status from
+    /// everything else.
+    ///
+    /// Unlike a write-off (PMS-1036) this freezes no amount. A write-off
+    /// forgives a debt that was genuinely owed, so the balance at that moment
+    /// is the number the books need; a void says nothing was ever owed, and an
+    /// invoice that never left `draft` or `pending` has no payments, no
+    /// credits and no statement line to reconcile against.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn void_invoice(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        user_id: Uuid,
+        request: &VoidInvoiceRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<InvoiceResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT invoice_number, status FROM invoices \
+             WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((invoice_number, status)) = row else {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        };
+        let status = InvoiceStatus::from_str(&status).unwrap_or(InvoiceStatus::Draft);
+        if !matches!(status, InvoiceStatus::Draft | InvoiceStatus::Pending) {
+            return Err(AppError::Conflict(format!(
+                "Invoice {invoice_number} cannot be voided in status '{}': the customer already \
+                 holds it. Issue a credit note against it instead.",
+                status.as_str()
+            )));
+        }
+
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let reason = request
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty());
+        sqlx::query(
+            r#"
+            UPDATE invoices
+            SET status       = 'void',
+                voided_at    = NOW(),
+                voided_by_id = $3,
+                void_reason  = $4,
+                updated_at   = NOW()
+            WHERE id = $1 AND tenant_id = $2
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "invoices",
+            Some(invoice_id),
+            before,
+            after,
+        )
+        .await?;
+        let invoice = Self::load_invoice(&mut tx, tenant_id, invoice_id).await?;
+        tx.commit().await?;
+        Ok(invoice)
+    }
+
     /// Assemble one invoice, in a transaction the caller owns (PMS-959).
     ///
     /// The whole of what an invoice response is, in one place with two entry
@@ -5044,6 +5301,8 @@ impl BillingService {
                    balance_due, currency, notes, po_number, sent_at, paid_at,
                    created_at, updated_at, emailed_at, emailed_to,
                    written_off_at, written_off_by_id, write_off_reason, write_off_amount,
+                   voided_at, voided_by_id, void_reason,
+                   number_scheme,
                    tax_rate_id, tax_rate
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
@@ -5109,6 +5368,19 @@ impl BillingService {
         // as no name rather than an error.
         if let Some(user_id) = resp.written_off_by_id {
             resp.written_off_by_name = sqlx::query_scalar(
+                "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
+                 FROM users WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+        }
+        // PMS-1333: and the one who voided it, the same way, so the page can
+        // say who without a users lookup it has no route for.
+        if let Some(user_id) = resp.voided_by_id {
+            resp.voided_by_name = sqlx::query_scalar(
                 "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
                  FROM users WHERE tenant_id = $1 AND id = $2",
             )
@@ -5323,7 +5595,9 @@ impl BillingService {
     /// since PMS-38 and PMS-39, in comments that both said "out of scope for
     /// this commit". Until it existed, an issued invoice could not be edited,
     /// cancelled or written off by any route, and `void` was a status the model
-    /// knew and nothing could write.
+    /// knew and nothing could write. Crediting was made to write it too, which
+    /// PMS-1333 undid: crediting an invoice in full leaves it `paid`, and
+    /// [`Self::void_invoice`] is what writes `void`.
     ///
     /// The invoice is not touched beyond its derived balance: its lines, totals
     /// and number stay exactly as the customer received them, because the
@@ -5415,6 +5689,16 @@ impl BillingService {
                 "This invoice has been written off; issuing a credit note against it would \
                  remove the same debt twice"
                     .to_string(),
+            ));
+        }
+        // PMS-1333: `void` passes the `is_frozen` gate above, and before this
+        // it could only be reached BY a credit note, so there was nothing to
+        // refuse. Now that voiding is its own act it means the document never
+        // stood, and there is nothing to correct: a credit note against it
+        // would be a correction to a charge that was never made.
+        if status == InvoiceStatus::Void {
+            return Err(AppError::BadRequest(
+                "This invoice was voided, so it charges nothing to credit".to_string(),
             ));
         }
 
@@ -5758,10 +6042,18 @@ impl BillingService {
 
     /// A statement is an account, and an account is what the client owes.
     /// A draft or pending invoice has not been issued, so it is not owed and
-    /// does not appear; every other status does, `void` included, because the
-    /// credit note that voided it appears too and dropping both would remove
-    /// the correction from the record along with the charge.
-    const STATEMENT_ISSUED_INVOICE: &'static str = "status NOT IN ('draft', 'pending')";
+    /// does not appear; neither does a voided one (PMS-1333), because voiding
+    /// is allowed only from those two statuses and says the document never
+    /// stood. Every other status appears, a written-off invoice included: that
+    /// debt was real and its own line says what became of it.
+    ///
+    /// `void` used to be on the statement for a reason that no longer holds.
+    /// It was reachable only by crediting an invoice for its full total, so
+    /// the credit note that voided it appeared beside it and dropping both
+    /// would have taken the correction out of the record along with the
+    /// charge. A full credit now leaves the invoice `paid`, so that pair still
+    /// appears; what is excluded here never reached a customer.
+    const STATEMENT_ISSUED_INVOICE: &'static str = "status NOT IN ('draft', 'pending', 'void')";
 
     /// PMS-954: a company's account over a period.
     ///
@@ -6781,6 +7073,10 @@ struct InvoiceRow {
     written_off_by_id: Option<Uuid>,
     write_off_reason: Option<String>,
     write_off_amount: Option<Decimal>,
+    voided_at: Option<chrono::DateTime<Utc>>,
+    voided_by_id: Option<Uuid>,
+    void_reason: Option<String>,
+    number_scheme: Option<String>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -6828,6 +7124,11 @@ impl From<InvoiceRow> for InvoiceResponse {
             written_off_by_name: None,
             write_off_reason: r.write_off_reason,
             write_off_amount: r.write_off_amount,
+            voided_at: r.voided_at,
+            voided_by_id: r.voided_by_id,
+            voided_by_name: None,
+            void_reason: r.void_reason,
+            number_scheme: r.number_scheme,
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,

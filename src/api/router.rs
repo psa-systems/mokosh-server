@@ -345,8 +345,17 @@ pub fn create_api_router(
     // present) is attached so the middleware can authenticate bunyip-minted
     // bearer tokens alongside legacy HS256 cookies.
     let mut auth_middleware = AuthMiddleware::new(auth_service.clone());
+    // PMS-998: one set, shared by the back-channel logout receiver that fills
+    // it and the bearer path that reads it. Built here rather than inside
+    // either so neither owns it.
+    let revoked_sessions = crate::modules::auth::backchannel_logout::RevokedSessions::new();
+    // The receiver needs the same verifier the bearer path uses, and
+    // `bunyip_verifier` is moved into the middleware below.
+    let logout_verifier = bunyip_verifier.clone();
     if let Some(v) = bunyip_verifier {
-        auth_middleware = auth_middleware.with_bunyip(v);
+        auth_middleware = auth_middleware
+            .with_bunyip(v)
+            .with_revoked_sessions(revoked_sessions.clone());
         // PMS-244: the bunyip path resolves the user's tenant from Mokosh's own
         // membership - a pending invite, else existing placement, else a
         // provisioned personal tenant. Its own cheap pool-backed tenant handle
@@ -741,7 +750,34 @@ pub fn create_api_router(
         pool: db.migrator_pool().clone(),
         webhook_secret: bunyip_webhook_secret,
     });
-    let bunyip_webhooks = Router::new()
+    // PMS-998: the OIDC back-channel logout receiver, in the same nest and
+    // outside the auth chain for the same reason the webhooks are: the caller
+    // is the OP and carries no session. What authenticates it is the logout
+    // token's own signature over bunyip's key, verified through the same JWKS
+    // the bearer path uses, so it needs no shared secret. Mounted whether or
+    // not the verifier exists; with no verifier there is nothing to verify
+    // against, and the route answering 404 in that deployment would be
+    // indistinguishable from a typo in bunyip's registered URI.
+    let backchannel_logout = logout_verifier.map(|verifier| {
+        let state = Arc::new(
+            crate::modules::auth::backchannel_logout::BackchannelLogoutState {
+                verifier,
+                revoked: revoked_sessions.clone(),
+                client_id: crate::config::get(&crate::config::registry::OIDC_BACKCHANNEL_CLIENT_ID)
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+                limiter: crate::modules::auth::backchannel_logout::BackchannelLogoutLimiter::new(),
+            },
+        );
+        Router::new()
+            .route(
+                "/oauth2/backchannel-logout",
+                post(crate::modules::auth::backchannel_logout::backchannel_logout),
+            )
+            .with_state(state)
+    });
+
+    let bunyip_nest = Router::new()
         .route(
             "/webhooks/account-deleted",
             post(crate::modules::auth::bunyip_webhook::account_deleted),
@@ -760,6 +796,16 @@ pub fn create_api_router(
         .layer(middleware::from_fn(
             crate::utils::error::normalize_error_envelope,
         ));
+    // PMS-998: merged rather than routed inside the block above because the
+    // two carry different state (an HMAC secret and a pool, against the OP
+    // verifier and the revoked set), and because the logout receiver answers
+    // the OP's own status codes rather than this API's error envelope: a 400
+    // it wraps would still be a delivery failure to bunyip, but the body
+    // would claim to be a Mokosh error for a caller that is not a client.
+    let bunyip_nest = match backchannel_logout {
+        Some(logout) => bunyip_nest.merge(logout),
+        None => bunyip_nest,
+    };
 
     // PMS-711: Stripe webhook receiver. Nested under `/api/v1/stripe` OUTSIDE
     // the JWT auth chain: Stripe authenticates itself with the `Stripe-Signature`
@@ -903,7 +949,7 @@ pub fn create_api_router(
         .nest("/api/v1", api_v1)
         .nest("/api/v1/public", public_api)
         .nest("/api/v1/contact", contact_api)
-        .nest("/api/v1/bunyip", bunyip_webhooks)
+        .nest("/api/v1/bunyip", bunyip_nest)
         .nest("/api/v1/stripe", stripe_webhooks)
         .nest("/api/v1/paypal", paypal_webhooks)
         .fallback(get(move |headers| {

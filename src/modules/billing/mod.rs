@@ -31,6 +31,8 @@ pub mod descriptions;
 pub mod documents;
 pub mod issuer;
 pub mod models;
+// PMS-979: what an invoice number is and who it belongs to.
+pub mod numbering;
 pub mod provider;
 pub mod routes;
 pub mod service;
