@@ -322,6 +322,27 @@ impl AutomationEngine {
                             .get("note_type")
                             .and_then(|v| v.as_str())
                             .unwrap_or("internal");
+                        // ticket_notes.created_by_id is NOT NULL FK to
+                        // users(id); a nil uuid fails the FK on the first
+                        // run against a real schema. The portal-note path
+                        // attributes to the tenant's fallback admin/manager
+                        // (`update_portal_ticket` in tickets/service.rs); the
+                        // automation engine picks the same row.
+                        let fallback: Option<Uuid> = sqlx::query_scalar(
+                            "SELECT id FROM users WHERE tenant_id = $1 AND status = 'active' \
+                             AND role IN ('super_admin', 'admin', 'manager') \
+                             ORDER BY created_at LIMIT 1",
+                        )
+                        .bind(tenant_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        let Some(created_by_id) = fallback else {
+                            tracing::warn!(
+                                %ticket_id, rule = %rule.name,
+                                "add_note skipped: tenant has no admin/manager to attribute the note to",
+                            );
+                            continue;
+                        };
                         sqlx::query(
                             "INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type, content, created_by_id) VALUES ($1, $2, $3, $4, $5, $6)",
                         )
@@ -330,7 +351,7 @@ impl AutomationEngine {
                         .bind(ticket_id)
                         .bind(note_type)
                         .bind(content)
-                        .bind(Uuid::nil()) // System-generated
+                        .bind(created_by_id)
                         .execute(&mut *tx)
                         .await?;
                     }

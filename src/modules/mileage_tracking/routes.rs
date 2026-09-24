@@ -1,5 +1,9 @@
 //! Mileage-tracking HTTP routes (PMS-315). Shape mirrors the time-entry CRUD
 //! endpoints; gated by the time-tracking module (`RequireTimeTracking`).
+//!
+//! parity record 2026-09-22: the SPA has no mileage entry surface today.
+//! The routes stay mounted so `RequireTimeTracking` and the block-hours
+//! consumption plumbing keep working; the entry screen is deferred.
 
 use std::sync::Arc;
 

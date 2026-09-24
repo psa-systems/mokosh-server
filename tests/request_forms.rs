@@ -527,8 +527,13 @@ async fn a_valid_submission_creates_a_ticket_carrying_the_data_and_the_article(p
         .to_string();
     assert_eq!(
         receipt.as_object().map(|o| o.len()),
-        Some(1),
-        "the receipt carries the ticket number and nothing else about the tenant"
+        Some(2),
+        "the receipt carries the ticket number and, since PMS-737, how many \
+         submissions the link has left, and nothing else about the tenant"
+    );
+    assert_eq!(
+        receipt["submissions_remaining"], 0,
+        "a single-person link is spent by this submission"
     );
 
     let (
@@ -740,6 +745,59 @@ async fn a_link_is_single_use(pool: PgPool) {
         .await
         .expect("count tickets");
     assert_eq!(tickets, 1, "exactly one ticket for one link");
+}
+
+/// PMS-1370: two concurrent submissions for the same single-use link must not
+/// both create a ticket. Before the fix, `tickets.create_ticket` ran ahead of
+/// the `uses_remaining` claim, so both requests could pass the earlier
+/// resolve check, both create a ticket, and only afterward would the claim
+/// pick a loser: the loser's ticket, already committed, was never rolled
+/// back. Firing both requests through the real bound listener (rather than
+/// calling the service directly) is what lets them actually race.
+#[sqlx::test]
+async fn a_concurrent_double_submit_produces_exactly_one_ticket(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let agent_token = common::login(&app, &email, &password).await;
+    let (form_id, _) = seed_form_with_article(&app, &agent_token, &pool, admin_id).await;
+    let (token, _) = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+
+    let payload = json!({"payload": {
+        "first_name": "Dana",
+        "start_date": "2099-06-01",
+        "laptop": "new"
+    }});
+
+    let send = |payload: serde_json::Value| {
+        app.client
+            .post(app.url(&format!("/api/v1/public/request-forms/{token}")))
+            .json(&payload)
+            .send()
+    };
+    let (first, second) = tokio::join!(send(payload.clone()), send(payload));
+    let first = first.expect("send first submission");
+    let second = second.expect("send second submission");
+
+    let statuses = [first.status(), second.status()];
+    assert!(
+        statuses.contains(&reqwest::StatusCode::CREATED),
+        "exactly one of the two concurrent submissions must succeed, got {statuses:?}"
+    );
+    assert!(
+        statuses.contains(&reqwest::StatusCode::GONE),
+        "exactly one of the two concurrent submissions must be refused as already submitted, got {statuses:?}"
+    );
+
+    let tickets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tickets WHERE tenant_id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("count tickets");
+    assert_eq!(
+        tickets, 1,
+        "a single-use link must produce exactly one ticket under concurrent submission"
+    );
 }
 
 #[sqlx::test]

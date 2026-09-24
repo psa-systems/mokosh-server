@@ -1,4 +1,10 @@
 //! Billing HTTP routes. Endpoints land incrementally across PMS-33.
+//!
+//! parity record 2026-09-22: `/payment-gateways/webhook-deliveries` has no
+//! SPA caller. It is an operator observability surface (recent Stripe /
+//! PayPal webhook attempts and their outcomes) that the admin reaches
+//! through the API; the delivery-log screen is deferred. Every other route
+//! in this file is consumed.
 
 use std::sync::Arc;
 
@@ -75,6 +81,13 @@ pub fn billing_routes(service: BillingService, public_api_base: Option<String>) 
         .route(
             "/invoices/{invoice_id}/write-off",
             axum::routing::post(write_off_invoice),
+        )
+        // PMS-1333: voiding, which had no endpoint at all. POST for the same
+        // reason the write-off is one, and because PMS-1227 closed the status
+        // field on PUT that a client used to void a draft through.
+        .route(
+            "/invoices/{invoice_id}/void",
+            axum::routing::post(void_invoice),
         )
         // PMS-911 / PMS-936: the invoice as a client receives it. Rendered
         // from the issuer snapshot frozen when it was sent, so a later rebrand
@@ -714,6 +727,26 @@ async fn write_off_invoice(
     let invoice = state
         .service
         .write_off_invoice(user.tenant(), invoice_id, user.id, &request, &ctx)
+        .await?;
+    Ok(Json(invoice))
+}
+
+/// PMS-1333: void an invoice nobody was ever sent. Finance only, like every
+/// other write that decides what a client owes. 409 names the status when the
+/// invoice is past `pending`, because from there the correction is a credit
+/// note; the reason is optional.
+async fn void_invoice(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(invoice_id): Path<Uuid>,
+    Json(request): Json<VoidInvoiceRequest>,
+) -> AppResult<Json<InvoiceResponse>> {
+    request.validate()?;
+    let invoice = state
+        .service
+        .void_invoice(user.tenant(), invoice_id, user.id, &request, &ctx)
         .await?;
     Ok(Json(invoice))
 }
