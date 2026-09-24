@@ -20,6 +20,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -54,7 +55,7 @@ async fn delete_company_raw(app: &common::TestApp, token: &str, company_id: Uuid
 /// Pinned on `credential_vault` since PMS-919. It is the one nullable column
 /// that deliberately still blocks, so it exercises the `23503` path without
 /// depending on a `NOT NULL` table's own seeding requirements.
-#[sqlx::test]
+#[mokosh_test]
 async fn delete_company_with_stored_credentials_returns_400_not_500(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Vault Co").await;
@@ -96,7 +97,7 @@ async fn delete_company_with_stored_credentials_returns_400_not_500(pool: PgPool
 
 /// PMS-919 AC2: a parent company delete promotes its children to top level
 /// instead of blocking. This is the inversion of the original PMS-170 test.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_a_parent_company_promotes_its_children_to_top_level(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let parent = seed_company_named(&pool, "Parent Co").await;
@@ -142,7 +143,7 @@ async fn deleting_a_parent_company_promotes_its_children_to_top_level(pool: PgPo
 /// company delete as a whole: a delete that unlinked three of them and blocked
 /// on the fourth would still be the MAPPS-574 defect, and four separate tests
 /// would each pass while the combination failed.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_a_company_unlinks_every_nullable_dependent(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Unlink Co").await;
@@ -242,7 +243,7 @@ async fn deleting_a_company_unlinks_every_nullable_dependent(pool: PgPool) {
 /// PMS-919 AC3: the `NOT NULL` group is untouched and still refuses. A
 /// company-less asset is not representable, so unlinking is not an option and
 /// the block is the data model rather than an omission.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_company_with_assets_still_refuses(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Asset Co").await;
@@ -283,7 +284,7 @@ async fn a_company_with_assets_still_refuses(pool: PgPool) {
 /// is nullable, so on a tenant with no overhead time yet the delete would
 /// succeed, the pointer would go NULL, and the failure would surface much later
 /// as a NOT NULL violation on `time_entries` (PMS-413, MAPPS-243).
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_the_tenants_own_company_names_its_role(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let own = seed_company_named(&pool, "Our MSP").await;
@@ -329,7 +330,7 @@ async fn deleting_the_tenants_own_company_names_its_role(pool: PgPool) {
 /// For an invoice that is advice they must not take: deleting the billing
 /// record to tidy a client list destroys exactly what the refusal exists to
 /// protect. This is the half of the message that was actively harmful.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_retained_blocker_is_not_something_the_operator_is_told_to_delete(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Billed Co").await;
@@ -366,7 +367,7 @@ async fn a_retained_blocker_is_not_something_the_operator_is_told_to_delete(pool
 
 /// The two halves must be distinguishable from each other, or splitting them
 /// bought nothing. Same company shape, different blocker, different advice.
-#[sqlx::test]
+#[mokosh_test]
 async fn retained_and_removable_blockers_give_different_advice(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let retained = seed_company_named(&pool, "Retained Co").await;
@@ -511,7 +512,7 @@ async fn company_contact_ids(app: &common::TestApp, token: &str, company_id: &st
 /// AC: a contact linked to A (primary) and B survives the delete of A with B
 /// promoted to primary, `contacts.company_id = B`, and the contact still
 /// listed under B.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_a_company_unlinks_a_multi_linked_contact_and_promotes_the_survivor(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -574,7 +575,7 @@ async fn deleting_a_company_unlinks_a_multi_linked_contact_and_promotes_the_surv
 
 /// AC: a contact linked only to A survives the delete of A as a company-less
 /// contact (`company_id` NULL, no links) and is still readable.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_a_company_leaves_its_only_contact_company_less(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -627,7 +628,7 @@ async fn deleting_a_company_leaves_its_only_contact_company_less(pool: PgPool) {
 /// delete that does NOT go through `delete_company` (a direct SQL delete, or a
 /// mirror that outlives its link row). Under the old CASCADE this deleted the
 /// contact outright.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_raw_company_delete_nulls_the_contact_mirror_instead_of_cascading(pool: PgPool) {
     let company_id = Uuid::new_v4();
     let contact_id = Uuid::new_v4();

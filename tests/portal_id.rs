@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -117,7 +118,7 @@ fn generate_portal_id_stays_in_9_digit_range() {
 // grant_portal_access: portal_id assignment + idempotency + email
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn grant_portal_access_assigns_a_portal_id(pool: PgPool) {
     let (company_id, _, _slug, portal_id, _token) =
         seed_portal_contact_with_portal_id(&pool, "PID Grant Co", "grant@pid.example").await;
@@ -139,7 +140,7 @@ async fn grant_portal_access_assigns_a_portal_id(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn grant_portal_access_is_idempotent_on_portal_id(pool: PgPool) {
     let (_, contact_id, _slug1, portal_id1, _t1) =
         seed_portal_contact_with_portal_id(&pool, "PID Idem Co", "idem@pid.example").await;
@@ -171,7 +172,7 @@ async fn grant_portal_access_is_idempotent_on_portal_id(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn grant_email_carries_the_portal_id(pool: PgPool) {
     // Drive the grant end-to-end via HTTP so the boot()-side
     // NotificationsService actually queues the email (the raw
@@ -245,7 +246,7 @@ async fn grant_email_carries_the_portal_id(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn portal_id_collision_retry_is_shaped_as_a_bounded_loop(pool: PgPool) {
     // Directly mocking `generate_portal_id` would require a global
     // seam we deliberately do not carry (the helper is a free
@@ -286,7 +287,7 @@ async fn portal_id_collision_retry_is_shaped_as_a_bounded_loop(pool: PgPool) {
 
 const STRONG_PW: &str = "Kq7$mZ2n#PxR9wLf";
 
-#[sqlx::test]
+#[mokosh_test]
 async fn login_with_portal_id_succeeds(pool: PgPool) {
     let (_, _, _slug, portal_id, token) =
         seed_portal_contact_with_portal_id(&pool, "PID Login Co", "pid-login@pid.example").await;
@@ -313,7 +314,7 @@ async fn login_with_portal_id_succeeds(pool: PgPool) {
     assert!(body["access_token"].as_str().unwrap_or_default().len() > 20);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn login_with_legacy_slug_still_succeeds(pool: PgPool) {
     // Compat pin: prompt 011 does NOT drop the slug column, and a
     // body carrying only `slug` (the pre-prompt-011 shape) must
@@ -341,7 +342,7 @@ async fn login_with_legacy_slug_still_succeeds(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn login_prefers_portal_id_when_both_supplied(pool: PgPool) {
     // Two Companies, one Contact each. Body sends Company B's
     // portal_id with Company A's slug (mismatched). Prompt 011 says
@@ -380,7 +381,7 @@ async fn login_prefers_portal_id_when_both_supplied(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn login_with_unknown_portal_id_returns_401_same_shape(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let resp = app
@@ -401,7 +402,7 @@ async fn login_with_unknown_portal_id_returns_401_same_shape(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn login_with_neither_portal_id_nor_slug_returns_401_same_shape(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let resp = app
@@ -425,7 +426,7 @@ async fn login_with_neither_portal_id_nor_slug_returns_401_same_shape(pool: PgPo
 // magic-link finder scoping
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn login_link_finder_scoped_to_portal_id_returns_single_match(pool: PgPool) {
     // Same email under two Companies (both portal-enabled). Finder
     // body carries the Portal ID of Company A + the shared email;
@@ -521,7 +522,7 @@ async fn login_link_finder_scoped_to_portal_id_returns_single_match(pool: PgPool
 // host endpoint by portal_id + slug-to-portal_id resolver
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn host_endpoint_by_portal_id_returns_hint_for_known_and_404s_for_unknown(pool: PgPool) {
     let (_, _, _slug, portal_id, _token) =
         seed_portal_contact_with_portal_id(&pool, "PID Host Co", "host@pid.example").await;
@@ -548,7 +549,7 @@ async fn host_endpoint_by_portal_id_returns_hint_for_known_and_404s_for_unknown(
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn resolve_to_portal_id_returns_id_for_known_slug_and_404s_for_unknown(pool: PgPool) {
     let (_, _, slug, portal_id, _token) =
         seed_portal_contact_with_portal_id(&pool, "PID Resolve Co", "resolve@pid.example").await;

@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -168,7 +169,7 @@ fn book() -> String {
 /// The whole path: upload previews without writing a contact, import writes
 /// them with the file as their provenance, and the held upload is discarded
 /// when the run ends.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_uploaded_file_previews_imports_and_is_then_discarded(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let uploaded = f.upload("Office contacts.vcf", &book()).await;
@@ -256,7 +257,7 @@ async fn an_uploaded_file_previews_imports_and_is_then_discarded(pool: PgPool) {
 
 /// Importing the same file twice creates nothing the second time, including
 /// the cards with no UID, which is what the content digest is for.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_same_file_twice_creates_nothing_the_second_time(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let first = f.upload("book.vcf", &book()).await;
@@ -276,7 +277,7 @@ async fn the_same_file_twice_creates_nothing_the_second_time(pool: PgPool) {
 
 /// A later file that leaves someone out is not a deletion: a file is
 /// whatever somebody exported, never the whole address book.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_missing_from_a_later_file_is_not_flagged_deleted(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let first = f.upload("all.vcf", &book()).await;
@@ -299,7 +300,7 @@ async fn a_contact_missing_from_a_later_file_is_not_flagged_deleted(pool: PgPool
 
 /// A file with no CATEGORIES at all is imported through "No category", which
 /// never becomes a tag.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_file_without_categories_imports_through_no_category(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let uploaded = f
@@ -328,7 +329,7 @@ async fn a_file_without_categories_imports_through_no_category(pool: PgPool) {
 
 /// One malformed card costs only itself, and is reported where the admin
 /// looks before importing.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_malformed_card_is_reported_and_the_rest_imports(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let text = [
@@ -348,7 +349,7 @@ async fn a_malformed_card_is_reported_and_the_rest_imports(pool: PgPool) {
 
 /// The same person in Google and in a file is one Mokosh contact with two
 /// links, matched by email.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_person_in_google_and_in_a_file_is_one_contact(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let (status, contact) = f
@@ -406,7 +407,7 @@ async fn a_person_in_google_and_in_a_file_is_one_contact(pool: PgPool) {
 
 /// A card that matches only by phone goes to the one review queue, says which
 /// file proposed it, and an answer links it with the file as provenance.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_phone_match_is_reviewed_in_the_shared_queue(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let (status, contact) = f
@@ -470,7 +471,7 @@ async fn a_phone_match_is_reviewed_in_the_shared_queue(pool: PgPool) {
 /// A PHOTO that names an address is kept as text and never requested: a
 /// listener named in the card sees no connection through upload, preview and
 /// import.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_remote_photo_is_never_requested(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -492,7 +493,7 @@ async fn a_remote_photo_is_never_requested(pool: PgPool) {
 }
 
 /// An oversized file is refused whole with the shared 413 and stores nothing.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_oversized_file_is_refused_cleanly(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let mut bytes = card("FN:A\r\n").into_bytes();
@@ -508,7 +509,7 @@ async fn an_oversized_file_is_refused_cleanly(pool: PgPool) {
 
 /// A file that is not a vCard, an empty choice, a category the file does not
 /// have, and a non-admin are each refused with something to act on.
-#[sqlx::test]
+#[mokosh_test]
 async fn bad_uploads_and_choices_are_refused(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let (status, body) = f
@@ -540,7 +541,7 @@ async fn bad_uploads_and_choices_are_refused(pool: PgPool) {
 }
 
 /// An upload nobody imports is discarded after its hold, by the runner's tick.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_abandoned_upload_is_discarded_after_its_hold(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let uploaded = f.upload("left.vcf", &book()).await;

@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -105,7 +106,7 @@ async fn accepted_quote(
     quote_id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn accepted_quote_converts_into_a_mapped_project(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Client A").await;
@@ -174,7 +175,7 @@ async fn accepted_quote_converts_into_a_mapped_project(pool: PgPool) {
     assert!(project_audits > 0, "project creation must be audited");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn conversion_is_refused_before_the_client_accepts(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Client A").await;
@@ -237,7 +238,7 @@ async fn conversion_is_refused_before_the_client_accepts(pool: PgPool) {
     assert_eq!(projects, 0, "a refused conversion creates no project");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn converting_twice_returns_the_same_project(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Client A").await;
@@ -280,7 +281,7 @@ async fn converting_twice_returns_the_same_project(pool: PgPool) {
     assert_eq!(projects, 1, "exactly one project exists");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn concurrent_conversions_produce_exactly_one_project(pool: PgPool) {
     // The `SELECT ... FOR UPDATE` on the quote row is what makes this
     // safe. Without it both requests read `accepted` and each inserts its
@@ -345,7 +346,7 @@ async fn concurrent_conversions_produce_exactly_one_project(pool: PgPool) {
     assert_eq!(projects, 1, "the race must leave exactly one project");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_failed_project_insert_leaves_the_quote_unconverted(pool: PgPool) {
     // Atomicity: the project insert and the quote transition share one
     // transaction. Point `project_manager_id` at a user that does not
@@ -396,7 +397,7 @@ async fn a_failed_project_insert_leaves_the_quote_unconverted(pool: PgPool) {
     assert_eq!(projects, 0, "the rolled-back insert left no project");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn convert_rejects_a_malformed_body(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Client A").await;

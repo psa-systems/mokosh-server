@@ -12,6 +12,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -174,7 +175,7 @@ async fn seed_quote(pool: &PgPool, company_id: Uuid, status: &str, admin_id: Uui
 
 /// Empty company: the summary renders (no 500), every count is zero and
 /// the activity feed is empty.
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_renders_zeros_when_company_is_empty(pool: PgPool) {
     let (_admin_id, _email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -201,7 +202,7 @@ async fn dashboard_renders_zeros_when_company_is_empty(pool: PgPool) {
 /// Populated company: only open tickets count, a void invoice is not
 /// unpaid, an accepted quote is no longer awaiting a decision, and the
 /// activity feed carries the rows.
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_aggregates_populated_data(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -280,7 +281,7 @@ async fn dashboard_aggregates_populated_data(pool: PgPool) {
 /// Cross-company isolation: a contact at Company A never sees Company
 /// B's tickets, invoices, or quotes, even though both live under the
 /// same tenant. Non-negotiable per §7 D18 style scoping.
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_never_leaks_cross_company_data(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -331,7 +332,7 @@ async fn dashboard_never_leaks_cross_company_data(pool: PgPool) {
 /// Missing bearer token: the summary is auth-required (401), not an open
 /// endpoint. Guards against a future middleware refactor that would
 /// accidentally publish the shape.
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_requires_a_portal_session(pool: PgPool) {
     let _admin = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -135,7 +136,7 @@ fn acme() -> Value {
 }
 
 /// The whole point: an invoice renders as a document carrying the MSP.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_invoice_renders_with_the_issuing_msp(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -182,7 +183,7 @@ async fn an_invoice_renders_with_the_issuing_msp(pool: PgPool) {
 
 /// The no-branding acceptance criterion: an MSP that filled nothing in still
 /// gets a valid invoice, with its own name on it.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_msp_with_no_branding_still_gets_a_valid_invoice(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -203,7 +204,7 @@ async fn an_msp_with_no_branding_still_gets_a_valid_invoice(pool: PgPool) {
 
 /// Rebranding after sending leaves the sent invoice exactly as it was. This is
 /// the criterion the whole snapshot exists for.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_rebrand_after_sending_leaves_the_invoice_byte_identical(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -242,7 +243,7 @@ async fn a_rebrand_after_sending_leaves_the_invoice_byte_identical(pool: PgPool)
 /// And replacing the logo FILE leaves it byte-identical too, which is the case
 /// a snapshot holding a logo URL would fail: the live logo is written to one
 /// key per tenant and overwritten in place.
-#[sqlx::test]
+#[mokosh_test]
 async fn replacing_the_logo_after_sending_leaves_the_invoice_byte_identical(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -271,7 +272,7 @@ async fn replacing_the_logo_after_sending_leaves_the_invoice_byte_identical(pool
 /// A draft has not been sent, so there is nothing to preserve and it follows
 /// current branding. Without this the previous two tests could pass for the
 /// wrong reason: a renderer that ignored branding entirely.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_follows_current_branding(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -303,7 +304,7 @@ async fn a_draft_follows_current_branding(pool: PgPool) {
 
 /// A statement renders live, because PMS-954 made it a read model that stores
 /// nothing: there is no statement row for a snapshot to hang off.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_statement_renders_from_current_branding(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -370,7 +371,7 @@ async fn a_statement_renders_from_current_branding(pool: PgPool) {
 /// The statement PDF is finance-gated too. PMS-911 left the JSON route beside
 /// it ungated on purpose, and PMS-962 closed that gap along with five others in
 /// the same file, so the two now answer a given role identically.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_pdf_routes_are_behind_the_billing_gate(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;

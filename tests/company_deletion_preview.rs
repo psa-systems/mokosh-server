@@ -12,6 +12,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -66,7 +67,7 @@ fn blocking_labels(body: &Value) -> Vec<String> {
 }
 
 /// AC3, and the whole point. `can_delete` predicts the outcome, both ways.
-#[sqlx::test]
+#[mokosh_test]
 async fn can_delete_predicts_what_the_delete_actually_does(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let clean = seed_company_named(&pool, "Clean Co").await;
@@ -106,7 +107,7 @@ async fn can_delete_predicts_what_the_delete_actually_does(pool: PgPool) {
 /// AC4, and the reason the existing page counts could not be reused. The guard
 /// counts ALL tickets; `open_ticket_count` on the company response counts only
 /// open ones. A company with closed tickets and none open is still refused.
-#[sqlx::test]
+#[mokosh_test]
 async fn closed_tickets_block_and_the_preview_says_so(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Closed Co").await;
@@ -142,7 +143,7 @@ async fn closed_tickets_block_and_the_preview_says_so(pool: PgPool) {
 /// AC3's split. PMS-920 distinguishes records that must be KEPT from ones the
 /// author could clear, and the preview carries that distinction so a client
 /// cannot tell somebody to delete their invoices.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_retained_blocker_is_marked_apart_from_a_removable_one(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Mixed Co").await;
@@ -186,7 +187,7 @@ async fn a_retained_blocker_is_marked_apart_from_a_removable_one(pool: PgPool) {
 /// AC2. What unlinks is reported as unlinking, not as blocking. This is the
 /// exact drift MAPPS-577 reported: the dialog warned that projects and
 /// sub-companies block, months after PMS-919 made them unlink.
-#[sqlx::test]
+#[mokosh_test]
 async fn what_unlinks_is_not_reported_as_blocking(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let parent = seed_company_named(&pool, "Parent Co").await;
@@ -233,7 +234,7 @@ async fn what_unlinks_is_not_reported_as_blocking(pool: PgPool) {
 
 /// AC6. The tenant's own company is refused for its ROLE, so an empty blocker
 /// list beside a delete that still fails would be a lie.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_own_company_reports_its_role_rather_than_an_empty_list(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let own = seed_company_named(&pool, "Our MSP").await;
@@ -258,7 +259,7 @@ async fn the_own_company_reports_its_role_rather_than_an_empty_list(pool: PgPool
 
 /// AC5. Tenant-scoped: a company in another tenant is not previewable, so this
 /// cannot be used to probe ids.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_preview_cannot_see_another_tenants_company(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let (other_tenant, _, _, _) = common::seed_tenant_with_admin(&pool, "other-msp").await;
@@ -277,7 +278,7 @@ async fn the_preview_cannot_see_another_tenants_company(pool: PgPool) {
 }
 
 /// AC7. A preview changes nothing.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_preview_has_no_side_effects(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Read Only Co").await;

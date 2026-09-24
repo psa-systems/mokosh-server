@@ -13,6 +13,7 @@
 //! and `tests/bunyip_query_budget.rs`, and for the same reason holds exactly ONE
 //! test: the subscriber is process-global.
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -85,7 +86,7 @@ impl<S: tracing::Subscriber> Layer<S> for RecordingLayer {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn process_rules_opens_one_transaction_for_the_whole_run(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(

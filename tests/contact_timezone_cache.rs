@@ -6,6 +6,7 @@
 //! same binary would also move (the same reason `contact_capability_cache`
 //! is split out for `CAPABILITY_LOADS`).
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::Ordering;
 
 use mokosh_server::modules::auth::caller_context::TIMEZONE_LOADS;
@@ -14,7 +15,7 @@ use mokosh_server::modules::contact_portal::models::ContactSession;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[sqlx::test(migrations = "./migrations")]
+#[mokosh_test]
 async fn repeated_today_calls_issue_one_timezone_query(pool: PgPool) {
     let db = mokosh_server::Database::from_pool(pool);
     let caller = CallerContext::Contact(ContactSession {

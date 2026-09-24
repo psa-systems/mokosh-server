@@ -11,6 +11,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -120,7 +121,7 @@ async fn seed_portal_contact_with_roles(
 /// leg is a distinct trust boundary (auth mint, cap load, ticket
 /// service, portal-note filter, refresh revoke) so a break in any one
 /// surfaces here even when the isolated per-endpoint tests still pass.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_full_flow(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (company_id, contact_id, email, slug, _access) = seed_portal_contact_with_roles(
@@ -282,7 +283,7 @@ async fn contact_full_flow(pool: PgPool) {
 /// Two contacts under two Companies of the same tenant. Contact A
 /// opens a ticket; Contact B tries to fetch it. B's GET must 404
 /// (not 403) so a probe cannot confirm the ticket's existence.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_cross_company_isolation(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (company_a, _c_a, _e_a, _slug_a, token_a) = seed_portal_contact_with_roles(
@@ -339,7 +340,7 @@ async fn contact_cross_company_isolation(pool: PgPool) {
 /// scope for this file - the tenant claim comes from the JWT, not
 /// from the request headers, so we assert the actually-exposed
 /// attack surface instead.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_cross_tenant_isolation(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company_a, _c_a, _e_a, _slug_a, token_a) = seed_portal_contact_with_roles(
@@ -443,7 +444,7 @@ async fn contact_cross_tenant_isolation(pool: PgPool) {
 /// reads `portal_roles` per request instead of trusting the JWT `caps`
 /// claim, so deleting the assignment row makes the very next call
 /// 403 even while the access token stays cryptographically valid.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_role_revoke_kicks_in_next_request(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company_id, contact_id, _email, _slug, token) = seed_portal_contact_with_roles(
@@ -494,7 +495,7 @@ async fn contact_role_revoke_kicks_in_next_request(pool: PgPool) {
 /// login-time gate; this one pins the mid-session gate so an admin
 /// flipping `tenants.status = 'suspended'` takes effect within one
 /// fetch instead of waiting for the 15-min access-token TTL.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_tenant_suspend_kicks_session(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company_id, _contact_id, _email, _slug, token) = seed_portal_contact_with_roles(
@@ -546,7 +547,7 @@ async fn contact_tenant_suspend_kicks_session(pool: PgPool) {
 /// any other revoke path) at 10:00:30 left the bearer minted at
 /// 10:00:00 valid for every contact route until its own 10:15:00
 /// expiry.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_session_revoke_kicks_the_access_token_mid_ttl(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company_id, _contact_id, _email, _slug, token) = seed_portal_contact_with_roles(
@@ -632,7 +633,7 @@ fn contact_access_token_ttl_is_15_minutes() {
 /// returns 429 (AppError::RateLimited). Six attempts total: five bump
 /// the counter, the sixth reads `portal_locked_until > NOW()` and
 /// short-circuits before password verification.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_per_account_lockout_returns_429(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company_id, _contact_id, email, slug, _access) = seed_portal_contact_with_roles(

@@ -20,6 +20,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -103,7 +104,7 @@ const DUE_CONTRACTS: usize = 4;
 /// a throughput regression, not a test failure to paper over.
 const CONTRACT_READ_BUDGET: usize = 3;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_sweep_batch_reads_contracts_once(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(

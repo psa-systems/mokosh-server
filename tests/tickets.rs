@@ -16,6 +16,7 @@
 mod common;
 
 use chrono::DateTime;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 /// Assert a ticket DTO carries its JOINed name/color fields populated from
@@ -39,7 +40,7 @@ fn assert_joined_fields_populated(t: &serde_json::Value, label: &str) {
     non_empty("created_by_name", t["created_by_name"].as_str());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_lifecycle_happy_path(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -184,7 +185,7 @@ async fn ticket_lifecycle_happy_path(pool: PgPool) {
 /// and the per-record history endpoint exposes it to a normal tenant member
 /// with the changed field surfaced. Also pins that an unknown entity type is
 /// a 404 (the whitelist guard) rather than an empty 200.
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_history_records_description_edit(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -286,7 +287,7 @@ async fn ticket_history_records_description_edit(pool: PgPool) {
 /// suffix renders as `Updated: Status id`; stripping it server-side at the
 /// history read boundary gives `Updated: Status`. The stored audit row is
 /// unaffected; only the rendered field label is cleaned up.
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_history_humanises_status_id_field(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -428,7 +429,7 @@ async fn lookup_id_by_name(app: &common::TestApp, token: &str, path: &str, name:
 ///     pull the due date earlier,
 ///   - the write is gated on authentication (AC: "must be logged in"); an
 ///     unauthenticated PUT is rejected.
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_inline_status_priority_assignee_edits_persist_audit_and_recalc_sla(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -594,7 +595,7 @@ async fn ticket_inline_status_priority_assignee_edits_persist_audit_and_recalc_s
 
 /// Full create/list/update/delete cycle for a ticket status, plus the
 /// re-delete 404. Exercises the admin-gated mutation routes end to end.
-#[sqlx::test]
+#[mokosh_test]
 async fn lookup_status_crud_lifecycle(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -692,7 +693,7 @@ async fn lookup_status_crud_lifecycle(pool: PgPool) {
 
 /// Setting a new default status clears the previously-seeded default, so a
 /// tenant never carries two defaults at once.
-#[sqlx::test]
+#[mokosh_test]
 async fn setting_new_default_status_clears_prior(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -749,7 +750,7 @@ async fn setting_new_default_status_clears_prior(pool: PgPool) {
 
 /// Deleting a lookup still referenced by a ticket returns 409, not 500 (and
 /// not a silent FK 500 from Postgres).
-#[sqlx::test]
+#[mokosh_test]
 async fn delete_status_referenced_by_ticket_returns_409(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -793,7 +794,7 @@ async fn delete_status_referenced_by_ticket_returns_409(pool: PgPool) {
 }
 
 /// Category create + child-via-parent + cross-tenant/self parent rejection.
-#[sqlx::test]
+#[mokosh_test]
 async fn category_crud_and_parent_validation(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -884,7 +885,7 @@ async fn category_crud_and_parent_validation(pool: PgPool) {
 
 /// A non-admin (technician) is refused on the lookup mutation routes; reads
 /// stay open to any authenticated member.
-#[sqlx::test]
+#[mokosh_test]
 async fn non_admin_cannot_mutate_lookups(pool: PgPool) {
     let (_tech_id, email, password) = common::seed_user(
         &pool,
@@ -925,7 +926,7 @@ async fn non_admin_cannot_mutate_lookups(pool: PgPool) {
 /// Priority create + update exercises the `sla_multiplier` f64 -> DECIMAL(3,2)
 /// binding (the lookup whose numeric column is most likely to trip an
 /// encode/decode mismatch) and the priority default-clearing invariant.
-#[sqlx::test]
+#[mokosh_test]
 async fn lookup_priority_crud_and_default(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1013,7 +1014,7 @@ async fn lookup_priority_crud_and_default(pool: PgPool) {
 
 /// A transitive parent cycle (A -> B, then re-parent A under B) is rejected,
 /// not just the depth-1 self-parent case.
-#[sqlx::test]
+#[mokosh_test]
 async fn category_transitive_cycle_rejected(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1062,7 +1063,7 @@ async fn category_transitive_cycle_rejected(pool: PgPool) {
 /// in migration 047 rejects a cross-tenant parent at the database layer, even
 /// for a write that bypasses the service-layer `validate_fk` guard. Same-tenant
 /// parenting still works.
-#[sqlx::test]
+#[mokosh_test]
 async fn category_parent_cross_tenant_blocked_at_db(pool: PgPool) {
     let (tenant_b, _u, _e, _p) = common::seed_tenant_with_admin(&pool, "tenant-b").await;
 
@@ -1119,7 +1120,7 @@ async fn category_parent_cross_tenant_blocked_at_db(pool: PgPool) {
 /// GET carry that exact id+name, never the default. If this stays green, the
 /// regression lives in the SPA form binding (it omits `priority_id`), not in
 /// the backend.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_ticket_round_trips_every_priority(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1232,7 +1233,7 @@ async fn create_ticket_round_trips_every_priority(pool: PgPool) {
 /// of both, and tags three tickets: one IT, one HR, one teamless. Team
 /// assignment is done with a direct `UPDATE` because the create-DTO path is
 /// covered elsewhere and here we only need rows carrying a specific `team_id`.
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_team_scope_filter(pool: sqlx::PgPool) {
     use uuid::Uuid;
 
@@ -1354,7 +1355,7 @@ async fn ticket_team_scope_filter(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn list_filters_by_contact_id(pool: PgPool) {
     // MAPPS-311: the SQL builder previously ignored `filter.contact_id`,
     // so the SPA's contact-detail "Recent Tickets" rail rendered every
@@ -1484,7 +1485,7 @@ async fn seed_named_company(pool: &PgPool, name: &str) -> Uuid {
 /// The company and assignee arms are correlated `EXISTS`, not joins, and the
 /// last assertion is why: an INNER JOIN to `users` would drop every unassigned
 /// ticket, turning a search into a filter nobody asked for.
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_search_matches_company_and_assignee(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let northwind = seed_named_company(&pool, "Northwind Traders").await;
@@ -1573,7 +1574,7 @@ async fn ticket_search_matches_company_and_assignee(pool: PgPool) {
 /// is dropped in favour of the default - so a client that started sending
 /// `sort=company_name` would have got `created_at DESC` and a 200. A page that
 /// looks sorted and is not is worse than one that cannot sort.
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_list_sorts_by_the_columns_the_client_offers(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let zeta = seed_named_company(&pool, "Zeta Industries").await;
@@ -1650,7 +1651,7 @@ async fn ticket_list_sorts_by_the_columns_the_client_offers(pool: PgPool) {
 /// The parent is set here with SQL rather than through the create route,
 /// because that route takes `parent_ticket_id` only from PMS-737; what is
 /// under test is the filter and the column on the list row.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_ticket_list_filters_by_parent(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -77,7 +78,7 @@ async fn version_count(pool: &PgPool, article: &str) -> i64 {
 /// AC1, and the whole reason this endpoint exists. Twenty autosaves add twenty
 /// rows to `kb_article_versions` if drafts go through `update_article`; here
 /// they must add none.
-#[sqlx::test]
+#[mokosh_test]
 async fn autosaving_a_draft_never_writes_a_version(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -101,7 +102,7 @@ async fn autosaving_a_draft_never_writes_a_version(pool: PgPool) {
 
 /// And the draft is readable, so autosave is recoverable rather than just
 /// writes into a table nobody reads.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_reads_back_and_reports_when_it_was_written(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -127,7 +128,7 @@ async fn a_draft_reads_back_and_reports_when_it_was_written(pool: PgPool) {
 
 /// The upsert replaces rather than accumulating, or the table grows per
 /// keystroke and the "which draft is current" question comes back.
-#[sqlx::test]
+#[mokosh_test]
 async fn saving_a_draft_twice_keeps_one_row(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -149,7 +150,7 @@ async fn saving_a_draft_twice_keeps_one_row(pool: PgPool) {
 
 /// AC2. Two people editing one article keep separate drafts. A shared row would
 /// resolve the conflict by losing somebody's work.
-#[sqlx::test]
+#[mokosh_test]
 async fn drafts_are_per_person(pool: PgPool) {
     let (_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     common::seed_user(
@@ -178,7 +179,7 @@ async fn drafts_are_per_person(pool: PgPool) {
 }
 
 /// AC4. A real save supersedes the author's own draft, and only theirs.
-#[sqlx::test]
+#[mokosh_test]
 async fn saving_the_article_clears_only_the_savers_draft(pool: PgPool) {
     let (_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     common::seed_user(
@@ -223,7 +224,7 @@ async fn saving_the_article_clears_only_the_savers_draft(pool: PgPool) {
 
 /// Discarding is idempotent: the caller's intent is satisfied whether or not
 /// there was a draft to remove.
-#[sqlx::test]
+#[mokosh_test]
 async fn discarding_a_draft_is_idempotent(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -247,7 +248,7 @@ async fn discarding_a_draft_is_idempotent(pool: PgPool) {
 }
 
 /// AC5. A draft cannot outlive its article.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_the_article_takes_its_drafts(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -272,7 +273,7 @@ async fn deleting_the_article_takes_its_drafts(pool: PgPool) {
 }
 
 /// AC7. A draft is not a side door into an article in another tenant.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_cannot_reach_another_tenants_article(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     // A manager in a DIFFERENT tenant. `seed_tenant_with_admin` supplies the
@@ -317,7 +318,7 @@ async fn a_draft_cannot_reach_another_tenants_article(pool: PgPool) {
 /// AC3-adjacent: a draft is editing, so it needs the same authority the save
 /// does. Otherwise it is a way for a reader to stash text against an article
 /// they cannot change.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_technician_cannot_draft(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     common::seed_user(

@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -164,7 +165,7 @@ async fn seed_plain_company(pool: &PgPool, tenant_id: Uuid, label: &str) -> Uuid
 
 /// prompt 008 shape row 1: contact WITH cap + matching company scope ->
 /// 201 (creating a ticket succeeds).
-#[sqlx::test]
+#[mokosh_test]
 async fn tickets_create_with_cap_and_matching_scope_returns_ok(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (company_id, _contact_id, _email, token) =
@@ -207,7 +208,7 @@ async fn tickets_create_with_cap_and_matching_scope_returns_ok(pool: PgPool) {
 /// `company_id` in the body -> the server silently overrides to the
 /// session's Company so the created ticket is still on the caller's
 /// own Company. Nothing can be widened by a client-supplied field.
-#[sqlx::test]
+#[mokosh_test]
 async fn tickets_create_body_company_id_is_ignored_for_contact(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -242,7 +243,7 @@ async fn tickets_create_body_company_id_is_ignored_for_contact(pool: PgPool) {
 /// listing tickets returns 403 even though the caller is
 /// authenticated. Belt-and-braces on the DB-loaded cap set (JWT `caps`
 /// is UI-only).
-#[sqlx::test]
+#[mokosh_test]
 async fn tickets_list_without_cap_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Billing Contact has NO tickets:* capability, so it must be
@@ -267,7 +268,7 @@ async fn tickets_list_without_cap_returns_403(pool: PgPool) {
 /// prompt 008 shape row 4: staff caller on the same endpoint keeps its
 /// 200. Regression pin: adding contact-plane enforcement must not
 /// break the staff branch.
-#[sqlx::test]
+#[mokosh_test]
 async fn tickets_list_staff_bypass_returns_200(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -288,7 +289,7 @@ async fn tickets_list_staff_bypass_returns_200(pool: PgPool) {
 
 /// prompt 008: contact GET one ticket that lives on another Company in
 /// the same tenant -> 404 (not 403). Enumeration-resistant.
-#[sqlx::test]
+#[mokosh_test]
 async fn tickets_get_foreign_company_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _c, _e, token) =
@@ -358,7 +359,7 @@ async fn tickets_get_foreign_company_returns_404(pool: PgPool) {
 /// prompt 008: contact POST notes must reject `internal` note_type
 /// even when the contact holds `tickets:comment`. Customer back-
 /// channel notes never leak into internal agent discussion.
-#[sqlx::test]
+#[mokosh_test]
 async fn tickets_add_note_contact_cannot_post_internal(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (company_id, _c, _e, token) =
@@ -405,7 +406,7 @@ async fn tickets_add_note_contact_cannot_post_internal(pool: PgPool) {
 // request 403s even though the JWT is still valid.
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn stale_jwt_after_role_revoke_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company_id, contact_id, _email, token) =
@@ -458,7 +459,7 @@ async fn stale_jwt_after_role_revoke_returns_403(pool: PgPool) {
 // must 401 - the JWT's `tid` scopes the whole request tree.
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn cross_tenant_invoice_id_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Contact under DEFAULT_TENANT_ID.
@@ -508,7 +509,7 @@ async fn cross_tenant_invoice_id_returns_404(pool: PgPool) {
 // INVOICES - contact list (shape row 1 + row 2 rolled into one test)
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn invoices_list_scoped_to_contact_company(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -563,7 +564,7 @@ async fn invoices_list_scoped_to_contact_company(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn invoices_list_without_cap_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Support Contact has NO invoices:* cap.
@@ -586,7 +587,7 @@ async fn invoices_list_without_cap_returns_403(pool: PgPool) {
 /// Regression pin: dropping RequireBilling+RequireFinance from the
 /// dual-plane invoice list handler must not stop the staff-side gate
 /// from rejecting non-finance roles.
-#[sqlx::test]
+#[mokosh_test]
 async fn invoices_staff_non_finance_still_403(pool: PgPool) {
     let (_tech_id, tech_email, tech_password) = common::seed_user(
         &pool,
@@ -637,7 +638,7 @@ async fn seed_sent_quote(pool: &PgPool, tenant_id: Uuid, company_id: Uuid) -> Uu
     id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn quotes_contact_accept_flips_status(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (company_id, _c, _e, token) =
@@ -666,7 +667,7 @@ async fn quotes_contact_accept_flips_status(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn quotes_accept_foreign_company_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _c, _e, token) =
@@ -689,7 +690,7 @@ async fn quotes_accept_foreign_company_returns_404(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn quotes_accept_without_cap_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Support Contact has quotes:* off.
@@ -711,7 +712,7 @@ async fn quotes_accept_without_cap_returns_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn quotes_staff_accept_endpoint_returns_403(pool: PgPool) {
     // Staff use the internal approvals surface, not accept/decline.
     // The contact-plane endpoint must refuse a staff bearer so the
@@ -742,7 +743,7 @@ async fn quotes_staff_accept_endpoint_returns_403(pool: PgPool) {
 // these routes.
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn companies_list_blocks_contact_bearer(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company_id, _c, _e, token) =
@@ -762,7 +763,7 @@ async fn companies_list_blocks_contact_bearer(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contacts_list_blocks_contact_bearer(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company_id, _c, _e, token) =
@@ -781,7 +782,7 @@ async fn contacts_list_blocks_contact_bearer(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn companies_list_still_allows_staff(pool: PgPool) {
     // Regression pin: the whole-router layer that rejects contacts
     // must NOT reject staff.
@@ -807,7 +808,7 @@ async fn companies_list_still_allows_staff(pool: PgPool) {
 // prompt-008 sweep must not accidentally open a public surface.
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn tickets_list_without_bearer_still_401(pool: PgPool) {
     let app = common::boot(pool).await;
     let resp = app

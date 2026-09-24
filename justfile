@@ -266,7 +266,7 @@ test:
 
 # Create the DB roles the migrations grant to, on the dev cluster (PMS-988).
 # Migration 207 grants on `app_secrets` to `mokosh_app`, and a GRANT to a role
-# that does not exist is a hard error, so a `#[sqlx::test]` database fails at
+# that does not exist is a hard error, so the `#[mokosh_test]` template fails at
 # migration 207 on a cluster where the server never booted and so never ran its
 # own `provision_roles`. integration.yml runs the same file against its postgres
 # service; scripts/test-db-roles.sql carries the reasoning.
@@ -280,7 +280,7 @@ ensure-test-db-roles: ensure-env
 # this omits `--no-deps`, so the compose `postgres` dependency starts. PMS-267.
 #
 # DATABASE_URL is overridden to the superuser connection for the run, because
-# `#[sqlx::test]` creates a database per test. The `server` service's own
+# `#[mokosh_test]` creates a database per test. The `server` service's own
 # DATABASE_URL connects as `mokosh_migrator`, which PMS-489 provisions with
 # `LOGIN BYPASSRLS` and deliberately WITHOUT `CREATEDB`, so the suite fails at
 # setup with `42501 permission denied to create database` once those roles
@@ -288,6 +288,13 @@ ensure-test-db-roles: ensure-env
 # the postgres superuser; this keeps the recipe a true mirror of it. The
 # override is expanded inside the container so the credential stays in the
 # compose environment rather than reaching the host shell.
+#
+# PMS-1254: `tests/template_database.rs` runs first and builds the template the
+# suite clones, so the migrations are applied by a step rather than by
+# whichever test process arrives first, and the line naming the template is
+# printed where it can be read rather than inside one case's captured output.
+# Skipping it would still work; the suite would just build the template under
+# its own lock.
 # Run the Postgres-backed integration suite in the dev compose `server` container.
 #
 # cargo-nextest run --profile ci (PMS-1177): the `ci` profile in
@@ -301,7 +308,7 @@ ensure-test-db-roles: ensure-env
 # exercise the same nextest release; update both in the same change.
 [group: 'test']
 test-integration: ensure-env ensure-test-db-roles
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci --no-capture -E '"'"'binary(template_database)'"'"' && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
 
 # Exercise every provider seam - configuration, application-tier secrets,
 # tenant-tier secrets, storage, authentication, email - against the running
@@ -333,7 +340,7 @@ verify-providers *args:
 # `test-integration` for re-checking before building the demo (PMS-677). Same
 # Postgres-backed setup as `test-integration`, including its superuser
 # DATABASE_URL override (see the note there for why `mokosh_migrator` cannot
-# run a `#[sqlx::test]` suite).
+# run a `#[mokosh_test]` suite).
 [doc("Run the demo-critical subset of the integration suite: seed_demo plus data_transfer (PMS-677).")]
 [group: 'test']
 verify-demo: ensure-env ensure-test-db-roles

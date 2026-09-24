@@ -11,6 +11,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -28,7 +29,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn email_intake_happy_dedup_thread(pool: PgPool) {
     let (_admin_id, _email, _password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

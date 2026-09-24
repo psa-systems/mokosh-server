@@ -20,6 +20,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -76,7 +77,7 @@ async fn assert_unauthorized_envelope(resp: reqwest::Response, ctx: &str) {
 
 // AC (H1+H2): login returns access_token + refresh_token, both strings,
 // plus the access expiry and the contact snapshot the SPA consumes.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_returns_access_and_refresh_tokens(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -96,7 +97,7 @@ async fn login_returns_access_and_refresh_tokens(pool: PgPool) {
 
 // AC (H2): refresh accepts a valid token, returns a new access + refresh
 // pair, and the new tokens work as credentials.
-#[sqlx::test]
+#[mokosh_test]
 async fn refresh_rotates_both_tokens(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -152,7 +153,7 @@ async fn refresh_rotates_both_tokens(pool: PgPool) {
 // customer's current token dies with the replayed one, so both parties
 // are signed out and the customer signs in again. A second login is a
 // new family and is untouched.
-#[sqlx::test]
+#[mokosh_test]
 async fn replayed_refresh_revokes_the_whole_rotation_chain(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -217,7 +218,7 @@ async fn replayed_refresh_revokes_the_whole_rotation_chain(pool: PgPool) {
 // token's `sid`), so a replay carrying a wrong secret is a plain 401
 // and revokes nothing. Only a GENUINE token presented after its
 // rotation is the theft signal.
-#[sqlx::test]
+#[mokosh_test]
 async fn replay_with_a_wrong_secret_revokes_nothing(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -247,7 +248,7 @@ async fn replay_with_a_wrong_secret_revokes_nothing(pool: PgPool) {
 // AC (H1, PMS-1062): logout revokes the presented refresh token and
 // its whole rotation family, so a stolen access token cannot be renewed
 // once the customer signs out.
-#[sqlx::test]
+#[mokosh_test]
 async fn logout_revokes_the_refresh_token(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -279,7 +280,7 @@ async fn logout_revokes_the_refresh_token(pool: PgPool) {
 // AC (H1 idempotent + enumeration-resistant): logout with an unknown
 // token still returns 204. This prevents a caller from probing whether
 // a specific token id ever existed.
-#[sqlx::test]
+#[mokosh_test]
 async fn logout_with_unknown_token_still_returns_204(pool: PgPool) {
     let app = common::boot(pool).await;
     let bogus = format!("{}.definitely-not-a-real-secret", Uuid::new_v4());
@@ -298,7 +299,7 @@ async fn logout_with_unknown_token_still_returns_204(pool: PgPool) {
 // AC (H2 fail-closed shape): every negative refresh path (unknown,
 // malformed, expired, cross-contact bogus id, empty) returns the
 // UNAUTHORIZED envelope. Cannot enumerate live tokens by response.
-#[sqlx::test]
+#[mokosh_test]
 async fn refresh_fails_closed_on_every_negative_path(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -321,7 +322,7 @@ async fn refresh_fails_closed_on_every_negative_path(pool: PgPool) {
 // AC (H2 rate limits + input validation): empty body is a 422 validation
 // error (via the ValidateJson layer), not a 401. Distinct so the SPA can
 // tell "you sent nothing" from "you sent a dead token".
-#[sqlx::test]
+#[mokosh_test]
 async fn refresh_with_empty_body_is_validation_error(pool: PgPool) {
     let app = common::boot(pool).await;
     let resp = app
@@ -341,7 +342,7 @@ async fn refresh_with_empty_body_is_validation_error(pool: PgPool) {
 // hit, so a logout kills the bearer immediately rather than only closing
 // the refresh path. Supersedes the old `access_token_survives_logout_until_expiry`
 // assertion, which documented the gap this issue closes.
-#[sqlx::test]
+#[mokosh_test]
 async fn access_token_is_rejected_immediately_after_logout(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;

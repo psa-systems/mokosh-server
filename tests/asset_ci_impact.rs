@@ -11,6 +11,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -82,7 +83,7 @@ async fn get_impact(app: &common::TestApp, token: &str, asset_id: Uuid, query: &
         .expect("impact body")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn impact_walks_downstream_and_upstream_chain(pool: PgPool) {
     let (_aid, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool).await;
@@ -136,7 +137,7 @@ async fn impact_walks_downstream_and_upstream_chain(pool: PgPool) {
     assert_eq!(depths.get(&a.to_string()), Some(&3));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn impact_depth_cap_applies_from_tenant_setting(pool: PgPool) {
     let (_aid, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool).await;
@@ -181,7 +182,7 @@ async fn impact_depth_cap_applies_from_tenant_setting(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn impact_cycle_terminates_at_cap(pool: PgPool) {
     let (_aid, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool).await;
@@ -190,7 +191,7 @@ async fn impact_cycle_terminates_at_cap(pool: PgPool) {
     let b = seed_asset(&pool, "BBB cycle", kind, company).await;
     // A <-> B cycle. With cap 5, the CTE visits A and B alternately
     // up to depth 5, then stops. A pathological infinite loop would
-    // hang the test (sqlx::test caps at the runtime's default).
+    // hang the test (the attribute caps at the runtime's default).
     seed_rel(&pool, a, b, "connected_to").await;
     seed_rel(&pool, b, a, "connected_to").await;
 
@@ -214,7 +215,7 @@ async fn impact_cycle_terminates_at_cap(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn impact_both_returns_upstream_and_downstream(pool: PgPool) {
     let (_aid, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool).await;

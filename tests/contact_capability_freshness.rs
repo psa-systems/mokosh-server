@@ -17,6 +17,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -234,7 +235,7 @@ async fn seed_open_tickets(pool: &PgPool, company_id: Uuid, admin_id: Uuid, n: i
 /// capability at all, so the ticket list is refused. The admin adds
 /// Support Contact; the SAME still-valid access token must be served on
 /// the next call.
-#[sqlx::test]
+#[mokosh_test]
 async fn assigning_a_role_lands_on_the_contacts_next_request(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -268,7 +269,7 @@ async fn assigning_a_role_lands_on_the_contacts_next_request(pool: PgPool) {
 }
 
 /// AC2: removing a role likewise takes effect without a restart.
-#[sqlx::test]
+#[mokosh_test]
 async fn revoking_a_role_lands_on_the_contacts_next_request(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -303,7 +304,7 @@ async fn revoking_a_role_lands_on_the_contacts_next_request(pool: PgPool) {
 /// first screen a contact lands on kept reporting zero open tickets
 /// after the admin had granted `tickets:read` - the exact "I gave them
 /// the role and they still cannot see anything" report.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_dashboard_counts_what_the_role_grants_right_now(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

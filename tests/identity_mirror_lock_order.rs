@@ -20,6 +20,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
@@ -54,11 +55,11 @@ async fn seed_person(pool: &PgPool, email: &str) -> (Uuid, Uuid) {
 /// Both must commit. A `40P01` here is the cycle, whichever transaction loses
 /// it: the loser rolled back cleanly, but its caller saw a 500 on an ordinary
 /// profile edit or an ordinary sign-in.
-#[sqlx::test]
+#[mokosh_test]
 async fn two_mirrored_writes_on_opposite_planes_do_not_deadlock(pool: PgPool) {
     let (user_id, identity_id) = seed_person(&pool, "cycle@example.test").await;
 
-    // Two connections from the test's own pool, because `#[sqlx::test]` runs
+    // Two connections from the test's own pool, because `#[mokosh_test]` runs
     // against a database it created for this test alone; `DATABASE_URL` names
     // the cluster that database was created in, not the database.
     let mut a = pool.acquire().await.expect("connection a");

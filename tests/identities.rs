@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -58,7 +59,7 @@ async fn insert_tenant(pool: &PgPool, name: &str, slug: &str) -> Uuid {
     id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn seed_admin_is_backfilled_into_identity_and_membership(pool: PgPool) {
     let (admin_id, admin_email, _password) = common::seed_admin(&pool).await;
 
@@ -78,7 +79,7 @@ async fn seed_admin_is_backfilled_into_identity_and_membership(pool: PgPool) {
     assert_eq!(memberships[0].role, "super_admin");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn insert_new_users_row_creates_identity_and_membership(pool: PgPool) {
     let tenant = insert_tenant(&pool, "Acme Co", "acme").await;
     let user_id = insert_user(&pool, tenant, "new@example.com", "admin", "active").await;
@@ -98,7 +99,7 @@ async fn insert_new_users_row_creates_identity_and_membership(pool: PgPool) {
     assert_eq!(membership.status, "active");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn insert_users_row_with_existing_email_reuses_identity(pool: PgPool) {
     // Same human, two tenants: one identity, two memberships.
     let tenant_a = insert_tenant(&pool, "Alpha Co", "alpha").await;
@@ -139,7 +140,7 @@ async fn insert_users_row_with_existing_email_reuses_identity(pool: PgPool) {
     assert_eq!(role_b, "technician");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn update_users_role_propagates_to_membership(pool: PgPool) {
     let tenant = insert_tenant(&pool, "Gamma Co", "gamma").await;
     let user_id = insert_user(&pool, tenant, "role@example.com", "technician", "active").await;
@@ -161,7 +162,7 @@ async fn update_users_role_propagates_to_membership(pool: PgPool) {
     assert_eq!(membership.role, "manager");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn update_users_status_propagates_to_membership(pool: PgPool) {
     let tenant = insert_tenant(&pool, "Delta Co", "delta").await;
     let user_id = insert_user(&pool, tenant, "status@example.com", "technician", "active").await;
@@ -191,7 +192,7 @@ async fn update_users_status_propagates_to_membership(pool: PgPool) {
 // hold independent passwords, forever, and a change on one row must
 // not overwrite the identity's hash (which would then re-mirror to
 // every other users row at that email via the reverse trigger).
-#[sqlx::test]
+#[mokosh_test]
 async fn update_users_password_hash_does_not_propagate_to_identity(pool: PgPool) {
     let tenant = insert_tenant(&pool, "Epsilon Co", "epsilon").await;
     let user_id = insert_user(&pool, tenant, "pw@example.com", "technician", "active").await;
@@ -246,7 +247,7 @@ async fn update_users_password_hash_does_not_propagate_to_identity(pool: PgPool)
 /// and it flows to `identities`. A write that must reach both planes writes
 /// both, `users` first, which is what `write_mfa_secret` and
 /// `write_mfa_enabled` do.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_write_to_identities_does_not_reach_users(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     sqlx::query("UPDATE identities SET mobile = '+15550001111' WHERE id = $1")
@@ -274,7 +275,7 @@ async fn a_write_to_identities_does_not_reach_users(pool: PgPool) {
 /// other alone. A caller that genuinely means "every seat this human holds"
 /// says so, on the migrator pool, the way `write_mfa_enabled` does - RLS would
 /// have stopped the mirror reaching the second tenant regardless.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_second_tenants_seat_is_its_own_row(pool: PgPool) {
     let (admin_id, email, _password) = common::seed_admin(&pool).await;
     let tenant_b = insert_tenant(&pool, "Beta Co", "beta-497").await;
@@ -313,7 +314,7 @@ async fn a_second_tenants_seat_is_its_own_row(pool: PgPool) {
 /// users -> identity mirror WITHOUT the identity -> users mirror
 /// re-firing (would cause infinite recursion). The pg_trigger_depth()
 /// guard on sync_identity_to_users breaks the cycle.
-#[sqlx::test]
+#[mokosh_test]
 async fn mirror_does_not_recurse(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     // A plain UPDATE. If the mirrors cycle, sqlx errors on stack
@@ -335,7 +336,7 @@ async fn mirror_does_not_recurse(pool: PgPool) {
 /// MAPPS-500 (MAPPS-496 stage 2b): a successful login writes
 /// `identities.last_login_at`; the MAPPS-498 mirror propagates it
 /// back to `users.last_login_at` for every membership.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_stamps_last_login_at_on_identity(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -370,7 +371,7 @@ async fn login_stamps_last_login_at_on_identity(pool: PgPool) {
 /// `update_last_login` writes the caller's own seat and the forward mirror
 /// carries the timestamp to the identity, which is where "when did this human
 /// last sign in anywhere" is answered.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_login_stamps_the_seat_it_signed_into_and_the_identity(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     // Second membership for the same identity in another tenant.
@@ -447,7 +448,7 @@ async fn a_login_stamps_the_seat_it_signed_into_and_the_identity(pool: PgPool) {
     assert_eq!(identity, signed_in, "the identity carries the same stamp");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_tenant_removes_memberships_but_not_identity(pool: PgPool) {
     let tenant = insert_tenant(&pool, "Zeta Co", "zeta").await;
     insert_user(&pool, tenant, "keep@example.com", "admin", "active").await;

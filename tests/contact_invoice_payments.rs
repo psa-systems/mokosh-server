@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -104,7 +105,7 @@ async fn ledger(app: &common::TestApp, token: &str, invoice: Uuid) -> (StatusCod
 
 // Two payments and a refund, newest first, the safe subset, the sums;
 // an invoice with nothing paid answers the same shape empty.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_reads_the_ledger_of_its_own_invoice(pool: PgPool) {
     let (_, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Ledger Co").await;
@@ -191,7 +192,7 @@ async fn a_contact_reads_the_ledger_of_its_own_invoice(pool: PgPool) {
 
 // A foreign invoice with payments is the unknown-id 404; without
 // invoices:read it is 403; anonymous is 401.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_foreign_invoice_is_404_and_the_gate_holds(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let mine = seed_company(&pool, "Mine Co").await;

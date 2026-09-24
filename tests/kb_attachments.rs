@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -77,7 +78,7 @@ async fn upload(
 
 /// The whole point: upload an image, then fetch it with no session at all,
 /// which is what a browser rendering `<img>` does.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_uploaded_image_is_fetchable_without_a_session(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -128,7 +129,7 @@ async fn an_uploaded_image_is_fetchable_without_a_session(pool: PgPool) {
 
 /// AC2. SVG is script-capable and this route serves it from the API origin to
 /// unauthenticated clients, so it is refused at upload, not at render.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_svg_is_refused(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -151,7 +152,7 @@ async fn an_svg_is_refused(pool: PgPool) {
 
 /// AC4. An unknown id and a deleted attachment answer identically, so the
 /// public route is not an existence oracle for ids somebody is guessing at.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unknown_and_a_deleted_attachment_are_indistinguishable(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -193,7 +194,7 @@ async fn an_unknown_and_a_deleted_attachment_are_indistinguishable(pool: PgPool)
 }
 
 /// AC1. Upload is authenticated and tenant-scoped, even though the read is not.
-#[sqlx::test]
+#[mokosh_test]
 async fn upload_needs_a_session_and_the_right_tenant(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -251,7 +252,7 @@ async fn upload_needs_a_session_and_the_right_tenant(pool: PgPool) {
 
 /// AC5. Deleting the article takes its attachments with it, so a published
 /// article's images cannot outlive the article and keep serving.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_the_article_takes_its_attachments(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -278,7 +279,7 @@ async fn deleting_the_article_takes_its_attachments(pool: PgPool) {
 
 /// A technician can read a published article but cannot attach to one, matching
 /// the authority the article PUT requires.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_technician_cannot_upload(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -301,7 +302,7 @@ async fn a_technician_cannot_upload(pool: PgPool) {
 
 /// The listing lets the editor offer what is already uploaded instead of making
 /// the author upload the same screenshot twice.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_articles_images_are_listable(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
