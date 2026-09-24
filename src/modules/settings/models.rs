@@ -151,6 +151,19 @@ pub fn validate_setting_value(
                 "expected a 3-letter uppercase ISO 4217 currency code",
             )),
         },
+        // PMS-979: which shape a new invoice's number takes. A closed set
+        // refused at the write, the `tickets/note_editing` rule, because a
+        // value outside it would be read as the default in silence and the
+        // tenant would think they had switched schemes when they had not.
+        // Changing this does not renumber anything: every invoice keeps the
+        // number it was issued with and records which scheme produced it.
+        ("billing_prefs", "invoice_numbering") => match value.as_str() {
+            Some("tenant_sequence") | Some("company_prefix") => Ok(()),
+            _ => Err(bad(
+                "value",
+                "expected one of \"tenant_sequence\", \"company_prefix\"",
+            )),
+        },
         // PMS-1037: overdue invoice reminders. `schedule` is the list of days
         // past due a reminder goes out on, ascending and distinct so each
         // step is one send; `send_hour` is the tenant's local hour.
