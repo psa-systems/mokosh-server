@@ -243,6 +243,9 @@ rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
 # signature verification, not a bypass.
 hmac = "0.12"
 sha2 = "0.10"
+# MAPPS-542: exercise `PaginationParams` deserialization from a raw query
+# string in unit tests, matching what axum's `Query` extractor does.
+serde_urlencoded = "0.7"
 
 [build-dependencies]
 # Shared build-script logic (PMS-198). build.rs calls build_metadata::emit().
