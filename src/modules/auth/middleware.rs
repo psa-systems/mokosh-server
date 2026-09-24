@@ -1053,13 +1053,14 @@ pub enum LocalPlacement {
     UserinfoNeeded,
 }
 
-/// PMS-777: the whole userinfo-free request path, in two statements.
+/// PMS-777 / PMS-1059: the whole userinfo-free request path, in two statements.
 ///
 /// `resolve_bunyip_caller` reads the caller's `users` row and the waiting-invite
 /// flag in one statement, and hands that row straight to `place_bunyip_caller`,
-/// which used to re-read both. The only other statement left is the PMS-698
-/// principal gate's tenant-status check, which is security-relevant and
-/// deliberately still runs on every request.
+/// which used to re-read both. The only other statement left is the tenant
+/// gate, which folds the PMS-698 status check and the MAPPS-459 entitlement
+/// check into one `LEFT JOIN` (PMS-1059 restored the budget from three to two);
+/// both are security-relevant and deliberately still run on every request.
 ///
 /// Public because it is the branch production takes for an already-provisioned
 /// caller, and the query-budget regression test

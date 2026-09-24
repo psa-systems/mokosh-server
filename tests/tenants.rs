@@ -2011,6 +2011,27 @@ async fn ensure_principal_usable_passes_when_entitlement_active(pool: PgPool) {
         .expect("active entitlement = pass");
 }
 
+/// PMS-1059: entitlement status = `unknown` is the seed state a tenant carries
+/// before the integration has ever reported on it, and it passes the gate. The
+/// PMS-1059 LEFT-JOINed read collapses the two prior statements into one, but
+/// the pass-through semantics for a non-suspended non-expired row must be
+/// preserved.
+#[sqlx::test]
+async fn ensure_principal_usable_passes_when_entitlement_unknown(pool: PgPool) {
+    let (admin_id, _e, _p) = common::seed_admin(&pool).await;
+    let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
+    auth.set_tenant_entitlement(common::DEFAULT_TENANT_ID, "unknown", None, None)
+        .await
+        .expect("write entitlement");
+    let user = auth
+        .get_user_by_id(common::DEFAULT_TENANT_ID, admin_id)
+        .await
+        .expect("read seed admin");
+    auth.ensure_principal_usable(&user)
+        .await
+        .expect("unknown entitlement = pass");
+}
+
 /// MAPPS-459: entitlement status = `suspended` rejects with the same "not
 /// active" copy the operator-side `tenants.status = 'suspended'` path returns,
 /// so a caller cannot distinguish billing suspension from operator suspension.
