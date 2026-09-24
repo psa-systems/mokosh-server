@@ -1,0 +1,40 @@
+-- PMS-1120: the users <-> identities mirror becomes one-way.
+--
+-- Two triggers, two lock orders. `sync_user_to_identity_and_membership` locks
+-- the `users` row, then `tenant_memberships`, then `identities`;
+-- `sync_identity_to_users` locked the `identities` row, then `users`. Two
+-- transactions writing one person on opposite planes at the same instant took
+-- those two row locks in opposite orders, so Postgres killed one with
+-- `40P01 deadlock detected` and its caller saw a 500 on an ordinary profile
+-- edit or an ordinary sign-in.
+--
+-- A cycle between two tables is closed by making every path take the locks in
+-- the same order. Neither trigger can do that from where it runs: by the time
+-- either fires, the row on its own plane is already locked, so an advisory
+-- lock taken inside a trigger only moves the cycle onto the advisory lock.
+-- Taking it in the application instead would mean every writer of either
+-- plane remembering to, which is 21 `UPDATE users` sites and 3 on
+-- `identities`, and one forgotten site silently restores the cycle.
+--
+-- Dropping one direction removes the cycle by construction, and this is the
+-- direction to drop, because it was carrying almost nothing:
+--
+--   * `record_identity_mfa_success` writes `mfa_last_totp_step`, which is not
+--     a mirrored column. Every successful TOTP verification was therefore
+--     rewriting all thirteen mirrored columns on every `users` row at that
+--     email, to the values they already held, and taking the `users` lock to
+--     do it. That is the bookkeeping write that made the cycle easy to hit.
+--   * `write_mfa_enabled` already writes both planes itself (PMS-1223),
+--     precisely because this trigger carries no `SECURITY DEFINER` and its
+--     `UPDATE users` was filtered by RLS to the caller's tenant, leaving a
+--     second tenant's seat with a stale flag.
+--   * `update_last_login` relied on it, and had the same RLS-filtered reach.
+--     It writes the `users` row directly now, and the forward mirror carries
+--     the timestamp to the identity.
+--
+-- So the surviving rule is simple enough to hold in one's head: `users` is
+-- where a human's profile is written, and it flows to `identities`. A write
+-- that must reach both planes writes `users` first, or writes both in that
+-- order.
+DROP TRIGGER IF EXISTS identities_sync_to_users ON identities;
+DROP FUNCTION IF EXISTS sync_identity_to_users();

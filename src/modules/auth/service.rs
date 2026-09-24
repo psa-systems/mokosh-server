@@ -2191,9 +2191,16 @@ impl AuthService {
     /// tenant column for a single GUC to cover anyway.
     async fn write_mfa_enabled(&self, email: &str, enabled: bool) -> AppResult<()> {
         let mut tx = self.db.migrator_pool().begin().await?;
+        // PMS-1120: `users` FIRST. The forward mirror locks `users`, then
+        // `tenant_memberships`, then `identities`, so that is the order every
+        // writer of either plane takes; this one took it the other way round
+        // and was one half of the cycle by itself. Both statements stay
+        // explicit rather than letting the mirror carry the flag, for the
+        // PMS-1223 reason: the flag has to reach every tenant seat the human
+        // holds, and the mirror would copy one seat's whole profile row onto
+        // the identity as a side effect.
         sqlx::query(
-            "UPDATE identities SET mfa_enabled = $1, mfa_last_totp_step = 0, \
-                                   updated_at = NOW() \
+            "UPDATE users SET mfa_enabled = $1, updated_at = NOW() \
              WHERE lower(email) = lower($2)",
         )
         .bind(enabled)
@@ -2201,7 +2208,8 @@ impl AuthService {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "UPDATE users SET mfa_enabled = $1, updated_at = NOW() \
+            "UPDATE identities SET mfa_enabled = $1, mfa_last_totp_step = 0, \
+                                   updated_at = NOW() \
              WHERE lower(email) = lower($2)",
         )
         .bind(enabled)
@@ -3690,30 +3698,34 @@ impl AuthService {
 
     /// Update user's last login timestamp. PMS-4 AC6.
     ///
-    /// MAPPS-500 (MAPPS-496 stage 2b): identities is now the source of
-    /// truth for `last_login_at`; the MAPPS-498 back-mirror propagates
-    /// the timestamp to every users row this identity backs across all
-    /// tenants they hold a membership in. `tenant_id + user_id` is
-    /// still consulted first to resolve the email, so a stray
-    /// cross-tenant `user_id` returns no email and the write is
-    /// silently a no-op (matches the pre-500 shape which was a
-    /// 0-rows-affected users UPDATE for the same case).
+    /// MAPPS-500 (MAPPS-496 stage 2b) made `identities` the source of truth
+    /// and wrote it there, leaving the MAPPS-498 back-mirror to carry the
+    /// timestamp onto the `users` rows. PMS-1120 retired that mirror, so this
+    /// writes the `users` row and the FORWARD mirror carries it to the
+    /// identity. One statement, and the lock order every other writer of this
+    /// plane takes.
+    ///
+    /// The reach is unchanged, and the old comment overstated it. This runs on
+    /// the tenant-GUC connection and the back-mirror's `UPDATE users` carried
+    /// no `SECURITY DEFINER`, so RLS filtered it to the caller's tenant: the
+    /// promised fan-out to "every users row this identity backs across all
+    /// tenants" never happened. PMS-1223 found the same gap in
+    /// `write_mfa_enabled` and fixed it by writing both planes on the migrator
+    /// pool. It is not fixed here because it is not a gap: which tenant a
+    /// person last signed into is a per-seat fact, and the identity's own
+    /// `last_login_at` is what answers "when did this human last sign in
+    /// anywhere".
+    ///
+    /// A `user_id` that does not belong to `tenant_id` matches no row and the
+    /// write is silently a no-op, which is the pre-MAPPS-500 shape.
     async fn update_last_login(&self, tenant_id: Uuid, user_id: Uuid) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let email: Option<String> =
-            sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND tenant_id = $2")
-                .bind(user_id)
-                .bind(tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some(email) = email else {
-            return Ok(());
-        };
         sqlx::query(
-            "UPDATE identities SET last_login_at = NOW(), updated_at = NOW() \
-             WHERE lower(email) = lower($1)",
+            "UPDATE users SET last_login_at = NOW(), updated_at = NOW() \
+             WHERE id = $1 AND tenant_id = $2",
         )
-        .bind(&email)
+        .bind(user_id)
+        .bind(tenant_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -4964,4 +4976,140 @@ mod tests {
 
     // PMS-657's non-public-IP coverage moved with the predicate itself in
     // PMS-805: see `crate::utils::net::tests::non_public_ip_detection`.
+}
+
+/// PMS-1120: the mirror is one way, and the source is what keeps it that way.
+#[cfg(test)]
+mod mirror_direction {
+    /// Every `UPDATE identities` in `src/` either writes only columns the
+    /// mirror does not carry, or writes `users` too, in that order.
+    ///
+    /// The `users` -> `identities` trigger locks `users`, then
+    /// `tenant_memberships`, then `identities`. That is the only lock order in
+    /// the system now that the reverse trigger is gone (migration 245), and a
+    /// writer that takes the identity row first and the `users` row second
+    /// reintroduces the cycle the whole change exists to close - not by
+    /// restoring the trigger, but in its own transaction. `write_mfa_enabled`
+    /// was exactly that shape before this, and it was the cycle by itself.
+    ///
+    /// The rule cannot be a type: these are raw `sqlx::query` statements the
+    /// compiler has no opinion about, so the source is what gets read, the way
+    /// `contacts::service::mirror_writers` and
+    /// `billing::routes::finance_gate` do, under `cargo test --lib` with no
+    /// script, recipe or CI step to add.
+    ///
+    /// A site that must write both planes is listed in `BOTH_PLANES` with the
+    /// order asserted, rather than being waved through: naming it here is
+    /// cheap, and the next person adding one has to say which order they took.
+    #[test]
+    fn no_writer_takes_the_identity_row_before_the_users_row() {
+        // Assembled so the needle is not its own hit; the prose above names
+        // the statement.
+        let needle = format!("UPDATE {}", "identities");
+        // The columns the forward mirror carries. A write confined to anything
+        // else cannot make the two planes disagree, so it does not have to
+        // touch `users` at all - `record_identity_mfa_success` is the case,
+        // and stamping a TOTP watermark used to rewrite thirteen columns on
+        // every seat at that email for nothing.
+        const MIRRORED: &[&str] = &[
+            "first_name",
+            "last_name",
+            "phone",
+            "mobile",
+            "avatar_url",
+            "timezone",
+            "locale",
+            "email_verified_at",
+            "last_login_at",
+            "mfa_enabled",
+            "notification_preferences",
+            "settings",
+        ];
+        // Functions allowed to write both planes, each of which writes `users`
+        // first. Kept as names rather than a count so a new one is a
+        // deliberate edit here.
+        const BOTH_PLANES: &[&str] = &["write_mfa_enabled", "write_mfa_secret"];
+        // Enough to cover the statement and its binds.
+        const WINDOW: usize = 1200;
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        let mut pending = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read source directory") {
+                let entry = entry.expect("read directory entry");
+                let path = entry.path();
+                if entry.file_type().expect("read entry type").is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source file");
+                for (offset, _) in text.match_indices(&needle) {
+                    // A backticked mention is prose, never a statement.
+                    if text[..offset].ends_with('`') {
+                        continue;
+                    }
+                    seen += 1;
+                    let rest = &text[offset..];
+                    let window = &rest[..rest.len().min(WINDOW)];
+                    let sets: Vec<&str> = MIRRORED
+                        .iter()
+                        .copied()
+                        .filter(|c| window.contains(*c))
+                        .collect();
+                    if sets.is_empty() {
+                        continue;
+                    }
+                    // A mirrored column is being written on the identity
+                    // plane. The enclosing function has to be one that writes
+                    // both planes, users first.
+                    let head = &text[..offset];
+                    let enclosing = BOTH_PLANES.iter().find(|name| {
+                        head.rfind(&format!("fn {name}"))
+                            .is_some_and(|at| head[at..].matches("\n    }").count() == 0)
+                    });
+                    match enclosing {
+                        None => offenders.push(format!(
+                            "{}: writes mirrored column(s) {:?} on the identity plane outside \
+                             any BOTH_PLANES writer",
+                            path.display(),
+                            sets
+                        )),
+                        Some(name) => {
+                            // The `users` write has to come FIRST, so it is
+                            // above this statement in the same function.
+                            let at = head.rfind(&format!("fn {name}")).expect("found above");
+                            let body_so_far = &head[at..];
+                            if !body_so_far.contains(&format!("UPDATE {}", "users")) {
+                                offenders.push(format!(
+                                    "{}: {name} writes the identity plane before the users \
+                                     plane, which is the lock order the forward mirror forbids",
+                                    path.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "PMS-1120: the mirror runs one way, users to identities.\n{}",
+            offenders.join("\n")
+        );
+        // Tripwire: if the statement is ever renamed or reformatted past this
+        // scan, the loop above would report clean over nothing. Two sites
+        // today, and both are deliberate: `write_mfa_enabled` writes the flag
+        // on both planes, and `record_identity_mfa_success` stamps the TOTP
+        // watermark, which the mirror does not carry.
+        assert!(
+            seen >= 2,
+            "expected to see the identity-plane writers; saw {seen}"
+        );
+    }
 }
