@@ -2789,6 +2789,14 @@ impl ContactAuthService {
         // then overrides the tenant's own validated value everywhere
         // `effective_branding` reads it.
         crate::modules::tenants::branding::validate_company_branding_patch(patch)?;
+        // PMS-1371: a contact-plane submission is just as able to name another
+        // tenant's asset path as the staff-plane one is, so it gets the same
+        // ownership check: the id following the prefix must be this tenant's
+        // own, or one of its own companies'.
+        crate::modules::tenants::branding::assert_branding_patch_owned_by_tenant(
+            patch, tenant_id, &self.db,
+        )
+        .await?;
         let mut tx = self
             .db
             .begin_with_tenant(TenantId::from_trusted(tenant_id))
