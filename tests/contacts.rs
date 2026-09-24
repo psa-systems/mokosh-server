@@ -711,6 +711,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
             "company_name": "Bob's Plumbing",
             "first_name": "Bob",
             "last_name": "Smith",
+            "email": format!("bob-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -755,6 +756,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
         .json(&serde_json::json!({
             "first_name": "Lone",
             "last_name": "Person",
+            "email": format!("lone-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -779,6 +781,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
             "company_name": "Acme Typed",
             "first_name": "Clash",
             "last_name": "Case",
+            "email": format!("clash-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -808,6 +811,7 @@ async fn updating_freeform_to_fk_clears_freeform_name(pool: PgPool) {
             "company_name": "Typed Co",
             "first_name": "Mover",
             "last_name": "Upper",
+            "email": format!("mover-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -1267,6 +1271,7 @@ async fn contact_field_validation(pool: PgPool) {
         "company_id": company_id,
         "first_name": "Ada",
         "last_name": "Lovelace",
+        "email": format!("ada-{}@example.com", uuid::Uuid::new_v4()),
     });
     let with = |k: &str, v: serde_json::Value| {
         let mut b = base.clone();
@@ -2067,8 +2072,11 @@ async fn website_probe_rejects_impossible_input(pool: PgPool) {
 async fn create_contact(
     app: &common::TestApp,
     token: &str,
-    body: serde_json::Value,
+    mut body: serde_json::Value,
 ) -> serde_json::Value {
+    if body.get("email").is_none() {
+        body["email"] = serde_json::json!(format!("{}@example.com", uuid::Uuid::new_v4()));
+    }
     let resp = app
         .client
         .post(app.url("/api/v1/contacts/contacts"))
@@ -2515,6 +2523,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
         serde_json::json!({
             "first_name": "Bad",
             "last_name": "Phone",
+            "email": format!("bad-phone-{}@example.com", uuid::Uuid::new_v4()),
             "phones": [
                 { "phone_type": "work", "number": "+14155551234" },
                 { "phone_type": "home", "number": "not-a-phone" },
@@ -2543,6 +2552,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
             serde_json::json!({
                 "first_name": "Two",
                 "last_name": "Primaries",
+                "email": format!("two-primaries-phones-{}@example.com", uuid::Uuid::new_v4()),
                 "phones": [
                     { "phone_type": "work", "number": "+14155551234", "is_primary": true },
                     { "phone_type": "home", "number": "+14155555678", "is_primary": true },
@@ -2562,6 +2572,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
             serde_json::json!({
                 "first_name": "Two",
                 "last_name": "Companies",
+                "email": format!("two-primaries-companies-{}@example.com", uuid::Uuid::new_v4()),
                 "companies": [
                     { "company_id": a, "is_primary": true },
                     { "company_id": b, "is_primary": true },
@@ -2581,6 +2592,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
             serde_json::json!({
                 "first_name": "Both",
                 "last_name": "Ways",
+                "email": format!("both-ways-{}@example.com", uuid::Uuid::new_v4()),
                 "company_name": "Acme Plumbing",
                 "companies": [{ "company_id": a }],
             }),
@@ -2599,6 +2611,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
         serde_json::json!({
             "first_name": "Foreign",
             "last_name": "Link",
+            "email": format!("foreign-link-{}@example.com", uuid::Uuid::new_v4()),
             "companies": [{ "company_id": a }, { "company_id": foreign }],
         }),
     )
