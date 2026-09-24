@@ -186,6 +186,22 @@ async fn kb_articles_list_handles_every_filter_combination(pool: PgPool) {
             status: Some("published".to_string()),
             visibility: Some("internal".to_string()),
             q: Some("printer".to_string()),
+            ..Default::default()
+        },
+        KbArticleFilter {
+            company_id: Some(id),
+            ..Default::default()
+        },
+        KbArticleFilter {
+            parent_article_id: Some(id),
+            ..Default::default()
+        },
+        // Company + parent together names "the variants this company owns
+        // of that generic article", the per-client documentation view.
+        KbArticleFilter {
+            company_id: Some(id),
+            parent_article_id: Some(id),
+            ..Default::default()
         },
     ];
     for (i, filter) in combos.iter().enumerate() {

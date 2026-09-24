@@ -68,6 +68,10 @@ pub struct KbArticleResponse {
     /// `public` / `internal` articles. Returned so the editor can
     /// round-trip the multi-select selection (PMS-341).
     pub company_ids: Vec<Uuid>,
+    /// The generic article this row is a client-specific version of.
+    /// `None` for a top-level article. The parent is scoped to the same
+    /// tenant; a cross-tenant link cannot be written through the API.
+    pub parent_article_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -130,6 +134,12 @@ pub struct CreateKbArticleRequest {
     /// and stored empty for `public` / `internal`.
     #[serde(default)]
     pub company_ids: Option<Vec<Uuid>>,
+    /// Optional parent article, when this row is the client-specific
+    /// version of a more generic one. The parent must live in the same
+    /// tenant; the service refuses a cross-tenant id and refuses a
+    /// self-reference.
+    #[serde(default)]
+    pub parent_article_id: Option<Uuid>,
 }
 
 fn default_draft() -> String {
@@ -154,12 +164,29 @@ pub struct UpdateKbArticleRequest {
     /// is not `client_specific` the scope is cleared regardless.
     #[serde(default)]
     pub company_ids: Option<Vec<Uuid>>,
+    /// Parent link. Absent leaves the current parent alone, `Some(None)`
+    /// clears it, `Some(Some(id))` sets or replaces it.
+    #[serde(default, deserialize_with = "deserialize_optional_optional_uuid")]
+    pub parent_article_id: Option<Option<Uuid>>,
     /// PMS-1126: why this edit was made, stored on the version the save
     /// creates. Trimmed; blank is the same as absent. A save that creates
     /// no version (a metadata-only edit) keeps no note, because there is
     /// no version for it to explain.
     #[validate(length(max = 500))]
     pub change_note: Option<String>,
+}
+
+/// A JSON `null` deserializes into `Some(None)`, an absent field into
+/// `None`, and a value into `Some(Some(_))`. Lets a caller distinguish
+/// "leave it alone" from "clear it" on a nullable column, the shape
+/// `contact_id` on opportunities also uses.
+fn deserialize_optional_optional_uuid<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<Uuid>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<Uuid>::deserialize(deserializer)?))
 }
 
 /// PMS-1126: the body of `POST /kb/articles/{id}/versions/{n}/restore`.
@@ -202,6 +229,14 @@ pub struct KbArticleFilter {
     pub status: Option<String>,
     #[validate(length(max = 100))]
     pub visibility: Option<String>,
+    /// Narrows the list to `client_specific` articles whose `company_ids`
+    /// contain this company. Backed by a GIN index over the array; without
+    /// the filter a per-company KB view has no way to ask this question.
+    pub company_id: Option<Uuid>,
+    /// Narrows the list to the client-specific variants of one generic
+    /// article. Paired with `company_id` the SPA reads "the variants
+    /// this client owns of that article".
+    pub parent_article_id: Option<Uuid>,
     /// Free-text search. Capped to 200 chars to keep the pg_trgm
     /// similarity scan bounded; matched against the
     /// `(title || ' ' || content) gin_trgm_ops` GIN index via the `%`

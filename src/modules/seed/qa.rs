@@ -1339,6 +1339,7 @@ fn qa_kb_article_specs(category_id: Uuid) -> Vec<CreateKbArticleRequest> {
         status: "published".to_string(),
         tags: vec![QA_TAG.to_string()],
         company_ids: None,
+        parent_article_id: None,
     };
     vec![
         mk(1, "Onboarding a new workstation", "onboard-workstation"),
