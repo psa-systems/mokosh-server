@@ -183,18 +183,22 @@ async fn a_vcard_upload_page_reads_files_and_runs_each_once(pool: PgPool) {
     );
 
     let statements = recorder.take();
-    for (table, label) in [
-        ("contact_import_files", "file metadata"),
+    for (needle, label) in [
+        // The aliased join form the batched file-metadata read uses; the
+        // id-list query also names `contact_import_files` but with no
+        // alias, so matching the bare table name here would double-count
+        // it against this read.
+        ("FROM contact_import_files f", "file metadata"),
         ("contact_sync_runs", "latest run"),
     ] {
         let reads: Vec<&String> = statements
             .iter()
-            .filter(|s| s.starts_with("SELECT") && s.contains(table))
+            .filter(|s| s.starts_with("SELECT") && s.contains(needle))
             .collect();
         assert_eq!(
             reads.len(),
             1,
-            "reading {label} for {UPLOADS} uploads must read `{table}` exactly once \
+            "reading {label} for {UPLOADS} uploads must read it exactly once \
              (N+1 regression), got: {reads:#?}"
         );
         assert!(
