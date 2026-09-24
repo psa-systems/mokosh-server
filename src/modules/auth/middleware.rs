@@ -30,6 +30,29 @@ pub enum BearerOutcome {
     /// A bearer was presented and rejected for any other reason (bad
     /// signature, wrong audience, unknown kid, unusable principal, ...).
     Rejected,
+    /// PMS-998: the bearer verified, but the OP has told us its session
+    /// ended. Distinct from `Expired` and from `Rejected` because the client
+    /// must act on it rather than retry: the token is well formed and still
+    /// inside its lifetime, and refreshing it will not help while the session
+    /// is gone.
+    SessionEnded,
+}
+
+/// PMS-998: whether the OP has told us this token's session ended.
+///
+/// A token with no `sid` names no session, so it is unaffected - that is
+/// every token minted before BUNYIP-636 emits the claim, and treating the
+/// absence as a refusal would 401 every caller the moment this shipped. The
+/// lookup is one `HashMap::get` behind a read lock over a map that is empty
+/// until a logout arrives.
+async fn session_ended(
+    revoked: &crate::modules::auth::backchannel_logout::RevokedSessions,
+    claims: &super::oidc_rs::AtClaims,
+) -> bool {
+    let Some(sid) = claims.sid.as_deref() else {
+        return false;
+    };
+    revoked.is_revoked(sid, chrono::Utc::now()).await
 }
 
 /// PMS-1299 (F7a): a rejection any anonymous caller can trigger with a junk
@@ -61,6 +84,9 @@ impl BearerOutcome {
                 r#"Bearer error="invalid_token", error_description="The access token expired""#
             }
             Self::Rejected => r#"Bearer error="invalid_token""#,
+            Self::SessionEnded => {
+                r#"Bearer error="invalid_token", error_description="The session was ended at the identity provider""#
+            }
             // No credential was presented (or one was accepted and the 401
             // came from somewhere else): the bare challenge just names the
             // scheme the resource server expects.
@@ -157,6 +183,10 @@ pub struct AuthMiddleware {
     /// Optional invitations service: the bunyip path resolves a pending invite
     /// for the user's email and places/re-homes them into that tenant (PMS-244).
     pub invitations: Option<Arc<crate::modules::invitations::InvitationsService>>,
+    /// PMS-998: sessions bunyip has told us it ended. Shared with the
+    /// back-channel logout receiver; empty (and therefore free) until one
+    /// arrives.
+    pub revoked_sessions: crate::modules::auth::backchannel_logout::RevokedSessions,
 }
 
 impl AuthMiddleware {
@@ -166,6 +196,7 @@ impl AuthMiddleware {
             bunyip: None,
             tenants: None,
             invitations: None,
+            revoked_sessions: Default::default(),
         }
     }
 
@@ -180,6 +211,17 @@ impl AuthMiddleware {
     /// personal tenant on self-signup (PMS-244).
     pub fn with_tenants(mut self, tenants: Arc<crate::modules::tenants::TenantService>) -> Self {
         self.tenants = Some(tenants);
+        self
+    }
+
+    /// PMS-998: share the revoked-session set with the back-channel logout
+    /// receiver, so a session bunyip ended is refused here on the next
+    /// request rather than at the access token's expiry.
+    pub fn with_revoked_sessions(
+        mut self,
+        revoked: crate::modules::auth::backchannel_logout::RevokedSessions,
+    ) -> Self {
+        self.revoked_sessions = revoked;
         self
     }
 
@@ -299,6 +341,23 @@ pub async fn auth_middleware(
             //    bunyip-api carry typ=at+jwt + iss=bunyip's OIDC_ISSUER.
             let from_bunyip = match auth_middleware.bunyip.as_ref().filter(|_| bunyip_enabled) {
                 Some(v) => match v.verify_at_jwt(token).await {
+                    Ok(claims)
+                        if session_ended(&auth_middleware.revoked_sessions, &claims).await =>
+                    {
+                        // PMS-998: the signature and the lifetime both say
+                        // this token is good; the OP saying its session ended
+                        // outranks both. Checked here rather than inside the
+                        // verifier because it is not a property of the token:
+                        // the same bytes were acceptable a moment ago, and a
+                        // verifier whose answer moved over time would make
+                        // its own failures unreproducible.
+                        outcome = BearerOutcome::SessionEnded;
+                        tracing::debug!(
+                            sub = %claims.sub,
+                            "bunyip bearer refused: the OP ended this session"
+                        );
+                        None
+                    }
                     Ok(claims) => {
                         bunyip_verified = true;
                         candidate_sub = uuid::Uuid::parse_str(&claims.sub).ok();
@@ -1015,6 +1074,29 @@ pub async fn place_bunyip_user_from_local_state(
     let principal = match resolve_bunyip_caller(auth_service, invitations, sub, claims).await {
         UserinfoDecision::Needed => return LocalPlacement::UserinfoNeeded,
         UserinfoDecision::Rejected(e) => return LocalPlacement::Placed(Box::new((None, Some(e)))),
+        // PMS-1372: the local read failed (a transient DB error), which is not
+        // the same thing as reading no row - the caller may well already be
+        // placed. Fall straight to `place_bunyip_caller` with no pre-resolved
+        // principal and no userinfo hints, the same shortcut the `Skip` arm
+        // below takes for the common case, rather than forcing the
+        // `/oauth2/userinfo` round trip PMS-713 exists to skip.
+        UserinfoDecision::ReadFailed => {
+            return LocalPlacement::Placed(Box::new(
+                place_bunyip_caller(
+                    auth_service,
+                    tenants,
+                    invitations,
+                    sub,
+                    None,
+                    false,
+                    None,
+                    None,
+                    claims,
+                    None,
+                )
+                .await,
+            ));
+        }
         UserinfoDecision::Skip(principal) => *principal,
     };
     LocalPlacement::Placed(Box::new(
@@ -1042,6 +1124,14 @@ pub async fn place_bunyip_user_from_local_state(
 /// not read the same rows again.
 enum UserinfoDecision {
     Needed,
+    /// PMS-1372: the local `users` read itself failed (a transient DB error),
+    /// distinct from `Needed`'s "read succeeded and found no row". Treated as
+    /// "assume already placed, do not re-provision": a wrongly-skipped
+    /// JIT/placement pass on a genuinely new user self-corrects on their very
+    /// next request once the read succeeds, while forcing the userinfo round
+    /// trip on every request for the duration of a DB outage does not
+    /// self-correct until the outage ends.
+    ReadFailed,
     /// PMS-1125: the row exists and the PMS-698 gate refused it. Decided
     /// before any placement question, so a refused principal is never
     /// re-homed or provisioned on its way to the refusal.
@@ -1097,15 +1187,17 @@ async fn resolve_bunyip_caller(
     }
 
     // First sight: no local row yet, so the user must be JIT-provisioned (needs
-    // email + name from userinfo). A read error reads the same way it did when
-    // this was `find_user_placement(..).ok().flatten()`: no placement, so the
-    // full path runs and re-reads.
+    // email + name from userinfo).
     let principal = match auth_service.find_bunyip_principal(sub).await {
         Ok(Some(principal)) => principal,
         Ok(None) => return UserinfoDecision::Needed,
+        // PMS-1372: a read error is NOT "no placement". Collapsing it into
+        // `Needed` forced the `/oauth2/userinfo` round trip PMS-713 exists to
+        // skip on every request for as long as the error recurs (a DB pool
+        // exhaustion or statement timeout), even for an already-placed user.
         Err(e) => {
             tracing::warn!(error = %e, sub = %sub, "bunyip principal lookup failed");
-            return UserinfoDecision::Needed;
+            return UserinfoDecision::ReadFailed;
         }
     };
     // PMS-1125: the PMS-698 principal gate runs on the row as read, BEFORE
@@ -2302,5 +2394,61 @@ mod pms_1299_tests {
         assert!(!is_anonymous_rejection(&VerifyError::DiscoveryFetch(
             "x".into()
         )));
+    }
+}
+
+/// PMS-998: the back-channel logout refusal, as a caller sees it.
+#[cfg(test)]
+mod pms_998_tests {
+    use super::*;
+    use crate::modules::auth::backchannel_logout::RevokedSessions;
+    use chrono::Utc;
+
+    fn claims_with_sid(sid: Option<&str>) -> super::super::oidc_rs::AtClaims {
+        serde_json::from_value(serde_json::json!({
+            "iss": "https://bunyip.test",
+            "sub": "11111111-1111-1111-1111-111111111111",
+            "aud": "https://api.mokosh.test",
+            "client_id": "mokosh-apps",
+            "scope": "openid",
+            "exp": Utc::now().timestamp() + 600,
+            "iat": Utc::now().timestamp(),
+            "sid": sid,
+        }))
+        .expect("claims fixture")
+    }
+
+    /// The whole point of the new outcome: a client can tell "your session
+    /// ended, sign in again" from "your token expired, refresh it". Sending
+    /// the expired challenge for both would have the SPA refresh forever
+    /// against a session that is gone.
+    #[test]
+    fn the_challenge_distinguishes_an_ended_session_from_an_expiry() {
+        let ended = BearerOutcome::SessionEnded.challenge();
+        let expired = BearerOutcome::Expired.challenge();
+        assert_ne!(ended, expired);
+        assert!(ended.contains("invalid_token"), "{ended}");
+        assert!(ended.contains("ended at the identity provider"), "{ended}");
+        // And it is not the bare rejection either, which carries no
+        // description at all.
+        assert_ne!(ended, BearerOutcome::Rejected.challenge());
+    }
+
+    #[tokio::test]
+    async fn only_a_token_naming_a_revoked_session_is_refused() {
+        let revoked = RevokedSessions::new();
+
+        // Nothing revoked yet.
+        assert!(!session_ended(&revoked, &claims_with_sid(Some("s1"))).await);
+
+        revoked.revoke("s1", Utc::now()).await;
+        assert!(session_ended(&revoked, &claims_with_sid(Some("s1"))).await);
+        assert!(
+            !session_ended(&revoked, &claims_with_sid(Some("s2"))).await,
+            "another session is untouched"
+        );
+        // Every token minted before BUNYIP-636 carries no sid, and must keep
+        // working: treating the absence as a refusal would 401 everyone.
+        assert!(!session_ended(&revoked, &claims_with_sid(None)).await);
     }
 }

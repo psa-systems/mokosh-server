@@ -39,6 +39,27 @@ async fn seed_work_type(pool: &PgPool) -> Uuid {
     id
 }
 
+/// PMS-999: issue an invoice without emailing anyone, which is what a test
+/// needs before it can record a payment against it. A payment is only legal
+/// against a document the customer has been given, and `skip_email` is the
+/// server's own path for an invoice delivered some other way (PMS-992), so it
+/// needs no billing contact seeded.
+async fn issue(app: &common::TestApp, token: &str, invoice_id: &str) {
+    let resp = app
+        .client
+        .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "status": "sent", "skip_email": true }))
+        .send()
+        .await
+        .expect("send invoice");
+    assert!(
+        resp.status().is_success(),
+        "issuing should 2xx, got {}",
+        resp.status()
+    );
+}
+
 /// Seed one billable, unbilled time entry directly. The money columns
 /// are bound as `Decimal` values (parsed from the string literals via
 /// [`common::dec`]) rather than interpolated as SQL literals. Returns
@@ -308,6 +329,9 @@ async fn payment_against_generated_invoice_transitions_status(pool: PgPool) {
     let invoice: serde_json::Value = resp.json().await.expect("invoice JSON");
     let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
 
+    // PMS-999: pay a document the customer has actually been given.
+    issue(&app, &token, &invoice_id).await;
+
     // Record a full payment via the existing payments endpoint.
     let pay_resp = app
         .client
@@ -353,6 +377,126 @@ async fn payment_against_generated_invoice_transitions_status(pool: PgPool) {
         balance.abs() < 0.001,
         "balance_due should be zero, got {balance}"
     );
+}
+
+/// PMS-999: a payment cannot send an invoice.
+///
+/// `recompute_invoice_balance` derived the status from the money, and its
+/// fall-through was a literal `'sent'`, so recording a payment against a
+/// draft rewrote that draft to `sent` in raw SQL. That was the only route to
+/// the status that did not go through `update_invoice`, and so the only one
+/// that skipped everything being sent means: no `sent_at`, no frozen issuer
+/// snapshot (PMS-911), no stored document (PMS-959), and since PMS-993 no
+/// billing contact for the pay-now mail to address.
+#[sqlx::test]
+async fn a_payment_against_an_unsent_invoice_is_refused(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seed_work_type(&pool).await;
+    seed_time_entry(
+        &pool,
+        admin_id,
+        company_id,
+        work_type_id,
+        60,
+        "150.00",
+        "150.00",
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let invoice: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/invoices/from-time-entries"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "company_id": company_id }))
+        .send()
+        .await
+        .expect("generate invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
+    assert_eq!(invoice["status"].as_str(), Some("draft"));
+
+    let refused = app
+        .client
+        .post(app.url("/api/v1/payments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "invoice_id": invoice_id,
+            "company_id": company_id,
+            "payment_date": chrono::Utc::now().date_naive().to_string(),
+            "amount": "150.00",
+            "payment_method": "check",
+        }))
+        .send()
+        .await
+        .expect("record payment");
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = refused.json().await.expect("refusal JSON");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("draft"), "names the status: {message}");
+    assert!(
+        message.contains("Send it first"),
+        "and says what to do: {message}"
+    );
+
+    // Nothing was recorded, and the invoice is exactly as it was.
+    let payments: i64 = sqlx::query_scalar("SELECT count(*) FROM payments WHERE tenant_id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("payments");
+    assert_eq!(payments, 0, "a refused payment records nothing");
+
+    let (status, sent_at, issuer, balance): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+        rust_decimal::Decimal,
+    ) = sqlx::query_as(
+        "SELECT status, sent_at, issuer_snapshot, balance_due FROM invoices WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&invoice_id).expect("uuid"))
+    .fetch_one(&pool)
+    .await
+    .expect("invoice row");
+    assert_eq!(status, "draft", "still a draft");
+    assert!(sent_at.is_none(), "never stamped as sent");
+    assert!(issuer.is_none(), "no issuer was frozen");
+    assert_eq!(balance, common::dec("150.00"));
+
+    let documents: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM files WHERE tenant_id = $1 AND entity_id = $2 \
+           AND entity_type = 'invoice_document'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(Uuid::parse_str(&invoice_id).expect("uuid"))
+    .fetch_one(&pool)
+    .await
+    .expect("documents");
+    assert_eq!(documents, 0, "no document was issued");
+
+    // Issued, the same payment is accepted, which is the point: the refusal
+    // is about the invoice's state and not about the payment.
+    issue(&app, &token, &invoice_id).await;
+    let accepted = app
+        .client
+        .post(app.url("/api/v1/payments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "invoice_id": invoice_id,
+            "company_id": company_id,
+            "payment_date": chrono::Utc::now().date_naive().to_string(),
+            "amount": "150.00",
+            "payment_method": "check",
+        }))
+        .send()
+        .await
+        .expect("record payment");
+    assert!(accepted.status().is_success(), "{}", accepted.status());
 }
 
 // PMS-186: invoice and payment responses carry the company's display name
@@ -424,6 +568,8 @@ async fn billing_responses_carry_company_name(pool: PgPool) {
     );
 
     // --- Payment create + list carry company_name ---
+    // PMS-999: the payment needs an issued invoice to attach to.
+    issue(&app, &token, &invoice_id).await;
     let payment: serde_json::Value = app
         .client
         .post(app.url("/api/v1/payments"))
