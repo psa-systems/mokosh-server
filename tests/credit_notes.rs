@@ -7,6 +7,11 @@
 //! other direction: crediting a draft, crediting past the total, hiding a
 //! charge inside a credit, and moving the status ladder for invoices that have
 //! no credits at all.
+//!
+//! PMS-1333 took one rule back out. Crediting used to be what wrote `void`,
+//! which read a credited invoice as a cancelled one; it is not, so a credit
+//! that clears the balance now settles the invoice to `paid` and voiding is
+//! `POST /invoices/{id}/void`, its own act with its own preconditions.
 
 mod common;
 
@@ -174,10 +179,18 @@ async fn a_credit_reduces_the_balance_without_editing_the_invoice(pool: PgPool) 
     );
 }
 
-/// `void` was a status the model knew and no code path could reach. Crediting
-/// away the whole outstanding balance is what finally writes it.
+/// PMS-1333: crediting an invoice for its whole total does NOT void it.
+///
+/// PMS-953 made crediting the writer of `void`, the status nothing could
+/// reach. That read a credited invoice as a cancelled one, and it is not: the
+/// document stood, the customer holds it, and the credit note is the
+/// correction. The balance reaches zero, so the invoice lands on `paid`, which
+/// is also Stripe's answer ("if a credit note reduces the balance of an open
+/// invoice to 0, the invoice status changes to paid",
+/// <https://docs.stripe.com/invoicing/dashboard/credit-notes>), and it carries
+/// no payment date, because nobody paid.
 #[sqlx::test]
-async fn crediting_the_whole_balance_voids_the_invoice(pool: PgPool) {
+async fn crediting_the_whole_balance_does_not_void_the_invoice(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
@@ -187,11 +200,71 @@ async fn crediting_the_whole_balance_voids_the_invoice(pool: PgPool) {
     assert!(resp.status().is_success());
 
     let after = get_invoice(&app, &token, &invoice_id).await;
-    assert_eq!(after["status"].as_str(), Some("void"));
+    assert_eq!(
+        after["status"].as_str(),
+        Some("paid"),
+        "a fully credited invoice is settled, not cancelled: {after}"
+    );
+    assert!(after["voided_at"].is_null(), "nothing voided it: {after}");
     assert_eq!(dec(&after["balance_due"]), Decimal::ZERO);
+    assert_eq!(dec(&after["amount_credited"]), Decimal::from(1000));
     assert!(
         after["paid_at"].is_null(),
         "a credited invoice was not paid, so it carries no payment date"
+    );
+}
+
+/// PMS-1333: a partial credit on a sent invoice leaves it sent, with the
+/// balance reduced by exactly the credit. The case either side of the one
+/// above, and the one an MSP hits most.
+#[sqlx::test]
+async fn a_partial_credit_leaves_a_sent_invoice_sent(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let (_company_id, invoice_id) = sent_invoice(&app, &token, &pool, "1000").await;
+
+    let resp = credit(&app, &token, &invoice_id, "250").await;
+    assert!(resp.status().is_success());
+
+    let after = get_invoice(&app, &token, &invoice_id).await;
+    assert_eq!(after["status"].as_str(), Some("sent"), "{after}");
+    assert!(after["voided_at"].is_null());
+    assert_eq!(dec(&after["amount_credited"]), Decimal::from(250));
+    assert_eq!(dec(&after["balance_due"]), Decimal::from(750));
+}
+
+/// PMS-1333: and a voided invoice cannot then be credited. Voiding says the
+/// document never stood, so there is no charge for a credit note to correct.
+#[sqlx::test]
+async fn a_voided_invoice_refuses_a_credit_note(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let (_company_id, invoice_id) = sent_invoice(&app, &token, &pool, "400").await;
+
+    // Back to draft, the only status a void is allowed from, then void it.
+    sqlx::query("UPDATE invoices SET status = 'draft' WHERE id = $1")
+        .bind(uuid::Uuid::from_str(&invoice_id).expect("invoice id"))
+        .execute(&pool)
+        .await
+        .expect("return the invoice to draft");
+    let voided = app
+        .client
+        .post(app.url(&format!("/api/v1/invoices/{invoice_id}/void")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "reason": "Raised against the wrong company" }))
+        .send()
+        .await
+        .expect("send void");
+    assert!(voided.status().is_success(), "{}", voided.status());
+
+    let resp = credit(&app, &token, &invoice_id, "100").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("refusal JSON");
+    assert!(
+        body.to_string().contains("voided"),
+        "the refusal should say why: {body}"
     );
 }
 
@@ -274,9 +347,10 @@ async fn voiding_a_credit_note_restores_the_balance(pool: PgPool) {
         .await
         .expect("credit note JSON");
     let note_id = note["id"].as_str().expect("credit note id").to_string();
+    // PMS-1333: settled by the credit, not cancelled by it.
     assert_eq!(
         get_invoice(&app, &token, &invoice_id).await["status"].as_str(),
-        Some("void")
+        Some("paid")
     );
 
     let resp = app
@@ -349,7 +423,8 @@ async fn a_credit_cannot_exceed_what_is_left_to_credit(pool: PgPool) {
 
     let after = get_invoice(&app, &token, &invoice_id).await;
     assert_eq!(dec(&after["amount_credited"]), Decimal::from(1000));
-    assert_eq!(after["status"].as_str(), Some("void"));
+    // PMS-1333: credited to zero across two notes is still settled, not void.
+    assert_eq!(after["status"].as_str(), Some("paid"));
 }
 
 /// An invoice the customer has already paid can still be credited in full.

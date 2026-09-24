@@ -261,10 +261,25 @@ async fn a_foreign_company_cannot_be_created_against(pool: PgPool) {
 
 /// The applied-payment path keeps its own refusal: the company has to match
 /// the invoice's, which already pins it to this tenant (PMS-1235).
+///
+/// PMS-999: the invoice is sent first, because a payment against a draft is
+/// now refused before the company is ever compared. Sending it is what keeps
+/// this test about the company check rather than about the status one.
 #[sqlx::test]
 async fn a_payment_still_has_to_match_its_invoices_company(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let invoice = f.draft(f.acme, None).await;
+    let (status, body) = f
+        .call(
+            reqwest::Method::PUT,
+            &format!("/api/v1/invoices/{invoice}"),
+            json!({ "status": "sent", "skip_email": true }),
+        )
+        .await;
+    assert!(
+        status.is_success(),
+        "issuing should 2xx, got {status}: {body}"
+    );
     let (status, body) = f
         .call(
             reqwest::Method::POST,

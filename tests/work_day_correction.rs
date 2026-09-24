@@ -15,7 +15,25 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const DAY: &str = "2026-06-15";
+/// PMS-1373: today's date at test run time, so the segment date the tests
+/// send matches the day segments actually START on when the clock is real.
+/// The hardcoded 2026-06-15 literal drifted into the past and the correction
+/// endpoint began refusing every test that reused it once real time passed
+/// it (`A segment's date must be the day it starts on`).
+fn today_str() -> String {
+    chrono::Utc::now().date_naive().to_string()
+}
+
+/// Today at the given wall-clock time, UTC. Used where a test wants a real
+/// `DateTime<Utc>` inside today's window, so the correction validator's
+/// "date matches the day it starts on" rule holds.
+fn today_at(h: u32, m: u32, s: u32) -> DateTime<Utc> {
+    chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(h, m, s)
+        .expect("valid time")
+        .and_utc()
+}
 
 /// The correction policy is a tenant setting; absent means `owner_or_admin`.
 async fn set_policy(pool: &PgPool, value: &str) {
@@ -36,7 +54,7 @@ async fn clock_in(app: &common::TestApp, token: &str) -> Value {
         .client
         .post(app.url("/api/v1/workday/clock-in"))
         .bearer_auth(token)
-        .json(&json!({ "date": DAY }))
+        .json(&json!({ "date": today_str() }))
         .send()
         .await
         .expect("clock in");
@@ -79,7 +97,7 @@ async fn remove(app: &common::TestApp, token: &str, id: &str) -> reqwest::Respon
 async fn day(app: &common::TestApp, token: &str) -> Value {
     let response = app
         .client
-        .get(app.url(&format!("/api/v1/workday?date={DAY}")))
+        .get(app.url(&format!("/api/v1/workday?date={}", today_str())))
         .bearer_auth(token)
         .send()
         .await
@@ -107,7 +125,7 @@ async fn a_corrected_segment_changes_the_day_it_belongs_to(pool: PgPool) {
 
     // A clean two hours, backdated: the shape of a real correction, where the
     // clock was started late or stopped late and the person knows the times.
-    let started: DateTime<Utc> = "2026-06-15T09:00:00Z".parse().expect("a start");
+    let started: DateTime<Utc> = today_at(9, 0, 0);
     let ended = started + Duration::hours(2);
     let response = correct(
         &app,
@@ -142,7 +160,7 @@ async fn a_segment_cannot_be_made_to_end_before_it_starts(pool: PgPool) {
     let id = id_of(&clock_in(&app, &token).await);
     clock_out(&app, &token).await;
 
-    let started: DateTime<Utc> = "2026-06-15T09:00:00Z".parse().expect("a start");
+    let started: DateTime<Utc> = today_at(9, 0, 0);
     let response = correct(
         &app,
         &token,
@@ -173,7 +191,7 @@ async fn an_explicit_null_reopens_a_segment_and_an_absent_field_does_not(pool: P
 
     // Absent: the correction touches the date only, and the segment stays
     // closed.
-    let response = correct(&app, &token, &id, json!({ "date": DAY })).await;
+    let response = correct(&app, &token, &id, json!({ "date": today_str() })).await;
     assert_eq!(response.status(), 200, "{:?}", response.text().await);
     assert_eq!(
         day(&app, &token).await["is_clocked_in"],
@@ -244,7 +262,7 @@ async fn the_off_policy_refuses_the_owner_too(pool: PgPool) {
     let token = common::login(&app, &email, &password).await;
 
     let id = id_of(&clock_in(&app, &token).await);
-    let response = correct(&app, &token, &id, json!({ "date": DAY })).await;
+    let response = correct(&app, &token, &id, json!({ "date": today_str() })).await;
     assert_eq!(
         response.status(),
         403,
@@ -274,10 +292,10 @@ async fn a_technician_corrects_their_own_segment_only(pool: PgPool) {
     let admins_own = id_of(&clock_in(&app, &admin).await);
     let techs_own = id_of(&clock_in(&app, &tech).await);
 
-    let response = correct(&app, &tech, &admins_own, json!({ "date": DAY })).await;
+    let response = correct(&app, &tech, &admins_own, json!({ "date": today_str() })).await;
     assert_eq!(response.status(), 403, "not the technician's segment");
 
-    let response = correct(&app, &tech, &techs_own, json!({ "date": DAY })).await;
+    let response = correct(&app, &tech, &techs_own, json!({ "date": today_str() })).await;
     assert_eq!(
         response.status(),
         200,
@@ -286,7 +304,7 @@ async fn a_technician_corrects_their_own_segment_only(pool: PgPool) {
     );
 
     // And the default policy lets an admin correct someone else's.
-    let response = correct(&app, &admin, &techs_own, json!({ "date": DAY })).await;
+    let response = correct(&app, &admin, &techs_own, json!({ "date": today_str() })).await;
     assert_eq!(
         response.status(),
         200,
@@ -323,14 +341,14 @@ async fn the_manager_policy_widens_it_without_opening_it(pool: PgPool) {
     let admins_own = id_of(&clock_in(&app, &admin).await);
     let _ = clock_in(&app, &tech).await;
 
-    let response = correct(&app, &manager, &admins_own, json!({ "date": DAY })).await;
+    let response = correct(&app, &manager, &admins_own, json!({ "date": today_str() })).await;
     assert_eq!(
         response.status(),
         200,
         "a manager may correct another's: {:?}",
         response.text().await
     );
-    let response = correct(&app, &tech, &admins_own, json!({ "date": DAY })).await;
+    let response = correct(&app, &tech, &admins_own, json!({ "date": today_str() })).await;
     assert_eq!(response.status(), 403, "a technician still may not");
 }
 
@@ -345,7 +363,7 @@ async fn a_correction_and_a_removal_are_both_recorded(pool: PgPool) {
 
     let id = id_of(&clock_in(&app, &token).await);
     clock_out(&app, &token).await;
-    let started: DateTime<Utc> = "2026-06-15T09:00:00Z".parse().expect("a start");
+    let started: DateTime<Utc> = today_at(9, 0, 0);
     correct(
         &app,
         &token,
@@ -400,7 +418,7 @@ async fn an_unknown_segment_is_not_an_existence_oracle(pool: PgPool) {
 
     let unknown = Uuid::new_v4().to_string();
     assert_eq!(
-        correct(&app, &token, &unknown, json!({ "date": DAY }))
+        correct(&app, &token, &unknown, json!({ "date": today_str() }))
             .await
             .status(),
         404
