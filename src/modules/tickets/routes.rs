@@ -21,7 +21,7 @@ use super::{
 use crate::db::Database;
 use crate::modules::approvals::{ApprovalResponse, ApprovalsService};
 use crate::modules::auth::{
-    CallerContext, RequireAdmin, RequireAuth, RequireCallerContext, TenantScoped,
+    CallerContext, RequireAdmin, RequireAuth, RequireCallerContext, RequireManager, TenantScoped,
 };
 use crate::modules::contact_portal::capabilities as caps;
 use crate::utils::error::{AppError, AppResult};
@@ -449,6 +449,7 @@ async fn request_approval_on_ticket(
 async fn delete_ticket(
     State(state): State<TicketRouterState>,
     RequireAuth(user): RequireAuth,
+    _manager: RequireManager,
     ctx: crate::modules::audit::AuditCtx,
     Path(ticket_id): Path<Uuid>,
 ) -> AppResult<()> {

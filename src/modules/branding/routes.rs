@@ -31,7 +31,7 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::modules::auth::{RequireAuth, TenantScoped};
+use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
 use crate::modules::branding::assets::{
     asset_path, AssetMeta, AssetScope, BrandAssetKind, BrandingAssetStore,
 };
@@ -109,13 +109,9 @@ async fn staff_upload_company_asset(
 async fn staff_delete_company_asset(
     State(state): State<StaffBrandingState>,
     RequireAuth(user): RequireAuth,
+    _admin: RequireAdmin,
     Path((company_id, asset)): Path<(Uuid, String)>,
 ) -> AppResult<Response> {
-    if !user.role.is_admin() {
-        return Err(AppError::Forbidden(
-            "You do not have permission to perform this action.".to_string(),
-        ));
-    }
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     verify_company_in_tenant(&state.db, user.tenant().get(), company_id).await?;
@@ -161,13 +157,9 @@ async fn staff_upload_tenant_asset(
 async fn staff_delete_tenant_asset(
     State(state): State<StaffBrandingState>,
     RequireAuth(user): RequireAuth,
+    _admin: RequireAdmin,
     Path(asset): Path<String>,
 ) -> AppResult<Response> {
-    if !user.role.is_admin() {
-        return Err(AppError::Forbidden(
-            "You do not have permission to perform this action.".to_string(),
-        ));
-    }
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
     let tenant_id = user.tenant().get();
