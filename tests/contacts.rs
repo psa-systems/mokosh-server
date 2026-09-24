@@ -711,6 +711,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
             "company_name": "Bob's Plumbing",
             "first_name": "Bob",
             "last_name": "Smith",
+            "email": format!("bob-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -755,6 +756,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
         .json(&serde_json::json!({
             "first_name": "Lone",
             "last_name": "Person",
+            "email": format!("lone-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -779,6 +781,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
             "company_name": "Acme Typed",
             "first_name": "Clash",
             "last_name": "Case",
+            "email": format!("clash-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -808,6 +811,7 @@ async fn updating_freeform_to_fk_clears_freeform_name(pool: PgPool) {
             "company_name": "Typed Co",
             "first_name": "Mover",
             "last_name": "Upper",
+            "email": format!("mover-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -1267,6 +1271,7 @@ async fn contact_field_validation(pool: PgPool) {
         "company_id": company_id,
         "first_name": "Ada",
         "last_name": "Lovelace",
+        "email": format!("ada-{}@example.com", uuid::Uuid::new_v4()),
     });
     let with = |k: &str, v: serde_json::Value| {
         let mut b = base.clone();
@@ -2067,8 +2072,11 @@ async fn website_probe_rejects_impossible_input(pool: PgPool) {
 async fn create_contact(
     app: &common::TestApp,
     token: &str,
-    body: serde_json::Value,
+    mut body: serde_json::Value,
 ) -> serde_json::Value {
+    if body.get("email").is_none() {
+        body["email"] = serde_json::json!(format!("{}@example.com", uuid::Uuid::new_v4()));
+    }
     let resp = app
         .client
         .post(app.url("/api/v1/contacts/contacts"))
@@ -2515,6 +2523,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
         serde_json::json!({
             "first_name": "Bad",
             "last_name": "Phone",
+            "email": format!("bad-phone-{}@example.com", uuid::Uuid::new_v4()),
             "phones": [
                 { "phone_type": "work", "number": "+14155551234" },
                 { "phone_type": "home", "number": "not-a-phone" },
@@ -2543,6 +2552,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
             serde_json::json!({
                 "first_name": "Two",
                 "last_name": "Primaries",
+                "email": format!("two-primaries-phones-{}@example.com", uuid::Uuid::new_v4()),
                 "phones": [
                     { "phone_type": "work", "number": "+14155551234", "is_primary": true },
                     { "phone_type": "home", "number": "+14155555678", "is_primary": true },
@@ -2562,6 +2572,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
             serde_json::json!({
                 "first_name": "Two",
                 "last_name": "Companies",
+                "email": format!("two-primaries-companies-{}@example.com", uuid::Uuid::new_v4()),
                 "companies": [
                     { "company_id": a, "is_primary": true },
                     { "company_id": b, "is_primary": true },
@@ -2581,6 +2592,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
             serde_json::json!({
                 "first_name": "Both",
                 "last_name": "Ways",
+                "email": format!("both-ways-{}@example.com", uuid::Uuid::new_v4()),
                 "company_name": "Acme Plumbing",
                 "companies": [{ "company_id": a }],
             }),
@@ -2599,6 +2611,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
         serde_json::json!({
             "first_name": "Foreign",
             "last_name": "Link",
+            "email": format!("foreign-link-{}@example.com", uuid::Uuid::new_v4()),
             "companies": [{ "company_id": a }, { "company_id": foreign }],
         }),
     )
@@ -3027,4 +3040,95 @@ async fn the_list_filters_by_portal_access_and_tags(pool: PgPool) {
     assert_eq!(both, vec!["Billing"], "filters combine");
     let (blank, _) = listed("tags=%20,").await;
     assert_eq!(blank.len(), 3, "a filter of blanks filters nothing");
+}
+
+/// A contact created with no address cannot be invited, cannot be sent an
+/// invoice, and silently produces a dead entry the moment a mail is queued.
+/// The API rejects the create with a field-level 422 on `email`; the shape
+/// covers a missing key, an explicit null, and a whitespace-only value, so a
+/// client that trims to `""` on submit still gets an honest error.
+#[sqlx::test]
+async fn contact_create_requires_an_email_address(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Acme").await;
+
+    for (label, body) in [
+        (
+            "no email key",
+            serde_json::json!({
+                "company_id": company_id,
+                "first_name": "No",
+                "last_name": "Email",
+            }),
+        ),
+        (
+            "email = null",
+            serde_json::json!({
+                "company_id": company_id,
+                "first_name": "Null",
+                "last_name": "Email",
+                "email": serde_json::Value::Null,
+            }),
+        ),
+        (
+            "email = whitespace",
+            serde_json::json!({
+                "company_id": company_id,
+                "first_name": "Blank",
+                "last_name": "Email",
+                "email": "   ",
+            }),
+        ),
+    ] {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/contacts/contacts"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .expect("send create contact");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{label}: got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("json");
+        let names_email = body["errors"]
+            .as_array()
+            .map(|errs| {
+                errs.iter().any(|e| {
+                    e["field"] == "email" || e.get("field") == Some(&serde_json::json!("email"))
+                })
+            })
+            .unwrap_or(false)
+            || body.to_string().contains("\"email\"");
+        assert!(
+            names_email,
+            "{label}: rejection must name the email field, got {body}"
+        );
+    }
+
+    // Sanity: the happy path with a real address still creates.
+    let ok = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Real",
+            "last_name": "Address",
+            "email": "real@acme.example",
+        }))
+        .send()
+        .await
+        .expect("send happy path");
+    assert!(
+        ok.status().is_success(),
+        "a real address still creates, got {}",
+        ok.status()
+    );
 }

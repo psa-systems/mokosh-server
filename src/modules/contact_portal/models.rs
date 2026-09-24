@@ -37,6 +37,12 @@ pub struct ContactSession {
     /// middleware, so this never outlives the request and a role revoke still
     /// lands on the next one.
     pub role_cache: std::sync::Arc<tokio::sync::OnceCell<Vec<String>>>,
+    /// PMS-1382: `contacts.timezone`, resolved on the first `today()` call
+    /// and shared by every clone of the session, mirroring `role_cache`.
+    /// The session is rebuilt per request by the middleware, so a timezone
+    /// change on the contact record takes effect on the contact's next
+    /// request, not mid-request.
+    pub timezone_cache: std::sync::Arc<tokio::sync::OnceCell<String>>,
 }
 
 /// JWT claims for the `typ: "contact"` token. Mirrors the shape of the

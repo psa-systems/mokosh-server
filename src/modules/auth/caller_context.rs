@@ -75,8 +75,11 @@ impl CallerContext {
     /// a contact's `contacts.timezone`, `UTC` when neither is set. A quote
     /// valid through today has to be accepted on today where the customer
     /// is, not on today in UTC, which from 14:00 Pacific onward is tomorrow.
-    /// The contact arm reads one column on its own tenant-GUC connection;
-    /// `ContactSession` is minted at login and does not carry the zone.
+    /// The contact arm resolves the zone through `session.timezone_cache`
+    /// (PMS-1382), the same one-load-per-request shape `role_cache` already
+    /// gives capabilities: `ContactSession` is rebuilt per request by the
+    /// middleware, so this never outlives the request and a timezone change
+    /// on the contact record lands on the contact's next request.
     pub async fn today(&self, db: &Database) -> AppResult<chrono::NaiveDate> {
         let now = chrono::Utc::now();
         let zone = match self {
@@ -85,18 +88,11 @@ impl CallerContext {
                 .as_ref()
                 .map(|u| u.timezone.clone())
                 .unwrap_or_else(|| "UTC".to_string()),
-            Self::Contact(session) => {
-                let mut tx = db.begin_with_tenant(self.tenant()).await?;
-                sqlx::query_scalar::<_, Option<String>>(
-                    "SELECT timezone FROM contacts WHERE id = $1 AND tenant_id = $2",
-                )
-                .bind(session.id)
-                .bind(session.tenant_id)
-                .fetch_optional(&mut *tx)
+            Self::Contact(session) => session
+                .timezone_cache
+                .get_or_try_init(|| load_contact_timezone(db, self.tenant(), session.id))
                 .await?
-                .flatten()
-                .unwrap_or_else(|| "UTC".to_string())
-            }
+                .clone(),
         };
         Ok(mokosh_types::datetime::user_today(now, &zone))
     }
@@ -231,6 +227,33 @@ pub async fn load_contact_capabilities(
     .fetch_all(db.migrator_pool())
     .await?;
     Ok(rows.into_iter().map(|(c,)| c).collect())
+}
+
+/// PMS-1382: how many times `load_contact_timezone` has hit the database in
+/// this process. A test reads the delta around one request to prove the
+/// per-request cache holds, mirroring `CAPABILITY_LOADS`.
+pub static TIMEZONE_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// PMS-1382: load a contact's `contacts.timezone` on its own tenant-GUC
+/// connection. Called at most once per request through
+/// `ContactSession::timezone_cache`.
+async fn load_contact_timezone(
+    db: &Database,
+    tenant: TenantId,
+    contact_id: Uuid,
+) -> AppResult<String> {
+    TIMEZONE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tx = db.begin_with_tenant(tenant).await?;
+    let zone = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT timezone FROM contacts WHERE id = $1 AND tenant_id = $2",
+    )
+    .bind(contact_id)
+    .bind(tenant.get())
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten()
+    .unwrap_or_else(|| "UTC".to_string());
+    Ok(zone)
 }
 
 /// PMS-1199: the ONE place a missing-capability 403 message is built,
