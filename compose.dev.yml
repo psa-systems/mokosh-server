@@ -36,13 +36,11 @@
 # https://${USER}-mokosh-api.a8n.run to the container's $MOKOSH_PORT (see the
 # server's `labels` below).
 #
-# MOKOSH_HOST_BIND_IP is still discovered and written to .env by `just dev`, but
-# nothing in this file consumes it. It is deliberately NOT used to publish any
-# host port: postgres and mailpit publish on loopback only (PMS-496), so
-# host-side tooling (sqlx-cli, the mail UI) reaches them via localhost while the
-# LAN/internet cannot, and the server is reachable through Traefik alone.
-# Discover the host IP with:
-#   sys net | where name =~ 'eth0|br0' | get ip.0 | where protocol == 'ipv4'
+# No service here publishes a host port on a LAN address, and none should:
+# postgres and mailpit publish on loopback only (PMS-496), so host-side tooling
+# (sqlx-cli, the mail UI) reaches them via localhost while the LAN/internet
+# cannot, and the server is reachable through Traefik alone. The LAN-IP variable
+# that once carried such a bind was removed in PMS-863 once nothing read it.
 #
 # The Mokosh application database runs inside this stack as the
 # `postgres` service (separate from `infisical-postgres`, which is for
@@ -116,7 +114,12 @@ services:
     networks:
       - private
     ports:
-      - "127.0.0.1:28002:8080"
+      # PMS-900: host side from .env, for the same reason as the others.
+      # Changing it means changing `INFISICAL_URL` and `INFISICAL_SITE_URL`
+      # in your .env to match: the bootstrap CLI reads the first from the
+      # host and Infisical builds its own links from the second, and neither
+      # can be derived from this line.
+      - "127.0.0.1:${MOKOSH_INFISICAL_HOST_PORT:-28002}:8080"
     depends_on:
       infisical-postgres:
         condition: service_healthy
@@ -150,8 +153,12 @@ services:
     networks:
       - private
     ports:
-      - "127.0.0.1:29000:9000"
-      - "127.0.0.1:29001:9001"
+      # PMS-900: host side from .env, so a second checkout running
+      # `just dev-s3` does not collide. The server reaches MinIO in-network
+      # at `minio:9000`, so these two are host-side tooling only (the console,
+      # and `tests/s3_storage.rs` when it is pointed at localhost).
+      - "127.0.0.1:${MOKOSH_MINIO_API_HOST_PORT:-29000}:9000"
+      - "127.0.0.1:${MOKOSH_MINIO_CONSOLE_HOST_PORT:-29001}:9001"
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
@@ -189,11 +196,11 @@ services:
       # PMS-496: published on LOOPBACK ONLY. host-side sqlx-cli (just
       # migrate-run) connects via localhost:${MOKOSH_PG_HOST_PORT}; sibling
       # containers reach this DB by in-network DNS `postgres:5432` and need no
-      # host publish at all. Do NOT reintroduce MOKOSH_HOST_BIND_IP here: that
-      # var is derived from the first non-loopback interface (which can be
-      # public), so binding the port to it exposed the app DB - and the
-      # BYPASSRLS mokosh_migrator role reachable through it - to the LAN/internet
-      # with weak default credentials. If a non-loopback bind is ever genuinely
+      # host publish at all. Do NOT reintroduce a LAN-IP bind here: the var
+      # that carried one was derived from the first non-loopback interface
+      # (which can be public), so binding the port to it exposed the app DB -
+      # and the BYPASSRLS mokosh_migrator role reachable through it - to the
+      # LAN/internet with weak default credentials. If a non-loopback bind is ever genuinely
       # required, introduce an explicit private-IP env var with NO default
       # (e.g. `${MOKOSH_PG_PRIVATE_BIND_IP:?...}`) and only after a host firewall
       # is confirmed to deny 5432/5433 inbound on every non-loopback interface.
@@ -222,12 +229,15 @@ services:
     networks:
       - private
     ports:
-      # Loopback-only on both ports. Multiple developers on the same
-      # box can collide on the host's 1025/8025; if you hit that,
-      # publish on a different host port (mailpit's internal ports
-      # stay 1025/8025 either way).
-      - "127.0.0.1:1025:1025"  # SMTP submission (mokosh-server -> mailpit)
-      - "127.0.0.1:8025:8025"  # web UI (developer browser)
+      # Loopback-only on both ports, and the HOST side of each comes from
+      # .env (PMS-900). Two checkouts on one box each publish mailpit, so a
+      # literal host port makes the second `just dev` fail with "Bind for
+      # 127.0.0.1:1025 failed: port is already allocated"; the note that used
+      # to sit here told the reader to edit this file, which a shared
+      # committed file cannot absorb. Change the two keys in your own .env
+      # instead. Mailpit's container-side ports stay 1025/8025 either way.
+      - "127.0.0.1:${MOKOSH_MAILPIT_SMTP_HOST_PORT:-1025}:1025"  # SMTP submission (mokosh-server -> mailpit)
+      - "127.0.0.1:${MOKOSH_MAILPIT_WEB_HOST_PORT:-8025}:8025"  # web UI (developer browser)
 
   # Mokosh API server. Built from the dev Dockerfile; source mounted for
   # live reload via `cargo run`.
@@ -350,6 +360,13 @@ services:
       # holds no local signing key and exposes no /oauth2/* endpoints.
       OIDC_ISSUER: https://${USER}-bunyip-api.a8n.run
       OIDC_AUDIENCE: https://${USER}-mokosh-api.a8n.run
+      # PMS-998: the client id bunyip addresses a back-channel logout token
+      # to, which is the `client_id` of that same oauth_clients row rather
+      # than its `audience`. Empty in dev, because bunyip only notifies a
+      # client whose `backchannel_logout_uri` is set (BUNYIP-636) and the dev
+      # client row has none; empty means the receiver refuses everything,
+      # which is the right posture for a deployment nothing is notifying.
+      OIDC_BACKCHANNEL_CLIENT_ID: ${OIDC_BACKCHANNEL_CLIENT_ID:-}
 
       # PMS-1193 / BUNYIP-641: Bunyip's suite-wide provider-status aggregator
       # (BUNYIP-634) calls GET /api/v1/admin/providers/status with HTTP Basic
