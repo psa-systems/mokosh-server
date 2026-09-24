@@ -204,6 +204,53 @@ impl PaymentMethodsService {
         Ok(())
     }
 
+    /// PMS-1369: detach every saved card a contact holds, on the provider
+    /// side only, before the caller deletes the `contacts` row that
+    /// `contact_payment_methods.contact_id ON DELETE CASCADE` would
+    /// otherwise remove silently. Mirrors [`Self::remove`]'s contract
+    /// exactly (detach first, same "gateway no longer active" refusal) but
+    /// does not touch the rows itself: the caller's own `DELETE FROM
+    /// contacts` removes them via the cascade once every detach has
+    /// succeeded.
+    ///
+    /// Takes the caller's own transaction rather than opening one, and locks
+    /// the rows `FOR UPDATE` in it, so the read and the contact delete that
+    /// follows are atomic: a card added between the read and the delete
+    /// cannot slip through undetached. A detach failure returns the error
+    /// without touching anything; the caller's transaction is left for it to
+    /// roll back, leaving the contact and its payment method rows in place.
+    pub async fn detach_all_for_contact(
+        &self,
+        tx: &mut crate::db::TenantTransaction<'_>,
+        tenant_id: TenantId,
+        contact_id: Uuid,
+    ) -> AppResult<()> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT provider, provider_pm_id \
+               FROM contact_payment_methods \
+              WHERE tenant_id = $1 AND contact_id = $2 \
+              FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(contact_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for (provider_id, provider_pm_id) in rows {
+            let Some(provider) = self
+                .billing
+                .active_provider(tenant_id, Some(&provider_id))
+                .await?
+            else {
+                return Err(AppError::BadRequest(format!(
+                    "The {provider_id} gateway is no longer active on this account, \
+                     so the card cannot be detached. Reconnect the gateway to delete this contact."
+                )));
+            };
+            provider.detach_payment_method(&provider_pm_id).await?;
+        }
+        Ok(())
+    }
+
     /// Flip the picked row to `is_default = TRUE` and clear every other row
     /// of the same contact in ONE transaction. The partial UNIQUE index on
     /// the table enforces at most one default even under concurrent writes.

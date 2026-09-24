@@ -27,6 +27,17 @@ pub use version::VersionInfo;
 mod repo_hygiene {
     /// Build output and local scratch, never tracked. Everything else under the
     /// manifest directory is repository content and is scanned.
+    ///
+    /// PMS-1304: `mokosh-apps` is not build output - it is the SPA repository
+    /// checked out beside this one by `check.yml` so `check-route-consumers.nu`
+    /// can compare mounted routes against SPA callers. The runner places it
+    /// under `../mokosh-apps` but Actions can materialise the relative path
+    /// inside `GITHUB_WORKSPACE` (this manifest dir) as `./mokosh-apps`, at
+    /// which point every hygiene scan below descends into another repo's
+    /// tree. That is what turned a green `check-web` recipe into a red
+    /// `the_former_client_repo_name_stays_gone` on every PR that touched
+    /// nothing here at all, so `mokosh-apps` is skipped exactly as the other
+    /// non-source directories are.
     const SKIP_DIRS: &[&str] = &[
         ".auth",
         ".claude",
@@ -37,6 +48,7 @@ mod repo_hygiene {
         "data",
         "gen",
         "logs",
+        "mokosh-apps",
         "node_modules",
         "playwright-report",
         "secrets",
