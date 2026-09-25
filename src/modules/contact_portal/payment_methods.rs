@@ -219,6 +219,12 @@ impl PaymentMethodsService {
     /// cannot slip through undetached. A detach failure returns the error
     /// without touching anything; the caller's transaction is left for it to
     /// roll back, leaving the contact and its payment method rows in place.
+    ///
+    /// PMS-1381 (F3): the lock is held only across this read; the gateway
+    /// calls that follow run concurrently rather than one row at a time, so
+    /// held-lock time is bounded by the slowest single outbound call instead
+    /// of their sum. `try_join_all` still returns the first error, leaving
+    /// the caller's transaction (and thus the lock) for it to roll back.
     pub async fn detach_all_for_contact(
         &self,
         tx: &mut crate::db::TenantTransaction<'_>,
@@ -235,19 +241,20 @@ impl PaymentMethodsService {
         .bind(contact_id)
         .fetch_all(&mut **tx)
         .await?;
-        for (provider_id, provider_pm_id) in rows {
-            let Some(provider) = self
-                .billing
-                .active_provider(tenant_id, Some(&provider_id))
-                .await?
-            else {
-                return Err(AppError::BadRequest(format!(
-                    "The {provider_id} gateway is no longer active on this account, \
-                     so the card cannot be detached. Reconnect the gateway to delete this contact."
-                )));
-            };
-            provider.detach_payment_method(&provider_pm_id).await?;
-        }
+        futures::future::try_join_all(rows.into_iter().map(|(provider_id, provider_pm_id)| {
+            let billing = self.billing.clone();
+            async move {
+                let Some(provider) = billing.active_provider(tenant_id, Some(&provider_id)).await?
+                else {
+                    return Err(AppError::BadRequest(format!(
+                        "The {provider_id} gateway is no longer active on this account, \
+                         so the card cannot be detached. Reconnect the gateway to delete this contact."
+                    )));
+                };
+                provider.detach_payment_method(&provider_pm_id).await
+            }
+        }))
+        .await?;
         Ok(())
     }
 
