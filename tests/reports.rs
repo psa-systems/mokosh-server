@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -156,7 +157,7 @@ async fn seed_invoice(pool: &PgPool, tenant_id: Uuid, company_id: Uuid, number: 
 // AC1 + AC2 + AC3 + AC4 + AC6: registry lists types; the dashboard,
 // tickets, time, and billing aggregates reflect seeded data; CSV export
 // works.
-#[sqlx::test]
+#[mokosh_test]
 async fn reports_registry_and_aggregates(pool: PgPool) {
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, common::DEFAULT_TENANT_ID, "Acme Co").await;
@@ -350,7 +351,7 @@ async fn reports_registry_and_aggregates(pool: PgPool) {
 // asserts is unchanged, because adding a format shrinks the rejected set
 // without changing the status of anything still in it. `xlsx` and the empty
 // string stand in for that set now.
-#[sqlx::test]
+#[mokosh_test]
 async fn unsupported_export_format_is_400_not_501(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -374,7 +375,7 @@ async fn unsupported_export_format_is_400_not_501(pool: PgPool) {
 
 // AC5: a report is tenant-scoped - another tenant's invoices never appear
 // in this tenant's billing report.
-#[sqlx::test]
+#[mokosh_test]
 async fn billing_report_is_tenant_scoped(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
     let company_a = seed_company(&pool, common::DEFAULT_TENANT_ID, "Tenant A Co").await;
@@ -410,7 +411,7 @@ async fn billing_report_is_tenant_scoped(pool: PgPool) {
 // tenant-scoped - a second tenant's tickets never inflate this tenant's
 // counts. Aggregates leak counts even when rows are hidden, so this pins
 // the COUNT(*) scoping directly at the service layer.
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_is_tenant_scoped(pool: PgPool) {
     let tenant_a = common::DEFAULT_TENANT_ID;
     let (admin_a, _email, _pw) = common::seed_admin(&pool).await;
@@ -450,7 +451,7 @@ async fn dashboard_is_tenant_scoped(pool: PgPool) {
 /// evening in America/Los_Angeles, so an LA viewer must see it on the prior
 /// day while a UTC viewer sees it on the UTC day. Same instant, two day
 /// buckets, exactly as the source-of-truth helper computes.
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_trend_buckets_in_user_timezone(pool: PgPool) {
     let (tenant, admin, _email, _pw) =
         common::seed_tenant_with_admin(&pool, "pms360-trend-tz").await;
@@ -684,7 +685,7 @@ async fn set_company_status(pool: &PgPool, company_id: Uuid, status: &str) {
 
 // PMS-179: projects report reflects seeded delivery data; appears in the
 // registry; CSV export works.
-#[sqlx::test]
+#[mokosh_test]
 async fn projects_report_aggregates(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
@@ -817,7 +818,7 @@ async fn projects_report_aggregates(pool: PgPool) {
 }
 
 // PMS-179: clients report reflects seeded CMDB / contract data; CSV works.
-#[sqlx::test]
+#[mokosh_test]
 async fn clients_report_aggregates(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
@@ -934,7 +935,7 @@ async fn clients_report_aggregates(pool: PgPool) {
 
 // PMS-179 (AC5): the clients report is tenant-scoped - a second tenant's
 // assets never leak into this tenant's counts.
-#[sqlx::test]
+#[mokosh_test]
 async fn clients_report_is_tenant_scoped(pool: PgPool) {
     let tenant_a = common::DEFAULT_TENANT_ID;
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
@@ -997,7 +998,7 @@ async fn custom_post_status(app: &common::TestApp, token: &str, body: serde_json
 
 // The builder runs a whitelisted aggregate, advertises its catalog, and
 // exports CSV.
-#[sqlx::test]
+#[mokosh_test]
 async fn custom_report_runs_and_exports(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
@@ -1090,7 +1091,7 @@ async fn custom_report_runs_and_exports(pool: PgPool) {
 
 // Unknown / malicious source, dimension, measure, or an empty measure list
 // are rejected with 400 before any SQL is built.
-#[sqlx::test]
+#[mokosh_test]
 async fn custom_report_rejects_unknown_fields(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1153,7 +1154,7 @@ async fn custom_report_rejects_unknown_fields(pool: PgPool) {
 
 // A custom report is tenant-scoped: a second tenant's assets never reach
 // this tenant's counts.
-#[sqlx::test]
+#[mokosh_test]
 async fn custom_report_is_tenant_scoped(pool: PgPool) {
     let tenant_a = common::DEFAULT_TENANT_ID;
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;

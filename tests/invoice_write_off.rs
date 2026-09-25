@@ -11,6 +11,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -112,7 +113,7 @@ async fn get_invoice(app: &common::TestApp, token: &str, invoice_id: &str) -> Va
 /// A sent invoice with a balance is written off with a reason; the response
 /// and the read carry the status, the frozen amount, who did it and why,
 /// and the balance itself is left as it was.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_sent_invoice_with_a_balance_is_written_off_with_a_reason(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -161,7 +162,7 @@ async fn a_sent_invoice_with_a_balance_is_written_off_with_a_reason(pool: PgPool
 
 /// A draft, a paid, a void and an already written-off invoice are refused
 /// with a 409 that names the status; a missing reason is a 422.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_wrong_states_and_a_missing_reason_are_refused(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -204,7 +205,7 @@ async fn the_wrong_states_and_a_missing_reason_are_refused(pool: PgPool) {
 /// A payment after the write-off is a recovery: recorded, the balance moves,
 /// and the status stays `written_off` rather than flipping back to
 /// `partially_paid` on the next balance recomputation.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_late_payment_is_kept_and_the_status_stands(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -243,7 +244,7 @@ async fn a_late_payment_is_kept_and_the_status_stands(pool: PgPool) {
 /// The statement shows the write-off as its own line kind, dated by the
 /// write-off, and takes it out of the closing balance; a write-off before
 /// the period is in the opening balance.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_statement_shows_the_write_off_and_settles_it(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -316,7 +317,7 @@ async fn the_statement_shows_the_write_off_and_settles_it(pool: PgPool) {
 /// same debt out of the account twice with no path back, since write-offs
 /// have no reversal in v1. The invoice's frozen `write_off_amount` and status
 /// must be untouched by the refused attempt.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_written_off_invoice_refuses_a_credit_note(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;

@@ -1,0 +1,24 @@
+[package]
+name = "mokosh-test"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The attribute itself. Re-exported from here so a test binary names one
+# crate, the split a proc-macro crate forces (it can export nothing else).
+mokosh-test-macros = { path = "../mokosh-test-macros" }
+# `migrate` is what builds the template; the rest is what a test pool needs.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate"] }
+# The attribute builds the same current-thread runtime `#[sqlx::test]` does,
+# and bounds the pool close with `tokio::time::timeout`.
+tokio = { version = "1", features = ["rt", "time"] }
+uuid = { workspace = true }
+# Names the template after the migrations it holds.
+sha2 = "0.10"
+# Rewrites `DATABASE_URL`'s path to reach the maintenance database.
+url = "2"

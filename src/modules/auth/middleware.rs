@@ -1074,6 +1074,29 @@ pub async fn place_bunyip_user_from_local_state(
     let principal = match resolve_bunyip_caller(auth_service, invitations, sub, claims).await {
         UserinfoDecision::Needed => return LocalPlacement::UserinfoNeeded,
         UserinfoDecision::Rejected(e) => return LocalPlacement::Placed(Box::new((None, Some(e)))),
+        // PMS-1372: the local read failed (a transient DB error), which is not
+        // the same thing as reading no row - the caller may well already be
+        // placed. Fall straight to `place_bunyip_caller` with no pre-resolved
+        // principal and no userinfo hints, the same shortcut the `Skip` arm
+        // below takes for the common case, rather than forcing the
+        // `/oauth2/userinfo` round trip PMS-713 exists to skip.
+        UserinfoDecision::ReadFailed => {
+            return LocalPlacement::Placed(Box::new(
+                place_bunyip_caller(
+                    auth_service,
+                    tenants,
+                    invitations,
+                    sub,
+                    None,
+                    false,
+                    None,
+                    None,
+                    claims,
+                    None,
+                )
+                .await,
+            ));
+        }
         UserinfoDecision::Skip(principal) => *principal,
     };
     LocalPlacement::Placed(Box::new(
@@ -1101,6 +1124,14 @@ pub async fn place_bunyip_user_from_local_state(
 /// not read the same rows again.
 enum UserinfoDecision {
     Needed,
+    /// PMS-1372: the local `users` read itself failed (a transient DB error),
+    /// distinct from `Needed`'s "read succeeded and found no row". Treated as
+    /// "assume already placed, do not re-provision": a wrongly-skipped
+    /// JIT/placement pass on a genuinely new user self-corrects on their very
+    /// next request once the read succeeds, while forcing the userinfo round
+    /// trip on every request for the duration of a DB outage does not
+    /// self-correct until the outage ends.
+    ReadFailed,
     /// PMS-1125: the row exists and the PMS-698 gate refused it. Decided
     /// before any placement question, so a refused principal is never
     /// re-homed or provisioned on its way to the refusal.
@@ -1156,15 +1187,17 @@ async fn resolve_bunyip_caller(
     }
 
     // First sight: no local row yet, so the user must be JIT-provisioned (needs
-    // email + name from userinfo). A read error reads the same way it did when
-    // this was `find_user_placement(..).ok().flatten()`: no placement, so the
-    // full path runs and re-reads.
+    // email + name from userinfo).
     let principal = match auth_service.find_bunyip_principal(sub).await {
         Ok(Some(principal)) => principal,
         Ok(None) => return UserinfoDecision::Needed,
+        // PMS-1372: a read error is NOT "no placement". Collapsing it into
+        // `Needed` forced the `/oauth2/userinfo` round trip PMS-713 exists to
+        // skip on every request for as long as the error recurs (a DB pool
+        // exhaustion or statement timeout), even for an already-placed user.
         Err(e) => {
             tracing::warn!(error = %e, sub = %sub, "bunyip principal lookup failed");
-            return UserinfoDecision::Needed;
+            return UserinfoDecision::ReadFailed;
         }
     };
     // PMS-1125: the PMS-698 principal gate runs on the row as read, BEFORE

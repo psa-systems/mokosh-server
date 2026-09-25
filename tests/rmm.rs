@@ -28,6 +28,7 @@ use mokosh_server::modules::rmm::{
 };
 use mokosh_server::utils::crypto;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sha2::Sha256;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -59,7 +60,7 @@ impl RmmProvider for StaticProvider {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn sync_writes_mapping_asset_audit_and_status(pool: PgPool) {
     common::seed_admin(&pool).await;
     let tenant_id = common::DEFAULT_TENANT_ID;
@@ -151,7 +152,7 @@ async fn sync_writes_mapping_asset_audit_and_status(pool: PgPool) {
     assert!(last_error.is_none());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_dedupe(
     pool: PgPool,
 ) {
@@ -266,7 +267,7 @@ async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn channel_credentials_are_encrypted_at_rest(pool: PgPool) {
     common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

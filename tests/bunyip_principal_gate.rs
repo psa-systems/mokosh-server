@@ -17,6 +17,7 @@ use axum::{routing::get, Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -162,7 +163,7 @@ async fn tickets_response(app: &common::TestApp, token: &str) -> (reqwest::Statu
 /// pinned to that tenant, and suspending that tenant rejects both.
 /// Platform-admin credentials for `/platform/login` still come from
 /// `common::seed_admin`'s `platform_admins` seed.
-#[sqlx::test]
+#[mokosh_test]
 async fn suspended_tenant_rejects_both_auth_paths(pool: PgPool) {
     // Platform-plane admin: exists in `platform_admins` so
     // `platform_login` returns a valid bearer for `/suspend`.
@@ -245,7 +246,7 @@ async fn suspended_tenant_rejects_both_auth_paths(pool: PgPool) {
 /// AC4 + AC5: the same fixture (one users row flipped to `inactive`) is
 /// rejected on BOTH branches of `auth_middleware`, which is what the shared
 /// `AuthService::ensure_principal_usable` buys.
-#[sqlx::test]
+#[mokosh_test]
 async fn inactive_user_rejects_both_auth_paths(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let op = StubOp::spawn(admin_id, &email).await;
@@ -316,7 +317,7 @@ async fn inactive_user_rejects_both_auth_paths(pool: PgPool) {
 /// dropped, the middleware fell through to the legacy decoder, and every
 /// request answered a bare 401 with nothing but a false `JWT error` in the
 /// log. Pins that the refusal reaches the caller from this path too.
-#[sqlx::test]
+#[mokosh_test]
 async fn inactive_user_in_a_real_tenant_gets_the_gate_reason_on_the_fast_path(pool: PgPool) {
     let (_tenant_id, admin_id, email, password) =
         common::seed_tenant_with_admin(&pool, "pms-1125-fast-path").await;
@@ -389,7 +390,7 @@ async fn inactive_user_in_a_real_tenant_gets_the_gate_reason_on_the_fast_path(po
 /// row. A bunyip `at+jwt` carries no `sid` and never had a `user_sessions` row
 /// in the first place: bunyip owns that session, so a mokosh-side sign-out is
 /// not a revocation signal for it and must not read as one.
-#[sqlx::test]
+#[mokosh_test]
 async fn legacy_sign_out_everywhere_leaves_the_bunyip_bearer_alone(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let op = StubOp::spawn(admin_id, &email).await;

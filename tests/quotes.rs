@@ -16,6 +16,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -96,7 +97,7 @@ async fn force_status(pool: &PgPool, quote_id: Uuid, status: &str) {
         .expect("force quote status");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn quote_crud_round_trip(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -229,7 +230,7 @@ async fn quote_crud_round_trip(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn line_mutations_recompute_totals(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -337,7 +338,7 @@ async fn line_mutations_recompute_totals(pool: PgPool) {
     assert_eq!(cross.status(), StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn client_supplied_total_is_never_trusted(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -379,7 +380,7 @@ async fn client_supplied_total_is_never_trusted(pool: PgPool) {
     assert_eq!(updated["total"], "1000.00");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn sent_quote_rejects_every_edit(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -445,7 +446,7 @@ async fn sent_quote_rejects_every_edit(pool: PgPool) {
     assert_eq!(cancel.status(), StatusCode::CONFLICT);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn content_freezes_at_submitted_but_status_still_advances(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -526,7 +527,7 @@ async fn content_freezes_at_submitted_but_status_still_advances(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_cannot_forge_the_client_decision(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -561,7 +562,7 @@ async fn staff_cannot_forge_the_client_decision(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn quotes_are_invisible_across_tenants(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -693,7 +694,7 @@ async fn quotes_are_invisible_across_tenants(pool: PgPool) {
     assert_eq!(foreign.status(), StatusCode::BAD_REQUEST);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn validation_rejects_malformed_quotes(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -742,7 +743,7 @@ async fn validation_rejects_malformed_quotes(pool: PgPool) {
     assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn approvals_surface_still_works_on_an_api_created_quote(pool: PgPool) {
     // PMS-484 wired `/quotes/{id}/approvals` against the stub table. It
     // must keep working now that quotes are created through their own

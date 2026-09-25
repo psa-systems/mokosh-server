@@ -14,6 +14,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -24,7 +25,7 @@ use uuid::Uuid;
 /// is read when the router is built.
 ///
 /// The same values for every case in this file on purpose: env is
-/// process-global and `#[sqlx::test]` cases in one binary run concurrently, so
+/// process-global and `#[mokosh_test]` cases in one binary run concurrently, so
 /// a case that changed the cap for itself would change it under its neighbours.
 /// 1 KiB is also what proves the inline cap is a floor rather than a fixed
 /// 5 MiB: the oversize case below is refused at 4 KiB, well under 5 MiB,
@@ -69,7 +70,7 @@ async fn upload_inline(
 
 /// The whole point: upload an image against a ticket, then fetch it with no
 /// session at all, which is what a browser rendering `<img>` does.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_inline_image_is_fetchable_without_a_session(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -135,7 +136,7 @@ async fn an_inline_image_is_fetchable_without_a_session(pool: PgPool) {
 /// a real id, and it must answer the public route exactly as an id that never
 /// existed does. This is the regression that would turn an invoice or a log
 /// bundle into a world-readable file.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_ordinary_attachment_is_not_readable_on_the_public_route(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -198,7 +199,7 @@ async fn an_ordinary_attachment_is_not_readable_on_the_public_route(pool: PgPool
 /// to unauthenticated clients, so it is refused at upload rather than sanitised
 /// at render. Non-images are refused for the same reason: the public route only
 /// ever hands back what this endpoint stored.
-#[sqlx::test]
+#[mokosh_test]
 async fn only_renderable_image_types_can_be_stored_inline(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -252,7 +253,7 @@ async fn only_renderable_image_types_can_be_stored_inline(pool: PgPool) {
 
 /// The WRITE is authenticated and tenant-scoped even though the read is not,
 /// and a ticket in another tenant is not addressable.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_upload_still_needs_a_session_and_the_right_tenant(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -291,7 +292,7 @@ async fn the_upload_still_needs_a_session_and_the_right_tenant(pool: PgPool) {
 
 /// The public read revalidates like the private download does, so a browser
 /// rendering the same ticket twice does not re-fetch the bytes.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_cached_inline_image_revalidates_to_304(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -337,7 +338,7 @@ async fn a_cached_inline_image_revalidates_to_304(pool: PgPool) {
 /// The default is 5 MiB rather than the 25 MiB an attachment gets: 25 MiB is a
 /// size for a file somebody chose to download, whereas this one is fetched by
 /// every browser that renders the ticket, without a session.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_oversized_inline_image_is_refused(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, email, password) = common::seed_admin(&pool).await;

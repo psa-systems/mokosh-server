@@ -18,6 +18,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -121,7 +122,7 @@ async fn seed_quote(pool: &PgPool, company_id: Uuid, admin_id: Uuid, status: &st
 /// The list carries the issued quotes and none of the working state; by
 /// id, an un-issued quote is a 404 on the read, the document and the
 /// decision alike, so the id is never confirmed.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_sees_issued_quotes_and_nothing_else(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let (company, slug) = seed_company(&pool, "Client A").await;

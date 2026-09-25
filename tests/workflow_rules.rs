@@ -12,6 +12,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -26,7 +27,7 @@ async fn lookup_id(pool: &PgPool, table: &str) -> Uuid {
     .unwrap_or_else(|e| panic!("lookup id from {table}: {e}"))
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_created_rule_fires_and_assigns(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

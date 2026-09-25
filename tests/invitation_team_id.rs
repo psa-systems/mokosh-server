@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -53,7 +54,7 @@ async fn membership_exists(pool: &PgPool, team_id: Uuid, user_id: Uuid) -> bool 
     .expect("membership_exists probe")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn accept_adds_user_to_the_teams_named_by_the_invite(pool: PgPool) {
     let team_id = common::seed_team(&pool, common::DEFAULT_TENANT_ID, "Alpha", None).await;
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
@@ -100,7 +101,7 @@ async fn accept_adds_user_to_the_teams_named_by_the_invite(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_refuses_a_foreign_tenant_team(pool: PgPool) {
     // Seed a second tenant with its own team, then attempt to create an
     // invite in the DEFAULT_TENANT_ID naming that foreign team.
@@ -132,7 +133,7 @@ async fn create_refuses_a_foreign_tenant_team(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn accept_still_succeeds_after_team_soft_delete(pool: PgPool) {
     let team_id = common::seed_team(&pool, common::DEFAULT_TENANT_ID, "Beta", None).await;
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
@@ -178,7 +179,7 @@ async fn accept_still_succeeds_after_team_soft_delete(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_without_team_id_is_unchanged_pre_pms_1161_behaviour(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let s = svc(pool.clone());

@@ -13,6 +13,7 @@ mod common;
 
 use mokosh_server::modules::saved_reports::{SavedReportsService, ScheduledReportsWorker};
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -92,7 +93,7 @@ fn build_worker(pool: PgPool) -> ScheduledReportsWorker {
     ScheduledReportsWorker::new(db, reports)
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn schedule_create_returns_next_run_at(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -122,7 +123,7 @@ async fn schedule_create_returns_next_run_at(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn worker_tick_materialises_due_schedule(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -196,7 +197,7 @@ async fn worker_tick_materialises_due_schedule(pool: PgPool) {
     assert!(row.2.is_none(), "no last_error on a successful delivery");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn worker_tick_skips_disabled_schedule(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

@@ -6,6 +6,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -87,7 +88,7 @@ fn current_id(rows: &[serde_json::Value]) -> String {
 
 // A fresh login lists exactly one session, marked current, with the
 // fields the SPA renders.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_fresh_login_lists_one_current_session(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -103,7 +104,7 @@ async fn a_fresh_login_lists_one_current_session(pool: PgPool) {
 // Two browsers: two rows, and each caller sees only its own as current.
 // The id is the family, so a refresh keeps it while the session stays
 // current.
-#[sqlx::test]
+#[mokosh_test]
 async fn two_logins_list_two_sessions_and_the_id_survives_rotation(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -135,7 +136,7 @@ async fn two_logins_list_two_sessions_and_the_id_survives_rotation(pool: PgPool)
 
 // Revoking the other browser removes it from the list and kills its
 // refresh token; the caller's own keeps rotating.
-#[sqlx::test]
+#[mokosh_test]
 async fn revoking_another_session_signs_that_browser_out(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -168,7 +169,7 @@ async fn revoking_another_session_signs_that_browser_out(pool: PgPool) {
 
 // The caller's own session is refused with a 400 that points at logout,
 // and stays live.
-#[sqlx::test]
+#[mokosh_test]
 async fn revoking_the_current_session_is_refused(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -194,7 +195,7 @@ async fn revoking_the_current_session_is_refused(pool: PgPool) {
 // The check the assertion cares about ("Bob's session family survives
 // Alice's attempt") reads the freshly rotated access token, not the
 // one whose sid the refresh just retired.
-#[sqlx::test]
+#[mokosh_test]
 async fn another_contacts_session_cannot_be_revoked(pool: PgPool) {
     let alice = seed_portal_contact(&pool, "alice@example.com").await;
     let bob = seed_portal_contact(&pool, "bob@example.com").await;
@@ -230,7 +231,7 @@ async fn another_contacts_session_cannot_be_revoked(pool: PgPool) {
 // with other requests. The check is asked of the rotation family
 // instead: the pre-refresh token keeps serving while the family holds
 // a live row, and dies the moment the family is actually revoked.
-#[sqlx::test]
+#[mokosh_test]
 async fn rotation_keeps_the_previous_access_token_alive(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -268,7 +269,7 @@ async fn rotation_keeps_the_previous_access_token_alive(pool: PgPool) {
 }
 
 // Both routes need a session.
-#[sqlx::test]
+#[mokosh_test]
 async fn session_routes_require_auth(pool: PgPool) {
     let _contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;

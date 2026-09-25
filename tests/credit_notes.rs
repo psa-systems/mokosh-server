@@ -15,6 +15,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -132,7 +133,7 @@ fn dec(v: &Value) -> Decimal {
 /// number are exactly what the customer received, and only the derived balance
 /// moves. That separation is the whole reason a credit note exists rather than
 /// an edit.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_credit_reduces_the_balance_without_editing_the_invoice(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -189,7 +190,7 @@ async fn a_credit_reduces_the_balance_without_editing_the_invoice(pool: PgPool) 
 /// invoice to 0, the invoice status changes to paid",
 /// <https://docs.stripe.com/invoicing/dashboard/credit-notes>), and it carries
 /// no payment date, because nobody paid.
-#[sqlx::test]
+#[mokosh_test]
 async fn crediting_the_whole_balance_does_not_void_the_invoice(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -217,7 +218,7 @@ async fn crediting_the_whole_balance_does_not_void_the_invoice(pool: PgPool) {
 /// PMS-1333: a partial credit on a sent invoice leaves it sent, with the
 /// balance reduced by exactly the credit. The case either side of the one
 /// above, and the one an MSP hits most.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_partial_credit_leaves_a_sent_invoice_sent(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -236,7 +237,7 @@ async fn a_partial_credit_leaves_a_sent_invoice_sent(pool: PgPool) {
 
 /// PMS-1333: and a voided invoice cannot then be credited. Voiding says the
 /// document never stood, so there is no charge for a credit note to correct.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_voided_invoice_refuses_a_credit_note(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -273,7 +274,7 @@ async fn a_voided_invoice_refuses_a_credit_note(pool: PgPool) {
 /// credit note (a post-payment adjustment `create_credit_note` documents as
 /// intended) must not void it, because `i.total - p.paid` is already zero and
 /// any credit at all used to satisfy `p.credited >= i.total - p.paid`.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_partial_credit_on_a_fully_paid_invoice_leaves_it_paid(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -334,7 +335,7 @@ async fn a_partial_credit_on_a_fully_paid_invoice_leaves_it_paid(pool: PgPool) {
 /// A credit note is never edited, for the reason its invoice is not. Voiding
 /// changes no amount and no line; the credit simply stops counting, and the
 /// invoice walks back to the status it would have had.
-#[sqlx::test]
+#[mokosh_test]
 async fn voiding_a_credit_note_restores_the_balance(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -396,7 +397,7 @@ async fn voiding_a_credit_note_restores_the_balance(pool: PgPool) {
 
 /// The cap is the total less what is already credited, and is checked across
 /// several notes rather than per note.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_credit_cannot_exceed_what_is_left_to_credit(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -430,7 +431,7 @@ async fn a_credit_cannot_exceed_what_is_left_to_credit(pool: PgPool) {
 /// An invoice the customer has already paid can still be credited in full.
 /// That is exactly the case where they are owed money back, so the cap is
 /// deliberately NOT reduced by what has been paid.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_paid_invoice_can_still_be_credited_in_full(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -476,7 +477,7 @@ async fn a_paid_invoice_can_still_be_credited_in_full(pool: PgPool) {
 
 /// A draft invoice can still be edited, so a credit note against it would
 /// correct a document nobody was sent.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_invoice_is_refused_because_it_can_still_be_edited(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -498,7 +499,7 @@ async fn a_draft_invoice_is_refused_because_it_can_still_be_edited(pool: PgPool)
 /// The document as a whole is the credit, so a negative line inside it is a
 /// charge in disguise. Checking only the total would miss one that a larger
 /// positive line offsets, which is why the check is per line.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_charge_cannot_hide_inside_a_credit(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -533,7 +534,7 @@ async fn a_charge_cannot_hide_inside_a_credit(pool: PgPool) {
 /// The regression pin. Credits were folded into the recompute that already
 /// owned `amount_paid`, and the status ladder gained an arm; an invoice with no
 /// credits must behave exactly as it did before, payment transitions included.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_invoice_with_no_credits_behaves_exactly_as_before(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -582,7 +583,7 @@ async fn an_invoice_with_no_credits_behaves_exactly_as_before(pool: PgPool) {
 /// It also runs the seed, which nothing else in the suite does: the credited
 /// invoice has to be created, sent and credited in sequence through three
 /// services, and a compile is not evidence that sequence works.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_qa_seed_carries_a_credited_invoice(pool: PgPool) {
     // The seed attributes every record to a user, and fails closed when the
     // tenant has none.

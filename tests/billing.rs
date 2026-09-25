@@ -16,6 +16,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
@@ -37,6 +38,27 @@ async fn seed_work_type(pool: &PgPool) -> Uuid {
     .await
     .expect("seed test work type");
     id
+}
+
+/// PMS-999: issue an invoice without emailing anyone, which is what a test
+/// needs before it can record a payment against it. A payment is only legal
+/// against a document the customer has been given, and `skip_email` is the
+/// server's own path for an invoice delivered some other way (PMS-992), so it
+/// needs no billing contact seeded.
+async fn issue(app: &common::TestApp, token: &str, invoice_id: &str) {
+    let resp = app
+        .client
+        .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "status": "sent", "skip_email": true }))
+        .send()
+        .await
+        .expect("send invoice");
+    assert!(
+        resp.status().is_success(),
+        "issuing should 2xx, got {}",
+        resp.status()
+    );
 }
 
 /// Seed one billable, unbilled time entry directly. The money columns
@@ -79,7 +101,7 @@ async fn seed_time_entry(
     id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn generate_invoice_from_time_entries(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -271,7 +293,7 @@ async fn generate_invoice_from_time_entries(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn payment_against_generated_invoice_transitions_status(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -307,6 +329,9 @@ async fn payment_against_generated_invoice_transitions_status(pool: PgPool) {
     );
     let invoice: serde_json::Value = resp.json().await.expect("invoice JSON");
     let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
+
+    // PMS-999: pay a document the customer has actually been given.
+    issue(&app, &token, &invoice_id).await;
 
     // Record a full payment via the existing payments endpoint.
     let pay_resp = app
@@ -355,9 +380,129 @@ async fn payment_against_generated_invoice_transitions_status(pool: PgPool) {
     );
 }
 
+/// PMS-999: a payment cannot send an invoice.
+///
+/// `recompute_invoice_balance` derived the status from the money, and its
+/// fall-through was a literal `'sent'`, so recording a payment against a
+/// draft rewrote that draft to `sent` in raw SQL. That was the only route to
+/// the status that did not go through `update_invoice`, and so the only one
+/// that skipped everything being sent means: no `sent_at`, no frozen issuer
+/// snapshot (PMS-911), no stored document (PMS-959), and since PMS-993 no
+/// billing contact for the pay-now mail to address.
+#[mokosh_test]
+async fn a_payment_against_an_unsent_invoice_is_refused(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seed_work_type(&pool).await;
+    seed_time_entry(
+        &pool,
+        admin_id,
+        company_id,
+        work_type_id,
+        60,
+        "150.00",
+        "150.00",
+    )
+    .await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let invoice: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/invoices/from-time-entries"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "company_id": company_id }))
+        .send()
+        .await
+        .expect("generate invoice")
+        .json()
+        .await
+        .expect("invoice JSON");
+    let invoice_id = invoice["id"].as_str().expect("invoice id").to_string();
+    assert_eq!(invoice["status"].as_str(), Some("draft"));
+
+    let refused = app
+        .client
+        .post(app.url("/api/v1/payments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "invoice_id": invoice_id,
+            "company_id": company_id,
+            "payment_date": chrono::Utc::now().date_naive().to_string(),
+            "amount": "150.00",
+            "payment_method": "check",
+        }))
+        .send()
+        .await
+        .expect("record payment");
+    assert_eq!(refused.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = refused.json().await.expect("refusal JSON");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("draft"), "names the status: {message}");
+    assert!(
+        message.contains("Send it first"),
+        "and says what to do: {message}"
+    );
+
+    // Nothing was recorded, and the invoice is exactly as it was.
+    let payments: i64 = sqlx::query_scalar("SELECT count(*) FROM payments WHERE tenant_id = $1")
+        .bind(common::DEFAULT_TENANT_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("payments");
+    assert_eq!(payments, 0, "a refused payment records nothing");
+
+    let (status, sent_at, issuer, balance): (
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<serde_json::Value>,
+        rust_decimal::Decimal,
+    ) = sqlx::query_as(
+        "SELECT status, sent_at, issuer_snapshot, balance_due FROM invoices WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&invoice_id).expect("uuid"))
+    .fetch_one(&pool)
+    .await
+    .expect("invoice row");
+    assert_eq!(status, "draft", "still a draft");
+    assert!(sent_at.is_none(), "never stamped as sent");
+    assert!(issuer.is_none(), "no issuer was frozen");
+    assert_eq!(balance, common::dec("150.00"));
+
+    let documents: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM files WHERE tenant_id = $1 AND entity_id = $2 \
+           AND entity_type = 'invoice_document'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(Uuid::parse_str(&invoice_id).expect("uuid"))
+    .fetch_one(&pool)
+    .await
+    .expect("documents");
+    assert_eq!(documents, 0, "no document was issued");
+
+    // Issued, the same payment is accepted, which is the point: the refusal
+    // is about the invoice's state and not about the payment.
+    issue(&app, &token, &invoice_id).await;
+    let accepted = app
+        .client
+        .post(app.url("/api/v1/payments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "invoice_id": invoice_id,
+            "company_id": company_id,
+            "payment_date": chrono::Utc::now().date_naive().to_string(),
+            "amount": "150.00",
+            "payment_method": "check",
+        }))
+        .send()
+        .await
+        .expect("record payment");
+    assert!(accepted.status().is_success(), "{}", accepted.status());
+}
+
 // PMS-186: invoice and payment responses carry the company's display name
 // so the client never has to surface a raw company_id UUID.
-#[sqlx::test]
+#[mokosh_test]
 async fn billing_responses_carry_company_name(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await; // seeded as "Acme Co"
@@ -424,6 +569,8 @@ async fn billing_responses_carry_company_name(pool: PgPool) {
     );
 
     // --- Payment create + list carry company_name ---
+    // PMS-999: the payment needs an issued invoice to attach to.
+    issue(&app, &token, &invoice_id).await;
     let payment: serde_json::Value = app
         .client
         .post(app.url("/api/v1/payments"))
@@ -504,7 +651,7 @@ async fn term_id(app: &common::TestApp, token: &str, name: &str) -> String {
 /// Migration 050 seeds Net 30 (PMS-934 renamed it from `net30`) as the single
 /// default per tenant; setting a new
 /// default clears the prior one.
-#[sqlx::test]
+#[mokosh_test]
 async fn payment_terms_seeded_and_single_default(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -592,7 +739,7 @@ async fn payment_terms_seeded_and_single_default(pool: PgPool) {
 /// An invoice references a payment term by FK; the response carries
 /// payment_term_id + payment_term_name, and a rename of the term is reflected
 /// on the invoice (rename-safe FK). Deleting a referenced term is a 409.
-#[sqlx::test]
+#[mokosh_test]
 async fn invoice_payment_term_link_rename_and_delete_guard(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -666,7 +813,7 @@ async fn invoice_payment_term_link_rename_and_delete_guard(pool: PgPool) {
 
 /// A payment_term_id from another tenant is rejected with a 400, never linked
 /// across tenants (the FK alone would pass since FK checks bypass RLS).
-#[sqlx::test]
+#[mokosh_test]
 async fn invoice_rejects_cross_tenant_payment_term(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -711,7 +858,7 @@ async fn invoice_rejects_cross_tenant_payment_term(pool: PgPool) {
 /// the `GET /payment-gateways` list must never echo the decrypted credential;
 /// they expose only non-secret metadata plus `configured`. Updating a gateway
 /// without re-sending `config` preserves the stored secret.
-#[sqlx::test]
+#[mokosh_test]
 async fn payment_gateway_secret_is_write_only(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -993,7 +1140,7 @@ async fn payments_sum(pool: &PgPool, invoice_id: Uuid) -> String {
 /// must land and the invoice must end fully paid. Before PMS-695 the two
 /// requests both read `amount_paid = 0` and the later write discarded the
 /// earlier one, leaving `amount_paid = 600.00` against `1000.00` of payments.
-#[sqlx::test]
+#[mokosh_test]
 async fn concurrent_partial_payments_both_land(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1023,7 +1170,7 @@ async fn concurrent_partial_payments_both_land(pool: PgPool) {
 /// Two concurrent payments that each fit the balance alone but overshoot it
 /// together: exactly one wins, the loser is rejected with a 400, and the
 /// invoice is never overpaid.
-#[sqlx::test]
+#[mokosh_test]
 async fn concurrent_overpayment_is_rejected(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1069,7 +1216,7 @@ async fn concurrent_overpayment_is_rejected(pool: PgPool) {
 /// computed `remaining = total - amount_paid = 100.00`, ignoring the credit,
 /// so a 100.00 payment passed and `recompute_invoice_balance` drove
 /// `balance_due` to -60.00. The guard must now reject it.
-#[sqlx::test]
+#[mokosh_test]
 async fn overpay_guard_accounts_for_credits(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1132,7 +1279,7 @@ async fn overpay_guard_accounts_for_credits(pool: PgPool) {
 
 /// Deleting one of two payments recomputes the invoice from the surviving
 /// rows rather than subtracting the deleted amount from a stale snapshot.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_a_payment_recomputes_from_remaining(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1187,7 +1334,7 @@ async fn deleting_a_payment_recomputes_from_remaining(pool: PgPool) {
 /// AC2 negative: a recipient from another company (or another tenant) is a
 /// 400, not a silent cross-account link. FK checks bypass RLS, so nothing else
 /// was stopping it.
-#[sqlx::test]
+#[mokosh_test]
 async fn invoice_rejects_a_billing_contact_from_another_company(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1220,7 +1367,7 @@ async fn invoice_rejects_a_billing_contact_from_another_company(pool: PgPool) {
 /// AC4: a company with no billing contact cannot have an invoice sent, and the
 /// refusal leaves nothing behind - no `sent_at`, no frozen issuer, no issued
 /// document. Those are what a partially-applied send would strand.
-#[sqlx::test]
+#[mokosh_test]
 async fn sending_without_a_billing_contact_is_refused(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1302,7 +1449,7 @@ async fn sending_without_a_billing_contact_is_refused(pool: PgPool) {
 /// AC2 + AC4: the send PERSISTS the recipient it resolved. Resolving only to
 /// decide the 409 would leave the column NULL, and the pay-now mail reads that
 /// column, so the invoice would go out addressed to nobody.
-#[sqlx::test]
+#[mokosh_test]
 async fn sending_persists_the_resolved_billing_contact(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1365,7 +1512,7 @@ async fn sending_persists_the_resolved_billing_contact(pool: PgPool) {
 /// columns this path never touches; accepting the status verbatim here used
 /// to commit e.g. `written_off` with every write-off column NULL, a row
 /// neither dedicated endpoint could then reach.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_invoice_rejects_void_and_written_off_status(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1425,7 +1572,7 @@ async fn update_invoice_rejects_void_and_written_off_status(pool: PgPool) {
 /// `Time entry {uuid}` was the description of every line the builder wrote,
 /// and it reached the API, the page and the PDF a customer receives. The
 /// line now names the date, the work type, the ticket and the notes.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_generated_line_describes_the_work_not_the_row(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

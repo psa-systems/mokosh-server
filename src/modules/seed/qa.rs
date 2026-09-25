@@ -235,6 +235,45 @@ struct QaSeeder {
 }
 
 impl QaSeeder {
+    /// Issue a seeded invoice without emailing anybody (PMS-992's
+    /// `skip_email`). Shared by the paid invoices and the credited one
+    /// because both need the same thing for the same reason: an invoice the
+    /// customer has not been given can be neither paid (PMS-999) nor credited
+    /// (PMS-953), and seeded data is issued rather than sent to a real
+    /// address.
+    async fn issue_for_qa(
+        &self,
+        tenant: TenantId,
+        invoice_id: Uuid,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        self.billing
+            .update_invoice(
+                tenant,
+                invoice_id,
+                &UpdateInvoiceRequest {
+                    tax_rate_id: None,
+                    company_id: None,
+                    billing_contact_id: None,
+                    contract_id: None,
+                    invoice_date: None,
+                    due_date: None,
+                    payment_terms: None,
+                    payment_term_id: None,
+                    tax_amount: None,
+                    discount_amount: None,
+                    notes: None,
+                    po_number: None,
+                    lines: None,
+                    status: Some(InvoiceStatus::Sent),
+                    skip_email: true,
+                },
+                ctx,
+            )
+            .await?;
+        Ok(())
+    }
+
     fn new(db: Database) -> Self {
         Self {
             contacts: ContactService::new(db.clone()),
@@ -412,6 +451,14 @@ impl QaSeeder {
             report.invoices += 1;
 
             if let Some(fraction) = pay_fraction {
+                // PMS-999: a payment is only legal against an invoice the
+                // customer has been given, so the ones this dataset pays are
+                // sent first. They used to be paid as drafts, which the
+                // recompute then laundered into `sent` with no `sent_at`, no
+                // frozen issuer and no stored document - the exact state that
+                // issue exists to make unreachable, seeded into every QA
+                // dataset.
+                self.issue_for_qa(tenant, invoice.id, &ctx).await?;
                 let amount = (total * fraction).round_dp(2);
                 let pay = CreatePaymentRequest {
                     invoice_id: Some(invoice.id),
@@ -430,9 +477,9 @@ impl QaSeeder {
 
         // --- A sent invoice, partly credited (PMS-953) ---
         //
-        // The two invoices above are drafts, and a credit note is only legal
-        // against a document the customer already holds, so this one is sent
-        // first. It exists so the QA dataset carries a corrected invoice and
+        // A credit note is only legal against a document the customer already
+        // holds, so this one is sent first, as the paid invoices above now
+        // are. It exists so the QA dataset carries a corrected invoice and
         // not only invoices that went out right the first time: a `void`
         // status and a non-zero `amount_credited` are states no other seeded
         // row reaches.
@@ -442,31 +489,7 @@ impl QaSeeder {
             .create_invoice(tenant, &credited_spec, &ctx)
             .await?;
         report.invoices += 1;
-        self.billing
-            .update_invoice(
-                tenant,
-                credited.id,
-                &UpdateInvoiceRequest {
-                    tax_rate_id: None,
-                    company_id: None,
-                    billing_contact_id: None,
-                    contract_id: None,
-                    invoice_date: None,
-                    due_date: None,
-                    payment_terms: None,
-                    payment_term_id: None,
-                    tax_amount: None,
-                    discount_amount: None,
-                    notes: None,
-                    po_number: None,
-                    lines: None,
-                    status: Some(InvoiceStatus::Sent),
-                    // PMS-992: seeded data is issued, not emailed.
-                    skip_email: true,
-                },
-                &ctx,
-            )
-            .await?;
+        self.issue_for_qa(tenant, credited.id, &ctx).await?;
         self.billing
             .create_credit_note(tenant, "UTC", &qa_credit_note_spec(credited.id), &ctx)
             .await?;

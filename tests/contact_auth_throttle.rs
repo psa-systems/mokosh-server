@@ -6,6 +6,7 @@ mod common;
 
 use chrono::{Duration, Utc};
 use mokosh_server::utils::crypto::{hash_password, sha256_hex};
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -29,7 +30,7 @@ async fn post(app: &common::TestApp, path: &str, body: serde_json::Value) -> req
         .expect("send")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn set_and_reset_password_share_one_budget(pool: PgPool) {
     let contact = seed_contact(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -50,7 +51,7 @@ async fn set_and_reset_password_share_one_budget(pool: PgPool) {
     assert!(r.headers().contains_key("retry-after"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn forgot_password_spends_quota_for_known_and_unknown_email(pool: PgPool) {
     let contact = seed_contact(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -70,7 +71,7 @@ async fn forgot_password_spends_quota_for_known_and_unknown_email(pool: PgPool) 
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_second_reset_token_invalidates_the_first(pool: PgPool) {
     let contact = seed_contact(&pool).await;
     let app = common::boot(pool.clone()).await;

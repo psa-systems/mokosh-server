@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -53,7 +54,7 @@ fn entry_body(user_id: Uuid, work_type_id: Uuid) -> serde_json::Value {
 
 /// The case the old `company_id NOT NULL` forbade outright: an employee logs an
 /// hour of the MSP's own time, naming nobody.
-#[sqlx::test]
+#[mokosh_test]
 async fn employee_time_names_no_company_at_all(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -86,7 +87,7 @@ async fn employee_time_names_no_company_at_all(pool: PgPool) {
 /// The tenant's own internal company is the signal today's client already
 /// sends for a General entry, so it resolves to employee time with no change
 /// on the client side. The company it named is left on the row.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_internal_company_still_means_the_msps_own_time(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let internal = own_company(&pool).await;
@@ -116,7 +117,7 @@ async fn the_internal_company_still_means_the_msps_own_time(pool: PgPool) {
 /// call for a customer, logged with no ticket, is the CLIENT's time. Deciding
 /// it from the absence of a ticket would move those hours onto the MSP's own
 /// books and off the invoice.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_client_call_with_no_ticket_is_still_the_clients_time(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -147,7 +148,7 @@ async fn a_client_call_with_no_ticket_is_still_the_clients_time(pool: PgPool) {
 
 /// Both contradictions are refused by name, so a caller reads which field is
 /// wrong instead of a database constraint's.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_two_contradictions_are_refused_as_bad_requests(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -188,7 +189,7 @@ async fn the_two_contradictions_are_refused_as_bad_requests(pool: PgPool) {
 /// An update cannot move an entry between the MSP's books and a client's.
 /// There is no `entry_kind` or `company_id` on the update request, so the only
 /// way to try is to attach a ticket to employee time.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_update_cannot_turn_employee_time_into_client_work(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -224,7 +225,7 @@ async fn an_update_cannot_turn_employee_time_into_client_work(pool: PgPool) {
 /// The timer that could not be stopped. With neither a company nor a ticket to
 /// infer one from, stopping used to 400 and the elapsed time had nowhere to
 /// go; the entry is the MSP's own time.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_timer_pointed_at_nobody_stops_into_employee_time(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -260,7 +261,7 @@ async fn a_timer_pointed_at_nobody_stops_into_employee_time(pool: PgPool) {
 /// The MSP's own overhead time is not invoiceable to the MSP. The internal
 /// company is a real `companies` row, so before PMS-942 naming it as the
 /// invoice's company was enough to sweep that time onto an invoice.
-#[sqlx::test]
+#[mokosh_test]
 async fn overhead_time_cannot_be_invoiced_to_the_internal_company(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let internal = own_company(&pool).await;
@@ -312,7 +313,7 @@ async fn overhead_time_cannot_be_invoiced_to_the_internal_company(pool: PgPool) 
 /// restated here: migrations are immutable once committed, so the file is a
 /// stable thing to quote, and a copy in the test would be free to drift from
 /// the SQL that actually ran on every existing database.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_backfill_claims_overhead_time_and_leaves_client_work_alone(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let internal = own_company(&pool).await;

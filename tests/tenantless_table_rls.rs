@@ -20,9 +20,10 @@
 //! the policies actually behave, which schema introspection cannot.
 //!
 //! Like `rls_isolation.rs`, the policy assertions run under a dedicated
-//! unprivileged role because `#[sqlx::test]` connects as the superuser, which
+//! unprivileged role because `#[mokosh_test]` connects as the superuser, which
 //! bypasses RLS unconditionally.
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -56,7 +57,7 @@ async fn seed_tenant_with_user(conn: &mut sqlx::PgConnection, name: &str) -> (Uu
 /// Create an unprivileged (`NOSUPERUSER NOBYPASSRLS`) role granted read/write on
 /// `tables`, and `SET ROLE` to it. Returns the generated role name for cleanup.
 ///
-/// `#[sqlx::test]` connects as the superuser, which bypasses RLS unconditionally,
+/// `#[mokosh_test]` connects as the superuser, which bypasses RLS unconditionally,
 /// so a policy assertion made without this switch proves nothing.
 async fn set_probe_role(conn: &mut sqlx::PgConnection, tables: &str) -> String {
     let role = format!("mokosh_rls_probe_{}", Uuid::new_v4().simple());
@@ -102,7 +103,7 @@ async fn drop_probe_role(conn: &mut sqlx::PgConnection, role: &str, tables: &str
         .expect("drop role");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn oauth_identity_is_tenant_scoped(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire connection");
 
@@ -154,7 +155,7 @@ async fn oauth_identity_is_tenant_scoped(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn child_table_parent_join_policy_is_fail_closed(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire connection");
 
@@ -242,7 +243,7 @@ async fn child_table_parent_join_policy_is_fail_closed(pool: PgPool) {
 /// policy either, so its isolation was entirely the application's job. The
 /// service is correct today; this proves the database now refuses the same
 /// mistakes on its own.
-#[sqlx::test]
+#[mokosh_test]
 async fn quote_lines_parent_join_policy_is_fail_closed(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire connection");
 

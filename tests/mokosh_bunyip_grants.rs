@@ -10,6 +10,7 @@
 mod common;
 
 use chrono::Utc;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -27,7 +28,7 @@ fn triple() -> (Uuid, Uuid, Uuid, &'static str) {
     )
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn upsert_granted_then_is_grant_active_returns_true(pool: PgPool) {
     clear_cache_for_tests();
     let (grant_id, owner, grantee, account) = triple();
@@ -53,7 +54,7 @@ async fn upsert_granted_then_is_grant_active_returns_true(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn upsert_revoked_is_seen_as_inactive(pool: PgPool) {
     clear_cache_for_tests();
     let (grant_id, owner, grantee, account) = triple();
@@ -103,7 +104,7 @@ async fn upsert_revoked_is_seen_as_inactive(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn is_grant_active_for_an_unknown_triple_is_false(pool: PgPool) {
     clear_cache_for_tests();
     // No upsert - the caller has never had a grant to this account.
@@ -115,7 +116,7 @@ async fn is_grant_active_for_an_unknown_triple_is_false(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_revoked_row_can_be_reinstated_by_a_later_granted_event(pool: PgPool) {
     clear_cache_for_tests();
     let (grant_id, owner, grantee, account) = triple();
@@ -176,7 +177,7 @@ async fn a_revoked_row_can_be_reinstated_by_a_later_granted_event(pool: PgPool) 
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_duplicate_granted_event_is_idempotent(pool: PgPool) {
     clear_cache_for_tests();
     let (grant_id, owner, grantee, account) = triple();
@@ -232,7 +233,7 @@ async fn a_duplicate_granted_event_is_idempotent(pool: PgPool) {
 /// no-op-on-unknown contract). The parent BUNYIP-674 ticket names this
 /// as the "race where mokosh missed the granted webhook still lands
 /// in the correct state" case.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_revoked_event_for_an_unknown_triple_lands_the_revoked_row(pool: PgPool) {
     clear_cache_for_tests();
     let (grant_id, owner, grantee, account) = triple();
@@ -294,7 +295,7 @@ fn claims_with_grant(sub: Uuid, mokosh_account_id: Option<&str>) -> AtClaims {
 /// BUNYIP-674 end-to-end: a token without a grant claim passes the gate
 /// with no DB touch; a token with an active grant passes; a token whose
 /// grant is revoked is refused with Forbidden.
-#[sqlx::test]
+#[mokosh_test]
 async fn ensure_grant_still_active_if_claimed_gates_on_the_mirror(pool: PgPool) {
     clear_cache_for_tests();
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
@@ -366,7 +367,7 @@ async fn ensure_grant_still_active_if_claimed_gates_on_the_mirror(pool: PgPool) 
 /// a specific tenant. Two owner rows for the SAME bunyip sub in two
 /// different tenants (the shape a grantee turns into) are both
 /// resolvable, and each returns the row from its own tenant.
-#[sqlx::test]
+#[mokosh_test]
 async fn find_bunyip_principal_in_tenant_returns_the_row_for_that_tenant(pool: PgPool) {
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
 
@@ -474,7 +475,7 @@ fn map_grant_role_covers_the_pms_1162_vocabulary() {
 /// on an active row and `None` on a revoked one, drawing off the
 /// same 30s cache `is_grant_active` populates so the request-path
 /// pair of reads pays for ONE database round-trip.
-#[sqlx::test]
+#[mokosh_test]
 async fn active_grant_role_reads_through_the_shared_cache(pool: PgPool) {
     clear_cache_for_tests();
     let (grant_id, owner, grantee, account) = triple();
@@ -535,7 +536,7 @@ async fn active_grant_role_reads_through_the_shared_cache(pool: PgPool) {
 /// row at the grant's role in the target tenant. A duplicate call
 /// (the same sub + tenant) upserts on the partial UNIQUE index and
 /// keeps ONE row.
-#[sqlx::test]
+#[mokosh_test]
 async fn place_grantee_user_jits_the_row_and_is_idempotent(pool: PgPool) {
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let tenant_id = Uuid::new_v4();
@@ -604,7 +605,7 @@ async fn place_grantee_user_jits_the_row_and_is_idempotent(pool: PgPool) {
 /// `deleted_at` on the row so `find_bunyip_principal_in_tenant` stops
 /// seeing it. A follow-up `place_grantee_user` on the same triple
 /// clears the tombstone (the re-grant heals the revoke).
-#[sqlx::test]
+#[mokosh_test]
 async fn tombstone_then_reinstate_via_place_grantee_user(pool: PgPool) {
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let tenant_id = Uuid::new_v4();
@@ -682,7 +683,7 @@ async fn tombstone_then_reinstate_via_place_grantee_user(pool: PgPool) {
 /// pre-migration rows) rather than being welded into the query with
 /// COALESCE, which would make it impossible to tell "same sub, other
 /// tenant" apart from "unmirrored row".
-#[sqlx::test]
+#[mokosh_test]
 async fn a_row_with_no_bunyip_user_id_is_invisible_to_the_new_resolver(pool: PgPool) {
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let tenant_id = Uuid::new_v4();
@@ -728,7 +729,7 @@ async fn a_row_with_no_bunyip_user_id_is_invisible_to_the_new_resolver(pool: PgP
 
 /// PMS-1295: a `granted` event older than the stored revoked row leaves
 /// it revoked, and a re-delivery of the same event changes nothing.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_stale_granted_event_never_reinstates_and_a_duplicate_is_a_no_op(pool: PgPool) {
     clear_cache_for_tests();
     let (grant_id, owner, grantee, account) = triple();

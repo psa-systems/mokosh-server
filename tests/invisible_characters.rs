@@ -16,6 +16,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -27,7 +28,7 @@ const ZWSP: &str = "\u{200B}";
 /// A no-break space: reaches a validator looking exactly like a space.
 const NBSP: &str = "\u{00A0}";
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_json_write_stores_the_value_with_invisible_characters_removed(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -81,7 +82,7 @@ async fn a_json_write_stores_the_value_with_invisible_characters_removed(pool: P
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn the_reported_phone_number_is_accepted_and_stored_normalized(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -120,7 +121,7 @@ async fn the_reported_phone_number_is_accepted_and_stored_normalized(pool: PgPoo
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_password_reaches_the_hasher_byte_identical(pool: PgPool) {
     let (admin_id, email, old_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -188,7 +189,7 @@ async fn a_password_reaches_the_hasher_byte_identical(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_multipart_body_reaches_the_handler_byte_identical(pool: PgPool) {
     // Own directory + generous cap: this suite only cares about the bytes.
     common::storage_root();

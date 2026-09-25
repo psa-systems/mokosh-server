@@ -16,6 +16,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -33,7 +34,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn intake_token_admin_round_trip(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     // Seed a technician in the same tenant so the admin-gate checks

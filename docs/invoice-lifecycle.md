@@ -91,7 +91,11 @@ Operationally: a company with no billing contact produces drafts that cannot be 
 
 ## Why a sent invoice is immutable
 
-Once an invoice is sent, the customer holds a copy and can quote the totals back. Mutating or deleting it would break audit integrity and invite fraud. Standard accounting practice keeps issued documents on the record and corrects them with a follow-on document, not by editing or deleting the original. Correcting a sent invoice therefore belongs to a credit note flow, which is not yet built (tracked separately). Until then, a sent invoice that should not have been issued stays on record; its balance is simply never collected.
+Once an invoice is sent, the customer holds a copy and can quote the totals back. Mutating or deleting it would break audit integrity and invite fraud. Standard accounting practice keeps issued documents on the record and corrects them with a follow-on document, not by editing or deleting the original.
+
+The follow-on document is the credit note, and it is the supported correction for a sent invoice: `POST /api/v1/credit-notes` against the invoice, `GET /api/v1/credit-notes` to list them. The invoice itself is never touched. Its lines, totals and number stay exactly as the customer received them; what changes is its derived balance, because `recompute_invoice_balance` folds issued credit notes into `amount_credited` and `balance_due` alongside payments.
+
+A credit note is issued the moment it is created, so it is immutable in the same way and for the same reason: the customer holds a copy of it too. There is no PUT and no DELETE on it. A credit note raised in error is voided (`POST /api/v1/credit-notes/{id}/void`), which changes no amount and no line and simply stops the credit counting against the invoice, and its own document is stored at creation and served unchanged from `GET /api/v1/credit-notes/{id}/pdf`.
 
 ## AC3 decision: no separate pre-send "cancel"
 

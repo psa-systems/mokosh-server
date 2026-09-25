@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -220,7 +221,7 @@ async fn seed_project(pool: &PgPool, tenant_id: Uuid, company_id: Uuid, name: &s
 // CONTRACTS - contact-plane sweep
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contracts_list_scoped_to_contact_company(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -257,7 +258,7 @@ async fn contracts_list_scoped_to_contact_company(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contracts_get_foreign_company_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own, _c, _e, token) =
@@ -279,7 +280,7 @@ async fn contracts_get_foreign_company_returns_404(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contracts_list_without_cap_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Support Contact does NOT hold contracts:read.
@@ -299,7 +300,7 @@ async fn contracts_list_without_cap_returns_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contracts_list_staff_bypass_returns_200(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -318,7 +319,7 @@ async fn contracts_list_staff_bypass_returns_200(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contracts_cross_tenant_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own, _c, _e, token) =
@@ -345,7 +346,7 @@ async fn contracts_cross_tenant_returns_404(pool: PgPool) {
 // ASSETS - contact-plane sweep
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn assets_list_scoped_to_contact_company(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -381,7 +382,7 @@ async fn assets_list_scoped_to_contact_company(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn assets_get_foreign_company_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own, _c, _e, token) =
@@ -402,7 +403,7 @@ async fn assets_get_foreign_company_returns_404(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn assets_list_without_cap_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own, _c, _e, token) =
@@ -421,7 +422,7 @@ async fn assets_list_without_cap_returns_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn assets_list_staff_bypass_returns_200(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -444,7 +445,7 @@ async fn assets_list_staff_bypass_returns_200(pool: PgPool) {
 // PROJECTS - contact-plane sweep
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn projects_list_scoped_to_contact_company(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -480,7 +481,7 @@ async fn projects_list_scoped_to_contact_company(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn projects_get_foreign_company_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own, _c, _e, token) =
@@ -501,7 +502,7 @@ async fn projects_get_foreign_company_returns_404(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn projects_list_without_cap_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own, _c, _e, token) =
@@ -520,7 +521,7 @@ async fn projects_list_without_cap_returns_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn projects_list_staff_bypass_returns_200(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -612,7 +613,7 @@ async fn seed_ticket_with_two_notes(
     ticket_id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_notes_staff_sees_internal_and_public(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -643,7 +644,7 @@ async fn ticket_notes_staff_sees_internal_and_public(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_notes_contact_sees_public_only(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (company_id, _c, _e, contact_token) =
@@ -754,7 +755,7 @@ async fn seed_unpaid_invoices(pool: &PgPool, tenant_id: Uuid, company_id: Uuid, 
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_summary_two_company_isolation(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (admin_id, _, _) = common::seed_admin(&pool).await;
@@ -816,7 +817,7 @@ async fn dashboard_summary_two_company_isolation(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_summary_requires_contact_bearer(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -840,7 +841,7 @@ async fn dashboard_summary_requires_contact_bearer(pool: PgPool) {
 // PROFILE SELF-EDIT - PUT /contact/auth/me
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_self_edit_persists_first_name(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Billing Contact + Support Contact both hold `settings:manage_own`
@@ -882,7 +883,7 @@ async fn contact_self_edit_persists_first_name(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_self_edit_does_not_bleed_to_sibling_contact(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (company_id, _c_a, _e_a, token_a) =
@@ -979,7 +980,7 @@ async fn contact_self_edit_does_not_bleed_to_sibling_contact(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_self_edit_without_cap_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Read-Only role is the built-in one that deliberately does NOT
@@ -1005,7 +1006,7 @@ async fn contact_self_edit_without_cap_returns_403(pool: PgPool) {
 // ContactMe DTO regression: company_id must round-trip on /me
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_me_carries_company_id(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (company_id, _c, _e, token) =

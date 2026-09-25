@@ -8,6 +8,7 @@
 mod common;
 
 use chrono::{DateTime, Duration, Utc};
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -95,7 +96,7 @@ async fn sla(app: &common::TestApp, token: &str, ticket: Uuid) -> (StatusCode, V
 // A healthy ticket is on_track with both legs' targets echoed; a
 // closed one collapses to not_applicable; an overdue open one is
 // breached. Staff read the same shape.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_sees_the_state_of_its_own_ticket(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Healthy Co").await;
@@ -168,7 +169,7 @@ async fn a_contact_sees_the_state_of_its_own_ticket(pool: PgPool) {
 
 // Another Company's ticket and an unknown id are the same 404; a
 // contact without tickets:read is 403; anonymous is 401.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_foreign_ticket_is_404_and_the_gate_holds(pool: PgPool) {
     let (admin_id, _, _) = common::seed_admin(&pool).await;
     let mine = seed_company(&pool, "Mine Co").await;

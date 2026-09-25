@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -95,7 +96,7 @@ async fn wait_for_code(mailer: &CapturingMailer) -> String {
     panic!("approval code was not emailed within 1s");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn new_device_login_requires_approval_then_succeeds(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let mailer = Arc::new(CapturingMailer::default());
@@ -182,7 +183,7 @@ async fn new_device_login_requires_approval_then_succeeds(pool: PgPool) {
     assert!(!repeat.access_token.is_empty());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn gate_disabled_never_flags_a_new_device(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let mailer = Arc::new(CapturingMailer::default());
