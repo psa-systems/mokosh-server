@@ -182,6 +182,11 @@ async fn role_route_coverage_matrix(pool: PgPool) {
     assert_matrix(&app, &tokens, "/api/v1/invitations", ADMIN_ROLES).await;
     assert_matrix(&app, &tokens, "/api/v1/audit-log", ADMIN_ROLES).await;
 
+    // PMS-1310: deciding that Xero issues this MSP's invoices is not a
+    // technician's call, and the connect route on the same prefix takes a
+    // credential.
+    assert_matrix(&app, &tokens, "/api/v1/integrations", ADMIN_ROLES).await;
+
     // Admin -> Team (user list) is manager-and-up.
     assert_matrix(&app, &tokens, "/api/v1/auth/users", MANAGER_ROLES).await;
 }
