@@ -256,6 +256,26 @@ where
     Ok(raw.and_then(|s| normalize_website(&s)))
 }
 
+/// PMS-1392: the `Option<Option<T>>` ("double option") twin of
+/// [`de_website_opt`], for a PATCH-style field where absent must mean "leave
+/// unchanged" and an explicit `null` must mean "clear to SQL NULL" - two
+/// states `de_website_opt` alone cannot distinguish, since it collapses both
+/// to `None` before the update gate ever sees them. Pair with
+/// `#[serde(default, deserialize_with = "de_website_opt_double")]` on an
+/// `Option<Option<String>>` field, the same shape as
+/// `mokosh_types::deserialize_double_option`: absent -> `None` (via
+/// `#[serde(default)]`, this function is not even called), `null` ->
+/// `Some(None)`, a value -> `Some(Some(normalized))`. A blank string still
+/// normalizes to `Some(None)`, i.e. also clears, matching `de_website_opt`'s
+/// existing blank-means-empty rule.
+fn de_website_opt_double<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(Some(raw.and_then(|s| normalize_website(&s))))
+}
+
 /// Normalize a phone number for storage (PMS-325): keep a single leading `+`
 /// and drop common formatting characters (spaces, dashes, parentheses, dots),
 /// so `+1 (415) 555-1234` becomes `+14155551234`. Returns the digits-only
@@ -284,6 +304,19 @@ where
 {
     let raw = Option::<String>::deserialize(deserializer)?;
     Ok(raw.map(|s| normalize_phone(&s)).filter(|s| !s.is_empty()))
+}
+
+/// PMS-1392: the `Option<Option<T>>` twin of [`de_phone_opt`]; see
+/// [`de_website_opt_double`] for why the extra level of `Option` is needed on
+/// a PATCH-style field.
+fn de_phone_opt_double<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(Some(
+        raw.map(|s| normalize_phone(&s)).filter(|s| !s.is_empty()),
+    ))
 }
 
 /// Validate a (normalized) phone number against E.164: an optional leading `+`
@@ -642,15 +675,15 @@ pub struct UpdateCompanyRequest {
     pub status: Option<CompanyStatus>,
     #[validate(custom(function = "validate_text_no_nul"))]
     pub industry: Option<String>,
-    #[serde(default, deserialize_with = "de_website_opt")]
+    #[serde(default, deserialize_with = "de_website_opt_double")]
     #[validate(length(max = 255), custom(function = "validate_website"))]
-    pub website: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    pub website: Option<Option<String>>,
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub phone: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    pub phone: Option<Option<String>>,
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub fax: Option<String>,
+    pub fax: Option<Option<String>>,
     #[validate(nested)]
     pub address: Option<Address>,
     #[validate(nested)]
@@ -1123,15 +1156,15 @@ pub struct UpdateContactRequest {
     pub last_name: Option<String>,
     #[validate(email)]
     pub email: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub phone: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    pub phone: Option<Option<String>>,
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub mobile: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    pub mobile: Option<Option<String>>,
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub fax: Option<String>,
+    pub fax: Option<Option<String>>,
     pub title: Option<String>,
     pub department: Option<String>,
     pub contact_type: Option<ContactType>,
@@ -1302,9 +1335,9 @@ pub struct UpdateSiteRequest {
     pub name: Option<String>,
     #[validate(nested)]
     pub address: Option<Address>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub phone: Option<String>,
+    pub phone: Option<Option<String>>,
     pub is_primary: Option<bool>,
     #[validate(custom(function = "validate_timezone"))]
     pub timezone: Option<String>,
@@ -1707,7 +1740,10 @@ mod tests {
         let req: UpdateCompanyRequest =
             serde_json::from_value(serde_json::json!({ "website": " Example.COM/About " }))
                 .expect("request deserializes");
-        assert_eq!(req.website.as_deref(), Some("https://example.com/About"));
+        assert_eq!(
+            req.website,
+            Some(Some("https://example.com/About".to_string()))
+        );
         assert!(req.validate().is_ok());
     }
 

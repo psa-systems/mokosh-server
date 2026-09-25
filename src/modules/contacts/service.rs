@@ -928,13 +928,13 @@ impl ContactService {
             q = q.bind(industry);
         }
         if let Some(ref website) = request.website {
-            q = q.bind(website);
+            q = q.bind(website.clone());
         }
         if let Some(ref phone) = request.phone {
-            q = q.bind(phone);
+            q = q.bind(phone.clone());
         }
         if let Some(ref fax) = request.fax {
-            q = q.bind(fax);
+            q = q.bind(fax.clone());
         }
         if let Some(ref addr) = request.address {
             q = q
@@ -3896,13 +3896,13 @@ impl ContactService {
             q = q.bind(email);
         }
         if let Some(ref phone) = request.phone {
-            q = q.bind(phone);
+            q = q.bind(phone.clone());
         }
         if let Some(ref mobile) = request.mobile {
-            q = q.bind(mobile);
+            q = q.bind(mobile.clone());
         }
         if let Some(ref fax) = request.fax {
-            q = q.bind(fax);
+            q = q.bind(fax.clone());
         }
         if let Some(ref title) = request.title {
             q = q.bind(title);
@@ -3954,6 +3954,11 @@ impl ContactService {
         // contact's only link: both preserve the pre-PMS-806 semantics the
         // current SPA relies on. A request that touches neither leaves the
         // child rows exactly as they are.
+        // PMS-1392: each scalar is doubly optional now, so "touched" (an
+        // explicit value or an explicit `null` to clear) must win over the
+        // existing row, and only an absent field falls back to it - a clear
+        // must not be re-read as "unchanged" the way a single-level `Option`
+        // made it look.
         let phones = match request.phones.as_deref() {
             Some(entries) => Some(resolve_phone_list(entries)?),
             None if request.phone.is_some()
@@ -3961,9 +3966,21 @@ impl ContactService {
                 || request.fax.is_some() =>
             {
                 Some(phones_from_scalars(
-                    request.phone.as_deref().or(existing.phone.as_deref()),
-                    request.mobile.as_deref().or(existing.mobile.as_deref()),
-                    request.fax.as_deref().or(existing.fax.as_deref()),
+                    request
+                        .phone
+                        .as_ref()
+                        .map(|o| o.as_deref())
+                        .unwrap_or(existing.phone.as_deref()),
+                    request
+                        .mobile
+                        .as_ref()
+                        .map(|o| o.as_deref())
+                        .unwrap_or(existing.mobile.as_deref()),
+                    request
+                        .fax
+                        .as_ref()
+                        .map(|o| o.as_deref())
+                        .unwrap_or(existing.fax.as_deref()),
                 ))
             }
             None => None,
@@ -4352,7 +4369,7 @@ impl ContactService {
                 .bind(&addr.country);
         }
         if let Some(ref phone) = request.phone {
-            q = q.bind(phone);
+            q = q.bind(phone.clone());
         }
         if let Some(is_primary) = request.is_primary {
             q = q.bind(is_primary);
