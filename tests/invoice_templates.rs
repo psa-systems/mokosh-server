@@ -12,6 +12,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -111,7 +112,7 @@ async fn invoice_pdf(
 /// The setting takes the three keys and nothing else, and the refusal names
 /// them: a typo that fell through would silently leave every document on
 /// Classic with nobody the wiser.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_template_setting_takes_exactly_three_keys(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -159,7 +160,7 @@ async fn the_template_setting_takes_exactly_three_keys(pool: PgPool) {
 
 /// Each template produces its own document, and the one a tenant gets with no
 /// setting at all is the same document Classic renders.
-#[sqlx::test]
+#[mokosh_test]
 async fn each_template_renders_its_own_invoice_and_no_setting_means_classic(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -208,7 +209,7 @@ async fn each_template_renders_its_own_invoice_and_no_setting_means_classic(pool
 /// PMS-990's guarantee, per template: previewing a draft shows the bytes the
 /// send will keep. The send must therefore use the tenant's stored choice and
 /// nothing else.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_preview_matches_the_document_stored_at_send_for_every_template(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -244,7 +245,7 @@ async fn a_draft_preview_matches_the_document_stored_at_send_for_every_template(
 /// PMS-911's rule, extended to the template: changing anything about the
 /// tenant's presentation after a send leaves the document the customer holds
 /// exactly as it was.
-#[sqlx::test]
+#[mokosh_test]
 async fn changing_the_template_after_sending_leaves_the_invoice_byte_identical(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -278,7 +279,7 @@ async fn changing_the_template_after_sending_leaves_the_invoice_byte_identical(p
 /// where an answer is honest: a draft is rendered live, and an issued invoice
 /// serves the bytes that were sent, so an override there would hand back a
 /// document that is not the one the customer holds.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_template_parameter_previews_a_draft_and_is_refused_on_an_issued_invoice(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -343,7 +344,7 @@ async fn the_template_parameter_previews_a_draft_and_is_refused_on_an_issued_inv
 
 /// A statement stores nothing (PMS-954), so it follows the tenant's template
 /// as it stands now.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_statement_follows_the_current_template(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -373,7 +374,7 @@ async fn a_statement_follows_the_current_template(pool: PgPool) {
 
 /// A credit note is issued the instant it exists, so its template is the one
 /// current at creation and it keeps that document afterwards.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_credit_note_is_issued_in_the_template_that_was_current(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -432,7 +433,7 @@ async fn a_credit_note_is_issued_in_the_template_that_was_current(pool: PgPool) 
 
 /// The report export is not a document a client receives, and PMS-876 never
 /// gave it branding. It stays Classic whatever the tenant picked.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_report_export_is_unaffected_by_the_template(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;

@@ -15,6 +15,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 fn install_test_env() {
@@ -22,7 +23,7 @@ fn install_test_env() {
     std::env::set_var("ATTACHMENT_MAX_BYTES", "3145728"); // 3 MiB
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_upload_between_axums_default_and_the_configured_cap_is_accepted(pool: PgPool) {
     install_test_env();
     let (admin_id, email, password) = common::seed_admin(&pool).await;
@@ -53,7 +54,7 @@ async fn an_upload_between_axums_default_and_the_configured_cap_is_accepted(pool
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_upload_over_the_configured_cap_is_refused_with_413(pool: PgPool) {
     install_test_env();
     let (admin_id, email, password) = common::seed_admin(&pool).await;

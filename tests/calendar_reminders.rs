@@ -25,6 +25,7 @@ use chrono::Utc;
 use mokosh_server::modules::calendar::{CalendarReminderWorker, CalendarService};
 use mokosh_server::modules::notifications::NotificationsService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -61,7 +62,7 @@ fn worker(pool: &PgPool) -> CalendarReminderWorker {
     CalendarReminderWorker::new(CalendarService::with_dispatcher(db, notifications))
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn reminder_fires_once_and_dedupes(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let appt_id = seed_due_appointment(&pool, admin_id).await;

@@ -15,6 +15,7 @@
 mod common;
 
 use common::{boot, login, seed_admin, seed_company, seed_tenant_with_admin, TestApp};
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -64,7 +65,7 @@ async fn enable_calendar_module(pool: &PgPool, tenant_id: Uuid) {
 /// Full CRUD lifecycle plus `kind` filtering. Create one `dispatch` and one
 /// `calendar` template, assert the list filter narrows by kind, then get,
 /// update, and delete the dispatch one.
-#[sqlx::test]
+#[mokosh_test]
 async fn template_crud_lifecycle_and_kind_filter(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -216,7 +217,7 @@ async fn template_crud_lifecycle_and_kind_filter(pool: PgPool) {
 
 /// A template created in tenant A is invisible to tenant B. Both tenants seed
 /// a template; each list returns only its own.
-#[sqlx::test]
+#[mokosh_test]
 async fn templates_are_tenant_isolated(pool: PgPool) {
     let (_admin_id, email_a, password_a) = seed_admin(&pool).await;
     let (tenant_b, _user_b, email_b, password_b) = seed_tenant_with_admin(&pool, "tenant-b").await;
@@ -277,7 +278,7 @@ async fn templates_are_tenant_isolated(pool: PgPool) {
 /// A `default_ticket_id` belonging to another tenant is rejected with 400.
 /// Tenant A (the default, lookup-seeded tenant) owns a ticket; tenant B tries
 /// to reference it from a template and is rejected by the FK-tenant guard.
-#[sqlx::test]
+#[mokosh_test]
 async fn template_rejects_cross_tenant_default_ticket(pool: PgPool) {
     let (_admin_id, email_a, password_a) = seed_admin(&pool).await;
     let company_id = seed_company(&pool).await;
@@ -329,7 +330,7 @@ async fn template_rejects_cross_tenant_default_ticket(pool: PgPool) {
 
 /// A non-positive `duration_minutes` is rejected at the request validator
 /// with 422, before reaching the DB CHECK.
-#[sqlx::test]
+#[mokosh_test]
 async fn template_rejects_non_positive_duration(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -355,7 +356,7 @@ async fn template_rejects_non_positive_duration(pool: PgPool) {
 }
 
 /// An unknown `kind` value is rejected at the request validator with 422.
-#[sqlx::test]
+#[mokosh_test]
 async fn template_rejects_invalid_kind(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;

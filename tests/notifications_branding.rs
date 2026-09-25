@@ -32,6 +32,7 @@
 mod common;
 
 use mokosh_server::modules::notifications::NotificationsService;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -45,7 +46,7 @@ use uuid::Uuid;
 /// `auth.password_reset` and `auth.welcome`, whose copy is the open question
 /// in PMS-1140, so asserting on either would make this test the place a
 /// product decision is enforced.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_seeded_template_carries_the_branding_placeholders(pool: PgPool) {
     let subject: Option<String> = sqlx::query_scalar(
         r#"SELECT subject FROM notification_templates
@@ -66,7 +67,7 @@ async fn a_seeded_template_carries_the_branding_placeholders(pool: PgPool) {
 /// Assert the branding placeholders are substituted with the
 /// tenant's actual values and land in the queued row's subject /
 /// body / body_html.
-#[sqlx::test]
+#[mokosh_test]
 async fn dispatch_injects_tenant_branding_into_render_context(pool: PgPool) {
     // Seed a fresh tenant with full branding so we do not clobber the
     // default tenant that every other test relies on.
@@ -214,7 +215,7 @@ async fn dispatch_injects_tenant_branding_into_render_context(pool: PgPool) {
 /// A tenant with an empty `branding` blob should still render (empty
 /// strings for the missing branding fields), never a literal
 /// `{{msp_logo_url}}` in the recipient's inbox.
-#[sqlx::test]
+#[mokosh_test]
 async fn dispatch_renders_cleanly_when_branding_absent(pool: PgPool) {
     let tenant_id = Uuid::new_v4();
     sqlx::query(
@@ -301,7 +302,7 @@ async fn dispatch_renders_cleanly_when_branding_absent(pool: PgPool) {
 /// Caller-supplied context keys win over the auto-injected branding
 /// defaults, so a specific dispatch can override the tenant identity
 /// (e.g. an integration test asserting a specific string).
-#[sqlx::test]
+#[mokosh_test]
 async fn caller_context_overrides_branding_defaults(pool: PgPool) {
     let tenant_id = Uuid::new_v4();
     sqlx::query(

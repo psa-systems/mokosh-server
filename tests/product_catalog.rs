@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -72,7 +73,7 @@ async fn invoice_with_product(
 /// The catalog exists to stop two rows quietly being the same product at two
 /// prices, so both identities are enforced and each refusal says which one was
 /// hit rather than quoting an index name.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_catalog_refuses_a_second_row_for_the_same_product(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -127,7 +128,7 @@ async fn the_catalog_refuses_a_second_row_for_the_same_product(pool: PgPool) {
 /// The load-bearing test. A catalog that reached into documents already written
 /// would re-price last year's invoices the day somebody corrected a typo in a
 /// price, and an issued invoice is immutable (PMS-953).
-#[sqlx::test]
+#[mokosh_test]
 async fn changing_a_catalog_price_does_not_reprice_a_document(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -191,7 +192,7 @@ async fn changing_a_catalog_price_does_not_reprice_a_document(pool: PgPool) {
 
 /// Retiring is the path for a product that has been sold, and the refusal to
 /// delete says so instead of surfacing a foreign-key error.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_sold_product_is_retired_rather_than_deleted(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -269,7 +270,7 @@ async fn a_sold_product_is_retired_rather_than_deleted(pool: PgPool) {
 /// PMS-1002: the response says whether anything has sold the product, so a
 /// client can show it and withhold Delete where the FK would refuse it. The
 /// flag is advisory and the FK stays the guard, which the test above pins.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_response_says_whether_anything_has_sold_the_product(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -382,7 +383,7 @@ async fn the_response_says_whether_anything_has_sold_the_product(pool: PgPool) {
 /// the constraint and link across tenants without a word. It is refused
 /// explicitly instead, and every link on the request is checked before the
 /// first line is written.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_foreign_product_is_refused_and_no_line_is_written(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -443,7 +444,7 @@ async fn a_foreign_product_is_refused_and_no_line_is_written(pool: PgPool) {
 
 /// A line with no product is every line written before this existed, and it has
 /// to keep working exactly as it did.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_line_with_no_product_is_unaffected(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -482,7 +483,7 @@ async fn a_line_with_no_product_is_unaffected(pool: PgPool) {
 /// through `create_invoice` and none of them noticed;
 /// `create_update_validation_parity` did, which is the whole reason that suite
 /// exists. This is the coverage that should have been here.
-#[sqlx::test]
+#[mokosh_test]
 async fn replacing_the_lines_keeps_the_product_link(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

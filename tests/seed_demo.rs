@@ -16,6 +16,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -120,7 +121,7 @@ async fn demo_seeded_flag(pool: &PgPool, tenant: Uuid) -> Option<String> {
         .expect("read demo_seeded flag")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn seeds_demo_data_once_for_a_fresh_tenant(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let tenant = common::DEFAULT_TENANT_ID;
@@ -207,7 +208,7 @@ async fn seeds_demo_data_once_for_a_fresh_tenant(pool: PgPool) {
 /// gate is off (staging / dev without the opt-in). Proves "staging seeds
 /// nothing" at the service level, complementing the `seed_enabled_for` unit
 /// tests.
-#[sqlx::test]
+#[mokosh_test]
 async fn auto_seed_is_a_no_op_when_the_gate_is_off(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let tenant = common::DEFAULT_TENANT_ID;
@@ -240,7 +241,7 @@ async fn auto_seed_is_a_no_op_when_the_gate_is_off(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn skips_seeding_the_shared_landing_tenant(pool: PgPool) {
     // PMS-239: when the deployment funnels every user into one shared tenant
     // (Bunyip JIT with no tenant claim), that tenant must never be auto-seeded
@@ -267,7 +268,7 @@ async fn skips_seeding_the_shared_landing_tenant(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn skips_seeding_a_tenant_that_already_has_companies(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let tenant = common::DEFAULT_TENANT_ID;
@@ -304,7 +305,7 @@ async fn skips_seeding_a_tenant_that_already_has_companies(pool: PgPool) {
 // (`load_demo_data`). Same underlying seed as the auto-seed, but it surfaces
 // its outcome and only ever loads into an empty tenant.
 
-#[sqlx::test]
+#[mokosh_test]
 async fn load_demo_data_seeds_an_empty_tenant(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let tenant = common::DEFAULT_TENANT_ID;
@@ -347,7 +348,7 @@ async fn load_demo_data_seeds_an_empty_tenant(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn load_demo_data_refuses_a_tenant_that_already_has_data(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let tenant = common::DEFAULT_TENANT_ID;
@@ -385,7 +386,7 @@ async fn load_demo_data_refuses_a_tenant_that_already_has_data(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn load_demo_data_refuses_the_shared_landing_tenant(pool: PgPool) {
     // PMS-239: the shared multi-user landing tenant must never receive
     // per-account demo rows, even on an explicit request.
@@ -413,7 +414,7 @@ async fn load_demo_data_refuses_the_shared_landing_tenant(pool: PgPool) {
 /// (`qa.rs`), gated to `is_qa` tenants; demo data (`data.rs`) is un-prefixed and
 /// tagged `demo`. This locks in that separation so a future change cannot leak
 /// QA fixtures into the demo baseline.
-#[sqlx::test]
+#[mokosh_test]
 async fn demo_seed_is_the_clean_baseline_with_no_qa_prefix(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let tenant = common::DEFAULT_TENANT_ID;

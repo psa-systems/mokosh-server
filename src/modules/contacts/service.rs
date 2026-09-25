@@ -2973,6 +2973,25 @@ impl ContactService {
         request: &CreateContactRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Contact> {
+        // A contact with no address cannot be invited, cannot be sent an
+        // invoice, and silently produces a dead entry the moment a mail is
+        // queued. The DTO carries `email: Option<String>` for compatibility
+        // with the SPA's older shape, so the gate lives here rather than as
+        // a `#[validate(...)]` on the type. Contact-sync imports have their
+        // own path (`insert_contact_in` via `import_contact_in`), so an
+        // address-less row from a CSV still lands the way it always has.
+        if request
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .is_none()
+        {
+            return Err(AppError::validation_field(
+                "email",
+                "Email address is required",
+            ));
+        }
         // PMS-402: only verify a CRM company exists when one is linked. A
         // freeform or company-less contact skips the existence check.
         if let Some(company_id) = request.company_id {

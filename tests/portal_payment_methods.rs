@@ -19,6 +19,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::OnceLock;
 
 use axum::{extract::Path, routing::post, Json, Router};
@@ -36,7 +37,7 @@ const TEST_KEY: [u8; 32] = [0u8; 32];
 /// stopping at the no-gateway 400 the other rows in this file use. One
 /// server for the whole binary, on its own thread with its own runtime, the
 /// same shape `tests/paypal_pay_now.rs` uses for the same reason:
-/// `STRIPE_API_BASE` is process-global and `#[sqlx::test]` cases run
+/// `STRIPE_API_BASE` is process-global and `#[mokosh_test]` cases run
 /// concurrently.
 fn stripe_stub_base() -> &'static str {
     static STUB: OnceLock<String> = OnceLock::new();
@@ -260,7 +261,7 @@ async fn seed_payment_method(
 /// Row 1: a Billing Contact (which the built-in seed grants
 /// `payment_methods:manage_own`) can list their own methods. Empty until
 /// a webhook lands.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_cap_lists_own_methods(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company, _contact, token) =
@@ -283,7 +284,7 @@ async fn contact_with_cap_lists_own_methods(pool: PgPool) {
 
 /// Row 2: a Support Contact holds `settings:manage_own` but NOT
 /// `payment_methods:manage_own`. Every route must refuse.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_cap_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company, _contact, token) =
@@ -326,7 +327,7 @@ async fn contact_without_cap_403(pool: PgPool) {
 /// the service and hits the same no-gateway 400 the pay-invoice matrix uses
 /// as the "the handler cleared every gate" signal. The Stripe-integrated
 /// success case is exercised elsewhere against a real key.
-#[sqlx::test]
+#[mokosh_test]
 async fn start_add_without_gateway_400(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company, _contact, token) =
@@ -361,7 +362,7 @@ async fn start_add_without_gateway_400(pool: PgPool) {
 
 /// Row 4: `PUT /payment-methods/{id}/default` with two seeded rows flips
 /// the picked one to default and clears the other in one transaction.
-#[sqlx::test]
+#[mokosh_test]
 async fn set_default_flips_atomically(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company, contact_id, token) =
@@ -420,7 +421,7 @@ async fn set_default_flips_atomically(pool: PgPool) {
 
 /// Row 5: `PUT /default` on an unknown id 404s, so a foreign guess does
 /// not silently succeed or reveal existence.
-#[sqlx::test]
+#[mokosh_test]
 async fn set_default_unknown_id_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_company, _contact, token) =
@@ -448,7 +449,7 @@ async fn set_default_unknown_id_404(pool: PgPool) {
 /// worker this table exists for names a specific card by looking here.
 /// Needs a working Stripe stub because `remove()` detaches on the provider
 /// side before it deletes the row and before it can promote anything.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_the_default_promotes_the_newest_remaining_method(pool: PgPool) {
     stripe_stub_base();
     seed_stripe_gateway(&pool).await;
@@ -506,7 +507,7 @@ async fn deleting_the_default_promotes_the_newest_remaining_method(pool: PgPool)
 /// PMS-1235: a tenant with two active providers must not be refused
 /// disambiguation just because it names one. Given no provider at all the
 /// old, still-correct ambiguity refusal stands.
-#[sqlx::test]
+#[mokosh_test]
 async fn start_add_with_no_provider_on_dual_provider_tenant_stays_ambiguous(pool: PgPool) {
     seed_stripe_gateway(&pool).await;
     seed_paypal_gateway(&pool).await;
@@ -541,7 +542,7 @@ async fn start_add_with_no_provider_on_dual_provider_tenant_stays_ambiguous(pool
 /// ambiguity refusal and resolve that provider. PayPal has no SetupIntent
 /// support yet, so it still refuses, but with PayPal's own message rather
 /// than the ambiguity one, proving the name was honoured.
-#[sqlx::test]
+#[mokosh_test]
 async fn start_add_with_named_provider_on_dual_provider_tenant_resolves_it(pool: PgPool) {
     seed_stripe_gateway(&pool).await;
     seed_paypal_gateway(&pool).await;

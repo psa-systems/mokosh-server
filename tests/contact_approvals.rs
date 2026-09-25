@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -126,7 +127,7 @@ fn ids(body: &Value) -> Vec<String> {
 // A staff user addresses two approvals to a contact; the contact lists
 // exactly those, decides one each way, and cannot decide twice. The
 // decision records the contact and writes the audit row.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_lists_and_decides_the_approvals_addressed_to_it(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Approvals Co").await;
@@ -207,7 +208,7 @@ async fn a_contact_lists_and_decides_the_approvals_addressed_to_it(pool: PgPool)
 // Anything not addressed to the contact is a 404 on decide: a
 // sibling's row, a row addressed to a staff user, an unknown id. And
 // staff cannot decide a row addressed to a contact.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_foreign_approval_is_404_on_both_sides(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Cross Co").await;
@@ -265,7 +266,7 @@ async fn a_foreign_approval_is_404_on_both_sides(pool: PgPool) {
 
 // Without `approvals:decide` (Read-Only and Billing Contact lack it)
 // both routes are 403; anonymous is 401.
-#[sqlx::test]
+#[mokosh_test]
 async fn without_approvals_decide_the_routes_are_403(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Cap Co").await;
@@ -295,7 +296,7 @@ async fn without_approvals_decide_the_routes_are_403(pool: PgPool) {
 
 // The create path refuses a contact that is not a portal user of the
 // tenant, and refuses two approver kinds at once.
-#[sqlx::test]
+#[mokosh_test]
 async fn addressing_an_approval_validates_the_contact(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Validate Co").await;
@@ -329,7 +330,7 @@ async fn addressing_an_approval_validates_the_contact(pool: PgPool) {
 // must succeed, leaving the approval row in the "unknown approver"
 // state (all three approver columns NULL) rather than failing the
 // DELETE with the `ticket_approvals_approver_xor` CHECK.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_a_sole_approver_contact_succeeds_and_leaves_the_approval_queryable(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Erasure Co").await;

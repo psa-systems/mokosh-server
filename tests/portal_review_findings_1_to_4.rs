@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -34,7 +35,7 @@ async fn seed_company(pool: &PgPool, name: &str) -> Uuid {
 /// canonical-cased login attempt. Before the fix, the DB compared
 /// bytes and returned Unauthorized for `alice@example.com` vs
 /// `Alice@Example.com`.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_matches_email_case_insensitively(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Case Co").await;
@@ -56,7 +57,7 @@ async fn login_matches_email_case_insensitively(pool: PgPool) {
 /// live refresh tokens on the next presentation. Before the fix, the
 /// refresh SELECT filtered only (id, tenant_id) and rotation continued
 /// after portal access was revoked.
-#[sqlx::test]
+#[mokosh_test]
 async fn refresh_rejects_a_deactivated_contact(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Deact Co").await;
@@ -92,7 +93,7 @@ async fn refresh_rejects_a_deactivated_contact(pool: PgPool) {
 /// A stolen access token must not be enough to enrol an attacker's
 /// authenticator: setup with no body, or the wrong password, must not
 /// stage a secret; the right password does.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_setup_rejects_missing_current_password(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Setup Co").await;
@@ -150,7 +151,7 @@ async fn mfa_setup_rejects_missing_current_password(pool: PgPool) {
 /// Password correct, TOTP wrong: the persistent `portal_failed_login_count`
 /// must tick so PMS-501's DB-backed lockout arms across replicas rather
 /// than leaving the second factor throttled only by an in-memory limiter.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_failure_ticks_persistent_failed_login_counter(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "MFAFail Co").await;

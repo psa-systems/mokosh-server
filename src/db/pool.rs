@@ -74,7 +74,7 @@ impl Database {
     }
 
     /// Wrap an existing `PgPool` as BOTH pools. Used by the integration-test
-    /// harness (`tests/common/`) where `#[sqlx::test]` provisions a single
+    /// harness (`tests/common/`) where `#[mokosh_test]` provisions a single
     /// superuser pool against a per-test database; without the role split
     /// the app and migrator connections coincide and RLS does not bite.
     /// Suites that exercise RLS through the app role build the app pool
@@ -88,7 +88,7 @@ impl Database {
 
     /// Wrap two distinct pools. Used by the RLS-exercising integration
     /// harness, which builds `app_pool` connecting as the unprivileged
-    /// `mokosh_app` role and passes the `#[sqlx::test]` superuser pool as
+    /// `mokosh_app` role and passes the `#[mokosh_test]` superuser pool as
     /// `migrator_pool`.
     pub fn from_pools(app_pool: PgPool, migrator_pool: PgPool) -> Self {
         Self {

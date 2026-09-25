@@ -11,6 +11,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -93,7 +94,7 @@ async fn ledger_row(pool: &PgPool, entity_id: Uuid) -> Option<(String, i64)> {
 
 /// Sending an invoice writes its document. Not on the first request for it:
 /// on the send.
-#[sqlx::test]
+#[mokosh_test]
 async fn sending_an_invoice_stores_its_document(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -135,7 +136,7 @@ async fn sending_an_invoice_stores_its_document(pool: PgPool) {
 /// and the route hands those back. A route that re-rendered would return a
 /// valid PDF and ignore the tampering, so this is the assertion that separates
 /// "stored" from "reproducible".
-#[sqlx::test]
+#[mokosh_test]
 async fn the_route_serves_the_stored_bytes_not_a_fresh_render(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -165,7 +166,7 @@ async fn the_route_serves_the_stored_bytes_not_a_fresh_render(pool: PgPool) {
 
 /// A rebrand after sending leaves the stored document alone, which is the
 /// PMS-911 guarantee now backed by bytes on disk rather than by re-derivation.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_rebrand_cannot_reach_a_stored_document(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -194,7 +195,7 @@ async fn a_rebrand_cannot_reach_a_stored_document(pool: PgPool) {
 
 /// A draft has no document and renders live, so the fallback is exercised
 /// rather than merely present.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_renders_live_and_stores_nothing(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -220,7 +221,7 @@ async fn a_draft_renders_live_and_stores_nothing(pool: PgPool) {
 
 /// A credit note gets its document at creation, because it is issued the
 /// instant it exists (PMS-953) and has no separate send transition.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_credit_note_gets_its_document_at_creation(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -278,7 +279,7 @@ async fn a_credit_note_gets_its_document_at_creation(pool: PgPool) {
 
 /// Voiding a credit note does not replace its document: the customer holds
 /// what was issued, and a void is a status the note carries.
-#[sqlx::test]
+#[mokosh_test]
 async fn voiding_a_credit_note_leaves_its_document_alone(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -331,7 +332,7 @@ async fn voiding_a_credit_note_leaves_its_document_alone(pool: PgPool) {
 
 /// The credit-note PDF is behind the finance gate like every other financial
 /// read in that file (PMS-962).
-#[sqlx::test]
+#[mokosh_test]
 async fn the_credit_note_pdf_is_finance_gated(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -366,7 +367,7 @@ async fn the_credit_note_pdf_is_finance_gated(pool: PgPool) {
 /// previewed are the bytes the client receives. Nothing here regenerates on
 /// edit or freezes on finalize as a mechanism: a live render plus a store at
 /// send already has that shape, and this pins that the two agree.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_preview_is_byte_identical_to_the_document_stored_at_send(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;

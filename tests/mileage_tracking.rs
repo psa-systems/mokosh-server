@@ -23,6 +23,7 @@ use mokosh_server::modules::mileage_tracking::{
 use mokosh_server::utils::error::AppError;
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -96,7 +97,7 @@ async fn seed_ready_time_entry(
     id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn mileage_entry_crud_and_listing(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -196,7 +197,7 @@ async fn mileage_entry_crud_and_listing(pool: PgPool) {
     assert_eq!(after.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn billable_mileage_inherits_default_rate_card_rate(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -237,7 +238,7 @@ async fn billable_mileage_inherits_default_rate_card_rate(pool: PgPool) {
     assert!(approx(num(&created["total_amount"]), 10.0));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn invoice_includes_time_and_mileage_lines(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -311,7 +312,7 @@ async fn invoice_includes_time_and_mileage_lines(pool: PgPool) {
     assert!(approx(num(&invoice["subtotal"]), 200.0));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn mileage_entries_are_tenant_isolated(pool: PgPool) {
     // Tenant A is the seeded default tenant; tenant B is a fresh one.
     let (admin_a, _email_a, _pw_a) = common::seed_admin(&pool).await;
@@ -385,7 +386,7 @@ async fn mileage_entries_are_tenant_isolated(pool: PgPool) {
 /// tenant's (here a non-existent id stands in for any out-of-tenant ticket,
 /// which RLS makes indistinguishable from absent) is rejected before the row
 /// is rewritten, so the cross-tenant link is never persisted.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_mileage_entry_rejects_foreign_ticket(pool: PgPool) {
     let (admin_a, _email, _pw) = common::seed_admin(&pool).await;
     let company_a = common::seed_company(&pool).await;
@@ -444,7 +445,7 @@ async fn update_mileage_entry_rejects_foreign_ticket(pool: PgPool) {
 /// same tx as the INSERT, so the entry's change-history pane surfaces the
 /// create event. The row is entity-scoped, has no `before` snapshot, captures
 /// the inserted row in `after`, and records the ctx user as actor.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_mileage_entry_writes_create_audit_row(pool: PgPool) {
     let probe = pool.clone();
     let (admin_id, _email, _pw) = common::seed_admin(&pool).await;

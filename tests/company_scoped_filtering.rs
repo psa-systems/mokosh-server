@@ -46,6 +46,7 @@ use mokosh_server::modules::projects::{ProjectFilter, ProjectsService};
 use mokosh_server::modules::tickets::{TicketFilter, TicketService};
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -78,7 +79,7 @@ async fn seed_company_named(pool: &PgPool, name: &str) -> Uuid {
     id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn tickets_list_is_company_scoped(pool: PgPool) {
     // created_by_id is NOT NULL -> a user must exist.
     let (user, _, _) = common::seed_admin(&pool).await;
@@ -160,7 +161,7 @@ async fn tickets_list_is_company_scoped(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contracts_list_is_company_scoped(pool: PgPool) {
     let a = seed_company_named(&pool, "Company A").await;
     let b = seed_company_named(&pool, "Company B").await;
@@ -208,7 +209,7 @@ async fn contracts_list_is_company_scoped(pool: PgPool) {
     assert_eq!(total, 0);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn projects_list_is_company_scoped(pool: PgPool) {
     let a = seed_company_named(&pool, "Company A").await;
     let b = seed_company_named(&pool, "Company B").await;
@@ -254,7 +255,7 @@ async fn projects_list_is_company_scoped(pool: PgPool) {
     assert_eq!(total, 0);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn assets_list_is_company_scoped(pool: PgPool) {
     let a = seed_company_named(&pool, "Company A").await;
     let b = seed_company_named(&pool, "Company B").await;
@@ -309,7 +310,7 @@ async fn assets_list_is_company_scoped(pool: PgPool) {
     assert_eq!(total, 0);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn invoices_list_is_company_scoped(pool: PgPool) {
     let a = seed_company_named(&pool, "Company A").await;
     let b = seed_company_named(&pool, "Company B").await;
@@ -362,7 +363,7 @@ async fn invoices_list_is_company_scoped(pool: PgPool) {
 /// filter and returning the unfiltered all-companies list. Proven at the
 /// HTTP layer because the rejection is a property of the `Query<Filter>`
 /// extractor, not the service. Exercises all five global list endpoints.
-#[sqlx::test]
+#[mokosh_test]
 async fn malformed_company_id_is_rejected_with_400(pool: PgPool) {
     let (_uid, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;

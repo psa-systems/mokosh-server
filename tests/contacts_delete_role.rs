@@ -2,6 +2,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -75,19 +76,19 @@ async fn check(pool: PgPool, kind: &str, id: Uuid) {
     assert!((200..300).contains(&status), "manager delete got {status}");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn company_delete_needs_manager(pool: PgPool) {
     let id = seed_company(&pool).await;
     check(pool, "company", id).await;
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_delete_needs_manager(pool: PgPool) {
     let id = seed_contact(&pool).await;
     check(pool, "contact", id).await;
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn site_delete_needs_manager(pool: PgPool) {
     let id = seed_site(&pool).await;
     check(pool, "site", id).await;

@@ -14,6 +14,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 fn install_test_env() {
@@ -34,7 +35,7 @@ async fn upload_background(app: &common::TestApp, token: &str, size: usize) -> r
         .expect("send upload")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_background_upload_at_exactly_the_cap_is_accepted(pool: PgPool) {
     install_test_env();
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -51,7 +52,7 @@ async fn a_background_upload_at_exactly_the_cap_is_accepted(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_background_upload_over_the_cap_is_refused_with_413(pool: PgPool) {
     install_test_env();
     let (_admin_id, email, password) = common::seed_admin(&pool).await;

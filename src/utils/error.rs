@@ -367,10 +367,18 @@ impl From<AppError> for ErrorResponse {
             _ => None,
         };
 
+        // The `AppError::Database` variant carries the raw sqlx cause on it so
+        // panics and logs name what broke; the wire body stays generic so no
+        // constraint / table / column names leak.
+        let message = match &error {
+            AppError::Database(_) => "Database operation failed".to_string(),
+            _ => error.to_string(),
+        };
+
         Self {
             error: ErrorDetail {
                 code: error.error_code().to_string(),
-                message: error.to_string(),
+                message,
                 errors,
             },
         }
@@ -531,15 +539,16 @@ mod server_impl {
                             return Self::Conflict("That record already exists".to_string());
                         }
                     }
-                    // The generic message is all the client gets, so the
-                    // Postgres cause (message, table, column, constraint)
-                    // must reach the log here or it reaches nobody. PMS-1039.
+                    // The client always sees the generic message via
+                    // `ErrorResponse::from`; the raw Postgres cause rides
+                    // along on the variant so a panicking test's `.expect()`
+                    // and the log line both name what actually broke.
                     tracing::error!("Database error: {:?}", db_err);
-                    Self::Database("Database operation failed".to_string())
+                    Self::Database(format!("Database operation failed: {db_err:?}"))
                 }
                 _ => {
                     tracing::error!("Database error: {:?}", err);
-                    Self::Database("Database operation failed".to_string())
+                    Self::Database(format!("Database operation failed: {err:?}"))
                 }
             }
         }
@@ -1528,6 +1537,27 @@ mod tests {
 
         assert_eq!(response.error.code, "UNAUTHORIZED");
         assert!(response.error.errors.is_none());
+    }
+
+    /// The wire body for an `AppError::Database` stays generic even when the
+    /// variant carries a raw sqlx cause on it. The raw cause is what a
+    /// panicking test's `.expect()` and the error log line print; the client
+    /// gets only "Database operation failed" so no constraint / table /
+    /// column name leaks.
+    #[test]
+    fn database_error_response_never_leaks_the_underlying_cause() {
+        let error = AppError::Database(
+            "Database operation failed: DatabaseError { code: \"23503\", constraint: \
+             \"ticket_notes_created_by_id_fkey\", detail: \"Key (created_by_id)=(...) is \
+             not present in table \\\"users\\\".\" }"
+                .to_string(),
+        );
+        let wire = ErrorResponse::from(error);
+        assert_eq!(wire.error.code, "DATABASE_ERROR");
+        assert_eq!(wire.error.message, "Database operation failed");
+        assert!(!wire.error.message.contains("constraint"));
+        assert!(!wire.error.message.contains("ticket_notes"));
+        assert!(!wire.error.message.contains("created_by_id"));
     }
 
     #[test]

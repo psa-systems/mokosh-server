@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -59,7 +60,7 @@ async fn upload_logo(app: &common::TestApp, token: &str, bytes: &[u8]) {
 }
 
 /// The bug, from the other side: something is uploaded and the number moves.
-#[sqlx::test]
+#[mokosh_test]
 async fn uploading_a_logo_moves_the_reported_usage(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -87,7 +88,7 @@ async fn uploading_a_logo_moves_the_reported_usage(pool: PgPool) {
 /// A logo is the one object written to the same key over and over. Replacing it
 /// must not add a row, or a tenant's usage climbs every time they change their
 /// branding while only one file is on disk.
-#[sqlx::test]
+#[mokosh_test]
 async fn replacing_a_logo_does_not_add_to_the_total(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -112,7 +113,7 @@ async fn replacing_a_logo_does_not_add_to_the_total(pool: PgPool) {
 
 /// Deleting an attachment gives the space back. Without this the figure only
 /// ever climbs, which is a different wrong number from the one being fixed.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_an_attachment_returns_its_bytes(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -166,7 +167,7 @@ async fn deleting_an_attachment_returns_its_bytes(pool: PgPool) {
 
 /// The ledger row IS the attachment, under the same id, so the two cannot
 /// drift apart and a size recorded twice is impossible by construction.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_ledger_row_carries_the_objects_own_id_and_a_relative_path(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

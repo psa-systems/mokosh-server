@@ -15,6 +15,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 
@@ -87,7 +88,7 @@ async fn assert_matrix(
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn role_route_coverage_matrix(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let tokens = tokens_per_role(&app, &pool).await;

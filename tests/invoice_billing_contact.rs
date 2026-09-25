@@ -21,6 +21,7 @@ use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::billing::BillingService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -122,7 +123,7 @@ fn extracted_text(bytes: &[u8]) -> String {
 }
 
 /// The API path: no contact on the request, so the company's pointer decides.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_api_path_stores_the_companys_default_billing_contact(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -143,7 +144,7 @@ async fn the_api_path_stores_the_companys_default_billing_contact(pool: PgPool) 
 }
 
 /// The time-entry path resolves it the same way.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_time_entry_path_stores_the_companys_default_billing_contact(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
@@ -201,7 +202,7 @@ async fn the_time_entry_path_stores_the_companys_default_billing_contact(pool: P
 
 /// The recurring generator has no caller to name a contact, so the company's
 /// pointer is the only answer it can give - and it now gives it.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_recurring_generator_stores_the_companys_default_billing_contact(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -251,7 +252,7 @@ async fn the_recurring_generator_stores_the_companys_default_billing_contact(poo
 
 /// A company with no pointer is unchanged: the draft names nobody, and the
 /// send is still refused with the 409 that names the company.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_company_with_no_default_creates_an_invoice_naming_nobody(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -294,7 +295,7 @@ async fn a_company_with_no_default_creates_an_invoice_naming_nobody(pool: PgPool
 
 /// The request always wins: a caller naming a contact is not second-guessed
 /// by the company's pointer.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_explicit_contact_wins_over_the_companys_default(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -318,7 +319,7 @@ async fn an_explicit_contact_wins_over_the_companys_default(pool: PgPool) {
 
 /// The point of resolving at create: the preview an operator sees before the
 /// send is addressed to the same person as the document the customer gets.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_draft_preview_prints_the_same_attn_line_as_the_stored_document(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;

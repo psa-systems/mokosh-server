@@ -22,6 +22,7 @@ use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::notifications::NotificationsService;
 use mokosh_server::modules::tenants::{CreateTenantRequest, TenantService};
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -75,7 +76,7 @@ async fn provision(svc: &TenantService, name: &str, slug: &str, first: &str, las
 /// A customer resetting their portal password is told whose portal it is.
 /// Before this the mail said "Reset your {{app_name}} password", naming a
 /// product the customer has never heard of instead of the MSP they hired.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_portal_password_reset_names_the_msp_and_never_the_product(pool: PgPool) {
     sqlx::query("UPDATE tenants SET name = 'Niceguy IT' WHERE id = $1")
         .bind(common::DEFAULT_TENANT_ID)
@@ -136,7 +137,7 @@ async fn the_portal_password_reset_names_the_msp_and_never_the_product(pool: PgP
 
 /// The staff mail is untouched by the split: it still names the deployment,
 /// which is PMS-789's decision and the thing migration 204 restored.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_staff_password_reset_still_names_the_deployment(pool: PgPool) {
     let subject: Option<String> = sqlx::query_scalar(
         r#"SELECT subject FROM notification_templates
@@ -164,7 +165,7 @@ async fn the_staff_password_reset_still_names_the_deployment(pool: PgPool) {
 /// and the shared template asked for `salutation`, and it never named the
 /// portal, because migration 152 was the only thing that would have
 /// referenced `client_portal_url` and its guard matched zero rows.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_admin_welcome_greets_the_admin_and_names_their_portal(pool: PgPool) {
     let notifications =
         NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
@@ -208,7 +209,7 @@ async fn the_admin_welcome_greets_the_admin_and_names_their_portal(pool: PgPool)
 /// The greeting with nothing to greet. PMS-774's rule is that a missing name
 /// reads "Hello" rather than "Hello ,", and the fix for the placeholder had
 /// to adopt that rule rather than interpolate a bare name.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_admin_welcome_reads_correctly_with_no_name_on_file(pool: PgPool) {
     let notifications =
         NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);
@@ -228,7 +229,7 @@ async fn the_admin_welcome_reads_correctly_with_no_name_on_file(pool: PgPool) {
 /// RULES, so a template copied without its rule is a message that is never
 /// sent (PMS-761), and the welcome above is how this very call reaches the
 /// admin it just created.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_new_tenant_can_send_both_portal_mails(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let tenant = svc
@@ -272,7 +273,7 @@ async fn a_new_tenant_can_send_both_portal_mails(pool: PgPool) {
 /// it, switching the dispatch sites over would have stopped the mail for
 /// every tenant already provisioned, silently: `dispatch` finds no rule,
 /// sends nothing and reports success.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_that_predates_the_migration_was_backfilled(pool: PgPool) {
     // The default tenant is migration 023's and predates 206 by definition.
     for event in ["auth.portal_password_reset", "auth.portal_welcome"] {
@@ -294,7 +295,7 @@ async fn a_tenant_that_predates_the_migration_was_backfilled(pool: PgPool) {
 /// The dispatcher is what decides which template renders, so the two portal
 /// events must not resolve to the staff copy. Cheap, and it is the assertion
 /// that would have caught the original defect the day it landed.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_two_planes_render_from_different_templates(pool: PgPool) {
     let service =
         NotificationsService::with_encryption_key(Database::from_pool(pool.clone()), [0u8; 32]);

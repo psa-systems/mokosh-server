@@ -11,6 +11,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::Arc;
 
 use mokosh_server::modules::notifications::{DispatcherWorker, NotificationsService};
@@ -150,7 +151,7 @@ async fn mark_read(app: &common::TestApp, token: &str, id: Uuid) -> StatusCode {
 // The dispatcher writes the contact's in_app row: once for a contact
 // named both in the context and on the rule, none for one who opted
 // out, and the entity ref from the context lands on the row.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_dispatch_writes_the_contacts_inbox_row(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Dispatch Co").await;
@@ -223,7 +224,7 @@ async fn a_dispatch_writes_the_contacts_inbox_row(pool: PgPool) {
 
 // The list is the caller's rows only, and mark-read is idempotent on
 // its own row and a 404 on anyone else's.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_inbox_is_the_callers_rows_only(pool: PgPool) {
     let (staff_id, staff_email, staff_password) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Inbox Co").await;
@@ -275,7 +276,7 @@ async fn the_inbox_is_the_callers_rows_only(pool: PgPool) {
 }
 
 // Without `notifications:read` both routes are 403; anonymous is 401.
-#[sqlx::test]
+#[mokosh_test]
 async fn without_notifications_read_the_routes_are_403(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Cap Co").await;
@@ -312,7 +313,7 @@ async fn without_notifications_read_the_routes_are_403(pool: PgPool) {
 
 // The worker delivers a contact's in_app row (status flips to sent)
 // instead of failing it for having no user_id.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_worker_delivers_a_contact_in_app_row(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Worker Co").await;

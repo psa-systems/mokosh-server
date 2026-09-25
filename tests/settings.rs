@@ -12,11 +12,12 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 // --- AC1: tenant_settings round-trip + validation -----------------------------
 
-#[sqlx::test]
+#[mokosh_test]
 async fn tenant_setting_round_trip_persists(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -50,7 +51,7 @@ async fn tenant_setting_round_trip_persists(pool: PgPool) {
     assert_eq!(body["value"].as_bool(), Some(true));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn tenant_setting_value_validation_rejects_bad_shape(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -85,7 +86,7 @@ async fn tenant_setting_value_validation_rejects_bad_shape(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn tenant_setting_unknown_category_accepted_with_warn(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -108,7 +109,7 @@ async fn tenant_setting_unknown_category_accepted_with_warn(pool: PgPool) {
 
 /// PMS-396 AC1: the `time_tracking/max_hours_per_day` cap accepts an integer in
 /// 1..=24 and 422s on out-of-range or non-integer values.
-#[sqlx::test]
+#[mokosh_test]
 async fn max_hours_per_day_value_validation(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -153,7 +154,7 @@ async fn max_hours_per_day_value_validation(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn get_settings_by_category_lists_only_that_category(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -215,7 +216,7 @@ async fn get_settings_by_category_lists_only_that_category(pool: PgPool) {
     assert_eq!(brand_arr.len(), 1);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn tenant_setting_delete_then_get_returns_404(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -260,7 +261,7 @@ async fn tenant_setting_delete_then_get_returns_404(pool: PgPool) {
 
 // --- AC2: module-config round-trip on both surfaces ---------------------------
 
-#[sqlx::test]
+#[mokosh_test]
 async fn module_config_settings_surface_round_trip(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -300,7 +301,7 @@ async fn module_config_settings_surface_round_trip(pool: PgPool) {
 /// PUT on the tenants-API surface, GET on the settings-API surface.
 /// Both hit the same row in `module_config` because the tenants
 /// handlers delegate to SettingsService (PMS-113 AC2).
-#[sqlx::test]
+#[mokosh_test]
 async fn module_config_tenants_surface_delegates_to_settings(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -342,7 +343,7 @@ async fn module_config_tenants_surface_delegates_to_settings(pool: PgPool) {
 
 // --- AC4: soft default on missing module-config row --------------------------
 
-#[sqlx::test]
+#[mokosh_test]
 async fn module_config_get_missing_returns_soft_default(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -376,7 +377,7 @@ async fn module_config_get_missing_returns_soft_default(pool: PgPool) {
 /// route returns 404; flipping it back lets traffic through again.
 /// Pins the `RequireModuleEnabled` extractor and the entire PMS-113
 /// AC3 wiring (extractor + Extension layer + sweep).
-#[sqlx::test]
+#[mokosh_test]
 async fn disabled_module_returns_404_on_route_access(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -450,7 +451,7 @@ async fn disabled_module_returns_404_on_route_access(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn enabled_module_response_unchanged(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -488,7 +489,7 @@ async fn enabled_module_response_unchanged(pool: PgPool) {
 /// `GET /invoices`, which is why the other four went unnoticed once that one
 /// was fixed. This walks the whole set, and asserts each route is unchanged
 /// when the module is on so the gate is not just answering 404 to everything.
-#[sqlx::test]
+#[mokosh_test]
 async fn disabled_billing_404s_every_dual_plane_invoice_route(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -607,7 +608,7 @@ async fn disabled_billing_404s_every_dual_plane_invoice_route(pool: PgPool) {
 /// finance gate would have refused. That ordering is what stacking
 /// `RequireBilling` ahead of `RequireFinance` produced, and it is what keeps a
 /// disabled feature indistinguishable from a route that is not mounted.
-#[sqlx::test]
+#[mokosh_test]
 async fn disabled_billing_404s_a_non_finance_role_rather_than_403(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (_tech_id, tech_email, tech_password) = common::seed_user(
@@ -668,7 +669,7 @@ async fn disabled_billing_404s_a_non_finance_role_rather_than_403(pool: PgPool) 
 /// PMS-1280: the deployment-wide settings belong to the deployment's
 /// operator. An admin of another organisation is refused on all six routes;
 /// the system tenant's admin keeps them.
-#[sqlx::test]
+#[mokosh_test]
 async fn only_the_deployment_operator_touches_deployment_settings(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let (_tenant, _user, other_email, other_password) =

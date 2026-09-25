@@ -7,12 +7,13 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 /// Login against a tenant whose status is not `active` must return 403
 /// with the server's "not active" message so the SPA can render the
 /// correct splash instead of prompting for re-authentication.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_against_suspended_tenant_returns_403_not_401(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     sqlx::query("UPDATE tenants SET status = 'suspended' WHERE id = $1")
@@ -52,7 +53,7 @@ async fn login_against_suspended_tenant_returns_403_not_401(pool: PgPool) {
 /// A live authenticated session whose tenant gets suspended mid-flight
 /// must have the very next agent-plane request return 403 with the same
 /// copy, NOT 401.
-#[sqlx::test]
+#[mokosh_test]
 async fn authed_request_after_tenant_suspend_returns_403_not_401(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
