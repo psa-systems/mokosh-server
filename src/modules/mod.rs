@@ -31,6 +31,7 @@ pub mod ip_enrich;
 pub mod knowledge_base;
 pub mod mileage_tracking;
 pub mod notifications;
+pub mod opportunities;
 pub mod platform;
 pub mod portal_roles;
 pub mod projects;

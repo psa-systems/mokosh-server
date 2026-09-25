@@ -579,6 +579,11 @@ pub fn create_api_router(
             status_service,
             rmm_service_shared,
         ))
+        // CRM opportunities: leads through won/lost, with an optional
+        // link to the quote raised from them.
+        .merge(crate::modules::opportunities::opportunities_routes(
+            crate::modules::opportunities::OpportunitiesService::new(db.clone()),
+        ))
         // PMS-1212 (PSA-70): connect, status and disconnect for the Google
         // Contacts import. Admin-gated inside, the RMM shape.
         .merge(crate::modules::contact_sync::routes::contact_sync_routes(
