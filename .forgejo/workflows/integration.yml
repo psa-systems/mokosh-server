@@ -31,9 +31,10 @@ jobs:
     # 10-minute run target plus checkout and cache upload with headroom.
     timeout-minutes: 30
 
-    # Postgres service for `cargo test --tests`. `#[sqlx::test]` creates a
-    # fresh database per invocation against the URL in DATABASE_URL, so
-    # this single instance fans out to all integration tests.
+    # Postgres service for `cargo test --tests`. `#[mokosh_test]` migrates one
+    # template database against the URL in DATABASE_URL and clones a fresh
+    # database per invocation from it, so this single instance fans out to all
+    # integration tests.
     #
     # The Forgejo Actions runner puts the job container and its service
     # containers on a shared bridge network; services are reachable from
@@ -228,8 +229,9 @@ jobs:
         # database never needs to survive into. Measured locally against
         # postgres:18.2-alpine3.23 on 2026-09-17: the 229-migration run drops
         # from 1.12-1.32s to 0.60-0.71s and `CREATE DATABASE ... TEMPLATE`
-        # from 104-146ms to 35-39ms, a cost `#[sqlx::test]` pays about 1,300
-        # times per run (one database per invocation). Kept out of
+        # from 104-146ms to 35-39ms. PMS-1254 moved the migration run to once
+        # per job, so what is paid about 1,300 times per run is now the clone.
+        # Kept out of
         # scripts/test-db-roles.sql, which also runs against the dev cluster,
         # whose data a developer keeps. All three settings are reloadable, so
         # no restart is needed. ON_ERROR_STOP is not optional, for the same
@@ -246,8 +248,8 @@ jobs:
       - name: Create the DB roles the migrations grant to
         # PMS-988: migration 207 (`app_secrets`) ends with `GRANT ... TO
         # mokosh_app`, and Postgres rejects a GRANT to a role that does not
-        # exist (42704), so every `#[sqlx::test]` in the suite failed at
-        # migration 207 before its body ran. A real deployment never reaches
+        # exist (42704), so every test in the suite failed at migration 207
+        # before its body ran. A real deployment never reaches
         # that: `provision_roles` creates the split roles at startup, before
         # the migrations run. This job has no server startup, so the step that
         # prepares the cluster creates the role instead. The statement lives in
@@ -293,6 +295,27 @@ jobs:
             fi
           fi
           exit "${status}"
+
+      - name: Build the template every test clones
+        # PMS-1254: the 243 migrations are applied ONCE per run, into a
+        # template database named after a digest of the migration files, and
+        # each case is then a `CREATE DATABASE ... TEMPLATE` clone of it. The
+        # suite builds the template by itself when it finds none, under an
+        # advisory lock, so this step is not what makes the run correct; it is
+        # what makes the run legible. Done here, the build happens in a step of
+        # the job rather than inside whichever case arrived first with every
+        # other case waiting on the lock, and the line naming the template is
+        # printed where a reader can see it instead of into one case's captured
+        # output. That line, printed only by the process that did the build, is
+        # the evidence that the migrations ran once rather than 1,300 times.
+        #
+        # Run out of the archive the previous step built, so it compiles
+        # nothing: `--no-capture` is what lets the line through, and it forces
+        # a single thread, which is why it is a filtered run of its own rather
+        # than a flag on the suite.
+        run: |
+          cargo nextest run --archive-file /tmp/nextest-archive.tar.zst --profile ci \
+            --no-capture -E 'binary(template_database)'
 
       - name: Integration tests
         # PMS-1177: `cargo nextest run --archive-file` runs every case from

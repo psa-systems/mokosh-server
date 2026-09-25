@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 /// Helper: create a company through the API and return its id.
@@ -102,7 +103,7 @@ async fn search_company_names(app: &common::TestApp, token: &str, q: &str) -> Ve
 /// interior word, and a leading prefix to all find the company. The bug
 /// was that only a leading prefix matched, so the full multi-word name and
 /// interior words returned zero rows.
-#[sqlx::test]
+#[mokosh_test]
 async fn company_search_matches_substring_not_just_prefix(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -143,7 +144,7 @@ async fn company_search_matches_substring_not_just_prefix(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn company_crud_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -223,7 +224,7 @@ async fn company_crud_happy_path(pool: PgPool) {
 /// website, phone, address, etc.) on a 200 OK. Cover representative
 /// scalar + nested-object fields and re-GET to prove the writes hit
 /// Postgres.
-#[sqlx::test]
+#[mokosh_test]
 async fn company_update_persists_all_fields(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -299,7 +300,7 @@ async fn company_update_persists_all_fields(pool: PgPool) {
 /// name (differing only by case or surrounding whitespace) must 409 and
 /// insert no row; renaming onto another company's name must 409; re-saving
 /// a company with its own name unchanged must succeed.
-#[sqlx::test]
+#[mokosh_test]
 async fn company_rejects_duplicate_name(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -379,7 +380,7 @@ async fn company_rejects_duplicate_name(pool: PgPool) {
 /// independent GET re-fetches the row to prove the change actually
 /// landed in Postgres rather than only being reflected in the PUT's
 /// response body.
-#[sqlx::test]
+#[mokosh_test]
 async fn site_update_persists_changes(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -434,7 +435,7 @@ async fn site_update_persists_changes(pool: PgPool) {
 /// (mokosh-server/src/modules/contacts/service.rs::update_site, the
 /// pre-UPDATE that flips other sites' is_primary to FALSE when a new
 /// primary is set).
-#[sqlx::test]
+#[mokosh_test]
 async fn site_crud_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -539,7 +540,7 @@ async fn site_crud_happy_path(pool: PgPool) {
 // PMS-17 AC5: contact CRUD
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_crud_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -696,7 +697,7 @@ async fn contact_crud_happy_path(pool: PgPool) {
 /// round-trips: create returns the typed company name and a null
 /// `company_id`, and a subsequent GET surfaces the same. Backs the read-side
 /// `COALESCE(co.name, c.company_name)` projection and the nullable FK.
-#[sqlx::test]
+#[mokosh_test]
 async fn freeform_company_contact_round_trips(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -711,6 +712,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
             "company_name": "Bob's Plumbing",
             "first_name": "Bob",
             "last_name": "Smith",
+            "email": format!("bob-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -755,6 +757,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
         .json(&serde_json::json!({
             "first_name": "Lone",
             "last_name": "Person",
+            "email": format!("lone-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -779,6 +782,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
             "company_name": "Acme Typed",
             "first_name": "Clash",
             "last_name": "Case",
+            "email": format!("clash-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -793,7 +797,7 @@ async fn freeform_company_contact_round_trips(pool: PgPool) {
 /// Updating a freeform contact to point at a real CRM company clears the
 /// stored freeform name; the read side then surfaces the CRM name and a
 /// non-null company_id.
-#[sqlx::test]
+#[mokosh_test]
 async fn updating_freeform_to_fk_clears_freeform_name(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -808,6 +812,7 @@ async fn updating_freeform_to_fk_clears_freeform_name(pool: PgPool) {
             "company_name": "Typed Co",
             "first_name": "Mover",
             "last_name": "Upper",
+            "email": format!("mover-{}@example.com", uuid::Uuid::new_v4()),
         }))
         .send()
         .await
@@ -856,7 +861,7 @@ async fn updating_freeform_to_fk_clears_freeform_name(pool: PgPool) {
 /// drives the contact's is_portal_user state. Includes a negative
 /// control (a second contact without the flag) so a future impl that
 /// silently always returns is_portal_user=true does NOT pass.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_contact_with_portal_access_flips_flag(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -956,7 +961,7 @@ async fn setup_token_count(pool: &PgPool, contact_id: &str) -> i64 {
 /// one `portal_setup_tokens` row (the emailed setup link). A re-grant of an
 /// already-portal contact mints no second token, and a plain contact (no
 /// flag) gets none (negative control).
-#[sqlx::test]
+#[mokosh_test]
 async fn granting_portal_access_mints_setup_token(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1060,7 +1065,7 @@ async fn granting_portal_access_mints_setup_token(pool: PgPool) {
 /// rename does not render an empty link, AND so the slug-less URL bug
 /// (dispatched an `auth.welcome` template with `/portal/set-password?...`
 /// missing the slug segment, SPA 404'd) does not regress.
-#[sqlx::test]
+#[mokosh_test]
 async fn granting_portal_access_enqueues_setup_link_email(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1128,7 +1133,7 @@ async fn granting_portal_access_enqueues_setup_link_email(pool: PgPool) {
 /// to whom. Pins the audit-side of the grant flow: without this, a
 /// future refactor that skips the audit_write inside the create/update
 /// tx would go undetected.
-#[sqlx::test]
+#[mokosh_test]
 async fn granting_portal_access_writes_audit_row(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1213,7 +1218,7 @@ async fn granting_portal_access_writes_audit_row(pool: PgPool) {
 /// q should be rejected with a 4xx rather than silently truncated or
 /// ILIKE'd into a slow scan. ContactFilter shares the same code path so
 /// covering one is sufficient.
-#[sqlx::test]
+#[mokosh_test]
 async fn company_filter_rejects_oversize_q(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1243,7 +1248,7 @@ async fn company_filter_rejects_oversize_q(pool: PgPool) {
 // normalized to E.164 on the way in.
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_field_validation(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1267,6 +1272,7 @@ async fn contact_field_validation(pool: PgPool) {
         "company_id": company_id,
         "first_name": "Ada",
         "last_name": "Lovelace",
+        "email": format!("ada-{}@example.com", uuid::Uuid::new_v4()),
     });
     let with = |k: &str, v: serde_json::Value| {
         let mut b = base.clone();
@@ -1303,7 +1309,7 @@ async fn contact_field_validation(pool: PgPool) {
     assert_eq!(created["phone"].as_str(), Some("+14155551234"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn company_address_validation(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1365,7 +1371,7 @@ async fn company_address_validation(pool: PgPool) {
 /// PMS-413: an `internal` own-company is excluded from the default
 /// `GET /contacts/companies` customer list (so it never appears as a fake
 /// client in pickers), but a direct lookup by id still resolves it.
-#[sqlx::test]
+#[mokosh_test]
 async fn internal_company_hidden_from_list_but_resolvable_by_id(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
 
@@ -1475,7 +1481,7 @@ async fn seed_contact_row(pool: &PgPool, company_id: uuid::Uuid, email: &str) ->
 /// mokosh-contact-login prompt 003: `POST /portal-roles` returns the
 /// three built-ins for a fresh tenant + `GET /contacts/{id}/portal-roles`
 /// starts empty for a contact who has never been granted access.
-#[sqlx::test]
+#[mokosh_test]
 async fn portal_roles_list_returns_the_three_builtins(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1507,7 +1513,7 @@ async fn portal_roles_list_returns_the_three_builtins(pool: PgPool) {
 /// `is_portal_user = TRUE`, mints exactly one setup token, dispatches
 /// the welcome email, returns `{portal_slug, setup_link}` from the
 /// handler.
-#[sqlx::test]
+#[mokosh_test]
 async fn grant_portal_access_mints_slug_roles_token_and_email(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1550,11 +1556,18 @@ async fn grant_portal_access_mints_slug_roles_token_and_email(pool: PgPool) {
     );
     let outcome: serde_json::Value = resp.json().await.expect("outcome JSON");
     let portal_slug = outcome["portal_slug"].as_str().expect("portal_slug");
-    let setup_link = outcome["setup_link"].as_str().expect("setup_link");
     assert_eq!(portal_slug.len(), 16, "slug must be 16 chars");
+    // PMS-1327 / PMS-1374: `setup_link` is `#[serde(skip)]` on the wire so
+    // an operator with only the API response cannot mint a password on the
+    // contact's behalf; the token reaches the contact through the setup
+    // email `send_grant_email` dispatches. The presence of the token is
+    // verified against `portal_setup_tokens` below (line ~1587); the URL
+    // shape is exercised end-to-end by `tests/contact_e2e.rs` where the
+    // suite drives the redemption flow using the raw token it reads out
+    // of the database, not out of the response body.
     assert!(
-        setup_link.contains(&format!("/portal/{portal_slug}/set-password?token=")),
-        "setup_link must carry the slug + query token, got {setup_link}"
+        outcome.get("setup_link").is_none(),
+        "PMS-1327: setup_link must never reach the wire, got {outcome:?}"
     );
 
     // Slug landed on the Company.
@@ -1611,7 +1624,7 @@ async fn grant_portal_access_mints_slug_roles_token_and_email(pool: PgPool) {
 /// mokosh-contact-login prompt 003: re-granting with a different role
 /// set REPLACES the assignment. Rewriting is atomic; the token gets
 /// re-issued (any prior unredeemed one drops).
-#[sqlx::test]
+#[mokosh_test]
 async fn grant_portal_access_rewrites_role_set_and_reissues_token(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1703,7 +1716,7 @@ async fn grant_portal_access_rewrites_role_set_and_reissues_token(pool: PgPool) 
 
 /// mokosh-contact-login prompt 003: grant fails closed on a role_id
 /// from another tenant.
-#[sqlx::test]
+#[mokosh_test]
 async fn grant_portal_access_rejects_cross_tenant_role_id(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1752,7 +1765,7 @@ async fn grant_portal_access_rejects_cross_tenant_role_id(pool: PgPool) {
 /// mokosh-contact-login prompt 003: revoke drops the assignment set,
 /// flips is_portal_user off, deletes pending tokens, marks live
 /// contact_sessions revoked.
-#[sqlx::test]
+#[mokosh_test]
 async fn revoke_portal_access_wipes_assignments_and_sessions(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1861,7 +1874,7 @@ async fn revoke_portal_access_wipes_assignments_and_sessions(pool: PgPool) {
 /// The reporter's case: typing `DentalArtsPractice.com` into the website field
 /// must save, and must persist with the scheme the product wants. The
 /// dangerous-scheme rejection that MAPPS-149 added must survive the change.
-#[sqlx::test]
+#[mokosh_test]
 async fn company_website_accepts_a_bare_domain(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1947,7 +1960,7 @@ async fn company_website_accepts_a_bare_domain(pool: PgPool) {
 /// and refuses to connect to anything off the public internet. A loopback
 /// target must come back as a successful probe reporting `blocked_host`, which
 /// is what proves the SSRF guard is wired into the live route.
-#[sqlx::test]
+#[mokosh_test]
 async fn website_probe_blocks_non_public_hosts(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2006,7 +2019,7 @@ async fn website_probe_blocks_non_public_hosts(pool: PgPool) {
 /// Input that cannot be a website at all is a 400, never a silently
 /// "unreachable" 200: a form has to tell "that is not a URL" apart from "your
 /// site is down".
-#[sqlx::test]
+#[mokosh_test]
 async fn website_probe_rejects_impossible_input(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2060,8 +2073,11 @@ async fn website_probe_rejects_impossible_input(pool: PgPool) {
 async fn create_contact(
     app: &common::TestApp,
     token: &str,
-    body: serde_json::Value,
+    mut body: serde_json::Value,
 ) -> serde_json::Value {
+    if body.get("email").is_none() {
+        body["email"] = serde_json::json!(format!("{}@example.com", uuid::Uuid::new_v4()));
+    }
     let resp = app
         .client
         .post(app.url("/api/v1/contacts/contacts"))
@@ -2215,7 +2231,7 @@ async fn company_contact_count(app: &common::TestApp, token: &str, company_id: &
 
 /// AC: with `phones` / `companies` absent, an existing-shaped request creates
 /// exactly the same contact AND materializes the matching child rows.
-#[sqlx::test]
+#[mokosh_test]
 async fn legacy_shaped_request_still_creates_the_same_contact_and_materializes_children(
     pool: PgPool,
 ) {
@@ -2283,7 +2299,7 @@ async fn legacy_shaped_request_still_creates_the_same_contact_and_materializes_c
 
 /// AC: explicit lists are authoritative and the mirrors are recomputed from
 /// them, in the same transaction as the write.
-#[sqlx::test]
+#[mokosh_test]
 async fn explicit_child_lists_drive_the_mirrors(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2348,7 +2364,7 @@ async fn explicit_child_lists_drive_the_mirrors(pool: PgPool) {
 
 /// AC: filtering by company matches ANY link, and each company counts the
 /// contact exactly once.
-#[sqlx::test]
+#[mokosh_test]
 async fn filtering_by_company_matches_any_link(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2394,7 +2410,7 @@ async fn filtering_by_company_matches_any_link(pool: PgPool) {
 
 /// AC: removing the primary link promotes the oldest remaining link and
 /// recomputes the mirrors; removing the last link nulls `contacts.company_id`.
-#[sqlx::test]
+#[mokosh_test]
 async fn removing_links_repromotes_and_recomputes(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2493,7 +2509,7 @@ async fn removing_links_repromotes_and_recomputes(pool: PgPool) {
 /// primaries in either list is a 422; a `companies` list plus a freeform
 /// `company_name` is a 422; a foreign `company_id` in the list is rejected
 /// before any row is written.
-#[sqlx::test]
+#[mokosh_test]
 async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2508,6 +2524,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
         serde_json::json!({
             "first_name": "Bad",
             "last_name": "Phone",
+            "email": format!("bad-phone-{}@example.com", uuid::Uuid::new_v4()),
             "phones": [
                 { "phone_type": "work", "number": "+14155551234" },
                 { "phone_type": "home", "number": "not-a-phone" },
@@ -2536,6 +2553,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
             serde_json::json!({
                 "first_name": "Two",
                 "last_name": "Primaries",
+                "email": format!("two-primaries-phones-{}@example.com", uuid::Uuid::new_v4()),
                 "phones": [
                     { "phone_type": "work", "number": "+14155551234", "is_primary": true },
                     { "phone_type": "home", "number": "+14155555678", "is_primary": true },
@@ -2555,6 +2573,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
             serde_json::json!({
                 "first_name": "Two",
                 "last_name": "Companies",
+                "email": format!("two-primaries-companies-{}@example.com", uuid::Uuid::new_v4()),
                 "companies": [
                     { "company_id": a, "is_primary": true },
                     { "company_id": b, "is_primary": true },
@@ -2574,6 +2593,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
             serde_json::json!({
                 "first_name": "Both",
                 "last_name": "Ways",
+                "email": format!("both-ways-{}@example.com", uuid::Uuid::new_v4()),
                 "company_name": "Acme Plumbing",
                 "companies": [{ "company_id": a }],
             }),
@@ -2592,6 +2612,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
         serde_json::json!({
             "first_name": "Foreign",
             "last_name": "Link",
+            "email": format!("foreign-link-{}@example.com", uuid::Uuid::new_v4()),
             "companies": [{ "company_id": a }, { "company_id": foreign }],
         }),
     )
@@ -2612,7 +2633,7 @@ async fn child_list_validation_is_enforced_end_to_end(pool: PgPool) {
 
 /// AC: a non-empty list with no `is_primary` promotes the first entry rather
 /// than erroring, on both the create and the update path.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_list_with_no_primary_promotes_the_first_entry(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2658,7 +2679,7 @@ async fn a_list_with_no_primary_promotes_the_first_entry(pool: PgPool) {
 
 /// AC: an update that touches only the scalar phone fields still rebuilds the
 /// child rows, so the two representations never diverge.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_scalar_only_update_keeps_the_child_rows_in_step(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2705,7 +2726,7 @@ async fn a_scalar_only_update_keeps_the_child_rows_in_step(pool: PgPool) {
 ///
 /// `company_type` is the exact key from that finding, which is why it is the
 /// one used here.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unknown_sort_field_is_rejected_with_what_is_accepted(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2807,7 +2828,7 @@ async fn set_billing_contact(
 /// company record reads it back (so a missing one is visible), and assigning a
 /// second contact replaces the first - the role is single-valued per company by
 /// construction, so there is nothing to demote separately.
-#[sqlx::test]
+#[mokosh_test]
 async fn company_billing_contact_is_assigned_and_readable(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2877,7 +2898,7 @@ async fn company_billing_contact_is_assigned_and_readable(pool: PgPool) {
 /// AC1 negative: the role can only be given to a contact OF the company. The
 /// pointer drives the invoice recipient and the portal invoice grant, so a
 /// stranger in it would address the bill outside the account.
-#[sqlx::test]
+#[mokosh_test]
 async fn company_billing_contact_must_belong_to_the_company(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2905,7 +2926,7 @@ async fn company_billing_contact_must_belong_to_the_company(pool: PgPool) {
 /// The failure branch: unlinking the contact takes the role with it. A plain
 /// `PUT /contacts/{id}` with a `company_id` rewrites the whole link set, so
 /// without this the pointer would keep naming somebody who left.
-#[sqlx::test]
+#[mokosh_test]
 async fn unlinking_the_billing_contact_clears_the_role(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2954,7 +2975,7 @@ async fn unlinking_the_billing_contact_clears_the_role(pool: PgPool) {
 /// PMS-1261: `is_portal_user` and `tags` filter the list and its total. Both
 /// were deserialized and never applied, so "Portal users only" returned every
 /// contact and the count agreed.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_list_filters_by_portal_access_and_tags(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -3020,4 +3041,95 @@ async fn the_list_filters_by_portal_access_and_tags(pool: PgPool) {
     assert_eq!(both, vec!["Billing"], "filters combine");
     let (blank, _) = listed("tags=%20,").await;
     assert_eq!(blank.len(), 3, "a filter of blanks filters nothing");
+}
+
+/// A contact created with no address cannot be invited, cannot be sent an
+/// invoice, and silently produces a dead entry the moment a mail is queued.
+/// The API rejects the create with a field-level 422 on `email`; the shape
+/// covers a missing key, an explicit null, and a whitespace-only value, so a
+/// client that trims to `""` on submit still gets an honest error.
+#[mokosh_test]
+async fn contact_create_requires_an_email_address(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let company_id = create_company(&app, &token, "Acme").await;
+
+    for (label, body) in [
+        (
+            "no email key",
+            serde_json::json!({
+                "company_id": company_id,
+                "first_name": "No",
+                "last_name": "Email",
+            }),
+        ),
+        (
+            "email = null",
+            serde_json::json!({
+                "company_id": company_id,
+                "first_name": "Null",
+                "last_name": "Email",
+                "email": serde_json::Value::Null,
+            }),
+        ),
+        (
+            "email = whitespace",
+            serde_json::json!({
+                "company_id": company_id,
+                "first_name": "Blank",
+                "last_name": "Email",
+                "email": "   ",
+            }),
+        ),
+    ] {
+        let resp = app
+            .client
+            .post(app.url("/api/v1/contacts/contacts"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .expect("send create contact");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "{label}: got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("json");
+        let names_email = body["errors"]
+            .as_array()
+            .map(|errs| {
+                errs.iter().any(|e| {
+                    e["field"] == "email" || e.get("field") == Some(&serde_json::json!("email"))
+                })
+            })
+            .unwrap_or(false)
+            || body.to_string().contains("\"email\"");
+        assert!(
+            names_email,
+            "{label}: rejection must name the email field, got {body}"
+        );
+    }
+
+    // Sanity: the happy path with a real address still creates.
+    let ok = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Real",
+            "last_name": "Address",
+            "email": "real@acme.example",
+        }))
+        .send()
+        .await
+        .expect("send happy path");
+    assert!(
+        ok.status().is_success(),
+        "a real address still creates, got {}",
+        ok.status()
+    );
 }

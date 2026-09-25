@@ -12,6 +12,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -31,7 +32,7 @@ async fn lookup_two(pool: &PgPool, table: &str) -> (Uuid, Uuid) {
     (rows[0].0, rows[1].0)
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn transition_triggers_fire_and_filter(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

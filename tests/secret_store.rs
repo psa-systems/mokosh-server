@@ -11,6 +11,7 @@ mod common;
 
 use mokosh_server::db::Database;
 use mokosh_server::secrets::{DatabaseSecretProvider, SecretKey, SecretProvider};
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -29,7 +30,7 @@ async fn rls_store(pool: &PgPool) -> DatabaseSecretProvider {
     DatabaseSecretProvider::new(Database::from_pools(app_pool, pool.clone()), TEST_KEY)
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_secret_round_trips(pool: PgPool) {
     let store = store(&pool);
     let key = SecretKey::payment_gateway(common::DEFAULT_TENANT_ID, "stripe");
@@ -41,7 +42,7 @@ async fn a_secret_round_trips(pool: PgPool) {
 
 /// The value is not sitting in the table in the clear. The column is what an
 /// operator with a database dump sees.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_stored_column_is_not_the_plaintext(pool: PgPool) {
     let store = store(&pool);
     let key = SecretKey::payment_gateway(common::DEFAULT_TENANT_ID, "stripe");
@@ -60,7 +61,7 @@ async fn the_stored_column_is_not_the_plaintext(pool: PgPool) {
 
 /// Writing twice replaces rather than accumulating: a reconnected integration
 /// has one current credential, and two rows would make "which one" a question.
-#[sqlx::test]
+#[mokosh_test]
 async fn writing_twice_replaces_the_value(pool: PgPool) {
     let store = store(&pool);
     let key = SecretKey::payment_gateway(common::DEFAULT_TENANT_ID, "stripe");
@@ -83,7 +84,7 @@ async fn writing_twice_replaces_the_value(pool: PgPool) {
 /// An unconfigured integration is `None`, not an error. Every caller has to
 /// handle it, and making it an error would push that handling into each of
 /// them differently.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_absent_secret_is_none(pool: PgPool) {
     let store = store(&pool);
     let key = SecretKey::payment_gateway(common::DEFAULT_TENANT_ID, "stripe");
@@ -93,7 +94,7 @@ async fn an_absent_secret_is_none(pool: PgPool) {
 /// Deleting something that is not there is success, matching `ObjectProvider` and
 /// for the same reason: the caller has already removed the row that pointed at
 /// it, so a missing secret says the same thing as a deleted one.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_is_idempotent(pool: PgPool) {
     let store = store(&pool);
     let key = SecretKey::payment_gateway(common::DEFAULT_TENANT_ID, "stripe");
@@ -112,7 +113,7 @@ async fn deleting_is_idempotent(pool: PgPool) {
 /// every read here sets the GUC from its own key, so it would pass with the
 /// policy dropped. `rls_confines_the_table_to_the_tenant_in_the_guc` below is
 /// the one that exercises the policy.
-#[sqlx::test]
+#[mokosh_test]
 async fn each_tenants_key_resolves_to_its_own_value(pool: PgPool) {
     let (other_tenant, _u, _e, _p) = common::seed_tenant_with_admin(&pool, "othertenant").await;
     let store = rls_store(&pool).await;
@@ -151,7 +152,7 @@ async fn each_tenants_key_resolves_to_its_own_value(pool: PgPool) {
 /// unprivileged NOBYPASSRLS role production serves with, because a superuser
 /// bypasses RLS unconditionally and the assertion would hold with the policy
 /// removed.
-#[sqlx::test]
+#[mokosh_test]
 async fn rls_confines_the_table_to_the_tenant_in_the_guc(pool: PgPool) {
     let (other_tenant, _u, _e, _p) = common::seed_tenant_with_admin(&pool, "othertenant").await;
     let store = rls_store(&pool).await;
@@ -212,7 +213,7 @@ async fn rls_confines_the_table_to_the_tenant_in_the_guc(pool: PgPool) {
 
 /// A key whose discriminator would not survive being a name is refused before
 /// anything touches the database, so a bad key can never write a row.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_malformed_key_never_reaches_the_table(pool: PgPool) {
     let store = store(&pool);
     let key = SecretKey::payment_gateway(Uuid::new_v4(), "../escape");

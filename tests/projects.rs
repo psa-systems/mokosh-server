@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -78,7 +79,7 @@ async fn first_task_status(app: &common::TestApp, token: &str) -> String {
 
 // AC1-4 + AC6: project -> phase -> task -> subtask -> dependency, end to
 // end, with budget-vs-actual on a fresh project and dependency guards.
-#[sqlx::test]
+#[mokosh_test]
 async fn project_phase_task_dependency_flow(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
@@ -296,7 +297,7 @@ async fn project_phase_task_dependency_flow(pool: PgPool) {
 // edit form does, so a project can be born "active" (and with a manager and
 // dates) in one submission instead of create-then-edit. Prove every such
 // field set on POST /projects round-trips into the row and back out on read.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_accepts_status_dates_and_manager(pool: PgPool) {
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
@@ -368,7 +369,7 @@ async fn create_accepts_status_dates_and_manager(pool: PgPool) {
 // everything. With approval confined to timesheets, a tenant with the flag off
 // never reaches 'approved', so the old rule would have shown every project on
 // such a tenant running at zero actuals for ever.
-#[sqlx::test]
+#[mokosh_test]
 async fn logged_time_rolls_into_actuals(pool: PgPool) {
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
@@ -496,7 +497,7 @@ async fn logged_time_rolls_into_actuals(pool: PgPool) {
 /// what is left of the distinction is that rejecting still drops an entry from
 /// both. The approval transitions are driven directly in SQL so the test pins
 /// the rollup SELECT, not the timesheet state machine.
-#[sqlx::test]
+#[mokosh_test]
 async fn task_logged_hours_counts_non_rejected(pool: PgPool) {
     let probe = pool.clone();
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
@@ -624,7 +625,7 @@ async fn set_entry_approval(pool: &PgPool, entry_id: &str, status: &str) {
 }
 
 // AC6 / AC5: projects + tasks routes are wired (never 501) and require auth.
-#[sqlx::test]
+#[mokosh_test]
 async fn projects_routes_require_auth_and_never_501(pool: PgPool) {
     let app = common::boot(pool).await;
     let some = Uuid::new_v4();
@@ -660,7 +661,7 @@ async fn projects_routes_require_auth_and_never_501(pool: PgPool) {
 /// row (entity_type + entity_id + the changed columns), which the per-record
 /// history endpoint then surfaces. Asserted directly against `audit_log` so
 /// this stays independent of the history-read endpoint (delivered separately).
-#[sqlx::test]
+#[mokosh_test]
 async fn task_and_project_edits_write_audit_rows(pool: PgPool) {
     let probe = pool.clone();
     let (_aid, email, pw) = common::seed_admin(&pool).await;
@@ -755,7 +756,7 @@ async fn task_and_project_edits_write_audit_rows(pool: PgPool) {
 /// INSERT, so the task's change-history pane surfaces the create event. The
 /// row is entity-scoped, has no `before` snapshot, captures the inserted row
 /// in `after`, and records the creating user as actor.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_task_writes_create_audit_row(pool: PgPool) {
     let probe = pool.clone();
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
@@ -816,7 +817,7 @@ async fn create_task_writes_create_audit_row(pool: PgPool) {
 /// Forcing the audit write to fail strictly after the INSERT (here a ctx whose
 /// `user_id` violates the `audit_log -> users` FK) rolls the whole transaction
 /// back, so neither the task nor an audit row survives.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_task_audit_failure_rolls_back_the_task(pool: PgPool) {
     use mokosh_server::modules::audit::AuditCtx;
     use mokosh_server::modules::auth::TenantId;
@@ -903,7 +904,7 @@ async fn create_task_audit_failure_rolls_back_the_task(pool: PgPool) {
 /// status check runs before any insert, and a missing project is 404. An active
 /// project still accepts both children (the guard scopes strictly to the
 /// create/attach paths and never blocks an open project).
-#[sqlx::test]
+#[mokosh_test]
 async fn cancelled_project_rejects_task_and_phase_creation(pool: PgPool) {
     let probe = pool.clone();
     let (_aid, email, pw) = common::seed_admin(&pool).await;
@@ -1032,7 +1033,7 @@ async fn cancelled_project_rejects_task_and_phase_creation(pool: PgPool) {
 /// The migration seeds client/internal as system defaults; the lookup has full
 /// CRUD; and a newly created project resolves its project_type_id from the
 /// legacy string.
-#[sqlx::test]
+#[mokosh_test]
 async fn project_types_seeded_crud_and_backfill(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company_id = seed_company(&pool, "Acme").await;
@@ -1129,7 +1130,7 @@ async fn project_types_seeded_crud_and_backfill(pool: PgPool) {
 
 /// A system project type cannot be deleted via the API (409). A custom type
 /// still referenced by a project is also 409, not 500.
-#[sqlx::test]
+#[mokosh_test]
 async fn project_type_delete_protections(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company_id = seed_company(&pool, "Acme").await;
@@ -1197,7 +1198,7 @@ async fn project_type_delete_protections(pool: PgPool) {
 }
 
 /// Setting a new default clears the prior default (seeded `client`).
-#[sqlx::test]
+#[mokosh_test]
 async fn project_type_new_default_clears_prior(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1226,7 +1227,7 @@ async fn project_type_new_default_clears_prior(pool: PgPool) {
 /// layer, independent of the service guard. The default tenant already has the
 /// seeded `client` row as default, so a direct insert of a second default
 /// row for that tenant must raise a unique_violation (23505).
-#[sqlx::test]
+#[mokosh_test]
 async fn project_type_second_default_violates_db_index(pool: PgPool) {
     let err = sqlx::query(
         "INSERT INTO project_types (tenant_id, name, is_default) VALUES ($1, $2, TRUE)",
@@ -1244,7 +1245,7 @@ async fn project_type_second_default_violates_db_index(pool: PgPool) {
 }
 
 /// A non-admin (technician) is refused on the mutation routes.
-#[sqlx::test]
+#[mokosh_test]
 async fn project_type_mutation_requires_admin(pool: PgPool) {
     let (_id, email, pw) = common::seed_user(
         &pool,
@@ -1273,7 +1274,7 @@ async fn project_type_mutation_requires_admin(pool: PgPool) {
 /// A duplicate name in the same tenant violates the UNIQUE (tenant_id, name)
 /// index and surfaces as a 409, not a 500. Covers both colliding with a seeded
 /// system row and with a custom row.
-#[sqlx::test]
+#[mokosh_test]
 async fn project_type_duplicate_name_conflicts(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1341,7 +1342,7 @@ async fn put_project(
         .expect("send PUT project")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn project_input_validation(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Budget Co").await;
@@ -1487,7 +1488,7 @@ async fn project_input_validation(pool: PgPool) {
 // is left intact.
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn project_oversized_budget_and_safe_company_id(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Oversize Co").await;
@@ -1598,7 +1599,7 @@ async fn project_oversized_budget_and_safe_company_id(pool: PgPool) {
 /// were already answerable with `?status=X&per_page=1` and `meta.total`; a sum
 /// is the one a page cannot approximate from a page, which is why this endpoint
 /// exists.
-#[sqlx::test]
+#[mokosh_test]
 async fn project_summary_totals_the_tenant_not_a_page(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
@@ -1693,7 +1694,7 @@ async fn project_summary_totals_the_tenant_not_a_page(pool: PgPool) {
 /// count WHERE clauses separately with their own placeholder numbering, and a
 /// filter added to one but not the other is a 500 or a lie, which is the bug
 /// class the comment above that code names.
-#[sqlx::test]
+#[mokosh_test]
 async fn project_search_matches_names_and_counts(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;

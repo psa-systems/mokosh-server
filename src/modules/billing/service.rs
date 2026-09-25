@@ -288,9 +288,13 @@ impl BillingService {
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         invoice_id: Uuid,
-    ) -> AppResult<Option<(Decimal, Decimal, Decimal)>> {
+    ) -> AppResult<Option<(Decimal, Decimal, Decimal, String)>> {
         Ok(sqlx::query_as(
-            "SELECT total, amount_paid, amount_credited FROM invoices \
+            // PMS-999: the status comes back under the same lock as the
+            // totals, so a caller that has to refuse an unissued invoice
+            // reads it from the row it has already locked rather than in a
+            // second query that could see a different state.
+            "SELECT total, amount_paid, amount_credited, status FROM invoices \
              WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
         )
         .bind(invoice_id)
@@ -338,6 +342,19 @@ impl BillingService {
     /// event runs this statement, so without the arm the next event on such an
     /// invoice would derive a status over the top of one somebody chose.
     ///
+    /// An unissued invoice leads all of them (PMS-999). This statement used to
+    /// fall through to a literal `'sent'` whenever nothing was paid or
+    /// credited, so recording a payment against a `draft` rewrote it to `sent`
+    /// in raw SQL: the only path to that status that did not go through
+    /// `update_invoice`, and so the only one that skipped everything being
+    /// sent means. Such an invoice had no `sent_at`, no frozen issuer snapshot
+    /// (PMS-911), no stored document (PMS-959) and, after PMS-993, no billing
+    /// contact to address the pay-now mail to. `create_payment` and
+    /// `record_gateway_payment` now refuse an unissued invoice outright, and
+    /// this arm is the statement's own invariant rather than an assumption
+    /// about its callers: a recompute derives the consequences of money
+    /// moving, and issuing a document is not one of them.
+    ///
     /// `paid_at` stays keyed on payments alone. A credited invoice was not
     /// paid, and stamping it would put a payment date on money nobody sent, so
     /// a fully credited invoice reads `paid` with no payment date - which is
@@ -361,7 +378,8 @@ impl BillingService {
                 -- partial payment on a written-off invoice would flip it back
                 -- to partially_paid; a late payment is a recovery, recorded
                 -- and kept, with the status standing.
-                status      = CASE WHEN i.written_off_at IS NOT NULL THEN 'written_off'
+                status      = CASE WHEN i.status IN ('draft', 'pending') THEN i.status
+                                   WHEN i.written_off_at IS NOT NULL THEN 'written_off'
                                    WHEN i.voided_at IS NOT NULL THEN 'void'
                                    WHEN i.total - p.paid - p.credited <= 0 THEN 'paid'
                                    WHEN p.paid > 0 THEN 'partially_paid'
@@ -535,31 +553,21 @@ impl BillingService {
     /// `contacts.company_id` scalar (which PMS-806 keeps as the mirror of the
     /// primary link) and a `contact_companies` row for a contact who works at
     /// several companies.
+    ///
+    /// PMS-1000: the rule itself moved to `contacts::billing_contact`, because
+    /// the quote flow asks the same question and two copies would drift on
+    /// what "a contact of this company" means. This stays as the name the
+    /// invoice paths already call.
     async fn assert_billing_contact_for_company(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         company_id: Uuid,
         contact_id: Uuid,
     ) -> AppResult<()> {
-        let found: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM contacts c \
-             WHERE c.tenant_id = $1 AND c.id = $3 \
-               AND (c.company_id = $2 \
-                    OR EXISTS(SELECT 1 FROM contact_companies l \
-                              WHERE l.tenant_id = $1 AND l.contact_id = c.id \
-                                AND l.company_id = $2)))",
+        crate::modules::contacts::billing_contact::assert_for_company(
+            tx, tenant_id, company_id, contact_id,
         )
-        .bind(tenant_id)
-        .bind(company_id)
-        .bind(contact_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !found {
-            return Err(AppError::BadRequest(
-                "billing_contact_id does not reference a contact of this company".to_string(),
-            ));
-        }
-        Ok(())
+        .await
     }
 
     /// PMS-990: the due date, and the term it came from.
@@ -650,27 +658,17 @@ impl BillingService {
     /// A company with no pointer still yields none, and the send-time guard is
     /// unchanged: `resolve_invoice_recipient` still runs and still refuses a
     /// send that resolves nobody.
+    ///
+    /// PMS-1000: shared with the quote flow, which needs the same answer at
+    /// create and at send.
     async fn resolve_billing_contact(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         company_id: Uuid,
         requested: Option<Uuid>,
     ) -> AppResult<Option<Uuid>> {
-        // PMS-993: an explicitly named contact is validated against this
-        // company and tenant first. FK checks bypass RLS, so an unchecked id
-        // could address the invoice to another tenant's contact.
-        if let Some(contact_id) = requested {
-            Self::assert_billing_contact_for_company(tx, tenant_id, company_id, contact_id).await?;
-            return Ok(requested);
-        }
-        let default_contact: Option<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT default_billing_contact_id FROM companies WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        Ok(default_contact.flatten())
+        crate::modules::contacts::billing_contact::resolve(tx, tenant_id, company_id, requested)
+            .await
     }
 
     /// Fill in `company_name` on a batch of invoice responses (PMS-186), and
@@ -3505,12 +3503,30 @@ impl BillingService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Lock the invoice so this read-modify-write serialises with manual
         // payments and concurrent webhook deliveries (PMS-695).
-        if Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id)
-            .await?
-            .is_none()
-        {
+        let Some((_, _, _, status)) =
+            Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?
+        else {
             // Invoice deleted between checkout and webhook. Nothing to
             // reconcile; report handled so the provider stops retrying.
+            return Ok(false);
+        };
+        // PMS-999: the webhook twin of the guard in `create_payment`. It
+        // should be unreachable, because `create_invoice_checkout_session`
+        // refuses a draft, so the customer cannot have been given a pay link
+        // for one. Reported as handled rather than as an error, for the same
+        // reason the deleted-invoice arm above is: the provider retrying
+        // would not change the answer, and this is a state a human has to
+        // look at rather than something the delivery can fix.
+        if matches!(
+            InvoiceStatus::from_str(&status),
+            Some(InvoiceStatus::Draft) | Some(InvoiceStatus::Pending)
+        ) {
+            tracing::error!(
+                %invoice_id,
+                %status,
+                provider_id,
+                "gateway payment for an invoice that was never sent; not recording it"
+            );
             return Ok(false);
         }
 
@@ -3750,11 +3766,29 @@ impl BillingService {
         // whole read-modify-write is serialised and an overpayment rejection
         // does not have to unwind an already-inserted payment row.
         if let Some(invoice_id) = request.invoice_id {
-            let Some((total, prior_paid, prior_credited)) =
+            let Some((total, prior_paid, prior_credited, status)) =
                 Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?
             else {
                 return Err(AppError::NotFound("Invoice".to_string()));
             };
+            // PMS-999: a payment against an invoice the customer has never
+            // been given is a data-entry error, not a state worth
+            // representing. Before this the recompute below laundered it into
+            // a send: the invoice came out `sent` with no `sent_at`, no frozen
+            // issuer and no stored document, which is the one way to reach
+            // that status without going through `update_invoice`. Refusing
+            // here rather than sending for them, because a send emails the
+            // customer and freezes a document, and neither belongs in
+            // recording a payment.
+            if matches!(
+                InvoiceStatus::from_str(&status),
+                Some(InvoiceStatus::Draft) | Some(InvoiceStatus::Pending)
+            ) {
+                return Err(AppError::Conflict(format!(
+                    "Invoice in status '{status}' has not been sent, so a payment cannot be \
+                     recorded against it. Send it first."
+                )));
+            }
             // Reject overpayment so `balance_due` never goes negative
             // (PMS-194, widened in PMS-1225 to account for credits). The
             // remaining balance is `total - prior_paid - prior_credited`,

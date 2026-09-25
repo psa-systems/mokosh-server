@@ -12,6 +12,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,7 +70,7 @@ fn install_test_attachment_env() -> PathBuf {
 /// PMS-783 F6: ten concurrent 25 MiB downloads used to mean 250 MiB of
 /// transient heap. Seeds the blob and the row directly rather than uploading,
 /// because the cap is 1 KiB and the upload path is not what is under test.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_large_download_never_allocates_the_whole_blob(pool: PgPool) {
     const BLOB_BYTES: usize = 25 * 1024 * 1024;
     /// Comfortably above any HTTP read buffer on either side of the socket and

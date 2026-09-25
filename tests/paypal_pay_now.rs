@@ -10,7 +10,7 @@
 //! case that proves the capture-completed event is what records the payment.
 //!
 //! One stub server per test binary, on its own thread with its own runtime.
-//! `PAYPAL_API_BASE` is process-global and `#[sqlx::test]` cases run
+//! `PAYPAL_API_BASE` is process-global and `#[mokosh_test]` cases run
 //! concurrently, so a stub per case would race on the variable; and a stub
 //! spawned on one case's tokio runtime dies when that case finishes, which is
 //! why it gets a thread instead. Every piece of recorded state is keyed by an id
@@ -18,6 +18,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -196,7 +197,7 @@ fn paypal_route() -> String {
     format!("/api/v1/paypal/webhooks/{DEFAULT_TENANT_ID}")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_completed_capture_marks_the_invoice_paid_and_is_idempotent(pool: sqlx::PgPool) {
     stub_base();
     seed_paypal_gateway(&pool).await;
@@ -227,7 +228,7 @@ async fn a_completed_capture_marks_the_invoice_paid_and_is_idempotent(pool: sqlx
     assert_eq!(invoice_state(&pool, invoice).await.1, dec("125.00"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_refund_walks_the_invoice_back_to_partially_paid(pool: sqlx::PgPool) {
     stub_base();
     seed_paypal_gateway(&pool).await;
@@ -263,7 +264,7 @@ async fn a_refund_walks_the_invoice_back_to_partially_paid(pool: sqlx::PgPool) {
     assert_eq!(due, dec("40.00"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unhandled_event_is_a_no_op(pool: sqlx::PgPool) {
     stub_base();
     seed_paypal_gateway(&pool).await;
@@ -283,7 +284,7 @@ async fn an_unhandled_event_is_a_no_op(pool: sqlx::PgPool) {
     assert_eq!(invoice_state(&pool, invoice).await.0, "sent");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_verification_failure_is_rejected_and_changes_nothing(pool: sqlx::PgPool) {
     stub_base();
     seed_paypal_gateway(&pool).await;
@@ -302,7 +303,7 @@ async fn a_verification_failure_is_rejected_and_changes_nothing(pool: sqlx::PgPo
 /// Approval does not move money. The receiver must call capture, and must
 /// write nothing itself: the capture-completed delivery is what records the
 /// payment, and that is covered above.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_approved_order_is_captured(pool: sqlx::PgPool) {
     stub_base();
     seed_paypal_gateway(&pool).await;
@@ -336,7 +337,7 @@ async fn an_approved_order_is_captured(pool: sqlx::PgPool) {
 /// The reason `/api/v1/paypal/` is in `RAW_BODY_PATHS`. A zero-width space
 /// inside a string is exactly what `sanitize_json_body` strips; if it did so
 /// here, the body PayPal is asked to verify would not be the body it sent.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_body_reaches_verification_byte_identical(pool: sqlx::PgPool) {
     stub_base();
     seed_paypal_gateway(&pool).await;
@@ -365,7 +366,7 @@ async fn the_body_reaches_verification_byte_identical(pool: sqlx::PgPool) {
 /// A tenant on PayPal receiving a delivery on the Stripe route. The receiver
 /// resolves the tenant's active provider, finds it is not the one this route
 /// is for, and refuses before any verification runs.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_delivery_on_the_wrong_providers_route_is_refused(pool: sqlx::PgPool) {
     stub_base();
     seed_paypal_gateway(&pool).await;
@@ -389,7 +390,7 @@ async fn a_delivery_on_the_wrong_providers_route_is_refused(pool: sqlx::PgPool) 
 /// tenant was the placeholder PMS-969 left while only one provider was
 /// serveable and nobody could name which one a payment should use; the pay
 /// request names it now, so two actives is a tenant offering a choice.
-#[sqlx::test]
+#[mokosh_test]
 async fn activating_paypal_leaves_stripe_active_and_both_are_offered(pool: sqlx::PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

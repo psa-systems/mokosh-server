@@ -11,7 +11,7 @@
 //! pulling `access_token` out of the login JSON response and attaching
 //! it via `.bearer_auth()` on subsequent requests.
 //!
-//! Each #[sqlx::test] gets a fresh database with the PSA migrations
+//! Each #[mokosh_test] gets a fresh database with the PSA migrations
 //! pre-applied. The `seed_admin` helper inserts a super_admin user under
 //! the default tenant (id 00000000-0000-0000-0000-000000000001) directly
 //! via SQL, mirroring `modules::auth::bootstrap::maybe_bootstrap_admin`
@@ -224,7 +224,7 @@ pub fn dec(s: &str) -> Decimal {
 /// was most expensive to diagnose.
 ///
 /// One root per binary rather than one per test case, because `ATTACHMENT_DIR`
-/// is process-global env and `#[sqlx::test]` cases within a binary run
+/// is process-global env and `#[mokosh_test]` cases within a binary run
 /// concurrently: a case that gave itself a private root would change the root
 /// under its neighbours mid-run. Every case in a binary therefore shares this
 /// one, which is safe for the same reason the old shared path was safe within a
@@ -265,7 +265,7 @@ pub fn storage_root() -> &'static std::path::Path {
 ///
 /// `Once` rather than relying solely on `try_init`'s own idempotency: this is
 /// called from many small helpers rather than one boot path, so it must be
-/// unconditionally cheap and safe under the concurrent `#[sqlx::test]` cases
+/// unconditionally cheap and safe under the concurrent `#[mokosh_test]` cases
 /// within a binary that share the global subscriber.
 #[allow(dead_code)]
 pub fn init_tracing() {
@@ -308,7 +308,7 @@ pub async fn boot_with_bunyip(
 /// unprivileged `NOBYPASSRLS` role, so the HTTP suite exercises Row Level
 /// Security rather than only the app-layer `WHERE tenant_id` filters.
 ///
-/// `#[sqlx::test]` provisions a single superuser pool; this builds a SECOND
+/// `#[mokosh_test]` provisions a single superuser pool; this builds a SECOND
 /// pool that connects as a freshly created `NOSUPERUSER NOBYPASSRLS` role
 /// (the production `mokosh_app` posture) against the same per-test database,
 /// and wires it as the app pool while the superuser pool stays the migrator
@@ -325,7 +325,7 @@ pub async fn boot_rls(pool: PgPool) -> TestApp {
 /// privileges `mokosh_app` gets in production, and return a pool that connects
 /// as it against the same database as `superuser_pool`.
 ///
-/// Roles are cluster-global while each `#[sqlx::test]` gets its own database,
+/// Roles are cluster-global while each `#[mokosh_test]` gets its own database,
 /// so the role name is made unique to avoid cross-test clashes (mirroring
 /// `tests/rls_isolation.rs`). The role owns no objects, so it stays exempt from
 /// neither RLS nor the `tenants`-root carve-out: exactly the production posture.

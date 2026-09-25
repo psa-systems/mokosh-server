@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -171,7 +172,7 @@ fn assert_reconciles(s: &Value) {
 }
 
 /// One period, one of everything, and the arithmetic holds.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_statement_reconciles_across_charges_payments_and_credits(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -202,7 +203,7 @@ async fn a_statement_reconciles_across_charges_payments_and_credits(pool: PgPool
 /// The half that a running total would get wrong. Everything before the period
 /// is folded into the opening balance rather than dropped, so splitting one
 /// period into two cannot change where the account ends up.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_opening_balance_carries_everything_before_the_period(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -248,7 +249,7 @@ async fn the_opening_balance_carries_everything_before_the_period(pool: PgPool) 
 /// A draft invoice has not been issued, so the client does not owe it. It must
 /// not appear and must not reach the opening balance either, which is the part
 /// a period-start check alone would miss.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_invoice_is_on_no_statement(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -282,7 +283,7 @@ async fn a_draft_invoice_is_on_no_statement(pool: PgPool) {
 /// for its whole total was what wrote that status. It reads `paid` now, and
 /// nothing else about the statement moves: the charge and the credit are both
 /// still here, dated, and they still net to zero.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_fully_credited_invoice_and_its_credit_note_both_appear(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -317,7 +318,7 @@ async fn a_fully_credited_invoice_and_its_credit_note_both_appear(pool: PgPool) 
 /// The reason nothing reads `invoices.balance_due`. A statement for a closed
 /// period must show what was outstanding THEN; the invoice's own balance has
 /// moved since and would make last month's statement change under the client.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_closed_period_is_not_rewritten_by_later_activity(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -354,7 +355,7 @@ async fn a_closed_period_is_not_rewritten_by_later_activity(pool: PgPool) {
 /// PMS-1333: a voided invoice is not on the statement at all. It was never
 /// issued, so it was never owed, and there is no credit note beside it to
 /// balance a charge that never stood.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_voided_invoice_is_on_no_statement(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -390,7 +391,7 @@ async fn a_voided_invoice_is_on_no_statement(pool: PgPool) {
 }
 
 /// A voided credit note stops counting, on the statement as everywhere else.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_voided_credit_note_leaves_the_statement(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -432,7 +433,7 @@ async fn a_voided_credit_note_leaves_the_statement(pool: PgPool) {
 
 /// Two companies in one tenant do not see each other's account, and a period
 /// that runs backwards is a 400 rather than an empty document that looks fine.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_statement_is_scoped_and_its_period_is_checked(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -499,7 +500,7 @@ async fn write_off(app: &common::TestApp, token: &str, invoice_id: &str, reason:
 /// frozen bucket taken out of the balance once; the recovery payment lands in
 /// `payments` like any other and would be taken out a second time for the
 /// same debt without `total_recovered` cancelling it back in.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_recovered_write_off_is_deducted_from_the_balance_only_once(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

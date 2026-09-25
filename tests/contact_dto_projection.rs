@@ -14,6 +14,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -85,7 +86,7 @@ async fn seed_row(pool: &PgPool, sql: &str, id: Uuid, company_id: Uuid) {
         .expect("seed row");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contract_reaches_a_contact_without_the_msps_notes(pool: PgPool) {
     let (_admin, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -141,7 +142,7 @@ async fn a_contract_reaches_a_contact_without_the_msps_notes(pool: PgPool) {
     assert_eq!(staff_one["notes"], "margin is thin, do not discount");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_asset_reaches_a_contact_without_its_price_network_or_assignee(pool: PgPool) {
     let (_admin, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -220,7 +221,7 @@ async fn an_asset_reaches_a_contact_without_its_price_network_or_assignee(pool: 
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_project_reaches_a_contact_without_the_msps_rate_or_money(pool: PgPool) {
     let (_admin, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;

@@ -12,6 +12,7 @@
 mod common;
 
 use hmac::{Hmac, Mac};
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sha2::Sha256;
 use sqlx::PgPool;
@@ -89,7 +90,7 @@ async fn put_gateway(
 
 /// The silence this issue removes. Before PMS-966 this stored an active row
 /// that no resolution path would ever read, and answered 200.
-#[sqlx::test]
+#[mokosh_test]
 async fn activating_a_provider_nothing_can_serve_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -120,7 +121,7 @@ async fn activating_a_provider_nothing_can_serve_is_refused(pool: PgPool) {
 
 /// Storing credentials ahead of support is not the thing that lies, so it stays
 /// allowed. Only switching the gateway on is refused.
-#[sqlx::test]
+#[mokosh_test]
 async fn storing_an_inactive_config_for_an_unserveable_provider_is_allowed(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -135,7 +136,7 @@ async fn storing_an_inactive_config_for_an_unserveable_provider_is_allowed(pool:
 }
 
 /// Stripe is unaffected by the guard.
-#[sqlx::test]
+#[mokosh_test]
 async fn activating_stripe_still_works(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -156,7 +157,7 @@ async fn activating_stripe_still_works(pool: PgPool) {
 /// it did when the SQL literal picked the row. If resolution returned the
 /// authorize_net row instead, the signature would fail against the wrong secret and
 /// the payment would never reconcile.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_legacy_unserveable_row_does_not_shadow_the_stripe_one(pool: PgPool) {
     seed_gateway(&pool, "authorize_net", true).await;
     seed_gateway(&pool, "stripe", true).await;
@@ -197,7 +198,7 @@ async fn a_legacy_unserveable_row_does_not_shadow_the_stripe_one(pool: PgPool) {
 /// one with no gateway at all, which is what the literal did and what the
 /// receiver's 401 already means. It must not become a 500 that tells an
 /// unauthenticated caller the tenant exists and is misconfigured.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_with_only_an_unserveable_gateway_answers_like_an_unconfigured_one(pool: PgPool) {
     seed_gateway(&pool, "authorize_net", true).await;
     let app = common::boot_rls(pool.clone()).await;
@@ -238,7 +239,7 @@ async fn a_tenant_with_only_an_unserveable_gateway_answers_like_an_unconfigured_
 /// produces the signing secret the form then demands. A value that only
 /// appeared once a gateway was saved would arrive after the save it is needed
 /// for.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_webhook_endpoints_are_known_before_any_gateway_exists(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -284,7 +285,7 @@ async fn the_webhook_endpoints_are_known_before_any_gateway_exists(pool: PgPool)
 /// The static segment must not be read as a provider id. `{provider}` sits on
 /// the same prefix for the DELETE, so a router that ordered these the other
 /// way would answer this path by trying to delete a gateway.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_endpoints_path_is_not_read_as_a_provider(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

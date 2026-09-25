@@ -29,6 +29,7 @@ use mokosh_server::modules::contracts::ContractsService;
 use mokosh_server::modules::time_tracking::TimeTrackingService;
 use mokosh_server::utils::error::AppError;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -110,7 +111,7 @@ async fn seed_block_item(
     id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn consume_within_allotment_debits_balance(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -158,7 +159,7 @@ async fn consume_within_allotment_debits_balance(pool: PgPool) {
 /// `consume_hours` buckets into a contiguous 7-day window anchored on
 /// `start_date`. Two consumes 9 days apart land in different weekly
 /// balance rows: [Jan 1, Jan 7] and [Jan 8, Jan 14].
-#[sqlx::test]
+#[mokosh_test]
 async fn consume_weekly_buckets_into_seven_day_windows(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -221,7 +222,7 @@ async fn consume_weekly_buckets_into_seven_day_windows(pool: PgPool) {
 /// PMS-404: a `bi_weekly` contract is accepted by the DB CHECK constraint
 /// and `consume_hours` buckets into a 14-day window anchored on
 /// `start_date`: Jan 10 falls in the first window [Jan 1, Jan 14].
-#[sqlx::test]
+#[mokosh_test]
 async fn consume_bi_weekly_buckets_into_fourteen_day_windows(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -258,7 +259,7 @@ async fn consume_bi_weekly_buckets_into_fourteen_day_windows(pool: PgPool) {
     assert_eq!(p_end, NaiveDate::from_ymd_opt(2026, 1, 14).unwrap());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn consume_past_allotment_computes_overage(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -300,7 +301,7 @@ async fn consume_past_allotment_computes_overage(pool: PgPool) {
     assert_eq!(remaining, common::dec("0"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn rollover_carries_capped_unused_hours(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -435,7 +436,7 @@ async fn seed_time_entry(
 /// edit, a delete - live in `tests/block_hours_consumption.rs`, driven through
 /// the real write paths rather than through direct SQL, which is what let the
 /// original pair pass while the write path could not reach `contract_id` at all.
-#[sqlx::test]
+#[mokosh_test]
 async fn approving_a_timesheet_does_not_consume_contract_hours(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -486,7 +487,7 @@ async fn approving_a_timesheet_does_not_consume_contract_hours(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn resolve_rate_honours_tier_precedence(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
@@ -547,7 +548,7 @@ async fn resolve_rate_honours_tier_precedence(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn expire_due_renews_auto_renew_and_expires_others(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -649,7 +650,7 @@ async fn expire_due_renews_auto_renew_and_expires_others(pool: PgPool) {
     assert_eq!(old_values["end_date"].as_str(), Some("2025-12-31"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn list_recurring_items_returns_recurring_and_retainer(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -686,7 +687,7 @@ async fn list_recurring_items_returns_recurring_and_retainer(pool: PgPool) {
     assert!(items.iter().all(|i| i.item_type != "block_hours"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn get_rate_card_returns_card_in_tenant(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
@@ -706,7 +707,7 @@ async fn get_rate_card_returns_card_in_tenant(pool: PgPool) {
     assert!(card.is_default);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn get_rate_card_missing_id_is_not_found(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
@@ -718,7 +719,7 @@ async fn get_rate_card_missing_id_is_not_found(pool: PgPool) {
     assert!(matches!(err, AppError::NotFound(_)));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn get_rate_card_other_tenant_is_not_found(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
@@ -748,7 +749,7 @@ async fn get_rate_card_other_tenant_is_not_found(pool: PgPool) {
 /// Omitting `billing_rule` must reproduce exactly what each type does today,
 /// because every existing API client omits it. Stating it is how a product on a
 /// contract becomes a licence that bills every period.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_items_billing_rule_is_derived_when_the_caller_omits_it(pool: PgPool) {
     use mokosh_server::modules::audit::AuditCtx;
     use mokosh_server::modules::contracts::{BillingRule, UpsertContractItemRequest};
@@ -815,7 +816,7 @@ async fn an_items_billing_rule_is_derived_when_the_caller_omits_it(pool: PgPool)
 /// Editing a `once` item that has already billed must not report it as
 /// unbilled: the response reads `billed_at` back from the write rather than
 /// assuming it, or the record would say the client still owes the charge.
-#[sqlx::test]
+#[mokosh_test]
 async fn editing_a_spent_one_time_item_keeps_it_spent(pool: PgPool) {
     use mokosh_server::modules::audit::AuditCtx;
     use mokosh_server::modules::contracts::{BillingRule, UpsertContractItemRequest};

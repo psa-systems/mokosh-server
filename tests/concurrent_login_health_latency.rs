@@ -26,6 +26,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -33,7 +34,7 @@ use std::time::{Duration, Instant};
 
 const CONCURRENT_LOGINS: usize = 15;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn health_p99_does_not_regress_under_concurrent_argon2_burst(pool: PgPool) {
     let app = Arc::new(common::boot(pool.clone()).await);
 

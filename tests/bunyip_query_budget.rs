@@ -31,6 +31,7 @@
 //! test on purpose: the subscriber is process-global, so a second test running
 //! concurrently would count its statements as well.
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -150,7 +151,7 @@ fn claims(sub: Uuid) -> AtClaims {
 /// paper over: see the module docs for what each statement is.
 const QUERY_BUDGET: usize = 3;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_authenticated_bunyip_request_costs_three_statements(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(

@@ -35,6 +35,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -170,7 +171,7 @@ impl Mailer for SlowProbingMailer {
 /// Rows delivered over SMTP in the measured tick.
 const EMAIL_ROWS: usize = 3;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tick_sends_with_no_transaction_open(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(

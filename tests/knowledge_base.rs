@@ -37,6 +37,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 /// Create a category through the API and return its id.
@@ -120,7 +121,7 @@ async fn seed_kb_article(
     .expect("seed kb article");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn category_and_article_crud_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -180,7 +181,7 @@ async fn category_and_article_crud_happy_path(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn publishing_stamps_published_at(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -239,7 +240,7 @@ async fn publishing_stamps_published_at(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_as_published_stamps_published_at(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -277,7 +278,7 @@ async fn versions(app: &common::TestApp, token: &str, article_id: &str) -> serde
     resp.json().await.expect("versions JSON")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn editing_content_appends_version(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -322,7 +323,7 @@ async fn editing_content_appends_version(pool: PgPool) {
     assert_eq!(newest["content"].as_str(), Some("v2 content"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn restore_brings_back_prior_version_as_new_version(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -397,7 +398,7 @@ async fn restore_brings_back_prior_version_as_new_version(pool: PgPool) {
     assert_eq!(got["content"].as_str(), Some("original content"));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn trigram_search_finds_article_by_fuzzy_term(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -437,7 +438,7 @@ async fn trigram_search_finds_article_by_fuzzy_term(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn duplicate_slug_is_rejected(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -519,7 +520,7 @@ async fn get_vote(app: &common::TestApp, token: &str, article_id: &str) -> serde
 /// helpful->not_helpful leaves helpful=0/not_helpful=1; a second user
 /// votes independently; counts never exceed distinct voters; and the GET
 /// vote endpoint reports each caller's current vote.
-#[sqlx::test]
+#[mokosh_test]
 async fn vote_is_per_user_exclusive_and_toggleable(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     // A second user in the same tenant to prove votes are per-account.
@@ -625,7 +626,7 @@ async fn vote_is_per_user_exclusive_and_toggleable(pool: PgPool) {
 /// round-trips them; omitting `company_ids` is a 422; a foreign company id
 /// is a 400; and switching an article away from `client_specific` clears
 /// the scope.
-#[sqlx::test]
+#[mokosh_test]
 async fn client_specific_company_ids_write_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let tenant_id = common::DEFAULT_TENANT_ID;
@@ -771,7 +772,7 @@ async fn client_specific_company_ids_write_path(pool: PgPool) {
 /// and the draft. This exercises the exact query the portal `/kb` route
 /// delegates to; the route itself just threads the contact's company_id
 /// from the JWT claim.
-#[sqlx::test]
+#[mokosh_test]
 async fn portal_feed_company_scoping(pool: PgPool) {
     use mokosh_server::utils::pagination::PaginationParams;
 
@@ -944,7 +945,7 @@ async fn seed_ticket_for_article(
 /// article, `{ id, title, ticket_count }`, ordered by descending count,
 /// scoped to the tenant and a recency window. Tickets with a NULL source
 /// and tickets older than the window are excluded.
-#[sqlx::test]
+#[mokosh_test]
 async fn top_ticket_driving_articles_orders_by_count_and_respects_window(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1134,7 +1135,7 @@ async fn top_ticket_driving_articles_orders_by_count_and_respects_window(pool: P
 ///    migration 099 adds a column instead of reusing 068's.
 /// 3. The FK is `ON DELETE SET NULL`, so retiring an article drops the
 ///    linkage and leaves the ticket intact.
-#[sqlx::test]
+#[mokosh_test]
 async fn procedure_kb_article_round_trips_and_stays_out_of_the_driving_widget(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1257,7 +1258,7 @@ async fn procedure_kb_article_round_trips_and_stays_out_of_the_driving_widget(po
 /// creates none; a restore names the version it brought back and answers
 /// that row; the article carries names, its last editor and its current
 /// version number.
-#[sqlx::test]
+#[mokosh_test]
 async fn versions_say_who_what_kind_and_why(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1408,7 +1409,7 @@ async fn versions_say_who_what_kind_and_why(pool: PgPool) {
 
 /// Restore is an edit in another shape, so it takes the role the edit
 /// takes. Before PMS-1126 the route carried only the module gate.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_technician_cannot_restore_a_version(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (_tech_id, tech_email, tech_password) = common::seed_user(
@@ -1458,7 +1459,7 @@ async fn a_technician_cannot_restore_a_version(pool: PgPool) {
 
 /// Create, edit, restore and delete each leave an audit row, and the
 /// per-record history route reads them for `kb_articles`.
-#[sqlx::test]
+#[mokosh_test]
 async fn article_writes_are_audited_and_readable_as_history(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1565,7 +1566,7 @@ async fn article_writes_are_audited_and_readable_as_history(pool: PgPool) {
 /// both), a fourth is unrelated; one of the pointing ones is closed. The
 /// route lists the three, open ones first, one row per ticket with the
 /// stronger relation, and a second tenant's admin gets 404 for it.
-#[sqlx::test]
+#[mokosh_test]
 async fn article_tickets_lists_referencing_tickets_open_first(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
