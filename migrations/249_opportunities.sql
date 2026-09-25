@@ -76,9 +76,14 @@ COMMENT ON COLUMN opportunities.stage IS
 COMMENT ON COLUMN opportunities.outcome IS
     'Filled in on close. NULL while the opportunity is open; won/lost once closed. The paired CHECK on stage+outcome keeps them in step.';
 
+-- RLS: enable AND force (the 038 fail-closed loop already ran, so a table
+-- created now does not inherit the policy) and cover both directions of
+-- the check with WITH CHECK. Same shape as migrations 090 / 091.
 ALTER TABLE opportunities ENABLE ROW LEVEL SECURITY;
+ALTER TABLE opportunities FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON opportunities
-    USING (tenant_id = current_setting('app.current_tenant', TRUE)::UUID);
+    USING       (tenant_id = NULLIF(current_setting('app.current_tenant', TRUE), '')::UUID)
+    WITH CHECK  (tenant_id = NULLIF(current_setting('app.current_tenant', TRUE), '')::UUID);
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON opportunities TO mokosh_app;
 

@@ -24,7 +24,7 @@ use super::{
     service::OpportunityFilter, CloseOpportunityRequest, CreateOpportunityRequest,
     OpportunitiesService, Opportunity, UpdateOpportunityRequest,
 };
-use crate::modules::auth::{RequireAuth, TenantScoped};
+use crate::modules::auth::{RequireAuth, RequireManager, TenantScoped};
 use crate::utils::error::AppResult;
 
 #[derive(Clone)]
@@ -123,6 +123,7 @@ async fn close_opportunity(
 
 async fn soft_delete_opportunity(
     State(state): State<OpportunitiesRouterState>,
+    _manager: RequireManager,
     RequireAuth(user): RequireAuth,
     Path(id): Path<Uuid>,
 ) -> AppResult<StatusCode> {

@@ -91,15 +91,22 @@ COMMENT ON COLUMN status_observations.outcome IS
 COMMENT ON COLUMN status_observations.observed_at IS
     'When the source observed the outcome, not when we received it. Also the third leg of the idempotency triple.';
 
--- RLS: both tables sit inside the standard tenant-scoped surface. The
--- policy shape matches every other tenant-scoped table.
+-- RLS: both tables sit inside the standard tenant-scoped surface. Enable
+-- AND FORCE (the 038 fail-closed loop already ran, so a table created now
+-- does not inherit the policy) and give the policy a WITH CHECK so an
+-- INSERT / UPDATE cannot land a row under another tenant either. The
+-- shape mirrors migrations 090 / 091.
 ALTER TABLE monitored_systems     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE monitored_systems     FORCE  ROW LEVEL SECURITY;
 ALTER TABLE status_observations   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE status_observations   FORCE  ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_isolation ON monitored_systems
-    USING (tenant_id = current_setting('app.current_tenant', TRUE)::UUID);
+    USING       (tenant_id = NULLIF(current_setting('app.current_tenant', TRUE), '')::UUID)
+    WITH CHECK  (tenant_id = NULLIF(current_setting('app.current_tenant', TRUE), '')::UUID);
 CREATE POLICY tenant_isolation ON status_observations
-    USING (tenant_id = current_setting('app.current_tenant', TRUE)::UUID);
+    USING       (tenant_id = NULLIF(current_setting('app.current_tenant', TRUE), '')::UUID)
+    WITH CHECK  (tenant_id = NULLIF(current_setting('app.current_tenant', TRUE), '')::UUID);
 
 -- Grants for the app pool. The provisioner reaches new tables only when
 -- the migrator owns them; naming them explicitly here keeps the app-pool
