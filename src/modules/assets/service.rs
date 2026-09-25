@@ -1,4 +1,17 @@
 //! Assets service.
+//!
+//! ## Credentials at rest
+//!
+//! `credential_vault` stores encrypted credential secrets locally. Every
+//! plaintext read runs through the audited reveal endpoint at
+//! `POST /assets/{asset_id}/credentials/{id}/reveal`, which writes an
+//! `asset_audit_log` row per read. This is deliberate: the per-client
+//! documentation surface is here so a technician working a ticket does
+//! not have to hop between systems, and referencing an external vault
+//! would put credentials in a system they do not already have open. The
+//! reveal audit trail is the control that made storing them acceptable.
+//! Migration 248's `COMMENT ON TABLE credential_vault` records the same
+//! stance on the table, and the reconciliation is written up on PSA-13.
 
 use rust_decimal::Decimal;
 use uuid::Uuid;
