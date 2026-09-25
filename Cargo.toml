@@ -78,6 +78,9 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+# PMS-1381: `try_join_all` runs a per-row set of gateway calls concurrently
+# instead of one row at a time, without spawning (the futures borrow `&self`).
+futures = "0.3"
 # PMS-783: `ReaderStream` turns an open file into a chunked response body so an
 # attachment download never buffers the whole blob. `tokio-stream` supplies the
 # `map` combinator that logs a mid-stream read failure instead of letting the
