@@ -27,6 +27,7 @@ use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::contact_sync::ContactSyncService;
 use mokosh_server::secrets::{DatabaseSecretProvider, SecretProvider};
+use mokosh_test::mokosh_test;
 
 /// Statements observed while [`Recorder::armed`] is set.
 #[derive(Default)]
@@ -94,7 +95,7 @@ fn card(body: &str) -> String {
 /// against the fixed per-page cost.
 const UPLOADS: usize = 5;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_vcard_upload_page_reads_files_and_runs_each_once(pool: PgPool) {
     // Installed before any `common::` call, because several of them
     // (`seed_admin`, `storage_root`) call `init_tracing`, which installs a
