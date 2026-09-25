@@ -4,12 +4,13 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 /// The happy path: create an opportunity against a real company, read
 /// it back, then read the list and see it there.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_get_list(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -64,7 +65,7 @@ async fn create_get_list(pool: PgPool) {
 /// refused: an open transition to `won` / `lost` has to go through the
 /// close endpoint, so the paired stage / outcome / closed_at write
 /// lives in one place.
-#[sqlx::test]
+#[mokosh_test]
 async fn stage_transitions_through_the_update_endpoint_except_the_close_ones(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -118,7 +119,7 @@ async fn stage_transitions_through_the_update_endpoint_except_the_close_ones(poo
 
 /// Closing sets stage, outcome and closed_at together, and (on won)
 /// accepts an optional link to the quote that closed the sale.
-#[sqlx::test]
+#[mokosh_test]
 async fn closing_is_a_single_write(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -171,7 +172,7 @@ async fn closing_is_a_single_write(pool: PgPool) {
 /// rather than the first defence. Foreign as in "belongs to another
 /// tenant": the RLS policy makes the row invisible, so the service's
 /// `assert_company_in_tenant` finds no match and refuses.
-#[sqlx::test]
+#[mokosh_test]
 async fn creating_against_a_foreign_company_is_rejected(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (foreign_tenant_id, _uid, _e, _p) =

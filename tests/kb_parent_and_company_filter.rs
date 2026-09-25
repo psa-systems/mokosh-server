@@ -2,6 +2,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 async fn create_article(
@@ -27,7 +28,7 @@ async fn create_article(
 
 /// A create with `parent_article_id` writes the link and it round-trips
 /// on read. Refuses a self-reference and refuses a foreign parent id.
-#[sqlx::test]
+#[mokosh_test]
 async fn parent_article_id_round_trips_and_refuses_bad_shapes(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -109,7 +110,7 @@ async fn parent_article_id_round_trips_and_refuses_bad_shapes(pool: PgPool) {
 /// Filtering by `company_id` narrows the list to the client-specific
 /// articles that carry that company. A `public` / `internal` article
 /// with no company scope stays out.
-#[sqlx::test]
+#[mokosh_test]
 async fn list_filters_by_company_id(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_a = common::seed_company_named(&pool, "Acme").await;

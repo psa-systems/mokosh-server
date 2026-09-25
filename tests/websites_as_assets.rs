@@ -1,12 +1,14 @@
 //! Tests for the website-as-asset migration.
 //!
-//! Every `sqlx::test` runs migrations up front, so the "before" state
-//! for a data migration cannot be observed directly. Instead these
-//! tests pin the post-migration invariants: the `Website` asset type
-//! exists per tenant, and re-running the backfill query is idempotent.
+//! `#[mokosh_test]` (PMS-1254) clones a database from a fully-migrated
+//! template, so the "before" state for a data migration cannot be
+//! observed directly. Instead these tests pin the post-migration
+//! invariants: the `Website` asset type exists per tenant, and
+//! re-running the backfill query is idempotent.
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -14,7 +16,7 @@ use uuid::Uuid;
 /// type. New tenants seeded via `TenantService::seed_default_config`
 /// inherit it too, since that path copies asset types from the default
 /// tenant.
-#[sqlx::test]
+#[mokosh_test]
 async fn every_tenant_has_a_website_asset_type(pool: PgPool) {
     common::seed_admin(&pool).await;
 
@@ -36,7 +38,7 @@ async fn every_tenant_has_a_website_asset_type(pool: PgPool) {
 /// The backfill inserts one asset per (tenant, company, website).
 /// Re-running the same INSERT against a company that now holds a
 /// Website asset writes nothing.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_backfill_is_idempotent_for_companies_that_already_hold_a_website_asset(pool: PgPool) {
     common::seed_admin(&pool).await;
 
@@ -107,7 +109,7 @@ async fn the_backfill_is_idempotent_for_companies_that_already_hold_a_website_as
 /// unique constraint that would refuse the second write via the
 /// normal API path (a real create hits `assets` directly without the
 /// backfill guard).
-#[sqlx::test]
+#[mokosh_test]
 async fn a_company_can_hold_multiple_website_assets(pool: PgPool) {
     common::seed_admin(&pool).await;
 

@@ -215,7 +215,8 @@ impl OpportunitiesService {
         let existing = self.load_row(&mut tx, id).await?;
         if existing.closed_at.is_some() {
             return Err(AppError::BadRequest(
-                "a closed opportunity is immutable; open a new one to record follow-up work".into(),
+                "A closed opportunity is immutable. Open a new one to record follow-up work."
+                    .into(),
             ));
         }
 
@@ -309,7 +310,9 @@ impl OpportunitiesService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let existing = self.load_row(&mut tx, id).await?;
         if existing.closed_at.is_some() {
-            return Err(AppError::BadRequest("opportunity is already closed".into()));
+            return Err(AppError::BadRequest(
+                "This opportunity is already closed.".into(),
+            ));
         }
 
         let effective_quote = if request.outcome == "won" {

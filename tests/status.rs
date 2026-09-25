@@ -11,6 +11,7 @@ use chrono::{Duration, TimeZone, Utc};
 use hmac::{Hmac, Mac};
 use mokosh_server::utils::crypto;
 use sha2::Sha256;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -96,7 +97,7 @@ fn status_body(
 
 /// Ingest, look up the observations row, then the monitored_systems
 /// row: the two together cover the write path end to end.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_backup_status_ingest_writes_the_observation_and_the_system(pool: PgPool) {
     common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -140,7 +141,7 @@ async fn a_backup_status_ingest_writes_the_observation_and_the_system(pool: PgPo
 
 /// The uniqueness triple is what makes retries safe. Replay with the
 /// same (system, check_kind, observed_at) leaves the row count at one.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_replayed_status_ingest_is_a_no_op(pool: PgPool) {
     common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -176,7 +177,7 @@ async fn a_replayed_status_ingest_is_a_no_op(pool: PgPool) {
 /// A device the tenant has not mapped to a company is refused with 422
 /// rather than silently written to nowhere: an unmapped delivery is a
 /// signal the operator has to act on.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unmapped_device_id_is_rejected_with_422(pool: PgPool) {
     common::seed_admin(&pool).await;
     common::seed_company(&pool).await;
@@ -209,7 +210,7 @@ async fn an_unmapped_device_id_is_rejected_with_422(pool: PgPool) {
 /// A signature over the wrong body, or a missing header, is a 401 and
 /// writes nothing. Guards the "no new inbound credential" AC: the same
 /// HMAC gate the alerts ingest uses.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_wrong_signature_is_rejected_and_writes_nothing(pool: PgPool) {
     common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -238,7 +239,7 @@ async fn a_wrong_signature_is_rejected_and_writes_nothing(pool: PgPool) {
 /// The read endpoint returns exactly the latest observation per check
 /// kind for the requested system, so a caller renders the current state
 /// without walking history.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_system_current_endpoint_returns_the_newest_per_check_kind(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -294,7 +295,7 @@ async fn the_system_current_endpoint_returns_the_newest_per_check_kind(pool: PgP
 /// current backup outcome. A system that has never carried a backup
 /// observation still appears (`latest = null`), so the client can
 /// render "unseen" separately from "failing".
-#[sqlx::test]
+#[mokosh_test]
 async fn the_company_backup_endpoint_lists_every_system_with_its_current_state(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -364,7 +365,7 @@ async fn the_company_backup_endpoint_lists_every_system_with_its_current_state(p
 /// The backup success rate reads the ratio out of the window and reports
 /// the raw counts too, so a caller can tell "no data" from
 /// "everything passed".
-#[sqlx::test]
+#[mokosh_test]
 async fn the_backup_success_rate_is_the_share_of_successes_in_the_window(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -424,7 +425,7 @@ async fn the_backup_success_rate_is_the_share_of_successes_in_the_window(pool: P
 /// `success | warning` as up. A window that carried no observations
 /// reports `1.0` so an unmonitored company does not read as totally
 /// down.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_uptime_report_treats_success_and_warning_as_up(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -482,7 +483,7 @@ async fn the_uptime_report_treats_success_and_warning_as_up(pool: PgPool) {
 /// The retention worker deletes observations older than the cutoff and
 /// leaves everything else alone. Drives the worker directly at a
 /// two-day retention so the fixture does not need thirteen months.
-#[sqlx::test]
+#[mokosh_test]
 async fn retention_purges_only_observations_older_than_the_cutoff(pool: PgPool) {
     common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
