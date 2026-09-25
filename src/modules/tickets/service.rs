@@ -1132,12 +1132,19 @@ impl TicketService {
             .unwrap_or_default())
     }
 
-    /// May `user` edit this note, all gates considered (PMS-974)? The policy
-    /// answers WHO, [`Self::note_edit_block`] answers WHETHER THIS ROW, and
-    /// this is the conjunction `update_note` enforces, so a client that shows
-    /// an Edit control on it is never refused for a reason it could have seen.
+    /// May `user` edit this note, all gates considered (PMS-974)? The role
+    /// gate is the tenant's policy against the note's author; the row-state
+    /// gates (customer author, sent-to-customer, time-entry-note) live in
+    /// `mokosh_types::tickets::note_is_editable` alongside the SPA's copy of
+    /// the same rule so the two cannot drift. `note_edit_block` still owns
+    /// the message text the update path returns as a 409.
     pub fn note_editable_by(note: &TicketNote, user: &CurrentUser, policy: NoteEditPolicy) -> bool {
-        policy.permits(user, note.created_by_id) && Self::note_edit_block(note).is_none()
+        mokosh_types::tickets::note_is_editable(
+            note.note_type,
+            note.is_email_sent,
+            note.created_by_contact_id,
+            policy.permits(user, note.created_by_id),
+        )
     }
 
     /// Edit a note's text (PMS-931).

@@ -787,6 +787,49 @@ pub struct CompanyDetailResponse {
 }
 
 // ============================================================================
+// COMPANY DELETION PREVIEW
+// ============================================================================
+
+/// What deleting a company would do, and what stops it.
+///
+/// The wire shape `GET /api/v1/contacts/companies/{id}/deletion-preview`
+/// returns. Held here rather than on either side so a client-side mirror
+/// cannot drift from what the server actually sends.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompanyDeletionPreview {
+    pub can_delete: bool,
+    /// The refusal that is about what the company IS (the tenant's own
+    /// company) rather than what references it. Reported separately so a
+    /// client can say so instead of showing an empty blocker list beside
+    /// a delete that still fails.
+    #[serde(default)]
+    pub is_own_company: bool,
+    /// Rows that stop the delete. A group with `retained: true` exists to
+    /// be kept and must not be phrased as something to clear first.
+    #[serde(default)]
+    pub blocking: Vec<DeletionRecords>,
+    /// Rows the delete would detach rather than destroy.
+    #[serde(default)]
+    pub unlinked: Vec<DeletionRecords>,
+    /// Rows the delete would destroy along with the company.
+    #[serde(default)]
+    pub removed: Vec<DeletionRecords>,
+}
+
+/// A group of rows a company delete touches, with a count and whether they
+/// exist to be kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeletionRecords {
+    pub label: String,
+    pub count: i64,
+    /// Only meaningful when this group is in `blocking`: rows that exist
+    /// to be KEPT rather than cleared, so the client's copy names them
+    /// differently.
+    #[serde(default)]
+    pub retained: bool,
+}
+
+// ============================================================================
 // CONTACT TYPES
 // ============================================================================
 

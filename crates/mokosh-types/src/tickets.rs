@@ -129,6 +129,37 @@ impl NoteType {
     }
 }
 
+/// Whether a note may be edited given its intrinsic state.
+///
+/// The role/policy gate is left to the caller because its inputs differ per
+/// audience: the server resolves the tenant's note-editing policy against the
+/// note's author, the SPA resolves `viewer_is_admin || viewer_id == author`.
+/// Both pre-resolve to `role_permits`, and this function then answers the row's
+/// own gates. A customer note posted through the portal cannot be rewritten:
+/// putting words in the customer's mouth. A public note that was already sent
+/// cannot be changed: the customer holds the original in their inbox and the
+/// system disagreeing with it is the disagreement an MSP loses. A time-entry
+/// note is edited through its time entry. Internal notes stay in-house so
+/// they can be edited freely subject to the role check.
+pub fn note_is_editable(
+    note_type: NoteType,
+    is_email_sent: bool,
+    created_by_contact_id: Option<Uuid>,
+    role_permits: bool,
+) -> bool {
+    if !role_permits {
+        return false;
+    }
+    if created_by_contact_id.is_some() {
+        return false;
+    }
+    match note_type {
+        NoteType::Internal | NoteType::Resolution => true,
+        NoteType::Public => !is_email_sent,
+        NoteType::TimeEntry => false,
+    }
+}
+
 // ============================================================================
 // TICKET STATUS
 // ============================================================================
@@ -875,6 +906,32 @@ pub struct AutomationAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn note_is_editable_covers_every_row_state() {
+        // The role gate refuses whatever the row says.
+        assert!(!note_is_editable(NoteType::Internal, false, None, false));
+        assert!(!note_is_editable(NoteType::Public, false, None, false));
+
+        // A customer note through the portal is never editable.
+        let contact = Uuid::new_v4();
+        for kind in [NoteType::Internal, NoteType::Public, NoteType::Resolution] {
+            assert!(
+                !note_is_editable(kind, false, Some(contact), true),
+                "{kind:?} written by a contact is not editable",
+            );
+        }
+
+        // A public note that was emailed cannot be changed; an internal or
+        // resolution one is fine.
+        assert!(!note_is_editable(NoteType::Public, true, None, true));
+        assert!(note_is_editable(NoteType::Public, false, None, true));
+        assert!(note_is_editable(NoteType::Internal, true, None, true));
+        assert!(note_is_editable(NoteType::Resolution, true, None, true));
+
+        // A time-entry note is edited through its time entry, not here.
+        assert!(!note_is_editable(NoteType::TimeEntry, false, None, true));
+    }
 
     #[test]
     fn test_ticket_source_from_str() {
