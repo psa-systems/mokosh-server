@@ -3,7 +3,7 @@
 //! Every `public` table with a `tenant_id` column must have Row-Level Security
 //! ENABLED and FORCED plus a `tenant_isolation` policy (the fail-closed backstop
 //! introduced by `038_rls_fail_closed.sql`). This test queries the fully-migrated
-//! schema that `#[sqlx::test]` builds and fails if any tenant-scoped table is
+//! schema that `#[mokosh_test]` builds and fails if any tenant-scoped table is
 //! missing that coverage, so a newly added tenant table cannot silently skip RLS
 //! the way the PMS-683 thirteen did.
 //!
@@ -31,6 +31,7 @@
 //! role - unlike the RLS-behaviour tests, which need a superuser to create the
 //! unprivileged probe role.
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 /// Tenant-scoped tables intentionally NOT under RLS, because the read that
@@ -184,7 +185,7 @@ fn assert_exemptions_honest(uncovered: &[String], exempt: &[&str], list_name: &s
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn every_tenant_table_has_rls_or_is_allowlisted(pool: PgPool) {
     // Tables that have a `tenant_id` column but are missing full fail-closed RLS.
     // `tenants` itself has no `tenant_id` column and is excluded by the predicate;
@@ -203,7 +204,7 @@ async fn every_tenant_table_has_rls_or_is_allowlisted(pool: PgPool) {
 /// `041` hand-listed five such tables, then `quote_lines` (092) and
 /// `credit_note_lines` (122) were added in the same shape with no policy at all
 /// and no test went red. This one does.
-#[sqlx::test]
+#[mokosh_test]
 async fn every_tenantless_table_has_rls_or_is_exempt(pool: PgPool) {
     let uncovered = uncovered_tables(&pool, false).await;
     assert_exemptions_honest(

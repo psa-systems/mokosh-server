@@ -21,6 +21,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -159,7 +160,7 @@ async fn store_raw(pool: &PgPool, value: &str) {
 /// The upgrade case, and the reason the default is a hard requirement rather
 /// than a nicety: an existing deployment has no setting row, and must read
 /// exactly as it did before the move.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_deployment_with_no_setting_row_renders_the_unchanged_default(pool: PgPool) {
     let _g = isolated().await;
     let admin = seed_one_admin(&pool).await;
@@ -189,7 +190,7 @@ async fn a_deployment_with_no_setting_row_renders_the_unchanged_default(pool: Pg
 /// AC5, and the whole point of the move: an admin changes the name and the next
 /// mail carries it, in the same process, with nothing restarted and no second
 /// boot-time load.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_admin_change_reaches_outbound_mail_with_no_restart(pool: PgPool) {
     let _g = isolated().await;
     let admin = seed_one_admin(&pool).await;
@@ -231,7 +232,7 @@ async fn an_admin_change_reaches_outbound_mail_with_no_restart(pool: PgPool) {
 /// The other half of "no restart": a name set in a previous process is picked
 /// up by the next boot, which is what makes the setting durable rather than
 /// only live in the process that wrote it.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_stored_name_is_picked_up_by_the_next_boot(pool: PgPool) {
     let _g = isolated().await;
     let admin = seed_one_admin(&pool).await;
@@ -256,7 +257,7 @@ async fn a_stored_name_is_picked_up_by_the_next_boot(pool: PgPool) {
 
 /// Clearing the override is a supported action, and it must land on the default
 /// rather than on an empty string - the same outcome as never having set one.
-#[sqlx::test]
+#[mokosh_test]
 async fn clearing_the_name_restores_the_default_rather_than_a_blank(pool: PgPool) {
     let _g = isolated().await;
     let admin = seed_one_admin(&pool).await;
@@ -298,7 +299,7 @@ async fn clearing_the_name_restores_the_default_rather_than_a_blank(pool: PgPool
 /// A row that the admin API would refuse today (written before a rule existed,
 /// or edited straight in the database) must not reach an email `Subject`
 /// header. Boot drops it and falls back, rather than rendering it.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unusable_stored_name_is_dropped_at_boot(pool: PgPool) {
     let _g = isolated().await;
     let admin = seed_one_admin(&pool).await;
@@ -321,7 +322,7 @@ async fn an_unusable_stored_name_is_dropped_at_boot(pool: PgPool) {
 
 /// The admin write path refuses the same value at the door, so the fallback
 /// above is a backstop and not the only defence.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_admin_api_refuses_a_name_that_would_inject_a_header(pool: PgPool) {
     let _g = isolated().await;
     let db = Database::from_pool(pool.clone());
@@ -353,7 +354,7 @@ async fn the_admin_api_refuses_a_name_that_would_inject_a_header(pool: PgPool) {
 /// The consumer that cannot make a query: the catch-all 404 page takes no
 /// `State` and has to render when the database is unreachable. It reads the
 /// same cache, which is why the value is cached rather than fetched per read.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_api_landing_page_names_the_deployment_without_touching_the_database(pool: PgPool) {
     let _g = isolated().await;
     let db = Database::from_pool(pool.clone());
@@ -390,7 +391,7 @@ async fn the_api_landing_page_names_the_deployment_without_touching_the_database
 /// A name with HTML in it is escaped on the page rather than injected into it.
 /// `sanitize` bars control characters, not markup, so the escaping is the
 /// defence and it belongs at the render site.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_name_containing_markup_is_escaped_on_the_landing_page(pool: PgPool) {
     let _g = isolated().await;
     let db = Database::from_pool(pool.clone());
@@ -426,7 +427,7 @@ async fn a_name_containing_markup_is_escaped_on_the_landing_page(pool: PgPool) {
 /// Fixing the Rust call sites and leaving these would ship the exact mismatch
 /// the issue exists to remove: an admin sets "PSA Systems" and the reset mail
 /// still says Mokosh.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_seeded_password_reset_mail_renders_the_configured_name(pool: PgPool) {
     let _g = isolated().await;
     let db = Database::from_pool(pool.clone());
@@ -457,7 +458,7 @@ async fn the_seeded_password_reset_mail_renders_the_configured_name(pool: PgPool
 
 /// The upgrade case for the same mail: a deployment that sets nothing gets the
 /// wording it had before PMS-789, character for character.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_seeded_password_reset_mail_is_unchanged_when_nothing_is_configured(pool: PgPool) {
     let _g = isolated().await;
     let db = Database::from_pool(pool.clone());
@@ -474,7 +475,7 @@ async fn the_seeded_password_reset_mail_is_unchanged_when_nothing_is_configured(
 /// Migration 116 has to have actually rewritten the seeded rows, not just the
 /// seed files. A fresh database is what an upgraded one becomes, so if any
 /// template still holds the literal here, it holds it in production too.
-#[sqlx::test]
+#[mokosh_test]
 async fn no_seeded_template_still_names_the_product_literally(pool: PgPool) {
     let stragglers: Vec<(String, String)> = sqlx::query_as(
         "SELECT event_type, channel_type FROM notification_templates
@@ -517,7 +518,7 @@ async fn no_seeded_template_still_names_the_product_literally(pool: PgPool) {
 /// the seeded text verbatim, so re-running it against a customised row is a
 /// no-op - which is exactly what an upgrade does to an operator who edited
 /// their template through the notification CRUD API.
-#[sqlx::test]
+#[mokosh_test]
 async fn re_running_the_migration_leaves_a_customised_template_alone(pool: PgPool) {
     let mine = "Our own words about Mokosh, thanks.";
     sqlx::query(

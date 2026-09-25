@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::path::PathBuf;
 
 use mokosh_server::db::Database;
@@ -26,7 +27,7 @@ use uuid::Uuid;
 ///
 /// A logo's key is the TENANT plus a fixed name, so every case here addresses
 /// the same two paths - unlike `kb_attachment_move.rs`, where each attachment
-/// carries a fresh UUID and parallel cases cannot collide. `#[sqlx::test]`
+/// carries a fresh UUID and parallel cases cannot collide. `#[mokosh_test]`
 /// gives each case its own DATABASE but they all share one process and one
 /// storage root, so without this a test that stages the pre-move state renames
 /// the file out from under a test asserting on a fresh upload. That is exactly
@@ -123,7 +124,7 @@ async fn fetch_public(app: &common::TestApp) -> (u16, Vec<u8>) {
 
 /// A new upload goes straight to the tenant path. This is the layout change
 /// itself, seen from the outside.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_fresh_upload_lands_under_its_tenant(pool: PgPool) {
     common::storage_root();
     let _guard = exclusive().await;
@@ -151,7 +152,7 @@ async fn a_fresh_upload_lands_under_its_tenant(pool: PgPool) {
 /// The read falls back while the file is still at the old path, so a logo does
 /// not vanish from a client's portal and emails between the deploy and the
 /// first tick of the mover.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_logo_written_under_the_old_layout_is_still_served(pool: PgPool) {
     common::storage_root();
     let _guard = exclusive().await;
@@ -167,7 +168,7 @@ async fn a_logo_written_under_the_old_layout_is_still_served(pool: PgPool) {
     assert_eq!(bytes, PNG, "and serves the right bytes");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn the_mover_carries_a_legacy_logo_under_its_tenant(pool: PgPool) {
     common::storage_root();
     let _guard = exclusive().await;
@@ -204,7 +205,7 @@ async fn the_mover_carries_a_legacy_logo_under_its_tenant(pool: PgPool) {
 /// The set the sweep selects is the UNMOVED one, so a second pass costs a query
 /// and does nothing. A mover that reconsidered every logo every hour would be a
 /// permanent load with no end state.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_second_pass_has_nothing_to_do(pool: PgPool) {
     common::storage_root();
     let _guard = exclusive().await;
@@ -229,7 +230,7 @@ async fn a_second_pass_has_nothing_to_do(pool: PgPool) {
 /// A tick that moved the file and then failed before it could say so leaves a
 /// ledger row naming the old path. The next tick has to correct the row without
 /// touching the file, because the file is already where it belongs.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_stale_ledger_row_is_corrected_without_touching_the_file(pool: PgPool) {
     common::storage_root();
     let _guard = exclusive().await;
@@ -264,7 +265,7 @@ async fn a_stale_ledger_row_is_corrected_without_touching_the_file(pool: PgPool)
 /// A tenant whose branding claims a logo whose bytes are at neither path is
 /// left completely alone. Rewriting its ledger row would dress a missing file
 /// up as a migrated one.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_with_no_file_is_left_alone(pool: PgPool) {
     common::storage_root();
     let _guard = exclusive().await;
@@ -294,7 +295,7 @@ async fn a_tenant_with_no_file_is_left_alone(pool: PgPool) {
 
 /// Replacing a logo before the mover has run must clear the pre-move file too,
 /// or the read fallback serves the OLD mark for a tenant that just changed it.
-#[sqlx::test]
+#[mokosh_test]
 async fn replacing_a_logo_clears_the_pre_move_file(pool: PgPool) {
     common::storage_root();
     let _guard = exclusive().await;
@@ -320,7 +321,7 @@ async fn replacing_a_logo_clears_the_pre_move_file(pool: PgPool) {
 /// The public route is still the only way in, and it still refuses a tenant id
 /// that has no logo, identically to one that does not exist. The layout moved;
 /// the PMS-941 bargain did not.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_without_a_logo_is_indistinguishable_from_an_unknown_one(pool: PgPool) {
     common::storage_root();
     let _guard = exclusive().await;

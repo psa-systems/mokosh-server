@@ -9,11 +9,12 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn approval_round_trip_role_assigned(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

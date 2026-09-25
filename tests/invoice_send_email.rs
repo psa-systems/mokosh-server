@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use mokosh_server::utils::email::{EmailAttachment, Mailer};
 use mokosh_server::utils::error::{AppError, AppResult};
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
@@ -195,7 +196,7 @@ async fn boot_capturing(
 /// The default configuration: a billing contact with an address, no
 /// payment gateway. The invoice goes, with the stored document attached and
 /// no pay link, and the record says who it went to.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_send_with_no_gateway_emails_the_invoice_with_its_pdf_and_records_it(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -243,7 +244,7 @@ async fn a_send_with_no_gateway_emails_the_invoice_with_its_pdf_and_records_it(p
 }
 
 /// With a gateway connected the same message also carries the pay link.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_send_with_a_gateway_adds_the_pay_link(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -281,7 +282,7 @@ async fn a_send_with_a_gateway_adds_the_pay_link(pool: PgPool) {
 
 /// The invoice names no contact, but the company does: the company's default
 /// billing contact is the recipient.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_companys_billing_contact_is_the_fallback_recipient(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -302,7 +303,7 @@ async fn the_companys_billing_contact_is_the_fallback_recipient(pool: PgPool) {
 
 /// No contact anywhere: the send is refused, the error names the company and
 /// what is missing, the invoice stays a draft, and nothing is mailed.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_send_with_no_billing_contact_is_refused_and_names_the_company(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -341,7 +342,7 @@ async fn a_send_with_no_billing_contact_is_refused_and_names_the_company(pool: P
 }
 
 /// A contact without an address is the same refusal, naming the contact.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_send_to_a_contact_without_an_address_is_refused(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -370,7 +371,7 @@ async fn a_send_to_a_contact_without_an_address_is_refused(pool: PgPool) {
 
 /// `skip_email` is the explicit path for an invoice delivered by hand: it
 /// freezes and records nobody as emailed, and the record says so.
-#[sqlx::test]
+#[mokosh_test]
 async fn skip_email_marks_sent_without_emailing_and_records_nobody(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -406,7 +407,7 @@ async fn skip_email_marks_sent_without_emailing_and_records_nobody(pool: PgPool)
 /// A relay that refuses the message rolls the transition back: the invoice
 /// stays a draft with no snapshot, no stored document and no `sent_at`,
 /// because "sent" means the send was accepted.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_refused_send_leaves_the_invoice_a_draft(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -471,7 +472,7 @@ async fn a_refused_send_leaves_the_invoice_a_draft(pool: PgPool) {
 /// writes carries `emailed_to` and `emailed_at`, but only as part of a diff
 /// of every column on the invoice; this asserts the named row PMS-977 gave
 /// the company move.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_send_is_a_named_event_in_the_audit_log(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
@@ -517,7 +518,7 @@ async fn a_send_is_a_named_event_in_the_audit_log(pool: PgPool) {
 /// The deliberate no-email send says so, because otherwise it is
 /// indistinguishable afterwards from a send whose mail was lost: both leave a
 /// `sent` invoice with no `emailed_to`, and only one of them was a decision.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_skip_email_send_records_that_nobody_was_emailed(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -546,7 +547,7 @@ async fn a_skip_email_send_records_that_nobody_was_emailed(pool: PgPool) {
 /// A refused send writes no delivery event, for the same reason it leaves the
 /// invoice a draft: the row is written inside the transaction the refusal
 /// rolls back, so the history cannot claim a delivery that did not happen.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_refused_send_records_no_delivery(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -604,7 +605,7 @@ async fn sent_events(
 /// the list batches it through `enrich_invoices`, the detail resolves it in
 /// `load_invoice`, and a field filled by only one of them would make the same
 /// invoice read differently depending on how it was fetched.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_invoice_names_the_contact_it_is_billed_to(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

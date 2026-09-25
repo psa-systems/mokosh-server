@@ -19,6 +19,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -48,7 +49,7 @@ async fn seed_token(pool: &PgPool, bearer: &str) {
     .expect("seed intake token");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn auto_create_contact_under_fallback_company(pool: PgPool) {
     let (_admin_id, _email, _password) = common::seed_admin(&pool).await;
     let fallback_company = common::seed_company(&pool).await;
@@ -132,7 +133,7 @@ async fn auto_create_contact_under_fallback_company(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn reply_appends_public_comment(pool: PgPool) {
     let (_admin_id, _email, _password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -218,7 +219,7 @@ async fn reply_appends_public_comment(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn every_intake_writes_a_log_row(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

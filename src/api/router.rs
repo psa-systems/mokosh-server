@@ -190,6 +190,22 @@ pub fn create_api_router(
         // MAPPS-457: attach the instance-wide tenant cap. `None` (unset
         // env) leaves the service uncapped, matching production today.
         .with_max_tenants(max_tenants);
+    // MAPPS-674: one `PaymentMethodsService` shared by every route and
+    // webhook receiver that touches `contact_payment_methods`, including
+    // `ContactService::delete_contact` below (PMS-1369), which detaches a
+    // deleted contact's saved cards on the provider side before the row (and
+    // its `contact_payment_methods` rows, via the FK cascade) goes away.
+    // Built here, ahead of its other two call sites further down, so the
+    // staff `ContactService` can hold the same instance from construction.
+    let payment_methods_service =
+        Arc::new(crate::modules::contact_portal::PaymentMethodsService::new(
+            db.clone(),
+            Arc::new(BillingService::with_secrets(
+                db.clone(),
+                encryption_key,
+                secrets.clone(),
+            )),
+        ));
     // PMS-136: ContactService emails a `/portal/set-password` setup link when
     // an agent grants portal access, so it holds the SPA origin (the link
     // base). PMS-700: that mail is queued through the same `auth.welcome`
@@ -202,7 +218,8 @@ pub fn create_api_router(
         // which has no portal.
         spa_base_url.clone(),
         notifications_service.clone(),
-    );
+    )
+    .with_payment_methods(payment_methods_service.clone());
     let ticket_service =
         TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone());
     // PMS-711: the agent-facing billing service also sends the outbound invoice
@@ -221,13 +238,15 @@ pub fn create_api_router(
     // secret provider for the tenant's refresh token, the PUBLIC api base
     // because that is the origin GOOGLE returns the browser to, and the SPA
     // origin because that is where the admin is sent afterwards.
-    let contact_sync_service =
-        std::sync::Arc::new(crate::modules::contact_sync::ContactSyncService::new(
+    let contact_sync_service = std::sync::Arc::new(
+        crate::modules::contact_sync::ContactSyncService::new(
             db.clone(),
             secrets.clone(),
             public_api_base_url.clone(),
             spa_base_url.clone(),
-        ));
+        )
+        .with_payment_methods(payment_methods_service.clone()),
+    );
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
@@ -388,6 +407,20 @@ pub fn create_api_router(
         // cheap Arc bump. PMS-837 removed the Google OAuth popup routes and
         // their `google_oauth` / `cookie_secure` parameters.
         .nest("/auth", auth_routes(auth_service.clone()))
+        // PMS-1210: the grantee-side "Leave account" endpoint. Placed at
+        // the top of `/api/v1` rather than under `/auth` because the
+        // gesture is a caller acting on themselves through the identity
+        // plane, not part of the auth-of-record surface.
+        .nest(
+            "/my-grants",
+            // SAFETY (PMS-285): the my-grants router owns the connection
+            // pool because its one write (grantee-leave) touches the
+            // cross-tenant `mokosh_bunyip_grants` table (RLS-exempt, see
+            // `mokosh_bunyip_grants.rs`) and the identity-plane `users`
+            // row. Neither is served on a tenant GUC, so the router takes
+            // the pool directly and threads it through the service call.
+            crate::modules::auth::my_grants::my_grants_routes(db.pool().clone()),
+        )
         // MAPPS-513: platform super-admin routes. Distinct credential
         // store (`platform_admins`) and distinct JWT typ so the
         // super-admin persona is isolated from the tenant identity
@@ -807,20 +840,8 @@ pub fn create_api_router(
     // secret). The tenant id in the path selects which tenant's secret to verify
     // against; it is not itself a credential. Its own `BillingService` instance
     // (the router's `billing_service` is moved into `billing_routes`).
-    // MAPPS-674: one `PaymentMethodsService` shared by every route and
-    // webhook receiver that touches `contact_payment_methods`. The billing
-    // handle it holds is the same shape the payment webhook uses (secret
-    // provider, encryption key), so `record_from_webhook` and
-    // `start_add` build providers from the same credential path.
-    let payment_methods_service =
-        Arc::new(crate::modules::contact_portal::PaymentMethodsService::new(
-            db.clone(),
-            Arc::new(BillingService::with_secrets(
-                db.clone(),
-                encryption_key,
-                secrets.clone(),
-            )),
-        ));
+    // `payment_methods_service` (MAPPS-674) was built above, ahead of
+    // `ContactService`, so it is already in scope here.
     let stripe_webhook_state = Arc::new(ProviderWebhookState {
         billing: Arc::new(BillingService::with_secrets(
             db.clone(),

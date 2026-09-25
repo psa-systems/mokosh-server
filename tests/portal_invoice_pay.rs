@@ -21,6 +21,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -155,7 +156,7 @@ fn pay_body() -> serde_json::Value {
     })
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_invoices_pay_reaches_service_400_no_gateway(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -186,7 +187,7 @@ async fn contact_with_invoices_pay_reaches_service_400_no_gateway(pool: PgPool) 
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_invoices_pay_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Support Contact has tickets:* but not invoices:pay.
@@ -209,7 +210,7 @@ async fn contact_without_invoices_pay_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_invoices_pay_foreign_company_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _c, _e, token) =
@@ -233,7 +234,7 @@ async fn contact_with_invoices_pay_foreign_company_404(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_bypasses_invoices_pay_cap_400_no_gateway(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -265,7 +266,7 @@ async fn staff_bypasses_invoices_pay_cap_400_no_gateway(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn pay_body_rejects_non_url_success_url(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -296,7 +297,7 @@ async fn pay_body_rejects_non_url_success_url(pool: PgPool) {
 /// from the contact plane is either a leak (list surfaced a row it
 /// shouldn't have) or an accident on the staff plane that would charge
 /// a card for an amount not yet finalized. Security-review F9.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_invoices_pay_refuses_draft_400(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -358,7 +359,7 @@ async fn contact_with_invoices_pay_refuses_draft_400(pool: PgPool) {
 /// pin. The invoice bucket trips at 10 vs 20 for the caller bucket, so
 /// hitting the invoice bucket is the cheapest way to observe the 429
 /// shape without seeding twenty-plus unique invoices.
-#[sqlx::test]
+#[mokosh_test]
 async fn eleventh_pay_attempt_on_one_invoice_is_429_with_retry_after(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -440,7 +441,7 @@ fn pay_body_with_amount(amount: &str) -> serde_json::Value {
 /// no-gateway 400 the full-pay test does; that reaching the service is
 /// what proves the cap gate passed. The Stripe-integrated success case is
 /// exercised by the sibling suite that seeds a gateway.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_pay_partial_and_amount_reaches_service_400_no_gateway(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -474,7 +475,7 @@ async fn contact_with_pay_partial_and_amount_reaches_service_400_no_gateway(pool
 /// MAPPS-673: an amount above `balance_due` is refused before the mint
 /// with a 400 that names the ceiling. The seed invoice has `balance_due
 /// = 100`; asking for 150 must refuse.
-#[sqlx::test]
+#[mokosh_test]
 async fn pay_amount_above_balance_is_400(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -510,7 +511,7 @@ async fn pay_amount_above_balance_is_400(pool: PgPool) {
 /// floor falls back to the code default via `min_partial_amount_across_active`.
 /// This proves the fee-abuse guard fires even when the tenant has not set
 /// a value in the column.
-#[sqlx::test]
+#[mokosh_test]
 async fn pay_amount_below_min_partial_is_400(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -563,7 +564,7 @@ async fn pay_amount_below_min_partial_is_400(pool: PgPool) {
 /// charging the full balance - a caller whose attempt did not do what
 /// they asked has to know. Seeded via a bespoke role so we do not rely
 /// on the migration having flipped Billing Contact's caps.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_pay_partial_with_amount_is_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Custom role: `invoices:pay` alone (no `invoices:pay_partial`).
@@ -600,7 +601,7 @@ async fn contact_without_pay_partial_with_amount_is_403(pool: PgPool) {
 /// MAPPS-673: a staff caller with billing + finance bypasses the
 /// partial-payment cap the same way they bypass `invoices:pay`. Hits the
 /// same no-gateway 400 as row 1 of the full-pay matrix.
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_bypasses_pay_partial_cap_400_no_gateway(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
