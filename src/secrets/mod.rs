@@ -98,6 +98,16 @@ pub enum SecretKind {
     /// in the app rather than in operator env. Held under the system tenant,
     /// because there is one per deployment and not one per organisation.
     OauthClient { provider: String },
+    /// PMS-1310: an installed integration's credential, keyed by the
+    /// `integrations.provider` discriminator.
+    ///
+    /// Keyed by the provider and not by the row id, unlike
+    /// [`SecretKind::ContactSync`], because `integrations` is UNIQUE on
+    /// `(tenant_id, provider)`: the row IS the installation, so disconnecting
+    /// and reconnecting reuses it and there is no second id for a stale secret
+    /// to hide behind. `disconnect` deletes the secret, which is what makes
+    /// that safe.
+    Integration { provider: String },
 }
 
 impl SecretKind {
@@ -107,6 +117,7 @@ impl SecretKind {
             SecretKind::PaymentGateway { .. } => "PAYMENT_GATEWAY",
             SecretKind::ContactSync { .. } => "CONTACT_SYNC",
             SecretKind::OauthClient { .. } => "OAUTH_CLIENT",
+            SecretKind::Integration { .. } => "INTEGRATION",
         }
     }
 
@@ -124,6 +135,7 @@ impl SecretKind {
                 connection_id,
             } => Cow::Owned(format!("{provider}_{}", connection_id.simple())),
             SecretKind::OauthClient { provider } => Cow::Borrowed(provider),
+            SecretKind::Integration { provider } => Cow::Borrowed(provider),
         }
     }
 }
@@ -158,6 +170,16 @@ impl SecretKey {
         Self {
             tenant_id: system_tenant,
             kind: SecretKind::OauthClient {
+                provider: provider.into(),
+            },
+        }
+    }
+
+    /// PMS-1310: an installed integration's credential.
+    pub fn integration(tenant_id: Uuid, provider: impl Into<String>) -> Self {
+        Self {
+            tenant_id,
+            kind: SecretKind::Integration {
                 provider: provider.into(),
             },
         }
