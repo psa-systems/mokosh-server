@@ -6,6 +6,15 @@
 //!   the `POST /rmm/alerts` shape so no new inbound credential exists.
 //! - `GET /status/*` is internal-user-authenticated: a company's own
 //!   staff looking at their own systems.
+//!
+//! parity record 2026-09-25: `/status/companies/{company_id}/backup`,
+//! `/reports/status/backup-success-rate` and `/reports/status/uptime`
+//! have no SPA caller today. PMS-795 and PMS-797 ship the server plane
+//! first (schema, service, routes, retention worker, integration tests)
+//! so the SPA "Client status" and reports screens can build against a
+//! stable surface; the mokosh-apps screens are filed under the same
+//! tickets and land after this merges. The route shapes are already the
+//! ones the spec commits to.
 
 use crate::utils::json::Json;
 use axum::{

@@ -1,4 +1,12 @@
 //! HTTP surface for opportunities.
+//!
+//! parity record 2026-09-25: `/crm/opportunities`, `/crm/opportunities/{id}`
+//! and `/crm/opportunities/{id}/close` have no SPA caller today. PMS-799
+//! ships the server plane first (schema, service, routes, integration
+//! tests) so the SPA CRM screen can build against a stable surface; the
+//! matching mokosh-apps screen is filed as MAPPS-799 and lands after this
+//! merges. The route shape is unlikely to move: create, read, list, close
+//! are the four verbs the PMS-799 spec commits to.
 
 use crate::utils::json::Json;
 use axum::{
