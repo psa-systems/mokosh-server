@@ -151,6 +151,67 @@ mod repo_hygiene {
         );
     }
 
+    /// PMS-1394: the supported and unsupported test profiles are complements.
+    ///
+    /// `.config/nextest.toml` splits the Postgres-backed suite in two: the `ci`
+    /// profile is what every pull request runs, and `unsupported` is what
+    /// `integration-unsupported.yml` runs weekly. The split is expressed as a
+    /// `default-filter` on each, and the two are only a split as long as they
+    /// are exact complements. Edit one and forget the other and a suite falls
+    /// into NEITHER, which is the one failure mode with no signal at all: no
+    /// job fails, no case is reported, and the coverage is simply gone.
+    ///
+    /// So this reads the two filters back and requires that one is the other
+    /// with `not ` in front. It is a text comparison on purpose: parsing
+    /// nextest's filter language here would be a second implementation of it,
+    /// and the convention that keeps the check meaningful is that the pair is
+    /// written as `X` and `not X` rather than as two expressions that happen to
+    /// mean the same thing.
+    #[test]
+    fn the_supported_and_unsupported_test_profiles_are_complements() {
+        let config = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".config")
+                .join("nextest.toml"),
+        )
+        .expect("read .config/nextest.toml");
+
+        let filter_for = |profile: &str| -> String {
+            let header = format!("[profile.{profile}]");
+            let start = config
+                .find(&header)
+                .unwrap_or_else(|| panic!("no {header} in .config/nextest.toml"));
+            let body = &config[start + header.len()..];
+            // Stop at the next table so a filter cannot be read out of a
+            // neighbouring profile.
+            let end = body
+                .find(
+                    "
+[",
+                )
+                .unwrap_or(body.len());
+            body[..end]
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("default-filter"))
+                .map(|rest| {
+                    rest.trim_start_matches([' ', '='])
+                        .trim()
+                        .trim_matches('\'')
+                        .trim_matches('"')
+                        .to_string()
+                })
+                .unwrap_or_else(|| panic!("[profile.{profile}] declares no default-filter"))
+        };
+
+        let supported = filter_for("ci");
+        let unsupported = filter_for("unsupported");
+        assert_eq!(
+            supported,
+            format!("not {unsupported}"),
+            "the `ci` and `unsupported` default-filters are not complements, so a              suite can be in neither and run nowhere: ci = {supported:?},              unsupported = {unsupported:?}"
+        );
+    }
+
     /// PMS-1010: a selectable implementation is a PROVIDER, and the two words
     /// it replaced do not come back.
     ///
