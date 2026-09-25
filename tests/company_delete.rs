@@ -435,6 +435,9 @@ async fn create_contact(
     token: &str,
     mut body: serde_json::Value,
 ) -> serde_json::Value {
+    // PMS-1329 makes email required on create; these tests exercise company
+    // cascades, so mint a unique fixture email when the caller does not name
+    // one.
     if body.get("email").is_none() {
         body["email"] = serde_json::json!(format!("{}@example.com", uuid::Uuid::new_v4()));
     }

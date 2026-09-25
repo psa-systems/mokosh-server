@@ -138,13 +138,37 @@ fn validate_child_lists(
     validate_companies_distinct(companies)
 }
 
-/// Struct-level guard for `CreateContactRequest` (PMS-402): a contact may link
-/// a CRM `company_id` OR carry a freeform `company_name`, never both. PMS-806
-/// extends the same rule to the `companies` list and adds the primary-flag and
-/// duplicate-link checks.
-fn validate_create_company_link(req: &CreateContactRequest) -> Result<(), ValidationError> {
+/// Struct-level guard for `CreateContactRequest`. Covers three shape rules:
+///
+/// - PMS-402: a contact may link a CRM `company_id` OR carry a freeform
+///   `company_name`, never both.
+/// - PMS-806: the same rule extended to the `companies` list, plus the
+///   primary-flag and duplicate-link checks.
+/// - PMS-1329: a contact must be created with an email address. Without one
+///   there is nothing to invite, invoice or notify, and the earlier
+///   `Option<String>` shape let the SPA silently create an unreachable row.
+///   Kept on the create path only: an `UpdateContactRequest` with no email
+///   is "leave the field alone", and rewriting existing rows created before
+///   this rule is out of scope (see the ticket description).
+fn validate_create_contact_request(req: &CreateContactRequest) -> Result<(), ValidationError> {
     validate_company_link_exclusive(req.company_id, &req.company_name)?;
-    validate_child_lists(&req.phones, &req.companies, &req.company_name)
+    validate_child_lists(&req.phones, &req.companies, &req.company_name)?;
+    require_email_on_create(req.email.as_deref())
+}
+
+/// Reject a create whose email is absent or blank. Rejected as a field-level
+/// error keyed on `email` so the SPA surfaces it inline on the same input
+/// the `#[validate(email)]` format check would.
+fn require_email_on_create(email: Option<&str>) -> Result<(), ValidationError> {
+    match email.map(str::trim) {
+        Some(v) if !v.is_empty() => Ok(()),
+        _ => {
+            let mut error = ValidationError::new("required");
+            error.message = Some("Email is required".into());
+            error.add_param("field".into(), &"email");
+            Err(error)
+        }
+    }
 }
 
 /// Struct-level guard for `UpdateContactRequest` (PMS-402): same mutual
@@ -1049,7 +1073,7 @@ impl Contact {
 
 /// Create contact request
 #[derive(Debug, Clone, Deserialize, Validate)]
-#[validate(schema(function = validate_create_company_link))]
+#[validate(schema(function = validate_create_contact_request))]
 pub struct CreateContactRequest {
     /// Optional link to an existing CRM company (PMS-402). Mutually exclusive
     /// with a non-empty `company_name`; supplying both is rejected (422).
@@ -1714,11 +1738,15 @@ mod tests {
     // ---- PMS-325: phone / timezone / country / postal validation ----
 
     /// Build a minimal valid `CreateContactRequest`, merging overrides.
+    /// A valid `email` is seeded by default (PMS-1329 makes it required on
+    /// create); an override may set it to `null` or omit the seeded value
+    /// when a test specifically exercises the required-email rule.
     fn contact_req(overrides: serde_json::Value) -> CreateContactRequest {
         let mut body = serde_json::json!({
             "company_id": "00000000-0000-0000-0000-000000000000",
             "first_name": "Ada",
             "last_name": "Lovelace",
+            "email": "ada@example.test",
         });
         if let serde_json::Value::Object(extra) = overrides {
             for (k, v) in extra {
@@ -1824,6 +1852,7 @@ mod tests {
         let mut full = serde_json::json!({
             "first_name": "Ada",
             "last_name": "Lovelace",
+            "email": "ada@example.test",
         });
         if let serde_json::Value::Object(extra) = body {
             for (k, v) in extra {
@@ -1865,6 +1894,56 @@ mod tests {
         assert!(
             req.validate().is_err(),
             "supplying both company_id and a non-empty company_name must be rejected"
+        );
+    }
+
+    // ========================================================================
+    // PMS-1329: a contact create must carry an email address
+    // ========================================================================
+
+    /// A create with no `email` field at all is rejected. The unreachable
+    /// contact this rule closes reached the interface's "set up email queue"
+    /// state and produced a dead notification row.
+    #[test]
+    fn create_without_email_is_rejected() {
+        let req = contact_req(serde_json::json!({ "email": null }));
+        assert!(req.email.is_none());
+        let err = req
+            .validate()
+            .expect_err("a create with no email must be rejected");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("email"),
+            "the field-level error must name the email field: {err:?}"
+        );
+    }
+
+    /// A create whose email is present but blank (or whitespace-only) is
+    /// rejected on the same rule, so a caller cannot bypass it by sending
+    /// `""` in place of omitting the field.
+    #[test]
+    fn create_with_blank_email_is_rejected() {
+        for blank in ["", "   ", "\t\n"] {
+            let req = contact_req(serde_json::json!({ "email": blank }));
+            assert!(
+                req.validate().is_err(),
+                "a blank email ({blank:?}) must be rejected"
+            );
+        }
+    }
+
+    /// The rule is create-side only: an update with `email: None` is "leave
+    /// the field alone" and must still validate. Rewriting existing rows is
+    /// out of scope for the ticket.
+    #[test]
+    fn update_without_email_is_still_accepted() {
+        let req: UpdateContactRequest = serde_json::from_value(serde_json::json!({
+            "first_name": "Grace"
+        }))
+        .expect("update deserializes");
+        assert!(req.email.is_none());
+        assert!(
+            req.validate().is_ok(),
+            "an update carrying no email must still validate"
         );
     }
 
