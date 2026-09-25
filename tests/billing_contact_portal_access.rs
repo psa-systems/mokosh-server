@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -108,7 +109,7 @@ async fn set_billing_contact(
 /// The case that shipped: a portal contact whose access was granted for
 /// tickets is made the billing contact, and could then be mailed an invoice
 /// they could not open.
-#[sqlx::test]
+#[mokosh_test]
 async fn designating_a_billing_contact_lets_them_read_invoices(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -140,7 +141,7 @@ async fn designating_a_billing_contact_lets_them_read_invoices(pool: PgPool) {
 }
 
 /// The grant is recorded, so an MSP can see the application did it and undo it.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_grant_is_audited_against_the_contact(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -166,7 +167,7 @@ async fn the_grant_is_audited_against_the_contact(pool: PgPool) {
 /// A contact who cannot sign in is left alone. Granting a role to somebody
 /// with no portal access changes nothing, and flipping `is_portal_user` here
 /// would invite a person to a portal without anyone deciding to.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_who_is_not_a_portal_user_is_left_alone(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -194,7 +195,7 @@ async fn a_contact_who_is_not_a_portal_user_is_left_alone(pool: PgPool) {
 
 /// Somebody who can already read invoices gains no second role, whichever role
 /// gave them the capability.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_who_can_already_read_invoices_gains_nothing(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -220,7 +221,7 @@ async fn a_contact_who_can_already_read_invoices_gains_nothing(pool: PgPool) {
 }
 
 /// Re-running the same designation changes nothing.
-#[sqlx::test]
+#[mokosh_test]
 async fn designating_the_same_contact_twice_is_a_no_op(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

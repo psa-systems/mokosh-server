@@ -1174,12 +1174,22 @@ impl TenantService {
         Ok(row.into())
     }
 
-    /// List all tenants
+    /// List all tenants, with a live user-count per row and a configurable
+    /// sort. The admin surface renders Client, Users and Created columns and
+    /// paginates server-side; picking the ORDER BY here means a single page
+    /// covers the count and the position without the client re-sorting.
     #[tracing::instrument(skip_all)]
     pub async fn list_tenants(
         &self,
         pagination: &crate::utils::pagination::PaginationParams,
-    ) -> AppResult<(Vec<Tenant>, u64)> {
+    ) -> AppResult<(Vec<(Tenant, i64)>, u64)> {
+        const TENANT_SORTS: &[(&str, &str)] = &[
+            ("name", "name"),
+            ("user_count", "user_count"),
+            ("created_at", "created_at"),
+        ];
+        let order_by = pagination.order_by_mapped("created_at", TENANT_SORTS)?;
+
         // SAFETY (PMS-285): list_tenants is a super-admin, cross-tenant handler
         // (the route gates it on super_admin) that enumerates every tenant in the
         // RLS-exempt `tenants` root. It runs on the privileged migrator pool.
@@ -1187,22 +1197,35 @@ impl TenantService {
             .fetch_one(self.db.migrator_pool())
             .await?;
 
-        let rows = sqlx::query_as::<_, TenantRow>(
+        let sql = format!(
             r#"
             SELECT id, name, slug, status, settings, branding, billing_email,
                    billing_contact_name, subscription_plan, subscription_status,
-                   trial_ends_at, created_at, updated_at
+                   trial_ends_at, created_at, updated_at,
+                   (SELECT COUNT(*)::bigint FROM users u
+                    WHERE u.tenant_id = tenants.id
+                      AND u.deleted_at IS NULL) AS user_count
             FROM tenants
-            ORDER BY created_at DESC
+            ORDER BY {order_by}, id ASC
             LIMIT $1 OFFSET $2
-            "#,
-        )
-        .bind(pagination.limit() as i64)
-        .bind(pagination.offset() as i64)
-        .fetch_all(self.db.migrator_pool())
-        .await?;
+            "#
+        );
 
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+        let rows: Vec<TenantListRow> = sqlx::query_as(&sql)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64)
+            .fetch_all(self.db.migrator_pool())
+            .await?;
+
+        Ok((
+            rows.into_iter()
+                .map(|row| {
+                    let user_count = row.user_count;
+                    (row.tenant.into(), user_count)
+                })
+                .collect(),
+            total as u64,
+        ))
     }
 
     /// Update tenant
@@ -1293,6 +1316,16 @@ impl TenantService {
         // published. Includes the PMS-758 object check.
         if let Some(branding) = request.branding.as_ref() {
             validate_branding_patch(branding)?;
+            // PMS-1371: the prefix check above never looked at whose id
+            // followed it, so a tenant could set `logo_url` to another
+            // tenant's (or another tenant's company's) real, currently-served
+            // asset path and have it accepted.
+            super::branding::assert_branding_patch_owned_by_tenant(
+                branding,
+                tenant_id.get(),
+                &self.db,
+            )
+            .await?;
         }
         if request.branding.is_some() {
             // PMS-758: MERGE, not replace. `branding` is a JSONB document and
@@ -2355,6 +2388,13 @@ struct TenantRow {
     trial_ends_at: Option<chrono::DateTime<Utc>>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct TenantListRow {
+    #[sqlx(flatten)]
+    tenant: TenantRow,
+    user_count: i64,
 }
 
 impl From<TenantRow> for Tenant {

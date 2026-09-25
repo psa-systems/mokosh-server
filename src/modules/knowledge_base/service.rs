@@ -36,6 +36,42 @@ impl KbService {
         self
     }
 
+    /// Refuse a parent id that names another tenant's article or the
+    /// article itself. A `None` parent is always accepted (that is the
+    /// "top-level article" state).
+    ///
+    /// Cycle prevention beyond self-reference is deliberately NOT
+    /// enforced here: the SPA today builds one generic-to-client-specific
+    /// hop, and richer trees are out of scope. If a future feature
+    /// admits deeper hierarchies, the walk goes here.
+    async fn validate_parent_article(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        parent_id: Uuid,
+        self_id: Option<Uuid>,
+    ) -> AppResult<()> {
+        if Some(parent_id) == self_id {
+            return Err(AppError::validation_field(
+                "parent_article_id",
+                "an article cannot be its own parent",
+            ));
+        }
+        let found: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM kb_articles WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(parent_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if found.is_none() {
+            return Err(AppError::validation_field(
+                "parent_article_id",
+                "parent article does not exist in this tenant",
+            ));
+        }
+        Ok(())
+    }
+
     /// Reject any `company_ids` entry that is not a company owned by this
     /// tenant, so a `client_specific` article cannot be scoped to another
     /// tenant's company (PMS-341). No-op for an empty set.
@@ -282,6 +318,13 @@ impl KbService {
             q: filter.q.clone(),
             status: None,
             visibility: None,
+            // The company scope is the session's (from the JWT claim
+            // dispatched by the caller), not the request's, so an
+            // incoming `company_id` is ignored here.
+            company_id: None,
+            // A contact browsing the variants of a generic parent is a
+            // legitimate use; pass it through.
+            parent_article_id: filter.parent_article_id,
         };
         self.list_articles_in_scope(
             tenant_id,
@@ -322,6 +365,18 @@ impl KbService {
         }
         if filter.visibility.is_some() {
             conditions.push(format!("visibility = ${idx}"));
+            idx += 1;
+        }
+        if filter.company_id.is_some() {
+            // GIN-backed membership predicate (see the migration): the
+            // filter narrows to `client_specific` articles that name
+            // this company. `public` / `internal` articles never carry
+            // a `company_ids` entry, so they cannot leak through.
+            conditions.push(format!("${idx} = ANY(company_ids)"));
+            idx += 1;
+        }
+        if filter.parent_article_id.is_some() {
+            conditions.push(format!("parent_article_id = ${idx}"));
             idx += 1;
         }
         // Full-text search via pg_trgm word similarity. The `<%`
@@ -372,6 +427,14 @@ impl KbService {
             cq = cq.bind(v);
         }
         if let Some(v) = &filter.visibility {
+            q = q.bind(v);
+            cq = cq.bind(v);
+        }
+        if let Some(v) = filter.company_id {
+            q = q.bind(v);
+            cq = cq.bind(v);
+        }
+        if let Some(v) = filter.parent_article_id {
             q = q.bind(v);
             cq = cq.bind(v);
         }
@@ -433,6 +496,10 @@ impl KbService {
                 request.slug
             )));
         }
+        if let Some(parent_id) = request.parent_article_id {
+            self.validate_parent_article(&mut tx, tenant_id, parent_id, None)
+                .await?;
+        }
         let id = Uuid::new_v4();
         // Stamp published_at when the article is created already
         // published; leave NULL for draft / archived. `NOW()` is applied
@@ -441,9 +508,9 @@ impl KbService {
         sqlx::query(
             r#"INSERT INTO kb_articles
                (id, tenant_id, title, slug, content, summary, category_id, visibility,
-                status, author_id, tags, company_ids, published_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                       CASE WHEN $13 THEN NOW() ELSE NULL END)"#,
+                status, author_id, tags, company_ids, parent_article_id, published_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                       CASE WHEN $14 THEN NOW() ELSE NULL END)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -457,6 +524,7 @@ impl KbService {
         .bind(author_id)
         .bind(&request.tags)
         .bind(&company_ids)
+        .bind(request.parent_article_id)
         .bind(publish_now)
         .execute(&mut *tx)
         .await?;
@@ -566,6 +634,18 @@ impl KbService {
         };
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Parent link, three-state per the request shape: leave alone,
+        // clear, or set. A set is validated against the tenant and
+        // against self-reference; a clear needs no check.
+        let (parent_touch, parent_value): (bool, Option<Uuid>) = match request.parent_article_id {
+            None => (false, None),
+            Some(None) => (true, None),
+            Some(Some(parent_id)) => {
+                self.validate_parent_article(&mut tx, tenant_id, parent_id, Some(id))
+                    .await?;
+                (true, Some(parent_id))
+            }
+        };
         let before = Self::article_snapshot(&mut tx, tenant_id, id).await?;
         let n = sqlx::query(
             r#"UPDATE kb_articles SET
@@ -578,6 +658,7 @@ impl KbService {
                 status = COALESCE($9, status),
                 tags = COALESCE($10, tags),
                 company_ids = $11,
+                parent_article_id = CASE WHEN $13 THEN $14 ELSE parent_article_id END,
                 -- Stamp published_at on the first transition to
                 -- 'published'; leave it untouched once set and for
                 -- draft / archived transitions.
@@ -602,6 +683,8 @@ impl KbService {
         .bind(&request.tags)
         .bind(&company_ids)
         .bind(editor)
+        .bind(parent_touch)
+        .bind(parent_value)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1880,7 +1963,7 @@ const USER_NAME_SQL: &str = "NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''
 /// unambiguous.
 const ARTICLE_SELECT: &str = r#"SELECT kb_articles.id, title, slug, content, summary, category_id, visibility, status,
               author_id, view_count, helpful_count, not_helpful_count,
-              published_at, tags, company_ids, created_at, updated_at,
+              published_at, tags, company_ids, parent_article_id, created_at, updated_at,
               prov.author_name, prov.editor_id AS updated_by_id,
               prov.editor_name AS updated_by_name, prov.current_version
        FROM kb_articles
@@ -1920,6 +2003,7 @@ struct ArticleRow {
     published_at: Option<chrono::DateTime<chrono::Utc>>,
     tags: Option<Vec<String>>,
     company_ids: Option<Vec<Uuid>>,
+    parent_article_id: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1948,6 +2032,7 @@ impl From<ArticleRow> for KbArticleResponse {
             published_at: r.published_at,
             tags: r.tags.unwrap_or_default(),
             company_ids: r.company_ids.unwrap_or_default(),
+            parent_article_id: r.parent_article_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

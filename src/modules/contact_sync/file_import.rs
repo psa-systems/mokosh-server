@@ -443,28 +443,66 @@ impl ContactSyncService {
         Ok(file)
     }
 
-    /// Recent uploads, newest first.
+    /// Recent uploads, newest first. Three queries in one transaction (ids,
+    /// file metadata batch, latest-run batch), not one transaction and two
+    /// queries per row.
     pub async fn vcard_files(
         &self,
         tenant_id: TenantId,
         limit: i64,
     ) -> AppResult<Vec<ImportFileView>> {
-        let ids: Vec<Uuid> = {
-            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-            sqlx::query_scalar(
-                "SELECT id FROM contact_import_files WHERE tenant_id = $1 \
-                 ORDER BY uploaded_at DESC LIMIT $2",
-            )
-            .bind(tenant_id)
-            .bind(limit.clamp(1, 50))
-            .fetch_all(&mut *tx)
-            .await?
-        };
-        let mut files = Vec::with_capacity(ids.len());
-        for id in ids {
-            files.push(self.vcard_file(tenant_id, id).await?);
+        #[derive(sqlx::FromRow)]
+        struct RunRow {
+            import_file_id: Uuid,
+            #[sqlx(flatten)]
+            run: RunStatus,
         }
-        Ok(files)
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM contact_import_files WHERE tenant_id = $1 \
+             ORDER BY uploaded_at DESC LIMIT $2",
+        )
+        .bind(tenant_id)
+        .bind(limit.clamp(1, 50))
+        .fetch_all(&mut *tx)
+        .await?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut files: std::collections::HashMap<Uuid, ImportFileView> = sqlx::query_as(&format!(
+            "SELECT {FILE_COLUMNS} FROM contact_import_files f \
+             LEFT JOIN users u ON u.id = f.uploaded_by_user_id \
+             WHERE f.tenant_id = $1 AND f.id = ANY($2)"
+        ))
+        .bind(tenant_id)
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|file: ImportFileView| (file.id, file))
+        .collect();
+        let mut runs: std::collections::HashMap<Uuid, RunStatus> = sqlx::query_as(&format!(
+            "SELECT DISTINCT ON (import_file_id) import_file_id, {RUN_COLUMNS} \
+             FROM contact_sync_runs \
+             WHERE tenant_id = $1 AND import_file_id = ANY($2) \
+             ORDER BY import_file_id, created_at DESC"
+        ))
+        .bind(tenant_id)
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row: RunRow| (row.import_file_id, row.run))
+        .collect();
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| {
+                let mut file = files.remove(&id)?;
+                file.latest_run = runs.remove(&id);
+                Some(file)
+            })
+            .collect())
     }
 
     /// A held upload that can still be imported.

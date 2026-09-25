@@ -15,6 +15,7 @@ mod common;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -49,7 +50,7 @@ fn install_test_attachment_env() {
     std::env::set_var("ATTACHMENT_MAX_BYTES", "1048576");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn email_intake_stores_attachments(pool: PgPool) {
     install_test_attachment_env();
 

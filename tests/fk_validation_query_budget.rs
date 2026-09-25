@@ -11,6 +11,7 @@
 //! same reason this file holds exactly ONE test: the subscriber is
 //! process-global.
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -83,7 +84,7 @@ impl<S: tracing::Subscriber> Layer<S> for RecordingLayer {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_ticket_validates_every_fk_in_one_query(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(

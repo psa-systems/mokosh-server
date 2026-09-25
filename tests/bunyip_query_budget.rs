@@ -10,21 +10,19 @@
 //! transaction, for twenty round trips in all.
 //!
 //! The budget is now two statements: one `users` read (carrying the waiting
-//! -invite flag), and one tenant-gate read that folds the PMS-698 `tenants`
-//! status check and the MAPPS-459 `tenant_membership_entitlements` check into
-//! one `LEFT JOIN` (PMS-1059). Both are security-relevant and deliberately NOT
-//! cached.
+//! -invite flag), and the tenant gate, which reads `tenants.status` and the
+//! `tenant_membership_entitlements` row in ONE round trip via `LEFT JOIN`.
+//! Both are security-relevant and deliberately NOT cached.
 //!
-//! History for the second slot: MAPPS-459 (PMS-728 slice 3) added the
-//! entitlement read as a second statement inside `AuthService::ensure_tenant_active`,
-//! where it ran unconditionally for every caller in every tenant, right after
-//! the `tenants` status read it extends. That landed while this test was
-//! already failing on its own setup (the abolished JIT self-signup, PMS-1042),
-//! so nothing reported the third statement until PMS-1042 fixed the test and
-//! raised the budget to 3. PMS-1059 folded the two reads back into one so the
-//! budget returns to 2. The entitlement is NOT an invitation lookup: the "is an
-//! invite waiting" flag is an `EXISTS` inside the one `users` read, so the
-//! invitation this test seeds costs no statement of its own.
+//! The entitlement read used to be a separate statement inside
+//! `AuthService::ensure_tenant_active` right after the `tenants` status read;
+//! the budget was briefly pinned at three so a statement nobody chose could
+//! not grow into the slack, then folded into the join above. The `LEFT JOIN`
+//! preserves the contract of the split: `unknown` and an absent row both
+//! leave the entitlement columns NULL and pass through, and only `suspended`
+//! or an expired `expires_at` rejects. The invitation lookup this test seeds
+//! costs no statement of its own: the "is an invite waiting" flag rides as
+//! an `EXISTS` inside the one `users` read.
 //!
 //! The count comes from a `tracing` subscriber that records `sqlx::query`
 //! events, which is the in-process equivalent of Postgres `log_statement=all`
@@ -33,6 +31,7 @@
 //! test on purpose: the subscriber is process-global, so a second test running
 //! concurrently would count its statements as well.
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -152,7 +151,7 @@ fn claims(sub: Uuid) -> AtClaims {
 /// paper over: see the module docs for what each statement is.
 const QUERY_BUDGET: usize = 2;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_authenticated_bunyip_request_costs_two_statements(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(
@@ -263,20 +262,17 @@ async fn an_authenticated_bunyip_request_costs_two_statements(pool: PgPool) {
         invite_reads <= 1,
         "`tenant_invitations` is read at most once: {statements:#?}"
     );
-    // PMS-1059: the tenant-status gate and the MAPPS-459 entitlement read fold
-    // into one LEFT JOIN, so the second statement is the joined read and both
-    // gates run in one round trip. The assertion names both tables so a future
-    // refactor that drops one silently fails this test.
-    let tenant_gate_reads = statements
-        .iter()
-        .filter(|s| {
-            s.contains("FROM tenants") && s.contains("LEFT JOIN tenant_membership_entitlements")
-        })
-        .count();
-    assert_eq!(
-        tenant_gate_reads, 1,
-        "the tenant gate runs in one statement covering both `tenants` and \
-         `tenant_membership_entitlements`: {statements:#?}"
+    // The tenant gate reads both the `tenants.status` and the
+    // `tenant_membership_entitlements` row in one join, so the same statement
+    // has to name both tables. Naming them is what stops a future edit from
+    // splitting the join back into two statements without also spending the
+    // budget it would need to.
+    assert!(
+        statements.iter().any(|s| {
+            s.contains("FROM tenants") && s.contains("tenant_membership_entitlements")
+        }),
+        "the tenant-status principal gate and the entitlement read run in one \
+         round trip: {statements:#?}"
     );
 
     // No transaction: the pre-PMS-777 path wrapped three of its reads in

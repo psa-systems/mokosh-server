@@ -21,6 +21,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -219,7 +220,7 @@ fn field_codes(body: &serde_json::Value) -> Vec<(String, String)> {
     pairs
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn definition_round_trips_with_its_ordered_field_set(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -273,7 +274,7 @@ async fn definition_round_trips_with_its_ordered_field_set(pool: PgPool) {
     assert_eq!(fetched["rules"], created["rules"]);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_submission_is_rejected_with_every_field_error_at_once(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -345,7 +346,7 @@ async fn a_submission_is_rejected_with_every_field_error_at_once(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_valid_submission_is_stored_normalised(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -397,7 +398,7 @@ async fn a_valid_submission_is_stored_normalised(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_definition_is_rejected_when_its_field_set_cannot_work(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -439,7 +440,7 @@ async fn a_definition_is_rejected_when_its_field_set_cannot_work(pool: PgPool) {
 /// condition field's type, so `"true"` has to match a JSON `true` answer, and
 /// an `equals` outside `true`/`false` has to be refused at authoring time
 /// rather than stored as a rule that can never fire.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_boolean_conditioned_rule_fires_and_is_bounded_at_authoring_time(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -521,7 +522,7 @@ async fn a_boolean_conditioned_rule_fires_and_is_bounded_at_authoring_time(pool:
 /// PMS-840 removed `DELETE /forms/{id}`, so `is_active` is the whole
 /// retirement story and this pins both halves of it: a link already in a
 /// client's inbox stops working, and no new link can be sent.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_retired_form_refuses_submissions_and_refuses_new_links(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -590,7 +591,7 @@ async fn a_retired_form_refuses_submissions_and_refuses_new_links(pool: PgPool) 
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn authoring_is_admin_gated_but_sending_a_link_is_not(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (_tech_id, tech_email, tech_password) = common::seed_user(
@@ -664,7 +665,7 @@ async fn authoring_is_admin_gated_but_sending_a_link_is_not(pool: PgPool) {
 /// field that no longer exists. Left unchecked the rule would be silently
 /// inert, so the update path validates whichever rule set is in force against
 /// whichever field set is in force, even when only one of the two changed.
-#[sqlx::test]
+#[mokosh_test]
 async fn replacing_the_field_set_cannot_strand_an_existing_rule(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -744,7 +745,7 @@ async fn replacing_the_field_set_cannot_strand_an_existing_rule(pool: PgPool) {
 /// to answer the same way on both of the server's own write paths. Before this,
 /// create refused an over-length line and update stored it, which made the cap
 /// a suggestion for anyone who edited an existing form.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_over_length_contact_line_is_refused_on_create_and_on_update(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -861,7 +862,7 @@ async fn an_over_length_contact_line_is_refused_on_create_and_on_update(pool: Pg
 /// The compiler is what made this unavoidable: `check_rules_against_fields`
 /// destructured `FormRule` irrefutably, so adding the catch-all broke the build
 /// until someone decided what an unnamed rule means on a write.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_rule_kind_the_server_cannot_name_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -980,7 +981,7 @@ async fn a_rule_kind_the_server_cannot_name_is_refused(pool: PgPool) {
 /// column, which is the backstop, not the contract - it would answer a 500.
 /// The service check is what turns an unknown type into a 422 that names the
 /// field.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_field_type_the_server_cannot_name_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

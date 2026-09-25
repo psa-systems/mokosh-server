@@ -22,6 +22,7 @@
 mod common;
 
 use base64::Engine as _;
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -327,7 +328,7 @@ async fn seed_quote_on_company(
 // tickets:reopen
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_tickets_reopen_can_reopen_own_company_ticket_200(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -370,7 +371,7 @@ async fn contact_with_tickets_reopen_can_reopen_own_company_ticket_200(pool: PgP
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_tickets_reopen_cannot_reopen_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Billing Contact holds NO tickets:reopen (that cap ships to Support Contact only).
@@ -403,7 +404,7 @@ async fn contact_without_tickets_reopen_cannot_reopen_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_tickets_reopen_cannot_reopen_wrong_company_ticket_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _c, _e, token) =
@@ -437,7 +438,7 @@ async fn contact_with_tickets_reopen_cannot_reopen_wrong_company_ticket_404(pool
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_bypasses_reopen_cap_200(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -482,7 +483,7 @@ fn tiny_base64_blob() -> String {
     base64::engine::general_purpose::STANDARD.encode(b"pms-936-payload")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_tickets_attach_file_can_attach_own_company_ticket_200(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -527,7 +528,7 @@ async fn contact_with_tickets_attach_file_can_attach_own_company_ticket_200(pool
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_tickets_attach_file_cannot_attach_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Billing Contact has no tickets:attach_file cap.
@@ -564,7 +565,7 @@ async fn contact_without_tickets_attach_file_cannot_attach_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_tickets_attach_file_cannot_attach_wrong_company_ticket_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _c, _e, token) =
@@ -602,7 +603,7 @@ async fn contact_with_tickets_attach_file_cannot_attach_wrong_company_ticket_404
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_bypasses_attach_file_cap_200(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -651,7 +652,7 @@ async fn staff_bypasses_attach_file_cap_200(pool: PgPool) {
 /// serves a real document now, so the assertion moved to the document
 /// itself. A gate this test exists to pin cannot be proved by a status a
 /// gateless handler would also produce.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_invoices_download_pdf_is_served(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -677,7 +678,7 @@ async fn contact_with_invoices_download_pdf_is_served(pool: PgPool) {
 /// used to sit on a foreign one, which meant a handler that had lost its
 /// gate still answered the 404 the Company scope gives - the row passed
 /// without the gate it was written to pin.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_invoices_download_pdf_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Support Contact has no invoices:* caps.
@@ -699,7 +700,7 @@ async fn contact_without_invoices_download_pdf_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_invoices_download_pdf_foreign_company_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _c, _e, token) =
@@ -722,7 +723,7 @@ async fn contact_with_invoices_download_pdf_foreign_company_404(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_bypasses_invoices_download_pdf_cap(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -748,7 +749,7 @@ async fn staff_bypasses_invoices_download_pdf_cap(pool: PgPool) {
 // assets:report_issue
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_assets_report_issue_can_file_own_company_ticket_200(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -790,7 +791,7 @@ async fn contact_with_assets_report_issue_can_file_own_company_ticket_200(pool: 
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_assets_report_issue_cannot_report_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Read-Only holds assets:read but not assets:report_issue.
@@ -814,7 +815,7 @@ async fn contact_without_assets_report_issue_cannot_report_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_assets_report_issue_cannot_report_wrong_company_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _c, _e, token) =
@@ -839,7 +840,7 @@ async fn contact_with_assets_report_issue_cannot_report_wrong_company_404(pool: 
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_bypasses_assets_report_issue_cap_200(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -877,7 +878,7 @@ async fn staff_bypasses_assets_report_issue_cap_200(pool: PgPool) {
 // quotes:download_pdf (501 stub)
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_quotes_download_pdf_reaches_stub_501(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -900,7 +901,7 @@ async fn contact_with_quotes_download_pdf_reaches_stub_501(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_quotes_download_pdf_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Support Contact has no quotes:* caps.
@@ -925,7 +926,7 @@ async fn contact_without_quotes_download_pdf_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_quotes_download_pdf_foreign_company_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _c, _e, token) =
@@ -950,7 +951,7 @@ async fn contact_with_quotes_download_pdf_foreign_company_404(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_bypasses_quotes_download_pdf_cap_501(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

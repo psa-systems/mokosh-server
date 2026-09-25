@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -106,7 +107,7 @@ fn invoice(company_id: Uuid, lines: Vec<Value>) -> Value {
 
 /// With a 13% default, tax lands on the taxable subtotal only, rounded half
 /// away from zero, and the invoice records the rate it used.
-#[sqlx::test]
+#[mokosh_test]
 async fn tax_is_the_default_rate_over_the_taxable_lines(pool: PgPool) {
     let (_, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -146,7 +147,7 @@ async fn tax_is_the_default_rate_over_the_taxable_lines(pool: PgPool) {
 
 /// The rate is frozen on the invoice: editing the tenant's rate afterwards
 /// changes nothing already written, and a new invoice picks the new rate.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_later_rate_change_does_not_reprice_an_invoice(pool: PgPool) {
     let (_, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -187,7 +188,7 @@ async fn a_later_rate_change_does_not_reprice_an_invoice(pool: PgPool) {
 }
 
 /// A product line takes the product's own flag, whatever the request says.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_product_line_copies_the_products_taxability(pool: PgPool) {
     let (_, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -226,7 +227,7 @@ async fn a_product_line_copies_the_products_taxability(pool: PgPool) {
 
 /// The two server-built writers, which wrote zero tax before, carry the
 /// default rate's tax.
-#[sqlx::test]
+#[mokosh_test]
 async fn server_built_invoices_carry_the_default_rates_tax(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -306,7 +307,7 @@ async fn server_built_invoices_carry_the_default_rates_tax(pool: PgPool) {
 
 /// A given amount is stored as given and records no rate; a tenant still on
 /// the seeded `No Tax` default gets zero, as before.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_given_amount_wins_and_no_tax_stays_zero(pool: PgPool) {
     let (_, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -342,7 +343,7 @@ async fn a_given_amount_wins_and_no_tax_stays_zero(pool: PgPool) {
 /// Replacing a draft's lines re-derives the tax; an update that touches
 /// neither lines nor rate nor amount leaves it alone; a foreign or retired
 /// rate is refused.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_update_rederives_only_when_asked(pool: PgPool) {
     let (_, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

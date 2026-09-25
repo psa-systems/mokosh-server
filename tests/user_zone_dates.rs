@@ -12,6 +12,7 @@
 mod common;
 
 use chrono::{DateTime, NaiveDate, Utc};
+use mokosh_test::mokosh_test;
 use mokosh_types::datetime::user_today;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -107,7 +108,7 @@ async fn two_admins(pool: &PgPool, app_pool: PgPool) -> (common::TestApp, [(Uuid
 
 /// An invoice built from time entries with no `invoice_date` is dated today
 /// where the finance user is, and the PMS-990 due date counts from there.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_invoice_from_time_entries_is_dated_on_the_users_day(pool: PgPool) {
     let (app, users) = two_admins(&pool, pool.clone()).await;
     let mut dates = Vec::new();
@@ -144,7 +145,7 @@ async fn an_invoice_from_time_entries_is_dated_on_the_users_day(pool: PgPool) {
 }
 
 /// A credit note with no `issue_date` is issued today where the user is.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_credit_note_is_issued_on_the_users_day(pool: PgPool) {
     let (app, users) = two_admins(&pool, pool.clone()).await;
     let mut dates = Vec::new();
@@ -202,7 +203,7 @@ async fn a_credit_note_is_issued_on_the_users_day(pool: PgPool) {
 
 /// A stopped timer's entry is dated by the day it is where the timer's
 /// owner is.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_stopped_timer_is_dated_on_its_owners_day(pool: PgPool) {
     let (app, users) = two_admins(&pool, pool.clone()).await;
     let mut dates = Vec::new();
@@ -245,7 +246,7 @@ async fn a_stopped_timer_is_dated_on_its_owners_day(pool: PgPool) {
 /// from 10:00 UTC), one valid through UTC's yesterday (the west reader is
 /// still on it until 12:00 UTC). Between them, at every hour of the day at
 /// least one verdict differs from the UTC rule's.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_quote_expires_on_the_readers_day(pool: PgPool) {
     let (app, [(_, east), (_, west)]) = two_admins(&pool, pool.clone()).await;
     let company_id = common::seed_company(&pool).await;
@@ -311,7 +312,7 @@ async fn a_quote_expires_on_the_readers_day(pool: PgPool) {
 
 /// An invoice that names no currency is issued in the tenant's default,
 /// and one that names a currency keeps it.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_invoice_is_issued_in_the_tenants_default_currency(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

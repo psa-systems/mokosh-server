@@ -15,6 +15,7 @@
 mod common;
 
 use common::DEFAULT_TENANT_ID;
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -30,7 +31,7 @@ const SECRET_SUBSTRINGS: &[&str] = &[
     "private_key",
 ];
 
-#[sqlx::test]
+#[mokosh_test]
 async fn export_import_round_trip_remaps_ids_and_leaks_no_secrets(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
 

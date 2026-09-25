@@ -1011,6 +1011,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(3600),
     );
 
+    // Retention for `status_observations`: cross-tenant sweep that drops
+    // rows older than the documented window (13 months). Runs every 6
+    // hours: rare enough that a slow scan does not compete with the
+    // reporting queries, frequent enough that a deployment that was
+    // offline for a day still catches up on its own.
+    let status_retention_worker = mokosh_server::modules::status::StatusRetentionWorker::new(
+        mokosh_server::modules::status::StatusService::new(db.clone()),
+    );
+    scheduler.register(
+        status_retention_worker,
+        std::time::Duration::from_secs(6 * 3600),
+    );
+
     let _scheduler_handles = scheduler.start();
 
     // PMS-657: build the IP -> country resolver for login-location alerts.

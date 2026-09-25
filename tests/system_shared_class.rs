@@ -12,10 +12,11 @@
 //! and given its policy by `095`, long after `039` ran.
 //!
 //! Like `rls_isolation.rs`, the policy assertions run under a dedicated
-//! `NOSUPERUSER NOBYPASSRLS` role, because `#[sqlx::test]` connects as the
-//! superuser, which bypasses RLS unconditionally. Each `#[sqlx::test]` gets its
+//! `NOSUPERUSER NOBYPASSRLS` role, because `#[mokosh_test]` connects as the
+//! superuser, which bypasses RLS unconditionally. Each `#[mokosh_test]` gets its
 //! own database, so the opt-in's schema change does not leak into other tests.
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -57,7 +58,7 @@ async fn tenant_isolation_qual(conn: &mut sqlx::PgConnection, table: &str) -> St
     .expect("read tenant_isolation policy expression")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn opting_in_a_post_039_table_makes_global_rows_readable(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire dedicated connection");
 
@@ -246,7 +247,7 @@ async fn opting_in_a_post_039_table_makes_global_rows_readable(pool: PgPool) {
         .expect("drop role");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn opting_in_a_tenantless_table_raises_and_leaves_its_policy_alone(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire dedicated connection");
 

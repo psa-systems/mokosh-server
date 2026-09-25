@@ -276,7 +276,7 @@ pub struct TenantAdminInfo {
 }
 
 /// Tenant response for API
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantResponse {
     pub id: Uuid,
     pub name: String,
@@ -289,10 +289,26 @@ pub struct TenantResponse {
     pub trial_ends_at: Option<DateTime<Utc>>,
     pub branding: TenantBranding,
     pub created_at: DateTime<Utc>,
+    /// Number of `users` rows in this tenant. Filled by the list endpoint so
+    /// the super-admin surface can render a live count; single-tenant reads
+    /// don't compute it and return zero. `#[serde(default)]` so the SPA can
+    /// deserialize a response from a server that predates this field.
+    #[serde(default)]
+    pub user_count: i64,
 }
 
 impl From<Tenant> for TenantResponse {
     fn from(t: Tenant) -> Self {
+        Self::from_tenant(t, 0)
+    }
+}
+
+impl TenantResponse {
+    /// Build a response with the caller-supplied user count. The list
+    /// endpoint computes it via a subquery; a bare `From<Tenant>` conversion
+    /// falls back to zero because the single-tenant read paths don't compute
+    /// the count and the SPA doesn't show it there.
+    pub fn from_tenant(t: Tenant, user_count: i64) -> Self {
         Self {
             id: t.id,
             name: t.name,
@@ -305,6 +321,7 @@ impl From<Tenant> for TenantResponse {
             trial_ends_at: t.trial_ends_at,
             branding: t.branding,
             created_at: t.created_at,
+            user_count,
         }
     }
 }

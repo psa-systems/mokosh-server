@@ -14,6 +14,7 @@ use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::billing::BillingService;
 use mokosh_server::modules::contracts::ContractsService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -88,7 +89,7 @@ async fn periods_billed(pool: &PgPool, contract: Uuid) -> Vec<NaiveDate> {
 
 /// At 13:00Z on 30 June, Vancouver is still on June and Auckland is already
 /// on July. The generator bills the period the TENANT is in.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_recurring_generator_bills_the_period_the_tenant_is_in(pool: PgPool) {
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
     let company = common::seed_company(&pool).await;
@@ -132,7 +133,7 @@ async fn the_recurring_generator_bills_the_period_the_tenant_is_in(pool: PgPool)
 
 /// A contract ending 30 June is still in force at 13:00Z that day in
 /// Vancouver, and over in Auckland.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contract_expires_on_its_tenants_day(pool: PgPool) {
     let company = common::seed_company(&pool).await;
     let contract = seed_contract(&pool, company, ymd(2026, 1, 1), Some(ymd(2026, 6, 30))).await;
@@ -160,7 +161,7 @@ async fn a_contract_expires_on_its_tenants_day(pool: PgPool) {
 }
 
 /// A tenant with no default business-hours row keeps the UTC day it always had.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_with_no_business_hours_stays_on_utc(pool: PgPool) {
     // The seeded row is named by an SLA policy, so it cannot go; the reader
     // keys on `is_default`, and a tenant with no default row has no zone.

@@ -15,6 +15,7 @@ mod common;
 
 use mokosh_server::modules::tenants::TenantService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -67,7 +68,7 @@ async fn primary_link_of(pool: &PgPool, contact_id: Uuid) -> Option<Uuid> {
 /// The company association is the whole value of an auto-created contact: it is
 /// what ties the sender's tickets to a customer. Losing it is silent from the
 /// row's point of view, because nothing was removed.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_email_intake_contact_keeps_its_company_when_edited(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let fallback_company = common::seed_company(&pool).await;
@@ -171,7 +172,7 @@ async fn an_email_intake_contact_keeps_its_company_when_edited(pool: PgPool) {
 /// Without the fix the first edit nulls `company_id`, and the grant then mints a
 /// token, commits it, and drops the email with a WARN: a redeemable link nobody
 /// was sent.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_provisioned_portal_admin_contact_is_still_mailable_after_an_edit(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -270,7 +271,7 @@ async fn a_provisioned_portal_admin_contact_is_still_mailable_after_an_edit(pool
 /// list the caller actually sent. Without this pin, widening it to "never null a
 /// non-null company_id" would look equally correct and would make unlinking
 /// impossible.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_explicit_empty_company_list_still_unlinks_the_contact(pool: PgPool) {
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

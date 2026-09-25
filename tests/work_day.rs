@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -90,7 +91,7 @@ async fn log_time(app: &common::TestApp, token: &str, body: Value) -> Value {
 
 /// Clock in, lunch, clock out: the day is work, break, work, and every
 /// transition is answered with the segment it opened or closed.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_full_day_with_a_break_is_work_break_work(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     track_breaks(&pool).await;
@@ -166,7 +167,7 @@ async fn a_full_day_with_a_break_is_work_break_work(pool: PgPool) {
 /// "Already clocked in; clock out first" with nothing naming the day, and the
 /// day view answered with yesterday without saying so - so the cheapest
 /// reading was to clock out now, which records the whole night as worked.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_clock_left_running_says_which_day_is_in_the_way(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -205,7 +206,7 @@ async fn a_clock_left_running_says_which_day_is_in_the_way(pool: PgPool) {
 
 /// The other two sources, so `date_source` is not a field that only ever says
 /// one thing.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_day_says_where_its_date_came_from(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -232,7 +233,7 @@ async fn the_day_says_where_its_date_came_from(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn clocking_in_twice_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -259,7 +260,7 @@ async fn clocking_in_twice_is_refused(pool: PgPool) {
 
 /// The open state is the server's, not the client's: a day view with no date
 /// finds the day of the open segment, even when that day is not today.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_open_day_survives_a_reload(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -283,7 +284,7 @@ async fn the_open_day_survives_a_reload(pool: PgPool) {
 
 /// A person may go home from lunch: clocking out while on a break closes the
 /// break, and the day ends there.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_day_may_end_on_a_break(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     track_breaks(&pool).await;
@@ -312,7 +313,7 @@ async fn a_day_may_end_on_a_break(pool: PgPool) {
 
 /// With break tracking off (the default), the break routes read as routes
 /// that do not exist, and the day view says so, so a client offers no control.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_break_is_not_offered_when_tracking_is_off(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -346,7 +347,7 @@ async fn a_break_is_not_offered_when_tracking_is_off(pool: PgPool) {
 /// The day's entries read by what they are attached to. Non-ticket,
 /// non-project time is Administrative and carries `entry_kind = 'employee'`
 /// (PMS-942); the gap between clocked and logged is reported, not resolved.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_day_breaks_down_by_ticket_project_and_administrative(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -429,7 +430,7 @@ async fn the_day_breaks_down_by_ticket_project_and_administrative(pool: PgPool) 
 
 /// With the flag off, every route here is answered the way a nonexistent
 /// route is. Not hidden in the client, not 403.
-#[sqlx::test]
+#[mokosh_test]
 async fn every_work_day_route_is_gone_when_the_flag_is_off(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     set_flag(&pool, false).await;
@@ -485,7 +486,7 @@ async fn every_work_day_route_is_gone_when_the_flag_is_off(pool: PgPool) {
 }
 
 /// A technician's day is their own; an admin may read anyone's.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_technician_sees_only_their_own_day(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (tech_id, tech_email, tech_password) = common::seed_user(
@@ -520,7 +521,7 @@ async fn a_technician_sees_only_their_own_day(pool: PgPool) {
 /// at least one of them is on a different calendar day from UTC; asserting
 /// both against `user_today` and one of them against UTC pins that the
 /// server read `users.timezone` rather than the clock on the wall.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_default_day_is_the_users_own_not_utc(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let (tech_id, tech_email, tech_password) = common::seed_user(

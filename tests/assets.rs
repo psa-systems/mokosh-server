@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -74,7 +75,7 @@ async fn create_asset(
 
 // AC1/AC2: asset-type + asset CRUD, tenant-scoped and filterable, with an
 // audit-log row written on mutation.
-#[sqlx::test]
+#[mokosh_test]
 async fn asset_crud_and_filtering(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
@@ -161,7 +162,7 @@ async fn asset_crud_and_filtering(pool: PgPool) {
 }
 
 // AC3: asset relationships with the four relationship types.
-#[sqlx::test]
+#[mokosh_test]
 async fn asset_relationships(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
@@ -211,7 +212,7 @@ async fn asset_relationships(pool: PgPool) {
 
 // AC4 (credentials): encrypted at rest, NEVER leaked in a list, reveal is
 // authz-gated + audited.
-#[sqlx::test]
+#[mokosh_test]
 async fn credential_round_trip_no_plaintext_in_list(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
@@ -304,7 +305,7 @@ async fn credential_round_trip_no_plaintext_in_list(pool: PgPool) {
 
 // AC4 (configuration items): encrypted, value never leaked in a list,
 // reveal decrypts it.
-#[sqlx::test]
+#[mokosh_test]
 async fn configuration_item_round_trip_no_plaintext_in_list(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
@@ -366,7 +367,7 @@ async fn configuration_item_round_trip_no_plaintext_in_list(pool: PgPool) {
 // as the delete, and that row survives the asset's removal (migration 042 drops
 // the cascade FK and widens the action CHECK to allow 'deleted'). Regression
 // guard for the CHECK-violation bug where every deletion 500'd.
-#[sqlx::test]
+#[mokosh_test]
 async fn delete_asset_writes_surviving_deleted_audit_row(pool: PgPool) {
     let (_aid, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;
@@ -445,7 +446,7 @@ async fn delete_asset_writes_surviving_deleted_audit_row(pool: PgPool) {
 /// page can be paged (MAPPS-546) would, on name-only matching, have silently
 /// dropped serial search - and a serial is the string an operator is most
 /// likely to paste into an asset search, off a sticker on the hardware.
-#[sqlx::test]
+#[mokosh_test]
 async fn asset_search_matches_serial_numbers(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool, "Acme Co").await;

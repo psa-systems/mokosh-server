@@ -23,6 +23,7 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 | [`e2e.md`](e2e.md) | The end-to-end suite: how it is wired, how to run it, and the failure modes you will actually hit. |
 | [`providers.md`](providers.md) | The selectable-implementation seam every provider follows: provider kinds, the three bootstrap-order tiers, priority, boot classifications, refresh, and the migrate-verify-purge workflow. |
 | [`ROADMAP.md`](ROADMAP.md) | Durable narrative: goals, phases, sequencing and the reasoning behind the order for the provider rollout. |
+| [`upgrade-blocked-by-duplicates.md`](upgrade-blocked-by-duplicates.md) | What to do when an upgrade stops because a migration cannot build a unique index over rows that predate it: the detect and repair queries for all five such indexes, and why the fix cannot live in a migration. |
 | [`operator-provider-runbook.md`](operator-provider-runbook.md) | The six-step operator workflow for moving a governed secret to a new provider. |
 
 ## Internal notes

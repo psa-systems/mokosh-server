@@ -166,6 +166,7 @@ mod server_impl {
     const RAW_BODY_PATHS: &[&str] = &[
         "/api/v1/bunyip/",
         "/api/v1/rmm/alerts",
+        "/api/v1/rmm/status",
         "/api/v1/stripe/",
         // PMS-969: not an HMAC, but the same bargain. PayPal verifies a
         // delivery by being sent the body back and comparing it to what it
@@ -495,14 +496,15 @@ mod server_impl {
 
         #[test]
         fn every_signature_verified_path_is_exempt() {
-            // Guards the four verify-over-raw-bytes receivers. If a fifth is
-            // added without a `RAW_BODY_PATHS` entry, its verification starts
-            // failing; this at least pins the four that exist.
+            // Guards every verify-over-raw-bytes receiver. If a new one is
+            // added without a `RAW_BODY_PATHS` entry, its verification
+            // starts failing; this at least pins the ones that exist.
             for path in [
                 "/api/v1/stripe/webhooks/00000000-0000-0000-0000-000000000001",
                 "/api/v1/paypal/webhooks/00000000-0000-0000-0000-000000000001",
                 "/api/v1/bunyip/webhooks/account-deleted",
                 "/api/v1/rmm/alerts",
+                "/api/v1/rmm/status",
             ] {
                 assert!(
                     RAW_BODY_PATHS.iter().any(|p| path.starts_with(p)),

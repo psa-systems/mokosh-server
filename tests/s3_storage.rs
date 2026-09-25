@@ -18,6 +18,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::OnceLock;
 
 use mokosh_server::storage::s3::S3Provider;
@@ -177,7 +178,7 @@ async fn two_tenants_cannot_reach_each_others_objects() {
 /// Backend selection, end to end: with `STORAGE_BACKEND=s3` an upload through
 /// the API lands in the bucket and NOT on the filesystem, and the download
 /// streams it back from there.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_upload_through_the_api_lands_in_the_bucket_and_not_on_disk(pool: PgPool) {
     let Some(store) = s3().await else { return };
     std::env::set_var("ATTACHMENT_MAX_BYTES", "1048576");

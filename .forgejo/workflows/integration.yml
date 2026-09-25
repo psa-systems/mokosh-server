@@ -8,6 +8,24 @@
 # DEV-612: pull_request only. The `push: main` run landed after the merge, so it
 # gated nothing, and re-ran a 440s suite against a tree the pull-request run had
 # usually already tested. scripts/check-single-build.nu fails if it comes back.
+#
+# PMS-1394: this job runs the SUPPORTED suites. The tests for functionality
+# nothing currently uses run weekly in `integration-unsupported.yml` instead,
+# because standing their dependencies up costs this job time on every pull
+# request for coverage of a path no deployment takes. Today that is
+# `tests/s3_storage.rs` and the MinIO the S3 backend needs, which also broke
+# every branch at once when its third-party image source retracted anonymous
+# pulls (PMS-1390).
+#
+# Which suites those are is NOT decided here. `.config/nextest.toml` carries
+# the split as a `default-filter` on the `ci` profile, so this job names a
+# profile and never a suite, and `just test-integration` selects the identical
+# set without either of them repeating the expression.
+#
+# The binaries are still BUILT here. `cargo nextest archive` compiles every
+# `tests/*.rs` target whatever the filter says, so a change that stops an
+# unsupported suite compiling still fails the pull request; only its
+# assertions moved.
 name: Integration
 
 on:
@@ -31,9 +49,10 @@ jobs:
     # 10-minute run target plus checkout and cache upload with headroom.
     timeout-minutes: 30
 
-    # Postgres service for `cargo test --tests`. `#[sqlx::test]` creates a
-    # fresh database per invocation against the URL in DATABASE_URL, so
-    # this single instance fans out to all integration tests.
+    # Postgres service for `cargo test --tests`. `#[mokosh_test]` migrates one
+    # template database against the URL in DATABASE_URL and clones a fresh
+    # database per invocation from it, so this single instance fans out to all
+    # integration tests.
     #
     # The Forgejo Actions runner puts the job container and its service
     # containers on a shared bridge network; services are reachable from
@@ -118,8 +137,8 @@ jobs:
         # logged `No cache found` on 2026-09-17, per DEV-758). A pinned
         # release archive replaces it. get.nexte.st publishes no checksum
         # file, so the archive's SHA-256 is pinned here and verified with
-        # `sha256sum --check --strict`, the same pattern the MinIO step below
-        # uses for the same reason.
+        # `sha256sum --check --strict`, the same pattern the MinIO step in
+        # `integration-unsupported.yml` uses for the same reason.
         #
         # `ghcr.io/niceguyit/rust-builder-glibc` sets CARGO_HOME=/usr/local/cargo
         # and puts only that on PATH, not `~/.cargo/bin` (`~` is `/root` in
@@ -147,89 +166,15 @@ jobs:
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
 
-      - name: Start MinIO for the S3 storage suite
-        # PMS-958. `tests/s3_storage.rs` round-trips the S3 backend against a
-        # real object store and skips (loudly) when S3_ENDPOINT is unset, so
-        # this step is what makes it run here. A `services:` entry cannot do
-        # it: the MinIO image carries no command, `server /data` has to be
-        # passed, and Forgejo (like GitHub) service containers have no
-        # `command` key and `--entrypoint` takes a binary without arguments.
-        # So the pinned release binary runs in the job.
-        #
-        # The binary comes OUT OF THE IMAGE rather than from a download.
-        # MinIO archived the open-source server, and dl.min.io now answers 410
-        # Gone for every community release and hotfix, the pinned one included
-        # ("These files are no longer served from this site"), which broke this
-        # job on every branch at once. The GitHub release assets are gone too.
-        # The container image is still published, and it is the same artefact:
-        # the binary extracted below hashes to exactly the MINIO_SHA256 the
-        # withdrawn URL used to serve, which is why that line is unchanged.
-        #
-        # Pinned by IMAGE DIGEST, not by tag, so a re-push under the same tag
-        # cannot change what runs here; the checksum stays as the second belt.
-        # `docker create` + `docker cp` rather than `docker run`, because the
-        # job container and a sibling container are not on the same network by
-        # default, and taking the binary out keeps the health check on
-        # 127.0.0.1 where the rest of this step already expects it. Jobs reach
-        # the runner's daemon (`container.docker_host: "-"`), which is the same
-        # access `build-oci-image.yml` uses.
-        #
-        # `compose.dev.yml` already runs this image for `just dev-s3`, so dev
-        # and CI now take MinIO from one place. Bump the digest and the
-        # checksum together, and the compose tag with them.
-        #
-        # Only this suite sets STORAGE_BACKEND=s3, in its own process; the
-        # variables below are read by nothing else, so every other suite
-        # keeps exercising the local backend.
-        env:
-          MINIO_IMAGE: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-          MINIO_SHA256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
-        run: |
-          set -euo pipefail
-          if [ "$(uname -m)" != "x86_64" ]; then
-            echo "::error::MinIO pin is for linux-amd64; runner is $(uname -m)"
-            exit 1
-          fi
-          docker pull --quiet "${MINIO_IMAGE}"
-          container="$(docker create "${MINIO_IMAGE}")"
-          # Removed even when the copy fails, or a retried job leaks a
-          # container per attempt onto the shared runner daemon.
-          trap 'docker rm --volumes "${container}" > /dev/null 2>&1 || true' EXIT
-          docker cp "${container}":/usr/bin/minio /tmp/minio
-          echo "${MINIO_SHA256}  /tmp/minio" | sha256sum --check --strict
-          chmod +x /tmp/minio
-          mkdir -p /tmp/minio-data
-          MINIO_ROOT_USER=mokosh MINIO_ROOT_PASSWORD=mokosh-ci-password \
-            nohup /tmp/minio server /tmp/minio-data --address 127.0.0.1:9000 \
-            > /tmp/minio.log 2>&1 &
-          for _ in $(seq 1 30); do
-            if curl --silent --fail http://127.0.0.1:9000/minio/health/live > /dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl --silent --fail http://127.0.0.1:9000/minio/health/live > /dev/null || {
-            echo "::error::MinIO did not become healthy; log follows"
-            cat /tmp/minio.log
-            exit 1
-          }
-          {
-            echo "S3_ENDPOINT=http://127.0.0.1:9000"
-            echo "S3_BUCKET=mokosh-ci"
-            echo "S3_REGION=us-east-1"
-            echo "S3_PATH_STYLE=true"
-            echo "S3_ACCESS_KEY_ID=mokosh"
-            echo "S3_SECRET_ACCESS_KEY=mokosh-ci-password"
-          } >> "$GITHUB_ENV"
-
       - name: Disable Postgres durability
         # PMS-1251: this `postgres` service is thrown away with the job, so
         # fsync/synchronous_commit/full_page_writes buy crash safety this
         # database never needs to survive into. Measured locally against
         # postgres:18.2-alpine3.23 on 2026-09-17: the 229-migration run drops
         # from 1.12-1.32s to 0.60-0.71s and `CREATE DATABASE ... TEMPLATE`
-        # from 104-146ms to 35-39ms, a cost `#[sqlx::test]` pays about 1,300
-        # times per run (one database per invocation). Kept out of
+        # from 104-146ms to 35-39ms. PMS-1254 moved the migration run to once
+        # per job, so what is paid about 1,300 times per run is now the clone.
+        # Kept out of
         # scripts/test-db-roles.sql, which also runs against the dev cluster,
         # whose data a developer keeps. All three settings are reloadable, so
         # no restart is needed. ON_ERROR_STOP is not optional, for the same
@@ -246,8 +191,8 @@ jobs:
       - name: Create the DB roles the migrations grant to
         # PMS-988: migration 207 (`app_secrets`) ends with `GRANT ... TO
         # mokosh_app`, and Postgres rejects a GRANT to a role that does not
-        # exist (42704), so every `#[sqlx::test]` in the suite failed at
-        # migration 207 before its body ran. A real deployment never reaches
+        # exist (42704), so every test in the suite failed at migration 207
+        # before its body ran. A real deployment never reaches
         # that: `provision_roles` creates the split roles at startup, before
         # the migrations run. This job has no server startup, so the step that
         # prepares the cluster creates the role instead. The statement lives in
@@ -293,6 +238,27 @@ jobs:
             fi
           fi
           exit "${status}"
+
+      - name: Build the template every test clones
+        # PMS-1254: the 243 migrations are applied ONCE per run, into a
+        # template database named after a digest of the migration files, and
+        # each case is then a `CREATE DATABASE ... TEMPLATE` clone of it. The
+        # suite builds the template by itself when it finds none, under an
+        # advisory lock, so this step is not what makes the run correct; it is
+        # what makes the run legible. Done here, the build happens in a step of
+        # the job rather than inside whichever case arrived first with every
+        # other case waiting on the lock, and the line naming the template is
+        # printed where a reader can see it instead of into one case's captured
+        # output. That line, printed only by the process that did the build, is
+        # the evidence that the migrations ran once rather than 1,300 times.
+        #
+        # Run out of the archive the previous step built, so it compiles
+        # nothing: `--no-capture` is what lets the line through, and it forces
+        # a single thread, which is why it is a filtered run of its own rather
+        # than a flag on the suite.
+        run: |
+          cargo nextest run --archive-file /tmp/nextest-archive.tar.zst --profile ci \
+            --no-capture -E 'binary(template_database)'
 
       - name: Integration tests
         # PMS-1177: `cargo nextest run --archive-file` runs every case from

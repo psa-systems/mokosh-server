@@ -14,6 +14,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -117,7 +118,7 @@ async fn generate(app: &common::TestApp, token: &str, company_id: Uuid) -> (u16,
 
 /// A company with nothing at all still gets the original sentence, because it
 /// is the one case in which it is true.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_company_with_no_time_at_all_is_told_exactly_that(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -136,7 +137,7 @@ async fn a_company_with_no_time_at_all_is_told_exactly_that(pool: PgPool) {
 /// The headline of PMS-944. Log an hour, invoice it. No submit, no approve, and
 /// nothing in between - which is also the case PMS-933's message existed to
 /// explain away, and now simply does not arise.
-#[sqlx::test]
+#[mokosh_test]
 async fn logged_billable_time_invoices_with_no_approval_step(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -163,7 +164,7 @@ async fn logged_billable_time_invoices_with_no_approval_step(pool: PgPool) {
 /// Time deliberately logged as non-billable. The entry exists, so the message
 /// must not deny it, and the fix is a decision to revisit rather than hours to
 /// re-log.
-#[sqlx::test]
+#[mokosh_test]
 async fn non_billable_time_is_named_rather_than_denied(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -186,7 +187,7 @@ async fn non_billable_time_is_named_rather_than_denied(pool: PgPool) {
 
 /// Already invoiced is the opposite problem: nothing is missing. Sending this
 /// user to log hours would have them bill the same work twice.
-#[sqlx::test]
+#[mokosh_test]
 async fn already_invoiced_time_does_not_ask_for_more_hours(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -221,7 +222,7 @@ async fn already_invoiced_time_does_not_ask_for_more_hours(pool: PgPool) {
 /// PMS-944. A billable, uninvoiced row that is not armed cannot be produced by
 /// the app any more, but it is exactly what every pre-PMS-944 row looked like,
 /// and answering "you have none" about it is the failure MAPPS-598 reported.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unarmed_entry_is_reported_rather_than_denied(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -245,7 +246,7 @@ async fn an_unarmed_entry_is_reported_rather_than_denied(pool: PgPool) {
 /// the gate any more, so pointing the reader at the approvals queue sends them
 /// to a screen that cannot help - the same failure MAPPS-598 reported, aimed
 /// the other way.
-#[sqlx::test]
+#[mokosh_test]
 async fn no_message_sends_the_user_to_a_timesheet(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

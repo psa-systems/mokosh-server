@@ -11,6 +11,7 @@
 mod common;
 
 use chrono::NaiveDate;
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -182,7 +183,7 @@ fn row<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
         .unwrap_or_else(|| panic!("no row for {name} in {report}"))
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn time_aggregates_by_request_type_and_respects_the_period(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -239,7 +240,7 @@ async fn time_aggregates_by_request_type_and_respects_the_period(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_request_type_with_no_tracked_time_reports_no_data_not_zero(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -293,7 +294,7 @@ async fn a_request_type_with_no_tracked_time_reports_no_data_not_zero(pool: PgPo
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn the_article_surfaces_the_measured_duration_and_excludes_ad_hoc_tickets(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -382,7 +383,7 @@ async fn the_article_surfaces_the_measured_duration_and_excludes_ad_hoc_tickets(
 
 /// PMS-772: the report is discoverable in the registry and exportable through
 /// the shared exporter, and the registry names the one key that is not.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_report_is_registered_and_exports_csv(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

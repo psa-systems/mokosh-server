@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -225,7 +226,7 @@ impl Fixture {
 
 /// Choose labels, start an import, and the worker - not the request - does
 /// it. Progress is on the row the client polls.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_import_is_queued_by_a_request_and_done_by_the_worker(pool: PgPool) {
     let f = Fixture::new(pool, &[]).await;
 
@@ -300,7 +301,7 @@ async fn an_import_is_queued_by_a_request_and_done_by_the_worker(pool: PgPool) {
 
 /// A run whose process died mid-import is picked up again and lands exactly
 /// once: the records the dead run applied replay as no-ops.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_run_interrupted_mid_import_resumes_and_lands_once(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let everyone: Vec<SourceContact> = (1..=30).map(person).collect();
@@ -354,7 +355,7 @@ async fn a_run_interrupted_mid_import_resumes_and_lands_once(pool: PgPool) {
 }
 
 /// Being rate limited is not failing: the run waits and retries by itself.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_rate_limited_run_waits_instead_of_failing(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     f.script.push(Err(SourceError::Throttled));
@@ -372,7 +373,7 @@ async fn a_rate_limited_run_waits_instead_of_failing(pool: PgPool) {
 
 /// Some records failing is reported as exactly that: what landed, what did
 /// not and why, and the cursor held so the next sync retries them.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_partial_failure_reports_what_landed_and_what_did_not(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     sqlx::query(
@@ -407,7 +408,7 @@ async fn a_partial_failure_reports_what_landed_and_what_did_not(pool: PgPool) {
 
 /// A connection that keeps failing says so on the card, and somebody is told
 /// once per streak rather than once per interval.
-#[sqlx::test]
+#[mokosh_test]
 async fn repeated_failure_is_visible_and_notifies_once(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let notified = "SELECT count(*) FROM notifications n JOIN notification_templates t ON t.id = n.template_id \
@@ -458,7 +459,7 @@ async fn repeated_failure_is_visible_and_notifies_once(pool: PgPool) {
 /// The review queue lists a record with its candidates, and each answer is
 /// kept: a link fills only what was empty, a create makes the contact, a skip
 /// is never asked again.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_review_queue_lists_and_resolves(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let grace = Uuid::new_v4();
@@ -586,7 +587,7 @@ async fn the_review_queue_lists_and_resolves(pool: PgPool) {
 
 /// A cancel stops a queued run, and a disconnect stops whatever is in flight
 /// without it counting as a failure.
-#[sqlx::test]
+#[mokosh_test]
 async fn cancel_and_disconnect_stop_runs(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let run_id = f.queue().await;
@@ -625,7 +626,7 @@ async fn cancel_and_disconnect_stop_runs(pool: PgPool) {
 
 /// The worker queues a connection past its interval, and leaves alone one
 /// that cannot succeed or has nothing selected.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_worker_schedules_only_connections_that_are_due_and_able(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let set = |sql: &'static str| {
@@ -663,7 +664,7 @@ async fn the_worker_schedules_only_connections_that_are_due_and_able(pool: PgPoo
 
 /// Starting imports and choosing labels are an admin's; watching progress and
 /// answering the queue are any staff member's.
-#[sqlx::test]
+#[mokosh_test]
 async fn admins_start_imports_and_staff_follow_them(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     let run_id = f.queue().await;
@@ -715,7 +716,7 @@ async fn admins_start_imports_and_staff_follow_them(pool: PgPool) {
 /// resolves, a run queued before the switch is cancelled rather than run, and
 /// the worker schedules nothing; the connection and its contacts stay. On
 /// again, everything works.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_off_switch_stops_every_sync_and_keeps_the_data(pool: PgPool) {
     let f = Fixture::new(pool, &[CLIENTS]).await;
     f.script.full(vec![person(1)]);

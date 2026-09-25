@@ -3,10 +3,12 @@
 use crate::modules::auth::TenantId;
 use chrono::{Duration, Utc};
 use sqlx::Row;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
+use crate::modules::contact_portal::PaymentMethodsService;
 use crate::modules::notifications::NotificationsService;
 use crate::utils::crypto::{generate_token, hash_password, sha256_hex};
 use crate::utils::email::salutation;
@@ -126,29 +128,10 @@ pub const COMPANY_BLOCKERS: &[CompanyBlocker] = &[
     },
 ];
 
-/// PMS-926: what deleting this company would do, and what stops it.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CompanyDeletionPreview {
-    pub can_delete: bool,
-    /// The PMS-919 refusal that is about what the company IS rather than what
-    /// references it. Reported separately so a client can say so instead of
-    /// showing an empty blocker list beside a delete that still fails.
-    pub is_own_company: bool,
-    pub blocking: Vec<BlockingRecords>,
-    /// Detached rather than destroyed (migration 113, PMS-812).
-    pub unlinked: Vec<BlockingRecords>,
-    /// Destroyed along with the company.
-    pub removed: Vec<BlockingRecords>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct BlockingRecords {
-    pub label: String,
-    pub count: i64,
-    /// Only meaningful in `blocking`: these records exist to be KEPT, so a
-    /// client must not phrase them as something to clear first.
-    pub retained: bool,
-}
+/// The wire shape lives in `mokosh_types` so mokosh-apps reads the same
+/// definition instead of mirroring it, and `BlockingRecords` there is
+/// `DeletionRecords` (the client-side name that survived the merge).
+pub use mokosh_types::contacts::{CompanyDeletionPreview, DeletionRecords as BlockingRecords};
 
 /// What a delete would unlink rather than destroy. Mirrors migration 113 plus
 /// PMS-812's `contacts` rule.
@@ -215,6 +198,14 @@ pub struct ContactService {
     /// both get the worker's retries. `None` in fixtures built without a
     /// dispatcher, which then queue nothing.
     notifications: Option<NotificationsService>,
+    /// PMS-1369: `delete_contact` detaches every card the contact saved
+    /// (`contact_payment_methods`) on the provider side before removing the
+    /// row, mirroring the standalone portal removal path's contract so the
+    /// `ON DELETE CASCADE` on that table never drops a local reference to a
+    /// card still attached on the provider. `None` in fixtures that never
+    /// seed a payment method before deleting a contact; `delete_contact`
+    /// only reaches for this when the contact actually has rows to detach.
+    payment_methods: Option<Arc<PaymentMethodsService>>,
 }
 
 impl ContactService {
@@ -223,6 +214,7 @@ impl ContactService {
             db,
             app_url: String::new(),
             notifications: None,
+            payment_methods: None,
         }
     }
 
@@ -240,7 +232,18 @@ impl ContactService {
             db,
             app_url,
             notifications: Some(notifications),
+            payment_methods: None,
         }
+    }
+
+    /// Attach the payment-methods service so `delete_contact` can detach a
+    /// contact's saved cards on the provider side before removing the row
+    /// (PMS-1369). The server uses this in `create_api_router`, where the
+    /// same `PaymentMethodsService` instance already serves the portal's own
+    /// payment-method routes.
+    pub fn with_payment_methods(mut self, payment_methods: Arc<PaymentMethodsService>) -> Self {
+        self.payment_methods = Some(payment_methods);
+        self
     }
 
     /// Reject a foreign id that does not belong to this tenant, so a request
@@ -880,6 +883,15 @@ impl ContactService {
             // check is folded into this: an unrecognised shape is
             // refused the same way an invalid value is.
             crate::modules::tenants::branding::validate_company_branding_patch(branding)?;
+            // PMS-1371: confirm the id following an accepted prefix is the
+            // caller's own tenant or one of its own companies, not merely
+            // that the prefix is legal.
+            crate::modules::tenants::branding::assert_branding_patch_owned_by_tenant(
+                branding,
+                tenant_id.get(),
+                &self.db,
+            )
+            .await?;
         }
         if request.branding.is_some() {
             updates.push(format!("branding = branding || ${param_idx}::jsonb"));
@@ -916,13 +928,13 @@ impl ContactService {
             q = q.bind(industry);
         }
         if let Some(ref website) = request.website {
-            q = q.bind(website);
+            q = q.bind(website.clone());
         }
         if let Some(ref phone) = request.phone {
-            q = q.bind(phone);
+            q = q.bind(phone.clone());
         }
         if let Some(ref fax) = request.fax {
-            q = q.bind(fax);
+            q = q.bind(fax.clone());
         }
         if let Some(ref addr) = request.address {
             q = q
@@ -2942,6 +2954,25 @@ impl ContactService {
         request: &CreateContactRequest,
         ctx: &AuditCtx,
     ) -> AppResult<Contact> {
+        // A contact with no address cannot be invited, cannot be sent an
+        // invoice, and silently produces a dead entry the moment a mail is
+        // queued. The DTO carries `email: Option<String>` for compatibility
+        // with the SPA's older shape, so the gate lives here rather than as
+        // a `#[validate(...)]` on the type. Contact-sync imports have their
+        // own path (`insert_contact_in` via `import_contact_in`), so an
+        // address-less row from a CSV still lands the way it always has.
+        if request
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .is_none()
+        {
+            return Err(AppError::validation_field(
+                "email",
+                "Email address is required",
+            ));
+        }
         // PMS-402: only verify a CRM company exists when one is linked. A
         // freeform or company-less contact skips the existence check.
         if let Some(company_id) = request.company_id {
@@ -3865,13 +3896,13 @@ impl ContactService {
             q = q.bind(email);
         }
         if let Some(ref phone) = request.phone {
-            q = q.bind(phone);
+            q = q.bind(phone.clone());
         }
         if let Some(ref mobile) = request.mobile {
-            q = q.bind(mobile);
+            q = q.bind(mobile.clone());
         }
         if let Some(ref fax) = request.fax {
-            q = q.bind(fax);
+            q = q.bind(fax.clone());
         }
         if let Some(ref title) = request.title {
             q = q.bind(title);
@@ -3923,6 +3954,11 @@ impl ContactService {
         // contact's only link: both preserve the pre-PMS-806 semantics the
         // current SPA relies on. A request that touches neither leaves the
         // child rows exactly as they are.
+        // PMS-1392: each scalar is doubly optional now, so "touched" (an
+        // explicit value or an explicit `null` to clear) must win over the
+        // existing row, and only an absent field falls back to it - a clear
+        // must not be re-read as "unchanged" the way a single-level `Option`
+        // made it look.
         let phones = match request.phones.as_deref() {
             Some(entries) => Some(resolve_phone_list(entries)?),
             None if request.phone.is_some()
@@ -3930,9 +3966,21 @@ impl ContactService {
                 || request.fax.is_some() =>
             {
                 Some(phones_from_scalars(
-                    request.phone.as_deref().or(existing.phone.as_deref()),
-                    request.mobile.as_deref().or(existing.mobile.as_deref()),
-                    request.fax.as_deref().or(existing.fax.as_deref()),
+                    request
+                        .phone
+                        .as_ref()
+                        .map(|o| o.as_deref())
+                        .unwrap_or(existing.phone.as_deref()),
+                    request
+                        .mobile
+                        .as_ref()
+                        .map(|o| o.as_deref())
+                        .unwrap_or(existing.mobile.as_deref()),
+                    request
+                        .fax
+                        .as_ref()
+                        .map(|o| o.as_deref())
+                        .unwrap_or(existing.fax.as_deref()),
                 ))
             }
             None => None,
@@ -4070,6 +4118,37 @@ impl ContactService {
         .bind(contact_id)
         .fetch_optional(&mut *tx)
         .await?;
+
+        // PMS-1369: detach every saved card on the provider side BEFORE the
+        // `DELETE FROM contacts` below, so `contact_payment_methods
+        // .contact_id ON DELETE CASCADE` never removes a local row while the
+        // card stays attached to the provider Customer. A detach failure
+        // returns the error here, leaving the transaction unwound and the
+        // contact (and its payment method rows) in place.
+        match &self.payment_methods {
+            Some(payment_methods) => {
+                payment_methods
+                    .detach_all_for_contact(&mut tx, tenant_id, contact_id)
+                    .await?;
+            }
+            None => {
+                let has_payment_methods: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM contact_payment_methods \
+                      WHERE tenant_id = $1 AND contact_id = $2)",
+                )
+                .bind(tenant_id)
+                .bind(contact_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if has_payment_methods {
+                    return Err(AppError::Configuration(
+                        "This contact has a saved payment method, but the contact service was \
+                         not configured to detach it on delete."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
 
         sqlx::query("DELETE FROM contacts WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -4290,7 +4369,7 @@ impl ContactService {
                 .bind(&addr.country);
         }
         if let Some(ref phone) = request.phone {
-            q = q.bind(phone);
+            q = q.bind(phone.clone());
         }
         if let Some(is_primary) = request.is_primary {
             q = q.bind(is_primary);
@@ -4901,7 +4980,13 @@ mod tests {
     // actually enforced on every run.
 
     fn contact_req(body: serde_json::Value) -> CreateContactRequest {
-        let mut full = serde_json::json!({ "first_name": "Ada", "last_name": "Lovelace" });
+        // PMS-1329: email is required on create, so the helper mints a
+        // unique fixture when the caller does not supply one.
+        let mut full = serde_json::json!({
+            "first_name": "Ada",
+            "last_name": "Lovelace",
+            "email": format!("{}@example.com", uuid::Uuid::new_v4()),
+        });
         if let serde_json::Value::Object(extra) = body {
             for (k, v) in extra {
                 full[k] = v;
