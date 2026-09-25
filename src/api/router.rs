@@ -318,6 +318,11 @@ pub fn create_api_router(
     let approvals_service = ApprovalsService::new(db.clone());
     let rmm_service =
         RmmService::with_dependencies(db.clone(), encryption_key, ticket_service.clone());
+    // Shared reference to the RMM service so the status ingest handler
+    // can look up the connection's HMAC secret without a second copy of
+    // the auth logic.
+    let rmm_service_shared = std::sync::Arc::new(rmm_service.clone());
+    let status_service = crate::modules::status::StatusService::new(db.clone());
     // SLA service shares the notifications dispatcher so the
     // `sla_sweep` worker (spawned from main.rs with this same service)
     // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
@@ -566,6 +571,19 @@ pub fn create_api_router(
         .merge(notifications_routes(notifications_service.clone()))
         // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
         .merge(rmm_routes(rmm_service))
+        // Client service status: monitored systems and observed check
+        // outcomes. Ingest is HMAC-authenticated (shares the RMM
+        // connection secret); the read endpoints run under the normal
+        // internal-user auth.
+        .merge(crate::modules::status::status_routes(
+            status_service,
+            rmm_service_shared,
+        ))
+        // CRM opportunities: leads through won/lost, with an optional
+        // link to the quote raised from them.
+        .merge(crate::modules::opportunities::opportunities_routes(
+            crate::modules::opportunities::OpportunitiesService::new(db.clone()),
+        ))
         // PMS-1212 (PSA-70): connect, status and disconnect for the Google
         // Contacts import. Admin-gated inside, the RMM shape.
         .merge(crate::modules::contact_sync::routes::contact_sync_routes(
