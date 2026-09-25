@@ -276,6 +276,11 @@ pub fn create_api_router(
     // acceptance), so created invites email the invitee.
     let invitations_service =
         Arc::new(InvitationsService::new(db.clone()).with_app_url(client_origin.clone()));
+    // PMS-1310: installed integrations and the capabilities each is handed. It
+    // takes the same `secrets` provider every other credential holder does, so a
+    // deployment on Infisical keeps its integration credentials there too.
+    let integrations_service =
+        crate::modules::integrations::IntegrationsService::new(db.clone(), secrets.clone());
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.clone());
@@ -564,6 +569,11 @@ pub fn create_api_router(
         // Notifications: channels + templates + prefs + inbox + rules
         // + dispatcher. PMS-86.
         .merge(notifications_routes(notifications_service.clone()))
+        // PMS-1310: the integrations catalog, per-capability delegation, and
+        // connect / disconnect. Admin-gated inside, the RMM shape.
+        .merge(crate::modules::integrations::integration_routes(
+            integrations_service,
+        ))
         // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
         .merge(rmm_routes(rmm_service))
         // PMS-1212 (PSA-70): connect, status and disconnect for the Google
