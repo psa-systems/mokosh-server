@@ -1261,6 +1261,10 @@ impl AuthService {
                  WHERE t.id = $1",
         )
         .bind(tenant_id)
+        // SAFETY (PMS-285 / PMS-692): `tenants` and `tenant_membership_entitlements`
+        // are both RLS-exempt (see the block above and `ALLOWED_WITHOUT_RLS`); this
+        // .pool() serving read is deliberate. Inlined here so `check-pool-safety.nu`
+        // sees the note inside its 8-line lookback.
         .fetch_optional(self.db.pool())
         .await?;
 
