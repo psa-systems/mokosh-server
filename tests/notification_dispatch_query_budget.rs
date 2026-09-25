@@ -26,6 +26,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -121,7 +122,7 @@ impl<S: tracing::Subscriber> Layer<S> for RecordingLayer {
 const RECIPIENT_USERS: usize = 3;
 const RECIPIENT_EMAILS: usize = 2;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn one_dispatch_is_one_transaction(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(

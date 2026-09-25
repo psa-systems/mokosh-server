@@ -12,10 +12,11 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn saved_reports_crud_and_visibility(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     // Seed a SECOND active admin in the same tenant so the visibility

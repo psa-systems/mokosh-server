@@ -7,10 +7,11 @@
 -- `Database::new` and the migrations run (src/db/provision.rs), so by the time
 -- migration 207 executes the role is there.
 --
--- The Postgres-backed suite has no server startup. `#[sqlx::test]` connects to
--- a bare cluster as the superuser, creates a database per test and runs the
--- migrations itself, so nothing satisfies that precondition and every test in
--- the suite fails at migration 207 before its body runs. Whatever prepares the
+-- The Postgres-backed suite has no server startup. `#[mokosh_test]` connects to
+-- a bare cluster as the superuser and runs the migrations itself into the
+-- template every test is cloned from, so nothing satisfies that precondition
+-- and the template build fails at migration 207, taking every test in the
+-- suite with it before any body runs. Whatever prepares the
 -- test cluster therefore has to create the role, which is what this file is
 -- for: `.forgejo/workflows/integration.yml` runs it against the job's postgres
 -- service, and `just ensure-test-db-roles` runs it against the dev cluster.

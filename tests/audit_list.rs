@@ -11,9 +11,10 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn audit_log_list_handles_every_filter_combination(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;

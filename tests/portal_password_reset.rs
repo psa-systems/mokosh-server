@@ -15,6 +15,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -85,7 +86,7 @@ fn in_thirty_minutes() -> chrono::DateTime<chrono::Utc> {
 }
 
 // AC (H3 forgot): unknown email still returns 204. Enumeration-resistant.
-#[sqlx::test]
+#[mokosh_test]
 async fn forgot_password_unknown_email_still_204(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -96,7 +97,7 @@ async fn forgot_password_unknown_email_still_204(pool: PgPool) {
 }
 
 // AC (H3 forgot): known email returns 204 AND inserts a row.
-#[sqlx::test]
+#[mokosh_test]
 async fn forgot_password_known_email_204_and_writes_row(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -123,7 +124,7 @@ async fn forgot_password_known_email_204_and_writes_row(pool: PgPool) {
 
 // AC (H3 reset): a valid + unused + unexpired token with a strong
 // password sets the hash and returns 204.
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_happy_path(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -177,7 +178,7 @@ async fn reset_password_happy_path(pool: PgPool) {
 
 // AC (H3 reset): a replayed token returns 410 Gone. A weak password in
 // the replay body does NOT change that: the token check wins.
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_replay_returns_410_regardless_of_password(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -198,7 +199,7 @@ async fn reset_password_replay_returns_410_regardless_of_password(pool: PgPool) 
 }
 
 // AC (H3 reset): an expired token is 400, distinct from replay.
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_expired_returns_400(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -215,7 +216,7 @@ async fn reset_password_expired_returns_400(pool: PgPool) {
 }
 
 // AC (H3 reset): an unknown or malformed token is 400.
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_unknown_token_returns_400(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;
@@ -241,7 +242,7 @@ async fn reset_password_unknown_token_returns_400(pool: PgPool) {
 
 // AC (H3 reset + H5): a valid token + a weak password is 400 with the
 // policy message. The token stays unused so the customer can retry.
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_weak_password_returns_400_and_token_unused(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -279,7 +280,7 @@ async fn reset_password_weak_password_returns_400_and_token_unused(pool: PgPool)
 // PMS-1062: a reset ends every session the contact holds, on every
 // device, so a refresh token stolen before the reset does not survive
 // it. The new password signs in fresh.
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_revokes_every_live_session(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -372,7 +373,7 @@ async fn refresh(app: &common::TestApp, refresh_token: &str) -> reqwest::Respons
 // The right pair is 204: the new password signs in, the old is refused,
 // the other device's refresh token is dead, and the caller's own still
 // rotates.
-#[sqlx::test]
+#[mokosh_test]
 async fn change_password_happy_path_keeps_the_caller_signed_in(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -414,7 +415,7 @@ async fn change_password_happy_path_keeps_the_caller_signed_in(pool: PgPool) {
 
 // A wrong current password is 401 with the hash untouched, and five of
 // them spend the re-auth budget: the sixth is 429 before any comparison.
-#[sqlx::test]
+#[mokosh_test]
 async fn change_password_wrong_current_is_401_and_rate_limited(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -447,7 +448,7 @@ async fn change_password_wrong_current_is_401_and_rate_limited(pool: PgPool) {
 
 // A weak new password is 400 with the policy message, the hash is
 // untouched, and it spends no re-auth budget.
-#[sqlx::test]
+#[mokosh_test]
 async fn change_password_weak_new_is_400_and_spends_no_budget(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -472,7 +473,7 @@ async fn change_password_weak_new_is_400_and_spends_no_budget(pool: PgPool) {
 }
 
 // No session: 401 before anything is read.
-#[sqlx::test]
+#[mokosh_test]
 async fn change_password_requires_a_session(pool: PgPool) {
     let _contact = seed_portal_contact(&pool, "user@example.com").await;
     let app = common::boot(pool).await;

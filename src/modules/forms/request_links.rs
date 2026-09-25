@@ -514,19 +514,25 @@ impl FormsService {
 
 impl FormsService {
     /// Redeem a resolved link: validate the payload against the definition,
-    /// store the submission, create the ticket, and mark the link used.
+    /// store the submission, claim the token's use, create the ticket, and
+    /// link the two together.
     ///
-    /// Ordering matters, and this is THREE transactions, not one
-    /// (PMS-1238): the submission commits, then `TicketService::create_ticket`
-    /// commits the ticket in its own transaction, then the ticket link and the
-    /// token burn commit together. The ticket service owns its transaction, so
-    /// they cannot be merged without reworking it. The token is marked used
-    /// LAST so a failure before that leaves the link live and the client can
-    /// retry; marking it first would burn a single-use link on a request that
-    /// never produced a ticket. The cost of the split is that a failure after
-    /// the first commit leaves an orphan `form_submissions` row, and one after
-    /// the ticket commit leaves a ticket whose retry files a second one; both
-    /// are visible to the MSP and neither loses a customer's request.
+    /// Ordering matters, and this is FOUR transactions, not one (PMS-1238,
+    /// PMS-1370): the submission commits, then the guarded token claim
+    /// commits, then `TicketService::create_ticket` commits the ticket in its
+    /// own transaction, then the submission is stamped with the ticket and
+    /// token ids. The ticket service owns its transaction, so it cannot be
+    /// merged into either neighbour. The claim moves AHEAD of ticket creation
+    /// (PMS-1370) so a single-use link cannot produce two tickets: two
+    /// concurrent submissions both pass the earlier resolve check, but the
+    /// claim's `uses_remaining > 0` guard lets only one of them proceed, and
+    /// the loser returns `AppError::Gone` before `create_ticket` is ever
+    /// called. The cost of the split is that a failure after the claim but
+    /// before the ticket commits leaves the use spent with no ticket to show
+    /// for it (the link reports itself as already submitted); that is judged
+    /// less harmful than the alternative of two tickets for one use, and is
+    /// visible to the MSP as an orphan `form_submissions` row with no
+    /// `ticket_id`, the same as a failure after the first commit always was.
     pub async fn submit_via_request_link(
         &self,
         resolved: &ResolvedRequestToken,
@@ -565,6 +571,34 @@ impl FormsService {
         .await?;
         tx.commit().await?;
 
+        // PMS-1370: claim the use BEFORE creating a ticket, so a link with
+        // nothing left never reaches `create_ticket` at all. Two submissions
+        // arriving together both pass the earlier resolve check, but the row
+        // is locked by the first, and a link with nothing left updates
+        // nothing; the loser is reported as already submitted rather than
+        // quietly accepted, and creates no ticket in doing so.
+        let mut claim_tx = self.db.begin_with_tenant(tenant_id).await?;
+        let remaining: Option<i32> = sqlx::query_scalar(
+            "UPDATE form_request_tokens \
+             SET uses_remaining = uses_remaining - 1, \
+                 used_at = CASE WHEN uses_remaining - 1 = 0 THEN NOW() ELSE used_at END, \
+                 submission_id = COALESCE(submission_id, $3) \
+             WHERE tenant_id = $1 AND id = $2 AND uses_remaining > 0 \
+             RETURNING uses_remaining",
+        )
+        .bind(tenant_id)
+        .bind(resolved.token_id)
+        .bind(submission_id)
+        .fetch_optional(&mut *claim_tx)
+        .await?;
+        claim_tx.commit().await?;
+
+        let Some(remaining) = remaining else {
+            return Err(AppError::Gone(
+                "This request link has already been submitted".to_string(),
+            ));
+        };
+
         let Some(tickets) = self.tickets.as_ref() else {
             return Err(AppError::Internal(
                 "no ticket service wired into the forms service".to_string(),
@@ -601,8 +635,9 @@ impl FormsService {
             .create_ticket(tenant_id, resolved.created_by_id, &request, &ctx)
             .await?;
 
-        // Link the chain and burn the token together, so a link is only ever
-        // spent once a ticket actually exists.
+        // Link the submission to the ticket and the token it was claimed
+        // against. The use is already spent by the claim above, so this no
+        // longer needs to re-guard on `uses_remaining`.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query("UPDATE form_submissions SET ticket_id = $3 WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
@@ -618,39 +653,11 @@ impl FormsService {
         .bind(resolved.token_id)
         .execute(&mut *tx)
         .await?;
-        // PMS-737: one use is spent. `used_at` is stamped on the LAST one, so
-        // a single-use link behaves exactly as it did, and `submission_id`
-        // keeps pointing at the FIRST submission the link produced.
-        let remaining: Option<i32> = sqlx::query_scalar(
-            "UPDATE form_request_tokens \
-             SET uses_remaining = uses_remaining - 1, \
-                 used_at = CASE WHEN uses_remaining - 1 = 0 THEN NOW() ELSE used_at END, \
-                 submission_id = COALESCE(submission_id, $3) \
-             WHERE tenant_id = $1 AND id = $2 AND uses_remaining > 0 \
-             RETURNING uses_remaining",
-        )
-        .bind(tenant_id)
-        .bind(resolved.token_id)
-        .bind(submission_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let burned = usize::from(remaining.is_some());
         tx.commit().await?;
-
-        // `uses_remaining > 0` in the UPDATE is the race guard: two
-        // submissions arriving together both pass the earlier resolve check,
-        // but the row is locked by the first, and a link with nothing left
-        // updates nothing. The loser is reported as already submitted rather
-        // than quietly accepted.
-        if burned == 0 {
-            return Err(AppError::Gone(
-                "This request link has already been submitted".to_string(),
-            ));
-        }
 
         Ok(PublicSubmissionReceipt {
             ticket_number: ticket.ticket_number,
-            submissions_remaining: remaining.unwrap_or(0),
+            submissions_remaining: remaining,
         })
     }
 }

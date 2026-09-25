@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -24,7 +25,7 @@ async fn lookup_id(pool: &PgPool, table: &str) -> Uuid {
     .unwrap_or_else(|e| panic!("lookup id from {table}: {e}"))
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_templates_crud_and_prefill(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let category_id = lookup_id(&pool, "ticket_categories").await;

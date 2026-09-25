@@ -30,6 +30,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -73,7 +74,7 @@ impl Mailer for CapturingMailer {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn dispatch_respects_preferences_and_worker_marks_sent(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -278,7 +279,7 @@ async fn dispatch_respects_preferences_and_worker_marks_sent(pool: PgPool) {
     assert!(read_at.is_some(), "mark-read should stamp read_at");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn channel_config_is_encrypted_at_rest(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -327,7 +328,7 @@ async fn channel_config_is_encrypted_at_rest(pool: PgPool) {
 /// synthetic subject and the serialized dispatch context as its body.
 /// Such a rule must now write nothing at all, and the API must refuse to
 /// create one.
-#[sqlx::test]
+#[mokosh_test]
 async fn rule_without_template_dispatches_nothing_and_cannot_be_created(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -442,7 +443,7 @@ fn placeholder_keys(text: &str) -> Vec<&str> {
 /// one long line) and dotted placeholders that `render_template`'s flat
 /// `context.get` can never resolve. Migration 096 rewrites those rows;
 /// this asserts no seeded template ever regresses to either shape.
-#[sqlx::test]
+#[mokosh_test]
 async fn seeded_templates_have_real_newlines_and_flat_placeholders(pool: PgPool) {
     // (name, subject, body_text, body_html)
     type TemplateRow = (String, Option<String>, Option<String>, Option<String>);
@@ -487,7 +488,7 @@ async fn seeded_templates_have_real_newlines_and_flat_placeholders(pool: PgPool)
 /// with the blank-name salutation is what proves the pair is in step: a
 /// template that kept its own "Hello" would render "Hello Hello," and one that
 /// still asked for `{{display_name}}` alone would open on a bare comma.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_seeded_greetings_read_correctly_without_a_name(pool: PgPool) {
     type BodyRow = (String, Option<String>, Option<String>);
     for event_type in ["forms.request_link", "auth.welcome"] {
@@ -547,7 +548,7 @@ async fn the_seeded_greetings_read_correctly_without_a_name(pool: PgPool) {
 /// dropped. The rendered HTML must now ride the `notifications` row and reach
 /// the mailer as the HTML alternative; a template with a NULL `body_html`
 /// must still produce a single-part plain-text send.
-#[sqlx::test]
+#[mokosh_test]
 async fn dispatch_carries_rendered_body_html_to_the_mailer(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -761,7 +762,7 @@ async fn preview(
 /// PMS-808: the preview must be what `dispatch` renders, not a second
 /// copy of the rendering that can drift from it, and asking for it must
 /// leave the queue exactly as it was.
-#[sqlx::test]
+#[mokosh_test]
 async fn preview_renders_what_dispatch_sends_and_queues_nothing(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -896,7 +897,7 @@ async fn preview_renders_what_dispatch_sends_and_queues_nothing(pool: PgPool) {
 
 /// PMS-808: no active rule means no email would be sent at all, which is
 /// a real answer an operator wants before clicking Send, not an error.
-#[sqlx::test]
+#[mokosh_test]
 async fn preview_of_an_event_with_no_rule_is_an_empty_array(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -920,7 +921,7 @@ async fn preview_of_an_event_with_no_rule_is_an_empty_array(pool: PgPool) {
 /// PMS-808: the preview reads templates and rules through
 /// `begin_with_tenant` like every other template read, so it cannot show
 /// one tenant what another tenant's mail says.
-#[sqlx::test]
+#[mokosh_test]
 async fn preview_cannot_read_another_tenants_templates(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -979,7 +980,7 @@ async fn preview_cannot_read_another_tenants_templates(pool: PgPool) {
 /// sends, so a worker that dies mid-tick leaves rows claimed. A later tick must
 /// pick those rows back up once the claim has expired, and must leave a claim
 /// that is still live alone.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_stale_claim_is_retried_and_a_live_one_is_left_alone(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let tenant_id = common::DEFAULT_TENANT_ID;
@@ -1053,7 +1054,7 @@ async fn a_stale_claim_is_retried_and_a_live_one_is_left_alone(pool: PgPool) {
 /// Both halves are checked, because the HTML one failed differently and worse:
 /// an empty `mailto:` anchor renders as nothing at all, so the sentence ended
 /// in a bare full stop with no clue why.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_with_no_support_address_gets_a_whole_footer_sentence(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1148,7 +1149,7 @@ async fn a_tenant_with_no_support_address_gets_a_whole_footer_sentence(pool: PgP
 /// when deciding whether a rule should fire. A rule scoped to
 /// `{"priority": "high"}` must only fire for a dispatch whose context names
 /// that priority.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_rule_scoped_by_conditions_only_fires_for_a_matching_context(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1246,7 +1247,7 @@ async fn a_rule_scoped_by_conditions_only_fires_for_a_matching_context(pool: PgP
 /// PMS-1237 finding 3: the notification worker's recipient-email lookup had
 /// no active-status filter, unlike every other recipient-expansion site in
 /// the codebase, so an offboarded user kept receiving tenant mail.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_inactive_user_is_excluded_from_email_dispatch(pool: PgPool) {
     let (admin_id, admin_email, password) = common::seed_admin(&pool).await;
     let tenant_id = common::DEFAULT_TENANT_ID;
@@ -1327,7 +1328,7 @@ async fn an_inactive_user_is_excluded_from_email_dispatch(pool: PgPool) {
 /// PMS-1237 finding 4: a recipient named by both a user id and their own
 /// email address was deduped within each list but not across them, so they
 /// received the same channel twice.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_recipient_named_by_user_id_and_email_sends_exactly_once(pool: PgPool) {
     let (admin_id, admin_email, password) = common::seed_admin(&pool).await;
     let tenant_id = common::DEFAULT_TENANT_ID;

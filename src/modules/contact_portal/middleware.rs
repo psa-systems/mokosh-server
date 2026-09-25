@@ -106,6 +106,7 @@ pub async fn portal_contact_middleware(
                                 email: claims.email,
                                 sid: claims.sid,
                                 role_cache: Default::default(),
+                                timezone_cache: Default::default(),
                             })
                         }
                     }

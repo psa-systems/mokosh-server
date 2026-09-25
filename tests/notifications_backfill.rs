@@ -10,7 +10,7 @@
 //! 030_backfill_notification_rules.sql backfills the same rows for every
 //! existing tenant that is missing them, idempotently.
 //!
-//! Why the SQL is duplicated here: `#[sqlx::test]` applies ALL migrations
+//! Why the SQL is duplicated here: `#[mokosh_test]` applies ALL migrations
 //! (including 030) before the test body runs, so re-asserting the
 //! migration against a fresh tenant created inside the test requires
 //! re-running the backfill statements. The two statements below are a
@@ -25,6 +25,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -120,7 +121,7 @@ async fn template_count(pool: &PgPool, tenant_id: Uuid) -> i64 {
     .expect("count worker templates")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn backfills_missing_rules_then_is_idempotent(pool: PgPool) {
     // A pre-seeding tenant: bare tenant row, NO notification rules or
     // templates. seed_tenant_with_admin inserts only the tenants row (+

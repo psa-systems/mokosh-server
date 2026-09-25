@@ -19,6 +19,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -84,7 +85,7 @@ async fn send_quote(app: &common::TestApp, token: &str, quote_id: &str) -> reqwe
         .expect("send quote")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn send_requires_internal_approval_and_stamps_sent_at(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Client A").await;
@@ -139,13 +140,13 @@ async fn send_requires_internal_approval_and_stamps_sent_at(pool: PgPool) {
     assert!(audited > 0, "quote transitions must be audited");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn portal_sees_only_issued_quotes_for_its_own_company(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_a = seed_company_named(&pool, "Client A").await;
     let company_b = seed_company_named(&pool, "Client B").await;
     let contact_a = seed_portal_contact(&pool, company_a, "a@example.com").await;
-    let _contact_b = seed_portal_contact(&pool, company_b, "b@example.com").await;
+    let contact_b = seed_portal_contact(&pool, company_b, "b@example.com").await;
 
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
@@ -177,7 +178,12 @@ async fn portal_sees_only_issued_quotes_for_its_own_company(pool: PgPool) {
     let issued_b = create_quote(
         &app,
         &token,
-        serde_json::json!({ "company_id": company_b, "title": "B issued" }),
+        // PMS-1000: as above, for B's issued quote.
+        serde_json::json!({
+            "company_id": company_b,
+            "billing_contact_id": contact_b.id,
+            "title": "B issued",
+        }),
     )
     .await;
     let issued_b_id = issued_b["id"].as_str().unwrap().to_string();
@@ -238,7 +244,7 @@ async fn portal_sees_only_issued_quotes_for_its_own_company(pool: PgPool) {
     assert_eq!(decide_other.status(), StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn client_accept_records_the_decision_and_is_not_repeatable(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Client A").await;
@@ -314,7 +320,7 @@ async fn client_accept_records_the_decision_and_is_not_repeatable(pool: PgPool) 
     assert_eq!(visible["status"], "accepted");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn client_can_decline_without_a_body(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Client A").await;
@@ -354,7 +360,7 @@ async fn client_can_decline_without_a_body(pool: PgPool) {
     assert!(body["decision_notes"].is_null());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_expired_quote_reads_as_expired_and_cannot_be_accepted(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Client A").await;
@@ -435,7 +441,7 @@ async fn an_expired_quote_reads_as_expired_and_cannot_be_accepted(pool: PgPool) 
     assert_eq!(deadline_accept.status(), StatusCode::OK);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_token_cannot_drive_the_portal_signoff(pool: PgPool) {
     // The client's decision is the client's. A staff bearer token must not
     // be accepted on the portal surface, or the whole point of routing
@@ -488,7 +494,7 @@ async fn staff_token_cannot_drive_the_portal_signoff(pool: PgPool) {
 /// exists. PMS-1060: the dual-plane `list_quotes` and `get_quote` scoped
 /// to the company only and handed a contact its company's drafts; the
 /// contact arms now go through the issued-only company reads.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_never_sees_an_unissued_quote(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Client A").await;
@@ -499,7 +505,13 @@ async fn a_contact_never_sees_an_unissued_quote(pool: PgPool) {
     let issued = create_quote(
         &app,
         &token,
-        serde_json::json!({ "company_id": company, "title": "Issued" }),
+        // PMS-1000: a send needs a recipient, so name the contact this test
+        // already seeds rather than leaving the company with nobody.
+        serde_json::json!({
+            "company_id": company,
+            "billing_contact_id": contact.id,
+            "title": "Issued",
+        }),
     )
     .await;
     let issued_id = issued["id"].as_str().unwrap().to_string();
@@ -584,7 +596,7 @@ impl mokosh_server::utils::email::Mailer for CapturingMailer {
 /// quote link was its own `format!`. It is now the company's portal login,
 /// carrying the quote through sign-in, and this reads it out of the mail the
 /// API actually sent rather than asserting on what the service passed around.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_quote_email_links_to_the_portal_login_returning_to_the_quote(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company = seed_company_named(&pool, "Linked Client").await;

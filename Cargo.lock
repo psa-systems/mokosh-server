@@ -2239,6 +2239,7 @@ dependencies = [
  "jsonwebtoken",
  "lettre",
  "moka",
+ "mokosh-test",
  "mokosh-types",
  "printpdf",
  "rand 0.9.4",
@@ -2266,6 +2267,27 @@ dependencies = [
  "uuid",
  "validator",
  "zxcvbn",
+]
+
+[[package]]
+name = "mokosh-test"
+version = "0.1.0"
+dependencies = [
+ "mokosh-test-macros",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "mokosh-test-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

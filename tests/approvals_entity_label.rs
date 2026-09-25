@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -175,7 +176,7 @@ fn find(rows: &[Value], approval_id: &str) -> Value {
         .clone()
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_ticket_approval_carries_the_ticket_number_and_title(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool).await;
@@ -198,7 +199,7 @@ async fn a_ticket_approval_carries_the_ticket_number_and_title(pool: PgPool) {
     assert_eq!(row["entity_label"], TICKET_TITLE);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_time_entry_approval_names_its_duration_and_date(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool).await;
@@ -215,7 +216,7 @@ async fn a_time_entry_approval_names_its_duration_and_date(pool: PgPool) {
     assert_eq!(created["entity_label"], "90 min on 2026-03-04");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_change_request_approval_carries_its_title(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let cr = seed_change_request(&pool, admin_id).await;
@@ -231,7 +232,7 @@ async fn a_change_request_approval_carries_its_title(pool: PgPool) {
     assert_eq!(created["entity_label"], "Fail over to the replica");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_quote_approval_carries_its_number_and_title(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let company = seed_company(&pool).await;
@@ -245,7 +246,7 @@ async fn a_quote_approval_carries_its_number_and_title(pool: PgPool) {
     assert_eq!(created["entity_label"], "Tier-2 hosting");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_orphaned_approval_still_reads(pool: PgPool) {
     // `entity_id` carries no foreign key (it is polymorphic), so a
     // deleted time entry leaves its approval behind. The joins are

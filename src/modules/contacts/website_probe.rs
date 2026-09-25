@@ -87,6 +87,12 @@ pub struct WebsiteProbe {
     pub www_change: WwwChange,
     pub final_status: Option<u16>,
     pub unreachable_reason: Option<UnreachableReason>,
+    /// True when the redirect chain was still redirecting when the hop budget
+    /// ran out, so `canonical_url` is the LAST URL we actually fetched rather
+    /// than the destination. A client can then say "site redirects again; not
+    /// followed" instead of presenting the URL as canonical. False otherwise,
+    /// including when the chain resolved within `MAX_HOPS`.
+    pub redirect_truncated: bool,
 }
 
 // ============================================================================
@@ -97,7 +103,15 @@ pub struct WebsiteProbe {
 /// failure can never reach `classify` as a bare `false` with no cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Reached { final_url: Url, status: u16 },
+    /// `truncated` is true when the hop budget ran out with the last response
+    /// still 3xx-with-Location: `final_url` is the LAST URL fetched (not the
+    /// destination), and the client is told the address is not settled rather
+    /// than a refused connection.
+    Reached {
+        final_url: Url,
+        status: u16,
+        truncated: bool,
+    },
     Failed(UnreachableReason),
 }
 
@@ -114,6 +128,16 @@ impl Outcome {
             Outcome::Reached { .. } => None,
             Outcome::Failed(r) => Some(*r),
         }
+    }
+
+    fn truncated(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Reached {
+                truncated: true,
+                ..
+            }
+        )
     }
 }
 
@@ -240,8 +264,18 @@ pub fn classify(
     // https is canonical when it answers; http is the fallback, so a site that
     // only serves plaintext still reports a usable URL.
     let canonical = match (https, http) {
-        (Outcome::Reached { final_url, status }, _) => Some((final_url.clone(), *status)),
-        (_, Outcome::Reached { final_url, status }) => Some((final_url.clone(), *status)),
+        (
+            Outcome::Reached {
+                final_url, status, ..
+            },
+            _,
+        ) => Some((final_url.clone(), *status)),
+        (
+            _,
+            Outcome::Reached {
+                final_url, status, ..
+            },
+        ) => Some((final_url.clone(), *status)),
         _ => None,
     };
 
@@ -268,6 +302,15 @@ pub fn classify(
         https.reason().or_else(|| http.reason())
     };
 
+    // The scheme whose outcome fed `canonical` is the one that carried the
+    // truncation flag; report it verbatim so the client that reads
+    // `canonical_url` also gets to know whether it was the destination.
+    let redirect_truncated = match (https, http) {
+        (Outcome::Reached { .. }, _) => https.truncated(),
+        (_, Outcome::Reached { .. }) => http.truncated(),
+        _ => false,
+    };
+
     WebsiteProbe {
         input: input.to_string(),
         reachable: https_ok || http_ok,
@@ -278,6 +321,7 @@ pub fn classify(
         www_change,
         final_status: canonical.as_ref().map(|(_, s)| *s),
         unreachable_reason,
+        redirect_truncated,
     }
 }
 
@@ -369,6 +413,7 @@ async fn attempt<F: WebsiteFetcher + ?Sized>(fetcher: &F, host: &str, scheme: &s
             return Outcome::Reached {
                 final_url: url,
                 status: response.status,
+                truncated: false,
             };
         }
 
@@ -378,8 +423,28 @@ async fn attempt<F: WebsiteFetcher + ?Sized>(fetcher: &F, host: &str, scheme: &s
             return Outcome::Reached {
                 final_url: url,
                 status: response.status,
+                truncated: false,
             };
         };
+        // The hop budget is `hop <= MAX_HOPS` (see the `for` header), so a
+        // redirect on the LAST allowed hop still has a Location we would not
+        // follow. Report the URL we just fetched and mark the chain
+        // truncated: the client says the address is not settled instead of
+        // reading it as canonical or as a refused connection.
+        if hop == MAX_HOPS {
+            tracing::warn!(
+                host,
+                scheme,
+                url = %url,
+                location,
+                "website probe reached MAX_HOPS with the chain still redirecting"
+            );
+            return Outcome::Reached {
+                final_url: url,
+                status: response.status,
+                truncated: true,
+            };
+        }
         match url.join(location) {
             Ok(next) => url = next,
             Err(e) => {
@@ -649,6 +714,15 @@ mod tests {
         Outcome::Reached {
             final_url: url(u),
             status,
+            truncated: false,
+        }
+    }
+
+    fn reached_truncated(u: &str, status: u16) -> Outcome {
+        Outcome::Reached {
+            final_url: url(u),
+            status,
+            truncated: true,
         }
     }
 
@@ -778,7 +852,59 @@ mod tests {
         assert_eq!(json["unreachable_reason"], "blocked_host");
     }
 
-    // ---- parse_target ----
+    /// A chain that would have kept redirecting past `MAX_HOPS` is reported
+    /// as reached-with-a-truncation-flag, not as `refused`. The canonical
+    /// URL is the last URL we actually fetched, and the client can tell
+    /// the address is not settled from `redirect_truncated`.
+    #[test]
+    fn classify_carries_the_truncated_flag_from_the_scheme_that_answered() {
+        let p = classify(
+            "example.com",
+            "example.com",
+            &reached_truncated("https://example.com/step5/", 302),
+            &Outcome::Failed(UnreachableReason::Refused),
+        );
+        assert!(p.reachable, "a truncated chain is not unreachable: {p:?}");
+        assert!(p.redirect_truncated);
+        assert_eq!(
+            p.canonical_url.as_deref(),
+            Some("https://example.com/step5/"),
+            "the last URL fetched, not a fabricated destination"
+        );
+        assert_eq!(p.final_status, Some(302));
+        assert!(p.unreachable_reason.is_none());
+    }
+
+    /// A chain that resolved cleanly does NOT carry the flag: the boolean is
+    /// scoped to the truncation case so a client cannot misread a settled URL.
+    #[test]
+    fn classify_does_not_flag_a_settled_chain_as_truncated() {
+        let p = classify(
+            "example.com",
+            "example.com",
+            &reached("https://www.example.com/", 200),
+            &reached("https://www.example.com/", 200),
+        );
+        assert!(!p.redirect_truncated);
+    }
+
+    /// When https truncates and http answers cleanly, https still wins as
+    /// the canonical scheme (the existing preference), so the flag rides on
+    /// the https outcome even though http was fully resolved.
+    #[test]
+    fn classify_prefers_the_https_truncation_over_a_settled_http() {
+        let p = classify(
+            "example.com",
+            "example.com",
+            &reached_truncated("https://example.com/last/", 302),
+            &reached("http://example.com/", 200),
+        );
+        assert_eq!(
+            p.canonical_url.as_deref(),
+            Some("https://example.com/last/")
+        );
+        assert!(p.redirect_truncated);
+    }
 
     #[test]
     fn parse_target_normalizes_a_bare_host() {
@@ -1003,8 +1129,14 @@ mod tests {
         }
 
         let p = probe(&fetcher, &target("example.com")).await;
-        assert!(!p.reachable);
-        // MAX_HOPS redirects followed means MAX_HOPS + 1 requests per scheme.
+        // The chain is still redirecting when the budget runs out, so the
+        // response is reached-with-truncated rather than refused: the client
+        // reports "site redirects again; not followed" and not "connection
+        // refused" for a site that answered every hop. MAX_HOPS still bounds
+        // the request count.
+        assert!(p.reachable);
+        assert!(p.redirect_truncated);
+        assert!(p.unreachable_reason.is_none());
         let https_requests = fetcher
             .requested()
             .iter()
@@ -1095,5 +1227,74 @@ mod tests {
             "one https and one http request total, not one pair per caller: {:?}",
             fetcher.requested()
         );
+    }
+
+    /// A chain that keeps redirecting past `MAX_HOPS` reaches the client as
+    /// reached-with-a-truncation-flag rather than as `refused`: the
+    /// canonical URL is the last URL we actually fetched, not a fabricated
+    /// destination, and `redirect_truncated` says the address is not
+    /// settled. Before this the same shape came back as
+    /// `reachable: false, unreachable_reason: "refused"` and the field
+    /// rendered "Could not reach ..." for a site that had answered every
+    /// hop.
+    #[tokio::test]
+    async fn probe_reports_a_hop_budget_exceeded_chain_as_truncated_not_refused() {
+        let mut fetcher = FakeFetcher::new().resolving("hoppy.example.com", "93.184.216.34");
+        // Six hops: MAX_HOPS + 1, so the final one is 302 with a Location we
+        // must not follow. Every hop resolves to the same address so the SSRF
+        // guard passes.
+        let hops = [
+            ("https://hoppy.example.com/", "https://hoppy.example.com/1/"),
+            (
+                "https://hoppy.example.com/1/",
+                "https://hoppy.example.com/2/",
+            ),
+            (
+                "https://hoppy.example.com/2/",
+                "https://hoppy.example.com/3/",
+            ),
+            (
+                "https://hoppy.example.com/3/",
+                "https://hoppy.example.com/4/",
+            ),
+            (
+                "https://hoppy.example.com/4/",
+                "https://hoppy.example.com/5/",
+            ),
+            (
+                "https://hoppy.example.com/5/",
+                "https://hoppy.example.com/6/",
+            ),
+        ];
+        for (from, to) in hops {
+            fetcher = fetcher.answering(from, 302, Some(to));
+        }
+        // Same story on the http scheme so classify has both to fold; the
+        // https flag is what canonical_url reports.
+        let http_hops = [
+            ("http://hoppy.example.com/", "http://hoppy.example.com/1/"),
+            ("http://hoppy.example.com/1/", "http://hoppy.example.com/2/"),
+            ("http://hoppy.example.com/2/", "http://hoppy.example.com/3/"),
+            ("http://hoppy.example.com/3/", "http://hoppy.example.com/4/"),
+            ("http://hoppy.example.com/4/", "http://hoppy.example.com/5/"),
+            ("http://hoppy.example.com/5/", "http://hoppy.example.com/6/"),
+        ];
+        for (from, to) in http_hops {
+            fetcher = fetcher.answering(from, 302, Some(to));
+        }
+
+        let p = probe(&fetcher, &target("hoppy.example.com")).await;
+        assert!(
+            p.reachable,
+            "a truncated chain is reached, not refused: {p:?}"
+        );
+        assert!(p.redirect_truncated);
+        assert_eq!(
+            p.canonical_url.as_deref(),
+            Some("https://hoppy.example.com/5/"),
+            "the last URL fetched on the MAX_HOPS-th step, not the unfollowed target"
+        );
+        assert_eq!(p.final_status, Some(302));
+        assert!(p.unreachable_reason.is_none());
     }
 }

@@ -5,6 +5,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
@@ -65,7 +66,7 @@ fn quote(company_id: uuid::Uuid, lines: Vec<Value>) -> Value {
 
 /// Tax lands on the taxable subtotal only, the rate is recorded, and adding a
 /// line re-derives it.
-#[sqlx::test]
+#[mokosh_test]
 async fn tax_follows_the_rate_over_the_taxable_lines_and_every_line_change(pool: PgPool) {
     let (_, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -115,7 +116,7 @@ async fn tax_follows_the_rate_over_the_taxable_lines_and_every_line_change(pool:
 
 /// A given amount is kept through line changes and records no rate; naming a
 /// rate on update re-derives; giving an amount on update clears the rate.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_given_amount_is_kept_until_a_rate_is_named(pool: PgPool) {
     let (_, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -176,7 +177,7 @@ async fn a_given_amount_is_kept_until_a_rate_is_named(pool: PgPool) {
 }
 
 /// Changing the tenant's rate afterwards does not move an existing quote.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_later_rate_change_does_not_move_an_existing_quote(pool: PgPool) {
     let (_, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

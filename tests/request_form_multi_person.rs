@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -150,7 +151,7 @@ impl Fixture {
 
 /// The case the issue was filed for: one link for five people produces one
 /// parent and a child per submission, and the sixth is refused.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_link_for_several_people_files_a_child_per_person(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let (status, issued, link) = f.issue(Some(3)).await;
@@ -205,7 +206,7 @@ async fn a_link_for_several_people_files_a_child_per_person(pool: PgPool) {
 
 /// The ordinary request is untouched: one person, one ticket, no parent, and
 /// the link is spent after one submission.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_single_person_link_is_unchanged(pool: PgPool) {
     let f = Fixture::new(pool).await;
     for people in [None, Some(1)] {
@@ -236,7 +237,7 @@ async fn a_single_person_link_is_unchanged(pool: PgPool) {
 
 /// The count is bounded: a request for no people or for hundreds is refused,
 /// and nothing is issued.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_number_of_people_is_bounded(pool: PgPool) {
     let f = Fixture::new(pool).await;
     for people in [0, -1, 51, 5_000] {
@@ -253,7 +254,7 @@ async fn the_number_of_people_is_bounded(pool: PgPool) {
 
 /// PMS-732 stays an average over PEOPLE: time is recorded on children, the
 /// parent has none, and the report counts the children.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_measured_duration_averages_over_children(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let (_, _, link) = f.issue(Some(2)).await;
