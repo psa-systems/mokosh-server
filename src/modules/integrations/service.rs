@@ -471,7 +471,7 @@ fn assert_config_object(config: Value) -> AppResult<Value> {
         Ok(config)
     } else {
         Err(AppError::BadRequest(
-            "config must be a JSON object of settings".to_string(),
+            "integrations.config must be a JSON object of settings".to_string(),
         ))
     }
 }
@@ -494,8 +494,8 @@ fn assert_poll_interval(
     };
     if minutes < polling.min_minutes {
         return Err(AppError::BadRequest(format!(
-            "a poll interval of {minutes} minutes is below the {} minute floor",
-            polling.min_minutes
+            "A poll interval of {minutes} minutes is below the {} minute floor for {}.",
+            polling.min_minutes, descriptor.display_name
         )));
     }
     Ok(Some(minutes))

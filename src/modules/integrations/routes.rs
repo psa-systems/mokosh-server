@@ -70,7 +70,7 @@ pub fn integration_routes(service: IntegrationsService) -> Router {
 fn parse_provider(raw: &str) -> AppResult<IntegrationProvider> {
     IntegrationProvider::from_str(raw).ok_or_else(|| {
         AppError::NotFound(format!(
-            "{raw:?} is not an integration provider. The providers are: {}",
+            "{raw} is not an integration provider. The providers are: {}",
             IntegrationProvider::ALL
                 .iter()
                 .map(|p| p.as_str())
