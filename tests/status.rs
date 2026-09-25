@@ -315,8 +315,14 @@ async fn the_company_backup_endpoint_lists_every_system_with_its_current_state(p
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
 
-    // device-B is mapped but has never delivered a backup observation.
-    // It has to appear as `latest: null` so the operator can act.
+    // device-B is mapped but has never delivered a backup observation, so
+    // no `monitored_systems` row exists for it yet: seeding a mapping
+    // creates a `status_device_mappings` row and nothing more, and the
+    // company backup endpoint reads out of `monitored_systems`. Only
+    // device-A - the one we just ingested - appears here, carrying its
+    // failure outcome. Surfacing a mapped-but-unseen system through this
+    // endpoint would be a separate feature and is not what this test
+    // pins.
     let token = common::login(&app, &email, &password).await;
     let resp = app
         .client
@@ -329,7 +335,12 @@ async fn the_company_backup_endpoint_lists_every_system_with_its_current_state(p
 
     let body: serde_json::Value = resp.json().await.expect("rollup JSON");
     let systems = body["systems"].as_array().expect("systems array");
-    assert_eq!(systems.len(), 0, "device seeding writes no monitored_systems row until the first ingest; the mapped-but-unseen system waits on that write");
+    assert_eq!(
+        systems.len(),
+        1,
+        "device-A had one ingest and is materialised into monitored_systems; device-B is only mapped and stays out until its first ingest"
+    );
+    assert_eq!(systems[0]["latest"]["outcome"].as_str(), Some("failure"));
 
     // After the first ingest for device-B the rollup has both systems.
     let resp = post_status(
