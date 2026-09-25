@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use printpdf::PdfDocument;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -137,7 +138,7 @@ async fn pdf(app: &common::TestApp, token: &str, path: &str) -> (StatusCode, Vec
 /// person. Since PMS-1016 the create path resolves that same pointer, so the
 /// draft already carries the recipient and the send keeps it rather than
 /// filling it in; either way the document names whoever was emailed.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_sent_invoice_names_the_person_it_was_emailed_to(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -180,7 +181,7 @@ async fn a_sent_invoice_names_the_person_it_was_emailed_to(pool: PgPool) {
 /// current pointer. Proven by deleting the stored document so the route has to
 /// render live, then moving the company's pointer to somebody else: a render
 /// that read the pointer would name the new person.
-#[sqlx::test]
+#[mokosh_test]
 async fn reassigning_the_billing_role_does_not_change_an_issued_invoice(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -219,7 +220,7 @@ async fn reassigning_the_billing_role_does_not_change_an_issued_invoice(pool: Pg
 
 /// An invoice sent with no contact anywhere prints the company and nothing
 /// else: an empty labelled attention line is worse than none.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_invoice_with_no_contact_prints_no_attention_line(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -250,7 +251,7 @@ async fn an_invoice_with_no_contact_prints_no_attention_line(pool: PgPool) {
 
 /// A credit note is addressed to whoever received the invoice it corrects, so
 /// the two documents in one correction name the same person.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_credit_note_names_the_contact_of_the_invoice_it_corrects(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
@@ -299,7 +300,7 @@ async fn a_credit_note_names_the_contact_of_the_invoice_it_corrects(pool: PgPool
 
 /// A statement names the company's CURRENT billing contact, because it stores
 /// nothing and renders from today (PMS-954), exactly as its branding does.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_statement_names_the_companys_current_billing_contact(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;

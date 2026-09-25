@@ -19,6 +19,7 @@ use mokosh_server::secrets::DatabaseSecretProvider;
 use mokosh_server::utils::email::{EmailAttachment, Mailer};
 use mokosh_server::utils::error::AppResult;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -229,7 +230,7 @@ fn reminder_service(pool: &PgPool, mailer: Arc<CapturingMailer>) -> BillingServi
 /// Overdue is derived: a sent invoice past due says so with the day count,
 /// one due today or in the future does not, and a paid, draft or
 /// written-off one never does. The list filter applies the same rule.
-#[sqlx::test]
+#[mokosh_test]
 async fn overdue_is_derived_on_every_read_and_filters_the_list(pool: PgPool) {
     tenant_on_utc(&pool).await;
     let (_admin, email, password) = common::seed_admin(&pool).await;
@@ -291,7 +292,7 @@ async fn overdue_is_derived_on_every_read_and_filters_the_list(pool: PgPool) {
 /// invoice 3 days past due gets one mail, a second run the same hour sends
 /// nothing, day 7 sends the second, and reminders off send nothing. The mail
 /// goes to the billing contact and carries the stored document.
-#[sqlx::test]
+#[mokosh_test]
 async fn reminders_follow_the_schedule_once_per_step(pool: PgPool) {
     install_test_attachment_env();
     tenant_on_utc(&pool).await;
@@ -387,7 +388,7 @@ async fn reminders_follow_the_schedule_once_per_step(pool: PgPool) {
 }
 
 /// The schedule setting refuses shapes the sweep could not follow.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_schedule_setting_is_validated(pool: PgPool) {
     let (_admin, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

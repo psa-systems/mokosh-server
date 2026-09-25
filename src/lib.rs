@@ -101,6 +101,56 @@ mod repo_hygiene {
         );
     }
 
+    /// PMS-1254: a database-backed integration test is `#[mokosh_test]`.
+    ///
+    /// The attribute clones each test's database from one migrated template
+    /// instead of applying all 243 migrations into it, which is the whole
+    /// saving. A single case left on the old attribute would quietly take the
+    /// slow path AND, because it migrates a database of its own, prove nothing
+    /// about the template the rest ran against, so the ban is enforced here
+    /// rather than left to the conversion having been complete on the day.
+    ///
+    /// Only the ATTRIBUTE is banned. The two crates under `crates/mokosh-test*`
+    /// explain at length what they replaced and are not scanned, and prose
+    /// elsewhere naming the old attribute is history rather than a call site.
+    ///
+    /// The needle is assembled at runtime so this file is not itself a hit.
+    #[test]
+    fn every_database_backed_test_takes_the_template_attribute() {
+        let needle = format!("#[sq{}::test", "lx");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        let mut hits: Vec<String> = Vec::new();
+        let mut pending = vec![dir];
+
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read the integration test directory") {
+                let entry = entry.expect("read directory entry");
+                let path = entry.path();
+                if entry.file_type().expect("read entry type").is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read an integration test");
+                for (number, line) in source.lines().enumerate() {
+                    if line.contains(&needle) {
+                        hits.push(format!("{}:{}", path.display(), number + 1));
+                    }
+                }
+            }
+        }
+
+        hits.sort();
+        assert!(
+            hits.is_empty(),
+            "a database-backed test is #[mokosh_test], which clones the \
+             migrated template (PMS-1254); these still migrate a database of \
+             their own: {hits:#?}"
+        );
+    }
+
     /// PMS-1010: a selectable implementation is a PROVIDER, and the two words
     /// it replaced do not come back.
     ///

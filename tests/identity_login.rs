@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -89,7 +90,7 @@ async fn post_select_tenant(app: &common::TestApp, body: Value) -> reqwest::Resp
         .expect("send select-tenant")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn email_only_login_with_single_membership_auto_scopes(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -117,7 +118,7 @@ async fn email_only_login_with_single_membership_auto_scopes(pool: PgPool) {
     assert!(body["user"].is_object(), "user profile returned");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn email_only_login_with_multiple_memberships_returns_picker(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let other_tenant = insert_tenant(&pool, "Second Tenant", "second-mapps492").await;
@@ -146,7 +147,7 @@ async fn email_only_login_with_multiple_memberships_returns_picker(pool: PgPool)
     assert!(body["user"].is_null());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn email_only_login_with_zero_memberships_returns_needs_setup(pool: PgPool) {
     insert_identity_no_membership(&pool, "orphan@example.com").await;
     let app = common::boot(pool).await;
@@ -174,7 +175,7 @@ async fn email_only_login_with_zero_memberships_returns_needs_setup(pool: PgPool
     assert!(body["user"].is_null());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn email_only_login_with_wrong_password_returns_401(pool: PgPool) {
     let (_admin_id, email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -192,7 +193,7 @@ async fn email_only_login_with_wrong_password_returns_401(pool: PgPool) {
 /// the same identity within its ~60s window. The second POST with the
 /// same code must 401, matching how the tenant-hint MFA branch has
 /// enforced anti-replay since PMS-502.
-#[sqlx::test]
+#[mokosh_test]
 async fn identity_first_mfa_burns_totp_step(pool: PgPool) {
     // Seed a fresh identity with MFA enabled and a known secret so we
     // can compute a valid TOTP code deterministically via the same
@@ -261,7 +262,7 @@ async fn identity_first_mfa_burns_totp_step(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn select_tenant_with_valid_identity_token_returns_session(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let other_tenant = insert_tenant(&pool, "Second Tenant", "second-mapps492").await;
@@ -307,7 +308,7 @@ async fn select_tenant_with_valid_identity_token_returns_session(pool: PgPool) {
     assert_eq!(body["needs_setup"], false);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn select_tenant_with_wrong_tenant_returns_404(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     // Force a picker branch so we get an identity_token.
@@ -337,7 +338,7 @@ async fn select_tenant_with_wrong_tenant_returns_404(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn select_tenant_with_bogus_token_returns_401(pool: PgPool) {
     let app = common::boot(pool).await;
     let resp = post_select_tenant(
@@ -351,7 +352,7 @@ async fn select_tenant_with_bogus_token_returns_401(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn tenant_hint_login_still_works_unchanged(pool: PgPool) {
     // Existing shape: caller supplies tenant_slug -> tenant-hint path
     // runs, identity-first is not entered. Guards the compat contract
@@ -378,7 +379,7 @@ async fn tenant_hint_login_still_works_unchanged(pool: PgPool) {
 // TWO memberships whose users rows carry DIFFERENT password hashes must
 // auto-scope to the tenant whose users row password matches the caller's
 // input, without a picker step and without asking the identity plane.
-#[sqlx::test]
+#[mokosh_test]
 async fn identity_first_finds_the_matching_membership_when_hashes_diverged(pool: PgPool) {
     let email = "diverged@example.com".to_string();
     let password_a = "TENANT-A-PW-12345".to_string();

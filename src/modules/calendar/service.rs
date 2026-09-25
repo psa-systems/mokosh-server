@@ -76,6 +76,17 @@ impl<'a> FilterClauses<'a> {
         }
     }
 
+    /// Like `add_opt` but the placeholder lands INSIDE the predicate, with
+    /// `prefix` before it and `suffix` after it, so a subquery condition like
+    /// `team_id IN (SELECT ... WHERE user_id = $N)` closes its own paren.
+    fn add_wrapped(&mut self, prefix: &str, suffix: &str, value: Option<FilterBind<'a>>) {
+        if let Some(value) = value {
+            self.conditions
+                .push(format!("{prefix}${}{suffix}", self.next_placeholder()));
+            self.binds.push(value);
+        }
+    }
+
     fn where_clause(&self) -> String {
         self.conditions.join(" AND ")
     }
@@ -272,6 +283,7 @@ impl CalendarService {
     pub async fn list_appointments(
         &self,
         tenant_id: TenantId,
+        caller_id: Uuid,
         filter: &AppointmentFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<AppointmentResponse>, u64)> {
@@ -282,11 +294,19 @@ impl CalendarService {
         // included, occurrences not expanded). `appointment_type` is not
         // a dimension of the range/dispatch view, so it is honoured only
         // on the unbounded path.
+        let my_teams_caller = filter.my_teams.unwrap_or(false).then_some(caller_id);
         if let (Some(from), Some(to), None) =
             (filter.from, filter.to, filter.appointment_type.as_ref())
         {
             let all = self
-                .appointments_in_range(tenant_id, from, to, filter.user_id, filter.team_id)
+                .appointments_in_range(
+                    tenant_id,
+                    from,
+                    to,
+                    filter.user_id,
+                    filter.team_id,
+                    my_teams_caller,
+                )
                 .await?;
             let total = all.len() as u64;
             let start = pagination.offset() as usize;
@@ -305,11 +325,15 @@ impl CalendarService {
         );
         filters.add_opt("end_time >=", filter.from.map(FilterBind::Timestamp));
         filters.add_opt("start_time <=", filter.to.map(FilterBind::Timestamp));
-        // PMS-791 phase 4 / MAPPS-465: exact-team filter. The my_teams
-        // convenience scope is on the DTO but its expansion needs a
-        // caller_id thread-through that the calendar routes do not
-        // currently plumb, so it is accepted and ignored: PMS-1102.
         filters.add_opt("team_id =", filter.team_id.map(FilterBind::Uuid));
+        // The convenience scope: narrow to teams the caller is on. The
+        // subquery reads `team_members` on the same tenant-scoped connection
+        // so RLS keeps it in-tenant; a caller on no team gets an empty set.
+        filters.add_wrapped(
+            "team_id IN (SELECT team_id FROM team_members WHERE user_id = ",
+            ")",
+            my_teams_caller.map(FilterBind::Uuid),
+        );
         let where_clause = filters.where_clause();
         let limit_placeholder = filters.next_placeholder();
         let offset_placeholder = limit_placeholder + 1;
@@ -364,6 +388,7 @@ impl CalendarService {
         to: DateTime<Utc>,
         assigned_to_id: Option<Uuid>,
         team_id: Option<Uuid>,
+        my_teams_caller: Option<Uuid>,
     ) -> AppResult<Vec<AppointmentResponse>> {
         // Non-recurring rows overlapping the window. The recurring
         // masters are fetched separately (next query) WITHOUT a time
@@ -372,6 +397,11 @@ impl CalendarService {
         let mut filters = FilterClauses::new(&["tenant_id = $1", "recurrence_rule IS NULL"]);
         filters.add_opt("assigned_to_id =", assigned_to_id.map(FilterBind::Uuid));
         filters.add_opt("team_id =", team_id.map(FilterBind::Uuid));
+        filters.add_wrapped(
+            "team_id IN (SELECT team_id FROM team_members WHERE user_id = ",
+            ")",
+            my_teams_caller.map(FilterBind::Uuid),
+        );
         // overlap: end >= from AND start <= to
         filters.add("end_time >=", FilterBind::Timestamp(from));
         filters.add("start_time <=", FilterBind::Timestamp(to));
@@ -397,6 +427,11 @@ impl CalendarService {
         let mut rfilters = FilterClauses::new(&["tenant_id = $1", "recurrence_rule IS NOT NULL"]);
         rfilters.add_opt("assigned_to_id =", assigned_to_id.map(FilterBind::Uuid));
         rfilters.add_opt("team_id =", team_id.map(FilterBind::Uuid));
+        rfilters.add_wrapped(
+            "team_id IN (SELECT team_id FROM team_members WHERE user_id = ",
+            ")",
+            my_teams_caller.map(FilterBind::Uuid),
+        );
         let rwhere = rfilters.where_clause();
         let recurring_query = format!(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
@@ -1228,7 +1263,7 @@ impl CalendarService {
         // No team filter: `DispatchFilter` exposes none, so the board is
         // never given one it could drop (PMS-1066).
         let appointments = self
-            .appointments_in_range(tenant_id, from, to, assigned_to_id, None)
+            .appointments_in_range(tenant_id, from, to, assigned_to_id, None, None)
             .await?;
 
         // Availability: optionally scoped to one technician.

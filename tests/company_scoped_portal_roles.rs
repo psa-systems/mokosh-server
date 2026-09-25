@@ -11,6 +11,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;
@@ -62,7 +63,7 @@ async fn find_builtin_role_id(pool: &PgPool, name: &str) -> Uuid {
 // Create + uniqueness
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_wide_role_with_null_company_id_succeeds(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -88,7 +89,7 @@ async fn create_tenant_wide_role_with_null_company_id_succeeds(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_company_scoped_role_with_company_id_succeeds(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -121,7 +122,7 @@ async fn create_company_scoped_role_with_company_id_succeeds(pool: PgPool) {
     assert_eq!(body["is_builtin"], false);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn tenant_wide_and_company_scoped_can_share_a_name(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -167,7 +168,7 @@ async fn tenant_wide_and_company_scoped_can_share_a_name(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn two_company_scoped_roles_same_name_different_companies_coexist(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -200,7 +201,7 @@ async fn two_company_scoped_roles_same_name_different_companies_coexist(pool: Pg
     assert_eq!(count, 2);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn two_tenant_wide_roles_same_name_return_409(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -227,7 +228,7 @@ async fn two_tenant_wide_roles_same_name_return_409(pool: PgPool) {
     assert_eq!(dup.status(), StatusCode::CONFLICT);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn two_company_scoped_roles_same_name_same_company_return_409(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -264,7 +265,7 @@ async fn two_company_scoped_roles_same_name_same_company_return_409(pool: PgPool
 // List semantics
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn list_portal_roles_none_returns_tenant_wide_only(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -307,7 +308,7 @@ async fn list_portal_roles_none_returns_tenant_wide_only(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn list_portal_roles_some_returns_union(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -372,7 +373,7 @@ async fn list_portal_roles_some_returns_union(pool: PgPool) {
     assert_eq!(rows.len(), nested.len(), "two list endpoints must agree");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn get_scoped_role_from_wrong_company_returns_404(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -425,7 +426,7 @@ async fn get_scoped_role_from_wrong_company_returns_404(pool: PgPool) {
 // Assignment scope enforcement
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn replace_role_assignments_rejects_scoped_role_for_wrong_company_400(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -472,7 +473,7 @@ async fn replace_role_assignments_rejects_scoped_role_for_wrong_company_400(pool
     assert_eq!(count, 0);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn grant_portal_access_rejects_scoped_role_for_wrong_company_400(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -520,7 +521,7 @@ async fn grant_portal_access_rejects_scoped_role_for_wrong_company_400(pool: PgP
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn delete_company_scoped_role_with_assignments_returns_409_with_count(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -585,7 +586,7 @@ async fn delete_company_scoped_role_with_assignments_returns_409_with_count(pool
 // Post-migration + cross-tenant integrity
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn built_in_roles_remain_tenant_wide_after_migration(pool: PgPool) {
     // No API involved; verify the seed rows stayed with company_id NULL
     // through migration 148.
@@ -613,7 +614,7 @@ async fn built_in_roles_remain_tenant_wide_after_migration(pool: PgPool) {
     assert_eq!(count, 3);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn cross_tenant_isolation_holds_on_company_scoped_roles(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -688,7 +689,7 @@ async fn cross_tenant_isolation_holds_on_company_scoped_roles(pool: PgPool) {
 // Update semantics
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn update_role_ignores_or_rejects_company_id_change(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -742,7 +743,7 @@ async fn update_role_ignores_or_rejects_company_id_change(pool: PgPool) {
 // Belt-and-braces on the nested create
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn nested_post_body_company_id_must_equal_path_400(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -778,7 +779,7 @@ async fn nested_post_body_company_id_must_equal_path_400(pool: PgPool) {
 ///
 /// Without this pin, the scope-check would silently start rejecting
 /// EVERY role assignment the moment the RLS gotcha comes back.
-#[sqlx::test]
+#[mokosh_test]
 async fn replace_role_assignments_with_tenant_wide_role_succeeds(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

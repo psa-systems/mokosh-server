@@ -16,6 +16,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
@@ -33,7 +34,7 @@ use mokosh_server::Database;
 /// row so the SPA can gate org-only features without a second round-trip.
 /// Default tenant seeded by migration 002 is `kind='org'`; separately-seeded
 /// tenants with `kind='personal'` also round-trip correctly.
-#[sqlx::test]
+#[mokosh_test]
 async fn current_user_carries_tenant_kind_org(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -56,7 +57,7 @@ async fn current_user_carries_tenant_kind_org(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn current_user_carries_tenant_kind_personal(pool: PgPool) {
     // Seed a personal tenant + a user in it so /me returns "personal".
     let personal_owner = Uuid::new_v4();
@@ -109,7 +110,7 @@ async fn current_user_carries_tenant_kind_personal(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn login_then_me_happy_path(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -152,7 +153,7 @@ async fn login_then_me_happy_path(pool: PgPool) {
 /// Distinguishes "your account has been deleted" from "your session expired
 /// (please refresh)" so the SPA can render its terminal modal instead of
 /// falling into a token-refresh loop.
-#[sqlx::test]
+#[mokosh_test]
 async fn tombstoned_user_gets_410_account_deleted_on_me(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -204,7 +205,7 @@ async fn tombstoned_user_gets_410_account_deleted_on_me(pool: PgPool) {
 /// `theme_accent_id`; `GET /me` reads them back; omitting one field on a
 /// later PUT leaves it unchanged (conditional UPDATE builder); an invalid
 /// `theme_base_mode` is rejected with 422 by the custom validator.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_me_theme_prefs_round_trip(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -318,7 +319,7 @@ async fn update_me_theme_prefs_round_trip(pool: PgPool) {
 /// is the mechanical guard on the removal - re-adding any of the three fields
 /// to the request type makes this test fail. `GET /me` still returns all
 /// three for display.
-#[sqlx::test]
+#[mokosh_test]
 async fn put_me_cannot_mutate_bunyip_owned_profile_fields(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     // `phone` has no seeder, so set it directly: it must survive the PUT too.
@@ -401,7 +402,7 @@ async fn put_me_cannot_mutate_bunyip_owned_profile_fields(pool: PgPool) {
 
 /// Seed 1 admin + 14 technicians (15 users total in tenant) and assert
 /// the pagination envelope at `page=2&per_page=10` returns exactly 5.
-#[sqlx::test]
+#[mokosh_test]
 async fn list_users_pagination_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     for i in 0..14 {
@@ -431,7 +432,7 @@ async fn list_users_pagination_happy_path(pool: PgPool) {
 /// requested role; combined `q` + `role` narrows to the intersection.
 /// The seeded admin (super_admin) is excluded from any
 /// `role=technician` / `role=manager` result.
-#[sqlx::test]
+#[mokosh_test]
 async fn list_users_filter_by_role_and_q(pool: PgPool) {
     let (_admin_id, admin_email, password) = common::seed_admin(&pool).await;
     for i in 0..3 {
@@ -473,7 +474,7 @@ async fn list_users_filter_by_role_and_q(pool: PgPool) {
 /// F9 regression pin: `q` is capped at 200 chars in `ListUsersFilter`;
 /// a 201-char `q` is rejected with 422 by the route's
 /// `filter.validate()?` call.
-#[sqlx::test]
+#[mokosh_test]
 async fn list_users_filter_validation_rejects_oversize_q(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -496,7 +497,7 @@ async fn list_users_filter_validation_rejects_oversize_q(pool: PgPool) {
 
 /// A logged-in non-admin (`technician`) cannot list users. PMS-4 AC1
 /// admin/manager gate pin.
-#[sqlx::test]
+#[mokosh_test]
 async fn list_users_requires_admin(pool: PgPool) {
     let (_uid, email, password) = common::seed_user(
         &pool,
@@ -528,7 +529,7 @@ async fn list_users_requires_admin(pool: PgPool) {
 
 /// End-to-end TOTP challenge: enroll, enable, log in without code
 /// (expect `mfa_required: true`), then log in with the TOTP code.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_challenge_happy_path(pool: PgPool) {
     let (_uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -612,7 +613,7 @@ async fn mfa_challenge_happy_path(pool: PgPool) {
 
 /// PMS-4 AC3: a recovery code can be used to log in instead of a TOTP
 /// code, and each code works exactly once.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_recovery_code_login_single_use(pool: PgPool) {
     let (_uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -734,7 +735,7 @@ async fn stored_mfa_secret(pool: &PgPool, user_id: Uuid) -> String {
 /// the whole enrol -> enable -> login round trip still works over it. Before
 /// this, anyone who could read `users` (a `pg_dump`, a replica, a SQL read
 /// primitive) could mint valid second factors for every user in every tenant.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_enrolment_persists_ciphertext(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -819,7 +820,7 @@ async fn mfa_enrolment_persists_ciphertext(pool: PgPool) {
 /// ciphertext on that first successful verification. No SQL migration can do
 /// this (a migration has no `ENCRYPTION_KEY`), so an in-place upgrade on use is
 /// what saves every enrolled user a forced re-enrolment.
-#[sqlx::test]
+#[mokosh_test]
 async fn legacy_plaintext_mfa_secret_logs_in_and_upgrades(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
     // Writes the raw base32 secret straight onto the row: exactly the shape
@@ -946,7 +947,7 @@ async fn set_mfa_secret_unmirrored(pool: &PgPool, table: &str, id: Uuid, value: 
 /// a plaintext one with no error and nothing in a log. The forward direction is
 /// the same defect with the planes swapped (a users row still legacy after a
 /// per-tenant login, any unrelated `users` write, a sealed identity).
-#[sqlx::test]
+#[mokosh_test]
 async fn neither_mirror_direction_can_rewrite_an_mfa_secret(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1027,7 +1028,7 @@ async fn neither_mirror_direction_can_rewrite_an_mfa_secret(pool: PgPool) {
 /// `identities.mfa_secret` - ciphertext, since the enrolment seals it - straight
 /// to `base32_decode`, which accepts only `A-Z2-7` and rejected the `0`, `1`,
 /// `8`, `9`, `+` and `/` base64 routinely carries.
-#[sqlx::test]
+#[mokosh_test]
 async fn identity_first_login_verifies_the_sealed_identity_secret(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1081,7 +1082,7 @@ async fn identity_first_login_verifies_the_sealed_identity_secret(pool: PgPool) 
 /// login branch answers `AppError::Internal("MFA enabled without secret")` - a
 /// 500 in the second tenant caused by enrolling in the first. `write_mfa_secret`
 /// is what closes that: it writes both planes by email, not the caller's row.
-#[sqlx::test]
+#[mokosh_test]
 async fn enrolling_in_one_tenant_arms_the_same_secret_in_the_other(pool: PgPool) {
     let (_uid, email, password) = common::seed_admin(&pool).await;
 
@@ -1176,7 +1177,7 @@ async fn enrolling_in_one_tenant_arms_the_same_secret_in_the_other(pool: PgPool)
 /// filtered by RLS to the caller's tenant alone. This uses `common::boot_rls`
 /// to exercise that role and proves the second tenant's `users` row gets both
 /// columns, and that logging in there is actually prompted for a code.
-#[sqlx::test]
+#[mokosh_test]
 async fn enabling_mfa_in_one_tenant_arms_the_flag_in_the_other_under_rls(pool: PgPool) {
     let (_uid, email, password) = common::seed_admin(&pool).await;
 
@@ -1262,7 +1263,7 @@ async fn enabling_mfa_in_one_tenant_arms_the_flag_in_the_other_under_rls(pool: P
 /// passes this assertion too. It stays as direct coverage of the disable
 /// contract itself, which `write_mfa_enabled` now satisfies without relying
 /// on that trigger side effect.
-#[sqlx::test]
+#[mokosh_test]
 async fn disabling_mfa_in_one_tenant_clears_the_flag_in_the_other_under_rls(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
 
@@ -1407,7 +1408,7 @@ async fn enroll_and_enable_mfa(app: &common::TestApp, token: &str) -> Vec<u8> {
 /// PMS-502 anti-replay: a TOTP code accepted once cannot be replayed while
 /// it is still inside its +/-1 verify window. The first login consumes the
 /// code's step; a second login with the SAME code is rejected.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_totp_code_cannot_be_replayed(pool: PgPool) {
     let (_uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1459,7 +1460,7 @@ async fn mfa_totp_code_cannot_be_replayed(pool: PgPool) {
 /// per-account lockout (`users.mfa_locked_until`), independent of the
 /// in-memory login limiter, that rejects further attempts with 429 even
 /// when a correct code is finally supplied.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_failed_codes_lock_account(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1618,7 +1619,7 @@ fn auth_service(pool: &PgPool) -> Arc<AuthService> {
 /// before any code is checked, so it spends no guess and must not tick the
 /// counter. How many racers land on each side is pure scheduling, so pinning
 /// the burst size made the test flaky (CI run #3783 saw 17 of 20).
-#[sqlx::test]
+#[mokosh_test]
 async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
     let secret = seed_mfa_enabled(&pool, uid).await;
@@ -1701,7 +1702,7 @@ async fn concurrent_wrong_mfa_codes_all_count(pool: PgPool) {
 /// the CAS UPDATE refused the second attempt at the step, no session was
 /// minted from a replayed code. The stricter `wins == 1` shape existed for
 /// a while and was intermittently flaky in CI for exactly this reason.
-#[sqlx::test]
+#[mokosh_test]
 async fn concurrent_same_totp_code_accepted_once(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
     let secret = seed_mfa_enabled(&pool, uid).await;
@@ -1748,7 +1749,7 @@ async fn concurrent_same_totp_code_accepted_once(pool: PgPool) {
 /// `mfa_lockout_until` defines in Rust. Pin the two together across the whole
 /// documented table (`1..=12` spans below-threshold, the doubling ramp and the
 /// 3600s cap) so neither can drift.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_lock_seconds_sql_matches_rust_schedule(pool: PgPool) {
     let sql = format!("SELECT {}", mfa_lock_seconds_sql("$1::int"));
     let now = Utc::now();
@@ -1793,7 +1794,7 @@ fn recovery_login_request(email: &str, password: &str, recovery_code: &str) -> L
 /// Calls `AuthService::login` directly for the same reason the PMS-693 pins do:
 /// the router's 5/min per-email limiter would answer 429 on its own and mask
 /// which gate refused the attempt.
-#[sqlx::test]
+#[mokosh_test]
 async fn failed_recovery_codes_lock_account(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
     seed_mfa_enabled(&pool, uid).await;
@@ -1856,7 +1857,7 @@ async fn failed_recovery_codes_lock_account(pool: PgPool) {
 /// user who locked themselves out of TOTP is not still penalised afterwards.
 /// It must NOT move `mfa_last_used_step`: a recovery code is not a TOTP step,
 /// and dragging the anti-replay watermark forward would invalidate live codes.
-#[sqlx::test]
+#[mokosh_test]
 async fn recovery_code_success_clears_mfa_counters(pool: PgPool) {
     let (uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1950,7 +1951,7 @@ async fn recovery_code_success_clears_mfa_counters(pool: PgPool) {
 
 /// Wrong password yields 401 (not 200, not 404). Negative pin for the
 /// login happy path.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_wrong_password_returns_401(pool: PgPool) {
     let (_uid, email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1977,10 +1978,10 @@ async fn login_wrong_password_returns_401(pool: PgPool) {
 /// with the wrong password 5+ times trips the limiter and returns 429
 /// with a populated `Retry-After` header.
 ///
-/// Each `#[sqlx::test]` boots a fresh `AuthRateLimiter` instance because
+/// Each `#[mokosh_test]` boots a fresh `AuthRateLimiter` instance because
 /// `boot(pool)` builds a new `AuthRouterState` per test, so this test
 /// starts with empty buckets and does not need a serial guard.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_rate_limit_triggers_429(pool: PgPool) {
     let (_uid, email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2044,7 +2045,7 @@ async fn login_rate_limit_triggers_429(pool: PgPool) {
 /// by id. Pre-fix the service-level SELECT returned the row (cross-
 /// tenant leak); post-fix the WHERE binds `tenant_id` so the route
 /// returns 404. Pins all four A.6 surgical fixes at the route level.
-#[sqlx::test]
+#[mokosh_test]
 async fn tenant_isolation_get_user_by_id_returns_404(pool: PgPool) {
     let (_admin_a, email_a, password_a) = common::seed_admin(&pool).await;
     let (_tenant_b_id, user_b_id, _email_b, _password_b) =
@@ -2080,7 +2081,7 @@ async fn tenant_isolation_get_user_by_id_returns_404(pool: PgPool) {
 /// tenants the `tenant_id` hint must steer the lookup to the user in
 /// the named tenant. Pre-PMS-138 the email-only lookup returned the
 /// oldest-created row regardless of which tenant the caller intended.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
     let colliding_email = "colliding@example.com";
 
@@ -2157,7 +2158,7 @@ async fn login_with_tenant_hint_resolves_to_correct_tenant(pool: PgPool) {
 /// membership succeeds and returns a full scoped session. The
 /// zero-membership and multi-membership branches are covered in
 /// `tests/identity_login.rs`.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_omitting_tenant_hint_autoscopes_when_identity_has_one_membership(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2186,7 +2187,7 @@ async fn login_omitting_tenant_hint_autoscopes_when_identity_has_one_membership(
 /// PMS-138 wrong-hint pin: a hint that names a tenant where the email
 /// does not exist must return 401, never accidentally cross-
 /// authenticate against a different tenant's user.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_wrong_tenant_hint_returns_401(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (tenant_c_id, _admin_c_id, _admin_c_email, _admin_c_password) =
@@ -2219,7 +2220,7 @@ async fn login_wrong_tenant_hint_returns_401(pool: PgPool) {
 /// MAPPS-396: the standalone login form types a slug rather than a UUID,
 /// so `tenant_slug: "acme"` on the login body must resolve to acme's
 /// tenant_id server-side and authenticate the acme-tenant user.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_with_tenant_slug_resolves_to_correct_tenant(pool: PgPool) {
     let (tenant_id, user_id, email, password) =
         common::seed_tenant_with_admin(&pool, "acme-mapps396").await;
@@ -2257,7 +2258,7 @@ async fn login_with_tenant_slug_resolves_to_correct_tenant(pool: PgPool) {
 
 /// MAPPS-396: `tenant_id` wins when both are set, so a host-derived
 /// UUID hint is not silently overridden by a mistyped slug field.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_with_both_tenant_id_and_slug_prefers_id(pool: PgPool) {
     let (tenant_a_id, user_a_id, email_a, password_a) =
         common::seed_tenant_with_admin(&pool, "acme-both-a").await;
@@ -2293,7 +2294,7 @@ async fn login_with_both_tenant_id_and_slug_prefers_id(pool: PgPool) {
 
 /// MAPPS-396: an unknown slug must 401 (fail-closed), never
 /// leak-through as "default tenant" and let the wrong user in.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_with_unknown_tenant_slug_401s(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2319,7 +2320,7 @@ async fn login_with_unknown_tenant_slug_401s(pool: PgPool) {
 /// MAPPS-396: a slug that names a suspended tenant must 401 the same
 /// way an unknown slug does, so the endpoint cannot be walked to
 /// enumerate active-vs-suspended tenants.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_with_suspended_tenant_slug_401s(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
 
@@ -2359,7 +2360,7 @@ async fn login_with_suspended_tenant_slug_401s(pool: PgPool) {
 /// PMS-138 forgot-password sibling fix: with the same email under two
 /// tenants the `tenant_id` hint on `/api/v1/auth/forgot-password` must
 /// route the reset token to the user in the named tenant.
-#[sqlx::test]
+#[mokosh_test]
 async fn forgot_password_with_tenant_hint_targets_correct_user(pool: PgPool) {
     let colliding_email = "colliding@example.com";
     let (_user_a_id, _, _) =
@@ -2458,7 +2459,7 @@ async fn insert_active_session(
 /// PMS-260: `get_user_sessions` must bind `tenant_id` so a `user_id` that
 /// carries sessions under two tenants only ever enumerates the caller's-tenant
 /// sessions. Pre-fix the `WHERE user_id = $1`-only query returned both rows.
-#[sqlx::test]
+#[mokosh_test]
 async fn get_user_sessions_is_tenant_scoped(pool: PgPool) {
     let (user_id, _email, _password) = common::seed_admin(&pool).await;
     let (tenant_b_id, _b_uid, _b_email, _b_password) =
@@ -2492,7 +2493,7 @@ async fn get_user_sessions_is_tenant_scoped(pool: PgPool) {
 /// PMS-260: `logout_all` must bind `tenant_id` so it cannot delete sessions a
 /// user holds under a different tenant. Pre-fix the `WHERE user_id = $1`-only
 /// DELETE wiped both rows.
-#[sqlx::test]
+#[mokosh_test]
 async fn logout_all_is_tenant_scoped(pool: PgPool) {
     let (user_id, _email, _password) = common::seed_admin(&pool).await;
     let (tenant_b_id, _b_uid, _b_email, _b_password) =
@@ -2590,7 +2591,7 @@ fn routes_do_not_reach_global_login_helpers() {
 /// NOT the role-sanitizing `/me` handler - to `super_admin` (rank 3), a
 /// platform-level cross-tenant account. Pins that an above-ceiling role is
 /// rejected with 403 while an at-or-below-ceiling change still succeeds.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_user_enforces_role_ceiling(pool: PgPool) {
     // Caller is a tenant admin (rank 2), NOT a super_admin.
     let (_admin_id, admin_email, admin_password) = common::seed_user(
@@ -2684,7 +2685,7 @@ async fn craft_reset_token(
 /// AC1/AC2: a valid reset changes the password, marks the token used, and
 /// revokes the user's sessions (`logout_all`). Confirms end to end that the old
 /// password stops working and the new one logs in.
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_changes_password_and_revokes_sessions(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2788,7 +2789,7 @@ async fn reset_password_changes_password_and_revokes_sessions(pool: PgPool) {
 }
 
 /// AC2: an expired token is rejected (the `expires_at > NOW()` guard).
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_rejects_expired_token(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2820,7 +2821,7 @@ async fn reset_password_rejects_expired_token(pool: PgPool) {
 
 /// AC2: a token is single-use (`used_at IS NULL` guard). The second redeem of
 /// the same token fails.
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_token_is_single_use(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2867,7 +2868,7 @@ async fn reset_password_token_is_single_use(pool: PgPool) {
 
 /// AC1: a malformed token, and a well-formed token whose secret does not match
 /// the stored hash, are both rejected (no password change).
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_rejects_malformed_and_wrong_secret(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -2919,7 +2920,7 @@ async fn reset_password_rejects_malformed_and_wrong_secret(pool: PgPool) {
 /// AC1: requesting a reset for an address that does not exist returns 2xx and
 /// issues no token, so the endpoint never reveals whether an email is
 /// registered (no user enumeration).
-#[sqlx::test]
+#[mokosh_test]
 async fn forgot_password_unknown_email_issues_no_token(pool: PgPool) {
     // Seed an admin so the default tenant/config exists, then request a reset for
     // a different, unknown address.
@@ -2954,7 +2955,7 @@ async fn forgot_password_unknown_email_issues_no_token(pool: PgPool) {
 /// with 429 + `Retry-After`, so a known address cannot be reset-email bombed.
 /// The email need not belong to a real user: the limiter runs before the
 /// (silent-success) lookup, so an unknown address is throttled the same.
-#[sqlx::test]
+#[mokosh_test]
 async fn forgot_password_rate_limit_triggers_429(pool: PgPool) {
     let app = common::boot(pool).await;
     let body = serde_json::json!({ "email": "reset-flood-pms680@example.com" });
@@ -3013,7 +3014,7 @@ async fn forgot_password_rate_limit_triggers_429(pool: PgPool) {
 /// PMS-681: an access token whose `iat` predates `users.password_changed_at` is
 /// rejected (401) on its next request. Stamps password_changed_at 30s in the
 /// future so the check is deterministic regardless of test timing.
-#[sqlx::test]
+#[mokosh_test]
 async fn access_token_rejected_after_password_change(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -3060,7 +3061,7 @@ async fn access_token_rejected_after_password_change(pool: PgPool) {
 
 /// PMS-681: a self-service password change (PUT /me/password) revokes all
 /// sessions and stamps password_changed_at, logging the user out everywhere.
-#[sqlx::test]
+#[mokosh_test]
 async fn change_password_logs_out_everywhere(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -3137,7 +3138,7 @@ async fn change_password_logs_out_everywhere(pool: PgPool) {
 /// write to `identities.mfa_secret` + `identities.mfa_enabled`; the
 /// MAPPS-498 back-mirror propagates both to `users`. Recovery-code
 /// hashes stay users-only (added by migration 029, never mirrored).
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_enable_writes_to_identity_plane(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -3221,7 +3222,7 @@ async fn mfa_enable_writes_to_identity_plane(pool: PgPool) {
 /// MAPPS-501: disable_mfa clears mfa_enabled + mfa_secret + watermark
 /// on identities; clears recovery hashes on users. Bidir mirror
 /// keeps users.mfa_* in sync.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_disable_clears_identity_plane(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -3294,7 +3295,7 @@ async fn mfa_disable_clears_identity_plane(pool: PgPool) {
 /// hash to `identities.password_hash`; the MAPPS-498 back-mirror
 /// propagates it to users.password_hash so the legacy read path in
 /// UserRow still sees the new value.
-#[sqlx::test]
+#[mokosh_test]
 async fn change_password_writes_users_only_post_551(pool: PgPool) {
     // MAPPS-551 (rewritten from the pre-551 mirror pin): identity's
     // password_hash is no longer authoritative. `change_password`
@@ -3357,7 +3358,7 @@ async fn change_password_writes_users_only_post_551(pool: PgPool) {
 /// untouched, so the original password still authenticates on tenant B.
 /// This is the operator-facing "two portals, two independent passwords"
 /// contract.
-#[sqlx::test]
+#[mokosh_test]
 async fn change_password_isolates_per_tenant_on_shared_email(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     // Second tenant with the same identity as an additional membership.
@@ -3503,7 +3504,7 @@ async fn change_password_isolates_per_tenant_on_shared_email(pool: PgPool) {
 //     "CLIENT-C" + tenant_slug="client-c" (the setup wrote to this
 //     specific users row only, so tenant-scoped login sees the fresh
 //     hash).
-#[sqlx::test]
+#[mokosh_test]
 async fn client_admin_setup_isolates_credentials_when_email_collides(pool: PgPool) {
     let email = "collide@example.com".to_string();
     let platform_pw = "PLATFORM-A-12345".to_string();
@@ -3710,7 +3711,7 @@ async fn client_admin_setup_isolates_credentials_when_email_collides(pool: PgPoo
 /// minted just before sign-out kept authenticating every `/api/v1/*` request
 /// for the rest of its hour - the residual half of the defect MAPPS-522 was
 /// filed to close, and the half that lets a signed-out bearer read tenant data.
-#[sqlx::test]
+#[mokosh_test]
 async fn logout_invalidates_the_access_token_not_just_the_refresh_session(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -3759,7 +3760,7 @@ async fn logout_invalidates_the_access_token_not_just_the_refresh_session(pool: 
 /// sessions apart, so signing out of one device would sign the user out
 /// everywhere. Signing out on a laptop must not sign the same person out on
 /// their phone.
-#[sqlx::test]
+#[mokosh_test]
 async fn logout_leaves_the_users_other_sessions_alone(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -3815,7 +3816,7 @@ async fn logout_leaves_the_users_other_sessions_alone(pool: PgPool) {
 /// check the single-session test above pins, which is why no per-user stamp was
 /// added: deleting every row for the user fails that check for every token they
 /// hold.
-#[sqlx::test]
+#[mokosh_test]
 async fn logout_all_refuses_every_access_token_minted_before_it(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -3895,7 +3896,7 @@ async fn logout_all_refuses_every_access_token_minted_before_it(pool: PgPool) {
 /// `logout-all` fail. Pinned here because "sign out my lost phone" is the one
 /// of the three where a token that outlived the click is most obviously wrong,
 /// and nothing asserted it.
-#[sqlx::test]
+#[mokosh_test]
 async fn revoking_a_session_refuses_that_devices_access_token(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -3971,7 +3972,7 @@ async fn revoking_a_session_refuses_that_devices_access_token(pool: PgPool) {
 /// check is throttled per account (5 failures/min) exactly as `/login` is.
 /// Pre-fix an attacker holding a stolen session could grind the password at
 /// full request rate; the sixth failure now costs a 429 with `Retry-After`.
-#[sqlx::test]
+#[mokosh_test]
 async fn change_password_reauth_rate_limit_triggers_429(pool: PgPool) {
     let (_uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -4050,7 +4051,7 @@ async fn change_password_reauth_rate_limit_triggers_429(pool: PgPool) {
 /// share ONE budget. Three failures on the password route plus two on the MFA
 /// route is five, so the sixth attempt is throttled on either of them: moving
 /// to the other endpoint must not hand the attacker a fresh budget.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_disable_reauth_shares_the_change_password_budget(pool: PgPool) {
     let (_uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -4120,7 +4121,7 @@ async fn mfa_disable_reauth_shares_the_change_password_budget(pool: PgPool) {
 /// successful `disable_mfa`, then a fifth failure - which must still be the
 /// plain 401, because the success in the middle charged nothing. Were success
 /// counted, the fifth would already be over the 5/min account quota.
-#[sqlx::test]
+#[mokosh_test]
 async fn successful_reauth_does_not_spend_rate_limit_budget(pool: PgPool) {
     let (_uid, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;

@@ -10,9 +10,10 @@
 mod common;
 
 use common::{boot, login, seed_admin};
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn dispatch_returns_aggregated_sections(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -47,7 +48,7 @@ async fn dispatch_returns_aggregated_sections(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn dispatch_requires_a_bounded_range(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;

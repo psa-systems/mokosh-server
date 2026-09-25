@@ -47,6 +47,7 @@ mod common;
 
 use mokosh_server::modules::tenants::TenantService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;
@@ -281,7 +282,7 @@ async fn create_time_entry(
 /// AC #1: across every module with real handlers, user B is denied both READ
 /// and WRITE of user A's records, while B's own lists stay populated (proving
 /// the policy scopes per tenant rather than blanket-denying).
-#[sqlx::test]
+#[mokosh_test]
 async fn cross_user_read_and_write_denied_across_modules(pool: PgPool) {
     let app = common::boot_rls(pool.clone()).await;
     let a = provision_actor(&pool, &app, "alice").await;
@@ -429,7 +430,7 @@ async fn cross_user_read_and_write_denied_across_modules(pool: PgPool) {
 
 /// AC #1 (tenants module): user B cannot read user A's `tenants` row, and B's
 /// tenant list never leaks A's tenant.
-#[sqlx::test]
+#[mokosh_test]
 async fn cross_user_tenant_endpoint_denied(pool: PgPool) {
     let app = common::boot_rls(pool.clone()).await;
     let a = provision_actor(&pool, &app, "alice").await;
@@ -453,7 +454,7 @@ async fn cross_user_tenant_endpoint_denied(pool: PgPool) {
 /// AC #2: aggregate endpoints are caller-scoped. Counts can leak across the
 /// isolation boundary even when individual rows are hidden, so this pins that
 /// `reports::dashboard` counts only the caller's own tickets.
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_aggregate_is_caller_scoped(pool: PgPool) {
     let app = common::boot_rls(pool.clone()).await;
     let a = provision_actor(&pool, &app, "alice").await;
@@ -536,7 +537,7 @@ async fn dashboard_aggregate_is_caller_scoped(pool: PgPool) {
 /// the matching GUC must see the row. This is the runtime activation the whole
 /// epic was building toward: a forgotten `WHERE tenant_id` filter is now
 /// backstopped by RLS on the live serving connection.
-#[sqlx::test]
+#[mokosh_test]
 async fn app_role_read_is_fail_closed_without_guc(pool: PgPool) {
     let app = common::boot_rls(pool.clone()).await;
     let app_pool = app

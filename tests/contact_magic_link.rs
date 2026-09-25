@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -73,7 +74,7 @@ async fn seed_portal_contact(pool: &PgPool, email: &str) -> (Uuid, Uuid, String,
 /// Fresh magic link redeems to 204 and the resulting password logs in.
 /// Sanity floor for every other test in this file: without this working
 /// the rest of the assertions are meaningless.
-#[sqlx::test]
+#[mokosh_test]
 async fn fresh_link_redeems_and_enables_login(pool: PgPool) {
     let (_company_id, _contact_id, slug, token) =
         seed_portal_contact(&pool, "fresh@ml.example").await;
@@ -126,7 +127,7 @@ async fn fresh_link_redeems_and_enables_login(pool: PgPool) {
 /// implementation returns `AppError::Gone` in that branch, which the
 /// HTTP layer maps to 410. Pinning the observed status keeps a future
 /// refactor that quietly downgrades this to 400 caught.
-#[sqlx::test]
+#[mokosh_test]
 async fn replayed_link_is_rejected(pool: PgPool) {
     let (_company_id, _contact_id, _slug, token) =
         seed_portal_contact(&pool, "replay@ml.example").await;
@@ -169,7 +170,7 @@ async fn replayed_link_is_rejected(pool: PgPool) {
 /// wait real wall-clock time. The service reads `expires_at <= NOW`
 /// under the same code path that rejects malformed tokens, and both
 /// surface as 400.
-#[sqlx::test]
+#[mokosh_test]
 async fn expired_link_is_rejected(pool: PgPool) {
     let (_company_id, contact_id, _slug, token) =
         seed_portal_contact(&pool, "expired@ml.example").await;
@@ -205,7 +206,7 @@ async fn expired_link_is_rejected(pool: PgPool) {
 /// rejected at the parser gate. `parse_contact_bound_token` returns
 /// `None` for a non-UUID first segment; `setup_password` maps that
 /// to `AppError::BadRequest`.
-#[sqlx::test]
+#[mokosh_test]
 async fn malformed_token_is_rejected(pool: PgPool) {
     let _ = seed_portal_contact(&pool, "malformed@ml.example").await;
     let app = common::boot(pool.clone()).await;
@@ -237,7 +238,7 @@ async fn malformed_token_is_rejected(pool: PgPool) {
 /// `aaaaaaaaaaaa` passes the 12-char length gate but scores as
 /// trivially guessable under zxcvbn, so the score branch is the one
 /// that fires (see `password_policy::rejects_weak_zxcvbn_score`).
-#[sqlx::test]
+#[mokosh_test]
 async fn weak_password_rejected_with_password_message(pool: PgPool) {
     let (_company_id, _contact_id, _slug, token) =
         seed_portal_contact(&pool, "weak@ml.example").await;

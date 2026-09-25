@@ -6,6 +6,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;
@@ -68,7 +69,7 @@ async fn find_role_id(app: &common::TestApp, token: &str, name: &str) -> String 
         .to_string()
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn crud_happy_path(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -157,7 +158,7 @@ async fn crud_happy_path(pool: PgPool) {
     assert_eq!(miss.status(), StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn delete_blocked_when_assignments_exist(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -199,7 +200,7 @@ async fn delete_blocked_when_assignments_exist(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn delete_blocked_when_builtin(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -216,7 +217,7 @@ async fn delete_blocked_when_builtin(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn update_rejects_empty_capabilities(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -246,7 +247,7 @@ async fn update_rejects_empty_capabilities(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn update_builtin_rejects_capability_change_allows_rename(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -282,7 +283,7 @@ async fn update_builtin_rejects_capability_change_allows_rename(pool: PgPool) {
     assert_eq!(body["is_builtin"], true);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_rejects_unknown_capability(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -302,7 +303,7 @@ async fn create_rejects_unknown_capability(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_rejects_duplicate_name(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -334,7 +335,7 @@ async fn create_rejects_duplicate_name(pool: PgPool) {
     assert_eq!(dup.status(), StatusCode::CONFLICT);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_allows_same_name_across_tenants(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -376,7 +377,7 @@ async fn create_allows_same_name_across_tenants(pool: PgPool) {
     assert!(res.is_ok(), "same name allowed across tenants: {res:?}");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn put_contact_portal_roles_rewires_and_replaces(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -453,7 +454,7 @@ async fn put_contact_portal_roles_rewires_and_replaces(pool: PgPool) {
     assert_eq!(token_count, 0, "PUT must not mint setup tokens");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn put_contact_portal_roles_rejects_cross_tenant_role(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -498,7 +499,7 @@ async fn put_contact_portal_roles_rejects_cross_tenant_role(pool: PgPool) {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn capabilities_endpoint_returns_all_descriptors(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

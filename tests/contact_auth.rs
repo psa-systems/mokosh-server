@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -74,7 +75,7 @@ async fn seed_portal_contact(pool: &PgPool, email: &str) -> (Uuid, String, Strin
 /// Redeems the magic link via POST /contact/auth/set-password,
 /// signs in via POST /contact/auth/login, then hydrates via GET
 /// /contact/auth/me with the returned Bearer.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_full_flow_setup_login_me(pool: PgPool) {
     let (_contact_id, slug, token) = seed_portal_contact(&pool, "flow@mcl.example").await;
     let app = common::boot(pool.clone()).await;
@@ -218,7 +219,7 @@ async fn contact_full_flow_setup_login_me(pool: PgPool) {
 /// mokosh-contact-login prompt 004: login with a wrong password 401s
 /// and bumps the failed-login counter. Enumeration-resistant: the
 /// same 401 shape for unknown-email, wrong-password, and unknown-slug.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_login_with_wrong_password_401s(pool: PgPool) {
     let (contact_id, slug, token) = seed_portal_contact(&pool, "wrong@mcl.example").await;
     let app = common::boot(pool.clone()).await;
@@ -288,7 +289,7 @@ async fn contact_login_with_wrong_password_401s(pool: PgPool) {
 
 /// mokosh-contact-login prompt 004: contact login against a suspended
 /// tenant 401s. Mirrors MAPPS-557 on the retired portal plane.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_login_against_suspended_tenant_401s(pool: PgPool) {
     let (_contact_id, slug, token) = seed_portal_contact(&pool, "suspend@mcl.example").await;
     let app = common::boot(pool.clone()).await;
@@ -327,7 +328,7 @@ async fn contact_login_against_suspended_tenant_401s(pool: PgPool) {
 /// mokosh-contact-login prompt 004: forgot-password returns 204
 /// regardless of whether the (slug, email) matches a contact. No
 /// email dispatched on a miss.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_forgot_password_is_enumeration_resistant(pool: PgPool) {
     let (_contact_id, slug, _token) = seed_portal_contact(&pool, "forgot@mcl.example").await;
     let app = common::boot(pool.clone()).await;
@@ -366,7 +367,7 @@ async fn contact_forgot_password_is_enumeration_resistant(pool: PgPool) {
 /// mokosh-contact-login prompt 004: staff JWT rejected on
 /// /contact/auth/me and contact JWT rejected on staff endpoints. The
 /// `typ` claim gate is what prevents cross-plane replay.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_token_rejected_on_staff_endpoint(pool: PgPool) {
     let (_contact_id, slug, token) = seed_portal_contact(&pool, "typ@mcl.example").await;
     let app = common::boot(pool.clone()).await;
@@ -434,7 +435,7 @@ async fn contact_token_rejected_on_staff_endpoint(pool: PgPool) {
 /// mokosh-contact-login prompt 004: /portal/{slug}/host returns 200
 /// with the branding hint (including raw tenant status) so the SPA
 /// can render a suspended splash. Unknown slugs 404 (enum-resistant).
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_portal_host_returns_hint_for_known_and_404s_for_unknown(pool: PgPool) {
     let (_contact_id, slug, _token) = seed_portal_contact(&pool, "host@mcl.example").await;
     let app = common::boot(pool.clone()).await;
@@ -476,7 +477,7 @@ async fn contact_portal_host_returns_hint_for_known_and_404s_for_unknown(pool: P
 /// PMS-917 AC4: a contact whose `portal_password_hash IS NULL` is refused
 /// with the same 401 shape as a wrong-password login. Pins the
 /// `ok_or(Unauthorized)` branch in `contact_portal::service::login`.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_login_with_no_credential_returns_401(pool: PgPool) {
     let (_contact_id, slug, _token) = seed_portal_contact(&pool, "no-cred@mcl.example").await;
     // Deliberately skip set-password so `portal_password_hash` stays NULL.
@@ -512,7 +513,7 @@ async fn contact_login_with_no_credential_returns_401(pool: PgPool) {
 /// Axum's own deserialize rejection is also 422, so the status alone would
 /// no longer prove the validator ran: the envelope's `VALIDATION_ERROR`
 /// code and the `password` field entry are what distinguish the two.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_login_with_empty_password_returns_422(pool: PgPool) {
     let (_contact_id, slug, _token) = seed_portal_contact(&pool, "empty-pw@mcl.example").await;
     let app = common::boot(pool.clone()).await;
@@ -553,7 +554,7 @@ async fn contact_login_with_empty_password_returns_422(pool: PgPool) {
 /// contact. A forged/unknown refresh token 401s without touching the
 /// contact row, so a NULL-hash contact has no way to obtain access tokens
 /// through this path either.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_refresh_with_bogus_token_returns_401(pool: PgPool) {
     let (_contact_id, _slug, _token) =
         seed_portal_contact(&pool, "refresh-nocred@mcl.example").await;
@@ -585,7 +586,7 @@ async fn contact_refresh_with_bogus_token_returns_401(pool: PgPool) {
 /// a no-credential contact a credential, it does so WITHOUT minting a
 /// session; the SPA then has to drive `POST /contact/auth/login` with the
 /// freshly-set password. Pins that contract.
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_reset_password_returns_no_session(pool: PgPool) {
     let (_contact_id, _slug, token) =
         seed_portal_contact(&pool, "reset-nosession@mcl.example").await;

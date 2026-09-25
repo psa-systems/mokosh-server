@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -86,7 +87,7 @@ async fn me_status(app: &common::TestApp, token: &str) -> StatusCode {
 /// names ("their own portal access is revoked at the contact level
 /// rather than the session level") - must reject the very next
 /// request on the still-live, unexpired access token.
-#[sqlx::test]
+#[mokosh_test]
 async fn revoking_portal_access_rejects_the_next_request(pool: PgPool) {
     let (contact_id, company_slug, setup_token) =
         seed_portal_contact(&pool, "revoke-access@pms1222.example").await;

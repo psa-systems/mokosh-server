@@ -6,7 +6,7 @@
 //! `tenant_id` does not equal the GUC is rejected (WITH CHECK), with
 //! `FORCE ROW LEVEL SECURITY` so even the table owner is constrained.
 //!
-//! `#[sqlx::test]` connects as the cluster superuser, which bypasses RLS
+//! `#[mokosh_test]` connects as the cluster superuser, which bypasses RLS
 //! unconditionally (FORCE does not apply to superusers or BYPASSRLS roles). To
 //! observe the policy this test creates an unprivileged application-style role
 //! (`NOSUPERUSER NOBYPASSRLS` - the posture the production application
@@ -14,17 +14,18 @@
 //! migration / owner role keeps its bypass, exactly as the deployment split
 //! requires.
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn rls_fail_closed_and_with_check(pool: PgPool) {
     // The default tenant the seed migration always inserts.
     let tenant_a = Uuid::from_u128(1);
     // An arbitrary other tenant id - only ever used as a GUC value, so it does
     // not need a matching `tenants` row.
     let wrong_tenant = Uuid::new_v4();
-    // Roles are cluster-global while each #[sqlx::test] gets its own database,
+    // Roles are cluster-global while each #[mokosh_test] gets its own database,
     // so use a unique, valid-identifier role name to avoid cross-test clashes.
     let role = format!("mokosh_rls_test_{}", Uuid::new_v4().simple());
 
@@ -175,7 +176,7 @@ async fn rls_fail_closed_and_with_check(pool: PgPool) {
 /// rejected by the new policy would leave the seat plane behind the `users`
 /// plane, and nothing else in the suite drives that trigger as a NOBYPASSRLS
 /// role.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_users_membership_mirror_survives_the_membership_policy(pool: PgPool) {
     let tenant_a = Uuid::from_u128(1);
     let role = format!("mokosh_rls_test_{}", Uuid::new_v4().simple());

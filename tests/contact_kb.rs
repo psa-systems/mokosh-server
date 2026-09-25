@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -175,7 +176,7 @@ fn slugs(body: &Value) -> Vec<String> {
 // A contact with `kb:read` lists exactly the published, Company-visible
 // articles, in the customer's projection, and cannot widen the slice
 // with the staff filters.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_lists_the_published_company_visible_slice(pool: PgPool) {
     let f = seed(&pool).await;
     let contact =
@@ -240,7 +241,7 @@ async fn a_contact_lists_the_published_company_visible_slice(pool: PgPool) {
 // The detail read answers the visible article trimmed, and 404s
 // identically for an internal, a draft, another Company's and an
 // unknown article.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_hidden_article_404s_exactly_like_an_unknown_one(pool: PgPool) {
     let f = seed(&pool).await;
     let contact =
@@ -288,7 +289,7 @@ async fn a_hidden_article_404s_exactly_like_an_unknown_one(pool: PgPool) {
 // Categories: the internal one stays with the staff. (Migration 023
 // seeds public categories on the default tenant, so the check is on
 // membership rather than the exact set.)
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_sees_only_non_internal_categories(pool: PgPool) {
     let f = seed(&pool).await;
     let contact =
@@ -313,7 +314,7 @@ async fn a_contact_sees_only_non_internal_categories(pool: PgPool) {
 // Without `kb:read` (the Billing Contact role has no KB capability),
 // every read is 403; with no bearer at all it is 401; and the
 // staff-only routes stay closed to a contact bearer.
-#[sqlx::test]
+#[mokosh_test]
 async fn without_kb_read_the_reads_are_403(pool: PgPool) {
     let f = seed(&pool).await;
     let billing =
@@ -369,7 +370,7 @@ async fn without_kb_read_the_reads_are_403(pool: PgPool) {
 // The staff arm is what it was: the whole catalogue with the staff
 // type, behind the knowledge_base module gate, which the contact arm
 // does not consult.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_staff_arm_is_unchanged_and_keeps_its_module_gate(pool: PgPool) {
     let f = seed(&pool).await;
     let contact =

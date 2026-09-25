@@ -13,6 +13,7 @@ mod common;
 
 use chrono::{Duration, Utc};
 use mokosh_server::utils::crypto::{hash_password, sha256_hex, verify_password_call_count};
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -35,7 +36,7 @@ async fn seed_candidate(pool: &PgPool, tenant_id: Uuid, user_id: Uuid, secret: &
     .expect("insert candidate reset token");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn reset_password_verifies_exactly_once_with_multiple_candidates(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -29,7 +30,7 @@ async fn term_names(pool: &PgPool, tenant_id: Uuid) -> Vec<String> {
     .expect("read payment terms")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn the_seeded_terms_read_as_english(pool: PgPool) {
     let names = term_names(&pool, common::DEFAULT_TENANT_ID).await;
     assert_eq!(names, READABLE.map(String::from).to_vec());
@@ -43,7 +44,7 @@ async fn the_seeded_terms_read_as_english(pool: PgPool) {
 
 /// The rename must not disturb which term is the default or the order the
 /// dropdown offers them in.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_rename_left_the_flags_alone(pool: PgPool) {
     let default_name: String = sqlx::query_scalar(
         "SELECT name FROM payment_terms WHERE tenant_id = $1 AND is_default LIMIT 1",
@@ -76,7 +77,7 @@ async fn the_rename_left_the_flags_alone(pool: PgPool) {
 /// A tenant that renamed its own term keeps that name. The migration matches
 /// the seeded identifier verbatim, so a customised row is not a candidate;
 /// replayed here against a row seeded to look customised.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_renamed_term_is_not_reworded(pool: PgPool) {
     let tenant = seed_tenant(&pool, "custom-terms").await;
     sqlx::query(
@@ -101,7 +102,7 @@ async fn a_renamed_term_is_not_reworded(pool: PgPool) {
 /// inserted a row already called "Net 30" from a legacy free-text value.
 /// Renaming into that name would violate the index and fail the whole
 /// migration, so the rename is skipped instead.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_colliding_name_is_skipped_rather_than_erroring(pool: PgPool) {
     let tenant = seed_tenant(&pool, "collision").await;
     for (name, order) in [("net30", 1), ("Net 30", 2)] {
@@ -130,7 +131,7 @@ async fn a_colliding_name_is_skipped_rather_than_erroring(pool: PgPool) {
 
 /// A tenant created after the migration inherits the readable names, because
 /// `TenantService::create` copies the default tenant's terms row-for-row.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_new_tenant_inherits_the_readable_names(pool: PgPool) {
     let tenant = seed_tenant(&pool, "inheritor").await;
     sqlx::query(

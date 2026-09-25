@@ -20,10 +20,11 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn invoice_create_then_update_writes_audit_rows(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -118,7 +119,7 @@ async fn invoice_create_then_update_writes_audit_rows(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contract_create_then_update_writes_audit_rows(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -207,7 +208,7 @@ async fn contract_create_then_update_writes_audit_rows(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn payment_gateway_upsert_audit_strips_secret(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;

@@ -11,6 +11,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -28,7 +29,7 @@ async fn probe_can_login(pool: &PgPool, role_name: &str) -> bool {
     .expect("probe query")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn nologin_role_returns_false_and_login_role_returns_true(pool: PgPool) {
     // PMS-1163 core assertion. Same shape mokosh_app would take on staging:
     // NOLOGIN row exists → predicate is false → fast path falls through →
@@ -69,7 +70,7 @@ async fn nologin_role_returns_false_and_login_role_returns_true(pool: PgPool) {
         .expect("drop role");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn missing_role_returns_false_from_probe(pool: PgPool) {
     // The other MigratorConnectsAppMissing arm: the row does not exist at
     // all. PMS-1163 collapses "row missing" and "row NOLOGIN" into one

@@ -17,6 +17,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -91,7 +92,7 @@ fn id_of(entry: &Value) -> Uuid {
 
 /// A billable entry is invoiceable the moment it exists. Before PMS-944 this
 /// row sat at the `not_billed` default until somebody countersigned the week.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_billable_entry_is_armed_at_creation(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -108,7 +109,7 @@ async fn a_billable_entry_is_armed_at_creation(pool: PgPool) {
 
 /// Non-billable time is not armed, so the write is a decision about the entry
 /// rather than a flag set on everything.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_non_billable_entry_is_not_armed(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -123,7 +124,7 @@ async fn a_non_billable_entry_is_not_armed(pool: PgPool) {
 /// A stopped timer is time that was worked, so it is billed on the same terms
 /// as time typed in. It has its own INSERT, which is how it could have been
 /// missed.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_stopped_timer_is_armed_the_same_way(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -165,7 +166,7 @@ async fn a_stopped_timer_is_armed_the_same_way(pool: PgPool) {
 /// The expensive direction. Marking an entry non-billable has to take it back
 /// out of the invoiceable set; leaving it armed would charge the client for
 /// work somebody had just decided not to charge for.
-#[sqlx::test]
+#[mokosh_test]
 async fn making_an_entry_non_billable_disarms_it(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -203,7 +204,7 @@ async fn making_an_entry_non_billable_disarms_it(pool: PgPool) {
 /// An entry that is already on an invoice keeps `billed` whatever else changes.
 /// Re-arming it would put the same work on a second invoice, which is the one
 /// mistake in this area that reaches the client as money.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_invoiced_entry_is_never_re_armed(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -247,7 +248,7 @@ async fn an_invoiced_entry_is_never_re_armed(pool: PgPool) {
 
 /// The one-person case David described. Timesheets off, so there is no submit
 /// and no approve to reach for, and the hour still becomes an invoice.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_with_timesheets_off_can_still_invoice(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -285,7 +286,7 @@ async fn a_tenant_with_timesheets_off_can_still_invoice(pool: PgPool) {
 /// Approval still exists where timesheets do, and it still moves the entry
 /// through its own lifecycle. What it must not do any more is touch billing:
 /// the entry was already armed, and approving is not what armed it.
-#[sqlx::test]
+#[mokosh_test]
 async fn approval_still_runs_and_no_longer_touches_billing(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -339,7 +340,7 @@ async fn approval_still_runs_and_no_longer_touches_billing(pool: PgPool) {
 /// Approving a unit of work is an employee-facing control, so on a tenant with
 /// timesheets off it is answered the way a nonexistent route is - not an empty
 /// list, which reads as a feature that is present and unused.
-#[sqlx::test]
+#[mokosh_test]
 async fn time_entry_approvals_are_gone_when_timesheets_are_off(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -375,7 +376,7 @@ async fn time_entry_approvals_are_gone_when_timesheets_are_off(pool: PgPool) {
 /// A quote approves a DECISION, not a unit of work, and a client signing one
 /// off has nothing to do with employment. It must keep working with timesheets
 /// off, or this change has removed the wrong thing.
-#[sqlx::test]
+#[mokosh_test]
 async fn quote_approvals_survive_timesheets_being_off(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     set_flag(&pool, false).await;
@@ -407,7 +408,7 @@ async fn quote_approvals_survive_timesheets_being_off(pool: PgPool) {
 /// Migration 121 releases the hours the old gate is holding. The UPDATE is read
 /// out of the migration file rather than restated, so this cannot pass against
 /// a statement that says something else.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_migration_releases_held_client_time(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
