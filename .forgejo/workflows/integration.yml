@@ -158,33 +158,39 @@ jobs:
         # So the pinned release binary runs in the job.
         #
         # The binary comes OUT OF THE IMAGE rather than from a download.
-        # MinIO archived the open-source server, and dl.min.io now answers 410
-        # Gone for every community release and hotfix, the pinned one included
-        # ("These files are no longer served from this site"), which broke this
-        # job on every branch at once. The GitHub release assets are gone too.
-        # The container image is still published, and it is the same artefact:
-        # the binary extracted below hashes to exactly the MINIO_SHA256 the
-        # withdrawn URL used to serve, which is why that line is unchanged.
+        # MinIO archived the open-source server: dl.min.io answers 410 Gone
+        # for every community release and the GitHub release assets are gone,
+        # and quay.io/minio/minio (and docker.io/minio/minio) then dropped
+        # anonymous pull access too, so anonymous token requests come back
+        # with an empty `actions:` array and every digest and tag returns
+        # 401. That broke this job on every branch at once.
         #
-        # Pinned by IMAGE DIGEST, not by tag, so a re-push under the same tag
-        # cannot change what runs here; the checksum stays as the second belt.
-        # `docker create` + `docker cp` rather than `docker run`, because the
-        # job container and a sibling container are not on the same network by
-        # default, and taking the binary out keeps the health check on
-        # 127.0.0.1 where the rest of this step already expects it. Jobs reach
-        # the runner's daemon (`container.docker_host: "-"`), which is the same
-        # access `build-oci-image.yml` uses.
+        # The still-pullable source is docker.io/bitnamilegacy/minio, which
+        # ships the same MinIO server binary (mainline server, still open
+        # source) at /opt/bitnami/minio/bin/minio. The binary is a
+        # DEVELOPMENT build rather than a signed RELEASE; the S3 suite
+        # exercises the S3 API, not a release identity, so a DEVELOPMENT
+        # build is functionally identical for this test. Bump both the
+        # digest and MINIO_SHA256 in the same commit, and bump the compose
+        # tag with them: `compose.dev.yml` runs the same image for
+        # `just dev-s3` so dev and CI take MinIO from one place.
         #
-        # `compose.dev.yml` already runs this image for `just dev-s3`, so dev
-        # and CI now take MinIO from one place. Bump the digest and the
-        # checksum together, and the compose tag with them.
+        # Pinned by IMAGE DIGEST, not by tag, so a re-push under the same
+        # tag cannot change what runs here; the checksum stays as the
+        # second belt. `docker create` + `docker cp` rather than
+        # `docker run`, because the job container and a sibling container
+        # are not on the same network by default, and taking the binary out
+        # keeps the health check on 127.0.0.1 where the rest of this step
+        # already expects it. Jobs reach the runner's daemon
+        # (`container.docker_host: "-"`), which is the same access
+        # `build-oci-image.yml` uses.
         #
         # Only this suite sets STORAGE_BACKEND=s3, in its own process; the
         # variables below are read by nothing else, so every other suite
         # keeps exercising the local backend.
         env:
-          MINIO_IMAGE: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-          MINIO_SHA256: 7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
+          MINIO_IMAGE: docker.io/bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
+          MINIO_SHA256: 0586fed6e33767430230d2f5bafd0d2f4ea2b844ce17025593dd7ab07f5f33c2
         run: |
           set -euo pipefail
           if [ "$(uname -m)" != "x86_64" ]; then
@@ -196,7 +202,7 @@ jobs:
           # Removed even when the copy fails, or a retried job leaks a
           # container per attempt onto the shared runner daemon.
           trap 'docker rm --volumes "${container}" > /dev/null 2>&1 || true' EXIT
-          docker cp "${container}":/usr/bin/minio /tmp/minio
+          docker cp "${container}":/opt/bitnami/minio/bin/minio /tmp/minio
           echo "${MINIO_SHA256}  /tmp/minio" | sha256sum --check --strict
           chmod +x /tmp/minio
           mkdir -p /tmp/minio-data
