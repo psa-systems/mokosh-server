@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -75,7 +76,7 @@ async fn list_drafts(app: &common::TestApp, token: &str) -> Vec<serde_json::Valu
 /// written over and over. Each write has to replace the last rather than
 /// accumulate, or a five-minute editing session leaves hundreds of rows and a
 /// drafts list nobody can use.
-#[sqlx::test]
+#[mokosh_test]
 async fn repeated_autosaves_leave_exactly_one_draft(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -118,7 +119,7 @@ async fn repeated_autosaves_leave_exactly_one_draft(pool: PgPool) {
 /// A draft for a new form and a draft for an existing one are different
 /// drafts. Keying them together would mean opening the editor on a saved form
 /// silently restored whatever unrelated thing was typed on the New button.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_new_form_draft_and_an_edit_draft_coexist(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -147,7 +148,7 @@ async fn a_new_form_draft_and_an_edit_draft_coexist(pool: PgPool) {
 /// the same tenant must not see it in their list, and must not be able to
 /// delete it: the delete is scoped by owner, so someone else's id reads as
 /// absent rather than forbidden.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_belongs_to_one_user_only(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -196,7 +197,7 @@ async fn a_draft_belongs_to_one_user_only(pool: PgPool) {
 /// Discarding removes the record. The point of the confirmation in the SPA is
 /// that the user meant it, so nothing should bring the draft back on the next
 /// open.
-#[sqlx::test]
+#[mokosh_test]
 async fn discarding_a_draft_removes_it(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -221,7 +222,7 @@ async fn discarding_a_draft_removes_it(pool: PgPool) {
 /// draft goes with it. Cleared server-side rather than by the SPA: a draft
 /// exists to survive the browser going away, so it cannot rely on the browser
 /// to tidy up.
-#[sqlx::test]
+#[mokosh_test]
 async fn saving_the_form_clears_its_draft(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -262,7 +263,7 @@ async fn saving_the_form_clears_its_draft(pool: PgPool) {
 /// `POST /auth/login` resolves a tenant-less login against the default tenant
 /// (PMS-138), so there is no token for a second tenant's admin to be had, and
 /// the test only needs an id that belongs somewhere else.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_cannot_name_another_tenants_form(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -297,7 +298,7 @@ async fn a_draft_cannot_name_another_tenants_form(pool: PgPool) {
 /// The payload is opaque and client-supplied, so it is bounded. Rejected
 /// rather than truncated: a truncated draft restores as a corrupted form,
 /// which is worse than a draft that says it could not be saved.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_oversized_draft_is_refused(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_admin_id, email, password) = common::seed_admin(&pool).await;

@@ -2,6 +2,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 use mokosh_server::modules::audit::AuditCtx;
@@ -41,7 +42,7 @@ fn req(email: &str, role: &str) -> CreateInvitationRequest {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_list_revoke_roundtrip(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
@@ -75,7 +76,7 @@ async fn create_list_revoke_roundtrip(pool: PgPool) {
     assert!(s.revoke(tenant, inv.id).await.is_err());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn reinvite_same_email_upserts(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
@@ -107,7 +108,7 @@ async fn reinvite_same_email_upserts(pool: PgPool) {
     assert_eq!(total, 1, "no duplicate pending invite");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn rejects_non_invitable_role(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
@@ -123,7 +124,7 @@ async fn rejects_non_invitable_role(pool: PgPool) {
     assert!(err.is_err(), "super_admin is not invitable");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_with_app_url_enqueues_invite_email(pool: PgPool) {
     // PMS-246: with a SPA URL configured, creating an invite enqueues an email
     // notification (channel=email, recipient=invitee) for the worker to deliver.
@@ -178,7 +179,7 @@ async fn create_with_app_url_enqueues_invite_email(pool: PgPool) {
     assert_eq!(count, 0, "no email enqueued when app_url is unset");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn newest_pending_lookup_then_accept(pool: PgPool) {
     // The login path's building blocks (PMS-244 phase 2): resolve the newest
     // live invite for an email, then mark it accepted so it stops resolving.
@@ -222,7 +223,7 @@ async fn newest_pending_lookup_then_accept(pool: PgPool) {
     assert_eq!(status, "accepted");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn first_invite_promotes_personal_tenant_to_org(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);

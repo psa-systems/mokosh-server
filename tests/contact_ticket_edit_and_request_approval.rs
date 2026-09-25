@@ -19,6 +19,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -220,7 +221,7 @@ async fn seed_ticket_with_reporter(
 // PATCH /api/v1/tickets/{id}
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_edit_own_can_edit_title_and_description_on_own_reported_ticket(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, contact_id, _e, token) =
@@ -274,7 +275,7 @@ async fn contact_with_edit_own_can_edit_title_and_description_on_own_reported_ti
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_edit_own_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Read-Only holds no mutation caps, and tickets:edit_own is not on
@@ -308,7 +309,7 @@ async fn contact_without_edit_own_returns_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_editing_a_different_contacts_ticket_same_company_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _self_contact, _e, token) =
@@ -348,7 +349,7 @@ async fn contact_editing_a_different_contacts_ticket_same_company_returns_404(po
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_editing_a_ticket_from_different_company_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _contact_id, _e, token) =
@@ -388,7 +389,7 @@ async fn contact_editing_a_ticket_from_different_company_returns_404(pool: PgPoo
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_editing_strips_status_id_priority_id_assignee_id_from_body(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, contact_id, _e, token) =
@@ -487,7 +488,7 @@ async fn contact_editing_strips_status_id_priority_id_assignee_id_from_body(pool
     assert_eq!(title, "just a title tweak");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_editing_still_accepts_all_editable_fields(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -540,7 +541,7 @@ async fn staff_editing_still_accepts_all_editable_fields(pool: PgPool) {
 // POST /api/v1/tickets/{id}/approvals/request
 // ============================================================================
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_with_request_approval_creates_pending_approval_row(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, contact_id, _e, token) =
@@ -608,7 +609,7 @@ async fn contact_with_request_approval_creates_pending_approval_row(pool: PgPool
     assert_eq!(row.ticket_id, Some(ticket_id));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_without_cap_returns_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Billing Contact holds no tickets:* caps at all - clean no-cap seed.
@@ -640,7 +641,7 @@ async fn contact_without_cap_returns_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contact_from_different_company_returns_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _contact, _e, token) =
@@ -673,7 +674,7 @@ async fn contact_from_different_company_returns_404(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn staff_request_approval_still_works(pool: PgPool) {
     let (admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

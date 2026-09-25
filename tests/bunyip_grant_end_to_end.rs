@@ -30,6 +30,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -198,7 +199,7 @@ async fn get_me(app: &common::TestApp, token: &str) -> (reqwest::StatusCode, ser
 /// grant's role, and the row is keyed on (bunyip_user_id, tenant_id)
 /// so a subsequent revoke tombstones it while the caller's own
 /// tenant (if any) is untouched.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_granted_token_places_the_grantee_in_the_granted_tenant(pool: PgPool) {
     clear_cache_for_tests();
 
@@ -308,7 +309,7 @@ async fn a_granted_token_places_the_grantee_in_the_granted_tenant(pool: PgPool) 
 /// ticket promises this happens within the 30-second stale-window
 /// budget; the cache clear here is what makes the test deterministic
 /// on the same clock cycle.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_revoked_grant_refuses_the_next_request(pool: PgPool) {
     clear_cache_for_tests();
 
@@ -373,7 +374,7 @@ async fn a_revoked_grant_refuses_the_next_request(pool: PgPool) {
 /// id from the first grant, not a second fresh id), so any FK on the
 /// row survives the cycle. This is the belt-and-braces path the
 /// receiver's `revoked` branch adds on top of the mirror gate.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_regrant_after_revoke_reinstates_the_same_row(pool: PgPool) {
     clear_cache_for_tests();
 

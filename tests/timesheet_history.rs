@@ -18,6 +18,7 @@ use mokosh_server::modules::time_tracking::{
 };
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -75,7 +76,7 @@ fn entry_req(
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn list_timesheets_status_filter_and_range(pool: PgPool) {
     let (admin_id, _, _) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -213,7 +214,7 @@ async fn list_timesheets_status_filter_and_range(pool: PgPool) {
     assert!(row_c.decided_at.is_none());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn list_timesheets_rejects_unknown_status(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let db = Database::from_pool(pool.clone());
@@ -236,7 +237,7 @@ async fn list_timesheets_rejects_unknown_status(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn list_timesheets_caps_range_at_26_weeks(pool: PgPool) {
     let _ = common::seed_admin(&pool).await;
     let db = Database::from_pool(pool.clone());

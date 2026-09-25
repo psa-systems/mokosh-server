@@ -12,6 +12,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::{Mutex, OnceLock};
 
 use axum::{
@@ -29,7 +30,7 @@ const TEST_KEY: [u8; 32] = [0u8; 32];
 
 /// Every `provider_pm_id` the stub has seen a detach call for, across every
 /// test in this binary. Tests seed a unique id per case and assert on
-/// `contains`, never on the full list, so concurrent `#[sqlx::test]` cases
+/// `contains`, never on the full list, so concurrent `#[mokosh_test]` cases
 /// sharing the one process-wide stub do not interfere with each other.
 fn detach_calls() -> &'static Mutex<Vec<String>> {
     static CALLS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
@@ -37,7 +38,7 @@ fn detach_calls() -> &'static Mutex<Vec<String>> {
 }
 
 /// One server for the whole binary, on its own thread with its own runtime:
-/// `STRIPE_API_BASE` is process-global and `#[sqlx::test]` cases run
+/// `STRIPE_API_BASE` is process-global and `#[mokosh_test]` cases run
 /// concurrently (same shape `tests/portal_payment_methods.rs` and
 /// `tests/paypal_pay_now.rs` use for the same reason).
 ///
@@ -146,7 +147,7 @@ async fn seed_payment_method(pool: &PgPool, contact_id: Uuid, provider_pm_id: &s
 /// provider's detach must be called with the row's own `provider_pm_id`
 /// BEFORE the contact (and, via the FK cascade, the payment method row)
 /// disappears.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_a_contact_detaches_its_saved_payment_method(pool: PgPool) {
     stripe_stub_base();
     seed_stripe_gateway(&pool).await;
@@ -198,7 +199,7 @@ async fn deleting_a_contact_detaches_its_saved_payment_method(pool: PgPool) {
 /// A provider detach failure must leave the contact and its payment method
 /// row in place and surface the error, rather than the contact being
 /// deleted regardless.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_provider_detach_failure_leaves_the_contact_in_place(pool: PgPool) {
     stripe_stub_base();
     seed_stripe_gateway(&pool).await;

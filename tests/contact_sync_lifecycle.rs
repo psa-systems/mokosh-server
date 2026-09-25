@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 
@@ -287,7 +288,7 @@ async fn seed_connection(pool: &PgPool) -> Uuid {
 
 /// PSA-70 H: the edit is what locks, the next sync leaves it, and a release
 /// hands the field back to the source.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_edit_locks_the_field_and_survives_the_next_sync(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let source = FakeSource::new();
@@ -374,7 +375,7 @@ async fn an_edit_locks_the_field_and_survives_the_next_sync(pool: PgPool) {
 
 /// PMS-1288: `NOTE` is a canonical field, so the sync writes it on create,
 /// follows the source on update, and a person's edit locks it like any other.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_imported_note_follows_the_source_until_someone_edits_it(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let source = FakeSource::new();
@@ -435,7 +436,7 @@ async fn an_imported_note_follows_the_source_until_someone_edits_it(pool: PgPool
 
 /// A contact that is not synced is never locked: nothing is protecting it
 /// from anything.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_edit_to_a_local_contact_locks_nothing(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let contact = Uuid::new_v4();
@@ -457,7 +458,7 @@ async fn an_edit_to_a_local_contact_locks_nothing(pool: PgPool) {
 }
 
 /// PSA-70 I: a deletion in Google is visible and changes nothing.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_deletion_in_the_source_is_surfaced_and_changes_no_field(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let source = FakeSource::new();
@@ -508,7 +509,7 @@ async fn a_deletion_in_the_source_is_surfaced_and_changes_no_field(pool: PgPool)
 
 /// PSA-70 J: disconnecting keeps every contact, as a local record that still
 /// says where it came from, and stops locking edits to it.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_disconnect_keeps_every_contact_as_a_local_record(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let source = FakeSource::new();
@@ -565,7 +566,7 @@ async fn a_disconnect_keeps_every_contact_as_a_local_record(pool: PgPool) {
 
 /// An unlinked contact stays as it is, and the next sync does not link it
 /// straight back by its email.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unlinked_contact_is_left_alone_and_not_relinked(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let source = FakeSource::new();
@@ -613,7 +614,7 @@ async fn an_unlinked_contact_is_left_alone_and_not_relinked(pool: PgPool) {
 /// PSA-70 K, the imported case: the contact goes, nothing of the person is
 /// kept in the removal's own audit row, and no later sync - not even on a
 /// reconnected account - imports them back.
-#[sqlx::test]
+#[mokosh_test]
 async fn removing_a_created_contact_deletes_it_and_it_never_comes_back(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let source = FakeSource::new();
@@ -669,7 +670,7 @@ async fn removing_a_created_contact_deletes_it_and_it_never_comes_back(pool: PgP
 /// `removing_a_created_contact_deletes_it_and_it_never_comes_back` exercises
 /// must detach a saved card on the provider side first, exactly like the
 /// staff `delete_contact` path.
-#[sqlx::test]
+#[mokosh_test]
 async fn removing_a_created_contact_detaches_its_saved_payment_method(pool: PgPool) {
     stripe_stub_base();
     seed_stripe_gateway(&pool).await;
@@ -710,7 +711,7 @@ async fn removing_a_created_contact_detaches_its_saved_payment_method(pool: PgPo
 
 /// PSA-70 K, the linked case: a contact the CRM already held keeps its record
 /// and loses only what the import attached.
-#[sqlx::test]
+#[mokosh_test]
 async fn removing_a_linked_contact_keeps_the_crm_record(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let existing = Uuid::new_v4();
@@ -755,7 +756,7 @@ async fn removing_a_linked_contact_keeps_the_crm_record(pool: PgPool) {
 
 /// A contact tickets refer to cannot be deleted, and then nothing at all is
 /// removed: not the link, not the marker.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_removal_the_database_refuses_removes_nothing(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let source = FakeSource::new();
@@ -792,7 +793,7 @@ async fn a_removal_the_database_refuses_removes_nothing(pool: PgPool) {
 }
 
 /// Removal deletes a person: an admin's act, with a stated reason.
-#[sqlx::test]
+#[mokosh_test]
 async fn only_an_admin_removes_imported_data_and_says_why(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let source = FakeSource::new();
@@ -835,7 +836,7 @@ async fn only_an_admin_removes_imported_data_and_says_why(pool: PgPool) {
 
 /// PMS-1260: the list says where each contact came from in the same page
 /// read, and filters by it. An unlinked contact still came from Google.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_list_says_where_a_contact_came_from_and_filters_by_it(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let source = FakeSource::new();

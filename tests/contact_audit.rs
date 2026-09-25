@@ -6,6 +6,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -94,7 +95,7 @@ async fn authed(
 
 // Login success and failure each write their own subtype, with the
 // client address and user agent on the row.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_success_and_failure_write_rows(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "login@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -112,7 +113,7 @@ async fn login_success_and_failure_write_rows(pool: PgPool) {
 }
 
 // A wrong second factor is its own subtype; the pre-signal writes none.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_wrong_second_factor_writes_mfa_failed(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "mfa@example.com").await;
     let secret = mokosh_server::utils::totp::generate_secret();
@@ -144,7 +145,7 @@ async fn a_wrong_second_factor_writes_mfa_failed(pool: PgPool) {
 }
 
 // Logout and a replayed refresh both write, as logout actions.
-#[sqlx::test]
+#[mokosh_test]
 async fn logout_and_replay_write_rows(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "sessions@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -203,7 +204,7 @@ async fn logout_and_replay_write_rows(pool: PgPool) {
 }
 
 // Reset through a token, and change while signed in, each write.
-#[sqlx::test]
+#[mokosh_test]
 async fn password_reset_and_change_write_rows(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "pw@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -277,7 +278,7 @@ async fn password_reset_and_change_write_rows(pool: PgPool) {
 }
 
 // The three MFA transitions each write.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_setup_enable_disable_write_rows(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "totp@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -325,7 +326,7 @@ async fn mfa_setup_enable_disable_write_rows(pool: PgPool) {
 // Signing out another browser (PMS-1085) writes a row on the contact
 // who revoked; the refused own-session delete and an id that is not
 // the caller's write nothing.
-#[sqlx::test]
+#[mokosh_test]
 async fn revoking_another_session_writes_a_row(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "revoke@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -407,7 +408,7 @@ async fn revoking_another_session_writes_a_row(pool: PgPool) {
 // the password login: a wrong code writes `portal.mfa_failed`, the
 // pre-signal writes nothing, and the completed link writes
 // `portal.login_link`.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_wrong_second_factor_on_the_magic_link_writes_mfa_failed(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "link-mfa@example.com").await;
     let secret = mokosh_server::utils::totp::generate_secret();

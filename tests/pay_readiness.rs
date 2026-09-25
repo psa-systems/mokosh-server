@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -215,7 +216,7 @@ async fn set_stripe_client_display_name(pool: &PgPool, tenant_id: Uuid, label: &
     .expect("set client_display_name");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn readiness_ready_when_gateway_and_payable(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -259,7 +260,7 @@ async fn readiness_ready_when_gateway_and_payable(pool: PgPool) {
 /// `money()` formatter like `balance_due_display`, which never special-cases
 /// `$` for USD, so a non-USD tenant's amounts must carry their own currency
 /// code rather than a dollar sign borrowed from the old hand-rolled format.
-#[sqlx::test]
+#[mokosh_test]
 async fn readiness_min_partial_amount_display_carries_its_own_currency(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -303,7 +304,7 @@ async fn readiness_min_partial_amount_display_carries_its_own_currency(pool: PgP
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn readiness_not_payable_when_draft(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -333,7 +334,7 @@ async fn readiness_not_payable_when_draft(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn readiness_not_ready_when_no_gateway(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -361,7 +362,7 @@ async fn readiness_not_ready_when_no_gateway(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn readiness_cross_company_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_own_company, _c, _e, token) =
@@ -387,7 +388,7 @@ async fn readiness_cross_company_404(pool: PgPool) {
 /// MAPPS-671 (mokosh-invoices P2a): the admin-set button label wins
 /// when set. Same seed as the ready-and-payable happy path plus one
 /// UPDATE to set the override.
-#[sqlx::test]
+#[mokosh_test]
 async fn readiness_button_label_uses_override_when_set(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -418,7 +419,7 @@ async fn readiness_button_label_uses_override_when_set(pool: PgPool) {
 }
 
 /// MAPPS-671: whitespace-only override does not ship a blank button.
-#[sqlx::test]
+#[mokosh_test]
 async fn readiness_button_label_falls_back_when_override_is_blank(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -446,7 +447,7 @@ async fn readiness_button_label_falls_back_when_override_is_blank(pool: PgPool) 
 /// MAPPS-670 (mokosh-invoices P1e): the portal must never see a draft
 /// invoice, and the exclusion runs server-side so the paginated `total`
 /// agrees with the returned rows.
-#[sqlx::test]
+#[mokosh_test]
 async fn list_invoices_contact_plane_hides_drafts(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -489,7 +490,7 @@ async fn list_invoices_contact_plane_hides_drafts(pool: PgPool) {
 /// posting `?exclude_draft=false` in the query string must NOT re-expose
 /// drafts (the field is `serde(skip_deserializing)` and the route sets
 /// it unconditionally for the contact plane).
-#[sqlx::test]
+#[mokosh_test]
 async fn list_invoices_contact_plane_ignores_client_exclude_draft_override(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =
@@ -513,7 +514,7 @@ async fn list_invoices_contact_plane_ignores_client_exclude_draft_override(pool:
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn readiness_no_invoices_read_cap_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Support Contact has tickets:* but not invoices:read.
@@ -538,7 +539,7 @@ async fn readiness_no_invoices_read_cap_403(pool: PgPool) {
 // MAPPS-705: `dashboard/summary` must not leak counts / recent-activity
 // rows past the caller's read caps.
 
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_summary_hides_invoices_from_no_invoices_read_cap(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Support Contact holds tickets:* but NOT invoices:read.
@@ -567,7 +568,7 @@ async fn dashboard_summary_hides_invoices_from_no_invoices_read_cap(pool: PgPool
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn dashboard_summary_surfaces_invoices_when_caller_holds_invoices_read(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (own_company, _c, _e, token) =

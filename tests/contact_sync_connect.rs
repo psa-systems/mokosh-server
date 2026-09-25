@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -17,7 +18,7 @@ use uuid::Uuid;
 /// `GOOGLE_CONTACTS_CLIENT_ID`), which is itself the first thing worth
 /// pinning: an operator who has not set the client gets told so, not a Google
 /// error page.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unconfigured_deployment_says_so_rather_than_offering_a_broken_connect(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -44,7 +45,7 @@ async fn an_unconfigured_deployment_says_so_rather_than_offering_a_broken_connec
 
 /// Connecting a tenant's directory to its CRM is an administrator's act, the
 /// same gate the RMM connection routes carry.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_non_admin_cannot_start_or_end_a_connection(pool: PgPool) {
     let (_admin, _email, _password) = common::seed_admin(&pool).await;
     let (_tech_id, tech_email, tech_password) = common::seed_user(
@@ -77,7 +78,7 @@ async fn a_non_admin_cannot_start_or_end_a_connection(pool: PgPool) {
 }
 
 /// Never connected reads as an offer, not an error.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_with_no_connection_reads_as_none(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -109,7 +110,7 @@ async fn a_tenant_with_no_connection_reads_as_none(pool: PgPool) {
 /// what keep it safe. A guessed state, a malformed one, a missing code and a
 /// cancelled consent all end the same way: a redirect carrying a flag, never
 /// a body, never the provider's words.
-#[sqlx::test]
+#[mokosh_test]
 async fn every_bad_callback_redirects_and_tells_the_browser_nothing(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let client = reqwest::Client::builder()
@@ -159,7 +160,7 @@ async fn every_bad_callback_redirects_and_tells_the_browser_nothing(pool: PgPool
 
 /// A state row is per tenant and RLS-scoped like everything else, so one
 /// tenant's in-flight connect is invisible to another.
-#[sqlx::test]
+#[mokosh_test]
 async fn state_rows_are_tenant_scoped(pool: PgPool) {
     let app = common::boot_rls(pool.clone()).await;
     let (other_tenant, _u, _e, _p) = common::seed_tenant_with_admin(&pool, "othersync").await;
@@ -188,7 +189,7 @@ async fn state_rows_are_tenant_scoped(pool: PgPool) {
 /// its id, links, runs and selection all hang off that id - and clears the
 /// failure state. A DIFFERENT account is refused, because every link names the
 /// account it came from.
-#[sqlx::test]
+#[mokosh_test]
 async fn reconnecting_the_same_account_keeps_the_connection(pool: PgPool) {
     use mokosh_server::db::Database;
     use mokosh_server::modules::auth::TenantId;
@@ -275,7 +276,7 @@ async fn reconnecting_the_same_account_keeps_the_connection(pool: PgPool) {
 /// the system tenant. The secret goes to the secret provider and never comes
 /// back; the connect flow uses the stored client; clearing it falls back to
 /// env (unset here, so "not configured").
-#[sqlx::test]
+#[mokosh_test]
 async fn the_google_client_is_set_in_the_app_and_the_secret_never_returns(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -404,7 +405,7 @@ async fn the_google_client_is_set_in_the_app_and_the_secret_never_returns(pool: 
 
 /// An admin of any other organisation cannot read or swap the client every
 /// tenant on the deployment connects through.
-#[sqlx::test]
+#[mokosh_test]
 async fn only_the_system_tenant_configures_the_google_client(pool: PgPool) {
     let (_tenant, _user, email, password) =
         common::seed_tenant_with_admin(&pool, "customer-msp").await;

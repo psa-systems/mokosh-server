@@ -15,11 +15,12 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn seed_admin_is_backfilled_into_platform_admins(pool: PgPool) {
     let (admin_id, email, _password) = common::seed_admin(&pool).await;
     // seed_admin inserts into users AFTER migration 132 already ran,
@@ -44,7 +45,7 @@ async fn seed_admin_is_backfilled_into_platform_admins(pool: PgPool) {
     assert_eq!(row_email.as_deref(), Some(email.as_str()));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn platform_login_returns_access_token(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     // Backfill this admin.
@@ -79,7 +80,7 @@ async fn platform_login_returns_access_token(pool: PgPool) {
     assert_eq!(body["admin"]["email"].as_str().unwrap(), email);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn platform_login_wrong_password_returns_401(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let hash = mokosh_server::utils::crypto::hash_password(&password)
@@ -106,7 +107,7 @@ async fn platform_login_wrong_password_returns_401(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn platform_change_password_isolates_from_identity_plane(pool: PgPool) {
     // Setup: super_admin users row (via seed_admin) + backfill platform_admins
     // with the same email/password. Login to /platform/login, change password.
@@ -215,7 +216,7 @@ async fn platform_change_password_isolates_from_identity_plane(pool: PgPool) {
 // plane lags, not leads). Logging in with the stale identity
 // password A must 401 and must NOT touch platform_admins.password_hash;
 // logging in with the current platform password B must still succeed.
-#[sqlx::test]
+#[mokosh_test]
 async fn platform_login_rejects_stale_identity_hash_after_rotation(pool: PgPool) {
     let email = "rotated@example.com".to_string();
     let password_old = "PLATFORM-OLD-STALE".to_string();
@@ -300,7 +301,7 @@ async fn platform_login_rejects_stale_identity_hash_after_rotation(pool: PgPool)
 // normally and gets 401 on any other password (no crash on the
 // missing-identity case, since there is no identity lookup at all
 // anymore).
-#[sqlx::test]
+#[mokosh_test]
 async fn platform_login_no_identity_row_still_works(pool: PgPool) {
     let email = "solo-platform@example.com".to_string();
     let password_a = "SOLO-A-12345".to_string();
@@ -378,7 +379,7 @@ async fn platform_post(app: &common::TestApp, body: Value) -> reqwest::Response 
         .expect("send")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn platform_login_is_rate_limited_and_isolated_from_staff_budget(pool: PgPool) {
     let (email, password) = seed_platform_admin(&pool, None).await;
     let app = common::boot(pool).await;
@@ -425,7 +426,7 @@ async fn platform_login_is_rate_limited_and_isolated_from_staff_budget(pool: PgP
     let _ = password;
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn platform_login_enforces_mfa_and_refuses_replay(pool: PgPool) {
     let secret = mokosh_server::utils::totp::generate_secret();
     let b32 = mokosh_server::utils::totp::base32_encode(&secret);
@@ -479,7 +480,7 @@ async fn platform_login_enforces_mfa_and_refuses_replay(pool: PgPool) {
 /// A lost authenticator spends a recovery code. The code is single-use, so
 /// a second login with the same one is refused, and an unknown code is the
 /// same 401 as a wrong TOTP.
-#[sqlx::test]
+#[mokosh_test]
 async fn platform_login_accepts_a_recovery_code_and_refuses_a_replay(pool: PgPool) {
     let secret = mokosh_server::utils::totp::generate_secret();
     let b32 = mokosh_server::utils::totp::base32_encode(&secret);

@@ -13,6 +13,7 @@ use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::time_tracking::TimeTrackingService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::str::FromStr;
@@ -165,7 +166,7 @@ fn create_request_on(
 
 /// The bug, from the other side: logging time draws on the block, without
 /// anybody approving anything.
-#[sqlx::test]
+#[mokosh_test]
 async fn logging_time_draws_on_the_block(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -206,7 +207,7 @@ async fn logging_time_draws_on_the_block(pool: PgPool) {
 /// Only billable client work draws. Employee time has no client to bill and a
 /// non-billable hour is not being charged for, so neither should come out of an
 /// allotment the client paid for.
-#[sqlx::test]
+#[mokosh_test]
 async fn time_that_is_not_a_clients_billable_work_draws_nothing(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -242,7 +243,7 @@ async fn time_that_is_not_a_clients_billable_work_draws_nothing(pool: PgPool) {
 
 /// An edit gives back what it took and draws again, so the balance follows the
 /// entry rather than the first version of it.
-#[sqlx::test]
+#[mokosh_test]
 async fn editing_an_entry_moves_the_balance_with_it(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -294,7 +295,7 @@ async fn editing_an_entry_moves_the_balance_with_it(pool: PgPool) {
 
 /// Deleting an entry returns its hours. The record of what it drew lives on the
 /// row, so the release has to happen before the row does not exist.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_an_entry_returns_its_hours(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -331,7 +332,7 @@ async fn deleting_an_entry_returns_its_hours(pool: PgPool) {
 /// the applied part comes out of the block. Recording the applied hours rather
 /// than the duration is what makes the release exact, so a delete gives back
 /// eight and not twelve.
-#[sqlx::test]
+#[mokosh_test]
 async fn hours_past_the_block_are_overage_and_only_the_applied_part_returns(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -375,7 +376,7 @@ async fn hours_past_the_block_are_overage_and_only_the_applied_part_returns(pool
 
 /// A company with no block-hours contract is every other company, and logging
 /// time against one must stay exactly as cheap as it was.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_company_with_no_block_contract_is_unaffected(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -407,7 +408,7 @@ async fn a_company_with_no_block_contract_is_unaffected(pool: PgPool) {
 /// The double-draw this change had to avoid. Approval used to be the
 /// consumption point (PMS-405); with `contract_id` finally being set, leaving
 /// it there would have drawn every hour twice for a tenant with timesheets on.
-#[sqlx::test]
+#[mokosh_test]
 async fn approving_a_timesheet_does_not_draw_again(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -448,7 +449,7 @@ async fn approving_a_timesheet_does_not_draw_again(pool: PgPool) {
 
 /// Decimal comparison sanity: the helpers above compare against whole hours, so
 /// a fractional entry has to land where it should too.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_fractional_entry_draws_its_fraction(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -521,7 +522,7 @@ async fn invoice_lines(
 
 /// An entry the block covers is `prepaid`: not on the invoice, and the
 /// refusal says the hours were covered rather than calling them not ready.
-#[sqlx::test]
+#[mokosh_test]
 async fn time_inside_the_block_is_prepaid_and_never_invoiced(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -561,7 +562,7 @@ async fn time_inside_the_block_is_prepaid_and_never_invoiced(pool: PgPool) {
 /// Ten hours against an eight-hour block: one line for the two hours over,
 /// at the contract's overage rate, and nothing for the eight the customer
 /// already paid for.
-#[sqlx::test]
+#[mokosh_test]
 async fn overage_bills_at_the_overage_rate_and_the_prepaid_part_does_not(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -609,7 +610,7 @@ async fn overage_bills_at_the_overage_rate_and_the_prepaid_part_does_not(pool: P
 /// A block item with no overage rate bills the overage at the entry's own
 /// hourly rate, and once the block is exhausted an entry is overage in full
 /// and the line says so.
-#[sqlx::test]
+#[mokosh_test]
 async fn overage_with_no_rate_bills_at_the_entrys_own_rate(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -675,7 +676,7 @@ async fn overage_with_no_rate_bills_at_the_entrys_own_rate(pool: PgPool) {
 /// Releasing a draw forgets what it decided: a prepaid entry made
 /// non-billable and billable again is drawn afresh, and an overage entry
 /// shortened to fit the block loses its overage and becomes prepaid.
-#[sqlx::test]
+#[mokosh_test]
 async fn releasing_a_draw_makes_the_entry_billable_again_in_full(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -762,7 +763,7 @@ use mokosh_server::modules::contracts::ContractsService;
 /// transaction the caller holds open and never commits it itself, so
 /// dropping that transaction without committing - simulating the crash -
 /// rolls the draw back right along with the stamp that was never reached.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_crash_between_the_draw_and_the_stamp_leaves_neither_applied(pool: PgPool) {
     let company = common::seed_company(&pool).await;
     let contract = seed_block_contract(&pool, company, 10).await;
@@ -849,7 +850,7 @@ async fn pool_begin_with_tenant(
 /// seed a stale balance: no contract covers 2026-08-05, so the entry ends up
 /// undrawn (`contract_id` and `hours_consumed` both `NULL`) and `C`'s balance
 /// is back to fully unused, not short by 3h with nothing to show for it.
-#[sqlx::test]
+#[mokosh_test]
 async fn editing_an_entrys_date_past_contract_coverage_refuses_the_draw(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;
@@ -910,7 +911,7 @@ async fn editing_an_entrys_date_past_contract_coverage_refuses_the_draw(pool: Pg
 /// Moving an entry to a date covered by a DIFFERENT contract re-derives onto
 /// that one, which is the legitimate case the alternative design (freezing
 /// `contract_id` at creation) would have broken.
-#[sqlx::test]
+#[mokosh_test]
 async fn editing_an_entrys_date_into_another_contracts_window_redraws_there(pool: PgPool) {
     let (user_id, _e, _p) = common::seed_admin(&pool).await;
     let company = common::seed_company(&pool).await;

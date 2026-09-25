@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -42,7 +43,7 @@ async fn seed_contact_row(pool: &PgPool, company_id: Uuid, email: &str) -> Uuid 
 /// mokosh-contact-login prompt 010: the auth.portal_grant email
 /// carries BOTH the magic-link URL and the set-password URL, so the
 /// recipient can pick whichever they prefer.
-#[sqlx::test]
+#[mokosh_test]
 async fn grant_email_now_carries_both_magic_link_and_set_password_urls(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -138,7 +139,7 @@ async fn grant_email_now_carries_both_magic_link_and_set_password_urls(pool: PgP
 /// well-formed URL + template that the explicit `/grant-portal-access`
 /// path already sent shows up here too. Without this pin, a future
 /// refactor that re-splits the two paths could silently re-open the bug.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_contact_with_is_portal_user_true_dispatches_portal_grant_email_with_slug(
     pool: PgPool,
 ) {
@@ -221,7 +222,7 @@ async fn create_contact_with_is_portal_user_true_dispatches_portal_grant_email_w
 /// contact's `is_portal_user` from false to true must also dispatch the
 /// correct grant email with the slug in the URL. The prior path routed
 /// through `send_setup_email` which produced the same broken URL.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_contact_flipping_is_portal_user_true_dispatches_portal_grant_email_with_slug(
     pool: PgPool,
 ) {

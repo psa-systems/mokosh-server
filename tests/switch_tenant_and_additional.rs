@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -80,7 +81,7 @@ async fn login_via_default_tenant(app: &common::TestApp, email: &str, password: 
         .to_string()
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn switch_tenant_returns_new_session_scoped_to_the_target(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let other_tenant = insert_tenant(&pool, "Other Co", "other-mapps494").await;
@@ -112,7 +113,7 @@ async fn switch_tenant_returns_new_session_scoped_to_the_target(pool: PgPool) {
     assert_eq!(body["needs_setup"], false);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn switch_tenant_to_stranger_tenant_returns_404(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -129,7 +130,7 @@ async fn switch_tenant_to_stranger_tenant_returns_404(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn switch_tenant_without_bearer_returns_401(pool: PgPool) {
     let app = common::boot(pool).await;
     let target = Uuid::new_v4();
@@ -142,7 +143,7 @@ async fn switch_tenant_without_bearer_returns_401(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn additional_tenant_creates_new_org_with_caller_as_admin(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -185,7 +186,7 @@ async fn additional_tenant_creates_new_org_with_caller_as_admin(pool: PgPool) {
     assert!(has_new, "new tenant appears as admin membership");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn additional_tenant_without_bearer_returns_401(pool: PgPool) {
     let app = common::boot(pool).await;
     let resp = app
@@ -198,7 +199,7 @@ async fn additional_tenant_without_bearer_returns_401(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn additional_tenant_slug_collision_returns_409(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     insert_tenant(&pool, "Existing", "second-org-taken").await;
@@ -219,7 +220,7 @@ async fn additional_tenant_slug_collision_returns_409(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn switch_then_switch_back_yields_two_working_sessions(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let other_tenant = insert_tenant(&pool, "Other Co", "other-mapps494").await;

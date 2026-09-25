@@ -6,6 +6,12 @@ members = [
     "crates/mokosh-types",
     # Shared build-script logic for the root build.rs (PMS-198).
     "crates/build-metadata",
+    # PMS-1254: `#[mokosh_test]`, the database-backed test attribute, and the
+    # template-database support it expands into. Two crates because a
+    # proc-macro crate can export nothing but macros. Dev-dependencies of the
+    # root package only; nothing they hold reaches a release build.
+    "crates/mokosh-test-macros",
+    "crates/mokosh-test",
 ]
 
 [workspace.package]
@@ -246,6 +252,12 @@ rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
 # signature verification, not a bypass.
 hmac = "0.12"
 sha2 = "0.10"
+# PMS-1254: `#[mokosh_test]`, which clones each test's database from a
+# migrated template instead of applying every migration into it. A
+# dev-dependency only, so nothing it expands to reaches a release build. It
+# re-exports the attribute from `mokosh-test-macros`, so that crate is not
+# named here.
+mokosh-test = { path = "crates/mokosh-test" }
 
 [build-dependencies]
 # Shared build-script logic (PMS-198). build.rs calls build_metadata::emit().
