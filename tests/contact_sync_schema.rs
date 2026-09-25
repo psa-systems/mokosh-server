@@ -7,6 +7,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -43,7 +44,7 @@ async fn seed_contact(pool: &PgPool, company_id: Uuid, email: &str) -> Uuid {
 
 /// PSA-70 (B): org-level is the schema's rule, not the service's. A tenant
 /// holds one live connection per provider.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_tenant_has_one_live_connection_per_provider(pool: PgPool) {
     seed_connection(&pool, "first@workspace.example").await;
     let second = sqlx::query(
@@ -76,7 +77,7 @@ async fn a_tenant_has_one_live_connection_per_provider(pool: PgPool) {
 
 /// PSA-70 (J): deleting a connection must never delete the record of where a
 /// contact came from, nor the contact.
-#[sqlx::test]
+#[mokosh_test]
 async fn provenance_survives_deleting_the_connection(pool: PgPool) {
     let company = common::seed_company(&pool).await;
     let connection = seed_connection(&pool, "msp@workspace.example").await;
@@ -122,7 +123,7 @@ async fn provenance_survives_deleting_the_connection(pool: PgPool) {
 /// PSA-70 (D): both awkward match shapes are representable, because the queue
 /// is keyed on the PAIR. One Google contact matching two Mokosh contacts, and
 /// two Google contacts matching one Mokosh contact.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_review_queue_holds_both_ambiguous_shapes(pool: PgPool) {
     let company = common::seed_company(&pool).await;
     let connection = seed_connection(&pool, "msp@workspace.example").await;
@@ -173,7 +174,7 @@ async fn the_review_queue_holds_both_ambiguous_shapes(pool: PgPool) {
 
 /// Every new table is RLS fail-closed, so the app role sees nothing without
 /// the tenant GUC. The `boot_rls` role is the production posture.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_new_tables_are_rls_fail_closed(pool: PgPool) {
     let app = common::boot_rls(pool.clone()).await;
     for table in [

@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -112,7 +113,7 @@ async fn failed_count(pool: &PgPool, id: Uuid) -> i32 {
 // code ticks the counter, the right code signs in, `me` reports the
 // flag, disable needs password plus code, and the password alone signs
 // in again afterwards.
-#[sqlx::test]
+#[mokosh_test]
 async fn enrolment_gates_the_login_and_disable_lifts_it(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "mfa@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -236,7 +237,7 @@ async fn enrolment_gates_the_login_and_disable_lifts_it(pool: PgPool) {
 
 // A recovery code signs in once, wins over a bad TOTP sent beside it,
 // and is refused on replay.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_recovery_code_signs_in_exactly_once(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "recover@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -288,7 +289,7 @@ async fn a_recovery_code_signs_in_exactly_once(pool: PgPool) {
 
 // Setup, enable and disable all sit behind the current password; enable
 // needs a staged secret; setup refuses while MFA is on.
-#[sqlx::test]
+#[mokosh_test]
 async fn every_mfa_change_needs_the_current_password(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "guard@example.com").await;
     let app = common::boot(pool.clone()).await;
@@ -391,7 +392,7 @@ async fn every_mfa_change_needs_the_current_password(pool: PgPool) {
 
 // A secret stored in the pre-encryption plaintext shape still verifies,
 // and is rewritten sealed once it has.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_legacy_plaintext_secret_verifies_and_is_sealed_on_the_way(pool: PgPool) {
     let contact = seed_portal_contact(&pool, "legacy@example.com").await;
     let secret = mokosh_server::utils::totp::generate_secret();

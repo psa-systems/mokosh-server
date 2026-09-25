@@ -17,6 +17,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 fn install_test_env() {
@@ -38,7 +39,7 @@ async fn upload(app: &common::TestApp, token: &str, size: usize) -> reqwest::Res
         .expect("send upload")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_upload_between_axums_default_and_the_configured_cap_is_accepted(pool: PgPool) {
     install_test_env();
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -54,7 +55,7 @@ async fn an_upload_between_axums_default_and_the_configured_cap_is_accepted(pool
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_upload_over_the_configured_cap_is_refused_with_413(pool: PgPool) {
     install_test_env();
     let (_admin_id, email, password) = common::seed_admin(&pool).await;

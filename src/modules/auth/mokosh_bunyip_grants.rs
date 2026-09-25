@@ -239,6 +239,12 @@ impl MokoshBunyipGrantService {
     /// a late, duplicate or replayed event changes nothing (PMS-1295).
     /// Returns `true` when a row was inserted or changed; only then is the
     /// cache entry for the (grantee, account) pair invalidated.
+    ///
+    /// PMS-1210: on a revoked event the receiver stamps `revoked_by =
+    /// 'owner'` so the audit line can tell an owner-side revoke apart
+    /// from a grantee's "Leave account" gesture. A granted event clears
+    /// the initiator back to `NULL`, so a re-grant does not carry the
+    /// stale initiator of a previous revoke.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert(
         pool: &PgPool,
@@ -250,11 +256,12 @@ impl MokoshBunyipGrantService {
         granted_at: DateTime<Utc>,
         revoked_at: Option<DateTime<Utc>>,
     ) -> AppResult<bool> {
+        let revoked_by: Option<&str> = revoked_at.is_some().then_some("owner");
         let result = sqlx::query(
             "INSERT INTO mokosh_bunyip_grants (\
                  bunyip_grant_id, owner_bunyip_user_id, grantee_bunyip_user_id, \
-                 mokosh_account_id, role, granted_at, revoked_at, event_at, updated_at\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $6, NOW()) \
+                 mokosh_account_id, role, granted_at, revoked_at, revoked_by, event_at, updated_at\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $6, NOW()) \
              ON CONFLICT (grantee_bunyip_user_id, mokosh_account_id) \
              DO UPDATE SET \
                  bunyip_grant_id = EXCLUDED.bunyip_grant_id, \
@@ -262,6 +269,7 @@ impl MokoshBunyipGrantService {
                  role = EXCLUDED.role, \
                  granted_at = EXCLUDED.granted_at, \
                  revoked_at = EXCLUDED.revoked_at, \
+                 revoked_by = EXCLUDED.revoked_by, \
                  event_at = EXCLUDED.event_at, \
                  updated_at = NOW() \
              WHERE mokosh_bunyip_grants.event_at < EXCLUDED.event_at",
@@ -273,6 +281,7 @@ impl MokoshBunyipGrantService {
         .bind(role)
         .bind(granted_at)
         .bind(revoked_at)
+        .bind(revoked_by)
         .execute(pool)
         .await?;
 
@@ -315,5 +324,99 @@ fn invalidate_cache(key: &GrantKey) {
 pub fn clear_cache_for_tests() {
     if let Ok(mut guard) = GRANT_CACHE.write() {
         *guard = None;
+    }
+}
+
+/// Outcome of [`MokoshBunyipGrantService::grantee_leave`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GranteeLeaveOutcome {
+    /// The row was found and this call is what revoked it. The receiver
+    /// tombstoned the granted-tenant `users` placement in the same
+    /// transaction.
+    Revoked,
+    /// The row was found and was already revoked; the caller's replay is
+    /// a no-op. Answered with `204` at the route to match the enumeration
+    /// resistant shape the owner-side revoke uses.
+    AlreadyRevoked,
+    /// No row matches the caller and id pair. Answered with `404` at the
+    /// route so a foreign id is indistinguishable from a nonexistent one,
+    /// matching the owner-side revoke.
+    NotFound,
+}
+
+impl MokoshBunyipGrantService {
+    /// PMS-1210: the caller leaves an account they were granted access to.
+    ///
+    /// Identifies the row by the mokosh-side `id` AND the caller's
+    /// `bunyip_user_id` in one predicate, so a foreign id is
+    /// enumeration-resistant: the query answers `NotFound` for both a
+    /// nonexistent id and one that belongs to a different grantee, which
+    /// mirrors the owner-side revoke's 404 posture.
+    ///
+    /// The write and the belt-and-braces tombstone on the granted-tenant
+    /// `users` row live in one transaction so a caller cannot end up half
+    /// revoked. The tombstone shape (`deleted_at = COALESCE(...)`) matches
+    /// the receiver's `mokosh_grant_changed` webhook path, so a grantee
+    /// leaving and the owner revoking converge on the same on-disk state.
+    ///
+    /// The 30s snapshot cache is invalidated on a successful revoke so the
+    /// next request from anyone in this process sees the change without
+    /// waiting for the TTL, the shape `upsert` already uses.
+    pub async fn grantee_leave(
+        pool: &PgPool,
+        row_id: Uuid,
+        grantee_bunyip_user_id: Uuid,
+    ) -> AppResult<GranteeLeaveOutcome> {
+        let mut tx = pool.begin().await?;
+
+        let row: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT mokosh_account_id, revoked_at FROM mokosh_bunyip_grants \
+             WHERE id = $1 AND grantee_bunyip_user_id = $2 FOR UPDATE",
+        )
+        .bind(row_id)
+        .bind(grantee_bunyip_user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((mokosh_account_id, revoked_at)) = row else {
+            return Ok(GranteeLeaveOutcome::NotFound);
+        };
+
+        if revoked_at.is_some() {
+            return Ok(GranteeLeaveOutcome::AlreadyRevoked);
+        }
+
+        sqlx::query(
+            "UPDATE mokosh_bunyip_grants \
+             SET revoked_at = NOW(), role = NULL, revoked_by = 'grantee', \
+                 event_at = NOW(), updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(row_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Belt-and-braces: tombstone the placement row so the grantee's
+        // next request cannot serve any tenant-scoped read out of stale
+        // rows the JIT provisioner minted. The webhook path does the same.
+        sqlx::query(
+            "UPDATE users \
+             SET deleted_at = COALESCE(deleted_at, NOW()) \
+             WHERE bunyip_user_id = $1 \
+               AND tenant_id = (SELECT id FROM tenants WHERE slug = $2)",
+        )
+        .bind(grantee_bunyip_user_id)
+        .bind(&mokosh_account_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        invalidate_cache(&GrantKey {
+            grantee_bunyip_user_id,
+            mokosh_account_id,
+        });
+
+        Ok(GranteeLeaveOutcome::Revoked)
     }
 }

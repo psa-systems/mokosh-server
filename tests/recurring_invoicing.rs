@@ -26,6 +26,7 @@ use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::billing::BillingService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -93,7 +94,7 @@ async fn seed_recurring_item(
     .expect("seed recurring item");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn monthly_contract_generates_one_invoice_for_due_period(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -165,7 +166,7 @@ async fn monthly_contract_generates_one_invoice_for_due_period(pool: PgPool) {
     assert_eq!(p_end, NaiveDate::from_ymd_opt(2026, 1, 31).unwrap());
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn second_run_same_period_is_idempotent(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -219,7 +220,7 @@ async fn second_run_same_period_is_idempotent(pool: PgPool) {
     assert_eq!(ledger_count, 1, "one ledger row per billed period");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn one_time_and_expired_contracts_generate_nothing(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -285,7 +286,7 @@ async fn one_time_and_expired_contracts_generate_nothing(pool: PgPool) {
     assert_eq!(invoice_count, 0);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contract_with_no_recurring_items_generates_nothing(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -327,7 +328,7 @@ async fn contract_with_no_recurring_items_generates_nothing(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn next_period_generates_a_new_invoice(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -442,7 +443,7 @@ async fn line_descriptions(pool: &PgPool, invoice_id: Uuid) -> Vec<String> {
 /// The defect, from the other side. A `product` item marked `every_period`
 /// bills like any other recurring line, which is what "30 licences at 22.00 a
 /// user" needs and what `item_type` alone could never express.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_product_item_bills_when_it_says_it_should(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -490,7 +491,7 @@ async fn a_product_item_bills_when_it_says_it_should(pool: PgPool) {
 /// keyed on the period, so a setup fee added in March would bill again in April
 /// under a new period key. Two consecutive periods is the test that would have
 /// caught a naive fix.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_one_time_item_bills_exactly_once(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -566,7 +567,7 @@ async fn a_one_time_item_bills_exactly_once(pool: PgPool) {
 /// A contract whose only item is a spent one-time charge has nothing left to
 /// bill, and must not produce an empty invoice or a ledger row that would block
 /// a later item.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_spent_one_time_item_leaves_nothing_to_bill(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;
@@ -620,7 +621,7 @@ async fn a_spent_one_time_item_leaves_nothing_to_bill(pool: PgPool) {
 /// two types that already billed, and a row left on the column default bills
 /// nothing rather than starting to charge a client for something recorded
 /// months ago.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_item_that_never_billed_does_not_start(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     let company = common::seed_company(&pool).await;

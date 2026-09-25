@@ -19,6 +19,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;
@@ -39,7 +40,7 @@ async fn seed_user_and_login(
     (user_id, token)
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn admin_can_edit_team_metadata_without_manager_binding(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
@@ -64,7 +65,7 @@ async fn admin_can_edit_team_metadata_without_manager_binding(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn technician_who_is_manager_can_edit_team_metadata(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
 
@@ -87,7 +88,7 @@ async fn technician_who_is_manager_can_edit_team_metadata(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn technician_who_is_not_manager_is_403(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let (_tech_id, tech_token) =
@@ -111,7 +112,7 @@ async fn technician_who_is_not_manager_is_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn user_role_manager_class_does_not_auto_grant_edit(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
 
@@ -138,7 +139,7 @@ async fn user_role_manager_class_does_not_auto_grant_edit(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn membership_writes_share_the_same_projection_guard(pool: PgPool) {
     // The projection guard runs on add_member / update_member_role /
     // remove_member the same way it does on update_team. Pin add_member as

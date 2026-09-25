@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -70,7 +71,7 @@ fn one_line_invoice(company_id: Uuid, invoice_date: &str) -> Value {
 
 /// Migration 133 gives the seeded names their counts: the readable forms
 /// PMS-117 wrote, and "Due on receipt" as zero.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_seeded_terms_carry_their_counts(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -84,7 +85,7 @@ async fn the_seeded_terms_carry_their_counts(pool: PgPool) {
 
 /// A count round-trips through create and update, blank is allowed (a term
 /// like "On approval" names no count), and the cap holds.
-#[sqlx::test]
+#[mokosh_test]
 async fn net_days_round_trip_and_are_capped(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -134,7 +135,7 @@ async fn net_days_round_trip_and_are_capped(pool: PgPool) {
 
 /// No due date and a named term: the invoice date plus that term's count,
 /// and the invoice records the term.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_named_term_derives_the_due_date(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -159,7 +160,7 @@ async fn a_named_term_derives_the_due_date(pool: PgPool) {
 /// No due date and no term: the tenant's default term (Net 30 as seeded)
 /// supplies both the count and the link, which is what "a configurable
 /// default" means.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_default_term_derives_the_due_date_when_none_is_named(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -178,7 +179,7 @@ async fn the_default_term_derives_the_due_date_when_none_is_named(pool: PgPool) 
 
 /// Changing the default changes what a new invoice gets: the setting is the
 /// operator's, not the seed's.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_new_default_is_what_the_next_invoice_follows(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -199,7 +200,7 @@ async fn a_new_default_is_what_the_next_invoice_follows(pool: PgPool) {
 
 /// A term that names no count, or a tenant whose default is gone, falls
 /// back to thirty days: what the server-minted paths always did.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_term_without_a_count_falls_back_to_thirty_days(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -237,7 +238,7 @@ async fn a_term_without_a_count_falls_back_to_thirty_days(pool: PgPool) {
 
 /// A given due date is stored as given whatever the term says, and one
 /// before the invoice date is still refused.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_given_due_date_wins_and_an_inverted_one_is_refused(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -265,7 +266,7 @@ async fn a_given_due_date_wins_and_an_inverted_one_is_refused(pool: PgPool) {
 
 /// Changing the term with no due date re-derives it; changing nothing, or
 /// giving a date, leaves it as the caller says.
-#[sqlx::test]
+#[mokosh_test]
 async fn changing_the_term_re_derives_the_due_date(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -320,7 +321,7 @@ async fn changing_the_term_re_derives_the_due_date(pool: PgPool) {
 
 /// A new tenant inherits the counts along with the names, because
 /// `TenantService` copies the default tenant's terms row-for-row.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_new_tenant_inherits_net_days(pool: PgPool) {
     let svc = mokosh_server::modules::tenants::TenantService::new(
         mokosh_server::Database::from_pool(pool.clone()),

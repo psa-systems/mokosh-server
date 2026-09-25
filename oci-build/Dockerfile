@@ -19,15 +19,20 @@ ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 COPY Cargo.toml Cargo.lock ./
 COPY crates/build-metadata/Cargo.toml ./crates/build-metadata/
 COPY crates/mokosh-types/Cargo.toml ./crates/mokosh-types/
+COPY crates/mokosh-test-macros/Cargo.toml ./crates/mokosh-test-macros/
+COPY crates/mokosh-test/Cargo.toml ./crates/mokosh-test/
 RUN mkdir -p src/bin crates/build-metadata/src crates/mokosh-types/src \
+             crates/mokosh-test-macros/src crates/mokosh-test/src \
     && echo 'fn main() {}' > build.rs \
     && echo 'fn main() {}' > src/main.rs \
     && echo 'fn main() {}' > src/bin/mokosh-bootstrap.rs \
     && touch src/lib.rs \
              crates/build-metadata/src/lib.rs \
-             crates/mokosh-types/src/lib.rs
+             crates/mokosh-types/src/lib.rs \
+             crates/mokosh-test-macros/src/lib.rs \
+             crates/mokosh-test/src/lib.rs
 
-# `cargo clean` drops the three stub-built workspace crates and keeps every
+# `cargo clean` drops the stub-built workspace crates and keeps every
 # dependency artifact. It is deterministic where relying on mtimes is not: COPY
 # preserves the build context's timestamps, which are older than this layer, so
 # without the clean cargo would call the stubs fresh and the image would ship a
@@ -36,7 +41,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bins \
     && cargo clean --release --package mokosh-server \
                              --package mokosh-types \
-                             --package build-metadata
+                             --package build-metadata \
+                             --package mokosh-test-macros \
+                             --package mokosh-test
 
 # Build-time version metadata. The `.git` directory is intentionally not
 # copied into the build context, so `build.rs` cannot derive these from

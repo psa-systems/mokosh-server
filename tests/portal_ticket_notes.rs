@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -97,7 +98,7 @@ async fn seed_public_note_from_agent(pool: &PgPool, ticket_id: Uuid, admin_id: U
     .expect("seed agent public note");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn portal_ticket_notes_round_trip(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let company_a = seed_company(&pool, "Company A").await;

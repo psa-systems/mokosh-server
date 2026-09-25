@@ -9,10 +9,11 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 
-#[sqlx::test]
+#[mokosh_test]
 async fn saved_dashboards_default_swap_cycle(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;

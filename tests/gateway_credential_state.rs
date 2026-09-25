@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 
@@ -71,7 +72,7 @@ async fn list_gateways(app: &common::TestApp, token: &str) -> Value {
 /// Whole is the point for the webhook id: comparing it against the one PayPal
 /// prints beside the webhook is the check that catches a wrong one before a
 /// customer's money does.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_stored_gateway_says_which_fields_it_holds(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -126,7 +127,7 @@ async fn a_stored_gateway_says_which_fields_it_holds(pool: PgPool) {
 
 /// A field that was never filled in reads as absent, which is what tells an
 /// admin WHICH part of the form to fix.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_missing_field_reads_as_absent(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -158,7 +159,7 @@ async fn a_missing_field_reads_as_absent(pool: PgPool) {
 
 /// The check answers with the provider that could not be built, rather than
 /// erroring, because that IS the answer to "does this configuration work".
-#[sqlx::test]
+#[mokosh_test]
 async fn checking_an_incomplete_gateway_names_the_missing_field(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -193,7 +194,7 @@ async fn checking_an_incomplete_gateway_names_the_missing_field(pool: PgPool) {
 
 /// Checking a provider the tenant has not configured is a 404 naming it, not a
 /// pass and not a 500.
-#[sqlx::test]
+#[mokosh_test]
 async fn checking_a_gateway_that_is_not_configured_is_a_404(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -212,7 +213,7 @@ async fn checking_a_gateway_that_is_not_configured_is_a_404(pool: PgPool) {
 /// The lie PMS-1181 closes: an active row whose credential cannot produce a
 /// provider reported the invoice as ready to pay, so the customer met the
 /// failure instead of the admin.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unusable_credential_is_not_reported_as_ready(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

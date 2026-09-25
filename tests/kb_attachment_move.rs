@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::path::PathBuf;
 
 use mokosh_server::db::Database;
@@ -122,7 +123,7 @@ async fn fetch_public(app: &common::TestApp, id: Uuid) -> (u16, Vec<u8>) {
 
 /// A new upload goes straight to the tenant path. This is the layout change
 /// itself, seen from the outside.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_fresh_upload_lands_under_its_tenant(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -149,7 +150,7 @@ async fn a_fresh_upload_lands_under_its_tenant(pool: PgPool) {
 
 /// The requirement that makes the layout change safe to ship: an image uploaded
 /// before this release is still served, before anything has moved it.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_file_written_under_the_old_layout_is_still_served(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -169,7 +170,7 @@ async fn a_file_written_under_the_old_layout_is_still_served(pool: PgPool) {
 }
 
 /// And then the mover carries it over, without the article noticing.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_mover_carries_a_legacy_file_under_its_tenant(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -198,7 +199,7 @@ async fn the_mover_carries_a_legacy_file_under_its_tenant(pool: PgPool) {
 
 /// A second pass finds nothing, which is the property that lets this run every
 /// hour for the life of the deployment.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_second_pass_has_nothing_to_do(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -219,7 +220,7 @@ async fn a_second_pass_has_nothing_to_do(pool: PgPool) {
 
 /// A moved file whose ledger row never caught up is corrected rather than
 /// moved, which is the half-failure the ordering can leave behind.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_stale_ledger_row_is_corrected_without_touching_the_file(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -250,7 +251,7 @@ async fn a_stale_ledger_row_is_corrected_without_touching_the_file(pool: PgPool)
 /// An attachment whose bytes are at neither path is left completely alone,
 /// ledger row included. Rewriting that row would dress a missing file up as a
 /// migrated one.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_attachment_with_no_file_is_left_alone(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -277,7 +278,7 @@ async fn an_attachment_with_no_file_is_left_alone(pool: PgPool) {
 
 /// Deleting an attachment removes the bytes wherever they are, so an image the
 /// mover never reached does not survive its own row.
-#[sqlx::test]
+#[mokosh_test]
 async fn deleting_an_unmoved_attachment_removes_the_legacy_file(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, password) = common::seed_admin(&pool).await;

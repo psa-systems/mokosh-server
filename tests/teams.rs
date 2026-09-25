@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -59,7 +60,7 @@ fn create_req(name: &str) -> CreateTeamRequest {
 // ============================================================================
 
 /// 1. create_team_persists_row
-#[sqlx::test]
+#[mokosh_test]
 async fn create_team_persists_row(pool: PgPool) {
     let s = svc(pool.clone());
     let team = s
@@ -73,7 +74,7 @@ async fn create_team_persists_row(pool: PgPool) {
 }
 
 /// 2. create_team_returns_full_team_including_timestamps
-#[sqlx::test]
+#[mokosh_test]
 async fn create_team_returns_full_team_including_timestamps(pool: PgPool) {
     let s = svc(pool);
     let team = s
@@ -86,7 +87,7 @@ async fn create_team_returns_full_team_including_timestamps(pool: PgPool) {
 }
 
 /// 3. list_teams_returns_only_tenant_teams
-#[sqlx::test]
+#[mokosh_test]
 async fn list_teams_returns_only_tenant_teams(pool: PgPool) {
     let s = svc(pool.clone());
     let (tenant_b, _uid, _e, _p) = common::seed_tenant_with_admin(&pool, "tenant-b-list").await;
@@ -110,7 +111,7 @@ async fn list_teams_returns_only_tenant_teams(pool: PgPool) {
 }
 
 /// 4. list_teams_filters_by_active
-#[sqlx::test]
+#[mokosh_test]
 async fn list_teams_filters_by_active(pool: PgPool) {
     let s = svc(pool);
     let team = s
@@ -140,7 +141,7 @@ async fn list_teams_filters_by_active(pool: PgPool) {
 }
 
 /// 5. get_team_with_members_includes_join
-#[sqlx::test]
+#[mokosh_test]
 async fn get_team_with_members_includes_join(pool: PgPool) {
     let (admin_id, _e, _p, team_id) = common::seed_admin_and_team(&pool, "Delta").await;
     let s = svc(pool);
@@ -153,7 +154,7 @@ async fn get_team_with_members_includes_join(pool: PgPool) {
 }
 
 /// 6. update_team_partial_updates_only_supplied_fields
-#[sqlx::test]
+#[mokosh_test]
 async fn update_team_partial_updates_only_supplied_fields(pool: PgPool) {
     let s = svc(pool);
     let mut req = create_req("Echo");
@@ -176,7 +177,7 @@ async fn update_team_partial_updates_only_supplied_fields(pool: PgPool) {
 }
 
 /// 7. update_team_rename_to_same_name_is_idempotent
-#[sqlx::test]
+#[mokosh_test]
 async fn update_team_rename_to_same_name_is_idempotent(pool: PgPool) {
     let s = svc(pool);
     let team = s
@@ -198,7 +199,7 @@ async fn update_team_rename_to_same_name_is_idempotent(pool: PgPool) {
 }
 
 /// 8. soft_delete_team_flips_is_active_and_preserves_ticket_fk
-#[sqlx::test]
+#[mokosh_test]
 async fn soft_delete_team_flips_is_active_and_preserves_ticket_fk(pool: PgPool) {
     let s = svc(pool.clone());
     let team = s
@@ -221,7 +222,7 @@ async fn soft_delete_team_flips_is_active_and_preserves_ticket_fk(pool: PgPool) 
 }
 
 /// 9. add_member_default_role_is_member
-#[sqlx::test]
+#[mokosh_test]
 async fn add_member_default_role_is_member(pool: PgPool) {
     let s = svc(pool.clone());
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
@@ -245,7 +246,7 @@ async fn add_member_default_role_is_member(pool: PgPool) {
 }
 
 /// 10. add_member_explicit_leader_role
-#[sqlx::test]
+#[mokosh_test]
 async fn add_member_explicit_leader_role(pool: PgPool) {
     let s = svc(pool.clone());
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
@@ -269,7 +270,7 @@ async fn add_member_explicit_leader_role(pool: PgPool) {
 }
 
 /// 11. list_members_returns_joined_user_fields
-#[sqlx::test]
+#[mokosh_test]
 async fn list_members_returns_joined_user_fields(pool: PgPool) {
     let (admin_id, admin_email, _p, team_id) = common::seed_admin_and_team(&pool, "Juliet").await;
     let s = svc(pool);
@@ -283,7 +284,7 @@ async fn list_members_returns_joined_user_fields(pool: PgPool) {
 }
 
 /// 12. update_member_role_flips_leader_to_member
-#[sqlx::test]
+#[mokosh_test]
 async fn update_member_role_flips_leader_to_member(pool: PgPool) {
     let (admin_id, _e, _p, team_id) = common::seed_admin_and_team(&pool, "Kilo").await;
     let s = svc(pool);
@@ -303,7 +304,7 @@ async fn update_member_role_flips_leader_to_member(pool: PgPool) {
 }
 
 /// 13. remove_member_is_idempotent
-#[sqlx::test]
+#[mokosh_test]
 async fn remove_member_is_idempotent(pool: PgPool) {
     let (admin_id, _e, _p, team_id) = common::seed_admin_and_team(&pool, "Lima").await;
     let s = svc(pool);
@@ -316,7 +317,7 @@ async fn remove_member_is_idempotent(pool: PgPool) {
 }
 
 /// 14. list_teams_for_user_returns_only_their_teams
-#[sqlx::test]
+#[mokosh_test]
 async fn list_teams_for_user_returns_only_their_teams(pool: PgPool) {
     let (admin_id, _e, _p, team_a) = common::seed_admin_and_team(&pool, "Mike-A").await;
     let s = svc(pool.clone());
@@ -335,7 +336,7 @@ async fn list_teams_for_user_returns_only_their_teams(pool: PgPool) {
 // ============================================================================
 
 /// 15. create_team_duplicate_name_returns_409
-#[sqlx::test]
+#[mokosh_test]
 async fn create_team_duplicate_name_returns_409(pool: PgPool) {
     let s = svc(pool);
     s.create_team(tenant(), &create_req("Nomad"), &ctx())
@@ -352,7 +353,7 @@ async fn create_team_duplicate_name_returns_409(pool: PgPool) {
 }
 
 /// 16. create_team_can_reuse_archived_name
-#[sqlx::test]
+#[mokosh_test]
 async fn create_team_can_reuse_archived_name(pool: PgPool) {
     let s = svc(pool);
     let first = s
@@ -368,7 +369,7 @@ async fn create_team_can_reuse_archived_name(pool: PgPool) {
 }
 
 /// 17. create_team_missing_name_returns_400
-#[sqlx::test]
+#[mokosh_test]
 async fn create_team_missing_name_returns_400(pool: PgPool) {
     let s = svc(pool);
     let req = CreateTeamRequest {
@@ -386,7 +387,7 @@ async fn create_team_missing_name_returns_400(pool: PgPool) {
 }
 
 /// 18. create_team_bad_color_returns_400 — three shapes
-#[sqlx::test]
+#[mokosh_test]
 async fn create_team_bad_color_returns_400(pool: PgPool) {
     let s = svc(pool);
     for bad in ["ff0000", "#f00", "javascript:alert(1)", "#ff0000ff"] {
@@ -405,7 +406,7 @@ async fn create_team_bad_color_returns_400(pool: PgPool) {
 // ============================================================================
 
 /// 19. add_member_from_wrong_tenant_returns_400 (F1)
-#[sqlx::test]
+#[mokosh_test]
 async fn add_member_from_wrong_tenant_returns_400(pool: PgPool) {
     let (tenant_b, user_b, _e, _p) =
         common::seed_tenant_with_admin(&pool, "wrong-tenant-add").await;
@@ -431,7 +432,7 @@ async fn add_member_from_wrong_tenant_returns_400(pool: PgPool) {
 }
 
 /// 20. create_team_with_wrong_tenant_manager_returns_400 (F2)
-#[sqlx::test]
+#[mokosh_test]
 async fn create_team_with_wrong_tenant_manager_returns_400(pool: PgPool) {
     let (_tenant_b, user_b, _e, _p) =
         common::seed_tenant_with_admin(&pool, "wrong-tenant-mgr").await;
@@ -443,7 +444,7 @@ async fn create_team_with_wrong_tenant_manager_returns_400(pool: PgPool) {
 }
 
 /// 21. update_team_with_wrong_tenant_manager_returns_400 (F2 update path)
-#[sqlx::test]
+#[mokosh_test]
 async fn update_team_with_wrong_tenant_manager_returns_400(pool: PgPool) {
     let (_tenant_b, user_b, _e, _p) =
         common::seed_tenant_with_admin(&pool, "wrong-tenant-mgr-upd").await;
@@ -467,7 +468,7 @@ async fn update_team_with_wrong_tenant_manager_returns_400(pool: PgPool) {
 }
 
 /// 22. get_team_from_other_tenant_returns_404_not_403 (F3)
-#[sqlx::test]
+#[mokosh_test]
 async fn get_team_from_other_tenant_returns_404_not_403(pool: PgPool) {
     let (tenant_b, _uid, _e, _p) = common::seed_tenant_with_admin(&pool, "other-tenant").await;
     let s = svc(pool);
@@ -500,7 +501,7 @@ async fn get_team_from_other_tenant_returns_404_not_403(pool: PgPool) {
 /// update_team as a technician — it succeeds at the service layer (because
 /// the service trusts the caller), proving the LACK of a leader-elevates
 /// branch. The route layer is what rejects the technician.
-#[sqlx::test]
+#[mokosh_test]
 async fn team_leader_cannot_edit_team_details(pool: PgPool) {
     let s = svc(pool.clone());
     let (tech_id, _e, _p) = common::seed_user(
@@ -537,7 +538,7 @@ async fn team_leader_cannot_edit_team_details(pool: PgPool) {
 }
 
 /// 24. team_color_rejects_javascript_uri (F5) — service-level validator
-#[sqlx::test]
+#[mokosh_test]
 async fn team_color_rejects_javascript_uri(pool: PgPool) {
     let s = svc(pool);
     let mut req = create_req("Victor");
@@ -547,7 +548,7 @@ async fn team_color_rejects_javascript_uri(pool: PgPool) {
 }
 
 /// 25. team_color_rejects_missing_hash (F5)
-#[sqlx::test]
+#[mokosh_test]
 async fn team_color_rejects_missing_hash(pool: PgPool) {
     let s = svc(pool);
     let mut req = create_req("Whiskey");
@@ -556,7 +557,7 @@ async fn team_color_rejects_missing_hash(pool: PgPool) {
 }
 
 /// 26. team_color_rejects_short_hex (F5)
-#[sqlx::test]
+#[mokosh_test]
 async fn team_color_rejects_short_hex(pool: PgPool) {
     let s = svc(pool);
     let mut req = create_req("Xray");
@@ -565,7 +566,7 @@ async fn team_color_rejects_short_hex(pool: PgPool) {
 }
 
 /// 27. concurrent_add_same_member_is_safe (F8)
-#[sqlx::test]
+#[mokosh_test]
 async fn concurrent_add_same_member_is_safe(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let s = svc(pool);
@@ -599,7 +600,7 @@ async fn concurrent_add_same_member_is_safe(pool: PgPool) {
 }
 
 /// 28. every_team_write_appends_audit_log (F10)
-#[sqlx::test]
+#[mokosh_test]
 async fn every_team_write_appends_audit_log(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let s = svc(pool.clone());
@@ -674,7 +675,7 @@ async fn every_team_write_appends_audit_log(pool: PgPool) {
 }
 
 /// 29. list_members_hides_soft_deleted_users (F13)
-#[sqlx::test]
+#[mokosh_test]
 async fn list_members_hides_soft_deleted_users(pool: PgPool) {
     let (admin_id, _e, _p, team_id) = common::seed_admin_and_team(&pool, "Alpha13").await;
     // Tombstone the admin.
@@ -692,7 +693,7 @@ async fn list_members_hides_soft_deleted_users(pool: PgPool) {
 }
 
 /// 30. platform_admin_in_default_tenant_does_not_see_other_tenants_teams (F15)
-#[sqlx::test]
+#[mokosh_test]
 async fn platform_admin_in_default_tenant_does_not_see_other_tenants_teams(pool: PgPool) {
     let s = svc(pool.clone());
     let (tenant_b, _uid, _e, _p) = common::seed_tenant_with_admin(&pool, "distant-tenant").await;
@@ -717,7 +718,7 @@ async fn platform_admin_in_default_tenant_does_not_see_other_tenants_teams(pool:
 // ============================================================================
 
 /// 31. list_teams_manager_id_filter
-#[sqlx::test]
+#[mokosh_test]
 async fn list_teams_manager_id_filter(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let s = svc(pool);
@@ -749,7 +750,7 @@ async fn list_teams_manager_id_filter(pool: PgPool) {
 // ============================================================================
 
 /// 32. personal_tenant_can_technically_create_team_but_ui_hides_it
-#[sqlx::test]
+#[mokosh_test]
 async fn personal_tenant_can_technically_create_team_but_ui_hides_it(pool: PgPool) {
     // Make a personal tenant + create a team in it via the service.
     // The UI hides this, but no server-side block per Q4 default = A.
@@ -786,7 +787,7 @@ async fn personal_tenant_can_technically_create_team_but_ui_hides_it(pool: PgPoo
 /// created with a manager can have its manager set to a DIFFERENT user
 /// (proving the field IS writeable via the update path), and separately
 /// pins that omitting the field leaves the value intact.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_team_clearing_manager_id_with_null(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (other_id, _e2, _p2) = common::seed_user(
@@ -837,7 +838,7 @@ async fn update_team_clearing_manager_id_with_null(pool: PgPool) {
 }
 
 /// 34. add_member_to_archived_team_succeeds
-#[sqlx::test]
+#[mokosh_test]
 async fn add_member_to_archived_team_succeeds(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let s = svc(pool);
@@ -869,7 +870,7 @@ async fn add_member_to_archived_team_succeeds(pool: PgPool) {
 /// Confirms the pre-PMS-791 world (tickets with NULL team_id) is
 /// preserved end-to-end. Inserts a ticket with team_id NULL and reads
 /// the row. Regression pin for phase 3.
-#[sqlx::test]
+#[mokosh_test]
 async fn existing_tickets_with_null_team_id_read_back_ok(pool: PgPool) {
     // Seed a company + insert a ticket with team_id NULL. Minimal shape;
     // just proving the row can round-trip.
@@ -886,7 +887,7 @@ async fn existing_tickets_with_null_team_id_read_back_ok(pool: PgPool) {
 }
 
 /// 36. team_delete_of_team_with_tickets_soft_deletes_not_hard
-#[sqlx::test]
+#[mokosh_test]
 async fn team_delete_of_team_with_tickets_soft_deletes_not_hard(pool: PgPool) {
     let s = svc(pool.clone());
     let team = s

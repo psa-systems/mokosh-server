@@ -34,6 +34,7 @@
 mod common;
 
 use common::{boot, login, seed_admin, seed_company, TestApp};
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -104,7 +105,7 @@ async fn create_id(app: &TestApp, token: &str, path: &str, body: serde_json::Val
         .to_string()
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contract_name_is_bounded_on_create_and_on_update(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let company_id = seed_company(&pool).await;
@@ -162,7 +163,7 @@ async fn a_contract_name_is_bounded_on_create_and_on_update(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_kb_article_is_bounded_on_create_and_on_update(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -225,7 +226,7 @@ async fn a_kb_article_is_bounded_on_create_and_on_update(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_asset_name_is_bounded_on_create_and_on_update(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let company_id = seed_company(&pool).await;
@@ -283,7 +284,7 @@ async fn an_asset_name_is_bounded_on_create_and_on_update(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_appointment_title_is_bounded_on_create_and_on_update(pool: PgPool) {
     let (admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -333,7 +334,7 @@ async fn an_appointment_title_is_bounded_on_create_and_on_update(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_template_default_title_is_bounded_on_create_and_on_update(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let app = boot(pool).await;
@@ -375,7 +376,7 @@ async fn a_template_default_title_is_bounded_on_create_and_on_update(pool: PgPoo
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_invoice_needs_a_line_on_create_and_on_update(pool: PgPool) {
     let (_admin_id, email, password) = seed_admin(&pool).await;
     let company_id: Uuid = seed_company(&pool).await;
