@@ -863,6 +863,7 @@ async fn contact_phone_fields_omit_leaves_unchanged_and_null_clears(pool: PgPool
             "company_id": company_id,
             "first_name": "Bob",
             "last_name": "Johnson",
+            "email": "bob.johnson@example.com",
             "phone": "+1 555 0100",
             "mobile": "+1 555 0200",
             "fax": "+1 555 0500",
