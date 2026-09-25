@@ -684,6 +684,7 @@ mod pms1194_sort_guard {
         "mileage_tracking::list_mileage_entries",
         "projects::list_projects",
         "quotes::list_quotes",
+        "tenants::list_tenants",
         "tickets::list_tickets",
         "time_tracking::list_time_entries",
     ];
