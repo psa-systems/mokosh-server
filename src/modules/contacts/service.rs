@@ -4980,7 +4980,13 @@ mod tests {
     // actually enforced on every run.
 
     fn contact_req(body: serde_json::Value) -> CreateContactRequest {
-        let mut full = serde_json::json!({ "first_name": "Ada", "last_name": "Lovelace" });
+        // PMS-1329: email is required on create, so the helper mints a
+        // unique fixture when the caller does not supply one.
+        let mut full = serde_json::json!({
+            "first_name": "Ada",
+            "last_name": "Lovelace",
+            "email": format!("{}@example.com", uuid::Uuid::new_v4()),
+        });
         if let serde_json::Value::Object(extra) = body {
             for (k, v) in extra {
                 full[k] = v;

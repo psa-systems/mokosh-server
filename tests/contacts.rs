@@ -2315,6 +2315,25 @@ async fn website_probe_rejects_impossible_input(pool: PgPool) {
 // PMS-806: typed phone list + links to multiple companies
 // ============================================================================
 
+/// Fill in an `email` on a create body that omits one so the caller does not
+/// have to name a placeholder in every fixture. PMS-1329 makes the API path
+/// reject a create with no email, and every test in this file below that
+/// exercises a different shape (phones, links, primary flags); none of them
+/// are about the email rule specifically, so an injected default keeps them
+/// scoped to what they pin. A body that names `email` explicitly (including
+/// `null`, which the required-email cases below use) is left alone.
+fn ensure_email(mut body: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut body {
+        if !map.contains_key("email") {
+            map.insert(
+                "email".to_string(),
+                serde_json::Value::String("fixture@example.test".to_string()),
+            );
+        }
+    }
+    body
+}
+
 /// Helper: create a contact through the API and return the response body.
 async fn create_contact(
     app: &common::TestApp,
@@ -2328,7 +2347,7 @@ async fn create_contact(
         .client
         .post(app.url("/api/v1/contacts/contacts"))
         .bearer_auth(token)
-        .json(&body)
+        .json(&ensure_email(body))
         .send()
         .await
         .expect("send create contact");
@@ -2349,7 +2368,7 @@ async fn post_contact_status(
     app.client
         .post(app.url("/api/v1/contacts/contacts"))
         .bearer_auth(token)
-        .json(&body)
+        .json(&ensure_email(body))
         .send()
         .await
         .expect("send create contact")

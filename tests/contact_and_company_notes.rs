@@ -33,6 +33,8 @@ async fn create_company(app: &common::TestApp, token: &str, body: serde_json::Va
 
 /// Create a contact through the API and return its id.
 async fn create_contact(app: &common::TestApp, token: &str, mut body: serde_json::Value) -> String {
+    // PMS-1329 makes email required on create; these tests exercise notes,
+    // so mint a unique fixture email when the caller does not name one.
     if body.get("email").is_none() {
         body["email"] = serde_json::json!(format!("{}@example.com", uuid::Uuid::new_v4()));
     }
