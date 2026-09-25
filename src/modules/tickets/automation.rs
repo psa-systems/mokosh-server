@@ -106,12 +106,19 @@ impl AutomationEngine {
 
     /// Process automation rules for a trigger type.
     ///
-    /// PMS-1246: one transaction for the whole run (rule fetch, the ticket
-    /// read every rule's conditions share, and every DB-writing action),
-    /// rather than one per rule (`evaluate_conditions`) plus one per action
-    /// (`execute_actions`) as before. A ticket update that fires 5 rules with
-    /// 3 actions each used to cost 1 + 5 + 15 = 21 transactions; it now costs
-    /// one.
+    /// PMS-1246: one transaction for the whole DB-only phase (rule fetch, the
+    /// ticket read every rule's conditions share, and every DB-writing
+    /// action), rather than one per rule (`evaluate_conditions`) plus one per
+    /// action (`execute_actions`) as before. A ticket update that fires 5
+    /// rules with 3 actions each used to cost 1 + 5 + 15 = 21 transactions;
+    /// it now costs a small constant number.
+    ///
+    /// PMS-1379: that transaction must never span an outbound network call.
+    /// `execute_db_actions` runs every DB-writing action on it and collects
+    /// the `webhook` / `send_notification` actions as [`DeferredAction`]s
+    /// instead of dispatching them inline; this method commits the
+    /// transaction first, THEN runs the deferred actions with no transaction
+    /// open at all.
     pub async fn process_rules(
         &self,
         tenant_id: TenantId,
@@ -131,14 +138,22 @@ impl AutomationEngine {
         // ticket data, so there is nothing rule-specific to re-fetch.
         let ticket = self.load_ticket_data(&mut tx, tenant_id, ticket_id).await?;
 
+        let mut deferred = Vec::new();
         for rule in &rules {
             if self.evaluate_conditions(ticket.as_ref(), rule) {
-                self.execute_actions(&mut tx, tenant_id, ticket_id, rule)
+                let actions = self
+                    .execute_db_actions(&mut tx, tenant_id, ticket_id, rule)
                     .await?;
+                deferred.extend(actions);
             }
         }
 
         tx.commit().await?;
+
+        for action in deferred {
+            self.run_deferred_action(tenant_id, ticket_id, action).await;
+        }
+
         Ok(())
     }
 
@@ -243,20 +258,24 @@ impl AutomationEngine {
         }
     }
 
-    /// Execute automation rule actions.
+    /// Execute a rule's DB-writing actions on the run's open transaction, and
+    /// collect its network-calling actions (`webhook`, `send_notification`)
+    /// as [`DeferredAction`]s instead of dispatching them here.
     ///
     /// `tx` is the single connection [`Self::process_rules`] opened for the
     /// whole run: every DB-writing action here runs on it rather than
-    /// opening its own transaction (PMS-1246).
-    async fn execute_actions(
+    /// opening its own transaction (PMS-1246). PMS-1379: nothing in this
+    /// method awaits a network call, so `tx` is never held open across one.
+    async fn execute_db_actions(
         &self,
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         ticket_id: Uuid,
         rule: &AutomationRule,
-    ) -> AppResult<()> {
+    ) -> AppResult<Vec<DeferredAction>> {
         let actions: Vec<AutomationAction> =
             serde_json::from_value(rule.actions.clone()).unwrap_or_default();
+        let mut deferred = Vec::new();
 
         for action in actions {
             match action.action_type.as_str() {
@@ -362,7 +381,11 @@ impl AutomationEngine {
                     // in `notifications`. Fall back to a direct mailer
                     // send for legacy fixtures that build the engine
                     // without a dispatcher. `params.to` is still
-                    // required either way.
+                    // required either way. The actual dispatch is a
+                    // network call (SMTP or the notifications queue), so
+                    // it is deferred (PMS-1379) rather than awaited here
+                    // on the open transaction; missing-param cases need
+                    // no network call and are logged immediately.
                     let to = action.params.get("to").and_then(|v| v.as_str());
                     // PMS-789: the fallback subject names the deployment, so
                     // it is the configured name rather than a literal.
@@ -372,43 +395,23 @@ impl AutomationEngine {
                         .params
                         .get("subject")
                         .and_then(|v| v.as_str())
-                        .unwrap_or(&default_subject);
+                        .unwrap_or(&default_subject)
+                        .to_string();
                     let body = action
                         .params
                         .get("body")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("A ticket you watch has been updated.");
+                        .unwrap_or("A ticket you watch has been updated.")
+                        .to_string();
                     match to {
-                        Some(addr) if !addr.is_empty() => match &self.notifications {
-                            Some(notify) => {
-                                let context = serde_json::json!({
-                                    "recipient_email": addr,
-                                    "subject": subject,
-                                    "body": body,
-                                    "ticket_id": ticket_id.to_string(),
-                                    // Per-entity deep-link metadata (migration 121).
-                                    "entity_type": "ticket",
-                                    "entity_id": ticket_id.to_string(),
-                                });
-                                if let Err(e) = notify
-                                    .dispatch(tenant_id, "ticket.automation.notify", &context)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        ?e, %ticket_id, rule = %rule.name,
-                                        "send_notification dispatch failed",
-                                    );
-                                }
-                            }
-                            None => {
-                                if let Err(e) = self.mailer.send_text(addr, subject, body).await {
-                                    tracing::warn!(
-                                        ?e, %ticket_id, rule = %rule.name,
-                                        "send_notification email failed (legacy mailer path)",
-                                    );
-                                }
-                            }
-                        },
+                        Some(addr) if !addr.is_empty() => {
+                            deferred.push(DeferredAction::Notification {
+                                rule_name: rule.name.clone(),
+                                to: addr.to_string(),
+                                subject,
+                                body,
+                            });
+                        }
                         _ => tracing::warn!(
                             %ticket_id, rule = %rule.name,
                             "send_notification action missing 'to' param",
@@ -420,7 +423,10 @@ impl AutomationEngine {
                     // (default POST), params.payload (default a small
                     // JSON envelope naming the ticket + rule). Failures
                     // log and continue; one bad webhook should not abort
-                    // the rule chain.
+                    // the rule chain. The send itself is a network call
+                    // and is deferred (PMS-1379); an unusable param is
+                    // caught here, before anything is queued, since it
+                    // needs no network call to detect.
                     let Some(url) = action.params.get("url").and_then(|v| v.as_str()) else {
                         tracing::warn!(
                             %ticket_id, rule_id = %rule.id, rule = %rule.name,
@@ -456,37 +462,13 @@ impl AutomationEngine {
                         })
                     });
 
-                    match send_guarded_webhook(
-                        &self.http,
-                        self.resolver.as_ref(),
-                        private_target_allowlist(),
-                        &target,
-                        &method,
-                        &payload,
-                    )
-                    .await
-                    {
-                        Ok(status) if status.is_success() => {
-                            tracing::info!(
-                                %ticket_id, rule_id = %rule.id, rule = %rule.name, status = %status,
-                                "automation webhook delivered",
-                            );
-                        }
-                        Ok(status) => tracing::warn!(
-                            %ticket_id, rule_id = %rule.id, rule = %rule.name, status = %status,
-                            "automation webhook returned non-2xx",
-                        ),
-                        // PMS-809: a refused target is a failed action naming
-                        // the rule and the address, not a silent no-op.
-                        Err(WebhookError::Refused(guard)) => tracing::warn!(
-                            %ticket_id, rule_id = %rule.id, rule = %rule.name, blocked = %guard,
-                            "automation webhook refused: target is not on the public internet",
-                        ),
-                        Err(e) => tracing::warn!(
-                            %ticket_id, rule_id = %rule.id, rule = %rule.name, error = %e,
-                            "automation webhook send failed",
-                        ),
-                    }
+                    deferred.push(DeferredAction::Webhook {
+                        rule_id: rule.id,
+                        rule_name: rule.name.clone(),
+                        target,
+                        method,
+                        payload,
+                    });
                 }
                 _ => {
                     tracing::warn!("Unknown automation action type: {}", action.action_type);
@@ -502,8 +484,117 @@ impl AutomationEngine {
         .execute(&mut *tx)
         .await?;
 
-        Ok(())
+        Ok(deferred)
     }
+
+    /// Run one network-calling action collected by [`Self::execute_db_actions`],
+    /// with no transaction open (PMS-1379). Failures log and never propagate:
+    /// one bad webhook or mail send must not abort the rest of the run, the
+    /// same contract `execute_db_actions` held when it dispatched these inline.
+    async fn run_deferred_action(
+        &self,
+        tenant_id: TenantId,
+        ticket_id: Uuid,
+        action: DeferredAction,
+    ) {
+        match action {
+            DeferredAction::Notification {
+                rule_name,
+                to,
+                subject,
+                body,
+            } => match &self.notifications {
+                Some(notify) => {
+                    let context = serde_json::json!({
+                        "recipient_email": to,
+                        "subject": subject,
+                        "body": body,
+                        "ticket_id": ticket_id.to_string(),
+                        // Per-entity deep-link metadata (migration 121).
+                        "entity_type": "ticket",
+                        "entity_id": ticket_id.to_string(),
+                    });
+                    if let Err(e) = notify
+                        .dispatch(tenant_id, "ticket.automation.notify", &context)
+                        .await
+                    {
+                        tracing::warn!(
+                            ?e, %ticket_id, rule = %rule_name,
+                            "send_notification dispatch failed",
+                        );
+                    }
+                }
+                None => {
+                    if let Err(e) = self.mailer.send_text(&to, &subject, &body).await {
+                        tracing::warn!(
+                            ?e, %ticket_id, rule = %rule_name,
+                            "send_notification email failed (legacy mailer path)",
+                        );
+                    }
+                }
+            },
+            DeferredAction::Webhook {
+                rule_id,
+                rule_name,
+                target,
+                method,
+                payload,
+            } => {
+                match send_guarded_webhook(
+                    &self.http,
+                    self.resolver.as_ref(),
+                    private_target_allowlist(),
+                    &target,
+                    &method,
+                    &payload,
+                )
+                .await
+                {
+                    Ok(status) if status.is_success() => {
+                        tracing::info!(
+                            %ticket_id, %rule_id, rule = %rule_name, status = %status,
+                            "automation webhook delivered",
+                        );
+                    }
+                    Ok(status) => tracing::warn!(
+                        %ticket_id, %rule_id, rule = %rule_name, status = %status,
+                        "automation webhook returned non-2xx",
+                    ),
+                    // PMS-809: a refused target is a failed action naming
+                    // the rule and the address, not a silent no-op.
+                    Err(WebhookError::Refused(guard)) => tracing::warn!(
+                        %ticket_id, %rule_id, rule = %rule_name, blocked = %guard,
+                        "automation webhook refused: target is not on the public internet",
+                    ),
+                    Err(e) => tracing::warn!(
+                        %ticket_id, %rule_id, rule = %rule_name, error = %e,
+                        "automation webhook send failed",
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// A `webhook` or `send_notification` action collected while
+/// [`AutomationEngine::execute_db_actions`] holds the run's transaction, to
+/// be dispatched by [`AutomationEngine::run_deferred_action`] after that
+/// transaction commits (PMS-1379): the automation transaction must never
+/// span an outbound network call.
+enum DeferredAction {
+    Notification {
+        rule_name: String,
+        to: String,
+        subject: String,
+        body: String,
+    },
+    Webhook {
+        rule_id: Uuid,
+        rule_name: String,
+        target: Url,
+        method: String,
+        payload: serde_json::Value,
+    },
 }
 
 /// Send one webhook, screening the target before the first connect and again
