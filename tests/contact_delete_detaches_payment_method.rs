@@ -258,7 +258,7 @@ async fn a_provider_detach_failure_leaves_the_contact_in_place(pool: PgPool) {
 /// take at least `4 * SLOW_DETACH_DELAY`, comfortably past the threshold
 /// below, while a concurrent `try_join_all` finishes in roughly one delay
 /// plus scheduling noise.
-#[sqlx::test]
+#[mokosh_test]
 async fn detaching_a_contacts_saved_cards_runs_the_gateway_calls_concurrently(pool: PgPool) {
     stripe_stub_base();
     seed_stripe_gateway(&pool).await;

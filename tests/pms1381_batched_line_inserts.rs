@@ -9,7 +9,7 @@
 //! `tests/pms1381_reminder_portal_batch.rs` (a `tracing` subscriber capturing
 //! `target: "sqlx::query"` events, the in-process equivalent of
 //! `log_statement=all`) to count what actually ran, since Postgres has no
-//! reliable, immediately-visible statement counter for a `#[sqlx::test]`
+//! reliable, immediately-visible statement counter for a `#[mokosh_test]`
 //! throwaway database.
 //!
 //! Also proves the recurring generator's per-"once"-item idempotency claim
@@ -28,6 +28,7 @@ use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::billing::BillingService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -249,7 +250,7 @@ async fn seed_item(
     .expect("seed contract item");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn line_inserts_are_batched_at_all_four_sites(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(

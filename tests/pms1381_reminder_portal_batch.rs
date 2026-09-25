@@ -24,6 +24,7 @@ use mokosh_server::secrets::DatabaseSecretProvider;
 use mokosh_server::utils::email::{EmailAttachment, Mailer};
 use mokosh_server::utils::error::AppResult;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -253,7 +254,7 @@ async fn put_setting(app: &common::TestApp, token: &str, key: &str, value: Value
     assert_eq!(resp.status(), StatusCode::OK, "setting {key}");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_reminder_sweep_looks_up_portal_ids_in_one_batched_query(pool: PgPool) {
     let recorder = Arc::new(Recorder::default());
     tracing::subscriber::set_global_default(
