@@ -128,29 +128,10 @@ pub const COMPANY_BLOCKERS: &[CompanyBlocker] = &[
     },
 ];
 
-/// PMS-926: what deleting this company would do, and what stops it.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CompanyDeletionPreview {
-    pub can_delete: bool,
-    /// The PMS-919 refusal that is about what the company IS rather than what
-    /// references it. Reported separately so a client can say so instead of
-    /// showing an empty blocker list beside a delete that still fails.
-    pub is_own_company: bool,
-    pub blocking: Vec<BlockingRecords>,
-    /// Detached rather than destroyed (migration 113, PMS-812).
-    pub unlinked: Vec<BlockingRecords>,
-    /// Destroyed along with the company.
-    pub removed: Vec<BlockingRecords>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct BlockingRecords {
-    pub label: String,
-    pub count: i64,
-    /// Only meaningful in `blocking`: these records exist to be KEPT, so a
-    /// client must not phrase them as something to clear first.
-    pub retained: bool,
-}
+/// The wire shape lives in `mokosh_types` so mokosh-apps reads the same
+/// definition instead of mirroring it, and `BlockingRecords` there is
+/// `DeletionRecords` (the client-side name that survived the merge).
+pub use mokosh_types::contacts::{CompanyDeletionPreview, DeletionRecords as BlockingRecords};
 
 /// What a delete would unlink rather than destroy. Mirrors migration 113 plus
 /// PMS-812's `contacts` rule.
