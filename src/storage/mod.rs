@@ -48,6 +48,10 @@
 //! operator-facing variable is still `STORAGE_BACKEND` and deliberately so:
 //! renaming it breaks every existing deployment for a vocabulary change.
 
+// PMS-1317: the `STORAGE_`-prefixed variables an operator sets, and the older
+// names still honoured as deprecated aliases while every deployment's compose
+// file catches up.
+pub mod env;
 mod ledger;
 pub mod s3;
 
@@ -380,12 +384,29 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
-    /// The ONE reader of `ATTACHMENT_DIR`. Three modules used to have their own,
-    /// with two different fallbacks between them.
+    /// The ONE reader of the storage root. Three modules used to have their
+    /// own, with two different fallbacks between them.
+    ///
+    /// PMS-1317 renamed the variable to `STORAGE_ROOT`; `ATTACHMENT_DIR` is
+    /// still honoured as a deprecated alias and says so once, because the
+    /// compose file that sets it lives in another repository and a hard rename
+    /// would serve 404s for every file already on the volume until that
+    /// repository caught up. [`env::resolve`] is the rule.
     pub fn from_env() -> Self {
-        let root = std::env::var("ATTACHMENT_DIR")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
+        let root = env::from_env(env::ROOT).unwrap_or_else(|| DEFAULT_ROOT.to_string());
+        Self {
+            root: PathBuf::from(root),
+        }
+    }
+
+    /// The rule itself, over a lookup rather than the process environment, so
+    /// the alias fallback is testable under a concurrent runner without
+    /// `set_var` - the shape `S3Config::parse` already has, and for the same
+    /// reason: a test that mutates the environment to check which name wins is
+    /// a test that changes the answer for every other test running beside it.
+    pub fn resolve(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let root = env::resolve(env::ROOT, lookup)
+            .0
             .unwrap_or_else(|| DEFAULT_ROOT.to_string());
         Self {
             root: PathBuf::from(root),
@@ -611,18 +632,21 @@ impl StorageProviderKind {
         }
     }
 
-    /// The ONE reader of `STORAGE_BACKEND`, the way [`StorageConfig::from_env`]
-    /// is the only reader of `ATTACHMENT_DIR`.
+    /// The ONE reader of `STORAGE_PROVIDER`, the way [`StorageConfig::from_env`]
+    /// is the only reader of the root.
     ///
-    /// Returns the source alongside the backend (PMS-1011), because "nobody
+    /// Returns the source alongside the provider (PMS-1011), because "nobody
     /// configured this and the hosting profile chose local" and "the operator
     /// asked for local" are different facts and the boot record reports both.
     /// The hosting profile's own strictness is the startup wiring's business:
     /// it hands in an already-resolved provider name.
+    ///
+    /// PMS-1317 renamed the variable from `STORAGE_BACKEND`, which is still
+    /// honoured as a deprecated alias; see [`env`].
     pub fn from_env(profile_default: &str) -> AppResult<(Self, EnablementSource)> {
         Self::resolve(
             profile_default,
-            &std::env::var("STORAGE_BACKEND").unwrap_or_default(),
+            &env::from_env(env::PROVIDER).unwrap_or_default(),
         )
     }
 
@@ -646,7 +670,7 @@ impl StorageProviderKind {
 
     /// A provider NAME to a backend. An unrecognised value is a hard error
     /// rather than a fall back to local, the same rule `SECRET_BACKEND`
-    /// follows: an operator who wrote `STORAGE_BACKEND=s3 ` with a typo asked
+    /// follows: an operator who wrote `STORAGE_PROVIDER=s3 ` with a typo asked
     /// for S3, and quietly writing their uploads to a container filesystem
     /// instead is the silent degrade this crate refuses everywhere else. Blank
     /// is not a name; [`resolve`](Self::resolve) settles it against the
@@ -657,7 +681,7 @@ impl StorageProviderKind {
             provider::LOCAL => Ok(StorageProviderKind::Local),
             provider::S3 => Ok(StorageProviderKind::S3),
             other => Err(AppError::Configuration(format!(
-                "STORAGE_BACKEND {other} is not a known provider; expected 'local' or 's3'"
+                "STORAGE_PROVIDER {other} is not a known provider; expected 'local' or 's3'"
             ))),
         }
     }
@@ -976,16 +1000,25 @@ mod tests {
     /// `./attachments` and `/data/attachments` in the same process.
     #[test]
     fn there_is_one_default_root() {
-        const SRC: &str = include_str!("mod.rs");
-        let readers = SRC.matches("ATTACHMENT_DIR").count();
-        assert!(
-            readers >= 1,
-            "this module is the one that reads the variable"
+        // Asserted as BEHAVIOUR rather than by counting strings in this file.
+        // The rule this replaced counted the reads of `ATTACHMENT_DIR` here,
+        // and PMS-1317 moved those to `storage::env`, which resolves each
+        // setting's current name and its deprecated alias together; the
+        // one-reader property went with them. What is still worth proving is
+        // what the test was named for: a deployment that sets nothing gets ONE
+        // default, not the two (`./attachments` and `/data/attachments`) that
+        // three modules disagreed about before PMS-910.
+        let unset = |_: &str| None;
+        assert_eq!(
+            StorageConfig::resolve(unset).root,
+            PathBuf::from(DEFAULT_ROOT),
+            "an unconfigured deployment falls back to the one default"
         );
         assert_eq!(
-            SRC.matches("var(\"ATTACHMENT_DIR\")").count(),
-            1,
-            "and it reads it exactly once"
+            StorageConfig::resolve(|_| Some(String::new())).root,
+            PathBuf::from(DEFAULT_ROOT),
+            "and so does one whose compose forwards the variable unset, which \
+             arrives as an empty string (PMS-836)"
         );
     }
 
@@ -1205,12 +1238,96 @@ mod tests {
         assert!(StorageProviderKind::parse("").is_err());
     }
 
-    /// `STORAGE_BACKEND` has exactly one reader, like `ATTACHMENT_DIR`: a
-    /// second is how two parts of one process come to disagree about where
-    /// bytes are.
+    /// PMS-1317: the root comes from `STORAGE_ROOT`, or from `ATTACHMENT_DIR`
+    /// while that alias lives, or from the compiled-in default.
+    ///
+    /// The middle case is the one that matters on the day this ships: a
+    /// deployment whose compose file still says `ATTACHMENT_DIR` keeps its
+    /// root, rather than silently falling back to `./attachments` and serving
+    /// 404s for every file already on its volume.
     #[test]
-    fn there_is_one_reader_of_the_provider_variable() {
-        const SRC: &str = include_str!("mod.rs");
-        assert_eq!(SRC.matches("var(\"STORAGE_BACKEND\")").count(), 1);
+    fn the_root_falls_back_to_the_deprecated_name_before_the_default() {
+        let lookup = |pairs: Vec<(&'static str, &'static str)>| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_string())
+            }
+        };
+
+        assert_eq!(
+            StorageConfig::resolve(lookup(vec![("STORAGE_ROOT", "/new")])).root,
+            PathBuf::from("/new")
+        );
+        assert_eq!(
+            StorageConfig::resolve(lookup(vec![("ATTACHMENT_DIR", "/old")])).root,
+            PathBuf::from("/old"),
+            "a deployment that has not moved its compose file keeps its root"
+        );
+        assert_eq!(
+            StorageConfig::resolve(lookup(vec![
+                ("STORAGE_ROOT", "/new"),
+                ("ATTACHMENT_DIR", "/old"),
+            ]))
+            .root,
+            PathBuf::from("/new"),
+            "the current name wins, or the new one looks broken mid-migration"
+        );
+        assert_eq!(
+            StorageConfig::resolve(lookup(vec![])).root,
+            PathBuf::from(DEFAULT_ROOT)
+        );
+    }
+
+    /// The provider selection takes the alias too, and an unset pair still
+    /// resolves to the hosting profile's default rather than erroring.
+    #[test]
+    fn the_provider_selection_takes_the_deprecated_name_too() {
+        let (kind, source) = StorageProviderKind::resolve(provider::LOCAL, "s3")
+            .expect("an explicit provider parses");
+        assert_eq!(kind, StorageProviderKind::S3);
+        assert_eq!(source, EnablementSource::Explicit);
+
+        let (value, by) = env::resolve(env::PROVIDER, |name| {
+            (name == "STORAGE_BACKEND").then(|| "s3".to_string())
+        });
+        assert_eq!(value.as_deref(), Some("s3"));
+        assert_eq!(by, env::SuppliedBy::Deprecated);
+        let (kind, source) = StorageProviderKind::resolve(provider::LOCAL, &value.unwrap())
+            .expect("the alias names a provider");
+        assert_eq!(kind, StorageProviderKind::S3);
+        assert_eq!(source, EnablementSource::Explicit);
+    }
+
+    /// No storage variable is read by NAME outside `storage::env` (PMS-1317).
+    ///
+    /// The rule this replaced counted `env::var("STORAGE_BACKEND")` in this
+    /// file, which stopped meaning anything once each setting became a pair of
+    /// names: a second reader would now be a second answer about which of the
+    /// two won, not merely about the value. `storage::env` owns that rule, so
+    /// what is asserted here is that this file names none of them.
+    #[test]
+    fn no_storage_variable_is_read_by_name_outside_the_env_module() {
+        // Comment lines are excluded: the doc comment above names the very
+        // pattern this looks for, which is the same reason
+        // `check-single-build.nu` strips them before it classifies a workflow.
+        let src: String = include_str!("mod.rs")
+            .lines()
+            .filter(|line| {
+                let code = line.trim_start();
+                !code.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for var in env::ALL {
+            for name in std::iter::once(var.name).chain(var.deprecated) {
+                assert!(
+                    !src.contains(&format!("var(\"{name}\")")),
+                    "{name} is read by name here; storage::env is the one place that \
+                     resolves a storage setting and its alias"
+                );
+            }
+        }
     }
 }
