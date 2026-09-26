@@ -1230,50 +1230,61 @@ impl AuthService {
     }
 
     async fn ensure_tenant_active(&self, tenant_id: Uuid) -> AppResult<()> {
-        // SAFETY (PMS-285 / PMS-692): the `tenants` table is the isolation root
-        // and is deliberately excluded from RLS (migration 038:
-        // `table_name != 'tenants'`), so this single-row status read is safe on
-        // the NOBYPASSRLS app pool with no GUC. `mokosh_app` holds SELECT on it.
-        let status: Option<String> = sqlx::query_scalar("SELECT status FROM tenants WHERE id = $1")
-            .bind(tenant_id)
-            .fetch_optional(self.db.pool())
-            .await?;
-        match status.as_deref() {
-            Some("active") => {}
-            _ => {
-                return Err(AppError::Forbidden(
-                    "This organization is not active".to_string(),
-                ));
-            }
-        }
-
-        // MAPPS-459 (PMS-728 slice 3): consult the per-tenant Bunyip
-        // entitlement. `unknown` (the seed state, or a tenant with no
-        // integration wired yet) passes through so a fresh instance is
-        // never locked out. `suspended` OR an expired entitlement
-        // rejects with the same "not active" copy so the endpoint does
-        // not distinguish billing vs. operator lifecycle to a caller.
-        // `tenant_membership_entitlements` (migration 154) is intentionally
-        // RLS-exempt: see the migration header for the "pre-auth / cross-
-        // tenant entitlement lookup path" reason, and 038's ENABLE-RLS loop
-        // runs at migration time only, so nothing enables RLS on 154's
-        // table after the fact. PMS-1040 put that exemption where it is
-        // enforced rather than only asserted: the table is named in
-        // `ALLOWED_WITHOUT_RLS` (`tests/rls_coverage.rs`), so a migration
-        // that gives it a policy fails the guard instead of silently
-        // fail-closing this read to `None` and passing every tenant.
-        let entitlement: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
-            "SELECT status, expires_at FROM tenant_membership_entitlements WHERE tenant_id = $1",
+        // The tenant-status gate and the per-tenant Bunyip entitlement gate
+        // are read in ONE statement: the auth path already spends the whole
+        // per-request query budget on this stretch, and two round trips for
+        // a check on the same row's id was the third statement per
+        // authenticated call for every caller in every tenant.
+        //
+        // SAFETY (PMS-285 / PMS-692): both `tenants` and
+        // `tenant_membership_entitlements` are RLS-exempt. The `tenants`
+        // table is the isolation root and is excluded by migration 038
+        // (`table_name != 'tenants'`); migration 154's header states the
+        // "pre-auth / cross-tenant entitlement lookup path" reason for the
+        // second table's exemption, and 038's ENABLE-RLS loop runs at
+        // migration time only. Both tables are named in `ALLOWED_WITHOUT_RLS`
+        // (`tests/rls_coverage.rs`), so a migration that gives either a
+        // policy fails the guard instead of silently fail-closing this read.
+        //
+        // The `LEFT JOIN` preserves the "no entitlement row passes through"
+        // contract: an unknown entitlement, and a fresh instance with no
+        // integration wired, both leave the entitlement columns NULL and
+        // reach the `None` arm of the match.
+        let row: Option<(
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )> = sqlx::query_as(
+            "SELECT t.status, e.status, e.expires_at \
+                 FROM tenants t \
+                 LEFT JOIN tenant_membership_entitlements e ON e.tenant_id = t.id \
+                 WHERE t.id = $1",
         )
         .bind(tenant_id)
-        // SAFETY (PMS-285 / PMS-692): RLS-exempt table, see the note
-        // right above; NOBYPASSRLS app pool without a GUC is fine here.
+        // SAFETY (PMS-285 / PMS-692): `tenants` and `tenant_membership_entitlements`
+        // are both RLS-exempt (see the block above and `ALLOWED_WITHOUT_RLS`); this
+        // .pool() serving read is deliberate. Inlined here so `check-pool-safety.nu`
+        // sees the note inside its 8-line lookback.
         .fetch_optional(self.db.pool())
         .await?;
-        if let Some((entitlement_status, expires_at)) = entitlement {
-            let now = chrono::Utc::now();
-            let expired = expires_at.is_some_and(|t| t < now);
-            if entitlement_status == "suspended" || expired {
+
+        let Some((tenant_status, entitlement_status, expires_at)) = row else {
+            return Err(AppError::Forbidden(
+                "This organization is not active".to_string(),
+            ));
+        };
+        if tenant_status != "active" {
+            return Err(AppError::Forbidden(
+                "This organization is not active".to_string(),
+            ));
+        }
+        // `unknown` and an absent row both pass; `suspended` and an expired
+        // entitlement reject with the same "not active" copy so the endpoint
+        // does not distinguish billing lifecycle from operator lifecycle to
+        // a caller.
+        if let Some(status) = entitlement_status {
+            let expired = expires_at.is_some_and(|t| t < chrono::Utc::now());
+            if status == "suspended" || expired {
                 return Err(AppError::Forbidden(
                     "This organization is not active".to_string(),
                 ));

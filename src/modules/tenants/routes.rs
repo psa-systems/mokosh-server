@@ -239,11 +239,13 @@ async fn list_tenants(
     _platform: RequirePlatformAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TenantResponse>>> {
-    pagination.reject_unsupported_sort()?;
     let (tenants, total) = state.tenant_service.list_tenants(&pagination).await?;
 
     let response = PaginatedResponse::from_params(
-        tenants.into_iter().map(TenantResponse::from).collect(),
+        tenants
+            .into_iter()
+            .map(|(tenant, user_count)| TenantResponse::from_tenant(tenant, user_count))
+            .collect(),
         &pagination,
         total,
     );

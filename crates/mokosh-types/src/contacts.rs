@@ -138,13 +138,37 @@ fn validate_child_lists(
     validate_companies_distinct(companies)
 }
 
-/// Struct-level guard for `CreateContactRequest` (PMS-402): a contact may link
-/// a CRM `company_id` OR carry a freeform `company_name`, never both. PMS-806
-/// extends the same rule to the `companies` list and adds the primary-flag and
-/// duplicate-link checks.
-fn validate_create_company_link(req: &CreateContactRequest) -> Result<(), ValidationError> {
+/// Struct-level guard for `CreateContactRequest`. Covers three shape rules:
+///
+/// - PMS-402: a contact may link a CRM `company_id` OR carry a freeform
+///   `company_name`, never both.
+/// - PMS-806: the same rule extended to the `companies` list, plus the
+///   primary-flag and duplicate-link checks.
+/// - PMS-1329: a contact must be created with an email address. Without one
+///   there is nothing to invite, invoice or notify, and the earlier
+///   `Option<String>` shape let the SPA silently create an unreachable row.
+///   Kept on the create path only: an `UpdateContactRequest` with no email
+///   is "leave the field alone", and rewriting existing rows created before
+///   this rule is out of scope (see the ticket description).
+fn validate_create_contact_request(req: &CreateContactRequest) -> Result<(), ValidationError> {
     validate_company_link_exclusive(req.company_id, &req.company_name)?;
-    validate_child_lists(&req.phones, &req.companies, &req.company_name)
+    validate_child_lists(&req.phones, &req.companies, &req.company_name)?;
+    require_email_on_create(req.email.as_deref())
+}
+
+/// Reject a create whose email is absent or blank. Rejected as a field-level
+/// error keyed on `email` so the SPA surfaces it inline on the same input
+/// the `#[validate(email)]` format check would.
+fn require_email_on_create(email: Option<&str>) -> Result<(), ValidationError> {
+    match email.map(str::trim) {
+        Some(v) if !v.is_empty() => Ok(()),
+        _ => {
+            let mut error = ValidationError::new("required");
+            error.message = Some("Email is required".into());
+            error.add_param("field".into(), &"email");
+            Err(error)
+        }
+    }
 }
 
 /// Struct-level guard for `UpdateContactRequest` (PMS-402): same mutual
@@ -256,6 +280,26 @@ where
     Ok(raw.and_then(|s| normalize_website(&s)))
 }
 
+/// PMS-1392: the `Option<Option<T>>` ("double option") twin of
+/// [`de_website_opt`], for a PATCH-style field where absent must mean "leave
+/// unchanged" and an explicit `null` must mean "clear to SQL NULL" - two
+/// states `de_website_opt` alone cannot distinguish, since it collapses both
+/// to `None` before the update gate ever sees them. Pair with
+/// `#[serde(default, deserialize_with = "de_website_opt_double")]` on an
+/// `Option<Option<String>>` field, the same shape as
+/// `mokosh_types::deserialize_double_option`: absent -> `None` (via
+/// `#[serde(default)]`, this function is not even called), `null` ->
+/// `Some(None)`, a value -> `Some(Some(normalized))`. A blank string still
+/// normalizes to `Some(None)`, i.e. also clears, matching `de_website_opt`'s
+/// existing blank-means-empty rule.
+fn de_website_opt_double<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(Some(raw.and_then(|s| normalize_website(&s))))
+}
+
 /// Normalize a phone number for storage (PMS-325): keep a single leading `+`
 /// and drop common formatting characters (spaces, dashes, parentheses, dots),
 /// so `+1 (415) 555-1234` becomes `+14155551234`. Returns the digits-only
@@ -284,6 +328,19 @@ where
 {
     let raw = Option::<String>::deserialize(deserializer)?;
     Ok(raw.map(|s| normalize_phone(&s)).filter(|s| !s.is_empty()))
+}
+
+/// PMS-1392: the `Option<Option<T>>` twin of [`de_phone_opt`]; see
+/// [`de_website_opt_double`] for why the extra level of `Option` is needed on
+/// a PATCH-style field.
+fn de_phone_opt_double<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(Some(
+        raw.map(|s| normalize_phone(&s)).filter(|s| !s.is_empty()),
+    ))
 }
 
 /// Validate a (normalized) phone number against E.164: an optional leading `+`
@@ -642,15 +699,15 @@ pub struct UpdateCompanyRequest {
     pub status: Option<CompanyStatus>,
     #[validate(custom(function = "validate_text_no_nul"))]
     pub industry: Option<String>,
-    #[serde(default, deserialize_with = "de_website_opt")]
+    #[serde(default, deserialize_with = "de_website_opt_double")]
     #[validate(length(max = 255), custom(function = "validate_website"))]
-    pub website: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    pub website: Option<Option<String>>,
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub phone: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    pub phone: Option<Option<String>>,
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub fax: Option<String>,
+    pub fax: Option<Option<String>>,
     #[validate(nested)]
     pub address: Option<Address>,
     #[validate(nested)]
@@ -695,6 +752,7 @@ pub struct CompanyResponse {
     pub industry: Option<String>,
     pub website: Option<String>,
     pub phone: Option<String>,
+    pub fax: Option<String>,
     pub address: Address,
     pub account_manager_id: Option<Uuid>,
     pub account_manager_name: Option<String>,
@@ -748,6 +806,7 @@ impl From<Company> for CompanyResponse {
             industry: c.industry,
             website: c.website,
             phone: c.phone,
+            fax: c.fax,
             address: c.address,
             account_manager_id: c.account_manager_id,
             account_manager_name: None,
@@ -1049,7 +1108,7 @@ impl Contact {
 
 /// Create contact request
 #[derive(Debug, Clone, Deserialize, Validate)]
-#[validate(schema(function = validate_create_company_link))]
+#[validate(schema(function = validate_create_contact_request))]
 pub struct CreateContactRequest {
     /// Optional link to an existing CRM company (PMS-402). Mutually exclusive
     /// with a non-empty `company_name`; supplying both is rejected (422).
@@ -1123,15 +1182,15 @@ pub struct UpdateContactRequest {
     pub last_name: Option<String>,
     #[validate(email)]
     pub email: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub phone: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    pub phone: Option<Option<String>>,
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub mobile: Option<String>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    pub mobile: Option<Option<String>>,
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub fax: Option<String>,
+    pub fax: Option<Option<String>>,
     pub title: Option<String>,
     pub department: Option<String>,
     pub contact_type: Option<ContactType>,
@@ -1302,9 +1361,9 @@ pub struct UpdateSiteRequest {
     pub name: Option<String>,
     #[validate(nested)]
     pub address: Option<Address>,
-    #[serde(default, deserialize_with = "de_phone_opt")]
+    #[serde(default, deserialize_with = "de_phone_opt_double")]
     #[validate(custom(function = "validate_phone_e164"))]
-    pub phone: Option<String>,
+    pub phone: Option<Option<String>>,
     pub is_primary: Option<bool>,
     #[validate(custom(function = "validate_timezone"))]
     pub timezone: Option<String>,
@@ -1707,18 +1766,25 @@ mod tests {
         let req: UpdateCompanyRequest =
             serde_json::from_value(serde_json::json!({ "website": " Example.COM/About " }))
                 .expect("request deserializes");
-        assert_eq!(req.website.as_deref(), Some("https://example.com/About"));
+        assert_eq!(
+            req.website,
+            Some(Some("https://example.com/About".to_string()))
+        );
         assert!(req.validate().is_ok());
     }
 
     // ---- PMS-325: phone / timezone / country / postal validation ----
 
     /// Build a minimal valid `CreateContactRequest`, merging overrides.
+    /// A valid `email` is seeded by default (PMS-1329 makes it required on
+    /// create); an override may set it to `null` or omit the seeded value
+    /// when a test specifically exercises the required-email rule.
     fn contact_req(overrides: serde_json::Value) -> CreateContactRequest {
         let mut body = serde_json::json!({
             "company_id": "00000000-0000-0000-0000-000000000000",
             "first_name": "Ada",
             "last_name": "Lovelace",
+            "email": "ada@example.test",
         });
         if let serde_json::Value::Object(extra) = overrides {
             for (k, v) in extra {
@@ -1824,6 +1890,7 @@ mod tests {
         let mut full = serde_json::json!({
             "first_name": "Ada",
             "last_name": "Lovelace",
+            "email": "ada@example.test",
         });
         if let serde_json::Value::Object(extra) = body {
             for (k, v) in extra {
@@ -1865,6 +1932,56 @@ mod tests {
         assert!(
             req.validate().is_err(),
             "supplying both company_id and a non-empty company_name must be rejected"
+        );
+    }
+
+    // ========================================================================
+    // PMS-1329: a contact create must carry an email address
+    // ========================================================================
+
+    /// A create with no `email` field at all is rejected. The unreachable
+    /// contact this rule closes reached the interface's "set up email queue"
+    /// state and produced a dead notification row.
+    #[test]
+    fn create_without_email_is_rejected() {
+        let req = contact_req(serde_json::json!({ "email": null }));
+        assert!(req.email.is_none());
+        let err = req
+            .validate()
+            .expect_err("a create with no email must be rejected");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("email"),
+            "the field-level error must name the email field: {err:?}"
+        );
+    }
+
+    /// A create whose email is present but blank (or whitespace-only) is
+    /// rejected on the same rule, so a caller cannot bypass it by sending
+    /// `""` in place of omitting the field.
+    #[test]
+    fn create_with_blank_email_is_rejected() {
+        for blank in ["", "   ", "\t\n"] {
+            let req = contact_req(serde_json::json!({ "email": blank }));
+            assert!(
+                req.validate().is_err(),
+                "a blank email ({blank:?}) must be rejected"
+            );
+        }
+    }
+
+    /// The rule is create-side only: an update with `email: None` is "leave
+    /// the field alone" and must still validate. Rewriting existing rows is
+    /// out of scope for the ticket.
+    #[test]
+    fn update_without_email_is_still_accepted() {
+        let req: UpdateContactRequest = serde_json::from_value(serde_json::json!({
+            "first_name": "Grace"
+        }))
+        .expect("update deserializes");
+        assert!(req.email.is_none());
+        assert!(
+            req.validate().is_ok(),
+            "an update carrying no email must still validate"
         );
     }
 

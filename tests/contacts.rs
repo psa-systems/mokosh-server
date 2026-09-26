@@ -295,6 +295,92 @@ async fn company_update_persists_all_fields(pool: PgPool) {
     assert_eq!(get_json["address"]["postal_code"].as_str(), Some("78701"));
 }
 
+/// PMS-1392: `website` / `phone` / `fax` on `UpdateCompanyRequest` are
+/// `Option<Option<T>>` now, so an omitted field must leave the column alone
+/// and an explicit `null` must clear it to SQL `NULL` - two states a plain
+/// `Option<T>` field could not tell apart, which is why the fields moved off
+/// it in the first place (a wire `null` was normalized to `None` by
+/// `de_website_opt`/`de_phone_opt` before `service.rs`'s `.is_some()` gate
+/// ever saw it, so a "clear this field" PUT silently no-opped).
+#[mokosh_test]
+async fn company_update_omit_leaves_unchanged_and_null_clears(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Clearable Co").await;
+
+    // Seed website/phone/fax with real values.
+    let seed_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "website": "https://example.com",
+            "phone": "+1 555 0300",
+            "fax": "+1 555 0400",
+        }))
+        .send()
+        .await
+        .expect("send seed update");
+    assert!(seed_resp.status().is_success());
+
+    // Omitting the fields entirely (only touching an unrelated one) must
+    // leave website/phone/fax exactly as seeded.
+    let omit_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "industry": "Healthcare" }))
+        .send()
+        .await
+        .expect("send omit update");
+    assert!(omit_resp.status().is_success());
+    let omit_json: serde_json::Value = omit_resp.json().await.expect("omit JSON");
+    assert_eq!(omit_json["website"].as_str(), Some("https://example.com"));
+    assert_eq!(omit_json["phone"].as_str(), Some("+15550300"));
+    assert_eq!(omit_json["fax"].as_str(), Some("+15550400"));
+
+    // An explicit `null` for each field clears it to SQL NULL.
+    let clear_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "website": null,
+            "phone": null,
+            "fax": null,
+        }))
+        .send()
+        .await
+        .expect("send clear update");
+    assert!(
+        clear_resp.status().is_success(),
+        "clearing update should 2xx, got {}",
+        clear_resp.status()
+    );
+    let clear_json: serde_json::Value = clear_resp.json().await.expect("clear JSON");
+    assert!(clear_json["website"].is_null(), "website should clear");
+    assert!(clear_json["phone"].is_null(), "phone should clear");
+    assert!(clear_json["fax"].is_null(), "fax should clear");
+
+    // Independent GET confirms the clear persisted rather than only showing
+    // up in the PUT's own response body.
+    let get_json: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/companies/{company_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get company")
+        .json()
+        .await
+        .expect("get JSON");
+    assert!(get_json["website"].is_null());
+    assert!(get_json["phone"].is_null());
+    assert!(get_json["fax"].is_null());
+}
+
 /// PMS-400: a company name must be unique within a tenant
 /// (case-insensitive, trimmed). Creating a second company with the same
 /// name (differing only by case or surrounding whitespace) must 409 and
@@ -428,6 +514,72 @@ async fn site_update_persists_changes(pool: PgPool) {
     assert_eq!(get_json["name"].as_str(), Some("Renamed HQ"));
     assert_eq!(get_json["is_primary"].as_bool(), Some(true));
     assert_eq!(get_json["phone"].as_str(), Some("+15550100"));
+}
+
+/// PMS-1392: `phone` on `UpdateSiteRequest` is `Option<Option<String>>` now.
+/// Omitting it leaves the column alone; an explicit `null` clears it. See
+/// `company_update_omit_leaves_unchanged_and_null_clears` for why both
+/// states matter.
+#[mokosh_test]
+async fn site_update_omit_leaves_unchanged_and_null_clears(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Acme").await;
+    let site_id = create_site(&app, &token, &company_id, "Main Office", false).await;
+
+    let seed_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/sites/{site_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "phone": "+1 555 0100" }))
+        .send()
+        .await
+        .expect("send seed update");
+    assert!(seed_resp.status().is_success());
+
+    // Omitting `phone` while touching an unrelated field leaves it alone.
+    let omit_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/sites/{site_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "Renamed HQ" }))
+        .send()
+        .await
+        .expect("send omit update");
+    assert!(omit_resp.status().is_success());
+    let omit_json: serde_json::Value = omit_resp.json().await.expect("omit JSON");
+    assert_eq!(omit_json["phone"].as_str(), Some("+15550100"));
+
+    // Explicit `null` clears it.
+    let clear_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/sites/{site_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "phone": null }))
+        .send()
+        .await
+        .expect("send clear update");
+    assert!(
+        clear_resp.status().is_success(),
+        "clearing update should 2xx, got {}",
+        clear_resp.status()
+    );
+    let clear_json: serde_json::Value = clear_resp.json().await.expect("clear JSON");
+    assert!(clear_json["phone"].is_null(), "phone should clear");
+
+    let get_json: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/sites/{site_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get site")
+        .json()
+        .await
+        .expect("get JSON");
+    assert!(get_json["phone"].is_null());
 }
 
 /// Site CRUD round-trip: covers create/list/get/update/delete plus the
@@ -687,6 +839,100 @@ async fn contact_crud_happy_path(pool: PgPool) {
         reqwest::StatusCode::NOT_FOUND,
         "GET after delete should 404"
     );
+}
+
+/// PMS-1392: `phone` / `mobile` / `fax` on `UpdateContactRequest` are
+/// `Option<Option<String>>` now. Omitting them leaves the columns alone; an
+/// explicit `null` clears each to SQL `NULL`. See
+/// `company_update_omit_leaves_unchanged_and_null_clears` for the underlying
+/// mechanism (`de_phone_opt` used to collapse both "absent" and "null" to
+/// `None` before the update gate could tell them apart).
+#[mokosh_test]
+async fn contact_phone_fields_omit_leaves_unchanged_and_null_clears(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = create_company(&app, &token, "Acme").await;
+
+    let create_resp = app
+        .client
+        .post(app.url("/api/v1/contacts/contacts"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "first_name": "Bob",
+            "last_name": "Johnson",
+            "email": "bob.johnson@example.com",
+            "phone": "+1 555 0100",
+            "mobile": "+1 555 0200",
+            "fax": "+1 555 0500",
+        }))
+        .send()
+        .await
+        .expect("send create contact");
+    assert!(create_resp.status().is_success());
+    let created: serde_json::Value = create_resp.json().await.expect("create JSON");
+    let contact_id = created["id"].as_str().expect("contact has id").to_string();
+
+    // Omitting phone/mobile/fax while touching an unrelated field leaves
+    // them alone.
+    let omit_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "title": "CTO" }))
+        .send()
+        .await
+        .expect("send omit update");
+    assert!(omit_resp.status().is_success());
+    let omit_json: serde_json::Value = omit_resp.json().await.expect("omit JSON");
+    assert_eq!(omit_json["phone"].as_str(), Some("+15550100"));
+    assert_eq!(omit_json["mobile"].as_str(), Some("+15550200"));
+
+    // Explicit `null` clears phone and mobile (the two mirrored on
+    // ContactResponse); fax is checked against the row directly below since
+    // it is not part of that response DTO.
+    let clear_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "phone": null,
+            "mobile": null,
+            "fax": null,
+        }))
+        .send()
+        .await
+        .expect("send clear update");
+    assert!(
+        clear_resp.status().is_success(),
+        "clearing update should 2xx, got {}",
+        clear_resp.status()
+    );
+    let clear_json: serde_json::Value = clear_resp.json().await.expect("clear JSON");
+    assert!(clear_json["phone"].is_null(), "phone should clear");
+    assert!(clear_json["mobile"].is_null(), "mobile should clear");
+
+    let get_json: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/contacts/contacts/{contact_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get contact")
+        .json()
+        .await
+        .expect("get JSON");
+    assert!(get_json["phone"].is_null());
+    assert!(get_json["mobile"].is_null());
+
+    let fax: Option<String> = sqlx::query_scalar("SELECT fax FROM contacts WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&contact_id).expect("contact id is a uuid"))
+        .fetch_one(&app.pool)
+        .await
+        .expect("fetch contact fax");
+    assert_eq!(fax, None, "fax should clear to SQL NULL");
 }
 
 // ============================================================================
@@ -2069,6 +2315,25 @@ async fn website_probe_rejects_impossible_input(pool: PgPool) {
 // PMS-806: typed phone list + links to multiple companies
 // ============================================================================
 
+/// Fill in an `email` on a create body that omits one so the caller does not
+/// have to name a placeholder in every fixture. PMS-1329 makes the API path
+/// reject a create with no email, and every test in this file below that
+/// exercises a different shape (phones, links, primary flags); none of them
+/// are about the email rule specifically, so an injected default keeps them
+/// scoped to what they pin. A body that names `email` explicitly (including
+/// `null`, which the required-email cases below use) is left alone.
+fn ensure_email(mut body: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(map) = &mut body {
+        if !map.contains_key("email") {
+            map.insert(
+                "email".to_string(),
+                serde_json::Value::String("fixture@example.test".to_string()),
+            );
+        }
+    }
+    body
+}
+
 /// Helper: create a contact through the API and return the response body.
 async fn create_contact(
     app: &common::TestApp,
@@ -2082,7 +2347,7 @@ async fn create_contact(
         .client
         .post(app.url("/api/v1/contacts/contacts"))
         .bearer_auth(token)
-        .json(&body)
+        .json(&ensure_email(body))
         .send()
         .await
         .expect("send create contact");
@@ -2103,7 +2368,7 @@ async fn post_contact_status(
     app.client
         .post(app.url("/api/v1/contacts/contacts"))
         .bearer_auth(token)
-        .json(&body)
+        .json(&ensure_email(body))
         .send()
         .await
         .expect("send create contact")

@@ -310,6 +310,21 @@ ensure-test-db-roles: ensure-env
 test-integration: ensure-env ensure-test-db-roles
     docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci --no-capture -E '"'"'binary(template_database)'"'"' && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
 
+# Mirrors .forgejo/workflows/integration-unsupported.yml (PMS-1394): the suites
+# `test-integration` skips, for functionality nothing currently uses. Today that
+# is `tests/s3_storage.rs` alone, and it needs a MinIO, which is what
+# `dev-s3` starts and what fills the blank S3_* keys in `.env`. Without those
+# keys the suite skips loudly rather than failing, so running this recipe on a
+# stack that never ran `just dev-s3` reports nothing and passes.
+#
+# Which suites these are is NOT decided here: `.config/nextest.toml` carries the
+# split as a `default-filter` on the `ci` and `unsupported` profiles, so this
+# recipe names a profile and never a suite.
+[doc("Run the suites integration.yml skips: functionality nothing currently uses (PMS-1394).")]
+[group: 'test']
+test-integration-unsupported: ensure-env ensure-test-db-roles
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile unsupported'
+
 # Exercise every provider seam - configuration, application-tier secrets,
 # tenant-tier secrets, storage, authentication, email - against the running
 # dev stack, and fail non-zero on any red row. Runs INSIDE the server
