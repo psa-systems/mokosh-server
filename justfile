@@ -313,7 +313,7 @@ test-integration: ensure-env ensure-test-db-roles
 # Mirrors .forgejo/workflows/integration-unsupported.yml (PMS-1394): the suites
 # `test-integration` skips, for functionality nothing currently uses. Today that
 # is `tests/s3_storage.rs` alone, and it needs a MinIO, which is what
-# `dev-s3` starts and what fills the blank S3_* keys in `.env`. Without those
+# `dev-s3` starts and what fills the blank STORAGE_S3_* keys in `.env`. Without those
 # keys the suite skips loudly rather than failing, so running this recipe on a
 # stack that never ran `just dev-s3` reports nothing and passes.
 #
@@ -502,11 +502,11 @@ dev-infisical *args: ensure-env
     docker compose --file {{ compose_file }} --profile infisical up {{ args }} infisical infisical-postgres
 
 # Start only MinIO (opt-in; not started by `just dev`). PMS-958.
-[doc("Start a MinIO object store and point the blank S3_* keys in .env at it (compose profile: s3)")]
+[doc("Start a MinIO object store and point the blank STORAGE_S3_* keys in .env at it (compose profile: s3)")]
 [group: 'dev']
 dev-s3 *args: ensure-env
     #!/usr/bin/env nu
-    # Fill in the S3_* keys that are blank so `just test-integration` runs the
+    # Fill in the STORAGE_S3_* keys that are blank so `just test-integration` runs the
     # S3 suite against this MinIO. STORAGE_BACKEND is left alone on purpose:
     # the server keeps writing to the attachments volume until an operator
     # sets it to `s3` and restarts `server`, the way `dev-infisical` only
@@ -526,12 +526,12 @@ dev-s3 *args: ensure-env
         error make { msg: "MINIO_ROOT_USER / MINIO_ROOT_PASSWORD are missing or blank in .env; copy both keys from .env.example and give the password a value (a .env generated before PMS-958 has neither)" }
     }
     let wanted = {
-        S3_ENDPOINT: 'http://minio:9000'
-        S3_BUCKET: 'mokosh'
-        S3_REGION: 'us-east-1'
-        S3_PATH_STYLE: 'true'
-        S3_ACCESS_KEY_ID: $root_user
-        S3_SECRET_ACCESS_KEY: $root_password
+        STORAGE_S3_ENDPOINT: 'http://minio:9000'
+        STORAGE_S3_BUCKET: 'mokosh'
+        STORAGE_S3_REGION: 'us-east-1'
+        STORAGE_S3_PATH_STYLE: 'true'
+        STORAGE_S3_ACCESS_KEY_ID: $root_user
+        STORAGE_S3_SECRET_ACCESS_KEY: $root_password
     }
     mut updated = $lines
     for key in ($wanted | columns) {

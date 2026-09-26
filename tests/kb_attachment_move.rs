@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Set before `common::boot` and before the mover is built: both read
-/// `ATTACHMENT_DIR` once, at construction.
+/// `STORAGE_ROOT` once, at construction.
 fn install_test_attachment_env() {
     common::storage_root();
 }
