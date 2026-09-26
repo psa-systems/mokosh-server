@@ -212,12 +212,16 @@ pub type CompanyAssetStore = BrandingAssetStore;
 
 impl BrandingAssetStore {
     pub fn from_env() -> Self {
-        let root = config::get(&keys::ATTACHMENT_DIR)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("./attachments"));
+        // PMS-1317: the root comes from `crate::storage`, the provider of
+        // record for it, rather than from a second read of the variable here.
+        // That mattered the moment the variable was renamed: this reader would
+        // have kept asking for `ATTACHMENT_DIR` while the provider moved to
+        // `STORAGE_ROOT`, and a deployment setting only the new name would have
+        // split its uploads across two roots inside one process - which is the
+        // exact defect PMS-910 was filed for, reintroduced by the rename meant
+        // to make the setting clearer.
         Self {
-            root,
+            root: crate::storage::StorageConfig::from_env().root,
             logo_store: crate::storage::shared(),
             ledger: None,
         }
