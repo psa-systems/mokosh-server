@@ -1171,6 +1171,84 @@ mod tests {
         );
     }
 
+    /// PMS-1316: nothing outside this module carries a root of its own.
+    ///
+    /// The defect was three subsystems each reading `ATTACHMENT_DIR` and
+    /// supplying their own fallback, two of which disagreed: the tenant logo
+    /// fell back to `./attachments` while KB fell back to `/data/attachments`,
+    /// so one unset variable split a single process's uploads across two roots.
+    /// It produced two defect tickets before anyone found the cause, because
+    /// the symptom is a 404 for a file that is genuinely on disk, just not
+    /// under the root the reader looked in.
+    ///
+    /// PMS-910 gave the layout one owner and PMS-1317 removed the last second
+    /// reader, which was branding. What was missing either time is the thing
+    /// that stops it coming back, and it did nearly come back: branding's copy
+    /// survived PMS-910 untouched and was only caught because renaming the
+    /// variable would have left it asking for the old name.
+    ///
+    /// Two mechanisms could reintroduce it and both are now closed. A second
+    /// READ of the variable is refused by
+    /// `config::guard::every_env_read_goes_through_the_provider`, which fails
+    /// any environment read outside its listed entry points, of which this
+    /// subsystem is one. A second FALLBACK is what this test refuses: the
+    /// default root is spelled out in this module and nowhere else, so a
+    /// module that wants a root has to ask for one.
+    ///
+    /// The needle is assembled so this file is not a hit on itself, the
+    /// `repo_hygiene` convention.
+    #[test]
+    fn no_module_outside_storage_carries_its_own_root() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let storage = src.join("storage");
+        let needle = format!(".{}", concat!("/attach", "ments"));
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut pending = vec![src.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read a source directory") {
+                let entry = entry.expect("read a source directory entry");
+                let path = entry.path();
+                if entry.file_type().expect("read entry type").is_dir() {
+                    if path != storage {
+                        pending.push(path);
+                    }
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).expect("read a source file");
+                // Prose may name the old default while explaining why it is
+                // gone; what is banned is code that falls back to one.
+                let code: String = body
+                    .lines()
+                    .filter(|line| {
+                        let trimmed = line.trim_start();
+                        !trimmed.starts_with("//")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if code.contains(&needle) {
+                    offenders.push(
+                        path.strip_prefix(&src)
+                            .expect("path came from this walk")
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "the storage root has one fallback and it lives in crate::storage; \
+             these carry their own, which is how one unset variable came to \
+             split a process's uploads across two roots (PMS-1316): {offenders:?}"
+        );
+    }
+
     /// And one place picks the root on the test side, for the same reason.
     ///
     /// Nine Postgres-backed suites each named a fixed path under `/tmp`. `/tmp`
@@ -1199,7 +1277,16 @@ mod tests {
             return;
         }
 
-        let needle = concat!("\"ATTACHMENT", "_DIR\"");
+        // Both names, because PMS-1317 renamed the variable and left the old
+        // one as a deprecated alias: a guard that watched only `ATTACHMENT_DIR`
+        // would have let the very next suite name `STORAGE_ROOT` instead and
+        // go back to a fixed path under a world-writable directory, which is
+        // the defect this exists to have stopped. Assembled so this file is
+        // not a hit on itself.
+        let needles = [
+            concat!("\"ATTACHMENT", "_DIR\""),
+            concat!("\"STORAGE", "_ROOT\""),
+        ];
         let mut offenders: Vec<String> = Vec::new();
         let mut pending = vec![tests.clone()];
 
@@ -1223,7 +1310,18 @@ mod tests {
                     continue;
                 }
                 let body = std::fs::read_to_string(&path).expect("read a test source file");
-                if body.contains(needle) {
+                // Comment lines are excluded: several suites explain in prose
+                // which variable the store reads, and naming it there is not
+                // picking a root.
+                let code: String = body
+                    .lines()
+                    .filter(|line| {
+                        let trimmed = line.trim_start();
+                        !trimmed.starts_with("//")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if needles.iter().any(|needle| code.contains(needle)) {
                     offenders.push(relative);
                 }
             }
@@ -1232,8 +1330,8 @@ mod tests {
         offenders.sort();
         assert!(
             offenders.is_empty(),
-            "these suites name ATTACHMENT_DIR in code instead of calling \
-             common::storage_root(), which is how a fixed path under a \
+            "these suites name the storage root variable in code instead of \
+             calling common::storage_root(), which is how a fixed path under a \
              world-writable directory keeps coming back: {offenders:?}"
         );
     }
