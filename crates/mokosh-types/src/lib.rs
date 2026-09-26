@@ -26,6 +26,9 @@ pub mod billing;
 pub mod contacts;
 pub mod datetime;
 pub mod forms;
+// PMS-1310: the integration vocabulary (capability, provider, status). Which
+// capabilities a provider SUPPORTS is not here; see the module doc.
+pub mod integrations;
 pub mod mileage_tracking;
 pub mod sort;
 pub mod teams;
