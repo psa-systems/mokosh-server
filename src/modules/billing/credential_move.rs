@@ -7,16 +7,19 @@
 //! path now puts new credentials there. This is what walks the existing ones
 //! over.
 //!
-//! ## Why a job and not a migration
+//! ## Why a one-shot and not a migration
 //!
 //! Migrations here are plain SQL embedded by `sqlx::migrate!` and run at
-//! startup. Writing to the secret provider is a network call when the provider is
-//! Infisical, which no SQL file can make. [`Scheduler`](crate::scheduler::Scheduler)
-//! fires every registered job once immediately at startup and then on its
-//! interval, which gives the one-shot behaviour with no maintenance window and
-//! makes a transient failure self-healing rather than waiting for a restart.
-//! Nothing about the API needs the move to have finished, because
-//! `gateway_plaintext` reads either state.
+//! startup. Writing to the secret provider is a network call when the provider
+//! is Infisical, which no SQL file can make.
+//!
+//! It ran as an hourly [`Job`](crate::scheduler::Job) until PMS-1320, because
+//! [`Scheduler`](crate::scheduler::Scheduler) fires every registered job once
+//! immediately at startup and the interval came free with that. It is a
+//! one-time move either way, so it now goes through
+//! [`crate::scheduler::one_shot::spawn_once`], which runs it once per process
+//! start and names it as the correction it is. Nothing about the API needs it
+//! to have finished, because `gateway_plaintext` reads either state.
 //!
 //! ## What it does about failure
 //!
@@ -27,21 +30,19 @@
 //! Three things can go wrong and none of them may half-finish a row. The
 //! ciphertext might not decrypt, which means the deployment's `ENCRYPTION_KEY`
 //! is not the one that wrote it and no amount of retrying will help. The store
-//! write might fail, which is usually an outage and is worth retrying next
-//! tick. Or the write might report success and the read-back not match, which
+//! write might fail, which is usually an outage and is worth retrying at the
+//! next restart. Or the write might report success and the read-back not match, which
 //! is the one that would be invisible without checking, so it is checked: the
 //! secret is written, read back and compared before the column is cleared.
 //!
 //! In every failing case the column keeps its ciphertext, so the gateway goes
-//! on working off the old path and the next tick tries again. The only ordering
+//! on working off the old path and the next restart tries again. The only ordering
 //! that can lie is clearing the column before the store has the value, and that
 //! ordering does not exist here.
 
-use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::scheduler::Job;
 use crate::secrets::{SecretKey, SecretProvider};
 use crate::utils::error::AppResult;
 
@@ -110,7 +111,7 @@ impl GatewayCredentialMover {
                 Err(e) => {
                     outcome.failed += 1;
                     // The tenant and provider, never the credential. `warn` and
-                    // not `error` because the next tick retries and the gateway
+                    // not `error` because the next restart retries and the gateway
                     // is still working off its column in the meantime.
                     tracing::warn!(
                         target: "mokosh_server.billing",
@@ -193,13 +194,12 @@ impl GatewayCredentialMover {
     }
 }
 
-#[async_trait]
-impl Job for GatewayCredentialMover {
-    fn name(&self) -> &'static str {
-        "gateway_credential_move"
-    }
-
-    async fn run(&self) -> AppResult<()> {
-        self.run_tick().await.map(|_| ())
-    }
+impl GatewayCredentialMover {
+    /// The name this pass is logged under, and the only thing left of the
+    /// `Job` impl it used to carry (PMS-1320). It is handed to
+    /// [`crate::scheduler::one_shot::spawn_once`] at boot rather than
+    /// registered on the scheduler: this corrects history once and never
+    /// becomes due again, so an hourly interval was a recurring job doing a
+    /// one-time job's work.
+    pub const ONE_SHOT_NAME: &'static str = "gateway_credential_move";
 }

@@ -13,6 +13,14 @@
 //! startup with no warmup delay; jobs that need a warmup should
 //! sleep inside `run` on first invocation.
 //!
+//! That immediate first tick is also what used to make this the wrong home for
+//! work with no cadence at all. Registering a one-time correction at an hour
+//! got it run at boot, and the interval was only ever a free retry, so the
+//! process ended up carrying three recurring jobs that existed to fix
+//! something once (PMS-1320). Such work now goes through
+//! [`one_shot::spawn_once`] and says so; a [`Job`] is for work that becomes
+//! due again.
+//!
 //! Usage from `main.rs`:
 //! ```ignore
 //! let mut scheduler = Scheduler::new();
@@ -32,6 +40,12 @@
 //! recurring-invoicing / SLA / calendar-reminder jobs already on the
 //! Scheduler. Workers expose a `run_tick`-style method for deterministic
 //! tests; the `Job::run` impl is a thin wrapper the Scheduler ticks.
+
+// PMS-1320: work that happens once per process start rather than on an
+// interval. Three "one-shot in effect" jobs used to sit on this scheduler at an
+// hour, which is a recurring job doing a one-time correction; see the module
+// doc for why that is not the same thing and why it is not a migration either.
+pub mod one_shot;
 
 use std::collections::HashSet;
 use std::sync::Arc;

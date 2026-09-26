@@ -960,39 +960,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it in prompt 004+; export gets rebuilt if the operator still
     // needs it on the contact side.
 
-    // PMS-960: one-shot in effect. A KB attachment used to be stored at a
-    // flat `kb-articles/{id}` with no tenant in the path; it is now under
-    // its tenant like everything else, and this walks the files already on
-    // the volume over to it. The Scheduler fires every job once immediately
-    // at startup, so the work happens at boot without blocking it, and the
-    // hourly interval is what makes a failed rename retry rather than wait
-    // for the next restart. Once every file has moved the tick is one query
-    // that returns no rows.
+    // PMS-1320: three passes that correct where existing objects are stored,
+    // run ONCE per process start rather than on an interval.
+    //
+    // Each was registered on the scheduler at an hour, which got them run at
+    // boot (the scheduler's first tick is immediate) with the interval as a
+    // free retry. The cost was three recurring jobs whose whole purpose was a
+    // one-time correction, which reads from outside as ongoing maintenance the
+    // design depends on. It is not: once a deployment has run them there is
+    // nothing left for them to do, and `one_shot::spawn_once` says so.
+    //
+    // None of them can be a migration, which is the first thing to reach for:
+    // a migration runs inside Postgres and what these move is bytes in
+    // `crate::storage`, or a credential into the secret provider. Only the
+    // ledger row is SQL, and rewriting a ledger row without moving the file it
+    // names is the one ordering that can lie.
+    //
+    // Spawned, not awaited: a pass over a volume of unknown size must not
+    // decide how long the API takes to come up, and every one of them has a
+    // read-side fallback to the old location for exactly that window. What is
+    // given up against the old hourly tick is retrying a transient failure an
+    // hour later instead of at the next restart, against a WARN line either
+    // way.
+    use mokosh_server::scheduler::one_shot::spawn_once;
+
+    // PMS-960: a KB attachment used to be stored at a flat `kb-articles/{id}`
+    // with no tenant in the path, and is now under its tenant like every other
+    // stored object. This walks the files already on the volume over.
     let kb_attachment_mover =
         mokosh_server::modules::knowledge_base::KbAttachmentMover::new(db.clone());
-    scheduler.register(kb_attachment_mover, std::time::Duration::from_secs(3600));
+    spawn_once(
+        mokosh_server::modules::knowledge_base::KbAttachmentMover::ONE_SHOT_NAME,
+        async move { kb_attachment_mover.run_tick().await.map(|_| ()) },
+    );
 
-    // One-shot move of the live tenant logo out of the shared `tenant-logos/`
-    // directory and under its own tenant, the same shape as the KB mover above
-    // and for the same reason: the layout changed, and the files already on the
-    // volume did not. `TenantLogoStore::read` falls back to the old location
-    // until this has reached them, so a logo keeps rendering in the meantime.
+    // The live tenant logo out of the shared `tenant-logos/` directory and
+    // under its own tenant, for the same reason. `TenantLogoStore::read` falls
+    // back to the old location until this has reached it, so a logo keeps
+    // rendering in the meantime.
     let tenant_logo_mover = mokosh_server::modules::tenants::TenantLogoMover::new(db.clone());
-    scheduler.register(tenant_logo_mover, std::time::Duration::from_secs(3600));
+    spawn_once(
+        mokosh_server::modules::tenants::TenantLogoMover::ONE_SHOT_NAME,
+        async move { tenant_logo_mover.run_tick().await.map(|_| ()) },
+    );
 
-    // PMS-968: one-shot move of pre-existing gateway credentials into the
-    // configured secret provider. The scheduler fires every job once at startup,
-    // so an hour gives the one-shot behaviour plus a retry if the store was
-    // briefly unreachable, and once the move is done the tick is one query
-    // returning no rows.
+    // PMS-968: pre-existing gateway credentials out of their column and into
+    // the configured secret provider.
     let gateway_credential_mover = mokosh_server::modules::billing::GatewayCredentialMover::new(
         db.clone(),
         secrets.clone(),
         encryption_key,
     );
-    scheduler.register(
-        gateway_credential_mover,
-        std::time::Duration::from_secs(3600),
+    spawn_once(
+        mokosh_server::modules::billing::GatewayCredentialMover::ONE_SHOT_NAME,
+        async move { gateway_credential_mover.run_tick().await.map(|_| ()) },
     );
     // PMS-1037: overdue invoice reminders, hourly so each tenant's local
     // sending hour is hit once a day. Built with delivery (the mailer and the

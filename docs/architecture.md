@@ -35,7 +35,7 @@ Under the storage root (`ATTACHMENT_DIR` for `local`, the bucket for `s3`, same 
 | `{tenant}/documents/{id}` | issued invoice or credit-note PDF |
 | `{tenant}/branding/{digest}` | a logo frozen onto a sent invoice, content-addressed |
 
-Two of these arrived at that shape late, and both moved the same way. A KB attachment was a flat `kb-articles/{id}` with no tenant anywhere in it (PMS-960); the live logo was `tenant-logos/{tenant}.{ext}`, a shared directory with the tenant in the filename. Each old path stays addressable as its own `ObjectKind::Legacy*` variant rather than as a fallback inside the provider - a fallback applies to every read and is reachable from any tenant's key, which is the hole being closed - the read falls back to it so nothing disappears mid-deploy, and a `Scheduler` job (`KbAttachmentMover`, `TenantLogoMover`) walks the files over. Each mover moves the file first and updates the `files` ledger row second, because a row naming a path before the bytes are there is the one ordering that can lie, and it leaves an object whose bytes are at neither path completely alone.
+Two of these arrived at that shape late, and both moved the same way. A KB attachment was a flat `kb-articles/{id}` with no tenant anywhere in it (PMS-960); the live logo was `tenant-logos/{tenant}.{ext}`, a shared directory with the tenant in the filename. Each old path stays addressable as its own `ObjectKind::Legacy*` variant rather than as a fallback inside the provider - a fallback applies to every read and is reachable from any tenant's key, which is the hole being closed - the read falls back to it so nothing disappears mid-deploy, and a one-shot (`KbAttachmentMover`, `TenantLogoMover`, spawned once per process start by `scheduler::one_shot::spawn_once`) walks the files over. They were `Scheduler` jobs at an hour until PMS-1320, which is a recurring job doing a one-time correction; a migration is not available for either, because what moves is bytes in `crate::storage` and a migration runs inside Postgres. Each mover moves the file first and updates the `files` ledger row second, because a row naming a path before the bytes are there is the one ordering that can lie, and it leaves an object whose bytes are at neither path completely alone.
 
 `{tenant}/logo.{ext}` and `{tenant}/branding/{digest}` are deliberately not the same directory: the first is one mutable object per tenant, the second is the content-addressed copies frozen onto documents, one per distinct logo rather than one per invoice.
 
@@ -78,7 +78,7 @@ src/
   modules/         Feature modules (tickets, contracts, billing, ...).
   pdf/             Document model, and the one place it becomes PDF bytes.
   providers/       Provider status collection and reporting across every capability kind; not itself a selectable provider.
-  scheduler/       Registry for the interval background jobs.
+  scheduler/       Registry for the interval background jobs, and `one_shot` for work that happens once per process start (PMS-1320).
   secrets/         Secret backend selection (database or Infisical) behind one store trait.
   storage/         Upload root and file storage, the provider of record for ATTACHMENT_DIR; branding/ also reads it through the config seam for local-path assets.
   utils/           Shared helpers (errors, email, crypto, validation, pagination).
