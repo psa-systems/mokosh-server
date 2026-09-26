@@ -252,6 +252,9 @@ rust_decimal = { version = "1", features = ["db-postgres", "serde"] }
 # signature verification, not a bypass.
 hmac = "0.12"
 sha2 = "0.10"
+# MAPPS-542: exercise `PaginationParams` deserialization from a raw query
+# string in unit tests, matching what axum's `Query` extractor does.
+serde_urlencoded = "0.7"
 # PMS-1254: `#[mokosh_test]`, which clones each test's database from a
 # migrated template instead of applying every migration into it. A
 # dev-dependency only, so nothing it expands to reaches a release build. It

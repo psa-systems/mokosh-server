@@ -2267,6 +2267,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha1",
  "sha2 0.10.9",
  "sqlx",
