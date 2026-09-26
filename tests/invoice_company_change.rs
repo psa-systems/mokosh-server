@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -103,7 +104,7 @@ impl Fixture {
 /// The case the issue was filed for: a draft on the wrong company moves, its
 /// old company's contact goes with the old company, and the move is audited
 /// with who, both companies, and their names.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_moves_to_another_company_and_the_move_is_audited(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let acme_contact = common::seed_billing_contact(&f.pool, f.acme).await;
@@ -131,7 +132,7 @@ async fn a_draft_moves_to_another_company_and_the_move_is_audited(pool: PgPool) 
 
 /// Naming one of the new company's contacts in the same request keeps it;
 /// naming one of the old company's is refused against the new company.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_billing_contact_follows_the_new_company(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let acme_contact = common::seed_billing_contact(&f.pool, f.acme).await;
@@ -158,7 +159,7 @@ async fn the_billing_contact_follows_the_new_company(pool: PgPool) {
 
 /// Once sent, the customer holds it: the company is locked, and the refusal
 /// says what to do instead.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_sent_invoice_cannot_move(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let invoice = f.draft(f.acme, None).await;
@@ -183,7 +184,7 @@ async fn a_sent_invoice_cannot_move(pool: PgPool) {
 /// found. An FK check bypasses RLS, so another tenant's company id satisfies
 /// it; an invoice, a generated invoice and an unapplied payment would each
 /// have named a company the caller cannot see.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_foreign_company_cannot_be_created_against(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let (other_tenant, _, _, _) = common::seed_tenant_with_admin(&f.pool, "other-msp").await;
@@ -265,7 +266,7 @@ async fn a_foreign_company_cannot_be_created_against(pool: PgPool) {
 /// PMS-999: the invoice is sent first, because a payment against a draft is
 /// now refused before the company is ever compared. Sending it is what keeps
 /// this test about the company check rather than about the status one.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_payment_still_has_to_match_its_invoices_company(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let invoice = f.draft(f.acme, None).await;
@@ -299,7 +300,7 @@ async fn a_payment_still_has_to_match_its_invoices_company(pool: PgPool) {
 
 /// Another tenant's company, or one that does not exist, is refused: the FK
 /// alone would accept the first, because it bypasses RLS.
-#[sqlx::test]
+#[mokosh_test]
 async fn only_a_company_of_this_organization_is_accepted(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let (other_tenant, _, _, _) = common::seed_tenant_with_admin(&f.pool, "other-msp").await;
@@ -324,7 +325,7 @@ async fn only_a_company_of_this_organization_is_accepted(pool: PgPool) {
 }
 
 /// Naming the company it already has is not a move.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_same_company_is_not_a_move(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let contact = common::seed_billing_contact(&f.pool, f.acme).await;
@@ -342,7 +343,7 @@ async fn the_same_company_is_not_a_move(pool: PgPool) {
 /// A draft whose contents are its company's stays with its company, and the
 /// refusal names what holds it there. Each case is set up directly, then the
 /// invoice is shown to be unchanged.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_draft_holding_its_companys_work_stays_put(pool: PgPool) {
     let f = Fixture::new(pool).await;
 

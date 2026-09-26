@@ -448,8 +448,8 @@ async fn request_approval_on_ticket(
 
 async fn delete_ticket(
     State(state): State<TicketRouterState>,
-    RequireAuth(user): RequireAuth,
     _manager: RequireManager,
+    RequireAuth(user): RequireAuth,
     ctx: crate::modules::audit::AuditCtx,
     Path(ticket_id): Path<Uuid>,
 ) -> AppResult<()> {

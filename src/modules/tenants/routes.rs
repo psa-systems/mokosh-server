@@ -239,11 +239,13 @@ async fn list_tenants(
     _platform: RequirePlatformAdmin,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<TenantResponse>>> {
-    pagination.reject_unsupported_sort()?;
     let (tenants, total) = state.tenant_service.list_tenants(&pagination).await?;
 
     let response = PaginatedResponse::from_params(
-        tenants.into_iter().map(TenantResponse::from).collect(),
+        tenants
+            .into_iter()
+            .map(|(tenant, user_count)| TenantResponse::from_tenant(tenant, user_count))
+            .collect(),
         &pagination,
         total,
     );
@@ -556,8 +558,8 @@ async fn upload_current_logo(
 /// broken image in every email the tenant sends.
 async fn delete_current_logo(
     State(state): State<TenantRouterState>,
-    RequireAuth(user): RequireAuth,
     _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
     ctx: crate::modules::audit::AuditCtx,
 ) -> AppResult<Json<TenantResponse>> {
     let tenant_id = user.tenant();

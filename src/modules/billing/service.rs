@@ -553,31 +553,21 @@ impl BillingService {
     /// `contacts.company_id` scalar (which PMS-806 keeps as the mirror of the
     /// primary link) and a `contact_companies` row for a contact who works at
     /// several companies.
+    ///
+    /// PMS-1000: the rule itself moved to `contacts::billing_contact`, because
+    /// the quote flow asks the same question and two copies would drift on
+    /// what "a contact of this company" means. This stays as the name the
+    /// invoice paths already call.
     async fn assert_billing_contact_for_company(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         company_id: Uuid,
         contact_id: Uuid,
     ) -> AppResult<()> {
-        let found: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM contacts c \
-             WHERE c.tenant_id = $1 AND c.id = $3 \
-               AND (c.company_id = $2 \
-                    OR EXISTS(SELECT 1 FROM contact_companies l \
-                              WHERE l.tenant_id = $1 AND l.contact_id = c.id \
-                                AND l.company_id = $2)))",
+        crate::modules::contacts::billing_contact::assert_for_company(
+            tx, tenant_id, company_id, contact_id,
         )
-        .bind(tenant_id)
-        .bind(company_id)
-        .bind(contact_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !found {
-            return Err(AppError::BadRequest(
-                "billing_contact_id does not reference a contact of this company".to_string(),
-            ));
-        }
-        Ok(())
+        .await
     }
 
     /// PMS-990: the due date, and the term it came from.
@@ -668,27 +658,17 @@ impl BillingService {
     /// A company with no pointer still yields none, and the send-time guard is
     /// unchanged: `resolve_invoice_recipient` still runs and still refuses a
     /// send that resolves nobody.
+    ///
+    /// PMS-1000: shared with the quote flow, which needs the same answer at
+    /// create and at send.
     async fn resolve_billing_contact(
         tx: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         company_id: Uuid,
         requested: Option<Uuid>,
     ) -> AppResult<Option<Uuid>> {
-        // PMS-993: an explicitly named contact is validated against this
-        // company and tenant first. FK checks bypass RLS, so an unchecked id
-        // could address the invoice to another tenant's contact.
-        if let Some(contact_id) = requested {
-            Self::assert_billing_contact_for_company(tx, tenant_id, company_id, contact_id).await?;
-            return Ok(requested);
-        }
-        let default_contact: Option<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT default_billing_contact_id FROM companies WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id)
-        .bind(company_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        Ok(default_contact.flatten())
+        crate::modules::contacts::billing_contact::resolve(tx, tenant_id, company_id, requested)
+            .await
     }
 
     /// Fill in `company_name` on a batch of invoice responses (PMS-186), and
@@ -1078,32 +1058,91 @@ impl BillingService {
             }
         }
 
-        for line in &request.lines {
-            sqlx::query(
-                r#"
-                INSERT INTO invoice_lines (
-                    id, invoice_id, line_type, description, quantity, unit_price,
-                    total, ticket_id, project_id, sort_order, product_id, is_taxable
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                        COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = $11), $12))
-                "#,
+        // PMS-1381 (F6): one batched multi-row insert for the whole
+        // request instead of one `INSERT` per line.
+        sqlx::query(
+            r#"
+            INSERT INTO invoice_lines (
+                id, invoice_id, line_type, description, quantity, unit_price,
+                total, ticket_id, project_id, sort_order, product_id, is_taxable
             )
-            .bind(Uuid::new_v4())
-            .bind(invoice_id)
-            .bind(line.line_type.as_str())
-            .bind(&line.description)
-            .bind(line.quantity)
-            .bind(line.unit_price)
-            .bind(line.quantity * line.unit_price)
-            .bind(line.ticket_id)
-            .bind(line.project_id)
-            .bind(line.sort_order)
-            .bind(line.product_id)
-            .bind(line.is_taxable)
-            .execute(&mut *tx)
-            .await?;
-        }
+            SELECT gen_random_uuid(), $1, t.line_type, t.description, t.quantity,
+                   t.unit_price, t.total, t.ticket_id, t.project_id, t.sort_order,
+                   t.product_id,
+                   COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = t.product_id), t.is_taxable)
+            FROM UNNEST($2::text[], $3::text[], $4::numeric[], $5::numeric[], $6::numeric[],
+                        $7::uuid[], $8::uuid[], $9::int[], $10::uuid[], $11::bool[])
+                 AS t(line_type, description, quantity, unit_price, total, ticket_id,
+                      project_id, sort_order, product_id, is_taxable)
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.line_type.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.description.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(request.lines.iter().map(|l| l.quantity).collect::<Vec<_>>())
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.unit_price)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.quantity * l.unit_price)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.ticket_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.project_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.sort_order)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.product_id)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.is_taxable)
+                .collect::<Vec<_>>(),
+        )
+        .execute(&mut *tx)
+        .await?;
         // PMS-1029: tax from the lines just written, in this transaction.
         Self::apply_tax(
             &mut tx,
@@ -1793,6 +1832,25 @@ impl BillingService {
         let contact_line = org.contact_line("Questions about this invoice?", None);
         let gateway = matches!(self.has_active_gateway(tenant_id).await, Ok(true));
 
+        // PMS-1381 (F4): one batch lookup for every distinct company in this
+        // sweep instead of one `company_portal_id` transaction per claim.
+        let portal_ids = if gateway && self.portal_origin.is_some() {
+            let company_ids: Vec<Uuid> = claims
+                .iter()
+                .map(|claim| claim.invoice.company_id)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            self.company_portal_ids(tenant_id, &company_ids)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(target: "mokosh_server.billing", tenant_id = %tenant_id, error = %e, "invoice reminder: batch portal id lookup failed, linking the generic login");
+                    std::collections::HashMap::new()
+                })
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let mut sent = Vec::new();
         for claim in claims {
             let pdf = super::documents::read_issued(tenant_id.get(), claim.invoice.id).await;
@@ -1800,13 +1858,7 @@ impl BillingService {
                 (Some(origin), true) => {
                     // PMS-1168: same builder as the send path, so the two
                     // cannot drift from the router separately again.
-                    let portal_id = self
-                        .company_portal_id(tenant_id, claim.invoice.company_id)
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(target: "mokosh_server.billing", invoice_id = %claim.invoice.id, error = %e, "invoice reminder: portal id lookup failed, linking the generic login");
-                            None
-                        });
+                    let portal_id = portal_ids.get(&claim.invoice.company_id).copied().flatten();
                     Self::portal_pay_link(origin, portal_id)
                 }
                 _ => None,
@@ -2094,7 +2146,11 @@ impl BillingService {
         // a setup fee added in March would bill again in April under a new
         // period key. If the claim matches nothing another run took it, and the
         // whole transaction rolls back rather than billing it twice.
-        for (idx, item) in items.iter().enumerate() {
+        // PMS-1381 (F6): the per-"once"-item claim stays a row-by-row UPDATE
+        // (it is a per-row idempotency claim, not a batchable insert), but the
+        // `invoice_lines` insert that follows every claim batches into one
+        // multi-row `INSERT` for the whole item set.
+        for item in &items {
             if item.billing_rule == "once" {
                 let claimed: Option<Uuid> = sqlx::query_scalar(
                     "UPDATE contract_items SET billed_at = NOW(), updated_at = NOW() \
@@ -2108,31 +2164,39 @@ impl BillingService {
                     return Ok(None);
                 }
             }
-            sqlx::query(
-                r#"
-                INSERT INTO invoice_lines (
-                    id, invoice_id, line_type, description, quantity, unit_price,
-                    total, sort_order, product_id, is_taxable
-                )
-                VALUES ($1, $2, 'service', $3, $4, $5, $6, $7, $8,
-                        COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = $8), TRUE))
-                "#,
-            )
-            .bind(Uuid::new_v4())
-            .bind(invoice_id)
-            .bind(&item.name)
-            .bind(item.quantity)
-            .bind(item.unit_price)
-            .bind(item.quantity * item.unit_price)
-            .bind(idx as i32)
-            // PMS-955: the item's catalog link travels onto the line it
-            // becomes. The PRICE does not: `item.unit_price` is what the
-            // contract agreed, and re-reading the catalog here would re-price
-            // a signed contract every time somebody edited the price list.
-            .bind(item.product_id)
-            .execute(&mut *tx)
-            .await?;
         }
+        sqlx::query(
+            r#"
+            INSERT INTO invoice_lines (
+                id, invoice_id, line_type, description, quantity, unit_price,
+                total, sort_order, product_id, is_taxable
+            )
+            SELECT gen_random_uuid(), $1, 'service', t.name, t.quantity, t.unit_price,
+                   t.total, t.sort_order, t.product_id,
+                   COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = t.product_id), TRUE)
+            FROM UNNEST($2::text[], $3::numeric[], $4::numeric[], $5::numeric[],
+                        $6::int[], $7::uuid[])
+                 AS t(name, quantity, unit_price, total, sort_order, product_id)
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(items.iter().map(|i| i.name.as_str()).collect::<Vec<_>>())
+        .bind(items.iter().map(|i| i.quantity).collect::<Vec<_>>())
+        .bind(items.iter().map(|i| i.unit_price).collect::<Vec<_>>())
+        .bind(
+            items
+                .iter()
+                .map(|i| i.quantity * i.unit_price)
+                .collect::<Vec<_>>(),
+        )
+        .bind((0..items.len() as i32).collect::<Vec<_>>())
+        // PMS-955: the item's catalog link travels onto the line it
+        // becomes. The PRICE does not: `item.unit_price` is what the
+        // contract agreed, and re-reading the catalog here would re-price
+        // a signed contract every time somebody edited the price list.
+        .bind(items.iter().map(|i| i.product_id).collect::<Vec<_>>())
+        .execute(&mut *tx)
+        .await?;
 
         // PMS-1029: a recurring invoice names no rate, so the tenant's default
         // applies over the lines just written.
@@ -3115,6 +3179,28 @@ impl BillingService {
         Ok(portal_id.flatten())
     }
 
+    /// Batch form of [`Self::company_portal_id`] for a reminder sweep: one
+    /// read-only query for every distinct company in the batch (PMS-1381,
+    /// F4) rather than one transaction per claim. No transaction needed for
+    /// a read-only lookup with no follow-up write.
+    async fn company_portal_ids(
+        &self,
+        tenant_id: TenantId,
+        company_ids: &[Uuid],
+    ) -> AppResult<std::collections::HashMap<Uuid, Option<i64>>> {
+        if company_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<(Uuid, Option<i64>)> =
+            sqlx::query_as("SELECT id, portal_id FROM companies WHERE id = ANY($1)")
+                .bind(company_ids)
+                .fetch_all(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(rows.into_iter().collect())
+    }
+
     pub async fn has_active_gateway(&self, tenant_id: TenantId) -> AppResult<bool> {
         Ok(!self.usable_providers(tenant_id).await?.is_empty())
     }
@@ -4093,36 +4179,45 @@ impl BillingService {
                 .bind(invoice_id)
                 .execute(&mut *tx)
                 .await?;
-            let mut sub = Decimal::ZERO;
-            for line in lines {
-                let line_total = line.quantity * line.unit_price;
-                sub += line_total;
-                sqlx::query(
-                    r#"
-                    INSERT INTO invoice_lines (
-                        id, invoice_id, line_type, description, quantity,
-                        unit_price, total, ticket_id, project_id, sort_order,
-                        product_id, is_taxable
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                            COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = $11), $12))
-                    "#,
+            let sub: Decimal = lines.iter().map(|l| l.quantity * l.unit_price).sum();
+            // PMS-1381 (F6): one batched multi-row insert for the whole
+            // replacement set, once the delete has run, instead of one
+            // `INSERT` per line.
+            sqlx::query(
+                r#"
+                INSERT INTO invoice_lines (
+                    id, invoice_id, line_type, description, quantity,
+                    unit_price, total, ticket_id, project_id, sort_order,
+                    product_id, is_taxable
                 )
-                .bind(Uuid::new_v4())
-                .bind(invoice_id)
-                .bind(line.line_type.as_str())
-                .bind(&line.description)
-                .bind(line.quantity)
-                .bind(line.unit_price)
-                .bind(line_total)
-                .bind(line.ticket_id)
-                .bind(line.project_id)
-                .bind(line.sort_order)
-                .bind(line.product_id)
-                .bind(line.is_taxable)
-                .execute(&mut *tx)
-                .await?;
-            }
+                SELECT gen_random_uuid(), $1, t.line_type, t.description, t.quantity,
+                       t.unit_price, t.total, t.ticket_id, t.project_id, t.sort_order,
+                       t.product_id,
+                       COALESCE((SELECT p.is_taxable FROM products p WHERE p.id = t.product_id), t.is_taxable)
+                FROM UNNEST($2::text[], $3::text[], $4::numeric[], $5::numeric[], $6::numeric[],
+                            $7::uuid[], $8::uuid[], $9::int[], $10::uuid[], $11::bool[])
+                     AS t(line_type, description, quantity, unit_price, total, ticket_id,
+                          project_id, sort_order, product_id, is_taxable)
+                "#,
+            )
+            .bind(invoice_id)
+            .bind(lines.iter().map(|l| l.line_type.as_str()).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.description.as_str()).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.quantity).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.unit_price).collect::<Vec<_>>())
+            .bind(
+                lines
+                    .iter()
+                    .map(|l| l.quantity * l.unit_price)
+                    .collect::<Vec<_>>(),
+            )
+            .bind(lines.iter().map(|l| l.ticket_id).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.project_id).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.sort_order).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.product_id).collect::<Vec<_>>())
+            .bind(lines.iter().map(|l| l.is_taxable).collect::<Vec<_>>())
+            .execute(&mut *tx)
+            .await?;
             sub
         } else {
             current.subtotal
@@ -5757,27 +5852,60 @@ impl BillingService {
         .execute(&mut *tx)
         .await?;
 
-        for line in &request.lines {
-            sqlx::query(
-                r#"
-                INSERT INTO credit_note_lines (
-                    id, credit_note_id, line_type, description, quantity,
-                    unit_price, total, sort_order
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                "#,
+        // PMS-1381 (F6): one batched multi-row insert for the whole request
+        // instead of one `INSERT` per line.
+        sqlx::query(
+            r#"
+            INSERT INTO credit_note_lines (
+                id, credit_note_id, line_type, description, quantity,
+                unit_price, total, sort_order
             )
-            .bind(Uuid::new_v4())
-            .bind(credit_note_id)
-            .bind(line.line_type.as_str())
-            .bind(&line.description)
-            .bind(line.quantity)
-            .bind(line.unit_price)
-            .bind(line.quantity * line.unit_price)
-            .bind(line.sort_order)
-            .execute(&mut *tx)
-            .await?;
-        }
+            SELECT gen_random_uuid(), $1, t.line_type, t.description, t.quantity,
+                   t.unit_price, t.total, t.sort_order
+            FROM UNNEST($2::text[], $3::text[], $4::numeric[], $5::numeric[],
+                        $6::numeric[], $7::int[])
+                 AS t(line_type, description, quantity, unit_price, total, sort_order)
+            "#,
+        )
+        .bind(credit_note_id)
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.line_type.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.description.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .bind(request.lines.iter().map(|l| l.quantity).collect::<Vec<_>>())
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.unit_price)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.quantity * l.unit_price)
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.sort_order)
+                .collect::<Vec<_>>(),
+        )
+        .execute(&mut *tx)
+        .await?;
 
         Self::recompute_invoice_balance(&mut tx, tenant_id, request.invoice_id).await?;
 

@@ -34,6 +34,7 @@ use mokosh_server::modules::time_tracking::{
 };
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -56,7 +57,7 @@ fn d(y: i32, m: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, day).unwrap()
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn time_entries_list_handles_every_filter_combination(pool: PgPool) {
     let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();
@@ -91,7 +92,7 @@ async fn time_entries_list_handles_every_filter_combination(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn timesheets_list_handles_every_filter_combination(pool: PgPool) {
     let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();
@@ -118,7 +119,7 @@ async fn timesheets_list_handles_every_filter_combination(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn appointments_list_handles_every_filter_combination(pool: PgPool) {
     let svc = CalendarService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();
@@ -152,13 +153,13 @@ async fn appointments_list_handles_every_filter_combination(pool: PgPool) {
         },
     ];
     for (i, filter) in combos.iter().enumerate() {
-        svc.list_appointments(tenant(), filter, &page())
+        svc.list_appointments(tenant(), Uuid::nil(), filter, &page())
             .await
             .unwrap_or_else(|e| panic!("list_appointments combo {i} must not error: {e:?}"));
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn kb_articles_list_handles_every_filter_combination(pool: PgPool) {
     let svc = KbService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();
@@ -186,6 +187,22 @@ async fn kb_articles_list_handles_every_filter_combination(pool: PgPool) {
             status: Some("published".to_string()),
             visibility: Some("internal".to_string()),
             q: Some("printer".to_string()),
+            ..Default::default()
+        },
+        KbArticleFilter {
+            company_id: Some(id),
+            ..Default::default()
+        },
+        KbArticleFilter {
+            parent_article_id: Some(id),
+            ..Default::default()
+        },
+        // Company + parent together names "the variants this company owns
+        // of that generic article", the per-client documentation view.
+        KbArticleFilter {
+            company_id: Some(id),
+            parent_article_id: Some(id),
+            ..Default::default()
         },
     ];
     for (i, filter) in combos.iter().enumerate() {
@@ -195,7 +212,7 @@ async fn kb_articles_list_handles_every_filter_combination(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn contracts_list_handles_every_filter_combination(pool: PgPool) {
     let svc = ContractsService::new(Database::from_pool(pool.clone()));
     let id = Uuid::new_v4();

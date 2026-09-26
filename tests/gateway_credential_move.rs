@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -129,7 +130,7 @@ fn working_store(pool: &PgPool) -> Arc<dyn SecretProvider> {
     ))
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_credential_moves_and_the_column_is_cleared(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     seed_legacy_gateway(&pool, tenant, "stripe", "sk_test_moved").await;
@@ -153,7 +154,7 @@ async fn a_credential_moves_and_the_column_is_cleared(pool: PgPool) {
 
 /// The pass is one query returning no rows once everything has moved, and a
 /// second run must not undo or re-do anything.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_second_pass_finds_nothing_to_do(pool: PgPool) {
     seed_legacy_gateway(&pool, common::DEFAULT_TENANT_ID, "stripe", "sk_test_x").await;
     let mover = mover(&pool, working_store(&pool));
@@ -166,7 +167,7 @@ async fn a_second_pass_finds_nothing_to_do(pool: PgPool) {
 
 /// An outage leaves the row exactly as it was, so the gateway keeps working off
 /// its column and the next tick retries.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unreachable_store_changes_nothing(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     seed_legacy_gateway(&pool, tenant, "stripe", "sk_test_kept").await;
@@ -189,7 +190,7 @@ async fn an_unreachable_store_changes_nothing(pool: PgPool) {
 /// The failure the read-back exists to catch: a store that reports success and
 /// does not have the value. Clearing the column here would destroy the only
 /// remaining copy of a live API key.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_store_that_forgets_the_write_does_not_clear_the_column(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     seed_legacy_gateway(&pool, tenant, "stripe", "sk_test_survives").await;
@@ -210,7 +211,7 @@ async fn a_store_that_forgets_the_write_does_not_clear_the_column(pool: PgPool) 
 
 /// A credential this deployment's key cannot decrypt is reported and left, not
 /// replaced with a blank. This is the shape of the failure PMS-912 named.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_credential_that_cannot_be_decrypted_is_left_alone(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     sqlx::query(
@@ -239,7 +240,7 @@ async fn a_credential_that_cannot_be_decrypted_is_left_alone(pool: PgPool) {
 /// store address this legacy column would move to. The mover must defer to
 /// it (never call `put`, which `AlreadyClaimedStore` would panic on) and must
 /// still clear the now-redundant column.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_store_already_holding_a_credential_is_never_overwritten(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
     seed_legacy_gateway(&pool, tenant, "stripe", "sk_test_stale").await;
@@ -261,7 +262,7 @@ async fn a_store_already_holding_a_credential_is_never_overwritten(pool: PgPool)
 }
 
 /// One tenant's failure does not stop another tenant's move.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_failing_row_does_not_block_the_rest(pool: PgPool) {
     let (other, _u, _e, _p) = common::seed_tenant_with_admin(&pool, "movertenant").await;
     sqlx::query(
@@ -292,7 +293,7 @@ async fn a_failing_row_does_not_block_the_rest(pool: PgPool) {
 /// it is the one that would break silently: the webhook fetches the very secret
 /// it needs to check the signature, so a credential the store cannot return is
 /// a 401 and a payment that never reconciles.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_moved_credential_still_serves_the_webhook(pool: PgPool) {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;

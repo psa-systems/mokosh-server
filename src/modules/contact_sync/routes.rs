@@ -419,8 +419,8 @@ async fn get_provenance(
 
 async fn release_lock(
     State(state): State<ContactSyncRouterState>,
-    RequireAuth(user): RequireAuth,
     _manager: RequireManager,
+    RequireAuth(user): RequireAuth,
     ctx: AuditCtx,
     Path((contact_id, field)): Path<(Uuid, String)>,
 ) -> AppResult<StatusCode> {

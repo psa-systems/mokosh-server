@@ -13,6 +13,7 @@ use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::invitations::{CreateInvitationRequest, InvitationsService};
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -66,7 +67,7 @@ async fn flag(pool: &PgPool, tenant_id: Uuid) -> Option<bool> {
 
 /// With the flag off, a direct request to any timesheet route is answered the
 /// way a nonexistent route is. Not hidden in the client, not 403.
-#[sqlx::test]
+#[mokosh_test]
 async fn every_timesheet_route_is_gone_when_the_flag_is_off(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     set_flag(&pool, common::DEFAULT_TENANT_ID, false).await;
@@ -92,7 +93,7 @@ async fn every_timesheet_route_is_gone_when_the_flag_is_off(pool: PgPool) {
 }
 
 /// And with it on, the same routes behave as they did before the gate existed.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_routes_are_unchanged_when_the_flag_is_on(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     // The default tenant is `kind = 'org'`, so migration 120 seeds it on. Assert
@@ -114,7 +115,7 @@ async fn the_routes_are_unchanged_when_the_flag_is_on(pool: PgPool) {
 /// Turning timesheets off does not stop anybody working. `time_tracking` is a
 /// separate module for this reason: a one-person MSP still logs time and still
 /// bills for it, it just has nobody to submit a week to.
-#[sqlx::test]
+#[mokosh_test]
 async fn logging_time_still_works_with_timesheets_off(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -158,7 +159,7 @@ async fn logging_time_still_works_with_timesheets_off(pool: PgPool) {
 /// migration 120 rather than restated, so this cannot drift from the SQL that
 /// actually ran on every existing database; migrations are immutable once
 /// committed, which is what makes the file safe to quote.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_seeding_rule_follows_the_tenant_kind(pool: PgPool) {
     let personal = Uuid::new_v4();
     let org = Uuid::new_v4();
@@ -208,7 +209,7 @@ async fn the_seeding_rule_follows_the_tenant_kind(pool: PgPool) {
 /// the moment timesheets start to mean something. Without this the promoted
 /// tenant would keep the answer it was given when it was one person: an
 /// employer with staff and no timesheets, until somebody found the setting.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_first_invitation_turns_timesheets_on(pool: PgPool) {
     let tenant_id = Uuid::new_v4();
     sqlx::query(
@@ -274,7 +275,7 @@ async fn the_first_invitation_turns_timesheets_on(pool: PgPool) {
 /// An established org that turned timesheets off keeps them off. The flag
 /// follows the PROMOTION, not every invitation, so an operator's decision is
 /// not undone by the next person they hire.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_later_invitation_does_not_re_enable_a_deliberate_off(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
     set_flag(&pool, common::DEFAULT_TENANT_ID, false).await;
@@ -302,7 +303,7 @@ async fn a_later_invitation_does_not_re_enable_a_deliberate_off(pool: PgPool) {
 
 /// Break tracking is off until an employer says otherwise, and it is a tenant
 /// setting because the employee taking the break is the MSP's. PMS-950 reads it.
-#[sqlx::test]
+#[mokosh_test]
 async fn break_tracking_defaults_off_and_is_settable(pool: PgPool) {
     let db = Database::from_pool(pool.clone());
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);

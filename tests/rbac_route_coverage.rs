@@ -15,6 +15,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use sqlx::PgPool;
 
@@ -87,7 +88,7 @@ async fn assert_matrix(
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn role_route_coverage_matrix(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let tokens = tokens_per_role(&app, &pool).await;
@@ -180,6 +181,11 @@ async fn role_route_coverage_matrix(pool: PgPool) {
     // Admin -> Team (invitations / Send invite) and Admin -> Audit Log.
     assert_matrix(&app, &tokens, "/api/v1/invitations", ADMIN_ROLES).await;
     assert_matrix(&app, &tokens, "/api/v1/audit-log", ADMIN_ROLES).await;
+
+    // PMS-1310: deciding that Xero issues this MSP's invoices is not a
+    // technician's call, and the connect route on the same prefix takes a
+    // credential.
+    assert_matrix(&app, &tokens, "/api/v1/integrations", ADMIN_ROLES).await;
 
     // Admin -> Team (user list) is manager-and-up.
     assert_matrix(&app, &tokens, "/api/v1/auth/users", MANAGER_ROLES).await;

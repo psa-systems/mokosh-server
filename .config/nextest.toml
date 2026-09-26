@@ -3,7 +3,37 @@
 # `just test-integration`, so CI and the local recipe run the identical
 # profile (PMS-1177).
 
+# PMS-1394: which suites run on every pull request and which do not, decided
+# HERE and in one place.
+#
+# A suite belongs in `UNSUPPORTED` when it covers functionality nothing
+# currently uses, and when standing it up costs the job real setup. The S3
+# storage suite is both: `STORAGE_BACKEND` defaults to `local` and no
+# deployment sets `s3` today, and running it means pulling a MinIO image,
+# extracting its server binary, checksumming it and health-polling it before a
+# single assertion runs. That setup is also the fragile part - a third-party
+# rehost of an archived upstream, which retracted anonymous pulls once already
+# and broke this job on every branch at once (PMS-1390).
+#
+# What is deliberately NOT given up: the code stays, the tests stay, and they
+# are still COMPILED by the pull-request job, because `cargo nextest archive`
+# builds every `tests/*.rs` binary whatever the filter says. A change that
+# stops `tests/s3_storage.rs` compiling still fails the PR. What moves is only
+# how often the assertions are executed, to weekly in
+# `integration-unsupported.yml`.
+#
+# The two filters are complements over the same list, so a suite is in exactly
+# one of them and adding a second unsupported suite is one edit in each. Do not
+# repeat either expression in a workflow: a filter in a YAML file is a second
+# home for this decision, and the point of putting it here is that the local
+# recipe and CI cannot disagree about what ran.
+
 [profile.ci]
+# Everything except the unsupported suites. `default-filter` rather than an
+# `-E` on the command line so `just test-integration` and the CI job select the
+# same set without either naming it.
+default-filter = 'not binary(s3_storage)'
+
 # nextest schedules test CASES across every archived binary at once instead
 # of running one binary to completion before starting the next (what
 # `cargo test --tests` did), which is the whole point of the switch: most of
@@ -38,3 +68,20 @@ terminate-after = 3
 [[profile.ci.overrides]]
 filter = 'test(health_p99_does_not_regress_under_concurrent_argon2_burst)'
 threads-required = "num-test-threads"
+
+# PMS-1394: the complement of `ci`, run weekly by
+# `integration-unsupported.yml` and locally by
+# `just test-integration-unsupported`.
+#
+# It inherits `ci`'s settings by naming it as its base, so the slow-timeout,
+# the failure policy and the thread budget cannot drift from the suite this one
+# was split out of. Only the filter differs.
+[profile.unsupported]
+inherits = "ci"
+default-filter = 'binary(s3_storage)'
+
+# The whole point of this profile is a suite that needs external setup, so a
+# failure has to say what it was. Printing the output of a failing case
+# immediately means the weekly run's log carries the reason without anyone
+# re-running it locally with a MinIO of their own.
+failure-output = "immediate-final"

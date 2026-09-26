@@ -22,7 +22,9 @@
 //! not gated on `multi-tenant`, and a single-tenant build has branding too.
 
 use serde_json::Value;
+use uuid::Uuid;
 
+use crate::db::Database;
 use crate::modules::settings::models::is_hex_color;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::validation::validate_email;
@@ -240,6 +242,100 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
             KNOWN_KEYS.join(", ")
         )),
     }
+}
+
+/// PMS-1371: confirm every `logo_url` / `favicon_url` / `background_url` in a
+/// branding patch names a public asset the caller's own tenant actually
+/// owns, not merely a value that starts with a legal prefix.
+///
+/// `validate_branding_patch` / `validate_company_branding_patch` (above)
+/// already confirmed the value is a string starting with
+/// [`PUBLIC_TENANT_PATH_PREFIX`] or [`PUBLIC_COMPANY_PATH_PREFIX`]
+/// (PMS-1197); that check is prefix-only and never looked at the id
+/// segment that follows, so tenant A could set its own `logo_url` to a real
+/// asset path belonging to tenant B and have it accepted. This narrows the
+/// id: for the tenant prefix it must equal the caller's own `tenant_id`,
+/// and for the company prefix it must name a company row that belongs to
+/// the caller's own tenant.
+///
+/// Called separately from the shape check above because the tenant id is
+/// only available at the callers (`TenantService::update_tenant`,
+/// `ContactsService::update_company`, `ContactAuthService::update_own_company_branding`,
+/// and the per-key settings write), never inside the free function. Reads
+/// the migrator pool with an explicit tenant filter, the same
+/// belt-and-braces shape `PortalRoleService::create_role`'s company check
+/// uses, rather than relying solely on RLS.
+pub async fn assert_branding_patch_owned_by_tenant(
+    patch: &Value,
+    tenant_id: Uuid,
+    db: &Database,
+) -> AppResult<()> {
+    let Some(obj) = patch.as_object() else {
+        return Ok(());
+    };
+    for (key, value) in obj {
+        assert_branding_value_owned_by_tenant(key, value, tenant_id, db)
+            .await
+            .map_err(|message| AppError::validation_field(format!("branding.{key}"), message))?;
+    }
+    Ok(())
+}
+
+/// The single-key twin of [`assert_branding_patch_owned_by_tenant`], for the
+/// per-key settings write (`PUT /api/v1/settings/branding/{key}`), which
+/// validates one key at a time rather than a whole document.
+pub async fn assert_branding_value_owned_by_tenant(
+    key: &str,
+    value: &Value,
+    tenant_id: Uuid,
+    db: &Database,
+) -> Result<(), String> {
+    if !matches!(key, "logo_url" | "favicon_url" | "background_url") {
+        return Ok(());
+    }
+    let Some(s) = value.as_str() else {
+        // Not a string: the shape check above has already refused this, or
+        // will; nothing further to say here.
+        return Ok(());
+    };
+    if let Some(rest) = s.strip_prefix(PUBLIC_TENANT_PATH_PREFIX) {
+        return match path_owner_id(rest) {
+            Some(id) if id == tenant_id => Ok(()),
+            _ => Err(cross_tenant_message(key)),
+        };
+    }
+    if let Some(rest) = s.strip_prefix(PUBLIC_COMPANY_PATH_PREFIX) {
+        let Some(company_id) = path_owner_id(rest) else {
+            return Err(cross_tenant_message(key));
+        };
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM companies WHERE id = $1 AND tenant_id = $2)",
+        )
+        .bind(company_id)
+        .bind(tenant_id)
+        .fetch_one(db.migrator_pool())
+        .await
+        .map_err(|e| e.to_string())?;
+        return if owned {
+            Ok(())
+        } else {
+            Err(cross_tenant_message(key))
+        };
+    }
+    // Neither prefix: the shape check above has already refused this.
+    Ok(())
+}
+
+/// The UUID segment immediately after a matched prefix, up to the next `/`.
+/// Matches how [`super::logo::logo_path`] and the Company-asset route
+/// construct these paths.
+fn path_owner_id(rest: &str) -> Option<Uuid> {
+    let segment = rest.split('/').next().unwrap_or("");
+    Uuid::parse_str(segment).ok()
+}
+
+fn cross_tenant_message(key: &str) -> String {
+    format!("`{key}` must be a public tenant or company path the caller's own tenant owns")
 }
 
 /// Every key the table above accepts, for the message an unknown key gets.

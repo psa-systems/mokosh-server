@@ -15,6 +15,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::sync::Arc;
 
 use sqlx::PgPool;
@@ -89,7 +90,7 @@ async fn user_tenant_role(pool: &PgPool, sub: Uuid) -> (Uuid, String) {
         .expect("user row")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn invited_user_lands_in_inviting_tenant_as_admin(pool: PgPool) {
     // MAPPS-330: every Mokosh user is an admin of their own instance, even
     // when joining a shared org tenant via an invite. The invite still
@@ -149,7 +150,7 @@ async fn invited_user_lands_in_inviting_tenant_as_admin(pool: PgPool) {
 /// no longer an onboarding surface: fresh users arrive via the explicit
 /// invitations flow. Supersedes the pre-MAPPS-458
 /// `uninvited_user_gets_their_own_personal_tenant` behavior.
-#[sqlx::test]
+#[mokosh_test]
 async fn uninvited_bunyip_user_without_invite_is_rejected(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
@@ -187,7 +188,7 @@ async fn uninvited_bunyip_user_without_invite_is_rejected(pool: PgPool) {
 /// MAPPS-458: two uninvited (non-platform-admin) Bunyip users both get
 /// rejected. Neither gets a personal tenant. Supersedes the pre-MAPPS-458
 /// `two_uninvited_users_are_isolated_in_distinct_tenants` behavior.
-#[sqlx::test]
+#[mokosh_test]
 async fn two_uninvited_bunyip_users_are_both_rejected(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
@@ -209,7 +210,7 @@ async fn two_uninvited_bunyip_users_are_both_rejected(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn non_admin_stuck_in_default_tenant_is_backfilled_out(pool: PgPool) {
     // PMS-262 AC: a non-admin Bunyip user must never RESOLVE to the default
     // tenant. A user historically parked in the shared default tenant (id 1)
@@ -261,7 +262,7 @@ async fn non_admin_stuck_in_default_tenant_is_backfilled_out(pool: PgPool) {
     assert_eq!(owner, Some(sub), "the personal tenant is owned by the user");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn super_admin_in_default_tenant_stays(pool: PgPool) {
     // PMS-262 disposition pin: the default tenant is infra-only. A platform
     // super_admin legitimately lives there and is NOT backfilled out, so the
@@ -301,7 +302,7 @@ async fn super_admin_in_default_tenant_stays(pool: PgPool) {
     assert_eq!(role, "super_admin");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
     // PMS-248 gate, end to end: an invite is honored only for a VERIFIED email.
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
@@ -360,7 +361,7 @@ async fn unverified_email_does_not_consume_an_invite(pool: PgPool) {
     assert_eq!(still_pending, 1, "the invite is still pending");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn placement_seeds_off_psa_target_tenant_so_tickets_create(pool: PgPool) {
     // PMS-288: a user placed in a tenant provisioned off the PSA path (here a
     // manually-created org tenant with no copy_default_config) gets it seeded on
@@ -453,7 +454,7 @@ async fn placement_seeds_off_psa_target_tenant_so_tickets_create(pool: PgPool) {
 /// `platform_admins` + `/platform/login` in MAPPS-513 / MAPPS-518 and is
 /// bootstrapped from `ADMIN_EMAIL` / `ADMIN_PASSWORD` (see
 /// `auth::bootstrap`), not from a bunyip claim.
-#[sqlx::test]
+#[mokosh_test]
 async fn bootstrap_admin_unverified_email_still_authenticates(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
@@ -509,7 +510,7 @@ async fn bootstrap_admin_unverified_email_still_authenticates(pool: PgPool) {
 /// Pairs with `bootstrap_admin_unverified_email_still_authenticates`
 /// above; both were pinned at `SuperAdmin` pre-MAPPS-519 and flipped
 /// together when the bunyip `admin` promotion was retired.
-#[sqlx::test]
+#[mokosh_test]
 async fn bootstrap_admin_verified_email_still_authenticates(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
 
@@ -549,7 +550,7 @@ async fn bootstrap_admin_verified_email_still_authenticates(pool: PgPool) {
 /// `profile_completed_at` when both name claims arrive non-empty, so the
 /// SPA's AuthGuard sees `profile_completed = true` from `/auth/me` and lets
 /// the user land directly on the dashboard.
-#[sqlx::test]
+#[mokosh_test]
 async fn name_claims_stamp_profile_completed_at(pool: PgPool) {
     // MAPPS-458: brand-new bunyip user needs an invitation to be placed
     // (JIT personal-tenant provisioning was retired). Seed one so the
@@ -605,7 +606,7 @@ async fn name_claims_stamp_profile_completed_at(pool: PgPool) {
 /// user, magic-link signup pre-BUNYIP-206, etc.) leaves `profile_completed_at`
 /// NULL so the existing mokosh `/onboarding/profile` page kicks in as the
 /// fallback for that user.
-#[sqlx::test]
+#[mokosh_test]
 async fn missing_name_claims_leave_profile_incomplete(pool: PgPool) {
     // MAPPS-458: seed an invitation so placement succeeds; the point of
     // this test is the name-claims -> profile-completed-at bookkeeping,
@@ -659,7 +660,7 @@ async fn missing_name_claims_leave_profile_incomplete(pool: PgPool) {
 /// `PUT /auth/me` cannot set names (PMS-512 gave those to bunyip), so nothing
 /// stamped `profile_completed_at` and the AuthGuard sent the user straight
 /// back. `POST /auth/me/complete-onboarding` is what lets the screen finish.
-#[sqlx::test]
+#[mokosh_test]
 async fn complete_onboarding_stamps_the_profile_once(pool: PgPool) {
     // MAPPS-458: seed an invitation so placement succeeds; this test's
     // point is `mark_profile_completed`, not the pre-458 self-signup.
@@ -735,7 +736,7 @@ async fn complete_onboarding_stamps_the_profile_once(pool: PgPool) {
 /// writes ONLY on first completion (guarded by
 /// `WHERE profile_completed_at IS NULL`) so a later bunyip-refreshed
 /// name is not clobbered by a replay of the endpoint.
-#[sqlx::test]
+#[mokosh_test]
 async fn complete_onboarding_persists_names_on_first_call_and_locks_thereafter(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
@@ -810,7 +811,7 @@ async fn complete_onboarding_persists_names_on_first_call_and_locks_thereafter(p
 /// PMS-512: bunyip owns the profile names, so the local columns are a
 /// read-only cache refreshed on EVERY login, not just the JIT one. A rename in
 /// bunyip lands in `users.first_name` / `last_name` on the next placement.
-#[sqlx::test]
+#[mokosh_test]
 async fn name_claims_refresh_on_every_login(pool: PgPool) {
     // MAPPS-458: seed an invitation so the first placement succeeds;
     // the subsequent calls see the user as already-placed and exercise
@@ -870,7 +871,7 @@ async fn name_claims_refresh_on_every_login(pool: PgPool) {
 /// which caller reaches it. A re-run with fresh hints overwrites; a re-run
 /// with no hints keeps the stored values (the synthetic `EXCLUDED` fallback
 /// must never clobber a real name).
-#[sqlx::test]
+#[mokosh_test]
 async fn upsert_on_conflict_overwrites_names_only_from_non_empty_hints(pool: PgPool) {
     let (auth, _tenants, _invitations) = services(&pool);
     let tenant = common::DEFAULT_TENANT_ID;
@@ -927,7 +928,7 @@ async fn upsert_on_conflict_overwrites_names_only_from_non_empty_hints(pool: PgP
 /// PMS-512: `users.first_name` / `last_name` are `NOT NULL`, so a login whose
 /// claims are absent (scope not granted) or empty (whitespace-only) must leave
 /// the cached values intact rather than blanking the columns.
-#[sqlx::test]
+#[mokosh_test]
 async fn absent_or_empty_name_claims_leave_cached_names_intact(pool: PgPool) {
     // MAPPS-458: seed an invitation so the first placement succeeds.
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
@@ -1002,7 +1003,7 @@ async fn absent_or_empty_name_claims_leave_cached_names_intact(pool: PgPool) {
 // for an already-placed user with no pending invite, who is resolved from local
 // state.
 
-#[sqlx::test]
+#[mokosh_test]
 async fn userinfo_is_fetched_for_a_first_sight_user(pool: PgPool) {
     // No local placement yet -> userinfo IS needed to JIT-provision the user.
     let (auth, _tenants, invitations) = services(&pool);
@@ -1013,7 +1014,7 @@ async fn userinfo_is_fetched_for_a_first_sight_user(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn userinfo_is_skipped_for_an_existing_placed_user(pool: PgPool) {
     // The perf fix: an already-provisioned user in their own tenant with no
     // pending invite is resolved locally, so the per-request userinfo hop is
@@ -1063,7 +1064,7 @@ async fn userinfo_is_skipped_for_an_existing_placed_user(pool: PgPool) {
 // forced the `/oauth2/userinfo` round trip PMS-713 exists to skip, for every
 // request, for as long as the error recurred - reintroducing the multi-second
 // stall for an already-placed user during a DB blip.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_transient_read_failure_does_not_force_the_userinfo_round_trip(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
@@ -1107,7 +1108,7 @@ async fn a_transient_read_failure_does_not_force_the_userinfo_round_trip(pool: P
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn userinfo_is_fetched_when_a_pending_invite_matches(pool: PgPool) {
     // Invites still work: an existing user with a pending invite for their
     // verified email goes through the full (userinfo) path so it is honored.
@@ -1166,7 +1167,7 @@ async fn userinfo_is_fetched_when_a_pending_invite_matches(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn existing_user_resolves_with_no_userinfo(pool: PgPool) {
     // The fast path end to end: once provisioned, a user is resolved by
     // place_bunyip_user with NO email/name (the values the middleware passes when
@@ -1235,7 +1236,7 @@ async fn existing_user_resolves_with_no_userinfo(pool: PgPool) {
 
 /// PMS-698 AC1: a user whose `users.status` is not `active` is not placed, so
 /// the bunyip branch of `auth_middleware` never authenticates them.
-#[sqlx::test]
+#[mokosh_test]
 async fn inactive_user_is_not_placed(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let (auth, tenants, invitations) = services(&pool);
@@ -1292,7 +1293,7 @@ async fn inactive_user_is_not_placed(pool: PgPool) {
 /// fresh sub with no seeded row so the first placement JITs the user
 /// into a personal tenant of their own; we read that tenant and suspend
 /// it, and the second placement then hits AC2's rejection cleanly.
-#[sqlx::test]
+#[mokosh_test]
 async fn suspended_tenant_is_not_placed(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
     let sub = Uuid::new_v4();
@@ -1427,7 +1428,7 @@ async fn degrade_to_placeholder(pool: &PgPool, sub: Uuid) {
 /// `uninvited_bunyip_user_without_invite_is_rejected` covers verified and
 /// uninvited, `unverified_email_does_not_consume_an_invite` covers unverified
 /// with an invitation pending, and this one covers unverified AND uninvited.
-#[sqlx::test]
+#[mokosh_test]
 async fn unverified_uninvited_first_sight_is_refused_placement(pool: PgPool) {
     let (auth, tenants, invitations) = services(&pool);
     let sub = Uuid::new_v4();
@@ -1460,7 +1461,7 @@ async fn unverified_uninvited_first_sight_is_refused_placement(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn userinfo_is_fetched_while_the_row_holds_a_placeholder_email(pool: PgPool) {
     // The PMS-713 hop is skipped for placed users, which is what made the
     // placeholder permanent. A placeholder row must keep fetching userinfo:
@@ -1493,7 +1494,7 @@ async fn userinfo_is_fetched_while_the_row_holds_a_placeholder_email(pool: PgPoo
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn placeholder_email_is_repaired_once_bunyip_verifies_it(pool: PgPool) {
     // MAPPS-458: the row is placed by invitation and then degraded to the legacy
     // placeholder shape. Before MAPPS-458 an unverified first sight wrote that
@@ -1545,7 +1546,7 @@ async fn placeholder_email_is_repaired_once_bunyip_verifies_it(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_real_address_is_never_overwritten_by_the_repair(pool: PgPool) {
     // The repair only ever replaces the placeholder. A verified user whose
     // userinfo later reports a different address keeps the stored one (bunyip
@@ -1593,7 +1594,7 @@ async fn a_real_address_is_never_overwritten_by_the_repair(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_repaired_user_can_then_consume_a_pending_invite(pool: PgPool) {
     // The downstream consequence of the placeholder: `email_verified_at IS NULL`
     // plus a placeholder address means the invite gate can never open. After the

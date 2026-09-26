@@ -2,7 +2,7 @@
 //!
 //! `/api/v1/ready` runs a live DB ping plus a best-effort Infisical
 //! probe gated on `INFISICAL_ADDRESS`. The integration harness
-//! provisions a fresh per-test database via `#[sqlx::test]` and does
+//! provisions a fresh per-test database via `#[mokosh_test]` and does
 //! not configure Infisical, so the expected payload is:
 //!   `{"status":"ready","checks":{"db":"ok","infisical":"skipped"}}`
 //!
@@ -12,6 +12,7 @@
 mod common;
 
 use common::boot;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 /// Pin the harness premise: Infisical is unconfigured. `just
@@ -34,7 +35,7 @@ fn unconfigure_infisical() {
     });
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ready_returns_ok_when_db_reachable_and_infisical_unconfigured(pool: PgPool) {
     unconfigure_infisical();
     let app = boot(pool).await;
@@ -58,7 +59,7 @@ async fn ready_returns_ok_when_db_reachable_and_infisical_unconfigured(pool: PgP
     assert_eq!(body["checks"]["infisical"], "skipped");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn health_remains_plain_text_ok(pool: PgPool) {
     let app = boot(pool).await;
 
@@ -73,7 +74,7 @@ async fn health_remains_plain_text_ok(pool: PgPool) {
     assert_eq!(body, "OK", "health stays the cheap liveness probe");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ready_sets_cache_control_no_store(pool: PgPool) {
     unconfigure_infisical();
     let app = boot(pool).await;
@@ -96,7 +97,7 @@ async fn ready_sets_cache_control_no_store(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ready_returns_503_when_db_pool_closed(pool: PgPool) {
     unconfigure_infisical();
     // Close the pool before booting the app so the SELECT 1 inside

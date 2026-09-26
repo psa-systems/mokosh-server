@@ -19,6 +19,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use reqwest::multipart::{Form, Part};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -32,7 +33,7 @@ fn install_test_attachment_env() {
     std::env::set_var("ATTACHMENT_MAX_BYTES", "1024");
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn agent_upload_list_download_delete(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
@@ -106,7 +107,7 @@ async fn agent_upload_list_download_delete(pool: PgPool) {
     assert_eq!(del.status().as_u16(), 204);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn oversize_upload_returns_413(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
@@ -144,7 +145,7 @@ async fn oversize_upload_returns_413(pool: PgPool) {
 
 /// PMS-783 F6: the bytes behind one attachment URL never change, so a repeat
 /// view must cost a conditional request, not a re-download.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_download_is_cacheable_and_revalidates_to_304(pool: PgPool) {
     install_test_attachment_env();
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;

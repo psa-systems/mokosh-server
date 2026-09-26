@@ -28,6 +28,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -126,7 +127,7 @@ async fn seed_user(pool: &PgPool, email: &str) -> Uuid {
 /// AC1: `request_password_reset` still answers `Ok(())` in both modes - the
 /// endpoint's contract is that it never reveals whether an address has an
 /// account - but queues nothing in `saas`.
-#[sqlx::test]
+#[mokosh_test]
 async fn password_reset_queues_in_self_hosted_and_is_suppressed_in_saas(pool: PgPool) {
     let self_hosted = "reset-selfhosted@example.test";
     let saas = "reset-saas@example.test";
@@ -169,7 +170,7 @@ async fn password_reset_queues_in_self_hosted_and_is_suppressed_in_saas(pool: Pg
 /// that refused only for real accounts, and kept the old silent success for
 /// the rest, would turn this endpoint into the account oracle it has always
 /// been written to avoid.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_refusal_is_the_same_for_a_known_and_an_unknown_address(pool: PgPool) {
     let known = "known@example.test";
     seed_user(&pool, known).await;
@@ -196,7 +197,7 @@ async fn the_refusal_is_the_same_for_a_known_and_an_unknown_address(pool: PgPool
 /// AC2: `create_user` still creates the account in both modes. Only the mail
 /// about the local password is withheld: the `users` row is what scopes the
 /// person to this tenant, and a SaaS deployment needs it just as much.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_welcome_mail_is_suppressed_in_saas_but_the_account_is_still_created(pool: PgPool) {
     let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
 
@@ -240,7 +241,7 @@ async fn the_welcome_mail_is_suppressed_in_saas_but_the_account_is_still_created
 /// live credential-bearing row that no recipient can redeem and no code path
 /// retires before its TTL. This is also why each gate sits above its token
 /// write rather than just above the dispatch.
-#[sqlx::test]
+#[mokosh_test]
 async fn saas_mints_no_token_whose_only_carrier_was_suppressed(pool: PgPool) {
     let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
     let saas = service(&pool, DeploymentMode::Saas);

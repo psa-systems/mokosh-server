@@ -108,8 +108,8 @@ async fn staff_upload_company_asset(
 
 async fn staff_delete_company_asset(
     State(state): State<StaffBrandingState>,
-    RequireAuth(user): RequireAuth,
     _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
     Path((company_id, asset)): Path<(Uuid, String)>,
 ) -> AppResult<Response> {
     let kind =
@@ -156,8 +156,8 @@ async fn staff_upload_tenant_asset(
 
 async fn staff_delete_tenant_asset(
     State(state): State<StaffBrandingState>,
-    RequireAuth(user): RequireAuth,
     _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
     Path(asset): Path<String>,
 ) -> AppResult<Response> {
     let kind =

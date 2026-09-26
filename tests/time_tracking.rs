@@ -14,6 +14,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -45,7 +46,7 @@ async fn seed_technician(pool: &PgPool) -> (Uuid, String, String) {
     (user_id, email, password)
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn service_desk_time_slice_happy_path(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let (tech_id, tech_email, tech_pw) = seed_technician(&pool).await;
@@ -449,7 +450,7 @@ fn notes_only_update(notes: &str) -> UpdateTimeEntryRequest {
 }
 
 /// AC1: a partial PUT that omits `task_id` leaves the existing link intact.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_preserves_task_id_when_omitted(pool: PgPool) {
     let (user_id, _, _) = seed_technician(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -481,7 +482,7 @@ async fn update_preserves_task_id_when_omitted(pool: PgPool) {
 }
 
 /// AC3 (change): sending an explicit `task_id` reassigns the link.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_with_explicit_task_id_changes_link(pool: PgPool) {
     let (user_id, _, _) = seed_technician(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -514,7 +515,7 @@ async fn update_with_explicit_task_id_changes_link(pool: PgPool) {
 }
 
 /// AC2: the get and list read paths surface `task_id`.
-#[sqlx::test]
+#[mokosh_test]
 async fn read_paths_expose_task_id(pool: PgPool) {
     let (user_id, _, _) = seed_technician(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -551,7 +552,7 @@ async fn read_paths_expose_task_id(pool: PgPool) {
 /// PMS-328 (auth gate): edit/delete of a time entry is restricted to the
 /// entry's owner or an admin. A second technician must not be able to edit or
 /// delete an entry they do not own, while the owner and an admin can.
-#[sqlx::test]
+#[mokosh_test]
 async fn non_owner_cannot_edit_or_delete_time_entry(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let (_a_id, a_email, a_pw) = seed_technician(&pool).await;
@@ -667,7 +668,7 @@ async fn non_owner_cannot_edit_or_delete_time_entry(pool: PgPool) {
 /// AC6: two entries totaling under the default 24h cap both succeed; a third
 /// that would cross the cap is rejected with a BadRequest naming the cap and
 /// the remaining minutes.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_rejects_day_total_over_default_cap(pool: PgPool) {
     let (user_id, _, _) = seed_technician(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -715,7 +716,7 @@ async fn create_rejects_day_total_over_default_cap(pool: PgPool) {
 
 /// AC7: with the setting at 18, a day total reaching 19h is rejected while 18h
 /// is allowed; the configured cap overrides the 24h default.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_honors_configured_lower_cap(pool: PgPool) {
     let (user_id, _, _) = seed_technician(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -763,7 +764,7 @@ async fn create_honors_configured_lower_cap(pool: PgPool) {
 /// PMS-395 AC6: an entry can be created where billable_minutes exceeds
 /// worked_minutes (a minimum increment billed across clients), and both the
 /// split and the billed-on-billable total round-trip through a read.
-#[sqlx::test]
+#[mokosh_test]
 async fn billable_minutes_can_exceed_worked_and_round_trips(pool: PgPool) {
     let (user_id, _, _) = seed_technician(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -811,7 +812,7 @@ async fn billable_minutes_can_exceed_worked_and_round_trips(pool: PgPool) {
 /// PMS-395 AC8: omitting billable_minutes on create preserves the pre-change
 /// behavior - billable defaults to the rounded worked time for a billable
 /// entry - while the stored worked figure is left unrounded (AC3).
-#[sqlx::test]
+#[mokosh_test]
 async fn omitted_billable_defaults_to_rounded_worked(pool: PgPool) {
     let (user_id, _, _) = seed_technician(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -852,7 +853,7 @@ async fn omitted_billable_defaults_to_rounded_worked(pool: PgPool) {
 /// AC4: update enforces the cap against the day, excluding the row being edited
 /// from the sum (so an in-place grow is measured against peers, not itself) and
 /// rejects an edit that would push the target day over the cap.
-#[sqlx::test]
+#[mokosh_test]
 async fn update_enforces_day_cap_excluding_self(pool: PgPool) {
     let (user_id, _, _) = seed_technician(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -904,7 +905,7 @@ async fn update_enforces_day_cap_excluding_self(pool: PgPool) {
 /// ticket-linked entry returns ticket_number + ticket_title (null project/
 /// task); a project+task entry returns project_name + task_title (null
 /// ticket). Exercised over HTTP through both the get and list read paths.
-#[sqlx::test]
+#[mokosh_test]
 async fn time_entry_response_carries_work_item_names(pool: PgPool) {
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -1105,7 +1106,7 @@ async fn time_entry_response_carries_work_item_names(pool: PgPool) {
 /// sets `tenants.own_company_id` for the default tenant, so it is available
 /// without going through tenant provisioning. The entry classifies as
 /// `general` and points at the own-company.
-#[sqlx::test]
+#[mokosh_test]
 async fn general_time_entry_against_own_company(pool: PgPool) {
     let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
 

@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 /// Create a company through the API and return its id.
@@ -31,7 +32,12 @@ async fn create_company(app: &common::TestApp, token: &str, body: serde_json::Va
 }
 
 /// Create a contact through the API and return its id.
-async fn create_contact(app: &common::TestApp, token: &str, body: serde_json::Value) -> String {
+async fn create_contact(app: &common::TestApp, token: &str, mut body: serde_json::Value) -> String {
+    // PMS-1329 makes email required on create; these tests exercise notes,
+    // so mint a unique fixture email when the caller does not name one.
+    if body.get("email").is_none() {
+        body["email"] = serde_json::json!(format!("{}@example.com", uuid::Uuid::new_v4()));
+    }
     let resp = app
         .client
         .post(app.url("/api/v1/contacts/contacts"))
@@ -90,7 +96,7 @@ async fn put_notes(
 /// The whole point: a note written on create comes back on an independent
 /// read, and so does one written by an update. The list endpoint serves the
 /// same DTO, so it carries the field too.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_company_note_can_be_read_back(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -132,7 +138,7 @@ async fn a_company_note_can_be_read_back(pool: PgPool) {
     assert_eq!(row["notes"].as_str(), Some("Renews in April."));
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_note_can_be_read_back(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -170,7 +176,7 @@ async fn a_contact_note_can_be_read_back(pool: PgPool) {
 /// A record nobody has written a note on returns the key as null. It must not
 /// be omitted: a client that reads `json["notes"]` to seed an edit form needs
 /// the same shape whether or not a note exists.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_record_with_no_note_returns_null(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -207,7 +213,7 @@ async fn a_record_with_no_note_returns_null(pool: PgPool) {
 /// means "leave it alone" and NOT "erase it". A form that maps an empty field
 /// to null therefore reports a save that stored nothing. An empty string is
 /// what actually clears the note.
-#[sqlx::test]
+#[mokosh_test]
 async fn clearing_a_note_takes_an_empty_string_and_a_null_leaves_it(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;

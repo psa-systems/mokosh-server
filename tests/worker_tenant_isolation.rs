@@ -16,6 +16,7 @@ mod common;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::notifications::NotificationsService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -63,7 +64,7 @@ async fn seed_rule_and_template(
     template_id
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn worker_dispatch_is_tenant_confined(pool: PgPool) {
     // Tenant A is the default tenant the seed migration inserts; tenant B is a
     // second, fully distinct tenant.

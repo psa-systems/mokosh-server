@@ -8,6 +8,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 use mokosh_server::modules::audit::AuditCtx;
@@ -23,7 +24,7 @@ async fn user_tenant(pool: &PgPool, user_id: uuid::Uuid) -> uuid::Uuid {
         .expect("read user tenant")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
     // PMS-243: a user mirrored into the default tenant is re-homed to their org
     // tenant on first org-claimed login; scoped to the default tenant and
@@ -59,7 +60,7 @@ async fn rehome_moves_default_tenant_user_to_org_tenant_once(pool: PgPool) {
     assert_eq!(user_tenant(&pool, admin_id).await, org_tenant);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ensure_personal_tenant_provisions_then_is_idempotent(pool: PgPool) {
     // PMS-244: a brand-new SSO user with no invite gets their own personal
     // tenant; subsequent logins resolve the same one (no duplicate).
@@ -129,7 +130,7 @@ async fn ensure_personal_tenant_provisions_then_is_idempotent(pool: PgPool) {
 /// render), so the customer never gets the setup link and the flow
 /// looks broken end-to-end. This regression test pins the template
 /// AND the delivery rule; either missing = red.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_copies_auth_welcome_template_and_rule(pool: PgPool) {
     let svc = TenantService::new(mokosh_server::Database::from_pool(pool.clone()));
     let req = mokosh_server::modules::tenants::CreateTenantRequest {
@@ -344,7 +345,7 @@ async fn RETIRED(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn list_tenants_returns_default(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -383,7 +384,7 @@ async fn list_tenants_returns_default(pool: PgPool) {
 // MAPPS-518 retired the role-based bypass). Pin that guard: a tenant
 // bearer must get 401 (no platform admin identity in the token), never
 // the global tenant list.
-#[sqlx::test]
+#[mokosh_test]
 async fn list_tenants_rejects_non_super_admin(pool: PgPool) {
     let (_admin_id, _admin_email, _admin_password) = common::seed_admin(&pool).await;
     // A second tenant exists, so an unscoped leak would be observable.
@@ -425,7 +426,7 @@ async fn list_tenants_rejects_non_super_admin(pool: PgPool) {
 /// module that has no row yet. Pins the F5 read endpoint plus the
 /// service's missing-row default-shaped fallback at
 /// `service.rs:380-385`.
-#[sqlx::test]
+#[mokosh_test]
 async fn module_config_read_returns_default(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -461,7 +462,7 @@ async fn module_config_read_returns_default(pool: PgPool) {
 /// persistence at `service.rs:390-413`. Uses a fresh `test_module`
 /// name so the migration-023 seed data (which may pre-populate rows
 /// for known modules) cannot interfere.
-#[sqlx::test]
+#[mokosh_test]
 async fn module_config_write_then_read_persists(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -507,7 +508,7 @@ async fn module_config_write_then_read_persists(pool: PgPool) {
 /// Module-config endpoints reject cross-tenant access by a non-super-
 /// admin. Pins the authz checks at `routes.rs:186` (GET) and `:205`
 /// (PUT). Super-admin is verified separately by the happy paths above.
-#[sqlx::test]
+#[mokosh_test]
 async fn module_config_cross_tenant_returns_403(pool: PgPool) {
     let (_admin_id, _admin_email, _admin_password) = common::seed_admin(&pool).await;
     let (tenant_b_id, _b_user_id, _b_email, _b_password) =
@@ -555,7 +556,7 @@ async fn module_config_cross_tenant_returns_403(pool: PgPool) {
 /// `GET /tenants/{other_tenant_id}` returns 403 when the caller is a
 /// non-super-admin authenticated under tenant A trying to read tenant
 /// B. Pins the authz check at `routes.rs:92-100` (`get_tenant`).
-#[sqlx::test]
+#[mokosh_test]
 async fn cross_tenant_get_tenant_returns_403(pool: PgPool) {
     let (_admin_id, _admin_email, _admin_password) = common::seed_admin(&pool).await;
     let (tenant_b_id, _b_user_id, _b_email, _b_password) =
@@ -585,7 +586,7 @@ async fn cross_tenant_get_tenant_returns_403(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn ensure_default_config_seeds_off_psa_tenant_idempotently(pool: PgPool) {
     // PMS-288: a tenant provisioned off the PSA path (auth/SSO or manual) has no
     // lookup config and no per-tenant sequences, so ticket creation 500s.
@@ -666,7 +667,7 @@ async fn ensure_default_config_seeds_off_psa_tenant_idempotently(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_sets_org_kind(pool: PgPool) {
     // PMS-287: `create_tenant` must set the NOT-NULL `kind` column. Migration
     // 019_tenant_kind dropped the column default, so omitting it inserts NULL
@@ -701,7 +702,7 @@ async fn create_tenant_sets_org_kind(pool: PgPool) {
 
 /// PMS-413: `create_tenant` also provisions an `internal` own-company named
 /// after the tenant and points `tenants.own_company_id` at it.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_provisions_internal_own_company(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let req = CreateTenantRequest {
@@ -744,7 +745,7 @@ async fn create_tenant_provisions_internal_own_company(pool: PgPool) {
 /// SPA can create-and-brand in one round-trip rather than a
 /// create-then-update pair. Round-trip: create -> read column ->
 /// GET response -> assert every populated field.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_persists_optional_branding(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let branding = mokosh_types::tenants::TenantBranding {
@@ -795,7 +796,7 @@ async fn create_tenant_persists_optional_branding(pool: PgPool) {
 /// MAPPS-396: omitting `branding` lands the tenant with an empty-object
 /// default rather than NULL (the column is NOT NULL DEFAULT '{}') so
 /// pre-MAPPS-396 clients keep working.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_omitting_branding_uses_empty_default(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let req = CreateTenantRequest {
@@ -830,7 +831,7 @@ async fn create_tenant_omitting_branding_uses_empty_default(pool: PgPool) {
 /// PMS-413: a tenant provisioned off the PSA create path (e.g. a manually
 /// inserted org tenant a bunyip user lands in) gets an own-company when
 /// `ensure_default_config` runs, and a second run is a no-op (one company).
-#[sqlx::test]
+#[mokosh_test]
 async fn ensure_default_config_backfills_own_company_idempotently(pool: PgPool) {
     // A tenant inserted directly, bypassing create_tenant: no own_company yet.
     let (tenant_id, _user_id, _email, _password) =
@@ -885,7 +886,7 @@ async fn ensure_default_config_backfills_own_company_idempotently(pool: PgPool) 
 /// Proving "no statement" without reading the server log: empty the tables the
 /// guards read, then call again. A call that still probed would find them empty
 /// and re-seed; a memoized call cannot, so the tables stay empty.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_seeded_tenant_is_not_probed_again(pool: PgPool) {
     let tenant = uuid::Uuid::new_v4();
     sqlx::query(
@@ -982,7 +983,7 @@ async fn a_seeded_tenant_is_not_probed_again(pool: PgPool) {
 /// These routes take no id, so the page works whether or not that claim is ever
 /// configured. Asserted end to end because the whole failure was that the id in
 /// the URL was wrong, which no unit test on a service can see.
-#[sqlx::test]
+#[mokosh_test]
 async fn current_reads_and_renames_the_callers_own_tenant(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1037,7 +1038,7 @@ async fn current_reads_and_renames_the_callers_own_tenant(pool: PgPool) {
 /// End to end rather than on the conversion alone: the point of the endpoint is
 /// that the record lands on the CALLER'S tenant with no id in the request, and
 /// that `GET /current` reads back what was submitted.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_organisation_record_persists_with_and_without_a_website(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1128,7 +1129,7 @@ async fn the_organisation_record_persists_with_and_without_a_website(pool: PgPoo
 /// refused and nothing is written. The generic `PUT /current` patch cannot say
 /// this (a logo upload sends two keys and no phone), which is why the
 /// organisation record has its own surface.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_organisation_submission_requires_a_phone_and_an_email(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1165,7 +1166,7 @@ async fn an_organisation_submission_requires_a_phone_and_an_email(pool: PgPool) 
 /// PMS-896: the organisation surface carries the same admin gate as the rename
 /// it performs (PMS-751); a non-admin's onboarding does not reach it
 /// (MAPPS-524).
-#[sqlx::test]
+#[mokosh_test]
 async fn a_non_admin_cannot_submit_the_organisation_record(pool: PgPool) {
     let (_tech_id, tech_email, tech_password) = common::seed_user(
         &pool,
@@ -1194,7 +1195,7 @@ async fn a_non_admin_cannot_submit_the_organisation_record(pool: PgPool) {
 
 /// `current` is not a uuid, and must never be parsed as one: a static segment
 /// has to win over `/{tenant_id}` or the route would 400 on every call.
-#[sqlx::test]
+#[mokosh_test]
 async fn current_is_not_mistaken_for_a_tenant_id(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1216,7 +1217,7 @@ async fn current_is_not_mistaken_for_a_tenant_id(pool: PgPool) {
 
 /// Reading your own tenant needs only a session, but renaming it is tenant-wide
 /// configuration: the name is the "from" on every email a client receives.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_non_admin_can_read_but_not_rename_their_tenant(pool: PgPool) {
     let (_tech_id, tech_email, tech_password) = common::seed_user(
         &pool,
@@ -1258,7 +1259,7 @@ async fn a_non_admin_can_read_but_not_rename_their_tenant(pool: PgPool) {
 /// PMS-751: the new routes address the caller's own tenant and nothing else, so
 /// a second tenant's row must be unreachable through them however the caller is
 /// authenticated.
-#[sqlx::test]
+#[mokosh_test]
 async fn current_cannot_reach_another_tenant(pool: PgPool) {
     let (other_tenant, _id, _email, _password) =
         common::seed_tenant_with_admin(&pool, "pms751-other").await;
@@ -1299,7 +1300,7 @@ async fn current_cannot_reach_another_tenant(pool: PgPool) {
 /// of which has a session, so the read side is public. Asserted end to end
 /// because the whole point is the hop from an authenticated upload to an
 /// unauthenticated fetch.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_logo_is_uploaded_by_an_admin_and_served_to_anyone(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1376,7 +1377,7 @@ async fn a_logo_is_uploaded_by_an_admin_and_served_to_anyone(pool: PgPool) {
 
 /// A logo is what every client sees on this tenant's forms and email, so it is
 /// tenant-wide configuration, gated like the rename.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_non_admin_cannot_replace_the_logo(pool: PgPool) {
     let (_tech_id, email, password) = common::seed_user(
         &pool,
@@ -1406,7 +1407,7 @@ async fn a_non_admin_cannot_replace_the_logo(pool: PgPool) {
 /// An unsupported type is refused rather than stored and served back as
 /// `octet-stream`, and SVG is refused specifically: it is a script-capable
 /// document and this route serves it from the API origin to anonymous callers.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unsupported_image_type_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -1443,19 +1444,21 @@ async fn an_unsupported_image_type_is_refused(pool: PgPool) {
 /// deleted `logo_mime`, so the public logo route answered 404 and every client
 /// email rendered a broken image. Merging keeps what a caller did not mention,
 /// and an explicit null still clears.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    // What the logo upload writes.
+    // What the logo upload writes. PMS-1371: the path must name the caller's
+    // own tenant, since ownership is now checked alongside the prefix.
+    let logo_url = format!("/api/v1/public/tenants/{}/logo", common::DEFAULT_TENANT_ID);
     let resp = app
         .client
         .put(app.url("/api/v1/tenants/current"))
         .bearer_auth(&token)
         .json(&serde_json::json!({
-            "branding": { "logo_url": "/api/v1/public/tenants/x/logo", "logo_mime": "image/png" }
+            "branding": { "logo_url": logo_url, "logo_mime": "image/png" }
         }))
         .send()
         .await
@@ -1484,7 +1487,7 @@ async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool
     );
     assert_eq!(
         after["branding"]["logo_url"].as_str(),
-        Some("/api/v1/public/tenants/x/logo")
+        Some(logo_url.as_str())
     );
     assert_eq!(
         after["branding"]["support_contact_name"].as_str(),
@@ -1520,7 +1523,7 @@ async fn a_partial_branding_write_keeps_the_keys_it_did_not_mention(pool: PgPool
 /// contact sentence in a client's email and `logo_url` becomes an `<img src>`
 /// in the same message, so a malformed value is one the MSP appears to have
 /// published over its own SMTP identity.
-#[sqlx::test]
+#[mokosh_test]
 async fn branding_a_client_will_read_is_validated_on_write(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1604,7 +1607,7 @@ async fn branding_a_client_will_read_is_validated_on_write(pool: PgPool) {
 /// PMS-776: the two endpoints that write a branding value agree about it.
 /// They still write to different stores (PMS-703 F18); what they no longer do
 /// is disagree about which values are legal.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_settings_endpoint_validates_branding_like_the_tenants_endpoint(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -1641,7 +1644,7 @@ async fn the_settings_endpoint_validates_branding_like_the_tenants_endpoint(pool
 /// The identity in a client's email has to be the identity of the tenant that
 /// owns the thing the email is about. `OrgIdentity::load` is the single reader
 /// for all of them, so this is the one place that guarantee is checked.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_org_identity_loads_the_callers_own_tenant(pool: PgPool) {
     use mokosh_server::modules::auth::TenantId;
     use mokosh_server::modules::tenants::OrgIdentity;
@@ -1699,7 +1702,7 @@ async fn the_org_identity_loads_the_callers_own_tenant(pool: PgPool) {
 /// a message that is never sent. `ticket.note_added` was seeded for the default
 /// tenant only and never copied, and `forms.request_link` had its template
 /// copied but not its rule: both were silent for every tenant created here.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_new_tenant_can_actually_send_the_client_facing_email(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
 
@@ -1743,7 +1746,7 @@ async fn a_new_tenant_can_actually_send_the_client_facing_email(pool: PgPool) {
 /// MAPPS-457: instance-wide creation cap set via `with_max_tenants`. When the
 /// current count is >= cap, `create_tenant` returns `AppError::Conflict` and
 /// commits no rows. Below-cap creates succeed and increment the count.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_enforces_max_tenants_cap(pool: PgPool) {
     // Count the seed tenants the schema ships with so the cap math is against
     // the real starting point, not a hardcoded expectation.
@@ -1808,7 +1811,7 @@ async fn create_tenant_enforces_max_tenants_cap(pool: PgPool) {
 
 /// MAPPS-457: `with_max_tenants(None)` (unset env) leaves creation uncapped.
 /// Regression guard so future work does not accidentally default to a ceiling.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_uncapped_by_default(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone())).with_max_tenants(None);
     let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
@@ -1835,7 +1838,7 @@ async fn create_tenant_uncapped_by_default(pool: PgPool) {
 /// MAPPS-457: two non-personal tenants cannot share a name (case-insensitive).
 /// The second create returns 409 with the documented copy; no rows on the
 /// losing side. Personal tenants are exempt (covered by a peer test below).
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
@@ -1882,7 +1885,7 @@ async fn create_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
 /// MAPPS-457: personal tenants (auto-generated names from user first names) are
 /// exempt from the case-insensitive name uniqueness constraint. Two users named
 /// "Chris" can both provision a "Chris's workspace" tenant.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_personal_tenant_allows_duplicate_names(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let owner_a = uuid::Uuid::new_v4();
@@ -1898,7 +1901,7 @@ async fn create_personal_tenant_allows_duplicate_names(pool: PgPool) {
 /// MAPPS-457: rename via `update_tenant` also enforces case-insensitive
 /// uniqueness against every OTHER non-personal tenant; renaming to the row's
 /// own name is a no-op (idempotent).
-#[sqlx::test]
+#[mokosh_test]
 async fn update_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
     use mokosh_server::modules::auth::TenantId;
     use mokosh_server::modules::tenants::UpdateTenantRequest;
@@ -1980,7 +1983,7 @@ async fn update_tenant_rejects_case_insensitive_duplicate_name(pool: PgPool) {
 /// MAPPS-459 (PMS-728 slice 3): entitlement absent = pass-through. A fresh
 /// tenant with no `tenant_membership_entitlements` row consults nothing (no
 /// integration wired), so `ensure_principal_usable` succeeds.
-#[sqlx::test]
+#[mokosh_test]
 async fn ensure_principal_usable_passes_when_no_entitlement_row(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
@@ -1995,7 +1998,7 @@ async fn ensure_principal_usable_passes_when_no_entitlement_row(pool: PgPool) {
 
 /// MAPPS-459: entitlement status = `active` passes. Regression pin so a future
 /// change to the entitlement writer does not accidentally block active tenants.
-#[sqlx::test]
+#[mokosh_test]
 async fn ensure_principal_usable_passes_when_entitlement_active(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
@@ -2014,7 +2017,7 @@ async fn ensure_principal_usable_passes_when_entitlement_active(pool: PgPool) {
 /// MAPPS-459: entitlement status = `suspended` rejects with the same "not
 /// active" copy the operator-side `tenants.status = 'suspended'` path returns,
 /// so a caller cannot distinguish billing suspension from operator suspension.
-#[sqlx::test]
+#[mokosh_test]
 async fn ensure_principal_usable_rejects_when_entitlement_suspended(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
@@ -2044,7 +2047,7 @@ async fn ensure_principal_usable_rejects_when_entitlement_suspended(pool: PgPool
 /// MAPPS-459: entitlement `active` but `expires_at < NOW()` rejects. Bunyip
 /// may hand us an active state that has since lapsed and there is no reason to
 /// wait for the next webhook to catch up.
-#[sqlx::test]
+#[mokosh_test]
 async fn ensure_principal_usable_rejects_when_entitlement_expired(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
@@ -2064,7 +2067,7 @@ async fn ensure_principal_usable_rejects_when_entitlement_expired(pool: PgPool) 
 /// MAPPS-459: upsert semantics - a later write replaces the prior state, so a
 /// suspended tenant that becomes active again on the next webhook is
 /// pass-through immediately.
-#[sqlx::test]
+#[mokosh_test]
 async fn set_tenant_entitlement_upserts_on_repeat_writes(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
@@ -2102,7 +2105,7 @@ async fn set_tenant_entitlement_upserts_on_repeat_writes(pool: PgPool) {
 /// misconfigured caller cannot smuggle a novel state into the enum column
 /// (the CHECK constraint would catch it too; the service-level guard just
 /// yields a clean 400 instead of a raw sqlx violation).
-#[sqlx::test]
+#[mokosh_test]
 async fn set_tenant_entitlement_rejects_unknown_status(pool: PgPool) {
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
     let err = auth
@@ -2120,7 +2123,7 @@ async fn set_tenant_entitlement_rejects_unknown_status(pool: PgPool) {
 /// are supplied by `TicketService::send_note_email`; an unresolved one would
 /// reach the client as literal braces, so template and context are asserted
 /// against each other here rather than trusted to stay in step.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_ticket_note_template_asks_for_the_organisation_identity(pool: PgPool) {
     let body: String = sqlx::query_scalar(
         "SELECT body_text FROM notification_templates \
@@ -2199,7 +2202,7 @@ async fn cancel_and_reactivate_flip_tenant_status_RETIRED(pool: PgPool) {
 /// TicketService::create_portal_ticket to see it), password_hash IS NULL
 /// (login is blocked - the row is unloginable by construction), email
 /// on the reserved suffix so a human user list can filter it out.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_provisions_system_attribution_user(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let req = CreateTenantRequest {
@@ -2273,7 +2276,7 @@ async fn create_tenant_provisions_system_attribution_user(pool: PgPool) {
 ///
 /// Pin end-to-end: rows exist, capability sets match the spec, all
 /// three carry `is_builtin = TRUE`.
-#[sqlx::test]
+#[mokosh_test]
 async fn create_tenant_seeds_three_builtin_portal_roles(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let req = CreateTenantRequest {
@@ -2393,7 +2396,7 @@ async fn create_tenant_seeds_three_builtin_portal_roles(pool: PgPool) {
 /// mokosh-contact-login prompt 002: migration 138 added
 /// `companies.portal_slug`. Pin the column exists, is nullable, and
 /// starts unset on a fresh Company.
-#[sqlx::test]
+#[mokosh_test]
 async fn companies_carry_a_nullable_portal_slug_column(pool: PgPool) {
     let (admin_id, ..) = common::seed_admin(&pool).await;
     let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")

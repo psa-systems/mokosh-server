@@ -10,6 +10,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -41,7 +42,7 @@ fn names(body: &Value) -> Vec<String> {
 
 /// AC1: a Technician can read it. This is the whole reason it exists, so it is
 /// asserted against the role that was refused before.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_technician_can_read_the_directory(pool: PgPool) {
     common::seed_user(
         &pool,
@@ -64,7 +65,7 @@ async fn a_technician_can_read_the_directory(pool: PgPool) {
 /// AC1 and AC7: the projection. Three fields, and nothing that belongs to user
 /// management. Asserted by walking the keys rather than by naming the ones we
 /// do not want, so a field added to the query fails here instead of shipping.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_directory_exposes_three_fields_and_no_more(pool: PgPool) {
     common::seed_user(
         &pool,
@@ -96,7 +97,7 @@ async fn the_directory_exposes_three_fields_and_no_more(pool: PgPool) {
 /// The handle is the local part of the address, not the address. A technician
 /// can already see a colleague's display name all over the app; a contactable
 /// address is a disclosure this endpoint deliberately does not make.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_handle_is_the_local_part_and_the_address_never_appears(pool: PgPool) {
     common::seed_user(
         &pool,
@@ -126,7 +127,7 @@ async fn the_handle_is_the_local_part_and_the_address_never_appears(pool: PgPool
 /// AC3: a deactivated colleague is not in the directory. A mention of somebody
 /// who has left then renders as the plain text it always was, which is a
 /// truthful signal rather than a broken one.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_deactivated_user_is_not_in_the_directory(pool: PgPool) {
     common::seed_user(
         &pool,
@@ -160,7 +161,7 @@ async fn a_deactivated_user_is_not_in_the_directory(pool: PgPool) {
 
 /// AC2: tenant scoping. The read goes through `begin_with_tenant` like every
 /// other serving read, so another tenant's staff are invisible.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_directory_never_shows_another_tenants_staff(pool: PgPool) {
     let (other_tenant, _, _, _) = common::seed_tenant_with_admin(&pool, "other-msp").await;
     common::seed_user(&pool, other_tenant, "outsider@other.test", "technician").await;
@@ -186,7 +187,7 @@ async fn the_directory_never_shows_another_tenants_staff(pool: PgPool) {
 
 /// AC6: nothing about user management was relaxed. The endpoint this replaces
 /// as a mention source still refuses a Technician.
-#[sqlx::test]
+#[mokosh_test]
 async fn user_management_is_still_manager_gated(pool: PgPool) {
     common::seed_user(
         &pool,
@@ -220,7 +221,7 @@ async fn user_management_is_still_manager_gated(pool: PgPool) {
 /// behaviour. The tiebreak is asserted on the query itself below, and this test
 /// covers what it can actually observe: that paging the endpoint yields each
 /// row exactly once.
-#[sqlx::test]
+#[mokosh_test]
 async fn paging_is_the_standard_envelope_and_covers_every_row_once(pool: PgPool) {
     common::seed_user(
         &pool,
@@ -284,7 +285,7 @@ async fn paging_is_the_standard_envelope_and_covers_every_row_once(pool: PgPool)
 
 /// An unauthenticated caller gets nothing. The gate moved from
 /// `RequireManager` to `RequireAuth`, not to nothing at all.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_directory_still_needs_a_session(pool: PgPool) {
     let app = common::boot(pool).await;
     let resp = app
@@ -297,7 +298,7 @@ async fn the_directory_still_needs_a_session(pool: PgPool) {
 }
 
 /// The id is a real user id, so a client can key on it.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_id_identifies_the_user(pool: PgPool) {
     let (uid, email, password) = common::seed_user(
         &pool,
