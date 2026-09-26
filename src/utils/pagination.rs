@@ -15,7 +15,7 @@
 //! `#[serde(flatten)] pagination: PaginationParams` instead of
 //! stacking two `Query<_>` extractors.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::utils::error::{AppError, AppResult};
 
@@ -25,14 +25,40 @@ pub struct PaginationParams {
     /// Page number (1-indexed)
     #[serde(default = "default_page")]
     pub page: u32,
-    /// Items per page
-    #[serde(default = "default_per_page")]
+    /// Items per page. MAPPS-542: rejected at parse time when the request
+    /// asks for more than [`PaginationParams::MAX_PER_PAGE`], so the
+    /// caller sees a bounded-request error instead of a silent clamp to
+    /// the cap on a page the server calls complete.
+    #[serde(
+        default = "default_per_page",
+        deserialize_with = "deserialize_per_page"
+    )]
     pub per_page: u32,
     /// Sort field
     pub sort: Option<String>,
     /// Sort direction (asc/desc)
     #[serde(default = "default_sort_dir")]
     pub sort_dir: String,
+}
+
+/// MAPPS-542: reject `per_page > MAX_PER_PAGE` at parse time so the
+/// silent clamp cannot make truncation look like completion. Below-1
+/// values are still allowed through and get [`PaginationParams::per_page`]'s
+/// clamp to 1: zero rows is not the same class of mistake as an
+/// unbounded page.
+fn deserialize_per_page<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u32::deserialize(deserializer)?;
+    if value > PaginationParams::MAX_PER_PAGE {
+        return Err(serde::de::Error::custom(format!(
+            "per_page {} exceeds the maximum of {}",
+            value,
+            PaginationParams::MAX_PER_PAGE
+        )));
+    }
+    Ok(value)
 }
 
 fn default_page() -> u32 {
@@ -444,11 +470,48 @@ mod tests {
         assert_eq!(zero.per_page(), 1);
     }
 
-    /// A `per_page` above the cap is a 422 that names the requested value and
-    /// the cap, so a client cannot mistake a truncated page for a whole one.
-    /// The clamp on the getter stays for callers that reach it directly, but
-    /// every handler that goes through `order_by` / `order_by_mapped` /
-    /// `reject_unsupported_sort` gets the rejection instead.
+    /// MAPPS-542: a query string asking for more rows than the cap is
+    /// rejected at parse time so the caller sees a bounded-request error
+    /// instead of a full page they read as a truncated one.
+    #[test]
+    fn deserializing_over_cap_per_page_is_rejected() {
+        let err = serde_urlencoded::from_str::<PaginationParams>("per_page=200")
+            .expect_err("per_page above the cap must be rejected at parse time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per_page 200 exceeds the maximum of 100"),
+            "rejection must name the value and the limit: {msg}"
+        );
+    }
+
+    /// per_page below 1 stays a parse success and clamps up in the
+    /// accessor: a request for zero rows is not the same class of
+    /// mistake as an unbounded page.
+    #[test]
+    fn deserializing_zero_per_page_still_clamps_up() {
+        let params = serde_urlencoded::from_str::<PaginationParams>("per_page=0")
+            .expect("per_page=0 must parse");
+        assert_eq!(params.per_page, 0);
+        assert_eq!(params.per_page(), 1);
+    }
+
+    /// A request whose per_page equals the cap is accepted verbatim: the
+    /// boundary is inclusive on the accepted side, exclusive on the
+    /// rejected side.
+    #[test]
+    fn deserializing_per_page_at_the_cap_is_accepted() {
+        let params = serde_urlencoded::from_str::<PaginationParams>(&format!(
+            "per_page={}",
+            PaginationParams::MAX_PER_PAGE
+        ))
+        .expect("per_page at the cap must parse");
+        assert_eq!(params.per_page, PaginationParams::MAX_PER_PAGE);
+    }
+
+    /// The runtime helper stays as a defense in depth for code paths that
+    /// construct `PaginationParams` directly rather than parsing a query
+    /// string: parse-time rejection cannot reach them, but the three sort
+    /// helpers pass through this check before touching SQL.
     #[test]
     fn per_page_above_the_cap_is_a_422() {
         let over_cap = PaginationParams {
@@ -495,7 +558,8 @@ mod tests {
     }
 
     /// The three sort helpers piggyback on the cap check, so any of the ~69
-    /// list handlers already threading `order_by` gets the 422 for free.
+    /// list handlers already threading `order_by` gets the 422 for free even
+    /// when the params come from a direct construction path.
     #[test]
     fn order_by_rejects_a_per_page_above_the_cap() {
         let over_cap = PaginationParams {
