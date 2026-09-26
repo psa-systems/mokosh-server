@@ -336,10 +336,13 @@ declare_keys! {
     Application PAYPAL_API_BASE = "PAYPAL_API_BASE";
 
     // -- Uploads -------------------------------------------------------------
-    // `ATTACHMENT_DIR` is also read by `crate::storage`, which is a provider of
-    // record and reads it at its entry point; branding asks for it here.
+    // The storage ROOT is not declared here. It is `STORAGE_ROOT` (PMS-1317),
+    // read by `crate::storage::env` at the provider of record's entry point
+    // along with the rest of the `STORAGE_*` settings and its deprecated
+    // `ATTACHMENT_DIR` alias, the same way `STORAGE_PROVIDER` and the
+    // `STORAGE_S3_*` block are. Branding used to declare it here and read it a
+    // second time; it now asks `crate::storage`, so there is one reader again.
 
-    Application ATTACHMENT_DIR = "ATTACHMENT_DIR";
     Application ATTACHMENT_MAX_BYTES = "ATTACHMENT_MAX_BYTES";
     Application KB_ATTACHMENT_MAX_BYTES = "KB_ATTACHMENT_MAX_BYTES";
 

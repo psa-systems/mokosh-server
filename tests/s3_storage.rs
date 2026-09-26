@@ -1,13 +1,13 @@
 //! PMS-958: the S3 provider against a real object store.
 //!
-//! Runs when `S3_ENDPOINT` is set and skips, saying so, when it is not. CI
+//! Runs when `STORAGE_S3_ENDPOINT` is set and skips, saying so, when it is not. CI
 //! starts a MinIO in the job and sets the `S3_*` variables for the whole run;
 //! locally `just dev-s3` starts one in the dev stack and fills them into
 //! `.env`. There is no second set of names for tests: the suite reads the
 //! production variables, so what it proves is the configuration an operator
 //! would write.
 //!
-//! `STORAGE_BACKEND=s3` is set by THIS process only, so every other suite in
+//! `STORAGE_PROVIDER=s3` is set by THIS process only, so every other suite in
 //! the same CI run keeps exercising the local provider. It has to be set before
 //! the first `boot` in this binary, because the store is process-wide and built
 //! on first use.
@@ -35,12 +35,12 @@ use uuid::Uuid;
 async fn s3() -> Option<S3Provider> {
     static SELECTED: OnceLock<bool> = OnceLock::new();
     let configured = *SELECTED.get_or_init(|| {
-        let endpoint = std::env::var("S3_ENDPOINT").unwrap_or_default();
+        let endpoint = std::env::var("STORAGE_S3_ENDPOINT").unwrap_or_default();
         if endpoint.trim().is_empty() {
-            eprintln!("s3_storage: skipped, S3_ENDPOINT is not set");
+            eprintln!("s3_storage: skipped, STORAGE_S3_ENDPOINT is not set");
             return false;
         }
-        std::env::set_var("STORAGE_BACKEND", "s3");
+        std::env::set_var("STORAGE_PROVIDER", "s3");
         true
     });
     if !configured {
@@ -175,7 +175,7 @@ async fn two_tenants_cannot_reach_each_others_objects() {
     }
 }
 
-/// Backend selection, end to end: with `STORAGE_BACKEND=s3` an upload through
+/// Provider selection, end to end: with `STORAGE_PROVIDER=s3` an upload through
 /// the API lands in the bucket and NOT on the filesystem, and the download
 /// streams it back from there.
 #[mokosh_test]

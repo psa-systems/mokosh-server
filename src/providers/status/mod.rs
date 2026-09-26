@@ -53,6 +53,7 @@ use crate::config::{
 };
 use crate::modules::auth::providers::{AuthProviderKind, AuthProviderSelection};
 use crate::secrets::SecretsConfig;
+use crate::storage::env as storage_env;
 use crate::storage::StorageProviderKind;
 use crate::utils::deployment::{
     provider as provider_name, DeploymentMode, EnablementSource, ProviderKind, ProviderOverrides,
@@ -331,8 +332,16 @@ fn collect_secrets_tenant_kind(
 }
 
 /// Storage kind. `StorageProviderKind::from_env` is the ONE reader of
-/// `STORAGE_BACKEND`, so the name here agrees byte-for-byte with what
+/// `STORAGE_PROVIDER`, so the name here agrees byte-for-byte with what
 /// `crate::storage::init_from_env` chose at boot.
+///
+/// PMS-1317 gave this row its `keys`. It used to name the provider and stop
+/// there, which is why David went through the staging compose looking for
+/// where storage is configured and came back having found nothing: the report
+/// said `local` and named no variable that would have made it anything else.
+/// Every storage setting is now listed whether or not it is set, because the
+/// list an operator needs is the one that includes the variable they have not
+/// set yet.
 fn collect_storage_kind(
     hosting_profile: DeploymentMode,
 ) -> (ProviderKindReport, Option<Vec<&'static str>>) {
@@ -343,6 +352,36 @@ fn collect_storage_kind(
         .unwrap_or((StorageProviderKind::Local, EnablementSource::Profile));
     let name = kind.as_str();
     let explicit = (source == EnablementSource::Explicit).then(|| vec![name]);
+
+    let keys: Vec<KeyReport> = storage_env::ALL
+        .iter()
+        .map(|var| {
+            // Never the VALUE. Two of these are credentials, and a report that
+            // printed the rest but not those would be a report whose shape
+            // tells you which is which.
+            let supplied_by = storage_env::supplied_by(*var);
+            KeyReport {
+                key: var.name.to_string(),
+                feature: Some(var.summary.to_string()),
+                // WHICH NAME supplied it, which is the question an operator
+                // migrating a compose file has: a row reading
+                // `ATTACHMENT_DIR` is one that has not moved yet, and
+                // "has staging moved" stops being a guess.
+                recorded_served_by: match supplied_by {
+                    storage_env::SuppliedBy::Current => Some(var.name.to_string()),
+                    storage_env::SuppliedBy::Deprecated => var.deprecated.map(str::to_string),
+                    storage_env::SuppliedBy::Unset => None,
+                },
+                live_holds: supplied_by != storage_env::SuppliedBy::Unset,
+                state: match supplied_by {
+                    storage_env::SuppliedBy::Current => "unchanged".to_string(),
+                    storage_env::SuppliedBy::Deprecated => "deprecated_alias".to_string(),
+                    storage_env::SuppliedBy::Unset => "unset".to_string(),
+                },
+            }
+        })
+        .collect();
+
     (
         ProviderKindReport {
             kind: "storage".to_string(),
@@ -353,7 +392,7 @@ fn collect_storage_kind(
                 unreachable_reason: None,
             }],
             serving: Some(name.to_string()),
-            keys: Vec::new(),
+            keys,
             enumeration: None,
         },
         explicit,

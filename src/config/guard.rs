@@ -88,9 +88,16 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
     },
     EntryPoint {
         path: "src/storage/mod.rs",
-        reason: "the one reader of STORAGE_BACKEND and the provider of record for ATTACHMENT_DIR \
-                 (PMS-910), the root a storage provider is built from, for the same reason as \
-                 SECRET_BACKEND; branding also reads ATTACHMENT_DIR through the config seam",
+        reason: "the provider of record for storage (PMS-910): the root and the provider \
+                 selection a storage provider is built from, for the same reason as \
+                 SECRET_BACKEND. Branding asks this module for the root rather than reading \
+                 the variable a second time (PMS-1317)",
+    },
+    EntryPoint {
+        path: "src/storage/env.rs",
+        reason: "the storage variables themselves (PMS-1317): the one place that reads a \
+                 STORAGE_ setting and its deprecated alias, for the same reason the provider \
+                 of record reads its own selection variable",
     },
     EntryPoint {
         path: "src/storage/s3.rs",

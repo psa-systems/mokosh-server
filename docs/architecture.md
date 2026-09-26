@@ -25,7 +25,7 @@ The dev host is a VPS on the public internet, and several developers share it. T
 
 Every stored object is addressed by an `ObjectKey`: a tenant plus the object's identity, never a path. A caller cannot assemble one, so the layout is decided in exactly one file (`src/storage/mod.rs`) and pinned by a test there, because getting an arm wrong does not fail loudly - it serves a 404 for a file that is still sitting on disk.
 
-Under the storage root (`ATTACHMENT_DIR` for `local`, the bucket for `s3`, same string either way):
+Under the storage root (`STORAGE_ROOT` for `local`, the bucket for `s3`, same string either way):
 
 | Path | What it is |
 |---|---|
@@ -83,7 +83,7 @@ src/
   providers/       Provider status collection and reporting across every capability kind; not itself a selectable provider.
   scheduler/       Registry for the interval background jobs, and `one_shot` for work that happens once per process start (PMS-1320).
   secrets/         Secret backend selection (database or Infisical) behind one store trait.
-  storage/         Upload root and file storage, the provider of record for ATTACHMENT_DIR; branding/ also reads it through the config seam for local-path assets.
+  storage/         Upload root and file storage, the provider of record for every STORAGE_ setting (PMS-1317); branding asks it for the root rather than reading one itself.
   utils/           Shared helpers (errors, email, crypto, validation, pagination).
   version.rs       VersionInfo (build-time git hash/describe via build.rs).
   version_check.rs Opt-in self-hosted update check against MOKOSH_UPDATE_CHECK_URL.

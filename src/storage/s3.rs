@@ -42,6 +42,8 @@ use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
 use url::Url;
 
+use super::env;
+
 use super::{ObjectKey, ObjectProvider, ObjectReader};
 use crate::utils::error::{AppError, AppResult};
 
@@ -89,47 +91,53 @@ impl S3Config {
     ///
     /// A forwarded-but-unset variable arrives as `""` (PMS-836), so blank is
     /// unset throughout. The endpoint, bucket and both halves of the credential
-    /// are required, because `STORAGE_BACKEND=s3` with any of them missing is
+    /// are required, because `STORAGE_PROVIDER=s3` with any of them missing is
     /// an operator who asked for S3 and would otherwise get a 500 on the first
     /// upload; the region defaults to `us-east-1`, which is what every
     /// S3-compatible store outside AWS expects to see in the signature.
-    pub fn parse(var: impl Fn(&str) -> Option<String>) -> AppResult<Self> {
-        let get = |name: &str| {
-            var(name)
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        };
-        let required = |name: &str| {
-            get(name).ok_or_else(|| {
-                AppError::Configuration(format!("STORAGE_BACKEND=s3 requires {name} to be set"))
+    ///
+    /// PMS-1317: each setting is read by its `STORAGE_S3_`-prefixed name,
+    /// falling back to the bare `S3_*` it replaced. [`env::resolve`] owns that
+    /// rule and the blank-is-unset one with it, so a compose file that
+    /// forwards the new name unset cannot shadow a working old one.
+    pub fn parse(lookup: impl Fn(&str) -> Option<String>) -> AppResult<Self> {
+        let get = |var: env::StorageVar| env::resolve(var, &lookup).0;
+        let required = |var: env::StorageVar| {
+            get(var).ok_or_else(|| {
+                AppError::Configuration(format!(
+                    "STORAGE_PROVIDER=s3 requires {} to be set",
+                    var.name
+                ))
             })
         };
 
-        let raw_endpoint = required("S3_ENDPOINT")?;
+        let raw_endpoint = required(env::S3_ENDPOINT)?;
         let endpoint = Url::parse(&raw_endpoint).map_err(|e| {
-            AppError::Configuration(format!("S3_ENDPOINT {raw_endpoint:?} is not a URL: {e}"))
+            AppError::Configuration(format!(
+                "STORAGE_S3_ENDPOINT {raw_endpoint:?} is not a URL: {e}"
+            ))
         })?;
         if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
             return Err(AppError::Configuration(format!(
-                "S3_ENDPOINT {raw_endpoint:?} must be an http or https URL with a host"
+                "STORAGE_S3_ENDPOINT {raw_endpoint:?} must be an http or https URL with a host"
             )));
         }
         if endpoint.query().is_some() || endpoint.fragment().is_some() {
             return Err(AppError::Configuration(format!(
-                "S3_ENDPOINT {raw_endpoint:?} must not carry a query or a fragment"
+                "STORAGE_S3_ENDPOINT {raw_endpoint:?} must not carry a query or a fragment"
             )));
         }
 
-        let bucket = required("S3_BUCKET")?;
+        let bucket = required(env::S3_BUCKET)?;
         validate_bucket_name(&bucket)?;
 
-        let path_style = match get("S3_PATH_STYLE").as_deref() {
+        let path_style = match get(env::S3_PATH_STYLE).as_deref() {
             None => true,
             Some("true" | "1" | "yes") => true,
             Some("false" | "0" | "no") => false,
             Some(other) => {
                 return Err(AppError::Configuration(format!(
-                    "S3_PATH_STYLE {other:?} is not a boolean; expected true or false"
+                    "STORAGE_S3_PATH_STYLE {other:?} is not a boolean; expected true or false"
                 )))
             }
         };
@@ -137,9 +145,9 @@ impl S3Config {
         Ok(Self {
             endpoint,
             bucket,
-            region: get("S3_REGION").unwrap_or_else(|| "us-east-1".to_string()),
-            access_key_id: required("S3_ACCESS_KEY_ID")?,
-            secret_access_key: required("S3_SECRET_ACCESS_KEY")?,
+            region: get(env::S3_REGION).unwrap_or_else(|| "us-east-1".to_string()),
+            access_key_id: required(env::S3_ACCESS_KEY_ID)?,
+            secret_access_key: required(env::S3_SECRET_ACCESS_KEY)?,
             path_style,
         })
     }

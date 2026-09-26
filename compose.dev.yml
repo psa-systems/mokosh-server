@@ -464,11 +464,17 @@ services:
       # code resolves to self-hosted, so the dev stack sends every email.
       MOKOSH_DEPLOYMENT_MODE: ${MOKOSH_DEPLOYMENT_MODE:-}
 
-      # Upload root, shared by ticket attachments and tenant logos (which live
-      # in a `tenant-logos/` subdirectory of it). Defaulted to the `attachments`
-      # named volume below rather than the code's CWD-relative `./attachments`,
-      # so an uploaded logo survives `just dev` rebuilding the image.
-      ATTACHMENT_DIR: ${ATTACHMENT_DIR:-/data/attachments}
+      # PMS-1317: the storage root every stored object hangs off. Defaulted to
+      # the `attachments` named volume below rather than the code's
+      # CWD-relative `./attachments`, so an upload survives `just dev`
+      # rebuilding the image.
+      #
+      # ATTACHMENT_DIR is forwarded beside it as the deprecated alias, with an
+      # EMPTY default on purpose: the resolver takes the first non-blank of the
+      # two, so a default here would shadow STORAGE_ROOT and every dev stack
+      # would silently keep running on the deprecated name.
+      STORAGE_ROOT: ${STORAGE_ROOT:-/data/attachments}
+      ATTACHMENT_DIR: ${ATTACHMENT_DIR:-}
       ATTACHMENT_MAX_BYTES: ${ATTACHMENT_MAX_BYTES:-}
       # PMS-923: KB article images. Default reproduces the code's own 5 MiB.
       KB_ATTACHMENT_MAX_BYTES: ${KB_ATTACHMENT_MAX_BYTES:-}
@@ -485,9 +491,20 @@ services:
       BRANDING_COMPANY_LOGO_MAX_BYTES: ${BRANDING_COMPANY_LOGO_MAX_BYTES:-}
       BRANDING_COMPANY_FAVICON_MAX_BYTES: ${BRANDING_COMPANY_FAVICON_MAX_BYTES:-}
       BRANDING_COMPANY_BACKGROUND_MAX_BYTES: ${BRANDING_COMPANY_BACKGROUND_MAX_BYTES:-}
-      # PMS-958: storage backend. Empty resolves to local, so the dev stack
+      # PMS-958, renamed by PMS-1317: which provider stores objects, and the
+      # S3-compatible store it uses. Empty resolves to local, so the dev stack
       # keeps writing to the `attachments` volume unless an operator opts in
       # to the `s3` profile's MinIO (`just dev-s3`) and sets these.
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-}
+      STORAGE_S3_ENDPOINT: ${STORAGE_S3_ENDPOINT:-}
+      STORAGE_S3_BUCKET: ${STORAGE_S3_BUCKET:-}
+      STORAGE_S3_REGION: ${STORAGE_S3_REGION:-}
+      STORAGE_S3_ACCESS_KEY_ID: ${STORAGE_S3_ACCESS_KEY_ID:-}
+      STORAGE_S3_SECRET_ACCESS_KEY: ${STORAGE_S3_SECRET_ACCESS_KEY:-}
+      STORAGE_S3_PATH_STYLE: ${STORAGE_S3_PATH_STYLE:-}
+      # The deprecated aliases, forwarded so an existing `.env` keeps working
+      # for the one release they live. Each is honoured only when its
+      # STORAGE_ name above is unset, and using one logs a deprecation line.
       STORAGE_BACKEND: ${STORAGE_BACKEND:-}
       S3_ENDPOINT: ${S3_ENDPOINT:-}
       S3_BUCKET: ${S3_BUCKET:-}
@@ -580,9 +597,9 @@ services:
       - ./.config:/app/.config
       - server-target:/app/target
       # PMS-836: uploads (ticket attachments and tenant logos) land under
-      # ATTACHMENT_DIR. Without this they live in the container filesystem and
+      # STORAGE_ROOT. Without this they live in the container filesystem and
       # a rebuild loses them, so a dev tenant's logo disappears on the next
-      # `just dev`. Mount point must match the ATTACHMENT_DIR default above.
+      # `just dev`. Mount point must match the STORAGE_ROOT default above.
       - attachments:/data/attachments
     depends_on:
       postgres:

@@ -211,7 +211,7 @@ pub fn dec(s: &str) -> Decimal {
 }
 
 /// A storage root private to this test binary's run, exported as
-/// `ATTACHMENT_DIR`.
+/// `STORAGE_ROOT`.
 ///
 /// Nine suites used to name a fixed path under `/tmp` (`/tmp/mokosh-pms923-test`
 /// and friends). `/tmp` is world-writable with the sticky bit, so whichever OS
@@ -223,7 +223,7 @@ pub fn dec(s: &str) -> Decimal {
 /// because each job gets a fresh container, so it only ever bit the place it
 /// was most expensive to diagnose.
 ///
-/// One root per binary rather than one per test case, because `ATTACHMENT_DIR`
+/// One root per binary rather than one per test case, because `STORAGE_ROOT`
 /// is process-global env and `#[mokosh_test]` cases within a binary run
 /// concurrently: a case that gave itself a private root would change the root
 /// under its neighbours mid-run. Every case in a binary therefore shares this
@@ -249,7 +249,7 @@ pub fn storage_root() -> &'static std::path::Path {
     });
     // Re-exported on every call, not only on the first: a suite may set other
     // storage env beside this one, and the cost of being sure is one setenv.
-    std::env::set_var("ATTACHMENT_DIR", dir.path());
+    std::env::set_var("STORAGE_ROOT", dir.path());
     dir.path()
 }
 
@@ -384,7 +384,7 @@ async fn boot_with_db(
     // compiled-in `./attachments` root for a neighbour that does.
     storage_root();
     // PMS-982: configuration resolves into a generation that is held, so a
-    // suite's `set_var` (ATTACHMENT_DIR above, ATTACHMENT_MAX_BYTES and
+    // suite's `set_var` (STORAGE_ROOT above, ATTACHMENT_MAX_BYTES and
     // INFISICAL_ADDRESS in the suites that set them before booting) is not
     // visible until the generation is rebuilt. Refreshing here rather than in
     // each suite means a suite only has to set the variable before it boots,
