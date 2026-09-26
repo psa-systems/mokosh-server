@@ -29,10 +29,47 @@ Every value the server reads comes from the configuration provider, and the only
 | `INFISICAL_URL` | `.env` | Host-side URL of the dev Infisical instance, read by the bootstrap CLI when `just infisical-bootstrap` runs it on the host. Default `http://localhost:28002`. Not the same key as `MOKOSH_SERVER_INFISICAL_ADDRESS` above, which is the in-network URL the server container gets. |
 | `INFISICAL_*` | `.env` | Infisical server config (bootstrap inputs) and Universal Auth client credentials (filled by `mokosh-bootstrap`). |
 | `STORAGE_PROVIDER` | `compose.dev.yml` | Which provider stores objects: `local` (the default, and the hosting profile's in both modes) or `s3`. An unrecognized value fails startup rather than falling back, so a typo cannot quietly write uploads to a container filesystem. Renamed from `STORAGE_BACKEND` by PMS-1317, which still works as a deprecated alias. |
-| `STORAGE_ROOT` | `compose.dev.yml` | Filesystem root the `local` provider hangs every stored object off: ticket attachments, tenant logos, knowledge base images and issued documents, each under its own tenant (the layout table is in [`architecture.md`](architecture.md)). Left commented out in `.env.example` on purpose: the dev stack points it at `/data/attachments` on the `dev-mokosh-attachments-${USER}` volume so an upload survives a rebuild, and setting it in `.env` would override that. Deployed environments want an absolute path on a mounted volume. Renamed from `ATTACHMENT_DIR` by PMS-1317, which still works as a deprecated alias; the old name described one of the four things kept under that root, which is what made it misleading. |
+| `STORAGE_ROOT` | `compose.dev.yml` | Filesystem root the `local` provider hangs every stored object off: ticket attachments, tenant logos, knowledge base images and issued documents, each under its own tenant (see [Storage layout](#storage-layout) below). Left commented out in `.env.example` on purpose: the dev stack points it at `/data/attachments` on the `dev-mokosh-attachments-${USER}` volume so an upload survives a rebuild, and setting it in `.env` would override that. Deployed environments want an absolute path on a mounted volume. Renamed from `ATTACHMENT_DIR` by PMS-1317, which still works as a deprecated alias; the old name described one of the four things kept under that root, which is what made it misleading. |
 | `STORAGE_S3_ENDPOINT`, `STORAGE_S3_BUCKET`, `STORAGE_S3_REGION`, `STORAGE_S3_PATH_STYLE`, `STORAGE_S3_ACCESS_KEY_ID`, `STORAGE_S3_SECRET_ACCESS_KEY` | `compose.dev.yml` | The S3-compatible store, read only when `STORAGE_PROVIDER=s3`. Endpoint, bucket and both halves of the credential are required, and a deployment that asks for `s3` without them refuses to boot rather than 500ing on the first upload; the region defaults to `us-east-1` and path-style addressing to `true`, which is what every non-AWS store serves. Renamed from the bare `S3_*` names by PMS-1317, which still work as deprecated aliases. |
 | deprecated: `ATTACHMENT_DIR`, `STORAGE_BACKEND`, `S3_*` | `compose.dev.yml` | Honoured for one release, and only when the `STORAGE_`-prefixed name above is unset. Using one logs a line naming its replacement, and `mokosh-server provider-status` reports which name supplied each setting, so finishing the migration is a question with an answer. |
 | `RUN_MIGRATIONS` | `.env` | Whether the server applies pending migrations on start. Default `true` whether or not the variable is set. |
 | `RUST_LOG` | `.env` | Tracing subscriber filter. |
 
 `compose.dev.yml` references every value via `${VAR}` substitution and contains no hardcoded secrets. Required vars use `${VAR:?...}` so compose fails loudly with a helpful message when a value is missing.
+
+## Storage layout
+
+Every stored object lives under one root: `STORAGE_ROOT` when `STORAGE_PROVIDER` is `local`, the bucket when it is `s3`. The path below the root is the same string either way, so moving a deployment between the two is a copy and not a re-layout.
+
+**Tenant isolation is a property of the path, not only of the database.** An object's path begins with the id of the tenant that owns it, so one tenant's files occupy one directory and a per-tenant bucket, quota, export or provider migration has a prefix to be built on. That is also why directories were chosen over a bucket per tenant: a directory moves to another provider by copying a prefix, and bucket-per-tenant runs into provider account limits.
+
+| Path | What it is |
+|---|---|
+| `{tenant}/{id}` | a file attached to a ticket or a ticket note |
+| `{tenant}/logo.{ext}` | the tenant's live logo, overwritten on replace |
+| `{tenant}/kb-articles/{id}` | an image embedded in a knowledge base article |
+| `{tenant}/documents/{id}` | an invoice or credit-note PDF, as it was issued |
+| `{tenant}/branding/{digest}` | a logo frozen onto a sent invoice, content-addressed |
+| `{tenant}/contact-imports/{id}` | an uploaded `.vcf`, held until the import that reads it ends |
+
+`{tenant}/logo.{ext}` and `{tenant}/branding/{digest}` are deliberately different directories: the first is one mutable object per tenant, the second holds the immutable copies frozen onto documents, one per distinct logo rather than one per invoice.
+
+### Paths that do not yet begin with their tenant
+
+Two kinds of path are exceptions, and an operator reading a volume will see both.
+
+**Old locations, read-only.** A knowledge base image written before the layout change is at `kb-articles/{id}`, and a tenant logo written before it is at `tenant-logos/{tenant}.{ext}`. Both are still served, and a one-shot pass at each server start walks them to the paths above; once it has, neither directory refills. Nothing writes to them.
+
+**Branding assets other than the tenant logo**, which are still on a shared directory per kind and are the subject of PMS-1397:
+
+| Path | What it is |
+|---|---|
+| `tenant-favicons/{tenant}.{ext}` | the tenant's favicon |
+| `tenant-backgrounds/{tenant}.{ext}` | the tenant's sign-in background |
+| `company-logos/{company}.{ext}` | a client company's logo |
+| `company-favicons/{company}.{ext}` | a client company's favicon |
+| `company-backgrounds/{company}.{ext}` | a client company's sign-in background |
+
+These are listed rather than left to be discovered, because the point of documenting a layout is that it is the real one. The three `company-*` directories carry no tenant at all. That is not a way for one tenant to read another's file through the API - the routes that serve these are deliberately public, with the id as the credential, so no tenant-scoped key is presented in the first place - but it does mean those five cannot be moved, quota-limited or exported per tenant until PMS-1397 lands.
+
+`crate::storage` is the only place any of this is decided, with `src/modules/branding/assets.rs` holding the five above. A caller is handed a tenant and an object identity and never a path, so a new kind of stored object cannot invent its own layout, and `storage::tests::every_object_kind_puts_its_tenant_first` fails the build if one is added without its tenant in front.

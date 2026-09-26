@@ -542,4 +542,119 @@ mod tests {
         assert!(p.starts_with("/api/v1/public/tenants/"));
         assert!(p.ends_with("/favicon"));
     }
+
+    /// PMS-1318: the (scope, kind) pairs whose stored path does NOT begin with
+    /// the tenant, and the directory each one shares across tenants.
+    ///
+    /// Only `(Tenant, Logo)` goes through `ObjectKey`, so only it gets the
+    /// `{tenant}/...` prefix every other kind of stored object has
+    /// (`crate::storage::tests::every_object_kind_puts_its_tenant_first`). The
+    /// other five are built from a local path in this module and sit in one
+    /// shared directory per kind, which is the same shape PMS-960 removed for
+    /// KB attachments and PMS-1234 removed for the logo itself.
+    ///
+    /// This is NOT live cross-tenant exposure: the serving routes are
+    /// deliberately public with the id as the credential, so no key is
+    /// presented that could name another tenant's object. What is missing is
+    /// the property - a per-tenant bucket, quota, export or provider migration
+    /// has no prefix to be built on, which is the reason the logo moved.
+    ///
+    /// PMS-1397 moves them. The list is here rather than in a comment so that
+    /// closing it is a code change with a test behind it, and so a SIXTH pair
+    /// added on the local-path layout fails below instead of joining them
+    /// quietly.
+    const NOT_TENANT_SCOPED: &[(AssetScope, BrandAssetKind, &str)] = &[
+        (
+            AssetScope::Tenant(Uuid::nil()),
+            BrandAssetKind::Favicon,
+            "tenant-favicons",
+        ),
+        (
+            AssetScope::Tenant(Uuid::nil()),
+            BrandAssetKind::Background,
+            "tenant-backgrounds",
+        ),
+        (
+            AssetScope::Company(Uuid::nil()),
+            BrandAssetKind::Logo,
+            "company-logos",
+        ),
+        (
+            AssetScope::Company(Uuid::nil()),
+            BrandAssetKind::Favicon,
+            "company-favicons",
+        ),
+        (
+            AssetScope::Company(Uuid::nil()),
+            BrandAssetKind::Background,
+            "company-backgrounds",
+        ),
+    ];
+
+    fn store() -> BrandingAssetStore {
+        BrandingAssetStore {
+            root: PathBuf::from("/data/attachments"),
+            logo_store: crate::storage::shared(),
+            ledger: None,
+        }
+    }
+
+    /// Exactly one pair is tenant-scoped, and it is the logo.
+    ///
+    /// `tenant_logo_id` is the classifier the store itself branches on, so
+    /// asserting over it is asserting over the real behaviour rather than a
+    /// restatement of the list. A sixth pair, or a pair moved onto `ObjectKey`
+    /// without updating the list, fails here.
+    #[test]
+    fn the_unscoped_pairs_are_the_ones_pms_1318_found() {
+        let every_pair = [
+            (AssetScope::Tenant(Uuid::nil()), BrandAssetKind::Logo),
+            (AssetScope::Tenant(Uuid::nil()), BrandAssetKind::Favicon),
+            (AssetScope::Tenant(Uuid::nil()), BrandAssetKind::Background),
+            (AssetScope::Company(Uuid::nil()), BrandAssetKind::Logo),
+            (AssetScope::Company(Uuid::nil()), BrandAssetKind::Favicon),
+            (AssetScope::Company(Uuid::nil()), BrandAssetKind::Background),
+        ];
+
+        for (scope, kind) in every_pair {
+            let through_object_key = BrandingAssetStore::tenant_logo_id(scope, kind).is_some();
+            let listed = NOT_TENANT_SCOPED
+                .iter()
+                .any(|(s, k, _)| s.subdir_prefix() == scope.subdir_prefix() && *k == kind);
+            assert_ne!(
+                through_object_key, listed,
+                "{}/{:?} is both tenant-scoped and listed as not, or neither;                  PMS-1397 closes this list and the entry comes off then",
+                scope.subdir_prefix(),
+                kind
+            );
+        }
+    }
+
+    /// Each listed pair really does land in a directory shared across tenants.
+    ///
+    /// Asserted against the path the store builds, so the list cannot go stale
+    /// by describing a layout the code stopped producing.
+    #[test]
+    fn an_unscoped_pair_shares_one_directory_across_tenants() {
+        let s = store();
+        for (scope, kind, directory) in NOT_TENANT_SCOPED {
+            let path = s.path_for(*scope, *kind, "image/png");
+            let relative = path
+                .strip_prefix("/data/attachments")
+                .expect("the store builds under its root");
+            let first = relative
+                .components()
+                .next()
+                .expect("a path has a first component")
+                .as_os_str()
+                .to_string_lossy()
+                .to_string();
+            assert_eq!(
+                &first,
+                directory,
+                "the list says {directory} but the store writes {}",
+                relative.display()
+            );
+        }
+    }
 }
