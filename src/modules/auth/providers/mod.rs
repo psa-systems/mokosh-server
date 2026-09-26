@@ -2,7 +2,7 @@
 //!
 //! Mokosh has two authentication paths, and both are always on by design
 //! (PMS-295): the Bunyip Resource-Server verifier in
-//! [`super::oidc_rs`] and the legacy HS256 cookie / bearer path in
+//! [`super::oidc_rs`] and the legacy HS256 bearer path in
 //! [`super::middleware`]. This module gives those two paths NAMES, an
 //! ordering, and a way for boot to say which is enabled by the operator vs
 //! by the hosting profile's default. It follows the shape
