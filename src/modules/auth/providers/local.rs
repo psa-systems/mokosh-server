@@ -1,4 +1,4 @@
-//! Local (legacy HS256 cookie / bearer) auth provider adapter (PMS-981).
+//! Local (legacy HS256 bearer) auth provider adapter (PMS-981).
 //!
 //! An adapter over [`crate::modules::auth::middleware`] and
 //! [`crate::modules::auth::service::AuthService`]. Like
@@ -17,7 +17,7 @@ use crate::utils::deployment::provider;
 
 use super::AuthProvider;
 
-/// The legacy cookie / bearer path, named.
+/// The legacy bearer path, named.
 #[derive(Clone, Copy, Debug)]
 pub struct LocalProvider {
     is_enabled: bool,

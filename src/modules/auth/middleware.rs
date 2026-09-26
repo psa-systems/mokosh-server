@@ -291,7 +291,7 @@ pub async fn auth_middleware(
 ) -> Response {
     // Extract Bearer token from Authorization header. The bunyip-as-OP
     // Resource-Server path is tried first; failing that we fall back to the
-    // legacy HS256 cookie path. The fallback keeps existing sessions working.
+    // legacy HS256 Bearer path. The fallback keeps existing sessions working.
     //
     // MAPPS-348: track the JWT-verified `sub` from whichever path decodes
     // it. If NEITHER path establishes an auth state (both lookups failed),
@@ -415,7 +415,7 @@ pub async fn auth_middleware(
                 }
                 AuthState::default()
             } else {
-                // 2. Legacy HS256 cookie path. Only an `access` token is a
+                // 2. Legacy HS256 Bearer path. Only an `access` token is a
                 // valid Bearer credential; `decode_token` runs
                 // `Validation::default()` and does not assert `typ`, so a
                 // `typ:"refresh"` token would otherwise be accepted here.

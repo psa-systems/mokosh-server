@@ -8,7 +8,7 @@ What mokosh-server is made of: the runtime pieces, where the code lives, how the
 - **Database**: PostgreSQL 18 via SQLx (compile-time-checked migrations).
 - **Secrets**: tenant-supplied secrets are AES-256-GCM ciphertext in the database by default, encrypted under `ENCRYPTION_KEY` (`SECRET_BACKEND=database`). `SECRET_BACKEND=infisical` keeps them in a self-hosted Infisical instance reached over HTTP instead, and then also requires `INFISICAL_ADDRESS`, `INFISICAL_PROJECT_ID`, `INFISICAL_CLIENT_ID` and `INFISICAL_CLIENT_SECRET`. An unrecognized value is a startup error rather than a fall back to the default.
 - **Email**: Lettre (SMTP).
-- **Auth**: two independent mechanisms run in parallel, and failing to mount one does not disable the other. The SPA and the E2E suite authenticate through bunyip, the sole OpenID Connect provider: mokosh verifies bunyip-issued Bearer tokens against bunyip's JWKS, configured by `OIDC_ISSUER` and `OIDC_AUDIENCE`. The original PSA endpoints use the legacy HS256 cookie session with Argon2 password hashing. The "Auth" section of [`CLAUDE.md`](../CLAUDE.md) carries the detail.
+- **Auth**: two independent mechanisms run in parallel, and failing to mount one does not disable the other. The SPA and the E2E suite authenticate through bunyip, the sole OpenID Connect provider: mokosh verifies bunyip-issued Bearer tokens against bunyip's JWKS, configured by `OIDC_ISSUER` and `OIDC_AUDIENCE`. The original PSA endpoints use the legacy HS256 Bearer-token session with Argon2 password hashing. The "Auth" section of [`CLAUDE.md`](../CLAUDE.md) carries the detail.
 - **Tenancy**: multi-tenant only. Every service method takes an explicit `tenant_id`; the former `single-tenant` cargo feature was removed.
 
 ## Modules
