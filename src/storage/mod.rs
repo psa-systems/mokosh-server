@@ -825,6 +825,15 @@ mod tests {
                 .unwrap(),
             PathBuf::from(format!("/data/attachments/{TENANT}/branding/{DIGEST}"))
         );
+        // PMS-959: the PDF of a document as it was issued. Absent from this
+        // list until PMS-1318, which is the gap an enumeration test closes
+        // that a hand-written one cannot: nothing failed, the arm was simply
+        // never named here.
+        assert_eq!(
+            s.path_for(&ObjectKey::financial_document(TENANT, OBJECT))
+                .unwrap(),
+            PathBuf::from(format!("/data/attachments/{TENANT}/documents/{OBJECT}"))
+        );
         // PMS-1290: an uploaded vCard file, under its tenant.
         assert_eq!(
             s.path_for(&ObjectKey::contact_import(TENANT, OBJECT))
@@ -832,6 +841,146 @@ mod tests {
             PathBuf::from(format!(
                 "/data/attachments/{TENANT}/contact-imports/{OBJECT}"
             ))
+        );
+    }
+
+    /// One sample of EVERY [`ObjectKind`], with the variant's name.
+    ///
+    /// The list is cross-checked against `relative_path`'s own match arms by
+    /// [`every_object_kind_is_sampled`], so a variant added without a sample
+    /// fails rather than being silently untested. That is what makes the
+    /// isolation assertion below a property of the enum rather than of the
+    /// seven keys somebody remembered to write down.
+    fn every_kind() -> Vec<(&'static str, ObjectKey)> {
+        vec![
+            (
+                "TicketAttachment",
+                ObjectKey::ticket_attachment(TENANT, OBJECT),
+            ),
+            ("TenantLogo", ObjectKey::tenant_logo(TENANT, "png")),
+            ("KbAttachment", ObjectKey::kb_attachment(TENANT, OBJECT)),
+            (
+                "FinancialDocument",
+                ObjectKey::financial_document(TENANT, OBJECT),
+            ),
+            ("BrandingLogo", ObjectKey::branding_logo(TENANT, DIGEST)),
+            ("ContactImport", ObjectKey::contact_import(TENANT, OBJECT)),
+            (
+                "LegacyKbAttachment",
+                ObjectKey::legacy_kb_attachment(TENANT, OBJECT),
+            ),
+            (
+                "LegacyTenantLogo",
+                ObjectKey::legacy_tenant_logo(TENANT, "png"),
+            ),
+        ]
+    }
+
+    /// The kinds whose path does NOT begin with their tenant, and why each is
+    /// allowed to.
+    ///
+    /// Both are the layouts their kind used to have, kept addressable because
+    /// files uploaded before the move are still sitting at them on volumes
+    /// this code cannot reach. Neither has a write path: every constructor
+    /// derives the tenant from a database row, and the movers are what empty
+    /// them. They come off this list, and out of the enum, once no deployment
+    /// can still hold a file under one.
+    ///
+    /// Nothing else belongs here. An entry that is not a `Legacy*` read path
+    /// is an isolation gap wearing an exemption, which is the thing PMS-1318
+    /// went looking for.
+    const NOT_TENANT_SCOPED: &[(&str, &str)] = &[
+        (
+            "LegacyKbAttachment",
+            "pre-PMS-960 flat `kb-articles/{id}`, read and move only",
+        ),
+        (
+            "LegacyTenantLogo",
+            "pre-PMS-1234 shared `tenant-logos/{tenant}.{ext}`, read and move only",
+        ),
+    ];
+
+    /// PMS-1318: the property David asked for, rather than a list of paths.
+    ///
+    /// Tenant isolation has to hold at the STORAGE layer and not only in the
+    /// database, because a shared directory is what makes one tenant's file
+    /// reachable from another tenant's key in the first place. Every kind
+    /// therefore puts its tenant first, so a per-tenant bucket, quota, export
+    /// or provider migration has a prefix to be built on - which is the whole
+    /// reason the logo and the KB attachment moved.
+    ///
+    /// The two exceptions are asserted to BE exceptions, not merely skipped:
+    /// a legacy arm that quietly gained a tenant prefix would mean its mover
+    /// is walking files to a path nothing reads.
+    #[test]
+    fn every_object_kind_puts_its_tenant_first() {
+        for (name, key) in every_kind() {
+            let path = key.relative_path().expect("a sample key has a path");
+            let first = path
+                .components()
+                .next()
+                .expect("a path has at least one component")
+                .as_os_str()
+                .to_string_lossy()
+                .to_string();
+
+            match NOT_TENANT_SCOPED.iter().find(|(kind, _)| *kind == name) {
+                Some((_, reason)) => assert_ne!(
+                    first,
+                    TENANT.to_string(),
+                    "{name} is exempt as {reason}, but its path now starts with the                      tenant; if it moved, take it off NOT_TENANT_SCOPED"
+                ),
+                None => assert_eq!(
+                    first,
+                    TENANT.to_string(),
+                    "{name} does not put its tenant first, so its objects share a                      directory across tenants: {}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    /// Every arm of `relative_path` is sampled above.
+    ///
+    /// Without this the isolation test is only as good as whoever last added
+    /// a variant, which is exactly how `FinancialDocument` went unpinned for
+    /// four releases. The arms are read out of this file's own text, so a new
+    /// variant fails here until it is sampled and, if it needs one, given a
+    /// reason in `NOT_TENANT_SCOPED`.
+    #[test]
+    fn every_object_kind_is_sampled() {
+        const SRC: &str = include_str!("mod.rs");
+        let body = SRC
+            .split_once("pub fn relative_path")
+            .expect("relative_path is in this file")
+            .1;
+        let body = body
+            .split_once(
+                "
+    }",
+            )
+            .expect("the function ends")
+            .0;
+
+        let mut arms: Vec<&str> = body
+            .match_indices("ObjectKind::")
+            .map(|(at, _)| {
+                body[at + "ObjectKind::".len()..]
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap_or_default()
+            })
+            .collect();
+        arms.sort_unstable();
+        arms.dedup();
+
+        let mut sampled: Vec<&str> = every_kind().into_iter().map(|(name, _)| name).collect();
+        sampled.sort_unstable();
+        sampled.dedup();
+
+        assert_eq!(
+            arms, sampled,
+            "every ObjectKind arm in relative_path needs a sample in every_kind(),              or the isolation test does not cover it"
         );
     }
 
