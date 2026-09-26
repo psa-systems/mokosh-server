@@ -26,11 +26,16 @@ pub mod dashboards;
 pub mod data_transfer;
 pub mod email_intake;
 pub mod forms;
+// PMS-1310: installed integrations per tenant, and which capabilities each one
+// is handed. The registry declares what a provider supports; the row records
+// what this tenant delegated.
+pub mod integrations;
 pub mod invitations;
 pub mod ip_enrich;
 pub mod knowledge_base;
 pub mod mileage_tracking;
 pub mod notifications;
+pub mod opportunities;
 pub mod platform;
 pub mod portal_roles;
 pub mod projects;
@@ -42,6 +47,7 @@ pub mod search;
 pub mod seed;
 pub mod settings;
 pub mod sla;
+pub mod status;
 pub mod teams;
 pub mod tenants;
 pub mod ticket_templates;

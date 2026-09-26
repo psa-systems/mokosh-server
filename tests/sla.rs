@@ -25,6 +25,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use std::collections::HashSet;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
@@ -89,7 +90,7 @@ fn friday_late_start_lands_on_monday_via_engine() {
 }
 
 /// End-to-end: persisted due times via the wired evaluate path.
-#[sqlx::test]
+#[mokosh_test]
 async fn evaluate_for_ticket_uses_business_hours(pool: PgPool) {
     let tenant_id = common::DEFAULT_TENANT_ID;
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;

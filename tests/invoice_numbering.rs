@@ -14,6 +14,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -69,7 +70,7 @@ async fn prefix_of(pool: &PgPool, company_id: Uuid) -> Option<String> {
 /// The case the issue was filed for: a customer's invoices carry their own
 /// prefix and their own consecutive sequence, and another customer's numbering
 /// is untouched by it.
-#[sqlx::test]
+#[mokosh_test]
 async fn each_customer_gets_their_own_prefix_and_sequence(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     use_company_prefixes(&pool).await;
@@ -114,7 +115,7 @@ async fn each_customer_gets_their_own_prefix_and_sequence(pool: PgPool) {
 /// The prefix is drawn, not derived. Two companies with the same name get
 /// different prefixes, and neither prefix contains the name, which is what
 /// makes it survive a rename.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_prefix_is_not_derived_from_the_name(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     use_company_prefixes(&pool).await;
@@ -160,7 +161,7 @@ async fn the_prefix_is_not_derived_from_the_name(pool: PgPool) {
 /// The counter is a row rather than a Postgres sequence precisely so this
 /// holds: the second create blocks on the first rather than reading a stale
 /// value, and a rollback gives the number back instead of leaving a gap.
-#[sqlx::test]
+#[mokosh_test]
 async fn concurrent_creates_are_unique_and_gap_free(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     use_company_prefixes(&pool).await;
@@ -230,7 +231,7 @@ async fn concurrent_creates_are_unique_and_gap_free(pool: PgPool) {
 
 /// The default is unchanged, so nothing moves for a tenant that does not opt
 /// in, and switching schemes renumbers nothing that already exists.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_old_scheme_is_the_default_and_switching_renumbers_nothing(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
@@ -280,7 +281,7 @@ async fn the_old_scheme_is_the_default_and_switching_renumbers_nothing(pool: PgP
 /// The setting is a closed set, refused at the write: a value outside it would
 /// otherwise be read as the default and the tenant would think they had
 /// switched when they had not.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unknown_scheme_is_refused(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

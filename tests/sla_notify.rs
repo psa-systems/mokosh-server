@@ -23,6 +23,7 @@
 mod common;
 
 use chrono::{DateTime, Utc};
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -61,7 +62,7 @@ async fn breach_notification_count(pool: &PgPool, tenant_id: Uuid, user_id: Uuid
     notification_count(pool, tenant_id, user_id, "sla.breached").await
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn sweep_dispatches_breach_then_dedupes(pool: PgPool) {
     let tenant_id = common::DEFAULT_TENANT_ID;
     // Seeded super_admin under the default tenant; used as the assignee.
@@ -182,7 +183,7 @@ async fn sweep_dispatches_breach_then_dedupes(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn sweep_dispatches_first_response_at_risk_then_dedupes(pool: PgPool) {
     let tenant_id = common::DEFAULT_TENANT_ID;
     let (assignee_id, _email, _password) = common::seed_admin(&pool).await;

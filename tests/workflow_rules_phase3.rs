@@ -13,6 +13,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -42,7 +43,7 @@ async fn lookup_one(pool: &PgPool, table: &str) -> Uuid {
     .unwrap_or_else(|e| panic!("lookup id from {table}: {e}"))
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn status_changed_mutating_rule_fires_note(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -134,7 +135,7 @@ async fn status_changed_mutating_rule_fires_note(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn status_changed_self_cascade_hits_depth_cap(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -264,7 +265,7 @@ async fn status_changed_self_cascade_hits_depth_cap(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn priority_changed_non_mutating_rule_fires_once(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;

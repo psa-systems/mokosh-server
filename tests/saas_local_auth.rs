@@ -23,6 +23,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -84,7 +85,7 @@ fn login_request(email: &str) -> LoginRequest {
 
 /// The configuration a SaaS deployment actually runs in: mode `saas`, verifier
 /// mounted. All three local-credential entry points refuse.
-#[sqlx::test]
+#[mokosh_test]
 async fn saas_with_sso_refuses_every_local_credential_entry_point(pool: PgPool) {
     let email = "closed@example.test";
     seed_local_user(&pool, email).await;
@@ -122,7 +123,7 @@ async fn saas_with_sso_refuses_every_local_credential_entry_point(pool: PgPool) 
 /// The refusal is one message across all three, so a customer who tries the
 /// password box, then "forgot password", then their old link is told the same
 /// thing three times rather than assembling three guesses.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_three_refusals_say_the_same_thing_and_name_single_sign_on(pool: PgPool) {
     let email = "consistent@example.test";
     seed_local_user(&pool, email).await;
@@ -166,7 +167,7 @@ async fn the_three_refusals_say_the_same_thing_and_name_single_sign_on(pool: PgP
 /// The break-glass. `saas` with no verifier can authenticate nobody through
 /// SSO, so the local path stays open: closing it would leave the deployment
 /// with no way in at all, which is PMS-289 rather than a security improvement.
-#[sqlx::test]
+#[mokosh_test]
 async fn saas_without_sso_keeps_the_local_path_as_the_only_way_in(pool: PgPool) {
     let email = "breakglass@example.test";
     seed_local_user(&pool, email).await;
@@ -194,7 +195,7 @@ async fn saas_without_sso_keeps_the_local_path_as_the_only_way_in(pool: PgPool) 
 /// Self-hosted is untouched by both halves of the condition. The verifier being
 /// mounted is not on its own a reason to close anything: a self-hosted operator
 /// may run SSO alongside local accounts and expect both to work.
-#[sqlx::test]
+#[mokosh_test]
 async fn self_hosted_is_unaffected_with_or_without_sso(pool: PgPool) {
     for (i, sso) in [false, true].into_iter().enumerate() {
         let email = format!("selfhosted{i}@example.test");
@@ -223,7 +224,7 @@ async fn self_hosted_is_unaffected_with_or_without_sso(pool: PgPool) {
 /// carry a local hash: the bootstrap admin and anything predating a switch to
 /// SaaS. Worth pinning because it is the reason this change is small, and the
 /// reason the break-glass above is narrow rather than a hole.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_federated_user_has_no_local_password_to_refuse_in_the_first_place(pool: PgPool) {
     let email = "federated@example.test";
     let id = Uuid::new_v4();

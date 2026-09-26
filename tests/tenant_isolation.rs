@@ -37,6 +37,7 @@ mod common;
 
 use mokosh_server::modules::tenants::TenantService;
 use mokosh_server::Database;
+use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;
@@ -281,7 +282,7 @@ async fn seed_records(
 
 /// AC #4: cross-tenant id reads return 404 (existence-hiding), not 403, for
 /// every direct-by-id read surface.
-#[sqlx::test]
+#[mokosh_test]
 async fn cross_tenant_idor_reads_return_404(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let a = provision(&pool, &app, "alpha").await;
@@ -313,7 +314,7 @@ async fn cross_tenant_idor_reads_return_404(pool: PgPool) {
 /// AC #5: the cross-tenant `tenants` admin guard. A tenant-scoped `admin`
 /// (NOT super_admin) is denied another tenant's row with 403, but reads its
 /// own. This is why the actors here are `admin`: super_admin would pass.
-#[sqlx::test]
+#[mokosh_test]
 async fn cross_tenant_admin_cannot_read_other_tenant(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let a = provision(&pool, &app, "alpha").await;
@@ -334,7 +335,7 @@ async fn cross_tenant_admin_cannot_read_other_tenant(pool: PgPool) {
 /// AC #2 / #6: a record created in A never appears in B's list or search, and
 /// the search predicate is tenant-bound (no trigram/ILIKE leak) for tickets,
 /// companies, and contacts.
-#[sqlx::test]
+#[mokosh_test]
 async fn search_and_list_do_not_leak_across_tenants(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let a = provision(&pool, &app, "alpha").await;
@@ -411,7 +412,7 @@ async fn search_and_list_do_not_leak_across_tenants(pool: PgPool) {
 /// AC #2: `ticket_number` is sequenced per tenant, so it never leaks A's
 /// volume into B. Both tenants' first ticket carries the same number; if the
 /// sequence were global, B's first would be offset by A's count.
-#[sqlx::test]
+#[mokosh_test]
 async fn ticket_number_sequence_is_per_tenant(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let a = provision(&pool, &app, "alpha").await;
@@ -493,7 +494,7 @@ fn ticket_seq(v: &serde_json::Value) -> u64 {
 
 /// AC #3: deletion is tenant-scoped. A deleting its own company leaves B's
 /// equivalent row intact, and B aiming a delete at A's id never removes it.
-#[sqlx::test]
+#[mokosh_test]
 async fn deletion_is_tenant_scoped(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let a = provision(&pool, &app, "alpha").await;
@@ -557,7 +558,7 @@ async fn deletion_is_tenant_scoped(pool: PgPool) {
 
 /// AC #8: tenant_settings, `tenants.branding`, and `module_config` are
 /// tenant-scoped. A's writes never bleed into B's defaults.
-#[sqlx::test]
+#[mokosh_test]
 async fn settings_and_branding_are_tenant_scoped(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     let a = provision(&pool, &app, "alpha").await;
@@ -642,7 +643,7 @@ async fn settings_and_branding_are_tenant_scoped(pool: PgPool) {
 /// AC #9 (users): users are tenant-scoped. A's admin cannot list or manage B's
 /// users, and the same email in both tenants yields a session scoped to
 /// exactly one tenant_id.
-#[sqlx::test]
+#[mokosh_test]
 async fn users_are_tenant_scoped(pool: PgPool) {
     let app = common::boot(pool.clone()).await;
     // Both tenants' login admin shares one email (allowed: UNIQUE is per
@@ -697,8 +698,8 @@ async fn users_are_tenant_scoped(pool: PgPool) {
 /// `begin_with_tenant`, cross-tenant reads are scoped by the policy itself,
 /// not only the service predicate - so the result does not depend on the
 /// fail-open default. Observed under an unprivileged `NOBYPASSRLS` role, since
-/// `#[sqlx::test]` connects as the cluster superuser (which bypasses RLS).
-#[sqlx::test]
+/// `#[mokosh_test]` connects as the cluster superuser (which bypasses RLS).
+#[mokosh_test]
 async fn rls_read_scoping_with_guc(pool: PgPool) {
     let tenant_a = Uuid::new_v4();
     let tenant_b = Uuid::new_v4();

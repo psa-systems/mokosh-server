@@ -16,6 +16,7 @@
 mod common;
 
 use chrono::{Duration, Utc};
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -177,7 +178,7 @@ async fn mint_intent_direct(
 
 /// mokosh-contact-login prompt 010: unknown email -> 204, no side
 /// effects. Pins the enumeration-resistance contract of the finder.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_link_returns_204_for_unknown_email(pool: PgPool) {
     // Seed a contact so the tenant/slug is well-formed, then request
     // the link for a DIFFERENT email under the same slug.
@@ -232,7 +233,7 @@ async fn login_link_returns_204_for_unknown_email(pool: PgPool) {
 /// operators saw every finder click quietly drop the email on the floor.
 /// This test pins both the row + the queued notification so the
 /// silent-drop regression cannot come back.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_link_returns_204_for_known_email_and_mints_intent(pool: PgPool) {
     let (_contact_id, _company_id, slug) = seed_portal_contact(&pool, "hit@mcl.example").await;
     clear_intents(&pool).await;
@@ -283,7 +284,7 @@ async fn login_link_returns_204_for_known_email_and_mints_intent(pool: PgPool) {
 
 /// mokosh-contact-login prompt 010: per-email rate limit blocks the
 /// 6th request inside 15 min without any 4xx leak (still 204).
-#[sqlx::test]
+#[mokosh_test]
 async fn login_link_respects_per_email_rate_limit(pool: PgPool) {
     let (_contact_id, _company_id, slug) = seed_portal_contact(&pool, "rate@mcl.example").await;
     clear_intents(&pool).await;
@@ -332,7 +333,7 @@ async fn login_link_respects_per_email_rate_limit(pool: PgPool) {
 
 /// mokosh-contact-login prompt 010: per-IP rate limit blocks the 21st
 /// request inside 1 min across DIFFERENT emails without any 4xx leak.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_link_respects_per_ip_rate_limit(pool: PgPool) {
     // Seed one real contact so the finder resolves the tenant; the
     // rate-limit assertion targets a different email so the finder
@@ -391,7 +392,7 @@ async fn login_link_respects_per_ip_rate_limit(pool: PgPool) {
 /// mokosh-contact-login prompt 010: single-match auto-mint. Redeem
 /// returns `auto.access_token` + `auto.refresh_token`, and the
 /// refresh token is usable on POST /contact/auth/refresh.
-#[sqlx::test]
+#[mokosh_test]
 async fn redeem_single_match_auto_mints_session(pool: PgPool) {
     let (contact_id, _company_id, _slug) = seed_portal_contact(&pool, "one@mcl.example").await;
     // Option-1 gate: stamp a password so the redeem path mints a
@@ -436,7 +437,7 @@ async fn redeem_single_match_auto_mints_session(pool: PgPool) {
 /// the generic 400 the expired and revoked branches produce, carries
 /// no candidate payload of any kind, and the intent is consumed so the
 /// token cannot be re-presented.
-#[sqlx::test]
+#[mokosh_test]
 async fn redeem_multi_match_returns_invalid_link(pool: PgPool) {
     let (_a_id, _a_co, _a_slug) = seed_portal_contact_in_tenant(
         &pool,
@@ -500,7 +501,7 @@ async fn redeem_multi_match_returns_invalid_link(pool: PgPool) {
 
 /// mokosh-contact-login prompt 010: replay of a used token folds to
 /// the generic 400.
-#[sqlx::test]
+#[mokosh_test]
 async fn redeem_replayed_token_returns_400(pool: PgPool) {
     let (_c_id, _co_id, _slug) = seed_portal_contact(&pool, "replay@mcl.example").await;
     let token =
@@ -531,7 +532,7 @@ async fn redeem_replayed_token_returns_400(pool: PgPool) {
 }
 
 /// mokosh-contact-login prompt 010: expired token folds to 400.
-#[sqlx::test]
+#[mokosh_test]
 async fn redeem_expired_token_returns_400(pool: PgPool) {
     let (_c_id, _co_id, _slug) = seed_portal_contact(&pool, "exp@mcl.example").await;
     // Insert an already-expired intent (expires_at = 1 hour ago).
@@ -558,7 +559,7 @@ async fn redeem_expired_token_returns_400(pool: PgPool) {
 /// click. The revoke path (is_portal_user = FALSE) leaves zero
 /// candidates at redeem. Response is the same generic 400 - do NOT
 /// leak that revocation happened.
-#[sqlx::test]
+#[mokosh_test]
 async fn redeem_revoked_between_mint_and_click_returns_400(pool: PgPool) {
     let (contact_id, _co_id, _slug) = seed_portal_contact(&pool, "revoke@mcl.example").await;
     let token =
@@ -589,7 +590,7 @@ async fn redeem_revoked_between_mint_and_click_returns_400(pool: PgPool) {
 /// and leaves the intent unconsumed; a wrong code is a 401 that ticks the
 /// PMS-501 counter and leaves it live; the right code consumes it and
 /// mints; the replay afterwards is the generic 400.
-#[sqlx::test]
+#[mokosh_test]
 async fn mfa_on_the_magic_link_completes_on_the_second_post(pool: PgPool) {
     let (contact_id, _co_id, _slug) = seed_portal_contact(&pool, "mfa@mcl.example").await;
     let secret = mokosh_server::utils::totp::generate_secret();
@@ -706,7 +707,7 @@ async fn mfa_on_the_magic_link_completes_on_the_second_post(pool: PgPool) {
 }
 
 /// PMS-1077: a recovery code completes the magic-link login too, once.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_recovery_code_completes_the_magic_link_once(pool: PgPool) {
     let (contact_id, _co_id, _slug) = seed_portal_contact(&pool, "recover@mcl.example").await;
     let secret_b32 =
@@ -788,7 +789,7 @@ async fn a_recovery_code_completes_the_magic_link_once(pool: PgPool) {
 /// tenant B. Finder at tenant A's slug mints an intent that only
 /// resolves tenant A's Companies at redeem time - tenant B's
 /// Company never appears in the picker.
-#[sqlx::test]
+#[mokosh_test]
 async fn cross_tenant_email_never_leaks_across_msps(pool: PgPool) {
     // Tenant B (fresh) + one Company under it, plus the seeded
     // portal roles (grant_portal_access requires the Support role
@@ -900,7 +901,7 @@ async fn cross_tenant_email_never_leaks_across_msps(pool: PgPool) {
 /// Without this pin a regression that skips the check would silently
 /// re-open the "clicked the magic-link, now I'm password-less and
 /// don't realise it" trap.
-#[sqlx::test]
+#[mokosh_test]
 async fn redeem_single_match_with_no_password_returns_setup_url(pool: PgPool) {
     let (_contact_id, _company_id, slug) = seed_portal_contact(&pool, "nopass@mcl.example").await;
     // Deliberately do NOT call stamp_password_hash: the seed helper
@@ -957,7 +958,7 @@ async fn redeem_single_match_with_no_password_returns_setup_url(pool: PgPool) {
 /// rather than served. `login_link_without_slug_unknown_email_stays_enum_resistant`
 /// below covers only the unknown-email side, so without this a known
 /// email that silently minted nothing would be untested.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_link_without_slug_for_a_known_email_mints_nothing(pool: PgPool) {
     let (_contact_id, _company_id, _slug) = seed_portal_contact(&pool, "nosslug@mcl.example").await;
     // Nuke the intent grant_portal_access minted so the assertion
@@ -1013,7 +1014,7 @@ async fn login_link_without_slug_for_a_known_email_mints_nothing(pool: PgPool) {
 /// Regression companion: an unknown email on the no-slug path returns
 /// 204 with zero intents + zero notifications. Enum-resistant even
 /// under the new fallback shape.
-#[sqlx::test]
+#[mokosh_test]
 async fn login_link_without_slug_unknown_email_stays_enum_resistant(pool: PgPool) {
     let (_contact_id, _company_id, _slug) = seed_portal_contact(&pool, "someone@mcl.example").await;
     clear_intents(&pool).await;

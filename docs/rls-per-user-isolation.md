@@ -90,7 +90,7 @@ in the 2026-06-12 draft had all moved by the time anyone followed them.
   table as an oversight rather than a decision. A rule recorded only in prose is not a rule.
 - **Behaviour is tested too, not just schema shape.** `tests/rls_isolation.rs` and
   `tests/tenantless_table_rls.rs` drive the policies through a purpose-created
-  `NOSUPERUSER NOBYPASSRLS` role (`#[sqlx::test]` itself connects as the superuser, which
+  `NOSUPERUSER NOBYPASSRLS` role (`#[mokosh_test]` itself connects as the superuser, which
   bypasses RLS), and `tests/rls_serving_reads.rs` pins the opposite failure: a serving read
   that reaches the app role must still return its own tenant's rows rather than fail-closing
   to an empty 200. `tests/per_user_isolation.rs` and `tests/worker_tenant_isolation.rs` cover

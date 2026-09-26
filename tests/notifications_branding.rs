@@ -14,14 +14,25 @@
 //! PMS-1139: the first test used to borrow the migrated `auth.password_reset`
 //! copy and assert what that copy SAYS before dispatching it. That is a
 //! different question from whether the dispatcher injects branding, and it is
-//! the question migration 139 lost and PMS-1140 has still to settle, so it
-//! stood red on `main` and reddened every pull request's integration run.
+//! the question migration 139 lost, so it stood red on `main` and reddened
+//! every pull request's integration run.
 //! `a_seeded_template_carries_the_branding_placeholders` below keeps the half
-//! that is worth pinning, pointed at the template where the answer is settled.
+//! that is worth pinning, pointed at a template of its own.
+//!
+//! PMS-1140 settled the other half, and PMS-1119 confirmed it: a mail serves
+//! ONE audience, so `auth.password_reset` and `auth.welcome` are staff mails
+//! that name the deployment through `{{app_name}}` and carry no MSP branding,
+//! while the client-facing `auth.portal_password_reset` names the MSP and
+//! carries none of the product. What migration 139 failed to apply to those
+//! two rows is therefore what they should not have: it was aimed at a
+//! question that had already been answered the other way by migration 116.
+//! `tests/portal_transactional_mail.rs` pins the split itself, and
+//! `tests/app_name_setting.rs` pins how many templates may name the product.
 
 mod common;
 
 use mokosh_server::modules::notifications::NotificationsService;
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -35,7 +46,7 @@ use uuid::Uuid;
 /// `auth.password_reset` and `auth.welcome`, whose copy is the open question
 /// in PMS-1140, so asserting on either would make this test the place a
 /// product decision is enforced.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_seeded_template_carries_the_branding_placeholders(pool: PgPool) {
     let subject: Option<String> = sqlx::query_scalar(
         r#"SELECT subject FROM notification_templates
@@ -56,7 +67,7 @@ async fn a_seeded_template_carries_the_branding_placeholders(pool: PgPool) {
 /// Assert the branding placeholders are substituted with the
 /// tenant's actual values and land in the queued row's subject /
 /// body / body_html.
-#[sqlx::test]
+#[mokosh_test]
 async fn dispatch_injects_tenant_branding_into_render_context(pool: PgPool) {
     // Seed a fresh tenant with full branding so we do not clobber the
     // default tenant that every other test relies on.
@@ -204,7 +215,7 @@ async fn dispatch_injects_tenant_branding_into_render_context(pool: PgPool) {
 /// A tenant with an empty `branding` blob should still render (empty
 /// strings for the missing branding fields), never a literal
 /// `{{msp_logo_url}}` in the recipient's inbox.
-#[sqlx::test]
+#[mokosh_test]
 async fn dispatch_renders_cleanly_when_branding_absent(pool: PgPool) {
     let tenant_id = Uuid::new_v4();
     sqlx::query(
@@ -291,7 +302,7 @@ async fn dispatch_renders_cleanly_when_branding_absent(pool: PgPool) {
 /// Caller-supplied context keys win over the auto-injected branding
 /// defaults, so a specific dispatch can override the tenant identity
 /// (e.g. an integration test asserting a specific string).
-#[sqlx::test]
+#[mokosh_test]
 async fn caller_context_overrides_branding_defaults(pool: PgPool) {
     let tenant_id = Uuid::new_v4();
     sqlx::query(

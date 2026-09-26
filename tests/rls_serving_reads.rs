@@ -5,11 +5,12 @@
 //! `common::boot_rls` / `build_app_role_pool` wire the request-serving pool as a
 //! freshly created `NOSUPERUSER NOBYPASSRLS` role (the production `mokosh_app`
 //! posture), so these assertions actually exercise Row Level Security rather than
-//! the superuser bypass the plain suite uses. Env-gated via `#[sqlx::test]` like
+//! the superuser bypass the plain suite uses. Env-gated via `#[mokosh_test]` like
 //! the rest of the integration suite.
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -21,7 +22,7 @@ use mokosh_server::Database;
 /// `SearchService` held a bare app pool, so under the NOBYPASSRLS role every
 /// scan fail-closed and `GET /search` returned an empty 200. It now runs the
 /// scans inside a `begin_with_tenant` transaction, so a seeded row is found.
-#[sqlx::test]
+#[mokosh_test]
 async fn search_returns_rows_through_the_nobypassrls_app_role(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
 
@@ -73,7 +74,7 @@ async fn search_returns_rows_through_the_nobypassrls_app_role(pool: PgPool) {
 /// runs on the migrator (BYPASSRLS) pool. On the app pool it always read
 /// "not tombstoned", making the 410 ACCOUNT_DELETED branch dead code. This
 /// asserts a soft-deleted row reads `true` through the NOBYPASSRLS-app Database.
-#[sqlx::test]
+#[mokosh_test]
 async fn is_user_tombstoned_true_for_a_soft_deleted_user(pool: PgPool) {
     let (admin_id, _email, _password) = common::seed_admin(&pool).await;
 

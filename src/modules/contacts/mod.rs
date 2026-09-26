@@ -2,6 +2,10 @@
 //!
 //! Handles companies (clients), contacts, and sites.
 
+// PMS-1000: who a document is addressed to, shared by the invoice and quote
+// flows so the two cannot drift on what the company's billing contact means.
+#[cfg(feature = "server")]
+pub(crate) mod billing_contact;
 #[cfg(feature = "server")]
 mod industry_backfill;
 mod models;

@@ -17,6 +17,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 
 async fn create_article(app: &common::TestApp, token: &str, slug: &str) -> String {
@@ -70,7 +71,7 @@ async fn comments(app: &common::TestApp, token: &str, article_id: &str) -> serde
     resp.json().await.expect("comments JSON")
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_thread_is_two_deep_named_and_oldest_first(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (_tech_id, tech_email, tech_password) = common::seed_user(
@@ -174,7 +175,7 @@ async fn a_thread_is_two_deep_named_and_oldest_first(pool: PgPool) {
     assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn the_author_or_an_admin_edits_and_deletes_and_a_manager_does_not(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (_tech_id, tech_email, tech_password) = common::seed_user(
@@ -299,7 +300,7 @@ async fn the_author_or_an_admin_edits_and_deletes_and_a_manager_does_not(pool: P
     assert_eq!(resolve.status(), reqwest::StatusCode::CONFLICT);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn any_staff_role_resolves_a_root_and_a_reply_cannot_be_resolved(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (_tech_id, tech_email, tech_password) = common::seed_user(
@@ -371,7 +372,7 @@ async fn any_staff_role_resolves_a_root_and_a_reply_cannot_be_resolved(pool: PgP
     assert_eq!(on_reply.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn an_anchored_root_records_the_article_version_it_quotes(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -406,7 +407,7 @@ async fn an_anchored_root_records_the_article_version_it_quotes(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
+#[mokosh_test]
 async fn a_contact_never_sees_a_comment(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -514,7 +515,7 @@ async fn mention_rows(
 /// an ambiguous one: exactly one in-app row per named colleague, none for the
 /// author, nothing for the rest. An edit that adds a handle notifies that
 /// person once; a re-save notifies nobody; the mention rows say who was told.
-#[sqlx::test]
+#[mokosh_test]
 async fn a_mention_notifies_the_named_colleague_exactly_once(pool: PgPool) {
     let (admin_id, email, password) = common::seed_admin(&pool).await;
     let (ada_id, _, _) = common::seed_user(
@@ -662,7 +663,7 @@ async fn a_mention_notifies_the_named_colleague_exactly_once(pool: PgPool) {
 
 /// A comment with no mention writes no mention row and no notification,
 /// and an inactive colleague is not a mention target.
-#[sqlx::test]
+#[mokosh_test]
 async fn no_mention_no_row_and_an_inactive_user_is_not_named(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let (gone_id, _, _) = common::seed_user(
@@ -712,7 +713,7 @@ async fn no_mention_no_row_and_an_inactive_user_is_not_named(pool: PgPool) {
 
 /// A full selector round-trips as given; each shape rule answers 422 naming
 /// the field, before any row is written.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_anchor_is_kept_as_given_and_a_malformed_one_names_its_field(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;

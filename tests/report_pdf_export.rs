@@ -9,6 +9,7 @@
 
 mod common;
 
+use mokosh_test::mokosh_test;
 use printpdf::PdfDocument;
 use reqwest::StatusCode;
 use sqlx::PgPool;
@@ -55,7 +56,7 @@ fn header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a
 /// The admin role clears both finance gates, so this covers the seven keys
 /// rather than the five a technician could reach; the gates themselves are
 /// asserted by the role matrix in `rbac_route_coverage.rs`.
-#[sqlx::test]
+#[mokosh_test]
 async fn every_exportable_report_serves_a_pdf(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -93,7 +94,7 @@ async fn every_exportable_report_serves_a_pdf(pool: PgPool) {
 /// `.to_string()`, so a whole-dollar total read as `1200` with no `.00` and
 /// no currency. It now goes through the promoted `money()` formatter like
 /// every other money value this repo renders.
-#[sqlx::test]
+#[mokosh_test]
 async fn billing_pdf_prints_money_through_the_shared_formatter(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -129,7 +130,7 @@ async fn billing_pdf_prints_money_through_the_shared_formatter(pool: PgPool) {
 
 /// The custom report still refuses, and for the reason it always did: adding a
 /// second format does not give a GET a body to carry a report spec in.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_custom_report_still_refuses_a_pdf(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -146,7 +147,7 @@ async fn the_custom_report_still_refuses_a_pdf(pool: PgPool) {
 
 /// A format outside the implemented set is still a 400, and the message names
 /// both formats rather than only the one that used to exist.
-#[sqlx::test]
+#[mokosh_test]
 async fn an_unimplemented_format_is_still_a_400(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -162,7 +163,7 @@ async fn an_unimplemented_format_is_still_a_400(pool: PgPool) {
 }
 
 /// Case is not significant, the way it never was for `csv`.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_format_is_matched_case_insensitively(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -177,7 +178,7 @@ async fn the_format_is_matched_case_insensitively(pool: PgPool) {
 /// `Content-Disposition` filename convention for the PDF to match; it carries
 /// none, and it does not gain one here, because it is an existing response the
 /// SPA already consumes.
-#[sqlx::test]
+#[mokosh_test]
 async fn the_csv_export_is_unchanged(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
@@ -214,7 +215,7 @@ fn extracted_text(bytes: &[u8]) -> String {
 /// honestly wrote `assignee_id` / `user_id`. Both now resolve a display name,
 /// with the CSV export left untouched (it still writes the ids under their id
 /// column names).
-#[sqlx::test]
+#[mokosh_test]
 async fn pdf_columns_name_the_user_instead_of_printing_a_uuid(pool: PgPool) {
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
