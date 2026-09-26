@@ -16,11 +16,11 @@ const EXEMPT: &[(&str, &str)] = &[
     ("delete_one", "owner-scoped dashboard / saved report"),
     (
         "remove_member",
-        "team-manage check in the service (assert_can_manage_team)",
+        "admin or the team's own manager_id, inline via assert_can_manage_team",
     ),
     (
         "soft_delete_team",
-        "team-manage check in the service (assert_can_manage_team)",
+        "admin or the team's own manager_id, inline via assert_can_manage_team",
     ),
 ];
 
