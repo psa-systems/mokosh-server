@@ -82,7 +82,7 @@ pub struct IntegrationResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub poll_interval_minutes: Option<i32>,
     /// Non-secret settings only. A credential here would be a defect; see
-    /// migration 251's header.
+    /// migration 252's header.
     pub config: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected_at: Option<DateTime<Utc>>,

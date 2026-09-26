@@ -250,7 +250,7 @@ async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
 }
 
 /// A credential is never on the row, never served back and never in the audit
-/// trail. This is the property migration 251's header states and the one the
+/// trail. This is the property migration 252's header states and the one the
 /// secrets provider exists for, so it is asserted against the stored bytes
 /// rather than against what the service passed around.
 #[mokosh_test]

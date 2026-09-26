@@ -102,7 +102,7 @@ impl ProviderDescriptor {
 /// Every provider, in the order the integrations page lists them.
 ///
 /// The `provider` strings are the same set the CHECK on
-/// `integrations.provider` accepts (migration 251); adding one means widening
+/// `integrations.provider` accepts (migration 252); adding one means widening
 /// that CHECK in a new migration and adding a variant to
 /// [`IntegrationProvider`] in the same change.
 pub const REGISTRY: &[ProviderDescriptor] = &[
