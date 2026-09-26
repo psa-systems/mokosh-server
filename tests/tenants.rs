@@ -2019,7 +2019,7 @@ async fn ensure_principal_usable_passes_when_entitlement_active(pool: PgPool) {
 /// PMS-1059 LEFT-JOINed read collapses the two prior statements into one, but
 /// the pass-through semantics for a non-suspended non-expired row must be
 /// preserved.
-#[sqlx::test]
+#[mokosh_test]
 async fn ensure_principal_usable_passes_when_entitlement_unknown(pool: PgPool) {
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let auth = AuthService::new(Database::from_pool(pool.clone()), "test-secret".into());
