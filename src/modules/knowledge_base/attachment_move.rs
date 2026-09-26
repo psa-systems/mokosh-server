@@ -6,15 +6,29 @@
 //! files already on a customer's volume in the wrong place. This is what walks
 //! them over.
 //!
-//! ## Why a scheduled job rather than a boot step
+//! ## Why a one-shot rather than a scheduled job
 //!
+//! This ran as an hourly [`Job`](crate::scheduler::Job) until PMS-1320, because
 //! [`Scheduler`](crate::scheduler::Scheduler) fires every registered job once
-//! immediately at startup and then on its interval, so registering this at an
-//! hour gets the one-shot behaviour with no maintenance window AND makes a
-//! transient failure self-healing instead of waiting for the next restart.
-//! Blocking the boot on a filesystem walk of unknown size is the thing worth
-//! avoiding; nothing about the API needs the move to have finished, because the
-//! read path falls back to the old location until it has.
+//! immediately at startup, so an hourly registration got the one-shot behaviour
+//! and a free retry. That is a recurring job whose whole purpose is a one-time
+//! correction, and from outside the process it is indistinguishable from
+//! maintenance the design still depends on.
+//!
+//! It now goes through [`crate::scheduler::one_shot::spawn_once`], which runs
+//! it once per process start and says which of the two it is. Spawned rather
+//! than awaited, for the reason the hourly version was not a boot step either:
+//! a walk of a volume of unknown size must not decide how long the API takes to
+//! come up, and nothing about serving a request needs the move to have
+//! finished, because the read path falls back to the old location until it has.
+//! What is given up is retrying a transient failure an hour later instead of at
+//! the next restart.
+//!
+//! A migration is the obvious alternative and is not available: a migration
+//! runs inside Postgres, and what this moves is bytes in [`crate::storage`], on
+//! a volume or in a bucket Postgres cannot reach. Only the `files` row is SQL,
+//! and rewriting it without moving the file it names is the one ordering that
+//! can lie.
 //!
 //! ## Why the ledger drives it
 //!
@@ -29,7 +43,7 @@
 //!
 //! The rename is atomic (see [`ObjectProvider::rename`]), and the ledger update
 //! follows it, so the two orders of partial failure are: a file that did not
-//! move, which the read fallback still serves and the next tick retries; and a
+//! move, which the read fallback still serves and the next restart retries; and a
 //! file that moved with a ledger row still naming the old path, which the next
 //! tick corrects because the file is already where it belongs.
 //!
@@ -37,13 +51,11 @@
 //! ledger row keeps pointing at the old location, which is honest: rewriting it
 //! to the new one would make a row that names a file nobody has look like a
 //! successfully migrated object, and the cost of leaving it is two `stat` calls
-//! an hour.
+//! per process start.
 
-use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::scheduler::Job;
 use std::sync::Arc;
 
 use crate::storage::{ObjectKey, ObjectProvider};
@@ -160,15 +172,14 @@ impl KbAttachmentMover {
     }
 }
 
-#[async_trait]
-impl Job for KbAttachmentMover {
-    fn name(&self) -> &'static str {
-        "kb_attachment_move"
-    }
-
-    async fn run(&self) -> AppResult<()> {
-        self.run_tick().await.map(|_| ())
-    }
+impl KbAttachmentMover {
+    /// The name this pass is logged under, and the only thing left of the
+    /// `Job` impl it used to carry (PMS-1320). It is handed to
+    /// [`crate::scheduler::one_shot::spawn_once`] at boot rather than
+    /// registered on the scheduler: this corrects history once and never
+    /// becomes due again, so an hourly interval was a recurring job doing a
+    /// one-time job's work.
+    pub const ONE_SHOT_NAME: &'static str = "kb_attachment_move";
 }
 
 #[cfg(test)]

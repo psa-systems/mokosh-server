@@ -17,20 +17,23 @@
 //! files might sit under the old directory: this job moves what the product
 //! considers a logo, and an orphan is not one.
 //!
-//! ## Why a scheduled job rather than a boot step
+//! ## Why a one-shot rather than a scheduled job
 //!
-//! [`Scheduler`](crate::scheduler::Scheduler) fires every registered job once
-//! immediately at startup and then on its interval, so registering this at an
-//! hour gets the one-shot behaviour with no maintenance window AND makes a
-//! transient failure self-healing instead of waiting for the next restart.
-//! Nothing about the API needs the move to have finished, because
+//! This ran as an hourly [`Job`](crate::scheduler::Job) until PMS-1320, for the
+//! reason the KB attachment mover beside it did: the
+//! [`Scheduler`](crate::scheduler::Scheduler) fires every job once immediately
+//! at startup, so an hourly registration bought the one-shot behaviour plus a
+//! free retry. It is a one-time correction either way, and
+//! [`crate::scheduler::one_shot::spawn_once`] now runs it once per process
+//! start and says which of the two it is. Spawned rather than awaited, because
+//! nothing about the API needs the move to have finished:
 //! `TenantLogoStore::read` falls back to the old location until it has.
 //!
 //! ## What it does about failure
 //!
 //! The rename is atomic (see [`ObjectProvider::rename`]), and the ledger update
 //! follows it, so the two orders of partial failure are: a file that did not
-//! move, which the read fallback still serves and the next tick retries; and a
+//! move, which the read fallback still serves and the next restart retries; and a
 //! file that moved with a ledger row still naming the old path, which the next
 //! tick corrects because the file is already where it belongs.
 //!
@@ -39,13 +42,11 @@
 //! rewriting it to the new one would make a row that names a file nobody has
 //! look like a successfully migrated object.
 
-use async_trait::async_trait;
 use uuid::Uuid;
 
 use std::sync::Arc;
 
 use crate::db::Database;
-use crate::scheduler::Job;
 use crate::storage::{ObjectKey, ObjectProvider};
 use crate::utils::error::AppResult;
 
@@ -173,15 +174,14 @@ impl TenantLogoMover {
     }
 }
 
-#[async_trait]
-impl Job for TenantLogoMover {
-    fn name(&self) -> &'static str {
-        "tenant_logo_move"
-    }
-
-    async fn run(&self) -> AppResult<()> {
-        self.run_tick().await.map(|_| ())
-    }
+impl TenantLogoMover {
+    /// The name this pass is logged under, and the only thing left of the
+    /// `Job` impl it used to carry (PMS-1320). It is handed to
+    /// [`crate::scheduler::one_shot::spawn_once`] at boot rather than
+    /// registered on the scheduler: this corrects history once and never
+    /// becomes due again, so an hourly interval was a recurring job doing a
+    /// one-time job's work.
+    pub const ONE_SHOT_NAME: &'static str = "tenant_logo_move";
 }
 
 #[cfg(test)]
