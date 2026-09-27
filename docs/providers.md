@@ -224,9 +224,9 @@ the active profile and every deviation from it.
 
 ## A note on names
 
-The environment variables `SECRET_BACKEND` and `STORAGE_BACKEND` still say "backend" and will keep saying it.
-Renaming them would break every running deployment for a vocabulary change. In code and in documentation the word
-is provider.
+The environment variable `SECRET_BACKEND` still says "backend": renaming it would break every running deployment
+for a vocabulary change, unless the rename ships behind a deprecated alias the way PMS-1317 renamed
+`STORAGE_BACKEND` to `STORAGE_PROVIDER`. In code and in documentation the word is provider.
 
 ## Feature flags
 

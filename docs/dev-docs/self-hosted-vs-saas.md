@@ -55,7 +55,7 @@ the change that read the deployment's configuration and moved the email row
 onto the confirmed value.
 
 Secrets, storage and configuration still match `self-hosted` because the SaaS
-deployment sets none of `SECRET_BACKEND`, `STORAGE_BACKEND` and no
+deployment sets none of `SECRET_BACKEND`, `STORAGE_PROVIDER` and no
 configuration provider selection, so all three resolve to the code default
 today. Writing `infisical` or `s3` here without the deployment naming them
 explicitly would boot-fail a deployment that sets neither, because
@@ -64,7 +64,7 @@ their variables. Moving those rows needs the deployment to set the variable
 first.
 
 **The profile supplies defaults and locks nothing.** Explicit configuration
-wins for its own kind - `CONFIG_BACKEND`, `SECRET_BACKEND`, `STORAGE_BACKEND`,
+wins for its own kind - `CONFIG_BACKEND`, `SECRET_BACKEND`, `STORAGE_PROVIDER`,
 `SMTP_HOST`, `OIDC_ISSUER` - and every provider stays available at runtime in both modes, so
 an operator can enable a second one during a migration.
 
