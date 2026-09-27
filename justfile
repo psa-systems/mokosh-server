@@ -62,7 +62,7 @@ pre-commit: ensure-env
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-doc-recipes check-config-doc-paths check-doc-links
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-doc-links
 
 # Keep every relative Markdown link pointing at a file that exists (PMS-850).
 # The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and
@@ -71,6 +71,17 @@ check: check-compile check-clippy check-fmt check-migrations check-migration-imm
 [group: 'check']
 check-doc-links:
     nu scripts/check-doc-links.nu
+
+# Keep build artifacts off memory-backed storage (PMS-973). The shared
+# development machines carry a large tmpfs at /tmp, and this workspace's target
+# directory runs to tens of gigabytes, so a `CARGO_TARGET_DIR` pointed there
+# spends memory the running application and the other developers need. Resolves
+# the path cargo will actually use and fails when its filesystem is tmpfs or
+# ramfs; docs/dev-docs/build-storage.md is where each host keeps its target.
+[doc("Fail if the cargo target directory sits on a memory-backed filesystem (PMS-973).")]
+[group: 'check']
+check-build-target-storage:
+    nu scripts/check-build-target-storage.nu
 
 # Keep the entry-point docs' `just` commands runnable (PMS-843). Fails if one of
 # the docs in `const DOCS` (scripts/check-doc-recipes.nu) names a recipe the
