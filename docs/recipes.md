@@ -37,6 +37,7 @@ just check-single-build     # fail if a compiling workflow builds the same tree 
 just check-workspace-deps   # fail if [workspace.dependencies] and its members disagree
 just check-unused-deps      # cargo-machete: fail on a dependency with no call site
 just check-env-example      # fail if a var the code reads is missing from .env.example or compose.dev.yml
+just check-build-target-storage # fail if the cargo target directory sits on a memory-backed filesystem
 just check-doc-recipes      # fail if a guarded doc names a recipe the justfile lacks
 just check-config-doc-paths # fail if a docs/ path in .env.example, compose.dev.yml or the justfile is missing
 just check-doc-links        # fail if a relative Markdown link does not resolve to an existing path

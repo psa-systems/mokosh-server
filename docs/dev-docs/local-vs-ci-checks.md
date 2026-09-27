@@ -31,6 +31,7 @@ one alone and you have not.
 | Single build per commit | `nu scripts/check-single-build.nu` | `check-single-build` | no |
 | Workspace dependency table | `nu scripts/check-workspace-deps.nu` | `check-workspace-deps` | no |
 | Environment-variable parity | `nu scripts/check-env-example.nu` | `check-env-example` | no |
+| Build target storage | `nu scripts/check-build-target-storage.nu` | `check-build-target-storage` | no |
 | Documented just recipes | `nu scripts/check-doc-recipes.nu` | `check-doc-recipes` | no |
 | Config doc paths | `nu scripts/check-config-doc-paths.nu` | `check-config-doc-paths` | no |
 | Markdown link targets | `nu scripts/check-doc-links.nu` | `check-doc-links` | no |
