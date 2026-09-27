@@ -46,6 +46,7 @@ use super::service::{
 };
 use super::sync::ImportPreview;
 use crate::modules::audit::AuditCtx;
+use crate::modules::auth::tenant::TenantId;
 use crate::modules::auth::{RequireAdmin, RequireAuth, RequireManager, TenantScoped};
 use crate::modules::tenants::TenantOrPlatformCaller;
 use crate::utils::error::{AppError, AppResult};
@@ -140,14 +141,36 @@ async fn get_connection(
     Ok(Json(overview))
 }
 
-/// The deployment's Google OAuth client (PMS-1264). Read and written by a
-/// platform admin, or by an admin of the system tenant.
+/// A tenant's own Google OAuth client (PMS-1340, was the deployment's under
+/// PMS-1264). An admin reads and writes THEIR OWN tenant's; a platform admin
+/// addresses the system tenant, which is the deprecated deployment-wide value a
+/// tenant without one of its own still falls back to.
+///
+/// The gate is `require_admin_write_access` on the caller's own tenant rather
+/// than on the system tenant, and that is the whole permission change. PMS-1264
+/// restricted this to the system tenant's admin for a stated reason - "a customer
+/// organisation must not be able to swap the client every other tenant connects
+/// through" - and the reason dissolves once the credential is per tenant: there
+/// is no longer a client every other tenant connects through.
+fn client_tenant(caller: &TenantOrPlatformCaller) -> Uuid {
+    match caller {
+        TenantOrPlatformCaller::Platform => ContactSyncService::system_tenant_id(),
+        TenantOrPlatformCaller::Tenant(user) => user.tenant_id,
+    }
+}
+
 async fn get_client(
     State(state): State<ContactSyncRouterState>,
     caller: TenantOrPlatformCaller,
 ) -> AppResult<Json<ClientSettingsView>> {
-    caller.require_admin_write_access(ContactSyncService::system_tenant_id())?;
-    Ok(Json(state.service.client_settings().await?))
+    let tenant_id = client_tenant(&caller);
+    caller.require_admin_write_access(tenant_id)?;
+    Ok(Json(
+        state
+            .service
+            .client_settings(TenantId::from_trusted(tenant_id))
+            .await?,
+    ))
 }
 
 async fn put_client(
@@ -155,13 +178,17 @@ async fn put_client(
     caller: TenantOrPlatformCaller,
     Json(input): Json<ClientSettingsInput>,
 ) -> AppResult<Json<ClientSettingsView>> {
-    caller.require_admin_write_access(ContactSyncService::system_tenant_id())?;
+    let tenant_id = client_tenant(&caller);
+    caller.require_admin_write_access(tenant_id)?;
     let actor = match &caller {
         TenantOrPlatformCaller::Platform => "platform admin".to_string(),
         TenantOrPlatformCaller::Tenant(user) => user.email.clone(),
     };
     Ok(Json(
-        state.service.put_client_settings(&input, &actor).await?,
+        state
+            .service
+            .put_client_settings(TenantId::from_trusted(tenant_id), &input, &actor)
+            .await?,
     ))
 }
 
