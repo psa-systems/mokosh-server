@@ -492,7 +492,7 @@ mod tests {
              runs against a schema missing it"
         );
 
-        let edited = vec![
+        let edited = [
             migration(1, "initial schema", "CREATE TABLE a ();"),
             migration(2, "second", "CREATE TABLE b (id int);"),
         ];
@@ -502,7 +502,7 @@ mod tests {
             "an edited migration must name a different template"
         );
 
-        let renamed = vec![
+        let renamed = [
             migration(1, "initial schema", "CREATE TABLE a ();"),
             migration(2, "second table", "CREATE TABLE b ();"),
         ];
