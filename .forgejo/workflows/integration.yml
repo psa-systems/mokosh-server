@@ -241,7 +241,8 @@ jobs:
 
       - name: Build the template every test clones
         # PMS-1254: the 243 migrations are applied ONCE per run, into a
-        # template database named after a digest of the migration files, and
+        # template database named after a digest of the migration set compiled
+        # into the test binary (PMS-1398: the same set that fills it), and
         # each case is then a `CREATE DATABASE ... TEMPLATE` clone of it. The
         # suite builds the template by itself when it finds none, under an
         # advisory lock, so this step is not what makes the run correct; it is
