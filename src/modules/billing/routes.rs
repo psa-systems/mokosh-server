@@ -89,6 +89,14 @@ pub fn billing_routes(service: BillingService, public_api_base: Option<String>) 
             "/invoices/{invoice_id}/void",
             axum::routing::post(void_invoice),
         )
+        // PMS-1334: amend, which is how a SENT invoice is corrected. POST and
+        // not PUT because it creates a document rather than changing one: the
+        // answer is a new draft, and the invoice named in the path is untouched
+        // until that draft is sent.
+        .route(
+            "/invoices/{invoice_id}/amend",
+            axum::routing::post(amend_invoice),
+        )
         // PMS-911 / PMS-936: the invoice as a client receives it. Rendered
         // from the issuer snapshot frozen when it was sent, so a later rebrand
         // cannot change a document somebody already holds. Contact plane gates
@@ -749,6 +757,22 @@ async fn void_invoice(
         .void_invoice(user.tenant(), invoice_id, user.id, &request, &ctx)
         .await?;
     Ok(Json(invoice))
+}
+
+/// PMS-1334: replace a sent invoice with a linked draft. Both gates, like every
+/// other handler in this file (PMS-962): the module gate first, then finance.
+async fn amend_invoice(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    ctx: crate::modules::audit::AuditCtx,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Json<InvoiceResponse>> {
+    let amendment = state
+        .service
+        .amend_invoice(user.tenant(), invoice_id, &user.timezone, &ctx)
+        .await?;
+    Ok(Json(amendment))
 }
 
 async fn create_credit_note(

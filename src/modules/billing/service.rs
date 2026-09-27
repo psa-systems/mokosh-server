@@ -903,7 +903,7 @@ impl BillingService {
                    written_off_at, written_off_by_id, write_off_reason, write_off_amount,
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
-                   tax_rate_id, tax_rate
+                   tax_rate_id, tax_rate, amends_invoice_id
             FROM invoices
             WHERE {data_where}
             ORDER BY {order_by}
@@ -4252,6 +4252,59 @@ impl BillingService {
         // fourth copy of the condition is a fourth chance to drift.
         let status = request.status.unwrap_or(locked_status);
         let just_sent = matches!(status, InvoiceStatus::Sent) && current.sent_at.is_none();
+        // PMS-1334: sending an amendment is what replaces the invoice it amends,
+        // so the original is voided here, in the transaction that sends the
+        // replacement, and never when the draft was created. Stripe's ordering
+        // (docs.stripe.com/invoicing/invoice-edits): the revision is created
+        // linked and harmless, and finalising it is the act that voids what it
+        // replaces. The preconditions are re-checked rather than trusted from
+        // creation time, because a payment or a credit note can land against the
+        // original while the amendment sits in draft, and either makes the void
+        // wrong: Stripe refuses to finalise a revision in exactly those cases.
+        let amends = if just_sent {
+            current.amends_invoice_id
+        } else {
+            None
+        };
+        // Captured before the void so the audit row carries both sides of it.
+        let mut voided_before: Option<serde_json::Value> = None;
+        if let Some(original_id) = amends {
+            let original: Option<(String, String, Decimal, Decimal)> = sqlx::query_as(
+                "SELECT invoice_number, status, amount_paid, amount_credited FROM invoices \
+                 WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+            )
+            .bind(original_id)
+            .bind(tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((original_number, original_status, paid, credited)) = original else {
+                return Err(AppError::Conflict(
+                    "The invoice this one amends no longer exists, so sending it would replace \
+                     nothing. Raise it as an ordinary invoice instead."
+                        .to_string(),
+                ));
+            };
+            let original_status =
+                InvoiceStatus::from_str(&original_status).unwrap_or(InvoiceStatus::Draft);
+            if !matches!(original_status, InvoiceStatus::Sent)
+                || paid > Decimal::ZERO
+                || credited > Decimal::ZERO
+            {
+                return Err(AppError::Conflict(format!(
+                    "Invoice {original_number} is no longer in a state this amendment can replace \
+                     (status '{}', {paid} paid, {credited} credited). Issue a credit note against \
+                     it instead, and invoice the difference.",
+                    original_status.as_str()
+                )));
+            }
+            voided_before = sqlx::query_scalar(
+                "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(original_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        }
         let sent_at = if just_sent {
             Some(Utc::now())
         } else {
@@ -4582,6 +4635,56 @@ impl BillingService {
                     "company_name": moved.to_name,
                     "billing_contact_id": billing_contact_id,
                 })),
+            )
+            .await?;
+        }
+
+        // PMS-1334: the replacement has gone out, so the invoice it replaces
+        // becomes a zero-value document. Voided rather than deleted, which is
+        // what a paper trail means: the number stays addressable and the reason
+        // names the invoice the customer should be holding instead. `voided_by_id`
+        // is the sender, since sending the amendment is the act that voided it.
+        //
+        // No credit note is raised beside it. A credit note says the customer
+        // did not owe this; a void says this document was never the invoice, and
+        // the amendment's own total is what they owe. Nothing had been paid or
+        // credited against it, which is checked twice (at amend, and again above
+        // in this transaction), so there is no money for a credit note to move.
+        if let Some(original_id) = amends {
+            sqlx::query(
+                r#"
+                UPDATE invoices
+                SET status       = 'void',
+                    voided_at    = NOW(),
+                    voided_by_id = $3,
+                    void_reason  = $4,
+                    balance_due  = 0,
+                    updated_at   = NOW()
+                WHERE id = $1 AND tenant_id = $2
+                "#,
+            )
+            .bind(original_id)
+            .bind(tenant_id)
+            .bind(ctx.user_id)
+            .bind(format!("Replaced by invoice {}", current.invoice_number))
+            .execute(&mut *tx)
+            .await?;
+            let voided_after: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(original_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            audit_write(
+                &mut *tx,
+                tenant_id,
+                ctx,
+                AuditAction::Update,
+                "invoices",
+                Some(original_id),
+                voided_before,
+                voided_after,
             )
             .await?;
         }
@@ -5287,6 +5390,206 @@ impl BillingService {
     /// invoice that never left `draft` or `pending` has no payments, no
     /// credits and no statement line to reconcile against.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    /// PMS-1334: amend a sent invoice, which means replace it rather than edit
+    /// it. Answers the new DRAFT.
+    ///
+    /// A sent invoice is frozen because the customer holds the document
+    /// (`InvoiceStatus::is_frozen`), and until now the only correction was a
+    /// credit note (PMS-953). That is the right instrument for an invoice
+    /// somebody has paid, and the wrong one for "the invoice is wrong and
+    /// nothing has been paid", where it means three documents for one mistake:
+    /// the original, the credit note, and the invoice that should have been
+    /// sent in the first place.
+    ///
+    /// The model is Stripe's revision (docs.stripe.com/invoicing/invoice-edits),
+    /// chosen because this is a question with an industry answer rather than a
+    /// local one. Creating the amendment does NOT touch the original: it stays
+    /// sent and payable, so an operator who changes their mind can delete the
+    /// draft and nothing was corrected. The original is voided at the moment the
+    /// amendment is SENT, by `update_invoice`, which is also where the
+    /// preconditions are re-checked, because what was true when the draft was
+    /// created may not be true when it goes out.
+    ///
+    /// The refusals are Stripe's too, each for a reason this codebase already
+    /// holds elsewhere:
+    ///
+    /// * Only `sent`. A draft is edited in place; `paid`, `partially_paid`,
+    ///   `void` and `written_off` all mean money or a decision has moved
+    ///   against the invoice, and a void would orphan it.
+    /// * Nothing paid and nothing credited. A payment recorded against an
+    ///   invoice that is then voided is a payment against a zero-value
+    ///   document, and a credit note against a voided invoice credits nothing.
+    ///   Both keep the credit-note route, which is what they are for.
+    /// * One draft amendment at a time, so "what replaces this invoice" has one
+    ///   answer while the correction is being written.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn amend_invoice(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        user_tz: &str,
+        ctx: &AuditCtx,
+    ) -> AppResult<InvoiceResponse> {
+        // PMS-1027: the amendment is dated where the person raising it is, the
+        // way every other date this service defaults is.
+        let today = user_today(chrono::Utc::now(), user_tz);
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let original: Option<(String, String, Decimal, Decimal, Uuid, Option<Uuid>)> =
+            sqlx::query_as(
+                "SELECT invoice_number, status, amount_paid, amount_credited, company_id, \
+                        payment_term_id \
+                 FROM invoices WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+            )
+            .bind(invoice_id)
+            .bind(tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some((number, status, paid, credited, company_id, payment_term_id)) = original else {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        };
+        let status = InvoiceStatus::from_str(&status).unwrap_or(InvoiceStatus::Draft);
+
+        // PMS-977's rule for every refusal on this surface: say what to do
+        // instead, because "cannot be amended" leaves the operator guessing.
+        if !matches!(status, InvoiceStatus::Sent) {
+            return Err(AppError::Conflict(match status {
+                InvoiceStatus::Draft | InvoiceStatus::Pending => format!(
+                    "Invoice {number} has not been sent yet, so it can be edited directly rather \
+                     than amended."
+                ),
+                InvoiceStatus::Void => format!(
+                    "Invoice {number} is void, so there is nothing to replace. Amend the invoice \
+                     that replaced it, or raise a new one."
+                ),
+                _ => format!(
+                    "Invoice {number} cannot be amended in status '{}': money or a decision has \
+                     already moved against it. Issue a credit note instead.",
+                    status.as_str()
+                ),
+            }));
+        }
+        if paid > Decimal::ZERO {
+            return Err(AppError::Conflict(format!(
+                "Invoice {number} has a payment recorded against it, so replacing it would leave \
+                 that payment on a voided document. Issue a credit note instead."
+            )));
+        }
+        if credited > Decimal::ZERO {
+            return Err(AppError::Conflict(format!(
+                "Invoice {number} already has a credit note against it, so the correction is \
+                 already under way. Credit the rest of it, or invoice the difference."
+            )));
+        }
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT invoice_number FROM invoices \
+             WHERE tenant_id = $1 AND amends_invoice_id = $2 AND status IN ('draft', 'pending') \
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(draft) = existing {
+            return Err(AppError::Conflict(format!(
+                "Invoice {number} already has a draft amendment, {draft}. Finish or delete that \
+                 one before starting another."
+            )));
+        }
+
+        let (invoice_number, scheme) =
+            Self::next_invoice_number(&mut tx, tenant_id, company_id).await?;
+        let new_id = Uuid::new_v4();
+        // PMS-990: the amendment is a document of its own, so it is dated today
+        // and its due date is re-derived from the term rather than inherited.
+        // An amendment born carrying the original's due date can arrive already
+        // overdue, which is a dunning email for an invoice nobody has seen.
+        let (due_date, _) =
+            Self::resolve_due_date(&mut tx, tenant_id, today, payment_term_id, None).await?;
+        // Column by column rather than a blanket copy: `sent_at`, `emailed_at`,
+        // `emailed_to`, `issuer_snapshot` and every payment, void and write-off
+        // column belong to the document that was sent, and an amendment that
+        // carried them would claim to have been sent and branded before it
+        // exists (PMS-911 freezes the issuer at the FIRST send, so a copied
+        // snapshot would freeze the wrong moment).
+        sqlx::query(
+            r#"
+            INSERT INTO invoices (
+                id, tenant_id, invoice_number, company_id, billing_contact_id,
+                contract_id, status, invoice_date, due_date, payment_terms,
+                payment_term_id, subtotal, tax_amount, discount_amount, total,
+                amount_paid, amount_credited, balance_due, currency, notes,
+                internal_notes, po_number, tax_rate_id, tax_rate, number_scheme,
+                amends_invoice_id
+            )
+            SELECT $1, tenant_id, $2, company_id, billing_contact_id,
+                   contract_id, 'draft', $3, $4, payment_terms,
+                   payment_term_id, subtotal, tax_amount, discount_amount, total,
+                   0, 0, total, currency, notes,
+                   internal_notes, po_number, tax_rate_id, tax_rate, $5,
+                   id
+            FROM invoices
+            WHERE id = $6 AND tenant_id = $7
+            "#,
+        )
+        .bind(new_id)
+        .bind(&invoice_number)
+        .bind(today)
+        .bind(due_date)
+        .bind(scheme.as_str())
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // `time_entry_ids` rides along: the amendment bills the same work, and
+        // the PMS-951 draw is keyed on `time_entries.hours_consumed` rather than
+        // on which invoice names the entry, so copying the reference claims
+        // nothing a second time. What it buys is an amendment whose lines can
+        // still say which entries they came from.
+        sqlx::query(
+            r#"
+            INSERT INTO invoice_lines (
+                id, invoice_id, line_type, description, quantity, unit_price,
+                total, time_entry_ids, ticket_id, project_id, sort_order,
+                product_id, is_taxable
+            )
+            SELECT gen_random_uuid(), $1, line_type, description, quantity, unit_price,
+                   total, time_entry_ids, ticket_id, project_id, sort_order,
+                   product_id, is_taxable
+            FROM invoice_lines
+            WHERE invoice_id = $2
+            ORDER BY sort_order, created_at
+            "#,
+        )
+        .bind(new_id)
+        .bind(invoice_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(new_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "invoices",
+            Some(new_id),
+            None,
+            after,
+        )
+        .await?;
+
+        let amendment = Self::load_invoice(&mut tx, tenant_id, new_id).await?;
+        tx.commit().await?;
+        Ok(amendment)
+    }
+
     pub async fn void_invoice(
         &self,
         tenant_id: TenantId,
@@ -5398,7 +5701,7 @@ impl BillingService {
                    written_off_at, written_off_by_id, write_off_reason, write_off_amount,
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
-                   tax_rate_id, tax_rate
+                   tax_rate_id, tax_rate, amends_invoice_id
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -5423,6 +5726,23 @@ impl BillingService {
         .await?;
 
         let mut resp: InvoiceResponse = row.into();
+        // PMS-1334: what replaced this invoice, derived rather than stored. The
+        // newest amendment wins, because an amendment can itself be amended and
+        // the question a reader is asking is "where did this end up".
+        resp.amended_by = sqlx::query_as::<_, (Uuid, String, String)>(
+            "SELECT id, invoice_number, status FROM invoices \
+             WHERE tenant_id = $1 AND amends_invoice_id = $2 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(|(id, invoice_number, status)| AmendmentRef {
+            id,
+            invoice_number,
+            status: InvoiceStatus::from_str(&status).unwrap_or(InvoiceStatus::Draft),
+        });
         // PMS-1037: overdue is the tenant's day, not the reader's clock.
         let zone = read_tenant_zone(tx, tenant_id).await?;
         resp.mark_overdue(mokosh_types::datetime::user_local_date(Utc::now(), &zone));
@@ -6180,7 +6500,16 @@ impl BillingService {
     /// the credit note that voided it appeared beside it and dropping both
     /// would have taken the correction out of the record along with the
     /// charge. A full credit now leaves the invoice `paid`, so that pair still
-    /// appears; what is excluded here never reached a customer.
+    /// appears.
+    ///
+    /// PMS-1334 costs this exclusion its simplest justification. An invoice
+    /// voided by sending its amendment DID reach the customer, so "excluded
+    /// because it never reached anyone" is no longer why: it is excluded
+    /// because a void is zero-value, which is also how Stripe reports one, and
+    /// because the amendment that replaced it carries the whole corrected total
+    /// on the same statement. Listing both would double the charge unless the
+    /// voided one showed as zero, which is a change to what a statement line
+    /// means and belongs to PMS-954's model rather than here.
     const STATEMENT_ISSUED_INVOICE: &'static str = "status NOT IN ('draft', 'pending', 'void')";
 
     /// PMS-954: a company's account over a period.
@@ -7205,6 +7534,8 @@ struct InvoiceRow {
     voided_by_id: Option<Uuid>,
     void_reason: Option<String>,
     number_scheme: Option<String>,
+    /// PMS-1334: the sent invoice this one replaces, NULL on an ordinary one.
+    amends_invoice_id: Option<Uuid>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
@@ -7257,6 +7588,11 @@ impl From<InvoiceRow> for InvoiceResponse {
             voided_by_name: None,
             void_reason: r.void_reason,
             number_scheme: r.number_scheme,
+            amends_invoice_id: r.amends_invoice_id,
+            // PMS-1334: resolved by the detail read, which is the only caller
+            // that can afford the extra lookup; a list of 200 invoices asking
+            // "what replaced you" 200 times is what this `None` avoids.
+            amended_by: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,
