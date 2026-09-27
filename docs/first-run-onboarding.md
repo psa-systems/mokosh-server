@@ -43,9 +43,9 @@ This path is DEV ONLY (it is labelled as such in code and `.env.example`); it is
 
 ## What "no verification gate" means precisely
 
-`email_verified` is read in three places, none of which block bootstrap-admin login:
+`email_verified` decides two things, neither of which blocks bootstrap-admin login:
 
-- Invite consumption: a pending invite is honored only for a verified address (`place_bunyip_user`).
+- Invite consumption: a pending invite is honored only for a verified address. This one rule is enforced in two spots, so a reader grepping for the column finds more hits than there are rules: `place_bunyip_user` consumes the invite, and `find_bunyip_principal` carries the same `email_verified_at IS NOT NULL` condition inside its `has_pending_invite` EXISTS, which is the SQL half PMS-777 folded in so the path resolves placement, principal and invite on one pool checkout.
 - Email persistence: the real address is stored on the JIT insert only when verified; otherwise a `<sub>@unresolved.invalid` placeholder is used (MAPPS-335). The placeholder is repaired on the first request after bunyip reports the address verified (`repair_placeholder_email`, PMS-635): the JIT insert runs once, so until then the row kept an address in the reserved `.invalid` TLD that every outbound email bounced off, and the invite gate above could never open for it.
 
 There is no `RequireVerified` extractor and no `email_verified_at`-based 403 anywhere in the request path.
