@@ -18,10 +18,18 @@
 //! quietly wrong.
 //!
 //! **The template is named after the migrations it contains.** The name is a
-//! digest over every migration's file name and bytes, so editing or adding one
-//! produces a different template rather than reusing a stale schema. A suite
-//! that silently ran against last week's schema would be worse than a slow
-//! one.
+//! digest over the EMBEDDED migration set, the same one that fills it, so
+//! editing or adding a migration produces a different template rather than
+//! reusing a stale schema. A suite that silently ran against last week's
+//! schema would be worse than a slow one, and PMS-1398 is what happens when
+//! the name and the contents are read from two places: the name came from a
+//! runtime walk of `migrations/` while the contents came from `sqlx::migrate!`,
+//! which embeds at compile time, so a binary that predated a new migration
+//! built the old schema under the new name and `ensure_template`, which trusts
+//! a name that exists, never rebuilt it. `build.rs` is the other half of that
+//! fix: `sqlx::migrate!` does not register the directory as a build dependency
+//! on stable, so nothing otherwise recompiles this crate when a migration
+//! lands.
 //!
 //! **A half-built template is never usable.** It is built under a
 //! `_building` name and renamed only once every migration has applied, so a
@@ -34,6 +42,7 @@
 
 use std::time::Duration;
 
+use sqlx::migrate::{Migration, Migrator};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Connection, Executor, PgConnection, PgPool};
 
@@ -278,7 +287,7 @@ async fn ensure_template(admin_url: &str, template: &str) {
         let mut conn = PgConnection::connect_with(&connect_options(&base, &building))
             .await
             .expect("connect to the template being built");
-        sqlx::migrate!("../../migrations")
+        embedded_migrations()
             .run(&mut conn)
             .await
             .expect("apply migrations into the template");
@@ -336,25 +345,50 @@ async fn database_exists(admin: &mut PgConnection, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The template's name, derived from the migrations it will contain, so a
-/// change to any of them produces a different template rather than reusing a
-/// schema that no longer matches the tree.
+/// The migration set this binary carries. `sqlx::migrate!` embeds it at
+/// COMPILE time, and this is the only place it is named, so what fills the
+/// template and what names it come from one expansion (PMS-1398).
+fn embedded_migrations() -> Migrator {
+    sqlx::migrate!("../../migrations")
+}
+
+/// The template's name, derived from the migration set this binary carries, so
+/// a template can never be named for a set it does not contain.
+///
+/// It was derived from a runtime walk of `migrations/` until PMS-1398, which is
+/// a second source of truth: `sqlx::migrate!` embeds at compile time and does
+/// not register the directory as a build dependency, so a run whose binary
+/// predated a new migration computed a name for the new set and filled the
+/// template with the old one. Since `ensure_template` trusts a name that
+/// exists, that template was then never rebuilt. Naming from the embedded set
+/// makes the two agree by construction: a stale binary computes the OLD name
+/// and correctly reuses the old template, and a rebuilt one computes a new name
+/// and builds. `build.rs` is the other half, and keeps the binary from being
+/// stale in the first place.
 fn template_name() -> String {
+    format!(
+        "mokosh_tpl_{}",
+        template_digest(embedded_migrations().iter())
+    )
+}
+
+/// The naming rule on its own, over whatever set it is handed, so a test can
+/// hand it two sets and assert they are named differently.
+///
+/// `version` and `checksum` are what `_sqlx_migrations` records and what sqlx
+/// re-verifies on every startup, so hashing them covers an edit to any
+/// migration's bytes without hashing the SQL a second time; `description`
+/// carries the rest of the file name. Each variable-length field is
+/// length-prefixed so no two different sets can serialise to the same stream.
+fn template_digest<'a>(migrations: impl IntoIterator<Item = &'a Migration>) -> String {
     use sha2::{Digest, Sha256};
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("migrations");
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .expect("read the migrations directory")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sql"))
-        .collect();
-    files.sort();
     let mut hasher = Sha256::new();
-    for path in files {
-        hasher.update(path.file_name().expect("file name").as_encoded_bytes());
-        hasher.update(std::fs::read(&path).expect("read a migration"));
+    for migration in migrations {
+        hasher.update(migration.version.to_le_bytes());
+        hasher.update((migration.description.len() as u64).to_le_bytes());
+        hasher.update(migration.description.as_bytes());
+        hasher.update((migration.checksum.len() as u64).to_le_bytes());
+        hasher.update(&migration.checksum);
     }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(16);
@@ -362,7 +396,7 @@ fn template_name() -> String {
         use std::fmt::Write;
         let _ = write!(hex, "{byte:02x}");
     }
-    format!("mokosh_tpl_{hex}")
+    hex
 }
 
 /// A database name unique to this test and this run: the test path, so a
