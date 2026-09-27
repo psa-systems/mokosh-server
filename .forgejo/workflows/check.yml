@@ -213,6 +213,20 @@ jobs:
         run: |
           nu scripts/check-env-example.nu
 
+      - name: Build target storage
+        # PMS-973: the shared development machines carry a large tmpfs at /tmp
+        # (46 GB on desktop-02) and this workspace's target directory runs to
+        # tens of gigabytes, so a `CARGO_TARGET_DIR` pointed at memory spends the
+        # resource those hosts are actually short of. The variable can be set by
+        # a shell profile, an editor or an agent, none of which travel with the
+        # checkout, which is why this is a check rather than a setting. The
+        # runner is ephemeral, so if a runner image ever puts the workspace on a
+        # tmpfs this step is the notice, and `MOKOSH_ALLOW_TMPFS_TARGET=true`
+        # here is the documented way to accept it.
+        shell: nu {0}
+        run: |
+          nu scripts/check-build-target-storage.nu
+
       - name: Documented just recipes
         # PMS-843: the docs in `const DOCS` (scripts/check-doc-recipes.nu) are
         # the first commands a newcomer types. Several sites invoked a `dev-down`
