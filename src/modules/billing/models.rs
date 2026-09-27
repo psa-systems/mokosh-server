@@ -45,6 +45,17 @@ pub struct InvoiceLineResponse {
     pub sort_order: i32,
 }
 
+/// PMS-1334: the invoice that replaced a voided one, enough of it for a client
+/// to name and link to without a second request. Deliberately not the whole
+/// `InvoiceResponse`: an amendment can itself be amended, so embedding one would
+/// recurse down the whole chain on every read.
+#[derive(Debug, Clone, Serialize)]
+pub struct AmendmentRef {
+    pub id: Uuid,
+    pub invoice_number: String,
+    pub status: InvoiceStatus,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InvoiceResponse {
     pub id: Uuid,
@@ -143,6 +154,15 @@ pub struct InvoiceResponse {
     /// the tenant-wide counter. Carried so a reader can tell two schemes
     /// apart without parsing the string.
     pub number_scheme: Option<String>,
+    /// PMS-1334: the sent invoice this one replaces, and the reverse. An
+    /// amendment names what it replaces because that is the column it carries;
+    /// the original names its replacement because the amendment is found by
+    /// looking for it, never stored on the original, so the two answers cannot
+    /// disagree (the PMS-953 rule for a derived fact). `amended_by` is `Some`
+    /// only on `GET /:id`, like the other resolved names on this struct.
+    pub amends_invoice_id: Option<Uuid>,
+    /// The invoice that replaced this one, resolved on the detail read.
+    pub amended_by: Option<AmendmentRef>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
