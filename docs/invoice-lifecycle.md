@@ -48,7 +48,9 @@ Switching schemes renumbers nothing. A number is a stored string on the invoice 
 
 Crediting an invoice does NOT void it. Until PMS-1333, a credit note covering the invoice's full total moved it to `void` (PMS-953 introduced that as the first writer `void` ever had, and PMS-1226 narrowed the threshold after a 5.00 goodwill credit voided a paid invoice). That read a credited invoice as a cancelled one, which it is not: the document stood, the customer holds it, and the credit note is the correction. A credit that takes the balance to zero now lands on `paid`, which is also what Stripe does - "if a credit note reduces the balance of an open invoice to 0, the invoice status changes to paid" ([Stripe: issue credit notes](https://docs.stripe.com/invoicing/dashboard/credit-notes)) - so a tenant reconciling against their gateway sees the same shape on both sides. Such an invoice carries no `paid_at`: nothing is owed and nobody paid.
 
-Two consequences follow from voiding being allowed only pre-send. A voided invoice never appears on a statement (PMS-954), because it was never issued and never owed; a fully credited one still does, beside the credit note that settled it. And a credit note against a voided invoice is refused, because there is no charge to correct.
+Voiding is allowed pre-send and in exactly one other place: sending an amendment voids the invoice it replaces (PMS-1334, below). There is still no endpoint that voids a sent invoice on its own, because the only thing that justifies it is a replacement document the customer can hold instead.
+
+Two consequences follow. A voided invoice never appears on a statement (PMS-954); pre-send that is because it was never issued and never owed, and for an amended-away one it is because a void is zero-value and the amendment beside it carries the whole corrected total, so listing both would double the charge. A fully credited invoice still appears, beside the credit note that settled it. And a credit note against a voided invoice is refused, because there is no charge to correct.
 
 `voided_at` leads `recompute_invoice_balance`'s status CASE, just ahead of `written_off_at`, so a payment or credit landing afterwards cannot derive the status back over one somebody chose.
 
@@ -96,6 +98,28 @@ Once an invoice is sent, the customer holds a copy and can quote the totals back
 The follow-on document is the credit note, and it is the supported correction for a sent invoice: `POST /api/v1/credit-notes` against the invoice, `GET /api/v1/credit-notes` to list them. The invoice itself is never touched. Its lines, totals and number stay exactly as the customer received them; what changes is its derived balance, because `recompute_invoice_balance` folds issued credit notes into `amount_credited` and `balance_due` alongside payments.
 
 A credit note is issued the moment it is created, so it is immutable in the same way and for the same reason: the customer holds a copy of it too. There is no PUT and no DELETE on it. A credit note raised in error is voided (`POST /api/v1/credit-notes/{id}/void`), which changes no amount and no line and simply stops the credit counting against the invoice, and its own document is stored at creation and served unchanged from `GET /api/v1/credit-notes/{id}/pdf`.
+
+## Amending a sent invoice (PMS-1334)
+
+`POST /invoices/{id}/amend` answers a new DRAFT invoice that carries the original's lines and names it in `amends_invoice_id`. Finance only, like every other write to an issued document. It is the correction for "the invoice is wrong and nothing has been paid", where a credit note means the customer receives three documents for one mistake.
+
+The ordering is the whole design, and it is Stripe's ([Stripe: edit finalized invoices](https://docs.stripe.com/invoicing/invoice-edits)). Creating the amendment changes NOTHING about the invoice it amends: that invoice stays `sent`, stays payable, and stays the document the customer holds, so an operator who starts a correction and thinks better of it can delete the draft and nothing was corrected. Sending the amendment is the act that replaces it: in that same transaction the original moves to `void` with `void_reason` reading "Replaced by invoice INV-000043", and its balance goes to zero.
+
+The refusals each point at a different instrument, because "cannot be amended" leaves the operator guessing:
+
+| State of the invoice | Answer |
+| --- | --- |
+| `draft` or `pending` | Edit it; nobody has it yet. |
+| Any payment recorded | Credit note. A payment against a voided document is a payment against nothing. |
+| Any credit note already raised | The correction is already under way; credit the rest or invoice the difference. |
+| `void` | It has already been replaced. Amend the invoice that replaced it. |
+| A draft amendment already open | Finish or delete that one first, so "what replaces this invoice" has one answer. |
+
+Those preconditions are checked twice: when the amendment is created, and again in the transaction that sends it, because a payment or a credit note can land against the original while the draft sits. Stripe refuses to finalise a revision in exactly those cases, and for the same reason.
+
+The link is stored in one direction only. The amendment carries `amends_invoice_id`; an invoice's `amended_by` (id, number and status of the amendment) is resolved by looking for the invoice that names it, on the detail read only. Stripe stores the reverse pointer as `latest_revision`; here it is derived, because PMS-953's rule is that a derived fact gets one home and the second one is the only one that can be silently wrong. An amendment can itself be amended, and each invoice then names the one that replaced IT rather than the end of the chain.
+
+What an amendment does NOT inherit: `sent_at`, `emailed_at`, `emailed_to`, `issuer_snapshot`, and every payment, void and write-off column. It is copied column by column rather than wholesale for exactly that reason - an amendment carrying the snapshot would freeze the wrong moment's branding (PMS-911 freezes at the FIRST send), and one carrying `emailed_to` would claim to have been sent before it existed. It is dated today and its due date is re-derived from its payment term (PMS-990), so it cannot arrive already overdue.
 
 ## AC3 decision: no separate pre-send "cancel"
 
