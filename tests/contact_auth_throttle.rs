@@ -1,11 +1,12 @@
 //! PMS-1297: the contact plane's unauthenticated credential routes are
-//! throttled, set/reset share one budget, and a new reset token supersedes
-//! the earlier ones.
+//! throttled, and the budget is spent per contact rather than per request.
+//!
+//! PMS-1343 removed the self-service reset, so the two cases about that
+//! endpoint went with it and the shared-budget case became a single-door one;
+//! the note at the foot of this file says where each property lives now.
 
 mod common;
 
-use chrono::{Duration, Utc};
-use mokosh_server::utils::crypto::{hash_password, sha256_hex};
 use mokosh_test::mokosh_test;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -30,84 +31,41 @@ async fn post(app: &common::TestApp, path: &str, body: serde_json::Value) -> req
         .expect("send")
 }
 
+/// The redemption budget is per CONTACT, so guessing at a link is throttled
+/// however many requests it is spread over.
+///
+/// PMS-1343: this used to spend the quota across `set-password` and
+/// `reset-password` together, to prove the two shared one budget rather than
+/// handing an attacker double. `reset-password` is gone with the self-service
+/// reset, so the budget has one door now; what still matters, and is what the
+/// test was really about, is that the door is keyed on the contact in the
+/// token rather than on the request.
 #[mokosh_test]
-async fn set_and_reset_password_share_one_budget(pool: PgPool) {
+async fn the_redemption_budget_is_spent_per_contact(pool: PgPool) {
     let contact = seed_contact(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = format!("{}.no-such-secret", contact.id);
     let body = serde_json::json!({ "token": token, "password": "Xy9#pQ4v!Lm2wRt7" });
 
-    // Account quota is 3 per minute: spend it across BOTH routes.
-    for path in [
-        "/api/v1/contact/auth/set-password",
-        "/api/v1/contact/auth/reset-password",
-        "/api/v1/contact/auth/set-password",
-    ] {
-        let r = post(&app, path, body.clone()).await;
+    // Account quota is 3 per minute.
+    for _ in 0..3 {
+        let r = post(&app, "/api/v1/contact/auth/set-password", body.clone()).await;
         assert_ne!(r.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
     }
-    let r = post(&app, "/api/v1/contact/auth/reset-password", body).await;
+    let r = post(&app, "/api/v1/contact/auth/set-password", body).await;
     assert_eq!(r.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
     assert!(r.headers().contains_key("retry-after"));
 }
 
-#[mokosh_test]
-async fn forgot_password_spends_quota_for_known_and_unknown_email(pool: PgPool) {
-    let contact = seed_contact(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    for email in [contact.email.as_str(), "nobody@example.com"] {
-        let body = serde_json::json!({ "slug": contact.slug, "email": email });
-        for _ in 0..3 {
-            let r = post(&app, "/api/v1/contact/auth/forgot-password", body.clone()).await;
-            assert_eq!(r.status(), reqwest::StatusCode::NO_CONTENT);
-        }
-        let r = post(&app, "/api/v1/contact/auth/forgot-password", body).await;
-        assert_eq!(
-            r.status(),
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            "{email}"
-        );
-        assert!(r.headers().contains_key("retry-after"));
-    }
-}
-
-#[mokosh_test]
-async fn a_second_reset_token_invalidates_the_first(pool: PgPool) {
-    let contact = seed_contact(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let secret = "first-secret-value-abcdef";
-    sqlx::query(
-        "INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, lookup_hash, expires_at) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(common::DEFAULT_TENANT_ID)
-    .bind(contact.id)
-    .bind(hash_password(secret).await.unwrap())
-    .bind(sha256_hex(secret))
-    .bind(Utc::now() + Duration::hours(1))
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let r = post(
-        &app,
-        "/api/v1/contact/auth/forgot-password",
-        serde_json::json!({ "slug": contact.slug, "email": contact.email }),
-    )
-    .await;
-    assert_eq!(r.status(), reqwest::StatusCode::NO_CONTENT);
-
-    let r = post(
-        &app,
-        "/api/v1/contact/auth/reset-password",
-        serde_json::json!({
-            "token": format!("{}.{secret}", contact.id),
-            "password": "Xy9#pQ4v!Lm2wRt7",
-        }),
-    )
-    .await;
-    assert!(
-        r.status().is_client_error(),
-        "the superseded token must fail"
-    );
-}
+// PMS-1343: two cases went with the endpoints they drove.
+//
+// `forgot_password_spends_quota_for_known_and_unknown_email` pinned that the
+// forgot-password budget was spent whether or not the address matched, so the
+// throttle could not be used as an enumeration oracle. Nothing on the contact
+// plane takes an email and answers whether it is known any more.
+//
+// `a_second_reset_token_invalidates_the_first` pinned PMS-1297: a newly minted
+// link superseded the outstanding ones. That property did not go with it - the
+// MSP's `POST /contacts/{id}/resend-portal-invite` deletes unused tokens
+// before minting - and it is pinned in `tests/msp_portal_password_reset.rs`,
+// which is where the reset now lives.

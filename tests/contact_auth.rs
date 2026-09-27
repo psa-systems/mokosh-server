@@ -325,44 +325,9 @@ async fn contact_login_against_suspended_tenant_401s(pool: PgPool) {
     );
 }
 
-/// mokosh-contact-login prompt 004: forgot-password returns 204
-/// regardless of whether the (slug, email) matches a contact. No
-/// email dispatched on a miss.
-#[mokosh_test]
-async fn contact_forgot_password_is_enumeration_resistant(pool: PgPool) {
-    let (_contact_id, slug, _token) = seed_portal_contact(&pool, "forgot@mcl.example").await;
-    let app = common::boot(pool.clone()).await;
-
-    // Miss.
-    let resp = app
-        .client
-        .post(app.url("/api/v1/contact/auth/forgot-password"))
-        .json(&serde_json::json!({
-            "slug": slug,
-            "email": "unknown@mcl.example",
-        }))
-        .send()
-        .await
-        .expect("forgot miss");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::NO_CONTENT,
-        "prompt 004: forgot on unknown email must still 204"
-    );
-
-    // Hit.
-    let resp = app
-        .client
-        .post(app.url("/api/v1/contact/auth/forgot-password"))
-        .json(&serde_json::json!({
-            "slug": slug,
-            "email": "forgot@mcl.example",
-        }))
-        .send()
-        .await
-        .expect("forgot hit");
-    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
-}
+// PMS-1343: the forgot-password enumeration-resistance case went with the
+// endpoint. Nothing on the contact plane now takes an email and answers
+// whether it is known, so there is no oracle left to resist.
 
 /// mokosh-contact-login prompt 004: staff JWT rejected on
 /// /contact/auth/me and contact JWT rejected on staff endpoints. The
@@ -581,24 +546,24 @@ async fn contact_refresh_with_bogus_token_returns_401(pool: PgPool) {
     );
 }
 
-/// PMS-917 AC4: `reset-password` writes `portal_password_hash` and returns
+/// PMS-917 AC4: redeeming a password link writes `portal_password_hash` and returns
 /// 204 without any session material. Even though it now legitimately gives
 /// a no-credential contact a credential, it does so WITHOUT minting a
 /// session; the SPA then has to drive `POST /contact/auth/login` with the
 /// freshly-set password. Pins that contract.
 #[mokosh_test]
-async fn contact_reset_password_returns_no_session(pool: PgPool) {
+async fn redeeming_a_password_link_returns_no_session(pool: PgPool) {
     let (_contact_id, _slug, token) =
         seed_portal_contact(&pool, "reset-nosession@mcl.example").await;
     let app = common::boot(pool.clone()).await;
 
-    // The `portal_setup_tokens` table backs both setup + reset; the
-    // seed's token can drive reset_password directly (they share
-    // `setup_password` under the hood, see service.rs:531).
+    // PMS-1343: the seed's token is redeemed through `set-password`, which
+    // is where the MSP's reissued link lands and the function the removed
+    // `reset-password` always delegated to.
     let strong = "Kq7$mZ2n#PxR9wLf";
     let resp = app
         .client
-        .post(app.url("/api/v1/contact/auth/reset-password"))
+        .post(app.url("/api/v1/contact/auth/set-password"))
         .json(&serde_json::json!({ "token": token, "password": strong }))
         .send()
         .await
@@ -606,11 +571,11 @@ async fn contact_reset_password_returns_no_session(pool: PgPool) {
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::NO_CONTENT,
-        "PMS-917: reset-password must 204 with no body"
+        "PMS-917: redemption must 204 with no body"
     );
     assert!(
         resp.headers().get("set-cookie").is_none(),
-        "PMS-917: reset-password must not Set-Cookie a contact session"
+        "PMS-917: redemption must not Set-Cookie a contact session"
     );
     let body = resp.text().await.unwrap_or_default();
     assert!(

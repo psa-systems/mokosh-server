@@ -229,7 +229,7 @@ async fn password_reset_and_change_write_rows(pool: PgPool) {
     .unwrap();
     let reset = app
         .client
-        .post(app.url("/api/v1/contact/auth/reset-password"))
+        .post(app.url("/api/v1/contact/auth/set-password"))
         .json(
             &serde_json::json!({ "token": format!("{}.{secret}", contact.id), "password": STRONG }),
         )
@@ -237,10 +237,11 @@ async fn password_reset_and_change_write_rows(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(reset.status(), reqwest::StatusCode::NO_CONTENT);
-    assert_one(&pool, contact.id, "portal.password_reset", "update").await;
-    assert!(rows(&pool, contact.id, "portal.setup_password")
-        .await
-        .is_empty());
+    // PMS-1343: redemption is `portal.setup_password` now. The distinct
+    // `portal.password_reset` subtype had exactly one writer, the removed
+    // self-service reset, so an audit reader sees one event for "a portal
+    // password was set by link" however the link was issued.
+    assert_one(&pool, contact.id, "portal.setup_password", "update").await;
 
     let body = common::contact_login_response(&app, &contact, STRONG).await;
     assert_eq!(body.status(), reqwest::StatusCode::OK);
