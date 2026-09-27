@@ -73,67 +73,13 @@ async fn provision(svc: &TenantService, name: &str, slug: &str, first: &str, las
     tenant.id
 }
 
-/// A customer resetting their portal password is told whose portal it is.
-/// Before this the mail said "Reset your {{app_name}} password", naming a
-/// product the customer has never heard of instead of the MSP they hired.
-#[mokosh_test]
-async fn the_portal_password_reset_names_the_msp_and_never_the_product(pool: PgPool) {
-    sqlx::query("UPDATE tenants SET name = 'Niceguy IT' WHERE id = $1")
-        .bind(common::DEFAULT_TENANT_ID)
-        .execute(&pool)
-        .await
-        .expect("name the tenant");
-
-    let company = Uuid::new_v4();
-    sqlx::query("INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'Acme Co')")
-        .bind(company)
-        .bind(common::DEFAULT_TENANT_ID)
-        .execute(&pool)
-        .await
-        .expect("seed company");
-    let contact = common::seed_portal_contact(&pool, company, "customer@acme.example", &[]).await;
-
-    let app = common::boot(pool.clone()).await;
-    let resp = app
-        .client
-        .post(app.url("/api/v1/contact/auth/forgot-password"))
-        .json(&serde_json::json!({ "slug": contact.slug, "email": contact.email }))
-        .send()
-        .await
-        .expect("send forgot-password");
-    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
-
-    let (subject, body, html) = latest_mail(&pool, common::DEFAULT_TENANT_ID).await;
-    let subject = subject.expect("subject rendered");
-    assert!(
-        subject.contains("Niceguy IT"),
-        "the customer is told whose portal this is: {subject}"
-    );
-    assert!(body.contains("Niceguy IT"), "and so does the body: {body}");
-    assert!(
-        body.contains("/reset-password?token="),
-        "the reset link survived the split: {body}"
-    );
-    assert!(
-        body.starts_with("Hello Portal,"),
-        "PMS-1198: the reset mail greets the contact by name, the same way \
-         its sibling auth.portal_welcome does: {body}"
-    );
-
-    // The product name must not reach a customer. `Mokosh` is the default
-    // app name, so its absence is the check that this mail is not the staff
-    // template wearing a new event name.
-    for rendered in [&subject, &body, html.as_ref().expect("html rendered")] {
-        assert!(
-            !rendered.contains("Mokosh"),
-            "the product name reached a customer: {rendered}"
-        );
-        assert!(
-            !rendered.contains("{{"),
-            "unresolved placeholder in a customer's inbox: {rendered}"
-        );
-    }
-}
+// PMS-1343: the self-service reset mail had this case, pinning that a
+// customer-facing mail names the MSP and never the product (PMS-1140).
+// `auth.portal_password_reset` has no dispatch site now that the customer
+// cannot start a reset; the template row stays seeded (migrations are
+// immutable, and a future MSP-initiated reset mail would want it). The
+// property moved to the mail that actually ships on a reissue, which is
+// `auth.portal_grant`, and is pinned in tests/msp_portal_password_reset.rs.
 
 /// The staff mail is untouched by the split: it still names the deployment,
 /// which is PMS-789's decision and the thing migration 204 restored.

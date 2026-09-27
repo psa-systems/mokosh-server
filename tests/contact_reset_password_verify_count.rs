@@ -76,7 +76,7 @@ async fn reset_password_verifies_exactly_once_with_multiple_candidates(pool: PgP
     let new_password = "Xy9#pQ4v!Lm2wRt7";
     let resp = app
         .client
-        .post(app.url("/api/v1/contact/auth/reset-password"))
+        .post(app.url("/api/v1/contact/auth/set-password"))
         .json(&serde_json::json!({
             "token": format!("{}.{real_secret}", contact.id),
             "password": new_password,
@@ -110,7 +110,7 @@ async fn reset_password_verifies_exactly_once_with_multiple_candidates(pool: PgP
     let before = verify_password_call_count();
     let resp = app
         .client
-        .post(app.url("/api/v1/contact/auth/reset-password"))
+        .post(app.url("/api/v1/contact/auth/set-password"))
         .json(&serde_json::json!({
             "token": format!("{}.no-such-secret-matches-any-row", contact.id),
             "password": new_password,

@@ -296,27 +296,10 @@ pub struct ContactSetPasswordRequest {
     pub password: String,
 }
 
-/// Request body for `POST /api/v1/contact/auth/forgot-password`.
-/// Always returns 204 whether the (slug, email) pair matches or not
-/// (enumeration-resistant).
-#[derive(Debug, Clone, Deserialize, Validate)]
-pub struct ContactForgotPasswordRequest {
-    #[validate(length(min = 1, max = 64, message = "portal slug is required"))]
-    pub slug: String,
-    #[validate(email)]
-    pub email: String,
-}
-
-/// Request body for `POST /api/v1/contact/auth/reset-password`.
-/// Redeems the emailed reset link. Same `{contact_id}.{secret}` shape
-/// as setup-password.
-#[derive(Debug, Clone, Deserialize, Validate)]
-pub struct ContactResetPasswordRequest {
-    #[validate(length(min = 1, message = "token is required"))]
-    pub token: String,
-    #[validate(length(min = 1, message = "password is required"))]
-    pub password: String,
-}
+// PMS-1343: the request bodies for `forgot-password` and `reset-password` went
+// with those endpoints. The MSP reissues a portal password by resending the
+// setup link (`POST /contacts/{id}/resend-portal-invite`), which redeems
+// through `ContactSetPasswordRequest` above.
 
 /// mokosh-contact-login prompt 010 (PMS-918): request body for
 /// `POST /api/v1/contact/auth/login-link`. Slug-less: the finder
