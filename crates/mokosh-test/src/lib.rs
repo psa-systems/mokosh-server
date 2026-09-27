@@ -447,3 +447,162 @@ fn maintenance_url(base: &str) -> String {
     url.set_path("/postgres");
     url.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{embedded_migrations, template_digest, template_name};
+    use sha2::{Digest, Sha384};
+    use sqlx::migrate::{Migration, MigrationType};
+    use std::borrow::Cow;
+
+    fn migration(version: i64, description: &str, sql: &str) -> Migration {
+        Migration::new(
+            version,
+            Cow::Owned(description.to_owned()),
+            MigrationType::Simple,
+            Cow::Owned(sql.to_owned()),
+            false,
+        )
+    }
+
+    /// PMS-1398: the name is a function of the SET, so the same set is always
+    /// the same template and any difference in the set is a different one.
+    ///
+    /// This is what makes `ensure_template`'s existence check sound. It trusts a
+    /// name that exists, which is only safe while a name cannot describe two
+    /// different schemas.
+    #[test]
+    fn the_name_is_a_function_of_the_migration_set() {
+        let base = vec![
+            migration(1, "initial schema", "CREATE TABLE a ();"),
+            migration(2, "second", "CREATE TABLE b ();"),
+        ];
+        assert_eq!(
+            template_digest(base.iter()),
+            template_digest(base.iter()),
+            "the same set must name the same template"
+        );
+
+        let mut added = base.clone();
+        added.push(migration(3, "third", "CREATE TABLE c ();"));
+        assert_ne!(
+            template_digest(base.iter()),
+            template_digest(added.iter()),
+            "an added migration must name a different template, or the suite \
+             runs against a schema missing it"
+        );
+
+        let edited = vec![
+            migration(1, "initial schema", "CREATE TABLE a ();"),
+            migration(2, "second", "CREATE TABLE b (id int);"),
+        ];
+        assert_ne!(
+            template_digest(base.iter()),
+            template_digest(edited.iter()),
+            "an edited migration must name a different template"
+        );
+
+        let renamed = vec![
+            migration(1, "initial schema", "CREATE TABLE a ();"),
+            migration(2, "second table", "CREATE TABLE b ();"),
+        ];
+        assert_ne!(
+            template_digest(base.iter()),
+            template_digest(renamed.iter()),
+            "a renamed migration must name a different template"
+        );
+
+        assert_ne!(
+            template_digest(base.iter()),
+            template_digest(base.iter().rev()),
+            "order is part of the set: two migrations applied the other way \
+             round are not the same schema"
+        );
+    }
+
+    /// PMS-1398: the tripwire for the failure the naming rule alone cannot
+    /// catch, which is the binary carrying a migration set that is not the
+    /// tree's.
+    ///
+    /// The comparison is deliberately lopsided: the embedded set is read from
+    /// this binary, and the directory is read from disk NOW. A stale binary
+    /// therefore fails here rather than going quietly green against last week's
+    /// schema, which is the whole reason PMS-1254 named the template after its
+    /// contents in the first place. With `build.rs` doing its job this never
+    /// fires; if it does, `cargo clean --package mokosh-test` and rebuild, and
+    /// treat it as that script having stopped working.
+    #[test]
+    fn the_embedded_migration_set_matches_the_migrations_directory() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("migrations");
+        let mut on_disk: Vec<(i64, Vec<u8>)> = std::fs::read_dir(&dir)
+            .expect("read the migrations directory")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("sql"))
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("a migration file name")
+                    .to_owned();
+                // sqlx's own rule: everything before the first underscore is the
+                // version, and the checksum is SHA-384 over the file's bytes.
+                let version: i64 = name
+                    .split('_')
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("migration {name} has no integer version prefix"));
+                let sql = std::fs::read(&path).expect("read a migration");
+                (version, Sha384::digest(&sql).to_vec())
+            })
+            .collect();
+        on_disk.sort_by_key(|(version, _)| *version);
+
+        let embedded: Vec<(i64, Vec<u8>)> = embedded_migrations()
+            .iter()
+            .map(|m| (m.version, m.checksum.to_vec()))
+            .collect();
+
+        assert_eq!(
+            embedded.len(),
+            on_disk.len(),
+            "this binary carries {} migrations and ./migrations holds {}: the \
+             embedded set is stale, so the template would be built from it",
+            embedded.len(),
+            on_disk.len()
+        );
+        for (embedded, on_disk) in embedded.iter().zip(on_disk.iter()) {
+            assert_eq!(
+                embedded.0, on_disk.0,
+                "migration versions diverge at {} versus {}: the embedded set \
+                 is stale",
+                embedded.0, on_disk.0
+            );
+            assert_eq!(
+                embedded.1, on_disk.1,
+                "migration {} differs on disk from the one embedded in this \
+                 binary: the embedded set is stale",
+                embedded.0
+            );
+        }
+    }
+
+    /// A Postgres identifier truncates silently past 63 bytes, and two
+    /// templates truncating to one name would be the same defect by another
+    /// route. `_building` rides on the end of it during a build, so that is
+    /// what has to fit.
+    #[test]
+    fn the_template_name_fits_a_postgres_identifier() {
+        let name = template_name();
+        assert!(
+            name.starts_with("mokosh_tpl_"),
+            "`drop_stale_templates` selects on this prefix: {name}"
+        );
+        assert!(
+            name.len() + "_building".len() <= 63,
+            "template name {name} plus the build suffix exceeds 63 bytes"
+        );
+    }
+}
