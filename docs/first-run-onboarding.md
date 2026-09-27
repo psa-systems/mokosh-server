@@ -2,9 +2,15 @@
 
 How the very first administrator gets into a brand-new mokosh-server instance and configures it, including the case where email/SMTP is not yet set up.
 
-## The chicken-and-egg this avoids
+## The chicken-and-egg, and whose it is
 
-On a fresh instance email/SMTP is not configured, so no verification message can be sent. If admin access were gated on a verified email address, the first admin could never get in to configure email in the first place. mokosh-server does not have that gate: the production bootstrap-admin login does not depend on email verification, so first-run is unblocked by construction.
+On a fresh instance email/SMTP is not configured, so no verification message can be sent. If admin access were gated on a verified email address, the first admin could never get in to configure email in the first place.
+
+mokosh-server does not add that gate: the production bootstrap-admin login does not depend on email verification, and the two tests at the end of this document pin it. That is the whole of mokosh's part, and it is worth being precise about, because the trap a real deployment actually fell into was NOT here.
+
+It was in bunyip, the OP. `bunyip-web`'s `needs_onboarding` pinned a named-but-unverified user to `/onboarding` whenever `setup_status.email_enabled == true`, and the onboarding allowlist did not include `/admin/email`, so a deployment with email ENABLED but undeliverable (bad credentials, a DMARC or SPF reject, a wrong `SMTP_FROM`, an unreachable relay) trapped the one party who could repair the relay: the verification mail never arrived, and the admin had no route to the page that would fix it. Bunyip already exempted `email_enabled == false`; the missing case was enabled-but-broken. That is BUNYIP-401, the chicken-and-egg behind PSA-1's "Verify the onboarding process for the admin", fixed in bunyip PR #393.
+
+So read this document as mokosh's downstream posture and not as the fix for first-run onboarding. If a first admin cannot get in on a deployment where SMTP is set but mail is not arriving, the gate to look at is bunyip's, not one of mokosh's.
 
 ## Production: bootstrap admin via bunyip-as-OP
 
@@ -37,9 +43,9 @@ This path is DEV ONLY (it is labelled as such in code and `.env.example`); it is
 
 ## What "no verification gate" means precisely
 
-`email_verified` is read in three places, none of which block bootstrap-admin login:
+`email_verified` decides two things, neither of which blocks bootstrap-admin login:
 
-- Invite consumption: a pending invite is honored only for a verified address (`place_bunyip_user`).
+- Invite consumption: a pending invite is honored only for a verified address. This one rule is enforced in two spots, so a reader grepping for the column finds more hits than there are rules: `place_bunyip_user` consumes the invite, and `find_bunyip_principal` carries the same `email_verified_at IS NOT NULL` condition inside its `has_pending_invite` EXISTS, which is the SQL half PMS-777 folded in so the path resolves placement, principal and invite on one pool checkout.
 - Email persistence: the real address is stored on the JIT insert only when verified; otherwise a `<sub>@unresolved.invalid` placeholder is used (MAPPS-335). The placeholder is repaired on the first request after bunyip reports the address verified (`repair_placeholder_email`, PMS-635): the JIT insert runs once, so until then the row kept an address in the reserved `.invalid` TLD that every outbound email bounced off, and the invite gate above could never open for it.
 
 There is no `RequireVerified` extractor and no `email_verified_at`-based 403 anywhere in the request path.
