@@ -35,7 +35,6 @@ const ACCESS_TOKEN_TTL_MIN: i64 = 15;
 const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
 /// 30 min. Same as PMS-729 phase 2 H3 - long enough to check email +
 /// short enough to blunt exposure of a leaked link.
-const RESET_TOKEN_TTL_MIN: i64 = 30;
 /// The JWT `typ` claim value that identifies a contact-plane token.
 /// Middleware (`portal_contact_middleware`) checks this string
 /// exactly so a staff-plane bearer cannot cross the plane.
@@ -70,7 +69,7 @@ const LOGIN_INTENT_MAX_PER_EMAIL_PER_15_MIN: i64 = 5;
 ///
 /// Clone-cheap - holds a `Database` handle + a jwt_secret + a builder
 /// slot for the notifications dispatcher. Frontend base URL is only
-/// needed by the forgot-password flow (the reset link needs an origin);
+/// needed where a mail carries a link (the setup link, the magic link);
 /// login + refresh + logout do not.
 #[derive(Clone)]
 pub struct ContactAuthService {
@@ -78,7 +77,7 @@ pub struct ContactAuthService {
     jwt_secret: String,
     notifications: Option<NotificationsService>,
     /// Base URL of the SPA (e.g. `http://localhost:4301`) so the
-    /// reset-password email carries a full-URL link.
+    /// set-password and magic-link emails carry a full-URL link.
     spa_base_url: String,
     /// PMS-1063: the `ENCRYPTION_KEY` that seals `contacts.portal_mfa_secret`
     /// at rest, the PMS-871 rule the staff plane already follows for
@@ -561,9 +560,10 @@ impl ContactAuthService {
     /// path. Sets `portal_password_hash`, marks the token used,
     /// deletes any other unredeemed tokens for the same contact, and
     /// (PMS-1062) revokes every live session the contact holds, so a
-    /// refresh token stolen before a reset does not survive it. The
-    /// reset path (`reset_password`) delegates here, so both share
-    /// the rule.
+    /// refresh token stolen before a reset does not survive it. Since
+    /// PMS-1343 this is the ONLY redemption path: the self-service
+    /// `reset_password` that delegated here is gone, and an MSP reissuing
+    /// the link mints another token for this same endpoint.
     ///
     /// Status contract:
     /// - valid, unused, unexpired -> Ok(())
@@ -575,8 +575,10 @@ impl ContactAuthService {
             .await
     }
 
-    /// The shared body of `setup_password` and `reset_password`; the
-    /// two differ only in the audit subtype they record (PMS-1089).
+    /// The body behind `setup_password`, kept separate from it because it
+    /// takes the audit subtype as an argument (PMS-1089): it served
+    /// `reset_password` too until PMS-1343, and a later second redemption
+    /// flow would name its own subtype the same way.
     async fn set_password_with_token(
         &self,
         token: &str,
@@ -726,115 +728,11 @@ impl ContactAuthService {
         Ok(())
     }
 
-    /// mokosh-contact-login prompt 004: request a password-reset
-    /// email. Always returns Ok(()) whether the (slug, email) pair
-    /// matches a portal contact or not (enumeration-resistant). When
-    /// matched, mints a `portal_setup_tokens` row (reuses the setup
-    /// token infrastructure) + dispatches an `auth.password_reset`
-    /// email carrying `{spa_base_url}/portal/{slug}/reset-password?token=...`.
-    #[tracing::instrument(skip_all)]
-    pub async fn request_password_reset(&self, slug: &str, email: &str) -> AppResult<()> {
-        let matched: Option<(Uuid, Uuid, Option<String>, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT c.tenant_id, c.id, c.email, c.first_name
-            FROM contacts c
-            INNER JOIN companies co ON co.id = c.company_id
-            INNER JOIN tenants t ON t.id = c.tenant_id
-            WHERE co.portal_slug = $1
-              AND LOWER(c.email) = LOWER($2)
-              AND c.is_portal_user = TRUE
-              AND t.status = 'active'
-            "#,
-        )
-        .bind(slug)
-        .bind(email)
-        .fetch_optional(self.db.migrator_pool())
-        .await?;
-        let Some((tenant_id, contact_id, contact_email, contact_first_name)) = matched else {
-            return Ok(());
-        };
-        let Some(email_addr) = contact_email.filter(|s| !s.trim().is_empty()) else {
-            return Ok(());
-        };
-
-        // Mint a fresh reset token. Reuses the setup-token shape +
-        // table so `setup_password` / `reset_password` can share the
-        // same verify path. 30-min TTL.
-        let secret = generate_token(64);
-        let token_hash = hash_password(&secret).await?;
-        let lookup_hash = sha256_hex(&secret);
-        let token = format!("{contact_id}.{secret}");
-        let expires_at = Utc::now() + Duration::minutes(RESET_TOKEN_TTL_MIN);
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        // PMS-1297: a new reset link supersedes the earlier ones.
-        sqlx::query(
-            "UPDATE portal_setup_tokens SET used_at = NOW() \
-             WHERE contact_id = $1 AND tenant_id = $2 AND used_at IS NULL",
-        )
-        .bind(contact_id)
-        .bind(tenant_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO portal_setup_tokens (tenant_id, contact_id, token_hash, lookup_hash, expires_at) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(tenant_id)
-        .bind(contact_id)
-        .bind(&token_hash)
-        .bind(&lookup_hash)
-        .bind(expires_at)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-
-        // Best-effort dispatch. A failed send leaves the token
-        // persisted; the customer can request another link.
-        if let Some(notify) = self.notifications.as_ref() {
-            let reset_link = format!(
-                "{}/portal/{}/reset-password?token={}",
-                self.spa_base_url.trim_end_matches('/'),
-                slug,
-                token,
-            );
-            let display_name = contact_first_name.unwrap_or_default();
-            let context = serde_json::json!({
-                "recipient_email": email_addr,
-                "display_name": &display_name,
-                "salutation": crate::utils::email::salutation(&display_name),
-                "reset_link": reset_link,
-            });
-            // PMS-1140: the portal-side event, not the staff one. The
-            // recipient here is a `contacts` row, the MSP's customer, and
-            // `auth.password_reset` names the product (migration 116) because
-            // it now serves staff only. Migration 206 seeded and backfilled
-            // this event's template for every tenant.
-            //
-            // PMS-1198: `auth.portal_welcome`'s dispatch site (migration 206)
-            // already supplies `{{salutation}}`; this one now does too
-            // (migration 220), rather than opening on a cold, nameless
-            // "We received a request...".
-            let _ = notify
-                .dispatch(
-                    TenantId::from_trusted(tenant_id),
-                    "auth.portal_password_reset",
-                    &context,
-                )
-                .await;
-        }
-        Ok(())
-    }
-
-    /// mokosh-contact-login prompt 004: redeem the reset-password
-    /// token. Same shape as `setup_password` - same table, same
-    /// `{contact_id}.{secret}` format, same status contract. Deleted
-    /// out of the same code path so a future policy change lands in
-    /// both flows.
-    #[tracing::instrument(skip_all)]
-    pub async fn reset_password(&self, token: &str, new_password: &str) -> AppResult<()> {
-        self.set_password_with_token(token, new_password, "portal.password_reset")
-            .await
-    }
+    // PMS-1343: `request_password_reset` and `reset_password` went with the
+    // two endpoints they served. The MSP reissues a portal password by
+    // resending the setup link, which redeems through `set_password_with_token`
+    // above under the `portal.setup_password` subtype; there is no
+    // customer-initiated reset to write a `portal.password_reset` row.
 
     /// mokosh-contact-login prompt 004: hydrate every field the SPA
     /// needs after a cold-load or a login. One JOIN so the SPA can

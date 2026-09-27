@@ -1,9 +1,11 @@
 //! mokosh-contact-login prompt 004: `/api/v1/contact/*` route family.
 //!
-//! Public routes (login, refresh, logout, set-password, forgot-password,
-//! reset-password, host hint) sit outside the auth check; the middleware
-//! still runs (it decodes the token when present) but downstream
-//! extractors don't. `/auth/me` is behind `RequireContactAuth`.
+//! Public routes (login, refresh, logout, set-password, the magic-link
+//! pair, host hint) sit outside the auth check; the middleware still runs
+//! (it decodes the token when present) but downstream extractors don't.
+//! `/auth/me` is behind `RequireContactAuth`. PMS-1343 took the
+//! self-service `forgot-password` / `reset-password` pair out of this list:
+//! a portal password reset goes through the MSP.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,13 +42,12 @@ pub struct ContactRouterState {
     /// own saved payment methods. Built at startup so the four routes
     /// below all reach the same service instance.
     pub payment_methods: Arc<super::payment_methods::PaymentMethodsService>,
-    /// PMS-1297: per-(IP, slug+email) budget for `POST /auth/forgot-password`,
-    /// spent before the lookup so a known and an unknown address cost the same.
-    pub forgot_password_limiter: Arc<crate::modules::auth::rate_limit::AuthRateLimiter>,
-    /// PMS-1297: one budget for `set-password` AND `reset-password`, keyed on
-    /// the contact id in the token, because both redeem the same
-    /// `portal_setup_tokens` row.
-    pub reset_password_limiter: Arc<crate::modules::auth::rate_limit::AuthRateLimiter>,
+    /// PMS-1297: the budget for redeeming a `portal_setup_tokens` row, keyed
+    /// on the contact id in the token. It covered `set-password` AND
+    /// `reset-password` until PMS-1343 left one redemption endpoint; the
+    /// per-(IP, slug+email) budget that fronted `forgot-password` went with
+    /// that endpoint.
+    pub set_password_limiter: Arc<crate::modules::auth::rate_limit::AuthRateLimiter>,
 }
 
 /// Build the `/api/v1/contact/*` sub-router. Layered with
@@ -65,16 +66,22 @@ pub fn contact_routes(
         service: service_arc,
         reauth_limiter: crate::modules::auth::rate_limit::ReauthRateLimiter::new(10, 5),
         payment_methods,
-        forgot_password_limiter: crate::modules::auth::rate_limit::AuthRateLimiter::new(10, 3),
-        reset_password_limiter: crate::modules::auth::rate_limit::AuthRateLimiter::new(10, 3),
+        set_password_limiter: crate::modules::auth::rate_limit::AuthRateLimiter::new(10, 3),
     };
     Router::new()
         .route("/auth/login", post(login))
         .route("/auth/refresh", post(refresh))
         .route("/auth/logout", post(logout))
         .route("/auth/set-password", post(set_password))
-        .route("/auth/reset-password", post(reset_password))
-        .route("/auth/forgot-password", post(forgot_password))
+        // PMS-1343: `/auth/reset-password` and `/auth/forgot-password` are
+        // gone. The MSP owns the client relationship and therefore owns the
+        // reset: a portal user asks their provider, who reissues the link from
+        // the contact record (`POST /contacts/{id}/resend-portal-invite`),
+        // which lands on `/auth/set-password` above. Keeping a second,
+        // customer-initiated path would undercut that ownership, and it also
+        // invalidated every outstanding token on the way past (PMS-1297), so a
+        // customer clicking "forgot password" silently killed the link their
+        // MSP had just sent them.
         .route("/auth/login-link", post(request_login_link))
         .route("/auth/login-link/redeem", post(redeem_login_link))
         // MAPPS-637: `/auth/login-link/select` retired. The
@@ -280,7 +287,7 @@ fn redeem_throttle(
         .map(|(id, _)| id.to_string())
         .unwrap_or_default();
     state
-        .reset_password_limiter
+        .set_password_limiter
         .check(ip, &account)
         .err()
         .map(|retry_after| {
@@ -304,51 +311,6 @@ async fn set_password(
     state
         .service
         .setup_password(&request.token, &request.password)
-        .await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-async fn reset_password(
-    State(state): State<ContactRouterState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(request): Json<ContactResetPasswordRequest>,
-) -> Result<Response, AppError> {
-    request.validate()?;
-    if let Some(resp) = redeem_throttle(&state, addr, &headers, &request.token) {
-        return Ok(resp);
-    }
-    state
-        .service
-        .reset_password(&request.token, &request.password)
-        .await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-async fn forgot_password(
-    State(state): State<ContactRouterState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(request): Json<ContactForgotPasswordRequest>,
-) -> Result<Response, AppError> {
-    request.validate()?;
-    let ip = crate::utils::client_ip::extract_client_ip(
-        addr.ip(),
-        &headers,
-        crate::utils::client_ip::trusted_proxies(),
-    );
-    // Keyed on (slug, email) because an email is only unique per portal;
-    // spent before the lookup, so a known and an unknown address are identical.
-    let account = format!("{}|{}", request.slug.trim(), request.email);
-    if let Err(retry_after) = state.forgot_password_limiter.check(ip, &account) {
-        return Ok(rate_limited_response(
-            retry_after,
-            "Too many password reset requests, please try again later",
-        ));
-    }
-    state
-        .service
-        .request_password_reset(&request.slug, &request.email)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
