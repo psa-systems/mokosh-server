@@ -1175,6 +1175,15 @@ mod tests {
     /// capitalised word ("Ticket") and an uppercased acronym ("SLA policy")
     /// are the canonical human form and must pass.
     fn is_identifier_shaped(noun: &str) -> bool {
+        // PMS-1341: a brand spells itself lowercase-then-uppercase ("iCloud"),
+        // which is exactly the shape a camelCase identifier has. Removed before
+        // the test rather than exempting the whole message, so the heuristic
+        // still reads the rest of it.
+        const BRANDS: &[&str] = &["iCloud"];
+        let mut noun = noun.to_string();
+        for brand in BRANDS {
+            noun = noun.replace(brand, "");
+        }
         noun.contains('_')
             || noun
                 .chars()
@@ -1256,6 +1265,9 @@ mod tests {
             "On-call schedule",
             "API key",
             "Report {other}",
+            // PMS-1341: a brand's own spelling, which is not an identifier
+            // however much it looks like one.
+            "iCloud Contacts connection",
         ] {
             assert!(!is_identifier_shaped(noun), "{noun:?}");
         }

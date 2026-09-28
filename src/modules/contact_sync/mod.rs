@@ -21,8 +21,10 @@
 //! * `file_import`: that file uploaded, previewed and imported through the
 //!   same engine, run queue and review queue as Google (PMS-1290).
 
+pub mod carddav;
 pub mod file_import;
 pub mod google;
+pub mod icloud;
 pub mod locks;
 pub mod mapping;
 pub mod matching;

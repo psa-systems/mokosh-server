@@ -1919,6 +1919,55 @@ impl ContactSyncService {
         }
     }
 
+    /// The Apple ID and app-specific password an iCloud connection syncs with
+    /// (PMS-1341).
+    ///
+    /// CardDAV is HTTP Basic, so there is no token to refresh and no
+    /// short-lived credential to mint: the password IS the credential, which is
+    /// why it lives in the [`SecretProvider`] under the same per-connection key
+    /// a Google refresh token does (PMS-912) and never in
+    /// `contact_sync_connections`. A revoked app password presents as a 401 on
+    /// the first request, which [`SourceError::Unauthorized`] turns into
+    /// `reconnect_required` the same way a revoked Google grant does, so this
+    /// method has no equivalent of [`Self::mark_reconnect_required`] to call.
+    ///
+    /// [`SecretProvider`]: crate::secrets::SecretProvider
+    /// [`SourceError::Unauthorized`]: super::provider::SourceError::Unauthorized
+    pub async fn icloud_credential(
+        &self,
+        tenant_id: TenantId,
+        connection_id: Uuid,
+    ) -> AppResult<(String, String)> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let apple_id: Option<String> = sqlx::query_scalar(
+            "SELECT account_email FROM contact_sync_connections \
+             WHERE tenant_id = $1 AND id = $2 AND provider = $3",
+        )
+        .bind(tenant_id)
+        .bind(connection_id)
+        .bind(super::icloud::ICLOUD)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let apple_id =
+            apple_id.ok_or_else(|| AppError::NotFound("iCloud Contacts connection".to_string()))?;
+        let app_password = self
+            .secrets
+            .get(&SecretKey::contact_sync(
+                tenant_id.get(),
+                super::icloud::ICLOUD,
+                connection_id,
+            ))
+            .await?
+            .ok_or_else(|| {
+                AppError::Configuration(
+                    "This connection's app-specific password is missing from the secret store."
+                        .to_string(),
+                )
+            })?;
+        Ok((apple_id, app_password))
+    }
+
     /// Best effort: a failure to record the state must not mask the token
     /// failure the caller is already handling.
     async fn mark_reconnect_required(&self, tenant_id: TenantId, connection_id: Uuid) {
