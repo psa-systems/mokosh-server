@@ -44,17 +44,33 @@ async function navClick(page: Page, href: string): Promise<void> {
 }
 
 test.describe('form validation (PMS-518 / AC7)', () => {
-  // PMS-1408: runs on all three engines. The chromium quarantine here was for
-  // the post-login crash PMS-592 recorded ("Target page, context or browser has
-  // been closed"), and all three causes it was waiting on have landed outside
-  // this repository: the runner containers pass --shm-size=2g (DEV-396), the
-  // dev image ships fonts so chromium no longer aborts in font fallback
-  // (DEV-756, which is what the /dev/shm theory had been masking), and the
-  // credential step assigns the DOM value instead of relying on fill(), which
-  // `e2e/lib/login.ts` records as the real cause. If this crashes on chromium
-  // again, do not restore a skip: attach the trace and a DEBUG=pw:browser run to
-  // a new issue carrying the signature, so the next quarantine names a cause
-  // somebody can act on rather than the same three that are now fixed.
+  // PMS-1408: still skipped on chromium, but for ONE named cause now instead of
+  // three, and the cause is measured rather than assumed.
+  //
+  // The quarantine was for the post-login crash PMS-592 recorded ("Target page,
+  // context or browser has been closed"), blamed on the container's 64 MB
+  // /dev/shm. Two of the three causes are fixed: the runners pass --shm-size=2g
+  // (DEV-396) and `e2e/lib/login.ts`'s credential step assigns the DOM value
+  // instead of relying on fill(), which that file records as the real cause
+  // behind PMS-592 and PMS-595. The third is not, and the evidence is in CI: the
+  // step this ticket added to e2e.yml reported, on run 47331, `/dev/shm` at 2.0G
+  // and `fc-list` at 0 fonts. With no fonts, headless chromium aborts inside
+  // font fallback (DEV-756) and Playwright reports the SAME closed-target error
+  // a resource crash gives - which is why raising shared memory never helped and
+  // the investigation stayed on the wrong cause for months.
+  //
+  // So the exit condition is now a number anybody can read off a run rather than
+  // a judgement call: when the E2E job's "fc-list reports N font(s)" line shows a
+  // non-zero N, delete this skip. The runner needs the fonted dev image
+  // (oci-images v1.13.0, DEV-756); nothing in this repository can supply it.
+  //
+  // If it crashes on chromium AFTER the fonts land, do not put a skip back:
+  // attach the trace and a DEBUG=pw:browser run to a new issue carrying the
+  // signature, so the next quarantine also names a cause somebody can act on.
+  test.skip(
+    ({ browserName }) => browserName === 'chromium',
+    'chromium aborts in font fallback on a fontless runner (DEV-756; see the fc-list line in the E2E job log, PMS-1408)',
+  );
   // ONE test, ONE login. The suite is rate-limited to 5 logins/min/email
   // (src/modules/auth/routes.rs); `setup` already spends one, so both forms are
   // exercised in a single test rather than a login-per-test beforeEach.

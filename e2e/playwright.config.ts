@@ -68,12 +68,15 @@ export default defineConfig({
     //    state, and use the SPA host the human-facing app is served on.
     //
     //    PMS-1408 corrected what this said about which specs run:
-    //    `form-validation.spec.ts` runs in all three projects, and only
-    //    `auth.spec.ts`'s logout test is `test.fixme` (PMS-148). The per-email
-    //    login rate limit (5/min, `src/modules/auth/routes.rs`) is therefore a
-    //    live cross-browser concern rather than a future one, which is why
-    //    form-validation is ONE test with ONE login rather than a login per
-    //    case: three engines plus `setup` already spend four of the five.
+    //    `form-validation.spec.ts` is NOT `test.fixme`, it is `test.skip` on
+    //    chromium alone (DEV-756: that runner has no fonts, which the job's
+    //    `fc-list` line now reports) and runs on firefox and webkit; only
+    //    `auth.spec.ts`'s logout test is `test.fixme` (PMS-148). So the per-email
+    //    login rate limit (5/min, `src/modules/auth/routes.rs`) is already a live
+    //    cross-browser concern rather than a future one, which is why
+    //    form-validation is ONE test with ONE login rather than a login per case:
+    //    two engines plus `setup` already spend three of the five, and a third
+    //    engine joins them when the fonts land.
     {
       name: 'chromium',
       testMatch: /(auth|form-validation)\.spec\.ts$/,
