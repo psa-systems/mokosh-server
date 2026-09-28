@@ -343,7 +343,10 @@ async fn the_google_client_is_set_in_the_app_and_the_secret_never_returns(pool: 
             saved["client_id"].as_str(),
             saved["secret_set"].as_bool()
         ),
-        (Some("database"), Some(id), Some(true))
+        // PMS-1340 split `database` in two. `seed_admin` is in the DEFAULT
+        // tenant, which is the system tenant, so what it writes IS the
+        // deployment-wide value and reads back as `deployment`.
+        (Some("deployment"), Some(id), Some(true))
     );
     assert!(
         !saved.to_string().contains("GOCSPX"),
@@ -380,7 +383,7 @@ async fn the_google_client_is_set_in_the_app_and_the_secret_never_returns(pool: 
     let (status, kept) = put(json!({})).await;
     assert_eq!(
         (status, kept["source"].as_str()),
-        (StatusCode::OK, Some("database"))
+        (StatusCode::OK, Some("deployment"))
     );
     let (status, cleared) = put(json!({ "client_id": "" })).await;
     assert_eq!(status, StatusCode::OK);
@@ -403,10 +406,22 @@ async fn the_google_client_is_set_in_the_app_and_the_secret_never_returns(pool: 
     assert_eq!(audited, 3, "every change is audited, without the secret");
 }
 
-/// An admin of any other organisation cannot read or swap the client every
-/// tenant on the deployment connects through.
+/// PMS-1340 reversed this test's rule, on purpose, and it is worth reading why
+/// rather than treating the change as a loosened gate.
+///
+/// PMS-1264 refused every tenant but the system one, because the client was the
+/// deployment's: "an admin of any other organisation cannot read or swap the
+/// client every tenant on the deployment connects through". PMS-1340 made the
+/// credential per tenant, so there is no longer a client every other tenant
+/// connects through, and an admin editing theirs changes only what their own
+/// organisation connects as - the same authority they already hold over their own
+/// payment gateway credentials.
+///
+/// What must still hold is that they reach their OWN and nobody else's, which is
+/// what this now asserts, and `tests/contact_sync_client_per_tenant.rs` covers
+/// the isolation and the fallback ladder in full.
 #[mokosh_test]
-async fn only_the_system_tenant_configures_the_google_client(pool: PgPool) {
+async fn a_tenant_admin_configures_their_own_google_client(pool: PgPool) {
     let (_tenant, _user, email, password) =
         common::seed_tenant_with_admin(&pool, "customer-msp").await;
     let app = common::boot(pool.clone()).await;
@@ -433,7 +448,11 @@ async fn only_the_system_tenant_configures_the_google_client(pool: PgPool) {
         .send()
         .await
         .unwrap();
-    assert_eq!(get.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        get.status(),
+        StatusCode::OK,
+        "an admin reads their own organisation's client"
+    );
     let put = app
         .client
         .put(app.url(path))
@@ -442,7 +461,21 @@ async fn only_the_system_tenant_configures_the_google_client(pool: PgPool) {
         .send()
         .await
         .unwrap();
-    assert_eq!(put.status(), StatusCode::FORBIDDEN);
+    assert!(put.status().is_success(), "and writes it: {}", put.status());
+    let saved: Value = app
+        .client
+        .get(app.url(path))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        saved["source"], "tenant",
+        "what it wrote is its own, not the deployment's: {saved}"
+    );
     let overview: Value = app
         .client
         .get(app.url("/api/v1/integrations/contact-sync"))
@@ -453,5 +486,8 @@ async fn only_the_system_tenant_configures_the_google_client(pool: PgPool) {
         .json()
         .await
         .unwrap();
-    assert_eq!(overview["client_editable"], false);
+    assert_eq!(
+        overview["client_editable"], true,
+        "the card offers the form to an admin of this tenant"
+    );
 }
