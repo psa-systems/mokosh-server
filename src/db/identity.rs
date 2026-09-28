@@ -173,28 +173,64 @@ impl MembershipRepo {
     /// (tenant name/slug/kind included) in one round trip. Ordered by
     /// `joined_at` so the phase-3 picker leads with the identity's
     /// longest-standing tenant.
+    ///
+    /// PMS-1393: each row also carries the live `mokosh_bunyip_grants` id when
+    /// the seat came from a grant, because that id is what makes
+    /// `DELETE /api/v1/my-grants/{id}` callable and nothing else on the wire
+    /// held it. Three things about the join are deliberate.
+    ///
+    /// It goes through `users` rather than `identities`, because the Bunyip sub
+    /// lives on `users.bunyip_user_id` (migration 226) and `identities` has no
+    /// such column; the placement row for the seat's own tenant is the one that
+    /// answers, which is also the row `grantee_leave` tombstones.
+    ///
+    /// It matches `mokosh_account_id` against `tenants.slug`, because that
+    /// column holds a SLUG and not a tenant id (migration 225's own comment says
+    /// so: Bunyip has no local tenant knowledge). A join written against
+    /// `t.id::text` would compile, return nothing, and read as "no grants
+    /// anywhere".
+    ///
+    /// It requires `revoked_at IS NULL`, so a revoked grant yields `None` rather
+    /// than an id. That is what stops a client offering Leave on a seat whose
+    /// grant is already gone, where the endpoint would answer 204 for a revoke
+    /// that happened days ago.
+    ///
+    /// Reads `users` and `mokosh_bunyip_grants` across tenants, which is what
+    /// the existing `tenant_memberships` read here already does: both callers
+    /// hand this the migrator pool because the whole point is the seats an
+    /// identity holds OUTSIDE the currently scoped tenant.
     pub async fn list_views_for_identity(
         pool: &PgPool,
         identity_id: Uuid,
         active_tenant_id: Option<Uuid>,
     ) -> Result<Vec<mokosh_types::auth::MembershipView>, sqlx::Error> {
-        let rows: Vec<(Uuid, String, String, String, String, String)> = sqlx::query_as(
-            r#"
-            SELECT tm.tenant_id, t.name, t.slug, t.kind, tm.role, tm.status
+        let rows: Vec<(Uuid, String, String, String, String, String, Option<Uuid>)> =
+            sqlx::query_as(
+                r#"
+            SELECT tm.tenant_id, t.name, t.slug, t.kind, tm.role, tm.status, g.id
             FROM tenant_memberships tm
             JOIN tenants t ON t.id = tm.tenant_id
+            JOIN identities i ON i.id = tm.identity_id
+            LEFT JOIN users u
+                   ON u.tenant_id = tm.tenant_id
+                  AND lower(u.email) = lower(i.email)
+                  AND u.deleted_at IS NULL
+            LEFT JOIN mokosh_bunyip_grants g
+                   ON g.grantee_bunyip_user_id = u.bunyip_user_id
+                  AND g.mokosh_account_id = t.slug
+                  AND g.revoked_at IS NULL
             WHERE tm.identity_id = $1 AND tm.status = 'active'
             ORDER BY tm.joined_at ASC
             "#,
-        )
-        .bind(identity_id)
-        .fetch_all(pool)
-        .await?;
+            )
+            .bind(identity_id)
+            .fetch_all(pool)
+            .await?;
 
         Ok(rows
             .into_iter()
-            .map(
-                |(tenant_id, name, slug, kind, role, status)| mokosh_types::auth::MembershipView {
+            .map(|(tenant_id, name, slug, kind, role, status, grant_id)| {
+                mokosh_types::auth::MembershipView {
                     is_active: Some(tenant_id) == active_tenant_id,
                     tenant_id,
                     tenant_name: name,
@@ -202,8 +238,9 @@ impl MembershipRepo {
                     tenant_kind: kind,
                     role,
                     status,
-                },
-            )
+                    mokosh_bunyip_grant_id: grant_id,
+                }
+            })
             .collect())
     }
 }

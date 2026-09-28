@@ -171,6 +171,24 @@ pub struct MembershipView {
     pub role: String,
     pub status: String,
     pub is_active: bool,
+    /// PMS-1393: the live `mokosh_bunyip_grants` row this seat came from, or
+    /// `None` for a seat the identity holds in its own right.
+    ///
+    /// It is here because it is the ONLY id that makes
+    /// `DELETE /api/v1/my-grants/{id}` callable (PMS-1210): that endpoint keys
+    /// on `mokosh_bunyip_grants.id`, and nothing else on the wire carried it, so
+    /// a client could see "you are in this account by grant" and still not
+    /// construct the request to leave it. Its presence is also the answer to
+    /// "may I leave this account", which is why the client needs no second
+    /// call: a seat with no grant id is one the owner cannot be left, and a
+    /// REVOKED grant reads as `None` rather than as an id, so Leave is never
+    /// offered for a grant that is already gone.
+    ///
+    /// `#[serde(default)]` keeps the wire shape backward-compatible, the rule
+    /// every field added to this struct since MAPPS-348 has followed: a client
+    /// pinned to an older `mokosh-types` still deserializes the payload.
+    #[serde(default)]
+    pub mokosh_bunyip_grant_id: Option<Uuid>,
 }
 
 /// Current authenticated user state
