@@ -22,6 +22,13 @@
 //!   the Google import they mirror. The upload raises axum's body limit to
 //!   the reader's own cap (PMS-1233), so an oversized file reaches the shared
 //!   413 rather than a framework 400.
+//! * `/api/v1/integrations/contact-sync/icloud/*` is the iCloud half
+//!   (PMS-1409). `connect` takes an Apple ID and an app-specific password in one
+//!   authenticated request, because Apple publishes no OAuth scope for contacts
+//!   and there is no consent screen to redirect to; `disconnect` mirrors
+//!   Google's. Which provider a SHARED route acts on (the selection, the preview,
+//!   starting an import) is the `provider` query parameter, defaulting to
+//!   `google` so every existing client call keeps working unchanged.
 //! * `/api/v1/public/contact-sync/google/callback` is the browser redirect
 //!   Google performs, which carries no session by construction. Its credential
 //!   is the single-use state parameter (migration 221); it is listed in the
@@ -217,8 +224,43 @@ async fn disconnect(
     RequireAuth(user): RequireAuth,
     ctx: AuditCtx,
 ) -> AppResult<StatusCode> {
-    state.service.disconnect(user.tenant(), &ctx).await?;
+    state
+        .service
+        .disconnect(user.tenant(), "google", &ctx)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Which provider a shared route acts on (PMS-1409).
+///
+/// A query parameter defaulting to `google`, not a path segment: every existing
+/// client call is `/integrations/contact-sync/selection` with no provider in it,
+/// and moving them all would be a flag day in another repository for a feature
+/// nobody asked to rename. `vcard` is refused rather than accepted, because an
+/// uploaded file has its own routes and its own per-import selection, so a
+/// `?provider=vcard` here is a caller that has the wrong route.
+#[derive(Debug, Default, Deserialize)]
+struct ProviderQuery {
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+impl ProviderQuery {
+    fn resolve(&self) -> AppResult<&str> {
+        match self
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            None => Ok("google"),
+            Some(provider @ ("google" | "icloud")) => Ok(provider),
+            Some(_) => Err(AppError::validation_field(
+                "provider",
+                "must be google or icloud",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -234,12 +276,17 @@ async fn preview(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
     RequireAuth(user): RequireAuth,
+    Query(which): Query<ProviderQuery>,
     Json(request): Json<PreviewRequest>,
 ) -> AppResult<Json<ImportPreview>> {
     Ok(Json(
         state
             .service
-            .preview(user.tenant(), request.group_ids.as_deref())
+            .preview(
+                user.tenant(),
+                which.resolve()?,
+                request.group_ids.as_deref(),
+            )
             .await?,
     ))
 }
@@ -253,13 +300,14 @@ async fn set_selection(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
     RequireAuth(user): RequireAuth,
+    Query(which): Query<ProviderQuery>,
     ctx: AuditCtx,
     Json(request): Json<SelectionRequest>,
 ) -> AppResult<Json<ConnectionStatus>> {
     Ok(Json(
         state
             .service
-            .set_selection(user.tenant(), &request.group_ids, &ctx)
+            .set_selection(user.tenant(), which.resolve()?, &request.group_ids, &ctx)
             .await?,
     ))
 }
@@ -289,9 +337,13 @@ async fn queue_run(
     State(state): State<ContactSyncRouterState>,
     _admin: RequireAdmin,
     RequireAuth(user): RequireAuth,
+    Query(which): Query<ProviderQuery>,
     ctx: AuditCtx,
 ) -> AppResult<(StatusCode, Json<RunStatus>)> {
-    let run = state.service.queue_run(user.tenant(), &ctx).await?;
+    let run = state
+        .service
+        .queue_run(user.tenant(), which.resolve()?, &ctx)
+        .await?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 

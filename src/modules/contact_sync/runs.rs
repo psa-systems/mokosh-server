@@ -72,8 +72,16 @@ pub const STALE_AFTER_MINUTES: i64 = 30;
 pub const RUNS_PER_TICK: i64 = 5;
 
 /// Why a run the tenant turned the integration off under did not happen.
-const TURNED_OFF: &str =
-    "Google Contacts was turned off for this organization before this import ran.";
+///
+/// By provider since PMS-1409: each integration has its own switch (PMS-1341),
+/// so a cancelled iCloud run that blamed Google Contacts would send an admin to
+/// the wrong toggle.
+fn turned_off(provider: &str) -> String {
+    format!(
+        "{} was turned off for this organization before this import ran.",
+        super::provider::words(provider).name
+    )
+}
 
 /// Consecutive failed runs before anyone is told.
 pub const NOTIFY_AFTER: i32 = 3;
@@ -393,7 +401,7 @@ impl ContactSyncRunner {
                 crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
             };
             if !allowed {
-                return Err(AppError::Conflict(TURNED_OFF.to_string()));
+                return Err(AppError::Conflict(turned_off(&provider)));
             }
             self.sources
                 .source(tenant_id, claimed.connection_id, &provider)
@@ -449,7 +457,7 @@ impl ContactSyncRunner {
             // Disconnected while queued or running: the admin ended it, and a
             // connection that no longer exists has no failure streak.
             _ if disconnected => ("cancelled", None, None),
-            Err(_) if turned_off => ("cancelled", Some(TURNED_OFF.to_string()), None),
+            Err(_) if turned_off => ("cancelled", Some(self::turned_off(&provider)), None),
             Ok(report) if report.failed == 0 => ("completed", None, Some(false)),
             Ok(report) => (
                 "failed",
@@ -477,12 +485,18 @@ impl ContactSyncRunner {
             sqlx::query(
                 "UPDATE contact_sync_runs SET status = 'queued', heartbeat_at = NULL, \
                      not_before = NOW() + ($3 * INTERVAL '1 minute'), \
-                     error = 'Google is rate limiting this connection; the import resumes by itself.' \
+                     error = $4 \
                  WHERE tenant_id = $1 AND id = $2",
             )
             .bind(tenant_id)
             .bind(claimed.id)
             .bind(minutes)
+            // PMS-1409: whoever is actually rate limiting. A bound parameter
+            // rather than a literal now that the sentence names a vendor.
+            .bind(format!(
+                "{} is rate limiting this connection; the import resumes by itself.",
+                super::provider::words(&provider).vendor
+            ))
             .execute(&mut *tx)
             .await?;
         } else {
