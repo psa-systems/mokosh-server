@@ -15,12 +15,14 @@
 //!
 //! # What is a secret and where it lives
 //!
-//! The CLIENT secret is operator configuration (`GOOGLE_CONTACTS_CLIENT_SECRET`),
-//! beside `INFISICAL_CLIENT_SECRET`, because it belongs to the deployment. A
-//! TENANT's refresh token is the tenant's and goes to the secret provider
-//! under `SecretKind::ContactSync`. Neither is ever logged, and neither
-//! reaches an error body: every failure below is reported by its shape, never
-//! by echoing what was sent.
+//! The CLIENT secret is the TENANT's since PMS-1340: its own registration
+//! first, then the deprecated deployment-wide client PMS-1264 stored on the
+//! system tenant, then `GOOGLE_CONTACTS_CLIENT_SECRET` as a last resort, which
+//! is what this module's doc used to describe as the only home. A tenant's
+//! refresh token is the tenant's too and goes to the secret provider under
+//! `SecretKind::ContactSync`. Neither is ever logged, and neither reaches an
+//! error body: every failure below is reported by its shape, never by echoing
+//! what was sent.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
