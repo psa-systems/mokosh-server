@@ -106,6 +106,24 @@ pub struct MembershipRow {
 
 pub struct MembershipRepo;
 
+/// PMS-1393: the seven columns [`MembershipRepo::list_views_for_identity`] reads,
+/// named.
+///
+/// A struct rather than a tuple because six of the seven are `String` or `Uuid`:
+/// a reordered SELECT still compiles and binds the wrong value to the wrong
+/// name, which `FromRow`'s match on column NAME makes impossible rather than
+/// unlikely. It is also what clippy's `type_complexity` asks for at seven.
+#[derive(sqlx::FromRow)]
+struct MembershipViewRow {
+    tenant_id: Uuid,
+    name: String,
+    slug: String,
+    kind: String,
+    role: String,
+    status: String,
+    grant_id: Option<Uuid>,
+}
+
 impl MembershipRepo {
     /// Every active membership for an identity, ordered by joined_at so
     /// the picker in phase 3 renders "your longest-standing tenant first".
@@ -204,10 +222,9 @@ impl MembershipRepo {
         identity_id: Uuid,
         active_tenant_id: Option<Uuid>,
     ) -> Result<Vec<mokosh_types::auth::MembershipView>, sqlx::Error> {
-        let rows: Vec<(Uuid, String, String, String, String, String, Option<Uuid>)> =
-            sqlx::query_as(
-                r#"
-            SELECT tm.tenant_id, t.name, t.slug, t.kind, tm.role, tm.status, g.id
+        let rows: Vec<MembershipViewRow> = sqlx::query_as(
+            r#"
+            SELECT tm.tenant_id, t.name, t.slug, t.kind, tm.role, tm.status, g.id AS grant_id
             FROM tenant_memberships tm
             JOIN tenants t ON t.id = tm.tenant_id
             JOIN identities i ON i.id = tm.identity_id
@@ -222,24 +239,22 @@ impl MembershipRepo {
             WHERE tm.identity_id = $1 AND tm.status = 'active'
             ORDER BY tm.joined_at ASC
             "#,
-            )
-            .bind(identity_id)
-            .fetch_all(pool)
-            .await?;
+        )
+        .bind(identity_id)
+        .fetch_all(pool)
+        .await?;
 
         Ok(rows
             .into_iter()
-            .map(|(tenant_id, name, slug, kind, role, status, grant_id)| {
-                mokosh_types::auth::MembershipView {
-                    is_active: Some(tenant_id) == active_tenant_id,
-                    tenant_id,
-                    tenant_name: name,
-                    tenant_slug: slug,
-                    tenant_kind: kind,
-                    role,
-                    status,
-                    mokosh_bunyip_grant_id: grant_id,
-                }
+            .map(|row| mokosh_types::auth::MembershipView {
+                is_active: Some(row.tenant_id) == active_tenant_id,
+                tenant_id: row.tenant_id,
+                tenant_name: row.name,
+                tenant_slug: row.slug,
+                tenant_kind: row.kind,
+                role: row.role,
+                status: row.status,
+                mokosh_bunyip_grant_id: row.grant_id,
             })
             .collect())
     }
