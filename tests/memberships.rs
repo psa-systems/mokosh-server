@@ -229,3 +229,139 @@ async fn legacy_token_without_mid_still_authorizes_and_resolves_membership(pool:
     assert_eq!(body[0]["is_active"].as_bool(), Some(true));
     assert_eq!(body[0]["role"].as_str().unwrap(), "super_admin");
 }
+
+/// PMS-1393: a seat that came from a grant carries the grant id, and the id is
+/// the one `DELETE /api/v1/my-grants/{id}` accepts.
+///
+/// PMS-1210 shipped that endpoint keyed on `mokosh_bunyip_grants.id` and shipped
+/// nothing on the wire that carried it, so this asserts the two halves agree
+/// rather than asserting a field exists: the id the memberships list hands a
+/// client is fed straight back as the path parameter, and the endpoint answers
+/// 204 instead of the 404 it gives for an id that is not the caller's.
+#[mokosh_test]
+async fn a_granted_seat_carries_the_grant_id_the_leave_endpoint_accepts(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let granted_tenant = insert_tenant(&pool, "Granted Tenant", "granted-pms1393").await;
+    let granted_user = insert_user_row(&pool, granted_tenant, &email, "manager").await;
+
+    // The grant is keyed on (Bunyip sub, tenant SLUG), so the placement row in
+    // the granted tenant has to name the same sub the caller's own row does:
+    // migration 226 pinned `(bunyip_user_id, tenant_id)` unique precisely so one
+    // human's placements across tenants share a sub.
+    let sub = Uuid::new_v4();
+    sqlx::query("UPDATE users SET bunyip_user_id = $1 WHERE id = ANY($2)")
+        .bind(sub)
+        .bind(vec![admin_id, granted_user])
+        .execute(&pool)
+        .await
+        .expect("stamp the Bunyip sub on both placements");
+    let grant_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO mokosh_bunyip_grants \
+         (id, grantee_bunyip_user_id, owner_bunyip_user_id, mokosh_account_id, role) \
+         VALUES ($1, $2, $3, 'granted-pms1393', 'manager')",
+    )
+    .bind(grant_id)
+    .bind(sub)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("insert the grant row");
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let body: Vec<Value> = app
+        .client
+        .get(app.url("/api/v1/auth/memberships"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /memberships")
+        .json()
+        .await
+        .expect("/memberships json");
+    assert_eq!(body.len(), 2, "own seat plus the granted one: {body:?}");
+
+    let granted = body
+        .iter()
+        .find(|m| m["tenant_id"].as_str() == Some(granted_tenant.to_string().as_str()))
+        .expect("the granted seat");
+    assert_eq!(
+        granted["mokosh_bunyip_grant_id"].as_str(),
+        Some(grant_id.to_string().as_str()),
+        "the granted seat names its grant"
+    );
+    let own = body
+        .iter()
+        .find(|m| m["tenant_id"].as_str() == Some(common::DEFAULT_TENANT_ID.to_string().as_str()))
+        .expect("the own seat");
+    assert!(
+        own["mokosh_bunyip_grant_id"].is_null(),
+        "a seat held in its own right has no grant to leave: {own:?}"
+    );
+
+    // The whole point: the id travels from the list into the endpoint.
+    let left = app
+        .client
+        .delete(app.url(&format!(
+            "/api/v1/my-grants/{}",
+            granted["mokosh_bunyip_grant_id"].as_str().unwrap()
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send the leave request");
+    assert_eq!(
+        left.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "the id the list handed us is the id the leave endpoint keys on"
+    );
+}
+
+/// PMS-1393: a revoked grant reads as no grant.
+///
+/// The column is nullable and the join requires `revoked_at IS NULL`, so a seat
+/// whose grant is already gone offers no id. Without that, a client would render
+/// Leave for a grant revoked days ago and the endpoint would answer 204 for
+/// nothing, which reads to the person as having just left.
+#[mokosh_test]
+async fn a_revoked_grant_leaves_no_id_on_the_membership(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let sub = Uuid::new_v4();
+    sqlx::query("UPDATE users SET bunyip_user_id = $1 WHERE id = $2")
+        .bind(sub)
+        .bind(admin_id)
+        .execute(&pool)
+        .await
+        .expect("stamp the Bunyip sub");
+    // A revoked row carries no role, which the table's own CHECK enforces.
+    sqlx::query(
+        "INSERT INTO mokosh_bunyip_grants \
+         (grantee_bunyip_user_id, owner_bunyip_user_id, mokosh_account_id, role, revoked_at) \
+         VALUES ($1, $2, 'default', NULL, NOW())",
+    )
+    .bind(sub)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("insert the revoked grant");
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let body: Vec<Value> = app
+        .client
+        .get(app.url("/api/v1/auth/memberships"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send /memberships")
+        .json()
+        .await
+        .expect("/memberships json");
+    assert_eq!(body.len(), 1);
+    assert!(
+        body[0]["mokosh_bunyip_grant_id"].is_null(),
+        "a revoked grant is not something to leave: {:?}",
+        body[0]
+    );
+}
