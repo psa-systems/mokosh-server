@@ -2453,3 +2453,63 @@ mod pms_998_tests {
         assert!(!session_ended(&revoked, &claims_with_sid(None)).await);
     }
 }
+
+/// PMS-1309: the MAPPS-458 reject stays a reject, and no by-email placement
+/// fallback comes back.
+///
+/// MAPPS-924's history is the whole argument for reading this file's own text
+/// back. A staging-only bypass let any Bunyip identity with no local placement
+/// and no pending invitation JIT-provision a personal tenant, which is the
+/// onboarding surface MAPPS-458 closed; three commits built it up and each said
+/// in its own comment to remove it before merging to main, and it reached main
+/// anyway, where it sat until `b7aa8af4`. Neither half was visible as a
+/// difference in behaviour a test would notice from outside, which is why the
+/// guard is a source scan rather than a request:
+///
+/// * The disabled reject kept the whole `if` block and deleted only its
+///   `return`, so every uninvited identity fell through to provisioning. A
+///   reader skimming for the block still found it.
+/// * The by-email fallback resolved a `users` row by case-insensitive email when
+///   the `sub` lookup missed and rebound `sub` to it, without requiring
+///   `email_verified`, so a Bunyip token carrying an unverified address was
+///   enough to be placed as whoever holds that address locally.
+#[cfg(test)]
+mod pms_1309_tests {
+    /// This file's own text. The needles below are assembled rather than
+    /// written out, because a scan whose literal sits in its own source matches
+    /// itself and passes for ever.
+    const SELF: &str = include_str!("middleware.rs");
+
+    #[test]
+    fn the_mapps_458_reject_still_refuses_an_uninvited_identity() {
+        let guard_line = format!(
+            "if placement.is_none() && invite.is_none() && {}is_platform_admin {{",
+            '!'
+        );
+        let at = SELF
+            .find(&guard_line)
+            .expect("the MAPPS-458 reject block is gone entirely, not merely disabled");
+        // The block is short; the return is what was deleted last time, so look
+        // for it inside the block rather than anywhere after it.
+        let block = &SELF[at..at + 600.min(SELF.len() - at)];
+        let end = block
+            .find("\n    }\n")
+            .expect("the reject block does not close within 600 bytes");
+        let body = &block[..end];
+        assert!(
+            body.contains(&format!("{} (None, None);", "return")),
+            "the MAPPS-458 reject no longer returns, so an uninvited Bunyip identity \
+             falls through to personal-tenant provisioning (the MAPPS-924 bypass): {body}"
+        );
+    }
+
+    #[test]
+    fn no_placement_lookup_falls_back_to_the_email() {
+        let needle = format!("find_user_placement_by_{}", "email");
+        assert!(
+            !SELF.contains(&needle),
+            "{needle} is the MAPPS-924 by-email placement fallback; a `sub` lookup that \
+             misses must not be resolved by address, which accepted an unverified one"
+        );
+    }
+}
