@@ -62,7 +62,7 @@ use crate::utils::error::AppError;
 /// `vcard` is an uploaded file (PMS-1290): one tenant-level source row whose
 /// reads are the file a run imports, so it is never scheduled and has no
 /// credential.
-pub const SUPPORTED: &[&str] = &["google", "vcard"];
+pub const SUPPORTED: &[&str] = &["google", "vcard", "icloud"];
 
 /// A group a source may offer for the records that carry no group at all, so
 /// they can be selected like any other (PMS-1290: a `.vcf` card with no
@@ -308,9 +308,11 @@ mod tests {
     /// this codebase before (PMS-966), so the guard reads the migration.
     #[test]
     fn the_supported_list_matches_the_migration_check() {
-        // The latest statement of the CHECK: migration 220 created it and
-        // 238 widened it for `vcard`.
-        const MIGRATION: &str = include_str!("../../../migrations/238_contact_import_files.sql");
+        // The latest statement of the CHECK: migration 220 created it, 238
+        // widened it for `vcard`, and 254 for `icloud` (PMS-1341). This
+        // constant moves with the newest one, which is the whole point of the
+        // guard reading a file rather than a list somebody keeps.
+        const MIGRATION: &str = include_str!("../../../migrations/254_icloud_contact_sync.sql");
         let check = MIGRATION
             .split("CHECK (provider IN (")
             .nth(1)
@@ -333,9 +335,12 @@ mod tests {
 
     /// Nothing outside the list is servable, so a stored row naming one cannot
     /// be silently skipped.
+    ///
+    /// `icloud` left this list under PMS-1341, which is the point: it was here as
+    /// an example of a provider the build does not serve, and it now does.
     #[test]
     fn an_unknown_provider_is_not_supported() {
-        for unknown in ["microsoft", "icloud", "carddav", "", "Google"] {
+        for unknown in ["microsoft", "carddav", "exchange", "", "Google"] {
             assert!(!is_supported(unknown), "{unknown:?} must not be supported");
         }
     }
