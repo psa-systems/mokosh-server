@@ -560,6 +560,26 @@ impl ContactSyncService {
                     .to_string(),
             ));
         };
+        // PMS-1356: the scope that came BACK, not the one that was asked for.
+        // Google's consent screen lets a person untick an individual permission
+        // and finish the flow anyway, so without this the exchange succeeds, the
+        // grant is stored, the Settings card reads healthy, and the first sync
+        // 403s - which `google` reports as `Unauthorized` and the connection
+        // renders as "Google has revoked this connection", when nothing was
+        // revoked and reconnecting the same way repeats it. A response that
+        // carries no `scope` at all is NOT refused: every authorization exchange
+        // returns one, and a missing field must not break a working connect over
+        // a check that cannot be made.
+        if tokens
+            .scope
+            .as_deref()
+            .is_some_and(|granted| !oauth::grants_contacts_read(granted))
+        {
+            return Err(AppError::BadRequest(
+                "This Google account was connected without permission to read its contacts. Connect again and leave the contacts permission ticked."
+                    .to_string(),
+            ));
+        }
         let account_email = oauth::account_email(&self.http, &tokens.access_token).await?;
 
         let outcome = self
