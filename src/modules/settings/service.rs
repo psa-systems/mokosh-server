@@ -481,6 +481,26 @@ pub async fn read_google_contacts_enabled(db: &Database, tenant_id: TenantId) ->
     Ok(value.and_then(|v| v.as_bool()).unwrap_or(true))
 }
 
+/// PMS-1341: whether this tenant allows the iCloud contact sync.
+///
+/// Its own key rather than sharing Google's, because they are two integrations a
+/// tenant decides about separately: an MSP that syncs its Google Workspace
+/// directory and wants nobody's personal iCloud contacts in the CRM is the
+/// ordinary case, and one flag could not express it. Defaults to allowed, the
+/// same way the Google one does, because the gate that actually decides whether
+/// anything syncs is whether a connection exists.
+pub async fn read_icloud_contacts_enabled(db: &Database, tenant_id: TenantId) -> AppResult<bool> {
+    let mut tx = db.begin_with_tenant(tenant_id).await?;
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'integrations' AND key = 'icloud_contacts_enabled'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(value.and_then(|v| v.as_bool()).unwrap_or(true))
+}
+
 /// PMS-1145: who may correct a work-day segment (`timesheets/segment_editing`),
 /// as the stored string; `SegmentEditPolicy::parse` gives it a meaning. Unset
 /// means `owner_or_admin`. A stored value the parser refuses is treated the
