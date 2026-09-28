@@ -157,6 +157,17 @@ constant_time_eq = "0.3"
 calcard = { version = "0.3", default-features = false }
 encoding_rs = "0.8"
 
+# CardDAV multistatus parsing for the iCloud contact sync (PMS-1341). XML is
+# unavoidable here in a way it was not for the S3 provider (PMS-958), which
+# needed five requests and no listing and so got a SigV4 signer and no parser: a
+# CardDAV response IS `<D:multistatus>`, with namespaced elements, and the
+# alternative is hand-rolled substring matching over somebody else's XML.
+# `default-features = false` drops the serde derive stack; the reader is used
+# directly, event by event, because the parts this needs (hrefs, etags,
+# address-data, the sync token) are a handful of elements rather than a document
+# model.
+quick-xml = { version = "0.37", default-features = false }
+
 # CIDR parsing for the trusted-proxy allowlist that gates X-Forwarded-For
 # client-IP extraction (PMS-587).
 ipnetwork = { workspace = true }

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:CARD="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/1234567890/carddavhome/card/ada.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"C=1234@example.com"</D:getetag>
+        <CARD:address-data>BEGIN:VCARD
+VERSION:3.0
+PRODID:-//Apple Inc.//iOS 18.1//EN
+UID:AAAA1111-2222-3333-4444-555566667777
+N:Lovelace;Ada;;;
+FN:Ada Lovelace
+ORG:Analytical Engines Ltd;Research;
+TITLE:Chief Programmer
+EMAIL;type=INTERNET;type=WORK;type=pref:ada@analytical.example
+EMAIL;type=INTERNET;type=HOME:ada@home.example
+TEL;type=CELL;type=VOICE;type=pref:+44 20 7946 0958
+TEL;type=WORK;type=FAX:+44 20 7946 0000
+NOTE:Met at the 1843 symposium. Prefers long notes\, folded over
+  several lines the way Apple writes them.
+REV:2026-09-20T11:12:13Z
+END:VCARD
+</CARD:address-data>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/1234567890/carddavhome/card/charles.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"C=1235@example.com"</D:getetag>
+        <CARD:address-data>BEGIN:VCARD
+VERSION:3.0
+UID:BBBB1111-2222-3333-4444-555566667777
+N:Babbage;Charles;;;
+FN:Charles Babbage
+EMAIL;type=INTERNET;type=WORK:charles@analytical.example
+TEL;type=WORK;type=VOICE:+44 20 7946 0100
+REV:2026-09-21T09:00:00Z
+END:VCARD
+</CARD:address-data>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/1234567890/carddavhome/card/group-clients.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"C=1236@example.com"</D:getetag>
+        <CARD:address-data>BEGIN:VCARD
+VERSION:3.0
+UID:GGGG1111-2222-3333-4444-555566667777
+FN:Clients
+N:Clients;;;;
+X-ADDRESSBOOKSERVER-KIND:group
+X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:AAAA1111-2222-3333-4444-555566667777
+X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:CCCC9999-0000-0000-0000-000000000000
+REV:2026-09-22T10:00:00Z
+END:VCARD
+</CARD:address-data>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:CARD="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/1234567890/carddavhome/card/ada.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"C=1240@example.com"</D:getetag>
+        <CARD:address-data>BEGIN:VCARD
+VERSION:3.0
+UID:AAAA1111-2222-3333-4444-555566667777
+N:Lovelace;Ada;;;
+FN:Ada Lovelace
+EMAIL;type=INTERNET;type=WORK;type=pref:ada@analytical.example
+TEL;type=CELL;type=VOICE;type=pref:+44 20 7946 0958
+REV:2026-09-26T08:00:00Z
+END:VCARD
+</CARD:address-data>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/1234567890/carddavhome/card/removed.vcf</D:href>
+    <D:status>HTTP/1.1 404 Not Found</D:status>
+  </D:response>
+  <D:sync-token>HwoQEgwAAAh4WEt3aAAAAAAYAhgAIhUIxNvJ9Y2AgAIQxNvJ9Y2AgAIYASgA</D:sync-token>
+</D:multistatus>

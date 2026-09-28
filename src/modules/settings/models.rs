@@ -98,8 +98,15 @@ pub fn validate_setting_value(
         // off switch for Google Contacts (PSA-70 K). Default ON, the absence
         // of a row, because turning it off is the deliberate act; the reader
         // is `read_google_contacts_enabled`.
+        //
+        // PMS-1341: `integrations/icloud_contacts_enabled` is the same switch
+        // for the iCloud CardDAV sync, with the same default. Its own key
+        // rather than one shared switch, because an MSP that syncs its Google
+        // Workspace directory and wants nobody's personal iCloud contacts in
+        // the CRM is the ordinary case.
         ("timesheets", "track_breaks")
         | ("integrations", "google_contacts_enabled")
+        | ("integrations", "icloud_contacts_enabled")
         | ("notifications", "channel_email_enabled")
         | ("notifications", "channel_in_app_enabled") => match value {
             Value::Bool(_) => Ok(()),

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:CARD="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/1234567890/principal/</D:href>
+    <D:propstat>
+      <D:prop>
+        <CARD:addressbook-home-set>
+          <D:href>/1234567890/carddavhome/</D:href>
+        </CARD:addressbook-home-set>
+        <D:displayname>Ada Lovelace</D:displayname>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>
