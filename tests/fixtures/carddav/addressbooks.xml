@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:CARD="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/1234567890/carddavhome/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/></D:resourcetype>
+        <D:displayname>Home</D:displayname>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/1234567890/carddavhome/card/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>
+        <D:displayname>Contacts</D:displayname>
+        <D:sync-token>HwoQEgwAAAh4WEt3aAAAAAAYAhgAIhUIxNvJ9Y2AgAIQxNvJ9Y2AgAIYASgA</D:sync-token>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>
