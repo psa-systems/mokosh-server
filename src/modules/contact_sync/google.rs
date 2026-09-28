@@ -836,6 +836,80 @@ mod tests {
 
     /// The request mask covers what the mapping reads, and nothing the mapping
     /// drops.
+    /// PMS-1356: one way, enforced in source rather than promised in a doc.
+    ///
+    /// `oauth::tests::the_scopes_are_read_only` pins the PERMISSION and this pins
+    /// the BEHAVIOUR, which are two different things: two-way is a planned option
+    /// (PMS-1356 sequenced it after one-way, and PMS-1340's ladder is the kind of
+    /// change that widens a scope set for an unrelated reason), and the way it
+    /// arrives by accident is one mutating call added here while somebody is
+    /// looking at something else. So this module's own text is read back: every
+    /// request it makes is a GET, and no People API write is named anywhere in the
+    /// contact-sync module.
+    ///
+    /// The needles are assembled from pieces, because a scan whose literal sits
+    /// in its own source matches itself and passes forever. `oauth` is not
+    /// scanned for verbs: its POST is the token exchange, which is the OAuth
+    /// protocol rather than a contacts write.
+    #[test]
+    fn this_module_never_writes_to_google() {
+        const SELF: &str = include_str!("google.rs");
+        for verb in ["post", "put", "patch", "delete"] {
+            let needle = format!(".{verb}(");
+            assert!(
+                !SELF.contains(&needle),
+                "{needle} makes this integration two-way; it reads with GET only"
+            );
+        }
+        assert!(
+            SELF.contains(&format!(".{}(", "get")),
+            "the scan is reading the wrong text if this module makes no GET"
+        );
+        assert!(
+            SELF.contains("https://people.googleapis.com"),
+            "the scan is reading the wrong text if this module does not name the People API"
+        );
+
+        // Every file in the module, because a write could be added beside the
+        // service rather than here, and a People API mutation has to name its
+        // endpoint wherever it is built.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules/contact_sync");
+        let mut scanned = 0;
+        for entry in std::fs::read_dir(&dir).expect("read the contact_sync module") {
+            let path = entry.expect("read a directory entry").path();
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let lowered = std::fs::read_to_string(&path)
+                .expect("read a module file")
+                .to_lowercase();
+            scanned += 1;
+            for op in ["create", "update", "delete", "batchupdate", "batchdelete"] {
+                // The People API joins its write method to the collection with
+                // a colon (the method names being `createContact`,
+                // `updateContact` and the batch forms), so that colon is the
+                // marker, and it is written this way round here because a scan
+                // whose own comment spells the needle matches itself. A
+                // DOUBLE colon is a Rust path, which is Mokosh's own
+                // `CreateContactRequest` in `sync`, and that is the local DTO
+                // this integration writes contacts THROUGH rather than a request
+                // to Google.
+                let needle = format!(":{op}contact");
+                let mut from = 0;
+                while let Some(offset) = lowered[from..].find(&needle) {
+                    let at = from + offset;
+                    assert!(
+                        at > 0 && lowered.as_bytes()[at - 1] == b':',
+                        "{} names a People API write ({needle})",
+                        path.display()
+                    );
+                    from = at + needle.len();
+                }
+            }
+        }
+        assert!(scanned > 10, "only {scanned} files scanned");
+    }
+
     #[test]
     fn the_field_mask_is_the_mapping_table() {
         for needed in [
