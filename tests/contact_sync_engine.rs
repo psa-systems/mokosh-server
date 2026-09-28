@@ -554,6 +554,179 @@ async fn nothing_is_imported_before_a_label_is_chosen(pool: PgPool) {
     assert_eq!(f.scalar::<i64>("SELECT count(*) FROM contacts").await, 0);
 }
 
+/// PMS-1216 phase 10: the awkward account, driven through the real engine.
+///
+/// The ticket asks for verification against a real Google account holding
+/// deliberately awkward data, "not fixtures alone", and that half needs a person
+/// with an account and a browser. This is the half that does not: every SHAPE the
+/// ticket names in one account, through `ContactSyncEngine::run` against the
+/// RLS-bound app role, asserting what lands in `contacts` rather than what the
+/// mapper returned.
+///
+/// The mapper's own tests already cover "Björk" and "王小明" as pure functions
+/// (`contact_sync::mapping`), which is why this is not a second copy of them: what
+/// is unpinned is whether such a record survives the whole path, where
+/// `contacts.first_name` and `last_name` are `NOT NULL`, the matcher builds keys
+/// from names, and the audit and link rows are written per record. A run is where
+/// an empty `last_name` or a non-ASCII key would actually fail.
+///
+/// Anything that fails here would have failed against the real account too, so
+/// the manual pass starts from a known-good baseline instead of debugging the
+/// parser through a consent screen.
+#[mokosh_test]
+async fn the_awkward_account_imports_through_the_engine(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+
+    // A Mokosh contact the twin records below should both resolve to.
+    let existing = f
+        .contact("Ada", "Lovelace", Some("ada@acme.example"), None)
+        .await;
+
+    // Several emails and several phones, primary first in each list, which is
+    // how every source says "primary" here.
+    let mut many = person("people/many", "e1", "Grace", "Hopper");
+    many.emails = vec!["grace@work.example".into(), "grace@home.example".into()];
+    many.phones = vec![
+        SourcePhone {
+            number: "(415) 555-0100".into(),
+            canonical: Some("+14155550100".into()),
+            label: Some("work".into()),
+            is_primary: true,
+        },
+        SourcePhone {
+            number: "+44 20 7946 0000".into(),
+            canonical: Some("+442079460000".into()),
+            label: Some("mobile".into()),
+            is_primary: false,
+        },
+    ];
+
+    // No email at all: nothing to match on by address, so it is a create.
+    let mut no_email = person("people/no-email", "e1", "Nomail", "Person");
+    no_email.emails = vec![];
+
+    // A single name. `contacts.first_name` is NOT NULL and `last_name` is too,
+    // so the whole name goes in the first and the last is empty rather than a
+    // guess being split out of it.
+    let mut single = person("people/single", "e1", "Prince", "");
+    single.given_name = Some("Prince".into());
+    single.family_name = None;
+    single.display_name = Some("Prince".into());
+    single.emails = vec!["prince@paisley.example".into()];
+
+    // A non-Latin script name, which has to survive the key building and the
+    // column, not only the mapper.
+    let mut cjk = person("people/cjk", "e1", "", "");
+    cjk.given_name = None;
+    cjk.family_name = None;
+    cjk.display_name = Some("王小明".into());
+    cjk.emails = vec!["wang@example.cn".into()];
+
+    // Two records for one Mokosh contact: the exact address links, and the
+    // second record carrying the same address is a question rather than a
+    // second contact.
+    let mut twin_a = person("people/twin-a", "e1", "Ada", "Lovelace");
+    twin_a.emails = vec!["ada@acme.example".into()];
+    let mut twin_b = person("people/twin-b", "e1", "A.", "Lovelace");
+    twin_b.emails = vec!["ada@acme.example".into()];
+
+    // Outside every group: not in the selection, so not imported at all.
+    let mut ungrouped = person("people/ungrouped", "e1", "Not", "Selected");
+    ungrouped.group_ids = vec![];
+    ungrouped.emails = vec!["nobody@elsewhere.example".into()];
+
+    let account = vec![many, no_email, single, cjk, twin_a, twin_b, ungrouped];
+    let source = FakeSource::new(vec![read(account.clone(), "t1", false)]);
+    let report = f.sync(&source).await.expect("the awkward account imports");
+
+    assert_eq!(
+        (report.not_selected, report.failed, report.total),
+        (1, 0, 7),
+        "the ungrouped record is skipped and nothing fails: {report:?}"
+    );
+    assert_eq!(
+        report.created + report.linked + report.queued,
+        6,
+        "every selected record is accounted for: {report:?}"
+    );
+
+    // The single name kept whole, in the column that is NOT NULL.
+    let (first, last): (String, String) = sqlx::query_as(
+        "SELECT first_name, last_name FROM contacts c          JOIN contact_sync_links l ON l.contact_id = c.id          WHERE l.external_id = $1",
+    )
+    .bind("people/single")
+    .fetch_one(&f.pool)
+    .await
+    .expect("the single-name contact landed");
+    assert_eq!(
+        (first.as_str(), last.as_str()),
+        ("Prince", ""),
+        "a single name is kept whole rather than split by a guess"
+    );
+
+    // The non-Latin name, byte for byte, after a round trip through the keys,
+    // the column and Postgres' own collation.
+    let cjk_first: String = sqlx::query_scalar(
+        "SELECT c.first_name FROM contacts c          JOIN contact_sync_links l ON l.contact_id = c.id          WHERE l.external_id = $1",
+    )
+    .bind("people/cjk")
+    .fetch_one(&f.pool)
+    .await
+    .expect("the non-Latin contact landed");
+    assert_eq!(cjk_first, "王小明");
+
+    // Several phones: both numbers are kept, the primary one first.
+    let phones: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT p.number, p.is_primary FROM contact_phones p          JOIN contact_sync_links l ON l.contact_id = p.contact_id          WHERE l.external_id = $1 ORDER BY p.is_primary DESC, p.number",
+    )
+    .bind("people/many")
+    .fetch_all(&f.pool)
+    .await
+    .expect("read the phones");
+    assert_eq!(phones.len(), 2, "both numbers survive: {phones:?}");
+    assert!(phones[0].1, "the primary number is the primary row");
+
+    // One contact, not two, for the twin records: the first linked and the
+    // second became a question.
+    assert_eq!(f.link_contact("people/twin-a").await, existing);
+    let twin_b_open: i64 = f
+        .scalar(
+            "SELECT count(*) FROM contact_sync_candidates              WHERE external_id = 'people/twin-b' AND status = 'open'",
+        )
+        .await;
+    assert_eq!(
+        twin_b_open, 1,
+        "the second record is asked about, not merged"
+    );
+    assert_eq!(
+        f.scalar::<i64>("SELECT count(*) FROM contacts WHERE email = 'ada@acme.example'")
+            .await,
+        1,
+        "two records for one address must not become two contacts"
+    );
+
+    // Nothing was imported for the record outside every group.
+    assert_eq!(
+        f.scalar::<i64>(
+            "SELECT count(*) FROM contact_sync_links WHERE external_id = 'people/ungrouped'"
+        )
+        .await,
+        0
+    );
+
+    // The second run changes nothing, which is the ticket's own "same sync
+    // twice" run and the property every awkward shape above has to preserve.
+    let before = f.state().await;
+    source.push(read(account, "t2", false));
+    let second = f.sync(&source).await.expect("second sync");
+    assert_eq!(
+        (second.created, second.linked, second.queued, second.failed),
+        (0, 0, 0, 0),
+        "a second run of the awkward account changes nothing: {second:?}"
+    );
+    assert_eq!(before, f.state().await, "no row moved on the second run");
+}
+
 /// PMS-1358: the label filter is re-applied on every sync, and a contact that
 /// LEAVES the selected label is kept rather than deleted.
 ///
