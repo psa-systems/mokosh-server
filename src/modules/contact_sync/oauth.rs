@@ -47,11 +47,30 @@ const USERINFO_ENDPOINT: &str = "https://openidconnect.googleapis.com/v1/userinf
 /// book is feeding the CRM before they disconnect it (PSA-70 J and K).
 /// Verified against Google's `people.get` reference: `contacts.readonly` alone
 /// cannot read the authenticated account's own `emailAddresses`.
-pub const SCOPES: &[&str] = &[
-    "https://www.googleapis.com/auth/contacts.readonly",
-    "openid",
-    "email",
-];
+pub const SCOPES: &[&str] = &[CONTACTS_READONLY, "openid", "email"];
+
+/// The one scope that actually reads an address book.
+///
+/// Named, because it is asked for in [`SCOPES`] and checked again in what came
+/// BACK (see [`grants_contacts_read`]): Google's consent screen lets a person
+/// untick an individual permission, so a successful exchange is not a granted
+/// scope.
+pub const CONTACTS_READONLY: &str = "https://www.googleapis.com/auth/contacts.readonly";
+
+/// Whether a granted scope string covers reading contacts (PMS-1356).
+///
+/// The token response's `scope` is space-delimited and unordered, so it is
+/// split rather than compared. The read-WRITE `.../auth/contacts` counts as
+/// covering it, because it does: a person who granted more than was asked for
+/// has not withheld the read, and what keeps this integration one-way is that
+/// no code path writes (`google::tests::this_module_never_writes_to_google`),
+/// not that the grant is narrow. Refusing a superset here would reject a
+/// working connection over a permission nothing uses.
+pub fn grants_contacts_read(granted: &str) -> bool {
+    granted.split_whitespace().any(|scope| {
+        scope == CONTACTS_READONLY || scope == "https://www.googleapis.com/auth/contacts"
+    })
+}
 
 /// The deployment's OAuth client, absent when unconfigured.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +315,33 @@ pub async fn account_email(http: &reqwest::Client, access_token: &str) -> AppRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PMS-1356: what came back is checked, not assumed.
+    ///
+    /// Google's consent screen lets a person untick an individual permission and
+    /// still finish the flow, so the exchange succeeds, a refresh token is
+    /// stored, and the connection looks healthy until the first sync 403s. The
+    /// read-write scope counts as covering the read because it does; what keeps
+    /// this integration one-way is that nothing writes.
+    #[test]
+    fn a_granted_scope_without_contacts_does_not_read_contacts() {
+        assert!(grants_contacts_read(
+            "openid email https://www.googleapis.com/auth/contacts.readonly"
+        ));
+        assert!(
+            grants_contacts_read("https://www.googleapis.com/auth/contacts"),
+            "the read-write scope covers the read"
+        );
+        assert!(
+            !grants_contacts_read("openid email"),
+            "the contacts permission was unticked on the consent screen"
+        );
+        assert!(!grants_contacts_read(""));
+        assert!(
+            !grants_contacts_read("https://www.googleapis.com/auth/contacts.other.readonly"),
+            "a scope that merely starts the same way is a different scope"
+        );
+    }
 
     /// The scope set is the whole permission surface, so it is pinned rather
     /// than trusted: a write scope added here is a bug that reaches somebody's
