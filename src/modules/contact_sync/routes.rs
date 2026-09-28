@@ -81,6 +81,14 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
             "/integrations/contact-sync/google/client",
             get(get_client).put(put_client),
         )
+        .route(
+            "/integrations/contact-sync/icloud/connect",
+            post(connect_icloud),
+        )
+        .route(
+            "/integrations/contact-sync/icloud/disconnect",
+            post(disconnect_icloud),
+        )
         .route("/integrations/contact-sync/selection", put(set_selection))
         .route("/integrations/contact-sync/preview", post(preview))
         .route(
@@ -267,6 +275,56 @@ impl ProviderQuery {
 struct PreviewRequest {
     #[serde(default)]
     group_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IcloudConnectRequest {
+    apple_id: String,
+    app_password: String,
+}
+
+/// Connect an iCloud account (PMS-1409). Admin, like Google's authorize.
+///
+/// The credential is in the body of an authenticated request rather than behind a
+/// redirect, because Apple has no consent screen for contacts. `app_password` is
+/// in `SECRET_FIELD_NAMES`' company by name, so the PMS-924 body sanitizer leaves
+/// it byte-identical: an app-specific password is compared elsewhere and a
+/// rewritten one is a refusal nobody can place.
+async fn connect_icloud(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<IcloudConnectRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let outcome = state
+        .service
+        .connect_icloud(
+            user.tenant(),
+            user.id,
+            &request.apple_id,
+            &request.app_password,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({
+        "connection_id": match outcome {
+            super::service::ConnectOutcome::Connected(id) => id,
+            super::service::ConnectOutcome::Reconnected(id) => id,
+        },
+        "reconnected": matches!(outcome, super::service::ConnectOutcome::Reconnected(_)),
+    })))
+}
+
+async fn disconnect_icloud(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .disconnect(user.tenant(), "icloud", &ctx)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST because it reads the tenant's whole Google account on the grant,

@@ -715,6 +715,65 @@ impl ContactSyncService {
         Ok(ConnectOutcome::Connected(connection_id))
     }
 
+    /// Connect an iCloud account with an Apple ID and an app-specific password
+    /// (PMS-1409).
+    ///
+    /// No redirect and no state row, because there is no consent screen: Apple
+    /// publishes no OAuth scope for contacts, so the credential arrives in one
+    /// authenticated request from an admin who is already signed in. That is why
+    /// this is a route and `complete_connect` is a callback, and why the state
+    /// token that makes the Google flow safe has no counterpart here.
+    ///
+    /// The credential is VERIFIED before anything is stored, by doing the CardDAV
+    /// discovery once. A stored password that does not work is a connection that
+    /// reads healthy until the first run fails, and the failure then arrives
+    /// hours later as a sync error rather than immediately as a typo. What comes
+    /// back is deliberately mapped by shape: a refused credential is the admin's
+    /// to fix and says so in Apple's terms, a throttle is Apple asking us to wait
+    /// and is not a wrong password, and anything else is this codebase's own
+    /// words rather than the server's.
+    pub async fn connect_icloud(
+        &self,
+        tenant_id: TenantId,
+        started_by: Uuid,
+        apple_id: &str,
+        app_password: &str,
+    ) -> AppResult<ConnectOutcome> {
+        self.assert_enabled(tenant_id, ICLOUD).await?;
+        let apple_id = apple_id.trim();
+        let app_password = app_password.trim();
+        crate::utils::validation::validate_email(apple_id).map_err(|_| {
+            AppError::validation_field("apple_id", "must be the Apple ID's email address")
+        })?;
+        if app_password.is_empty() {
+            return Err(AppError::validation_field(
+                "app_password",
+                "must be an app-specific password from appleid.apple.com",
+            ));
+        }
+
+        let client = CardDavClient::new(
+            self.http.clone(),
+            self.carddav_base_url.clone(),
+            apple_id,
+            app_password,
+        );
+        client.address_book().await.map_err(|e| match e {
+            SourceError::Unauthorized => AppError::BadRequest(
+                "Apple refused that Apple ID and app-specific password. Check the Apple ID, and generate a new app-specific password at appleid.apple.com if this one has been revoked."
+                    .to_string(),
+            ),
+            SourceError::Throttled => AppError::Conflict(
+                "Apple is asking us to wait before checking this account again. Try connecting in a few minutes."
+                    .to_string(),
+            ),
+            SourceError::Failed(message) => AppError::BadRequest(message),
+        })?;
+
+        self.record_connection(tenant_id, started_by, ICLOUD, apple_id, app_password)
+            .await
+    }
+
     /// Where to send a browser whose callback failed. The reason is a shape,
     /// never the provider's text: this lands in a URL bar and a browser
     /// history.
