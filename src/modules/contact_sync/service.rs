@@ -11,8 +11,11 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
+use super::carddav::{self, CardDavClient};
 use super::google::GoogleContactsProvider;
+use super::icloud::{ICloudProvider, ICLOUD};
 use super::oauth::{self, OauthClient, Pkce, TokenError};
+use super::provider::{words, ContactSyncProvider, SourceError, UNGROUPED_ID};
 use super::runs::{RunStatus, RUN_COLUMNS};
 use super::sync::{external_id_digest, fields, ContactSyncEngine, ImportPreview, SyncReport};
 use crate::db::Database;
@@ -54,6 +57,11 @@ pub struct ContactSyncService {
     /// card still attached on the provider. `None` in fixtures that never
     /// seed a payment method before removing imported data.
     payment_methods: Option<Arc<crate::modules::contact_portal::PaymentMethodsService>>,
+    /// Where the CardDAV client points (PMS-1409). A field rather than the
+    /// constant at the call site, for the reason `GoogleContactsProvider`
+    /// takes `with_base_url`: verifying an app-specific password is a real
+    /// request, so a suite that drives the connect has to be able to answer it.
+    carddav_base_url: String,
 }
 
 /// The in-flight connect, as migration 221 stores it.
@@ -192,6 +200,15 @@ pub struct ContactSyncOverview {
     /// The caller may set the deployment's OAuth client (PMS-1264): an admin
     /// of the system tenant. Filled by the route, which knows the caller.
     pub client_editable: bool,
+    /// `integrations/icloud_contacts_enabled` (PMS-1341), the iCloud half of
+    /// `enabled`.
+    pub icloud_enabled: bool,
+    /// The iCloud connection, `null` when there is none (PMS-1409).
+    ///
+    /// Beside `connection` rather than replacing it with a list, because the
+    /// existing client reads `connection` and a tenant holding both is the point:
+    /// two cards, two credentials, two selections, one response.
+    pub icloud_connection: Option<ConnectionStatus>,
 }
 
 /// What one connection looks like to the Settings card.
@@ -362,7 +379,16 @@ impl ContactSyncService {
             public_api_base,
             spa_base_url,
             payment_methods: None,
+            carddav_base_url: carddav::ICLOUD_BASE_URL.to_string(),
         }
+    }
+
+    /// Point the CardDAV client somewhere else (PMS-1409). For the suite that
+    /// drives `connect_icloud` against a local server; production leaves it on
+    /// `carddav::ICLOUD_BASE_URL`.
+    pub fn with_carddav_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.carddav_base_url = base_url.into();
+        self
     }
 
     /// Attach the payment-methods service so `remove_imported_data`'s
@@ -407,7 +433,7 @@ impl ContactSyncService {
     /// URL Google will reject: an operator who has not set the client sees
     /// that, not a Google error page.
     pub async fn begin_connect(&self, tenant_id: TenantId, user_id: Uuid) -> AppResult<String> {
-        self.assert_enabled(tenant_id).await?;
+        self.assert_enabled(tenant_id, GOOGLE).await?;
         let client = self.require_oauth_client(tenant_id).await?;
         let redirect_uri = self.redirect_uri()?;
         let pkce = Pkce::generate();
@@ -557,7 +583,13 @@ impl ContactSyncService {
         let account_email = oauth::account_email(&self.http, &tokens.access_token).await?;
 
         let outcome = self
-            .record_connection(tenant_id, started_by, &account_email, &refresh_token)
+            .record_connection(
+                tenant_id,
+                started_by,
+                GOOGLE,
+                &account_email,
+                &refresh_token,
+            )
             .await?;
         let flag = match outcome {
             ConnectOutcome::Connected(_) => "connected",
@@ -582,28 +614,37 @@ impl ContactSyncService {
     /// attribute one address book's contacts to another.
     ///
     /// Public so the suite can drive it without Google's token endpoint; the
-    /// only production caller is [`Self::complete_connect`], after the state
-    /// was verified and consumed.
+    /// production callers are [`Self::complete_connect`] and
+    /// [`Self::connect_icloud`], each after its own credential was verified.
+    ///
+    /// By provider since PMS-1409. The rules above are the same for both and the
+    /// credential is opaque here - a Google refresh token or an Apple
+    /// app-specific password - so what differs is which row is looked for and
+    /// which words a refusal uses. A second copy of this for iCloud would have
+    /// been a second place for the reconnect-keeps-the-connection rule to be
+    /// got wrong.
     pub async fn record_connection(
         &self,
         tenant_id: TenantId,
         started_by: Uuid,
+        provider: &str,
         account_email: &str,
-        refresh_token: &str,
+        credential: &str,
     ) -> AppResult<ConnectOutcome> {
         let tenant_uuid = tenant_id.get();
         let ctx = AuditCtx::system(tenant_uuid);
-        if let Some(existing) = self.connection(tenant_id).await? {
+        let words = words(provider);
+        if let Some(existing) = self.connection(tenant_id, provider).await? {
             if !existing.account_email.eq_ignore_ascii_case(account_email) {
                 return Err(AppError::Conflict(format!(
-                    "This organization is connected to {}. Disconnect it before connecting a different Google account.",
-                    existing.account_email
+                    "This organization is connected to {}. Disconnect it before connecting a different {}.",
+                    existing.account_email, words.account
                 )));
             }
             self.secrets
                 .put(
                     &SecretKey::contact_sync(tenant_uuid, &existing.provider, existing.id),
-                    refresh_token,
+                    credential,
                 )
                 .await?;
             let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -645,8 +686,8 @@ impl ContactSyncService {
         let connection_id = Uuid::new_v4();
         self.secrets
             .put(
-                &SecretKey::contact_sync(tenant_uuid, GOOGLE, connection_id),
-                refresh_token,
+                &SecretKey::contact_sync(tenant_uuid, provider, connection_id),
+                credential,
             )
             .await?;
 
@@ -658,7 +699,7 @@ impl ContactSyncService {
         )
         .bind(connection_id)
         .bind(tenant_id)
-        .bind(GOOGLE)
+        .bind(provider)
         .bind(started_by)
         .bind(account_email)
         .execute(&mut *tx)
@@ -667,10 +708,10 @@ impl ContactSyncService {
             |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
                 // The live-connection index (migration 220) is the org-level
                 // rule; reaching it here means a connect raced this one.
-                Some("23505") => AppError::Conflict(
-                    "This tenant already has a Google Contacts connection. Disconnect it first."
-                        .to_string(),
-                ),
+                Some("23505") => AppError::Conflict(format!(
+                    "This tenant already has a {} connection. Disconnect it first.",
+                    words.name
+                )),
                 _ => e.into(),
             },
         )?;
@@ -684,7 +725,7 @@ impl ContactSyncService {
             None,
             Some(serde_json::json!({
                 "event": "contact_sync.connected",
-                "provider": GOOGLE,
+                "provider": provider,
                 "account_email": account_email,
                 "connected_by_user_id": started_by,
             })),
@@ -692,6 +733,65 @@ impl ContactSyncService {
         .await?;
         tx.commit().await?;
         Ok(ConnectOutcome::Connected(connection_id))
+    }
+
+    /// Connect an iCloud account with an Apple ID and an app-specific password
+    /// (PMS-1409).
+    ///
+    /// No redirect and no state row, because there is no consent screen: Apple
+    /// publishes no OAuth scope for contacts, so the credential arrives in one
+    /// authenticated request from an admin who is already signed in. That is why
+    /// this is a route and `complete_connect` is a callback, and why the state
+    /// token that makes the Google flow safe has no counterpart here.
+    ///
+    /// The credential is VERIFIED before anything is stored, by doing the CardDAV
+    /// discovery once. A stored password that does not work is a connection that
+    /// reads healthy until the first run fails, and the failure then arrives
+    /// hours later as a sync error rather than immediately as a typo. What comes
+    /// back is deliberately mapped by shape: a refused credential is the admin's
+    /// to fix and says so in Apple's terms, a throttle is Apple asking us to wait
+    /// and is not a wrong password, and anything else is this codebase's own
+    /// words rather than the server's.
+    pub async fn connect_icloud(
+        &self,
+        tenant_id: TenantId,
+        started_by: Uuid,
+        apple_id: &str,
+        app_password: &str,
+    ) -> AppResult<ConnectOutcome> {
+        self.assert_enabled(tenant_id, ICLOUD).await?;
+        let apple_id = apple_id.trim();
+        let app_password = app_password.trim();
+        crate::utils::validation::validate_email(apple_id).map_err(|_| {
+            AppError::validation_field("apple_id", "must be the Apple ID's email address")
+        })?;
+        if app_password.is_empty() {
+            return Err(AppError::validation_field(
+                "app_password",
+                "must be an app-specific password from appleid.apple.com",
+            ));
+        }
+
+        let client = CardDavClient::new(
+            self.http.clone(),
+            self.carddav_base_url.clone(),
+            apple_id,
+            app_password,
+        );
+        client.address_book().await.map_err(|e| match e {
+            SourceError::Unauthorized => AppError::BadRequest(
+                "Apple refused that Apple ID and app-specific password. Check the Apple ID, and generate a new app-specific password at appleid.apple.com if this one has been revoked."
+                    .to_string(),
+            ),
+            SourceError::Throttled => AppError::Conflict(
+                "Apple is asking us to wait before checking this account again. Try connecting in a few minutes."
+                    .to_string(),
+            ),
+            SourceError::Failed(message) => AppError::BadRequest(message),
+        })?;
+
+        self.record_connection(tenant_id, started_by, ICLOUD, apple_id, app_password)
+            .await
     }
 
     /// Where to send a browser whose callback failed. The reason is a shape,
@@ -712,8 +812,13 @@ impl ContactSyncService {
             enabled: crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id)
                 .await?,
             configured: self.oauth_client(tenant_id).await?.is_some(),
-            connection: self.connection(tenant_id).await?,
+            connection: self.connection(tenant_id, GOOGLE).await?,
             client_editable: false,
+            icloud_enabled: crate::modules::settings::read_icloud_contacts_enabled(
+                &self.db, tenant_id,
+            )
+            .await?,
+            icloud_connection: self.connection(tenant_id, ICLOUD).await?,
         })
     }
 
@@ -988,23 +1093,38 @@ impl ContactSyncService {
     /// Refuse while `integrations/google_contacts_enabled` is off (PSA-70 K).
     /// A 409 naming the setting, because the request is fine and the tenant's
     /// state is what stands in the way.
-    pub async fn assert_enabled(&self, tenant_id: TenantId) -> AppResult<()> {
-        if crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await? {
+    pub async fn assert_enabled(&self, tenant_id: TenantId, provider: &str) -> AppResult<()> {
+        // PMS-1409: each integration has its own switch (PMS-1341), so this asks
+        // the one the caller is actually using. Reading Google's flag for an
+        // iCloud request would have made one integration turn the other off.
+        let on = if provider == ICLOUD {
+            crate::modules::settings::read_icloud_contacts_enabled(&self.db, tenant_id).await?
+        } else {
+            crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
+        };
+        if on {
             Ok(())
         } else {
-            Err(AppError::Conflict(
-                "Google Contacts is turned off for this organization. An administrator can turn it back on in Settings, Integrations."
-                    .to_string(),
-            ))
+            Err(AppError::Conflict(format!(
+                "{} is turned off for this organization. An administrator can turn it back on in Settings, Integrations.",
+                words(provider).name
+            )))
         }
     }
 
-    /// The tenant's live Google connection, if any.
+    /// The tenant's live connection to one provider, if any.
     ///
-    /// Google by name: since PMS-1290 a tenant also has a `vcard` source row
-    /// for uploaded files, and every caller of this - the Settings card, the
-    /// connect and disconnect, the label selection - means the account.
-    pub async fn connection(&self, tenant_id: TenantId) -> AppResult<Option<ConnectionStatus>> {
+    /// By provider and not "the connection": since PMS-1290 a tenant also has a
+    /// `vcard` source row for uploaded files, which none of these callers mean,
+    /// and since PMS-1341 it can hold an iCloud account as well as a Google one.
+    /// The schema has allowed that since migration 220 - `idx_contact_sync_
+    /// connections_live` is unique on `(tenant_id, provider)` - and this method
+    /// filtering on `google` was the only reason a tenant could not.
+    pub async fn connection(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+    ) -> AppResult<Option<ConnectionStatus>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<ConnectionRow> = sqlx::query_as(
             "SELECT c.id, c.provider, c.account_email, c.is_active, c.sync_status, c.last_sync_at, \
@@ -1019,7 +1139,7 @@ impl ContactSyncService {
              WHERE c.tenant_id = $1 AND c.provider = $2 AND c.disconnected_at IS NULL",
         )
         .bind(tenant_id)
-        .bind(GOOGLE)
+        .bind(provider)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
@@ -1047,9 +1167,17 @@ impl ContactSyncService {
     /// contacts local records: nothing syncs into them again, nothing about
     /// them is deleted, and the link row still names the provider and account
     /// they came from.
-    pub async fn disconnect(&self, tenant_id: TenantId, ctx: &AuditCtx) -> AppResult<()> {
-        let Some(connection) = self.connection(tenant_id).await? else {
-            return Err(AppError::NotFound("Google Contacts connection".to_string()));
+    pub async fn disconnect(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        let Some(connection) = self.connection(tenant_id, provider).await? else {
+            return Err(AppError::NotFound(format!(
+                "{} connection",
+                words(provider).name
+            )));
         };
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
@@ -1127,36 +1255,55 @@ impl ContactSyncService {
 
     /// The live connection's id and provider, or the NotFound every caller
     /// below would otherwise spell out.
-    async fn live_connection(&self, tenant_id: TenantId) -> AppResult<ConnectionStatus> {
-        self.connection(tenant_id)
+    async fn live_connection(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+    ) -> AppResult<ConnectionStatus> {
+        self.connection(tenant_id, provider)
             .await?
-            .ok_or_else(|| AppError::NotFound("Google Contacts connection".to_string()))
+            .ok_or_else(|| AppError::NotFound(format!("{} connection", words(provider).name)))
     }
 
-    /// A provider for the live connection, holding a freshly refreshed token.
-    /// Refused while the integration is turned off: a read of the tenant's
-    /// Google account is exactly what the switch exists to stop.
+    /// A provider for the live connection, holding whatever credential that
+    /// provider needs right now. Refused while the integration is turned off: a
+    /// read of the tenant's address book is exactly what the switch stops.
+    ///
+    /// Boxed since PMS-1409, because there are two. The alternative, a second
+    /// `icloud_source`, would mean every caller choosing which to call, and the
+    /// caller is a route that was handed a provider name.
     async fn source(
         &self,
         tenant_id: TenantId,
-    ) -> AppResult<(ConnectionStatus, GoogleContactsProvider)> {
-        self.assert_enabled(tenant_id).await?;
-        let connection = self.live_connection(tenant_id).await?;
+        provider: &str,
+    ) -> AppResult<(ConnectionStatus, Box<dyn ContactSyncProvider>)> {
+        self.assert_enabled(tenant_id, provider).await?;
+        let connection = self.live_connection(tenant_id, provider).await?;
+        if provider == ICLOUD {
+            let (apple_id, app_password) = self.icloud_credential(tenant_id, connection.id).await?;
+            let client = CardDavClient::new(
+                self.http.clone(),
+                self.carddav_base_url.clone(),
+                apple_id,
+                app_password,
+            );
+            return Ok((connection, Box::new(ICloudProvider::new(client))));
+        }
         let token = self
             .access_token(tenant_id, connection.id, &connection.provider)
             .await?;
         Ok((
             connection,
-            GoogleContactsProvider::new(self.http.clone(), token),
+            Box::new(GoogleContactsProvider::new(self.http.clone(), token)),
         ))
     }
 
     /// Run one sync of the tenant's live connection now (PMS-1213). The
     /// scheduled worker and the run rows that make it resumable are PMS-1215.
-    pub async fn sync_now(&self, tenant_id: TenantId) -> AppResult<SyncReport> {
-        let (connection, source) = self.source(tenant_id).await?;
+    pub async fn sync_now(&self, tenant_id: TenantId, provider: &str) -> AppResult<SyncReport> {
+        let (connection, source) = self.source(tenant_id, provider).await?;
         ContactSyncEngine::new(self.db.clone())
-            .run(tenant_id, connection.id, &source)
+            .run(tenant_id, connection.id, source.as_ref())
             .await
     }
 
@@ -1166,22 +1313,33 @@ impl ContactSyncService {
     pub async fn preview(
         &self,
         tenant_id: TenantId,
+        provider: &str,
         group_ids: Option<&[String]>,
     ) -> AppResult<ImportPreview> {
-        let (connection, source) = self.source(tenant_id).await?;
+        let (connection, source) = self.source(tenant_id, provider).await?;
         let selection: Option<std::collections::BTreeSet<String>> =
             group_ids.map(|ids| ids.iter().map(|g| g.trim().to_string()).collect());
         ContactSyncEngine::new(self.db.clone())
-            .preview(tenant_id, connection.id, &source, selection.as_ref())
+            .preview(
+                tenant_id,
+                connection.id,
+                source.as_ref(),
+                selection.as_ref(),
+            )
             .await
     }
 
-    /// Replace the label selection. An empty list stops imports without
-    /// disconnecting. The ids are checked for shape, not against Google: an
-    /// id that names no label selects nobody, which is what it means.
+    /// Replace the group selection. An empty list stops imports without
+    /// disconnecting. The ids are checked for shape, not against the provider: an
+    /// id that names no group selects nobody, which is what it means.
+    ///
+    /// The shape is the PROVIDER's, which is what PMS-1409 had to fix: Google's
+    /// ids are `contactGroups/...` and an iCloud group is a vCard `UID`, so the
+    /// prefix check refused every id the iCloud picker could ever offer.
     pub async fn set_selection(
         &self,
         tenant_id: TenantId,
+        provider: &str,
         group_ids: &[String],
         ctx: &AuditCtx,
     ) -> AppResult<ConnectionStatus> {
@@ -1189,17 +1347,16 @@ impl ContactSyncService {
         let mut ids: Vec<String> = group_ids.iter().map(|g| g.trim().to_string()).collect();
         ids.sort();
         ids.dedup();
-        if ids.len() > MAX_GROUPS
-            || ids
-                .iter()
-                .any(|g| !g.starts_with("contactGroups/") || g.len() > 255)
-        {
+        if ids.len() > MAX_GROUPS || !ids.iter().all(|id| group_id_is_shaped(provider, id)) {
             return Err(AppError::validation_field(
                 "group_ids",
-                "must be Google label ids such as contactGroups/myContacts, at most 200",
+                format!(
+                    "must be {} ids, at most {MAX_GROUPS}",
+                    words(provider).group
+                ),
             ));
         }
-        let connection = self.live_connection(tenant_id).await?;
+        let connection = self.live_connection(tenant_id, provider).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE contact_sync_connections SET selected_groups = $3, updated_at = NOW() \
@@ -1225,23 +1382,30 @@ impl ContactSyncService {
         )
         .await?;
         tx.commit().await?;
-        self.live_connection(tenant_id).await
+        self.live_connection(tenant_id, provider).await
     }
 
     /// Queue an import now. The first one after connecting is `initial`.
-    pub async fn queue_run(&self, tenant_id: TenantId, ctx: &AuditCtx) -> AppResult<RunStatus> {
-        self.assert_enabled(tenant_id).await?;
-        let connection = self.live_connection(tenant_id).await?;
+    pub async fn queue_run(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+        ctx: &AuditCtx,
+    ) -> AppResult<RunStatus> {
+        self.assert_enabled(tenant_id, provider).await?;
+        let connection = self.live_connection(tenant_id, provider).await?;
+        let words = words(provider);
         if connection.selected_groups.is_empty() {
-            return Err(AppError::Conflict(
-                "Choose at least one Google label to import before syncing.".to_string(),
-            ));
+            return Err(AppError::Conflict(format!(
+                "Choose at least one {} to import before syncing.",
+                words.group
+            )));
         }
         if connection.sync_status == "reconnect_required" {
-            return Err(AppError::Conflict(
-                "Google has revoked this connection. Connect the account again before importing."
-                    .to_string(),
-            ));
+            return Err(AppError::Conflict(format!(
+                "{} before importing.",
+                words.credential_gone
+            )));
         }
         let trigger = if connection.last_sync_at.is_none() {
             "initial"
@@ -1448,13 +1612,17 @@ impl ContactSyncService {
             .await
         {
             Err(AppError::NotFound(what)) => {
-                self.assert_enabled(tenant_id).await?;
+                // PMS-1409: the queue spans every live source, and a reviewer
+                // answering an item does not name a provider, so the switch that
+                // could explain an item having vanished is Google's - the only
+                // one an answer can be refused by here.
+                self.assert_enabled(tenant_id, GOOGLE).await?;
                 return Err(AppError::NotFound(what));
             }
             other => other?,
         };
-        if connection.provider == GOOGLE {
-            self.assert_enabled(tenant_id).await?;
+        if connection.provider != super::file_import::VCARD {
+            self.assert_enabled(tenant_id, &connection.provider).await?;
         }
         let engine = ContactSyncEngine::new(self.db.clone());
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -2013,6 +2181,29 @@ impl ContactSyncService {
                 "could not record the revoked grant: {e}"
             );
         }
+    }
+}
+
+/// Whether an id could be one of this provider's group ids (PMS-1409).
+///
+/// Shape only, never a lookup: an id that names no group selects nobody, which is
+/// what it means. Google's ids are `contactGroups/<id>` and the check is
+/// unchanged for them, because it is what every stored selection was written
+/// against. An iCloud group is a vCard `UID`, which the spec leaves as free text
+/// and Contacts.app writes as a UUID, so there is no prefix to require: what a
+/// UID cannot be is blank, whitespace-bearing, or longer than the column. That
+/// prefix check was the whole reason an iCloud selection could not be saved at
+/// all, since no id the iCloud picker offers has ever started with
+/// `contactGroups/`. `UNGROUPED_ID` is accepted there because the iCloud source
+/// offers it (an Apple address book routinely holds contacts in no group), and
+/// deliberately NOT for Google, whose picker never has.
+fn group_id_is_shaped(provider: &str, id: &str) -> bool {
+    if id.is_empty() || id.len() > 255 {
+        return false;
+    }
+    match provider {
+        GOOGLE => id.starts_with("contactGroups/"),
+        _ => id == UNGROUPED_ID || !id.chars().any(char::is_whitespace),
     }
 }
 

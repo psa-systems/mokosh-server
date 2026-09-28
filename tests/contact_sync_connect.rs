@@ -211,7 +211,7 @@ async fn reconnecting_the_same_account_keeps_the_connection(pool: PgPool) {
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
 
     let ConnectOutcome::Connected(id) = service
-        .record_connection(tenant, admin_id, "ops@msp.example", "grant-one")
+        .record_connection(tenant, admin_id, "google", "ops@msp.example", "grant-one")
         .await
         .expect("first connect")
     else {
@@ -228,7 +228,7 @@ async fn reconnecting_the_same_account_keeps_the_connection(pool: PgPool) {
     .unwrap();
 
     let again = service
-        .record_connection(tenant, admin_id, "OPS@msp.example", "grant-two")
+        .record_connection(tenant, admin_id, "google", "OPS@msp.example", "grant-two")
         .await
         .expect("reconnect");
     assert_eq!(
@@ -256,7 +256,13 @@ async fn reconnecting_the_same_account_keeps_the_connection(pool: PgPool) {
     );
 
     let other = service
-        .record_connection(tenant, admin_id, "someone@else.example", "grant-three")
+        .record_connection(
+            tenant,
+            admin_id,
+            "google",
+            "someone@else.example",
+            "grant-three",
+        )
         .await
         .expect_err("a different account is refused");
     assert!(other.to_string().contains("ops@msp.example"), "{other}");

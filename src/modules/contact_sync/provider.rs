@@ -75,6 +75,68 @@ pub fn is_supported(provider: &str) -> bool {
     SUPPORTED.contains(&provider)
 }
 
+/// What a provider is CALLED in a message an admin reads, and what its group ids
+/// look like (PMS-1409).
+///
+/// A table rather than a `provider == ICLOUD` at each refusal, because the
+/// failure this exists to prevent is a mixed message: PMS-1341 shipped the
+/// iCloud provider while seven refusals still said "Google label", "Google has
+/// revoked this connection" or "a different Google account", and an admin who
+/// pasted an app-specific password would have been told to reconnect an account
+/// Google never issued. Every user-facing string on the connection surface comes
+/// from here, so adding a provider means filling this in once and finding the
+/// sites by the compiler rather than by a customer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Words {
+    /// The integration's name, as the Settings card says it.
+    pub name: &'static str,
+    /// What one selectable group is called: Google has labels, Apple has groups.
+    pub group: &'static str,
+    /// What to do when the stored credential stops being accepted. The two
+    /// differ in kind and not only in wording: a Google grant is revoked and
+    /// re-granted through a consent screen, and an Apple app-specific password
+    /// is reissued from the Apple ID's own settings, so "connect the account
+    /// again" is an instruction that cannot work on the iCloud path.
+    pub credential_gone: &'static str,
+    /// What the account IS, for a message about connecting a different one.
+    pub account: &'static str,
+    /// Who is on the other end, for a message about what THEY are doing (a rate
+    /// limit is Apple's or Google's, not "Google Contacts'").
+    pub vendor: &'static str,
+}
+
+/// The words for a provider, falling back to the `vcard` file source's.
+///
+/// Total by construction rather than exhaustive over a list: a discriminator
+/// this does not know is one no build serves ([`is_supported`] refuses it before
+/// any of these strings can be shown), and a wrong-but-generic noun is a better
+/// failure than a panic on the Settings card.
+pub fn words(provider: &str) -> Words {
+    match provider {
+        "google" => Words {
+            name: "Google Contacts",
+            group: "Google label",
+            credential_gone: "Google has revoked this connection. Connect the account again",
+            account: "Google account",
+            vendor: "Google",
+        },
+        "icloud" => Words {
+            name: "iCloud Contacts",
+            group: "iCloud group",
+            credential_gone: "Apple no longer accepts this app-specific password. Enter a new one in Settings, Integrations",
+            account: "Apple ID",
+            vendor: "Apple",
+        },
+        _ => Words {
+            name: "Contact import",
+            group: "category",
+            credential_gone: "This source can no longer be read. Set it up again",
+            account: "source",
+            vendor: "The contact source",
+        },
+    }
+}
+
 /// One contact group or label, for the opt-in selection (PSA-70 E).
 ///
 /// `member_count` is what the preview counts against, so a person choosing

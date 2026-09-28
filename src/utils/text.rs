@@ -31,6 +31,12 @@ pub use mokosh_types::text::sanitize_invisible;
 /// - `username`: the credential-vault and SMTP username are login identifiers a
 ///   person retypes, and a stray trailing space in one is the bug, not the data.
 ///
+/// `app_password` is here for the iCloud contact sync (PMS-1409): Apple prints an
+/// app-specific password in four hyphen-separated groups and a person pastes it,
+/// so it is exactly the "compared byte for byte somewhere else" case, and a
+/// rewritten one would come back as Apple refusing a password the admin can see
+/// is right.
+///
 /// Kept sorted and unique so the lookup can binary-search;
 /// `the_secret_field_list_is_sorted_and_unique` fails the build otherwise.
 pub const SECRET_FIELD_NAMES: &[&str] = &[
@@ -38,6 +44,7 @@ pub const SECRET_FIELD_NAMES: &[&str] = &[
     "api_key",
     "api_keys",
     "api_secret",
+    "app_password",
     "approval_code",
     "backup_code",
     "backup_codes",

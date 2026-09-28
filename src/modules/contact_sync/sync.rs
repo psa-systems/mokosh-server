@@ -532,14 +532,17 @@ impl ContactSyncEngine {
                 .collect();
         // An empty selection is "not chosen yet", never "everything" (PSA-70 E).
         if selected.is_empty() {
-            return Err(AppError::Conflict(
-                if source.lists_everything() {
-                    "Choose at least one Google label to import before syncing."
-                } else {
-                    "Choose at least one category to import before importing."
-                }
-                .to_string(),
-            ));
+            // PMS-1409: the provider's own word for a group. An address book is
+            // synced and an uploaded file is imported, which is why the verb
+            // differs too.
+            return Err(AppError::Conflict(if source.lists_everything() {
+                format!(
+                    "Choose at least one {} to import before syncing.",
+                    super::provider::words(&connection.provider).group
+                )
+            } else {
+                "Choose at least one category to import before importing.".to_string()
+            }));
         }
         // PMS-1290: a file run links its contacts to the file it imports.
         if connection.provider == super::file_import::VCARD {
