@@ -145,6 +145,31 @@ jobs:
         # revision; it self-heals if the two ever drift.
         run: bun x playwright install chromium firefox webkit
 
+      - name: Report the runner's shared memory and fonts
+        # PMS-1408: the two runner facts the chromium quarantine turned on, in
+        # the log, because neither is knowable from any repository. The image and
+        # the container options come from `vars.RUNS_ON_OPENSUSE_DEV_LATEST` and
+        # the forgejo-runner config on the host, so a job log is the only place
+        # that records what a given run actually got.
+        #
+        # Fonts are GATED, /dev/shm is only PRINTED. A runner with no fonts makes
+        # headless chromium abort inside font fallback (DEV-756) and every
+        # chromium spec fails with a crash that reads like a resource problem, so
+        # failing here with the cause named is strictly better than failing later
+        # with the symptom. A small /dev/shm is not fatal by itself, because the
+        # chromium project passes --disable-dev-shm-usage and routes shared
+        # memory to /tmp, so its size is evidence rather than a gate.
+        run: |
+          echo "--- /dev/shm"
+          df --human-readable /dev/shm || echo "(no /dev/shm)"
+          echo "--- fonts"
+          fonts=$(fc-list 2>/dev/null | wc --lines)
+          echo "fc-list reports ${fonts} font(s)"
+          if [ "${fonts}" -eq 0 ]; then
+            echo "FAIL: the runner image has no fonts; headless Chromium aborts on font fallback (DEV-756)"
+            exit 1
+          fi
+
       # PMS-271: a production dispatch must NOT run the SHA-polling gate - the
       # dispatched commit is unlikely to be what prod currently serves, so the
       # version-sync poll would time out. Version-sync runs on push and on a
