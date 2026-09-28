@@ -720,7 +720,11 @@ create-release bump: ensure-env
     # transitive dependency churn.
     ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo update --workspace
     git add Cargo.toml Cargo.lock
-    git commit --signoff --message $"Release ($tag)"
+    # PMS-1411: --no-verify skips the local pre-commit hook (fmt/clippy/check/test,
+    # ~14 of this recipe's ~15 minutes) because this commit touches only the
+    # version line in Cargo.toml and its Cargo.lock counterpart; check.yml
+    # re-verifies the identical tree on the release PR moments later.
+    git commit --signoff --no-verify --message $"Release ($tag)"
 
     # Push release branch
     git push --set-upstream origin $release_branch
