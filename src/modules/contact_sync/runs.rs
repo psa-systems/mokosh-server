@@ -91,6 +91,12 @@ pub trait SourceFactory: Send + Sync {
 }
 
 /// Production: a fresh access token per run, never stored (PMS-1212).
+///
+/// PMS-1341: named for Google and now serving iCloud too, because what it does is
+/// "load this connection's credential and build its provider" and only the
+/// credential differs. Renaming it would touch every construction site in `main`
+/// and the suites for no behaviour; what matters is that the dispatch below is on
+/// the connection's own provider rather than on which factory was wired in.
 pub struct GoogleSourceFactory {
     service: Arc<ContactSyncService>,
     http: reqwest::Client,
@@ -113,6 +119,26 @@ impl SourceFactory for GoogleSourceFactory {
         connection_id: Uuid,
         provider: &str,
     ) -> AppResult<Box<dyn ContactSyncProvider>> {
+        // PMS-1341: iCloud's credential is an Apple ID and an app-specific
+        // password, sent as Basic on every CardDAV request, so there is no token
+        // to mint and nothing to refresh. The Apple ID is `account_email` on the
+        // connection row - it is not a credential and Settings shows it so an
+        // admin can tell which account this is - and the password is the
+        // connection's secret, the same key shape Google's refresh token uses.
+        if provider == super::icloud::ICLOUD {
+            let (apple_id, app_password) = self
+                .service
+                .icloud_credential(tenant_id, connection_id)
+                .await?;
+            return Ok(Box::new(super::icloud::ICloudProvider::new(
+                super::carddav::CardDavClient::new(
+                    self.http.clone(),
+                    super::carddav::ICLOUD_BASE_URL,
+                    apple_id,
+                    app_password,
+                ),
+            )));
+        }
         let token = self
             .service
             .access_token(tenant_id, connection_id, provider)
@@ -265,7 +291,11 @@ impl ContactSyncRunner {
                AND jsonb_array_length(c.selected_groups) > 0 \
                AND NOT EXISTS (SELECT 1 FROM tenant_settings s \
                                WHERE s.tenant_id = c.tenant_id AND s.category = 'integrations' \
-                                 AND s.key = 'google_contacts_enabled' AND s.value = 'false'::jsonb) \
+                                 AND s.value = 'false'::jsonb \
+                                 AND ((c.provider = 'google' \
+                                       AND s.key = 'google_contacts_enabled') \
+                                   OR (c.provider = 'icloud' \
+                                       AND s.key = 'icloud_contacts_enabled'))) \
                AND c.sync_status NOT IN ('reconnect_required', 'in_progress') \
                AND c.last_sync_at IS NOT NULL \
                AND c.last_sync_at <= NOW() - (c.sync_interval_minutes * INTERVAL '1 minute') \
@@ -352,7 +382,17 @@ impl ContactSyncRunner {
             // Turned off after the run was queued (PMS-1241): no token
             // refresh, no read of the account. `settle` records the run as
             // cancelled.
-            if !crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await? {
+            //
+            // PMS-1341: by provider, because iCloud has its own switch. Reading
+            // Google's flag for an iCloud run would have made one integration
+            // turn the other off, which is the shape of bug that is only ever
+            // found by the tenant it surprises.
+            let allowed = if provider == super::icloud::ICLOUD {
+                crate::modules::settings::read_icloud_contacts_enabled(&self.db, tenant_id).await?
+            } else {
+                crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
+            };
+            if !allowed {
                 return Err(AppError::Conflict(TURNED_OFF.to_string()));
             }
             self.sources
@@ -384,9 +424,13 @@ impl ContactSyncRunner {
             Option<Uuid>,
         ) = sqlx::query_as(
             "SELECT c.sync_status, c.disconnected_at IS NOT NULL, \
-                    c.provider = 'google' AND EXISTS (SELECT 1 FROM tenant_settings s \
+                    EXISTS (SELECT 1 FROM tenant_settings s \
                             WHERE s.tenant_id = c.tenant_id AND s.category = 'integrations' \
-                              AND s.key = 'google_contacts_enabled' AND s.value = 'false'::jsonb), \
+                              AND s.value = 'false'::jsonb \
+                              AND ((c.provider = 'google' \
+                                    AND s.key = 'google_contacts_enabled') \
+                                OR (c.provider = 'icloud' \
+                                    AND s.key = 'icloud_contacts_enabled'))), \
                     c.provider, \
                     (SELECT r.import_file_id FROM contact_sync_runs r \
                      WHERE r.tenant_id = c.tenant_id AND r.id = $3) \
