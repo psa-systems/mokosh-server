@@ -222,6 +222,48 @@ One binary, two shapes, selected by `MOKOSH_DEPLOYMENT_MODE`:
 The profile supplies defaults only. Explicit configuration overrides it per kind, and the status report shows both
 the active profile and every deviation from it.
 
+## Authentication, and what its modes are called
+
+Two providers, not three, and the naming is worth stating because the same deployment shape has been asked for under
+three different words (PMS-1309: "database for standalone, Bunyip for SaaS, local for development").
+
+| Provider | What it authenticates against | Selected by |
+|---|---|---|
+| `local` | credentials this deployment holds: a password hash on the `users` row, verified with Argon2, plus the session rows behind it | `AUTH_PROVIDERS=local` |
+| `bunyip` | `at+jwt` bearers issued by Bunyip, verified against its JWKS | `AUTH_PROVIDERS=bunyip` |
+
+`local` IS the standalone database mode. There is no separate `database` provider to select and no third
+development-only mode: a development deployment and a standalone customer deployment authenticate the same way, out
+of the same table, which is what makes "it works on my machine" and "it works in the customer image" the same
+statement. PMS-981's own title says it as well: the choice is Bunyip OIDC *or local database credentials*.
+
+Both can be enabled at once, comma-separated, in priority order. That is how the SaaS deployment runs
+(`bunyip,local`), and it is what the hosting profile defaults to there; `self-hosted` defaults to `local` alone. An
+unset `AUTH_PROVIDERS` takes the profile default, so a deployment that configures nothing keeps the behaviour it
+had. An unrecognised name is a boot error naming the legal set, never a fallback, and so are a duplicate and a blank
+entry in the list.
+
+Enablement is enforced at the two points that can admit a caller: the bearer path in `auth_middleware` and password
+login in `AuthService::login`. A provider the operator excluded is skipped there as though its capability were not
+configured, so the refusal is byte-identical to the one an invalid credential gets. That is deliberate: the response
+must not disclose which providers a deployment has enabled.
+
+### Switching is not a value migration
+
+The six-step path above moves VALUES between providers, keyed and comparable, and `provider-migrate` exists because
+a key can be written to a second provider and read back. Authentication has no such values. A local credential is a
+one-way Argon2 hash that cannot be handed to an identity provider, and a Bunyip identity is not something this
+deployment holds a copy of, so there is nothing for `provider-migrate` to carry and running it against the
+authentication kind is not a supported operation.
+
+What switching means here is a sequence in the SAME order and for the same reason as the value path: enable the new
+provider alongside the old one, let callers arrive through it, and only then drop the old one. Moving from `local`
+to `bunyip` means the people signing in need identities at the OP and the deployment needs `OIDC_ISSUER` and
+`OIDC_AUDIENCE`; moving from `bunyip` to `local` means each of them needs a password set on this deployment, which
+is a password-reset mail per person rather than a migration command. `provider-status` still answers which
+providers are enabled and whether the profile or the operator decided that, which is the part an operator needs
+while both are live.
+
 ## A note on names
 
 The environment variable `SECRET_BACKEND` still says "backend": renaming it would break every running deployment
