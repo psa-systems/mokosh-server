@@ -146,8 +146,28 @@ pub struct VcardFile {
     /// Cards describing a group rather than a person (vCard 4.0 `KIND:group`,
     /// Apple's `X-ADDRESSBOOKSERVER-KIND:group`). Not contacts, not failures.
     pub group_cards: u32,
+    /// PMS-1341: those cards' own contents, for a source whose grouping lives
+    /// in them. Empty for a `.vcf` import, which groups by `CATEGORIES`.
+    pub group_cards_read: Vec<GroupCard>,
     /// Every `BEGIN:VCARD` seen.
     pub cards: u32,
+}
+
+/// A group card's own contents (PMS-1341).
+///
+/// Apple writes a group as a vCard whose `X-ADDRESSBOOKSERVER-KIND` is `group`,
+/// with one `X-ADDRESSBOOKSERVER-MEMBER` per member holding `urn:uuid:<UID>`.
+/// The members are therefore ids, resolved against the contacts' own `UID`s by
+/// whoever needs membership; this type carries them as written, minus the scheme
+/// prefix, and decides nothing about what is missing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupCard {
+    /// The group card's `UID`, which is what a contact's membership names.
+    pub id: Option<String>,
+    /// `FN`: what the person called the group in Contacts.app.
+    pub name: Option<String>,
+    /// Member `UID`s, in the order the card lists them.
+    pub member_ids: Vec<String>,
 }
 
 /// Read a `.vcf` file.
@@ -518,7 +538,19 @@ fn finish(mut card: CardBuilder, limits: Limits, file: &mut VcardFile) {
             }
             file.contacts.push(*contact);
         }
-        Converted::GroupCard => file.group_cards += 1,
+        Converted::GroupCard(group) => {
+            file.group_cards += 1;
+            // PMS-1341: kept rather than only counted. A `.vcf` file groups by
+            // `CATEGORIES`, so the file import has no use for these; iCloud's
+            // CardDAV payload carries membership ONLY here, in the group card's
+            // `X-ADDRESSBOOKSERVER-MEMBER` lines, so the iCloud provider reads
+            // them. Surfaced from the one parser rather than parsed a second
+            // time in that provider, which is the rule PMS-1288 set: one
+            // canonical model, one place that produces it.
+            if group.id.is_some() || group.name.is_some() {
+                file.group_cards_read.push(*group);
+            }
+        }
         Converted::Empty => file.failures.push(card.problem(
             "The card has no name, email address, phone number or organisation, so it was skipped.",
         )),
@@ -587,7 +619,7 @@ const UID_MAX: usize = 200;
 
 enum Converted {
     Contact(Box<SourceContact>),
-    GroupCard,
+    GroupCard(Box<GroupCard>),
     Empty,
 }
 
@@ -708,6 +740,39 @@ fn phone_label(types: &[String]) -> Option<String> {
     types.first().cloned()
 }
 
+/// PMS-1341: a group card's id, name and member ids.
+///
+/// `urn:uuid:` is stripped so a member reads as the `UID` it names; anything else
+/// Apple might put there is kept verbatim rather than guessed at, because a
+/// member this cannot resolve should show up as a member nobody is in, not as a
+/// silently dropped line.
+fn read_group_card(card: &VCard) -> GroupCard {
+    let mut group = GroupCard::default();
+    for entry in &card.entries {
+        match &entry.name {
+            VCardProperty::Uid => {
+                group.id = texts(entry).next().and_then(clean);
+            }
+            VCardProperty::Fn => {
+                if group.name.is_none() {
+                    group.name = texts(entry).next().and_then(clean);
+                }
+            }
+            VCardProperty::Other(name)
+                if name.eq_ignore_ascii_case("X-ADDRESSBOOKSERVER-MEMBER") =>
+            {
+                for value in texts(entry) {
+                    if let Some(member) = clean(value.trim_start_matches("urn:uuid:")) {
+                        group.member_ids.push(member);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    group
+}
+
 fn is_group_card(card: &VCard) -> bool {
     card.entries.iter().any(|e| match &e.name {
         VCardProperty::Kind => e
@@ -723,7 +788,7 @@ fn is_group_card(card: &VCard) -> bool {
 
 fn convert(card: &VCard, text: &str, raw: &CardBuilder) -> Converted {
     if is_group_card(card) {
-        return Converted::GroupCard;
+        return Converted::GroupCard(Box::new(read_group_card(card)));
     }
     // Apple's custom labels live on a sibling property in the same group.
     let mut labels: BTreeMap<String, String> = BTreeMap::new();
