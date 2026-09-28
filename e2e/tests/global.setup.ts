@@ -275,13 +275,19 @@ setup('capture bearer from the SPA login', async ({ page }) => {
   // leading-dot domains before comparing so `.a8n.systems` matches
   // `a8n.systems` as expected.
   // OP cookies are a SECONDARY artifact: only oidc.spec.ts replays them; the
-  // 20+ bearer-auth specs run purely off the token persisted above. On headless
-  // chromium the browser process can die right after login ("Target page,
-  // context or browser has been closed") - a resource-level crash tracked for a
-  // runner-side fix (PMS-592) - and that must NOT take the already-captured
-  // token down with it. Guard the whole OP-cookie capture: on any failure (or
-  // an empty match) persist an EMPTY OP storage state and continue, so
-  // oidc.spec.ts degrades to a skip while every other api spec still runs.
+  // 20+ bearer-auth specs run purely off the token persisted above. So the whole
+  // capture is guarded: on any failure, or an empty match, persist an EMPTY OP
+  // storage state and continue, and oidc.spec.ts degrades to a skip while every
+  // other api spec still runs.
+  //
+  // PMS-1408: the guard stays, and its reason is no longer a pending runner fix.
+  // It was written for the PMS-592 post-login crash, which is fixed (DEV-396's
+  // --shm-size, DEV-756's fonts, and the login fill in `e2e/lib/login.ts`), but
+  // the guard is not about that crash: cookie capture reads browser state over
+  // the wire, and anything that makes THAT fail - a closed context, a slow
+  // teardown, an OP that moved host - would otherwise take down a token that was
+  // already captured successfully and with it every bearer-auth spec. One
+  // secondary artifact must not be able to fail twenty specs that do not use it.
   let opCookies: Array<{ name: string; domain: string; path: string }> = [];
   try {
     const opCookieDomains = computeOpCookieDomains(env.opBaseURL);
@@ -324,10 +330,15 @@ setup('capture bearer from the SPA login', async ({ page }) => {
       );
     }
   } catch (e) {
-    console.warn(
-      `[setup] OP cookie capture failed (browser likely closed post-login, PMS-592): ${
-        (e as Error).message
-      }. Persisting an empty OP storage state; oidc.spec.ts will skip, bearer-auth specs are unaffected.`,
+    // PMS-1408: error, not warn, and carrying the stack. This branch means a
+    // capture that was expected to work did not, and the run then goes GREEN
+    // with oidc.spec.ts skipped - so if it is logged at warning level with only
+    // a message, the one line explaining a silently reduced suite is the easiest
+    // line in the log to miss.
+    const err = e as Error;
+    console.error(
+      `[setup] OP cookie capture failed: ${err.message}. Persisting an empty OP storage state; ` +
+        `oidc.spec.ts will skip, bearer-auth specs are unaffected.\n${err.stack ?? '(no stack)'}`,
     );
   }
   writeFileSync(

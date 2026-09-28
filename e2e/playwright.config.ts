@@ -46,16 +46,15 @@ export default defineConfig({
       name: 'setup',
       testMatch: /global\.setup\.ts$/,
       dependencies: ['preflight'],
-      // Run setup in FIREFOX, not chromium. The bearer this project persists is
-      // read off the OIDC `/oauth2/token` response and is browser-agnostic, but
-      // headless chromium crashes intermittently post-login in CI ("Target
-      // page, context or browser has been closed") - sometimes before the token
-      // is even captured - which made the token every api spec depends on flaky.
-      // firefox drives the identical SPA login reliably (it passes
-      // form-validation on the same runner and never hits the crash), so setup
-      // becomes deterministic. The crash itself is a runner-resource issue
-      // (container /dev/shm / RAM) tracked in DEV-396; move setup back to
-      // Desktop Chrome once that lands.
+      // Run setup in FIREFOX, not chromium, and PMS-1408 keeps it there on
+      // purpose rather than while waiting for something. The bearer this project
+      // persists is read off the OIDC `/oauth2/token` response and is
+      // browser-agnostic, so capturing it in a second engine buys no coverage;
+      // what it would buy is the token every `api` spec depends on sitting behind
+      // the engine that is still being re-proven. Chromium coverage of the SPA
+      // login comes from the `chromium` project below, which is where a
+      // chromium-only regression should surface: in one spec, not in twenty that
+      // never touched a browser.
       use: { ...devices['Desktop Firefox'], baseURL: env.baseURL },
     },
     // 2. Browser-driven coverage across all three engines (PMS-423). Each
@@ -66,20 +65,26 @@ export default defineConfig({
     //    invalidate the API token and do not depend on `setup`; they depend on
     //    `preflight` only so a misconfigured CI fails clean. They drive the SPA
     //    form and assert on the DOM / URL transitions, not request-context API
-    //    state, and use the SPA host the human-facing app is served on. Both
-    //    specs are currently `test.fixme` (see tests/auth.spec.ts and
-    //    tests/form-validation.spec.ts for the un-fixme conditions), so the
-    //    per-email login rate limit (5/min) is not yet a cross-browser concern.
+    //    state, and use the SPA host the human-facing app is served on.
+    //
+    //    PMS-1408 corrected what this said about which specs run:
+    //    `form-validation.spec.ts` runs in all three projects, and only
+    //    `auth.spec.ts`'s logout test is `test.fixme` (PMS-148). The per-email
+    //    login rate limit (5/min, `src/modules/auth/routes.rs`) is therefore a
+    //    live cross-browser concern rather than a future one, which is why
+    //    form-validation is ONE test with ONE login rather than a login per
+    //    case: three engines plus `setup` already spend four of the five.
     {
       name: 'chromium',
       testMatch: /(auth|form-validation)\.spec\.ts$/,
       dependencies: ['preflight'],
-      // --disable-dev-shm-usage: CI runs headless chromium in a container
-      // whose /dev/shm defaults to 64 MB. The WASM SPA + post-login data load
-      // exhausts it and the tab crashes with "Target page, context or browser
-      // has been closed" (chromium only; firefox/webkit are unaffected). This
-      // flag routes chromium's shared memory to /tmp instead - the standard
-      // fix for that crash in CI (PMS-592).
+      // --disable-dev-shm-usage routes chromium's shared memory to /tmp instead
+      // of /dev/shm. PMS-1408: defence in depth, not the fix. The runners now
+      // pass --shm-size=2g (DEV-396) and the crash this flag was credited with
+      // turned out to be a missing font package (DEV-756), so nothing here
+      // depends on it - but 64 MB is still the container default, and a
+      // workstation or a runner that has not taken the config keeps working with
+      // it. It costs nothing, so it stays.
       use: {
         ...devices['Desktop Chrome'],
         baseURL: env.baseURL,
