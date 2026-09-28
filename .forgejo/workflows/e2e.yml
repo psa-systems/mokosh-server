@@ -145,6 +145,44 @@ jobs:
         # revision; it self-heals if the two ever drift.
         run: bun x playwright install chromium firefox webkit
 
+      - name: Report the runner's shared memory and fonts
+        # PMS-1408: the two runner facts the chromium quarantine turned on, in
+        # the log, because neither is knowable from any repository. The image and
+        # the container options come from `vars.RUNS_ON_OPENSUSE_DEV_LATEST` and
+        # the forgejo-runner config on the host, so a job log is the only place
+        # that records what a given run actually got.
+        #
+        # Both facts are PRINTED and neither fails the job, which is a change
+        # from how this step was first written and the run that changed it is
+        # worth recording: on its first real run (run 47331) it reported
+        # `/dev/shm` at 2.0G and `fc-list` at 0 fonts. So DEV-396 IS deployed on
+        # the E2E runner and DEV-756 is NOT, which is exactly the state that
+        # makes headless chromium abort inside font fallback and report the same
+        # "Target page, context or browser has been closed" a resource crash
+        # gives.
+        #
+        # It was specified as a hard gate on the font count, and as a gate it was
+        # correct: it named the cause in five seconds. It is a warning instead
+        # because `E2E / *` is a REQUIRED status check on main, so failing here
+        # blocks every merge in the repository on an infrastructure fact that no
+        # change in this repository can fix. A loud line in every run gets the
+        # same information to whoever can fix it without holding the estate
+        # hostage to it.
+        #
+        # When `fc-list` reports a non-zero count, the chromium skip in
+        # `e2e/tests/form-validation.spec.ts` can come off and this can go back
+        # to being a gate (PMS-1408).
+        run: |
+          echo "--- /dev/shm"
+          df --human-readable /dev/shm || echo "(no /dev/shm)"
+          echo "--- fonts"
+          fonts=$(fc-list 2>/dev/null | wc --lines)
+          echo "fc-list reports ${fonts} font(s)"
+          if [ "${fonts}" -eq 0 ]; then
+            echo "WARNING: the runner image has no fonts; headless Chromium aborts on font fallback (DEV-756)."
+            echo "WARNING: the chromium project's form-validation coverage stays skipped until this runner takes the fonted dev image (PMS-1408)."
+          fi
+
       # PMS-271: a production dispatch must NOT run the SHA-polling gate - the
       # dispatched commit is unlikely to be what prod currently serves, so the
       # version-sync poll would time out. Version-sync runs on push and on a
