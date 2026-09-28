@@ -554,6 +554,96 @@ async fn nothing_is_imported_before_a_label_is_chosen(pool: PgPool) {
     assert_eq!(f.scalar::<i64>("SELECT count(*) FROM contacts").await, 0);
 }
 
+/// PMS-1358: the label filter is re-applied on every sync, and a contact that
+/// LEAVES the selected label is kept rather than deleted.
+///
+/// David's requirement was to import only the label that names his clients, and
+/// the half that is easy to get wrong is what happens later: a contact moved out
+/// of that label must stop being updated (the MSP no longer agreed to hold its
+/// data) without being tombstoned (the MSP still holds the contact). The second
+/// read here is a FULL one, which is where a tombstone would come from: the
+/// record is present in the read, so `seen` covers it, and the filter is the only
+/// thing that decides not to apply it.
+#[mokosh_test]
+async fn a_contact_that_leaves_the_selected_label_is_kept_and_stops_being_updated(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+    let ada = f
+        .contact("Ada", "Lovelace", Some("ada@acme.example"), None)
+        .await;
+
+    let mut inside = person("people/c1", "e1", "Ada", "Lovelace");
+    inside.emails = vec!["ada@acme.example".into()];
+    inside.title = Some("Analyst".into());
+    let source = FakeSource::new(vec![read(vec![inside], "t1", false)]);
+    assert_eq!(
+        f.sync(&source).await.expect("the first sync"),
+        SyncReport {
+            full_read: true,
+            linked: 1,
+            total: 1,
+            ..SyncReport::default()
+        }
+    );
+    assert_eq!(f.link_contact("people/c1").await, ada);
+
+    // The same person in Friends instead, with a new etag and a new title, so a
+    // record that WAS applied would be visibly different afterwards.
+    let mut moved = person("people/c1", "e2", "Ada", "Lovelace");
+    moved.emails = vec!["ada@acme.example".into()];
+    moved.title = Some("Countess".into());
+    moved.group_ids = vec![FRIENDS.into()];
+    source.push(read(vec![moved], "t2", true));
+    assert_eq!(
+        f.sync(&source).await.expect("the second sync"),
+        SyncReport {
+            full_read: true,
+            not_selected: 1,
+            total: 1,
+            ..SyncReport::default()
+        }
+    );
+
+    #[derive(sqlx::FromRow)]
+    struct After {
+        title: Option<String>,
+        tags: Vec<String>,
+    }
+    let after: After = sqlx::query_as("SELECT title, tags FROM contacts WHERE id = $1")
+        .bind(ada)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.title.as_deref(),
+        Some("Analyst"),
+        "the record left the selection, so nothing about it is written"
+    );
+    assert_eq!(
+        after.tags,
+        vec!["Clients"],
+        "the tag the import agreed to is kept; a sync that no longer applies the record does not \
+         retag it, and Friends was never selected so it could not become a tag either"
+    );
+
+    let (etag, deleted): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT etag, deleted_in_source_at FROM contact_sync_links WHERE external_id = $1",
+    )
+    .bind("people/c1")
+    .fetch_one(&f.pool)
+    .await
+    .expect("the link survives");
+    assert_eq!(
+        etag.as_deref(),
+        Some("e1"),
+        "the etag is the one that was applied, not the one that was skipped"
+    );
+    assert!(
+        deleted.is_none(),
+        "leaving a label is not being deleted in the source, and a full read must not say it is"
+    );
+    assert_eq!(f.scalar::<i64>("SELECT count(*) FROM contacts").await, 1);
+}
+
 /// A question a human answered is not asked again when the record changes.
 #[mokosh_test]
 async fn an_answered_question_is_not_asked_again(pool: PgPool) {
