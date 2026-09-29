@@ -32,6 +32,26 @@ const JUSTFILE = "justfile"
 
 # Recipe names `just --list` prints: every non-private recipe header. A header
 # is `name[ params][: deps]` at column 0; `:=` is a variable assignment.
+#
+# PMS-786: the textual scan below reads THIS file only, and since the root
+# justfile imports `common/common.just` that is no longer the whole set. A doc
+# naming an imported recipe (`just pre-commit`, `just create-release`) was
+# reported as naming a recipe that does not exist, which is the opposite of this
+# guard's job. So the imported names come from `just --summary`, which resolves
+# imports, and the two sets are unioned: the summary alone would not do, because
+# it omits `[private]` recipes and this guard's own doc-comment/attribute
+# handling is what decides whether a LOCAL recipe counts.
+def imported-recipes [] {
+    let summary = (do { ^just --summary } | complete)
+    if $summary.exit_code != 0 {
+        # `just` missing or the justfile unparseable: report nothing extra and
+        # let the local scan speak, rather than failing the guard on a tooling
+        # problem it does not own.
+        return []
+    }
+    $summary.stdout | split row --regex '\s+' | where {|r| ($r | is-not-empty) }
+}
+
 def justfile-recipes [] {
     let lines = (open --raw $JUSTFILE | decode utf-8 | lines)
 
@@ -102,7 +122,7 @@ def documented-recipes [file: string] {
 }
 
 def main [] {
-    let recipes = (justfile-recipes)
+    let recipes = ((justfile-recipes) | append (imported-recipes) | uniq)
     if ($recipes | is-empty) {
         print --stderr $"ERROR: no recipes parsed out of ($JUSTFILE)"
         exit 1
