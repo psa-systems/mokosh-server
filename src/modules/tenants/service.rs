@@ -159,6 +159,17 @@ pub async fn forget_seeded_tenant(tenant_id: Uuid) {
     seeded_tenants_cache().invalidate(&tenant_id).await;
 }
 
+/// PMS-897/PMS-1416: the public sort key each `list_tenants` column answers
+/// to. Mirrors `tickets::TICKET_SORT_COLUMNS`: `order_by_mapped` pairs a
+/// public key with the SQL that sorts by it, and only the key half is safe
+/// to share, so this stays a local tuple whose keys `pms1416_tests` below
+/// asserts against `mokosh_types::sort::TENANTS`.
+const TENANT_SORTS: &[(&str, &str)] = &[
+    ("name", "name"),
+    ("user_count", "user_count"),
+    ("created_at", "created_at"),
+];
+
 impl TenantService {
     pub fn new(db: Database) -> Self {
         Self {
@@ -1178,16 +1189,17 @@ impl TenantService {
     /// sort. The admin surface renders Client, Users and Created columns and
     /// paginates server-side; picking the ORDER BY here means a single page
     /// covers the count and the position without the client re-sorting.
+    ///
+    /// The keys are `mokosh_types::sort::TENANTS`, asserted by
+    /// `pms1416_tests` below: `order_by_mapped` needs `(key, SQL)` pairs, so
+    /// this one allow-list cannot be `mokosh_types::sort::TENANTS` itself
+    /// (the SQL half must not cross the wire), and this test stands in for
+    /// the compiler pairing every other call site gets for free.
     #[tracing::instrument(skip_all)]
     pub async fn list_tenants(
         &self,
         pagination: &crate::utils::pagination::PaginationParams,
     ) -> AppResult<(Vec<(Tenant, i64)>, u64)> {
-        const TENANT_SORTS: &[(&str, &str)] = &[
-            ("name", "name"),
-            ("user_count", "user_count"),
-            ("created_at", "created_at"),
-        ];
         let order_by = pagination.order_by_mapped("created_at", TENANT_SORTS)?;
 
         // SAFETY (PMS-285): list_tenants is a super-admin, cross-tenant handler
@@ -2499,6 +2511,26 @@ mod tests {
         assert_eq!(
             personal_tenant_name(Some("Chris"), None),
             "Chris's workspace"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pms1416_tests {
+    use super::TENANT_SORTS;
+
+    /// PMS-897/PMS-1416: the one allow-list pairing the compiler cannot
+    /// check, mirroring `tickets::pms897_tests`. `TENANT_SORTS` pairs a
+    /// public key with the SQL that sorts by it, so only the KEY half is
+    /// shared through `mokosh_types::sort::TENANTS`; this test stands in for
+    /// the compiler pairing every other call site gets for free.
+    #[test]
+    fn the_mapped_keys_are_exactly_the_shared_list() {
+        let keys: Vec<&str> = TENANT_SORTS.iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            keys,
+            mokosh_types::sort::TENANTS.to_vec(),
+            "the tenant sort keys must match mokosh_types::sort::TENANTS, in order"
         );
     }
 }
