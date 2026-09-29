@@ -252,10 +252,15 @@ impl ReportsService {
         .bind(to)
         .fetch_all(&mut *tx)
         .await?;
-        let by_work_type: Vec<(Uuid, i64)> = sqlx::query_as(
-            r#"SELECT work_type_id, SUM(duration_minutes)::bigint FROM time_entries
-               WHERE tenant_id = $1 AND date BETWEEN $2 AND $3
-               GROUP BY work_type_id"#,
+        // Joined to `work_types` for the same reason as the user query above:
+        // the PDF export names the work type rather than printing its id
+        // (PMS-1207).
+        let by_work_type: Vec<(Uuid, Option<String>, i64)> = sqlx::query_as(
+            r#"SELECT te.work_type_id, wt.name, SUM(te.duration_minutes)::bigint
+               FROM time_entries te
+               LEFT JOIN work_types wt ON wt.id = te.work_type_id
+               WHERE te.tenant_id = $1 AND te.date BETWEEN $2 AND $3
+               GROUP BY te.work_type_id, wt.name"#,
         )
         .bind(tenant_id)
         .bind(from)
@@ -275,7 +280,11 @@ impl ReportsService {
                 .collect(),
             minutes_by_work_type: by_work_type
                 .into_iter()
-                .map(|(id, m)| IdCount { id, count: m })
+                .map(|(id, name, m)| WorkTypeCount {
+                    id,
+                    name: name.unwrap_or_else(|| "Unknown work type".into()),
+                    count: m,
+                })
                 .collect(),
         })
     }
@@ -311,6 +320,21 @@ impl ReportsService {
         let (invoiced, paid, outstanding) =
             totals.unwrap_or((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
 
+        // PMS-1418: the report's own scope, echoed back so the PDF can state
+        // which client it covers rather than staying silent. `None` when
+        // `company_id` names no row in this tenant, the same as when none was
+        // given: either way the totals above cover every client.
+        let company_name: Option<String> = match company_id {
+            Some(c) => {
+                sqlx::query_scalar(r#"SELECT name FROM companies WHERE tenant_id = $1 AND id = $2"#)
+                    .bind(tenant_id)
+                    .bind(c)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            }
+            None => None,
+        };
+
         let aging: Vec<(String, Decimal)> = sqlx::query_as(
             r#"SELECT
                   CASE
@@ -339,6 +363,7 @@ impl ReportsService {
                 .into_iter()
                 .map(|(bucket, total)| AgingBucket { bucket, total })
                 .collect(),
+            company_name,
         })
     }
 
@@ -560,18 +585,19 @@ pub struct AssigneeCount {
     pub count: i64,
 }
 
+/// The display name resolved alongside `id` (PMS-1196): `minutes_by_user`
+/// names a user the way `AssigneeCount` does.
 #[derive(Debug, Clone, Serialize)]
-pub struct IdCount {
+pub struct UserCount {
     pub id: Uuid,
+    pub name: String,
     pub count: i64,
 }
 
-/// Like [`IdCount`], plus the display name resolved alongside `id` (PMS-1196):
-/// `minutes_by_user` names a user, so it carries a name the way
-/// `AssigneeCount` does, while `minutes_by_work_type` stays a bare
-/// [`IdCount`], since a work type has no comparable display-name lookup here.
+/// Like [`UserCount`], for `minutes_by_work_type` (PMS-1207): a work type is
+/// named through `work_types.name`, joined alongside `work_type_id`.
 #[derive(Debug, Clone, Serialize)]
-pub struct UserCount {
+pub struct WorkTypeCount {
     pub id: Uuid,
     pub name: String,
     pub count: i64,
@@ -605,7 +631,7 @@ pub struct TimeReportResponse {
     pub from: NaiveDate,
     pub to: NaiveDate,
     pub minutes_by_user: Vec<UserCount>,
-    pub minutes_by_work_type: Vec<IdCount>,
+    pub minutes_by_work_type: Vec<WorkTypeCount>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -614,6 +640,11 @@ pub struct BillingReportResponse {
     pub paid: Decimal,
     pub outstanding: Decimal,
     pub aging: Vec<AgingBucket>,
+    /// The company the report is scoped to, resolved alongside `company_id`
+    /// (PMS-1418). `None` means the report covers every client, not that the
+    /// name failed to resolve: a `company_id` naming no row in this tenant
+    /// matches nothing in the totals either, so the two stay consistent.
+    pub company_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

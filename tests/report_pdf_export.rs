@@ -197,6 +197,69 @@ async fn the_csv_export_is_unchanged(pool: PgPool) {
     assert!(!body.is_empty());
 }
 
+/// PMS-1418: every exported PDF states when it was generated, in the same
+/// place regardless of whether it already carries its own date-range
+/// subtitle. Before this, `pdf_for_dashboard`, `pdf_for_billing`,
+/// `pdf_for_projects` and `pdf_for_clients` printed no date at all.
+#[mokosh_test]
+async fn every_exported_pdf_states_when_it_was_generated(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    for key in EXPORTABLE {
+        let (status, _headers, body) = export(&app, &token, key, "pdf").await;
+        assert_eq!(status, StatusCode::OK, "{key} should export as PDF");
+        let text = extracted_text(&body);
+        assert!(
+            text.contains("Generated "),
+            "{key} PDF should state when it was generated: {text}"
+        );
+    }
+}
+
+/// PMS-1418: the billing PDF states whether it covers one client or all of
+/// them, even though `BillingReportResponse` (and the PDF export it feeds)
+/// never printed a scope before.
+#[mokosh_test]
+async fn billing_pdf_states_its_client_scope(pool: PgPool) {
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let company_name: String = sqlx::query_scalar("SELECT name FROM companies WHERE id = $1")
+        .bind(company_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded company");
+
+    let (status, _headers, all_pdf) = export(&app, &token, "billing", "pdf").await;
+    assert_eq!(status, StatusCode::OK);
+    let all_text = extracted_text(&all_pdf);
+    assert!(
+        all_text.contains("All clients"),
+        "no company_id should read as every client: {all_text}"
+    );
+
+    let resp = app
+        .client
+        .get(app.url(&format!(
+            "/api/v1/reports/billing/export?format=pdf&company_id={company_id}"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("export billing scoped to a company");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let scoped_bytes = resp.bytes().await.expect("body");
+    let scoped_text = extracted_text(&scoped_bytes);
+    assert!(
+        scoped_text.contains(&company_name),
+        "a company_id should name the company it scopes to: {scoped_text}"
+    );
+}
+
 /// Read the text back out of rendered bytes, through printpdf's own parser so
 /// this reads what a PDF reader reads (the pattern `document_bill_to.rs` uses).
 fn extracted_text(bytes: &[u8]) -> String {
@@ -262,9 +325,10 @@ async fn pdf_columns_name_the_user_instead_of_printing_a_uuid(pool: PgPool) {
     .expect("seed assigned ticket");
 
     // A time entry logged by the same admin, so `pdf_for_time`'s "Minutes by
-    // user" table has a resolvable user to name.
-    let work_type_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM work_types WHERE tenant_id = $1 LIMIT 1")
+    // user" table has a resolvable user to name, and the "Minutes by work
+    // type" table (PMS-1207) has a resolvable work type to name.
+    let (work_type_id, work_type_name): (Uuid, String) =
+        sqlx::query_as("SELECT id, name FROM work_types WHERE tenant_id = $1 LIMIT 1")
             .bind(common::DEFAULT_TENANT_ID)
             .fetch_one(&pool)
             .await
@@ -284,6 +348,7 @@ async fn pdf_columns_name_the_user_instead_of_printing_a_uuid(pool: PgPool) {
     .expect("seed time entry");
 
     let uuid_shaped = admin_id.to_string();
+    let work_type_uuid_shaped = work_type_id.to_string();
 
     let (status, _headers, tickets_pdf) = export(&app, &token, "tickets", "pdf").await;
     assert_eq!(status, StatusCode::OK);
@@ -307,5 +372,13 @@ async fn pdf_columns_name_the_user_instead_of_printing_a_uuid(pool: PgPool) {
     assert!(
         !time_text.contains(&uuid_shaped),
         "time PDF should not print the user's raw id: {time_text}"
+    );
+    assert!(
+        time_text.contains(&work_type_name),
+        "time PDF should name the work type (PMS-1207): {time_text}"
+    );
+    assert!(
+        !time_text.contains(&work_type_uuid_shaped),
+        "time PDF should not print the work type's raw id: {time_text}"
     );
 }
