@@ -56,6 +56,14 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
         with:
           fetch-depth: 0
+          # PMS-786: the root justfile imports `common/common.just` from the
+          # `common` submodule, so without this NOTHING in this job can parse
+          # the justfile - `just --list` included. The first casualty was the
+          # doc-recipe guard, which resolves imported recipe names through
+          # `just --summary` and reported every one of them as a recipe that
+          # does not exist. `fetch-depth: 0` above is for migration
+          # immutability and is unrelated.
+          submodules: true
 
       - name: Clone the mokosh-apps sibling
         # check-route-consumers.nu compares mounted routes against the SPA

@@ -44,9 +44,20 @@ const JUSTFILE = "justfile"
 def imported-recipes [] {
     let summary = (do { ^just --summary } | complete)
     if $summary.exit_code != 0 {
-        # `just` missing or the justfile unparseable: report nothing extra and
-        # let the local scan speak, rather than failing the guard on a tooling
-        # problem it does not own.
+        # A justfile that carries an `import` and will not parse is almost
+        # always the submodule missing (a fresh clone, or a CI checkout without
+        # `submodules: true`), and the first run of this guard in CI proved why
+        # that must not degrade quietly: every imported recipe went missing at
+        # once and the output blamed the DOCS for naming recipes that do not
+        # exist. Fail on the real cause instead.
+        if (open --raw $JUSTFILE | decode utf-8 | lines | any {|l| ($l | str trim | str starts-with "import ") }) {
+            print --stderr "ERROR: the justfile imports another file and `just --summary` failed, so imported recipe names cannot be resolved."
+            print --stderr "Run `git submodule update --init` (the root justfile imports common/common.just), then re-run."
+            print --stderr ($summary.stderr | str trim)
+            exit 1
+        }
+        # No import: `just` is simply absent. Not this guard's problem to
+        # report, and the local scan is the whole set anyway.
         return []
     }
     $summary.stdout | split row --regex '\s+' | where {|r| ($r | is-not-empty) }
