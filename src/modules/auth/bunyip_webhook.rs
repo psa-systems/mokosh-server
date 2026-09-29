@@ -281,7 +281,7 @@ pub async fn mokosh_grant_changed(
 
     if payload.event != EVENT_MOKOSH_GRANT_CHANGED {
         return Err(AppError::BadRequest(format!(
-            "Unsupported event {:?}",
+            "Unsupported event `{}`.",
             payload.event
         )));
     }
@@ -298,7 +298,7 @@ pub async fn mokosh_grant_changed(
         "revoked" => Some(payload.at),
         other => {
             return Err(AppError::BadRequest(format!(
-                "Unknown grant state {other:?}"
+                "Unknown grant state `{other}`."
             )));
         }
     };

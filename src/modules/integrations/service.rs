@@ -426,7 +426,7 @@ fn resolve_capabilities(
     for raw in requested {
         let Some(capability) = Capability::from_str(raw) else {
             return Err(AppError::BadRequest(format!(
-                "{raw:?} is not a capability. The capabilities are: {}",
+                "`{raw}` is not a capability. The capabilities are: {}",
                 Capability::ALL
                     .iter()
                     .map(|c| c.as_str())
