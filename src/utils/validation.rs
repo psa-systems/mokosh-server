@@ -408,16 +408,6 @@ pub fn slugify(s: &str) -> String {
         .join("-")
 }
 
-/// Sanitize HTML content to prevent XSS
-pub fn sanitize_html(html: &str) -> String {
-    // Basic HTML entity encoding for XSS prevention
-    html.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
-}
-
 /// Truncate a string to a maximum length, adding ellipsis if needed.
 ///
 /// `max_len` is a byte budget. Slicing at an arbitrary byte index panics when
@@ -649,12 +639,6 @@ mod tests {
         assert_eq!(slugify("Hello World!"), "hello-world");
         assert_eq!(slugify("  Multiple   Spaces  "), "multiple-spaces");
         assert_eq!(slugify("Special@#Characters"), "special-characters");
-    }
-
-    #[test]
-    fn test_sanitize_html() {
-        assert_eq!(sanitize_html("<script>"), "&lt;script&gt;");
-        assert_eq!(sanitize_html("\"test\""), "&quot;test&quot;");
     }
 
     #[test]
