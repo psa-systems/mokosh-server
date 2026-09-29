@@ -32,8 +32,8 @@ just check-single-build    # fail if a compiling workflow builds the same tree t
 just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
 just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
-just install-hooks         # install the git pre-commit hook -> runs `just pre-commit`
-just pre-commit            # check.yml's cargo steps only: fmt/clippy/compile/unit/doc, in the dev container
+just install-hooks         # install the git pre-commit hook -> runs `just pre-commit` (from common)
+just pre-commit            # check.yml's cargo steps except doc tests: fmt/clippy/compile/unit, in the dev container
 just build                 # cargo build --release --bins
 just migrate-run           # sqlx migrate run against $DATABASE_URL
 just migrate-create <name> # new migration in migrations/
@@ -41,7 +41,7 @@ just check-docker          # validate OCI image builder stage (NOT part of `just
 just build-docker          # build production OCI image (oci-build/Dockerfile)
 ```
 
-`just check` and `just pre-commit` are complements: together they cover every step of `.forgejo/workflows/check.yml`, and neither covers it alone. `docs/dev-docs/local-vs-ci-checks.md` maps the workflow onto the recipes step by step and states why `check-docker`, `test-integration`, `verify-demo` and `test-e2e` stay outside the umbrella recipe (PMS-851). Adding a step to `check.yml` means adding the matching recipe to `just check` (or `just pre-commit`), the row in that file, and its line in `docs/recipes.md`.
+`just check` and `just pre-commit` are complements: together they cover every step of `.forgejo/workflows/check.yml` except its doc tests, and neither covers it alone. `pre-commit`, `install-hooks` and `create-release` come from `psa-systems/common`, vendored as the `common` submodule and imported by the root justfile (PMS-786), so a fresh clone needs `git submodule update --init` before `just` resolves. They are configured through the variables at the top of the justfile, never by redefining the recipe: `check-justfile` fails the build on a local copy of a protected recipe, which is how a new shared guard reaches every repo at once. The one thing the shared recipe cannot express is this repo's second test invocation, so `cargo test --workspace --doc` is CI-only now (PC-70 asks common for it; `docs/dev-docs/local-vs-ci-checks.md` carries the detail). `docs/dev-docs/local-vs-ci-checks.md` maps the workflow onto the recipes step by step and states why `check-docker`, `test-integration`, `verify-demo` and `test-e2e` stay outside the umbrella recipe (PMS-851). Adding a step to `check.yml` means adding the matching recipe to `just check` (or `just pre-commit`), the row in that file, and its line in `docs/recipes.md`.
 
 Single test: `cargo test -p <crate> <test_name>` (workspace), e.g. `cargo test -p mokosh-server utils::totp::tests::rfc6238_vector`.
 

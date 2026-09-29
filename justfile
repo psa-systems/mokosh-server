@@ -1,50 +1,65 @@
 # General Task Runner
+#
+# The shared recipes live in psa-systems/common, vendored as the ./common
+# submodule (PMS-786). After cloning this repo run `git submodule update --init`
+# so the import below resolves. To pull a newer common: update the submodule and
+# commit the new gitlink.
+#
+# `default` below must stay the FIRST recipe defined in THIS file: just picks
+# the default recipe by source order and never an imported one, so any recipe
+# added later goes BELOW it. The import comes first so that our own definitions,
+# being later, win for the names we deliberately keep (`dev-clean`, `ensure-env`,
+# `check-docker`, `build-docker`, `test`); `set allow-duplicate-recipes` is what
+# makes that override legal rather than a parse error.
 
 compose_file := "compose.dev.yml"
+
+# -- psa-systems/common configuration (PMS-786) -----------------------------
+# Every value here reproduces what this repo's forked `pre-commit` and
+# `create-release` recipes did before they were deleted. common/README.md is the
+# authority for each variable; the notes are why THIS repo's value differs from
+# the default.
+
+# Root `package.name`, which `release_crate` defaults to for the `cargo update
+# --package` that syncs Cargo.lock on a release.
+app := "mokosh-server"
+
+# The dev compose service the checks run in. Ours is `server`, not the `app`
+# default, and a wrong value fails naming the services that do exist.
+compose_service := "server"
+
+# `--workspace`, and deliberately NOT common's default `--all-features`: the
+# crate is feature-gated (`multi-tenant`, `server`) and check.yml compiles the
+# default set, so `--all-features` would have the hook and CI disagree.
+clippy_args := "--workspace --all-targets -- -D warnings"
+
+# The forked recipe ran `cargo check`, not `cargo build`: this crate's binaries
+# are expensive to link and check.yml's compile step is a check too.
+compile_step := "check"
+compile_args := "--workspace --all-targets"
+
+# `--workspace --lib` is what the forked recipe ran for unit tests. Its SECOND
+# test step, `cargo test --workspace --doc`, has no expression here: common's
+# pre-commit runs exactly one `cargo test {{ test_args }}`, and cargo refuses
+# `--lib --doc` in one invocation. Doc tests therefore run in CI (check.yml's
+# `Doc tests` step) and no longer in the hook; PC-70 asks common for the second
+# invocation, and this line goes back to carrying both when it lands.
+test_args := "--workspace --lib"
+
+# `dev_extra_volumes` is deliberately unset: it configures common's `dev-clean`,
+# and this repo keeps its own (it removes five named volumes and prints a
+# per-volume line). A value here would be read by nothing.
+
+# The local `default`, `dev-clean`, `ensure-env`, `check-docker`, `build-docker`
+# and `test` below intentionally shadow common's; last definition wins.
+set allow-duplicate-recipes := true
+
+import 'common/common.just'
 
 # List available recipes
 default:
     @just --list
 
-# -- Hooks ------------------------------------------------------------------
-
-# Install the git pre-commit hook (run once per fresh clone). Writes a stub at .git/hooks/pre-commit that execs `just pre-commit`. Bypass with `git commit --no-verify`.
-[group: 'hooks']
-install-hooks:
-    #!/usr/bin/env nu
-    let hook = ".git/hooks/pre-commit"
-    # Remove first so a leftover symlink from an older install does not get
-    # written through to its target file. `try` swallows the not-found case.
-    try { rm $hook }
-    "#!/usr/bin/env sh\nexec just pre-commit\n" | save $hook
-    ^chmod +x $hook
-    print $"Wrote ($hook) -> just pre-commit"
-
-# The cargo half of check.yml (fmt, clippy, compile, unit tests, doc tests) run
-# in the dev compose `server` container. It does NOT run check.yml's repo guard
-# scripts; `just check` runs those, so the two together cover check.yml and
-# neither covers it alone (PMS-851; full mapping in
-# docs/dev-docs/local-vs-ci-checks.md). The `--all-targets` clippy/check steps
-# compile the tests/*.rs integration binaries too (PMS-640 mounts ./tests into
-# the `server` service), so a harness-breaking signature change fails here
-# rather than only in CI. The Postgres-backed suite is still NOT run here
-# (compile-only); use `just test-integration` (mirrors integration.yml) to
-# actually run it. PMS-267.
-[doc("Run check.yml's fast, database-free cargo checks inside the dev compose `server` container.")]
-[group: 'hooks']
-pre-commit: ensure-env
-    #!/usr/bin/env nu
-    print "\n[pre-commit] cargo fmt --all --check"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo fmt --all --check
-    print "\n[pre-commit] cargo clippy --workspace --all-targets -- -D warnings"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo clippy --workspace --all-targets -- -D warnings
-    print "\n[pre-commit] cargo check --workspace --all-targets"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo check --workspace --all-targets
-    print "\n[pre-commit] unit tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --workspace --lib
-    print "\n[pre-commit] doc tests"
-    ^docker compose --file {{ compose_file }} run --rm --no-deps -e SQLX_OFFLINE=true server cargo test --workspace --doc
-    print "\n[pre-commit] all checks passed"
 
 # -- Checks ----------------------------------------------------------------------
 
@@ -664,108 +679,3 @@ dev-clean-all: dev-clean
     }
     docker buildx prune --force
     print "dev-clean-all: done"
-
-# -- Release ------------------------------------------------------------------
-
-# Create a release: bump major (vx.0.0), minor (v0.x.0), or hotfix (v0.0.x), push the branch, and open the PR via fj.
-# After the PR merges, the create-release workflow creates the tag and release automatically.
-[doc("Bump the version (major|minor|hotfix), push the release branch, and open the release PR.")]
-[group: 'release']
-create-release bump: ensure-env
-    #!/usr/bin/env nu
-    let bump = "{{ bump }}"
-
-    # Abort if there are uncommitted changes
-    let status = git status --porcelain | str trim
-    if ($status | is-not-empty) {
-        print $"(ansi red)Working tree is dirty. Please stash or commit your changes first.(ansi reset)"
-        exit 1
-    }
-
-    # Switch to main if not already there
-    let branch = git branch --show-current | str trim
-    if $branch != "main" {
-        print $"Switching from ($branch) to main..."
-        git checkout main
-    }
-
-    # Pull latest changes
-    git pull --rebase origin main
-
-    let current = (open Cargo.toml | get package.version | split row "." | each { into int })
-    let next = match $bump {
-        "major" => [$"($current.0 + 1)" "0" "0"],
-        "minor" => [$"($current.0)" $"($current.1 + 1)" "0"],
-        "hotfix" => [$"($current.0)" $"($current.1)" $"($current.2 + 1)"],
-        _ => { print $"(ansi red)Usage: just create-release <major|minor|hotfix>(ansi reset)"; exit 1 }
-    }
-    let bare = ($next | str join ".")
-    let tag = $"v($bare)"
-    let release_branch = $"release/($tag)"
-
-    git checkout -b $release_branch
-    # Targeted version bump: rewrite only the `version = "..."` line so the
-    # Cargo.toml comments and PMS docs survive. Round-tripping the whole file
-    # through `to toml` stripped every comment on each release. Stage through a
-    # tempfile + external mv so we never reach for `save --force`, per the repo
-    # no-force safety policy.
-    let toml_tmp = (mktemp --tmpdir --suffix .toml)
-    open Cargo.toml --raw | str replace --regex '(?m)^version = "[^"]*"' $'version = "($bare)"' | save --append $toml_tmp
-    ^mv $toml_tmp Cargo.toml
-    # PMS-642: sync Cargo.lock to the bumped version so the lock never drifts
-    # from Cargo.toml (a --locked build otherwise fails, and every build
-    # re-dirties the lock, masking real lock changes in diffs). Dev boxes have no
-    # host cargo, so run the one cargo step in the dev `server` container.
-    # `--workspace` limits the change to the workspace members' own versions - no
-    # transitive dependency churn.
-    ^docker compose --file {{ compose_file }} run --rm --no-deps server cargo update --workspace
-    git add Cargo.toml Cargo.lock
-    # PMS-1411: --no-verify skips the local pre-commit hook (fmt/clippy/check/test,
-    # ~14 of this recipe's ~15 minutes) because this commit touches only the
-    # version line in Cargo.toml and its Cargo.lock counterpart; check.yml
-    # re-verifies the identical tree on the release PR moments later.
-    git commit --signoff --no-verify --message $"Release ($tag)"
-
-    # Push release branch
-    git push --set-upstream origin $release_branch
-
-    # Open the release PR via fj. Body lives in a tempfile so the
-    # changelog can grow later without inline escaping pain.
-    let body_file = (mktemp --tmpdir --suffix .md)
-    [
-        $"Automated release PR for ($tag)."
-        ""
-        $"After merge, `.forgejo/workflows/create-release.yml` tags and publishes ($tag) to the Generic Packages registry."
-    ] | str join "\n" | save --force $body_file
-    let fj_result = (^fj --host dev.a8n.run pr create $"Release ($tag)" --body-file $body_file | complete)
-    rm $body_file
-    if $fj_result.exit_code != 0 {
-        print $"(ansi red)fj pr create failed(ansi reset)"
-        print $fj_result.stderr
-        exit 1
-    }
-
-    # `fj pr create` prints `created pull request #N: <title>` on success.
-    # Parse the number out and build the PR URL from `origin` so the user
-    # gets a clickable link instead of just the fj line.
-    let pr_num = (
-        $fj_result.stdout
-        | str trim
-        | parse --regex 'created pull request #(?P<num>\d+)'
-        | get num.0?
-    )
-    let remote = (git remote get-url origin | str trim)
-    let base_url = if ($remote | str starts-with "ssh://") {
-        $remote | str replace "ssh://git@" "https://" | str replace "git.a8n.run" "dev.a8n.run" | str replace ".git" ""
-    } else {
-        $remote | str replace --regex "git@([^:]+):" "https://$1/" | str replace "git.a8n.run" "dev.a8n.run" | str replace ".git" ""
-    }
-    print $"(ansi green)Pushed ($release_branch)(ansi reset)"
-    if ($pr_num | is-not-empty) {
-        print $"PR: ($base_url)/pulls/($pr_num)"
-    } else {
-        # fj output format drifted; fall back to whatever it said.
-        print $"fj output: ($fj_result.stdout | str trim)"
-    }
-    print $"After merging, the create-release workflow will tag and release ($tag) automatically."
-

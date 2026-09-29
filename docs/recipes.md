@@ -5,8 +5,8 @@ Every task in this repository runs through [`just`](https://github.com/casey/jus
 ```nu
 # General
 just                        # the `default` recipe: list every recipe
-just install-hooks          # install the git pre-commit hook (once per fresh clone) -> runs `just pre-commit`
-just pre-commit             # check.yml's cargo checks (fmt/clippy/compile/unit/doc) in the dev `server` container
+just install-hooks          # install the git pre-commit hook (once per fresh clone) -> runs `just pre-commit` [from common]
+just pre-commit             # check.yml's cargo checks except doc tests (fmt/clippy/compile/unit) in the dev `server` container [from common]
 
 # Dev stack
 just dev [args]             # start the Traefik-routed dev stack (args go to `docker compose up`, e.g. --build --detach)
@@ -63,11 +63,11 @@ just migrate-run            # apply pending migrations against $DATABASE_URL
 just migrate-create <name>  # create a new migration file
 
 # Release
-just create-release <bump>  # bump version (major|minor|hotfix), push release branch, print PR link
+just create-release <bump>  # bump version (major|minor|hotfix), push release branch, print PR link [from common]
 ```
 
 `ensure-env` is the one `[private]` recipe: it generates `.env` on first run and is a dependency of the recipes that need it, so it never has to be run by hand.
 
-`just check` plus `just pre-commit` together cover every step of `.forgejo/workflows/check.yml`; neither covers it alone. [`dev-docs/local-vs-ci-checks.md`](dev-docs/local-vs-ci-checks.md) maps the workflow onto the recipes step by step and states why `check-docker`, `test-integration`, `verify-demo` and `test-e2e` stay outside the umbrella.
+`just check` plus `just pre-commit` together cover every step of `.forgejo/workflows/check.yml` except its doc tests, which are CI-only since PMS-786; neither covers it alone. Recipes marked `[from common]` are imported from the `psa-systems/common` submodule rather than defined here, and are configured through the variables at the top of the justfile; `check-justfile` fails the build if one is redefined locally. [`dev-docs/local-vs-ci-checks.md`](dev-docs/local-vs-ci-checks.md) maps the workflow onto the recipes step by step and states why `check-docker`, `test-integration`, `verify-demo` and `test-e2e` stay outside the umbrella.
 
 Release mechanics, from the version bump to the published tag, are on [`architecture.md`](architecture.md).
