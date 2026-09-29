@@ -1353,6 +1353,222 @@ mod tests {
         );
     }
 
+    /// Find every call to a `::<method>(` (the `::` excludes the method's
+    /// own `fn` definition in this file, which is never preceded by `::`)
+    /// and return its 1-based line number together with the byte offset of
+    /// the call's opening `(`.
+    fn find_calls(source: &str, method: &str) -> Vec<(usize, usize)> {
+        let marker = format!("::{method}(");
+        let mut out = Vec::new();
+        let mut search = 0;
+        while let Some(offset) = source[search..].find(marker.as_str()) {
+            let marker_start = search + offset;
+            let open_paren = marker_start + marker.len() - 1;
+            let line = source[..marker_start].matches('\n').count() + 1;
+            out.push((line, open_paren));
+            search = open_paren + 1;
+        }
+        out
+    }
+
+    /// Split the top-level, comma-separated arguments of a call whose `(`
+    /// sits at `open_paren`, honoring nesting (parens/brackets/braces) and
+    /// string literals (with `\`-escapes) so a nested `format!(...)` or a
+    /// comma inside a string never splits an argument early. Every skip
+    /// below lands on an ASCII delimiter, which is always a char boundary,
+    /// so slicing `source` at these byte offsets is safe even with non-ASCII
+    /// message text.
+    fn parse_call_args(source: &str, open_paren: usize) -> Vec<String> {
+        let bytes = source.as_bytes();
+        let mut i = open_paren + 1;
+        let mut depth = 0i32;
+        let mut arg_start = i;
+        let mut args = Vec::new();
+        while let Some(&b) = bytes.get(i) {
+            match b {
+                b'"' => {
+                    i += 1;
+                    while let Some(&c) = bytes.get(i) {
+                        i += if c == b'\\' { 2 } else { 1 };
+                        if c == b'"' {
+                            break;
+                        }
+                    }
+                }
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b')' | b']' | b'}' if depth > 0 => {
+                    depth -= 1;
+                    i += 1;
+                }
+                b')' => {
+                    let text = source[arg_start..i].trim();
+                    if !text.is_empty() {
+                        args.push(text.to_string());
+                    }
+                    break;
+                }
+                b',' if depth == 0 => {
+                    args.push(source[arg_start..i].trim().to_string());
+                    i += 1;
+                    arg_start = i;
+                }
+                _ => i += 1,
+            }
+        }
+        args
+    }
+
+    /// The raw text between the quotes of a plain string-literal argument,
+    /// or of the first argument to a `format!(...)` argument, escapes left
+    /// as-is (the same convention `variant_literals` already uses). `None`
+    /// for anything else (a variable, a `.to_string()` on one, etc.), which
+    /// a scanner reads as "not statically checkable here" rather than "ok".
+    fn call_literal_content(arg: &str) -> Option<String> {
+        fn raw_string_literal(arg: &str) -> Option<String> {
+            let bytes = arg.as_bytes();
+            if bytes.first() != Some(&b'"') {
+                return None;
+            }
+            let mut i = 1;
+            while let Some(&b) = bytes.get(i) {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    return Some(arg[1..i].to_string());
+                }
+                i += 1;
+            }
+            None
+        }
+
+        let arg = arg.trim();
+        raw_string_literal(arg)
+            .or_else(|| raw_string_literal(arg.strip_prefix("format!(")?.trim_start()))
+    }
+
+    /// Whether any `{...}` format placeholder in a literal carries a `:?`
+    /// (Debug) spec, e.g. `{:?}` or a named/positional capture like
+    /// `{other:?}` or `{0:?}`. A plain `.contains("{:?}")` misses every
+    /// named or positional case, which is most of them in practice.
+    fn debug_formats_a_placeholder(literal: &str) -> bool {
+        let mut in_brace = false;
+        let mut brace_start = 0;
+        for (i, c) in literal.char_indices() {
+            match c {
+                '{' => {
+                    in_brace = true;
+                    brace_start = i;
+                }
+                '}' if in_brace => {
+                    in_brace = false;
+                    if literal[brace_start..i].contains(":?") {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// A `validation_field`/`validation_required` literal opens with a
+    /// lowercase letter, or with a fragment that is not English prose at
+    /// all: an interpolated value (`{`), a backtick-quoted term, an
+    /// identifier (`_`), an index (`[`), or a qualified path (`.`). Mirrors
+    /// `opens_with_a_fragment`'s allowance for the same reason: a message
+    /// that opens with a submitted value rather than a word has no case to
+    /// police.
+    fn validation_message_opens_correctly(literal: &str) -> bool {
+        if literal
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+        {
+            return true;
+        }
+        let first_word = literal.split(' ').next().unwrap_or_default();
+        ['{', '`', '_', '[', '.']
+            .iter()
+            .any(|c| first_word.contains(*c))
+    }
+
+    /// PMS-1419: the message-convention enforcement the doc comment on
+    /// `AppError::validation_field` describes but nothing checked. Every
+    /// literal argument passed to `validation_field` or `validation_required`
+    /// in shipping code (the test module is cut away, same as
+    /// `without_test_module`'s other users) must open lowercase-or-a-value,
+    /// never end with a trailing period, and never carry `{:?}` (a Debug
+    /// leak into a 422 body). `validation_must_be`'s only literal is the
+    /// `expected` value plugged into its own "must be {expected}" template,
+    /// which is compliant by construction, so it is not scanned here.
+    #[test]
+    fn validation_field_messages_follow_the_convention() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(
+            !files.is_empty(),
+            "no sources found under {}",
+            src.display()
+        );
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read source file");
+            let source = without_test_module(&source);
+
+            let mut check = |label: &str, line: usize, literal: &str| {
+                if debug_formats_a_placeholder(literal) {
+                    offenders.push(format!(
+                        "{}:{line}: {label} argument {literal:?} interpolates a placeholder \
+                         with :? (Debug), not {{}} (Display)",
+                        file.display()
+                    ));
+                }
+                if literal.ends_with('.') {
+                    offenders.push(format!(
+                        "{}:{line}: {label} argument {literal:?} ends with a trailing period",
+                        file.display()
+                    ));
+                }
+                if !validation_message_opens_correctly(literal) {
+                    offenders.push(format!(
+                        "{}:{line}: {label} argument {literal:?} does not open with a \
+                         lowercase letter or an interpolated/identifier fragment",
+                        file.display()
+                    ));
+                }
+            };
+
+            for (line, open_paren) in find_calls(source, "validation_field") {
+                let args = parse_call_args(source, open_paren);
+                if let Some(field) = args.first().and_then(|a| call_literal_content(a)) {
+                    check("field", line, &field);
+                }
+                if let Some(message) = args.get(1).and_then(|a| call_literal_content(a)) {
+                    check("message", line, &message);
+                }
+            }
+            for (line, open_paren) in find_calls(source, "validation_required") {
+                let args = parse_call_args(source, open_paren);
+                if let Some(field) = args.first().and_then(|a| call_literal_content(a)) {
+                    check("field", line, &field);
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a validation_field/validation_required call site does not follow the message \
+             convention documented on AppError::validation_field:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// Cut a file at its top-level `#[cfg(test)]` module so a scanner sees
     /// only shipping call sites. Every `#[cfg(test)]` in `src/` is at column 0
     /// and no file has two, so the first one is the boundary.
@@ -1506,6 +1722,43 @@ mod tests {
             offenders.is_empty(),
             "these variants render the call-site string verbatim (PMS-771), so each \
              string must be a complete sentence and must not restate the code:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// PMS-1419: a `BadRequest` message reaches the client verbatim (the
+    /// same PMS-771 contract `verbatim_variant_arguments_are_whole_sentences`
+    /// enforces above), so an interpolated value in it must go through
+    /// Display (`{}`), never Debug (`{:?}`, `{other:?}`, ...): Debug leaks
+    /// Rust's own quoting and braces into a 400 body a caller has to parse.
+    #[test]
+    fn bad_request_messages_never_debug_format_a_value() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(
+            !files.is_empty(),
+            "no sources found under {}",
+            src.display()
+        );
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read source file");
+            for (line, literal) in variant_literals(without_test_module(&source), "BadRequest") {
+                if debug_formats_a_placeholder(&literal) {
+                    offenders.push(format!(
+                        "{}:{line}: BadRequest({literal:?}) interpolates a placeholder with \
+                         :? (Debug), not {{}} (Display)",
+                        file.display()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a BadRequest argument renders verbatim in the 400 response body, so it must \
+             never Debug-format an interpolated value:\n{}",
             offenders.join("\n")
         );
     }

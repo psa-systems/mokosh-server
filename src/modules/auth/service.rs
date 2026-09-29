@@ -1572,7 +1572,7 @@ impl AuthService {
         if request.new_password != request.confirm_password {
             return Err(AppError::validation_field(
                 "confirm_password",
-                "Passwords do not match",
+                "passwords do not match",
             ));
         }
 
@@ -1700,7 +1700,7 @@ impl AuthService {
         if request.new_password != request.confirm_password {
             return Err(AppError::validation_field(
                 "confirm_password",
-                "Passwords do not match",
+                "passwords do not match",
             ));
         }
 
@@ -1726,7 +1726,7 @@ impl AuthService {
         if !verify_password(&request.current_password, &current_hash).await? {
             return Err(AppError::validation_field(
                 "current_password",
-                "Current password is incorrect",
+                "current password is incorrect",
             ));
         }
 
