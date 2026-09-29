@@ -2968,10 +2968,7 @@ impl ContactService {
             .filter(|e| !e.is_empty())
             .is_none()
         {
-            return Err(AppError::validation_field(
-                "email",
-                "Email address is required",
-            ));
+            return Err(AppError::validation_required("email"));
         }
         // PMS-402: only verify a CRM company exists when one is linked. A
         // freeform or company-less contact skips the existence check.

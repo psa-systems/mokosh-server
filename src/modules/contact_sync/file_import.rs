@@ -320,7 +320,7 @@ impl ContactSyncService {
         ctx: &AuditCtx,
     ) -> AppResult<UploadedFile> {
         if bytes.is_empty() {
-            return Err(AppError::validation_field("file", "The file is empty."));
+            return Err(AppError::validation_field("file", "the file is empty"));
         }
         if bytes.len() as u64 > max_upload_bytes() {
             return Err(oversized_upload_error("vCard file", max_upload_bytes()));
@@ -333,7 +333,7 @@ impl ContactSyncService {
         if parsed.cards == 0 {
             return Err(AppError::validation_field(
                 "file",
-                "This file holds no contacts: it has no BEGIN:VCARD. Export the contacts as a vCard (.vcf) file and upload that.",
+                "holds no contacts: it has no BEGIN:VCARD. Export the contacts as a vCard (.vcf) file and upload that",
             ));
         }
         let problems = |list: &[CardProblem]| serde_json::to_value(list).unwrap_or_default();

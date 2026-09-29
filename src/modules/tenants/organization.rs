@@ -74,19 +74,15 @@ pub fn organization_update(request: &OrganizationProfileRequest) -> AppResult<Up
 /// The organisation name: required, and bounded by the column it lands in
 /// rather than by the branding table (this one is `tenants.name`).
 fn org_name(value: Option<&str>) -> AppResult<String> {
-    let name =
-        clean(value).ok_or_else(|| AppError::validation_field("name", "`name` is required"))?;
+    let name = clean(value).ok_or_else(|| AppError::validation_required("name"))?;
     if name.chars().count() > MAX_ORG_NAME {
         return Err(AppError::validation_field(
             "name",
-            format!("`name` must be at most {MAX_ORG_NAME} characters"),
+            format!("must be at most {MAX_ORG_NAME} characters"),
         ));
     }
     if name.chars().any(char::is_control) {
-        return Err(AppError::validation_field(
-            "name",
-            "`name` must be a single line",
-        ));
+        return Err(AppError::validation_field("name", "must be a single line"));
     }
     Ok(name)
 }
@@ -94,8 +90,7 @@ fn org_name(value: Option<&str>) -> AppResult<String> {
 /// A required contact field, checked against its branding rule and reported
 /// against the name the caller sent.
 fn required(field: &str, key: &str, value: Option<&str>) -> AppResult<Value> {
-    let value = clean(value)
-        .ok_or_else(|| AppError::validation_field(field, format!("`{field}` is required")))?;
+    let value = clean(value).ok_or_else(|| AppError::validation_required(field))?;
     checked(field, key, Some(value))
 }
 

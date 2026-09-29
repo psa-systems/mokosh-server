@@ -80,7 +80,7 @@ impl InvitationsService {
             if !team_exists {
                 return Err(AppError::validation_field(
                     "team_id",
-                    "Team not found in this tenant.",
+                    "does not exist in this tenant",
                 ));
             }
         }

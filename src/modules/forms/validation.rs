@@ -46,7 +46,7 @@ pub fn validate_submission(
     let Some(object) = payload.as_object() else {
         return Err(AppError::validation_field(
             "payload",
-            "Submission payload must be a JSON object",
+            "must be a JSON object",
         ));
     };
 
