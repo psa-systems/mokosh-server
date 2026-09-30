@@ -164,6 +164,25 @@ single-provider slot cannot itself produce; it is derived from the shape so the 
 without another API-shape change. Wiring the report into an HTTP handler or CLI is the follow-up: PMS-989 renders
 the admin endpoint and PMS-1012 the CLI, and PMS-984 is the data model each of those calls into.
 
+## Putting one value in the declared provider
+
+`mokosh-server provider-set --secret <NAME> --from-env <VAR>` (PMS-1441) writes one application-tier secret into
+the provider this deployment declares, reads it back from a freshly built provider, and compares. It is the
+command for a value that has no previous home, such as the host's Google OAuth client on a deployment that has
+never had one, where there is nothing to migrate from.
+
+Three properties are the design rather than conveniences. The value arrives by the NAME of an environment
+variable, because a value passed as an argument is in `ps`, in shell history and in a one-off container's argv.
+There is no `--to`, because a governed secret held by a provider the deployment did not declare is `Misplaced`,
+which ends boot, so a flag aiming elsewhere would be a flag for producing that state; a deployment that wants the
+value somewhere else changes what it declares. And the read-back re-builds the provider instead of re-reading the
+handle just written, because the database provider caches the plaintext on a successful write and reading it back
+would only prove the cache agrees with itself.
+
+A read-only declared provider (`environment`) is refused with the `{NAME}_FILE` route named, since a process
+cannot set a variable for its own next boot. A restart is required before the value is served: `app_secrets`
+resolves once per process.
+
 ## Moving a value to a different provider
 
 The order matters, and the tooling enforces the parts that are dangerous to get wrong. The three commands land

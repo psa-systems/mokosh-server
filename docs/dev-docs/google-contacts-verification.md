@@ -162,8 +162,23 @@ Done once per deployment, by whoever runs it. A tenant never does this, which is
    the sync needs.
 5. Clients, Create client, application type **Web application**, with the redirect URI above under Authorized
    redirect URIs. No JavaScript origins: the code exchange happens on the server.
-6. Put the id and the secret in the provider `SECRET_BACKEND` names, under the key names in step 0. Both or neither:
-   one without the other is a boot error naming the missing half.
+6. Put the id and the secret in the provider this deployment DECLARES, one command each (PMS-1441). Both or
+   neither: one without the other is a boot error naming the missing half.
+
+   ```
+   MOKOSH_SECRET_INPUT=<the id>     mokosh-server provider-set --secret GOOGLE_CONTACTS_CLIENT_ID     --from-env MOKOSH_SECRET_INPUT
+   MOKOSH_SECRET_INPUT=<the secret> mokosh-server provider-set --secret GOOGLE_CONTACTS_CLIENT_SECRET --from-env MOKOSH_SECRET_INPUT
+   mokosh-server provider-status --text
+   ```
+
+   The value goes in by the NAME of a variable, never as an argument, so it stays out of `ps`, shell history and
+   a one-off container's argv. `provider-status` must then show both keys held and served by the declared
+   provider; anything else means stop. Restart before expecting it to work: the pair is resolved once at boot.
+
+   Which provider is declared is not a choice made here. `SECRET_BACKEND` unset means the hosting profile's
+   default, which for `saas` is the DATABASE, not Infisical, on every deployment today (PMS-1440). Creating the
+   entries in Infisical instead would leave them found by the boot survey and not by the reader, which is
+   `Misplaced` and refuses to start. Run `provider-status` first if unsure; it names the declared provider.
 
 Two properties of the Google application, which belong to this procedure rather than to the code:
 

@@ -14,6 +14,10 @@
 //!   reset, or remove the richer showcase demo dataset (PMS-620), fail-closed
 //!   against any tenant not explicitly marked `is_showcase`.
 //!
+//! - `provider-status` / `provider-set` / `provider-migrate` / `provider-purge`
+//!   and `verify-providers` - the operator surface over the provider seams
+//!   (PMS-1012, PMS-1013, PMS-1441), in [`providers`] and [`verify`].
+//!
 //! The former `clients register` subcommand (which registered an OAuth client
 //! in `mokosh_auth.oauth_clients`) was removed with mokosh-auth in PMS-295;
 //! bunyip is now the sole OP and owns its own client registry.
@@ -54,6 +58,7 @@ pub fn is_subcommand(name: &str) -> bool {
             | "showcase-refresh"
             | "showcase-teardown"
             | "provider-status"
+            | "provider-set"
             | "provider-migrate"
             | "provider-purge"
             | "verify-providers"
@@ -72,6 +77,9 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
         Some("showcase-refresh") => run_showcase("showcase-refresh", args).await,
         Some("showcase-teardown") => run_showcase("showcase-teardown", args).await,
         Some("provider-status") => providers::run_provider_status(args)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}")),
+        Some("provider-set") => providers::run_provider_set(args)
             .await
             .map_err(|e| anyhow::anyhow!("{e}")),
         Some("provider-migrate") => providers::run_provider_migrate(args)
