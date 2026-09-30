@@ -269,6 +269,9 @@ struct PurgeArgs {
     mode: OutputMode,
 }
 
+/// `Debug` is safe here and is derived so the parser's refusals are assertable:
+/// every field is a NAME. The value is never parsed into this struct.
+#[derive(Debug)]
 struct SetArgs {
     secret: GovernedSecret,
     /// The NAME of the environment variable holding the value, never the
@@ -901,57 +904,21 @@ pub async fn run_provider_set(args: &[String]) -> AppResult<()> {
     let providers = build_secret_providers(&db, encryption_key).await?;
     let selection = current_secret_selection()?;
     let declared = selection.provider;
-
-    let target = providers[declared.index()].clone().ok_or_else(|| {
-        AppError::Configuration(format!(
-            "provider-set: the declared {declared} app-secret provider could not be built, so \
-             there is nowhere to write {}. Fix its construction inputs first; \
-             `provider-status --text` reports which providers are reachable.",
-            parsed.secret
-        ))
-    })?;
-
-    if !target.is_writable() {
-        return Err(AppError::Configuration(format!(
-            "provider-set: the declared provider is {declared}, which cannot be written by this \
-             process. Point {}_FILE at a file holding the value, or set SECRET_BACKEND to a \
-             provider that accepts writes ({}).",
-            parsed.secret,
-            AppSecretProviderKind::LEGAL_VALUES
-        )));
-    }
-
     let secret = parsed.secret;
-    let write_target = target.clone();
-    move_value_with_readback(
-        &plain,
-        move |written| async move { write_target.set(secret, written).await },
-        || async {
-            // Re-BUILD rather than re-read the handle just written to. The
-            // database provider caches the plaintext on a successful write, so
-            // reading the same handle would prove the cache agrees with itself
-            // and say nothing about the row. A fresh build re-reads the row (or
-            // re-fetches from Infisical), which is what the next boot will do.
-            let fresh = build_secret_providers(&db, encryption_key).await?;
-            Ok(fresh[declared.index()]
-                .as_ref()
-                .and_then(|provider| provider.get(secret)))
-        },
-    )
+
+    let report = set_one_secret(secret, &plain, selection, &providers, || async {
+        // Re-BUILD rather than re-read the handle just written to. The database
+        // provider caches the plaintext on a successful write, so reading the
+        // same handle would prove the cache agrees with itself and say nothing
+        // about the row. A fresh build re-reads the row (or re-fetches from
+        // Infisical), which is what the next boot will do.
+        let fresh = build_secret_providers(&db, encryption_key).await?;
+        Ok(fresh[declared.index()]
+            .as_ref()
+            .and_then(|provider| provider.get(secret)))
+    })
     .await?;
 
-    let report = SetReport {
-        secret: secret.name().to_string(),
-        provider: declared.as_str().to_string(),
-        declared_by: match selection.source {
-            crate::utils::deployment::EnablementSource::Profile => {
-                "the hosting profile's default".to_string()
-            }
-            crate::utils::deployment::EnablementSource::Explicit => "SECRET_BACKEND".to_string(),
-        },
-        outcome: "written, read back and compared".to_string(),
-        restart_required: true,
-    };
     redaction::assert_no_leak(&report);
     match parsed.mode {
         OutputMode::Json => println!(
@@ -963,6 +930,65 @@ pub async fn run_provider_set(args: &[String]) -> AppResult<()> {
         OutputMode::Text => print!("{}", render_set_text(&report)),
     }
     Ok(())
+}
+
+/// The decision and the write, split from the wiring so every refusal is
+/// reachable from a unit test with in-memory providers: an unbuildable declared
+/// provider and a read-only one are the two cases a deployment actually hits,
+/// and neither is reproducible through `run_provider_set` without a database.
+///
+/// `read_back` reads the target LIVE and is the caller's business, because what
+/// "live" means differs by provider and the production caller has to defeat a
+/// cache to get it.
+async fn set_one_secret<ReadBack, Fut>(
+    secret: GovernedSecret,
+    plain: &str,
+    selection: AppSecretsSelection,
+    providers: &[Option<Arc<dyn AppSecretProvider>>],
+    read_back: ReadBack,
+) -> AppResult<SetReport>
+where
+    ReadBack: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = AppResult<Option<String>>>,
+{
+    let declared = selection.provider;
+    let target = providers[declared.index()].clone().ok_or_else(|| {
+        AppError::Configuration(format!(
+            "provider-set: the declared {declared} app-secret provider could not be built, so \
+             there is nowhere to write {secret}. Fix its construction inputs first; \
+             `provider-status --text` reports which providers are reachable."
+        ))
+    })?;
+
+    if !target.is_writable() {
+        return Err(AppError::Configuration(format!(
+            "provider-set: the declared provider is {declared}, which cannot be written by this \
+             process. Point {secret}_FILE at a file holding the value, or set SECRET_BACKEND to \
+             a provider that accepts writes ({}).",
+            AppSecretProviderKind::LEGAL_VALUES
+        )));
+    }
+
+    let write_target = target.clone();
+    move_value_with_readback(
+        plain,
+        move |written| async move { write_target.set(secret, written).await },
+        read_back,
+    )
+    .await?;
+
+    Ok(SetReport {
+        secret: secret.name().to_string(),
+        provider: declared.as_str().to_string(),
+        declared_by: match selection.source {
+            crate::utils::deployment::EnablementSource::Profile => {
+                "the hosting profile's default".to_string()
+            }
+            crate::utils::deployment::EnablementSource::Explicit => "SECRET_BACKEND".to_string(),
+        },
+        outcome: "written, read back and compared".to_string(),
+        restart_required: true,
+    })
 }
 
 /// Read the value out of the environment variable the operator named.
@@ -1535,6 +1561,262 @@ mod tests {
                 "line uses the banned v placeholder: {line}"
             );
         }
+    }
+
+    /// PMS-1441: the parser demands both arguments and resolves the secret
+    /// NAME, so a typo is refused before a pool is opened rather than after a
+    /// write went somewhere.
+    #[test]
+    fn parse_set_demands_a_secret_and_a_variable_name() {
+        let argv = |rest: &[&str]| -> Vec<String> {
+            std::iter::once("mokosh-server")
+                .chain(std::iter::once("provider-set"))
+                .chain(rest.iter().copied())
+                .map(str::to_string)
+                .collect()
+        };
+
+        let parsed = parse_set_args(&argv(&[
+            "--secret",
+            "GOOGLE_CONTACTS_CLIENT_ID",
+            "--from-env",
+            "MOKOSH_SECRET_INPUT",
+        ]))
+        .expect("both arguments present");
+        assert_eq!(parsed.secret, GovernedSecret::GoogleContactsClientId);
+        assert_eq!(parsed.from_env, "MOKOSH_SECRET_INPUT");
+
+        for (rest, expected) in [
+            (vec!["--from-env", "V"], "--secret is required"),
+            (vec!["--secret", "SMTP_PASSWORD"], "--from-env is required"),
+            (vec!["--secret"], "--secret needs a value"),
+        ] {
+            let err = parse_set_args(&argv(&rest)).expect_err("incomplete arguments are refused");
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?} in {err}"
+            );
+        }
+
+        let unknown = parse_set_args(&argv(&[
+            "--secret",
+            "GOOGLE_CLIENT",
+            "--from-env",
+            "MOKOSH_SECRET_INPUT",
+        ]))
+        .expect_err("a name that is not a governed secret is refused");
+        assert!(
+            unknown.to_string().contains("GOOGLE_CONTACTS_CLIENT_ID"),
+            "the refusal names the legal secrets: {unknown}"
+        );
+    }
+
+    /// The value never travels as an argument, so the two ways the variable can
+    /// fail are the two refusals that matter, and each names the variable.
+    ///
+    /// The empty case is the one worth pinning: every provider treats a
+    /// present-but-empty value as absent, so writing one would report success
+    /// and leave the feature off, which is the exact silence PMS-988 exists to
+    /// remove.
+    #[test]
+    fn a_missing_or_empty_variable_is_refused_by_name() {
+        let absent = read_secret_from_env("PMS1441_A_VARIABLE_NOTHING_SETS")
+            .expect_err("an unset variable is refused");
+        assert!(
+            absent
+                .to_string()
+                .contains("PMS1441_A_VARIABLE_NOTHING_SETS"),
+            "{absent}"
+        );
+        assert!(absent.to_string().contains("not set"), "{absent}");
+    }
+
+    /// A declared provider that could not be built is refused, and nothing is
+    /// written anywhere else.
+    ///
+    /// This is the shape of a deployment whose Infisical is unreachable at the
+    /// moment an operator runs the command. Falling back to another provider
+    /// would put the value where the next boot calls it `Misplaced` and refuses
+    /// to start, which is a worse outcome than the operator retrying.
+    #[tokio::test]
+    async fn set_refuses_when_the_declared_provider_could_not_be_built() {
+        let providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
+        let selection = AppSecretsSelection {
+            provider: AppSecretProviderKind::Infisical,
+            source: crate::utils::deployment::EnablementSource::Explicit,
+        };
+        let err = set_one_secret(
+            GovernedSecret::GoogleContactsClientId,
+            "x.apps.googleusercontent.com",
+            selection,
+            &providers,
+            || async { panic!("the read-back must not be reached when there is no target") },
+        )
+        .await
+        .expect_err("an unbuildable declared provider is refused");
+        let message = err.to_string();
+        assert!(message.contains("could not be built"), "{message}");
+        assert!(
+            message.contains("GOOGLE_CONTACTS_CLIENT_ID"),
+            "the refusal names the secret: {message}"
+        );
+    }
+
+    /// A read-only declared provider is refused with the alternative named.
+    ///
+    /// The environment provider is the one read-only case, and the message has
+    /// to carry the `{NAME}_FILE` route because that is the only way to hold a
+    /// secret there: a process cannot set an environment variable for its own
+    /// next boot.
+    #[tokio::test]
+    async fn set_refuses_a_read_only_declared_provider_and_names_the_alternative() {
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
+        providers[AppSecretProviderKind::Environment.index()] = Some(Arc::new(SecretsEnvProvider));
+        let selection = AppSecretsSelection {
+            provider: AppSecretProviderKind::Environment,
+            source: crate::utils::deployment::EnablementSource::Explicit,
+        };
+        let err = set_one_secret(
+            GovernedSecret::SmtpPassword,
+            "hunter2",
+            selection,
+            &providers,
+            || async { panic!("the read-back must not be reached when the target refuses writes") },
+        )
+        .await
+        .expect_err("a read-only declared provider is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("SMTP_PASSWORD_FILE"),
+            "the refusal names the file route: {message}"
+        );
+        assert!(!message.contains("hunter2"), "the value leaked: {message}");
+    }
+
+    /// The good path: the declared provider holds the value afterwards, the
+    /// read-back was consulted, and no rendered field carries the value.
+    #[tokio::test]
+    async fn set_writes_to_the_declared_provider_and_reports_names_only() {
+        use std::sync::Mutex;
+        struct MemProvider {
+            values: Mutex<std::collections::HashMap<&'static str, String>>,
+        }
+        #[async_trait::async_trait]
+        impl AppSecretProvider for MemProvider {
+            fn name(&self) -> &'static str {
+                "database"
+            }
+            fn get(&self, s: GovernedSecret) -> Option<String> {
+                self.values.lock().unwrap().get(s.name()).cloned()
+            }
+            async fn set(&self, s: GovernedSecret, written: &str) -> AppResult<()> {
+                self.values
+                    .lock()
+                    .unwrap()
+                    .insert(s.name(), written.to_string());
+                Ok(())
+            }
+        }
+        let target = Arc::new(MemProvider {
+            values: Mutex::new(std::collections::HashMap::new()),
+        });
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
+        providers[AppSecretProviderKind::Database.index()] = Some(target.clone());
+        let selection = AppSecretsSelection {
+            provider: AppSecretProviderKind::Database,
+            source: crate::utils::deployment::EnablementSource::Profile,
+        };
+
+        let readback_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = readback_ran.clone();
+        let live = target.clone();
+        let report = set_one_secret(
+            GovernedSecret::GoogleContactsClientSecret,
+            "a-google-client-secret",
+            selection,
+            &providers,
+            || async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(live.get(GovernedSecret::GoogleContactsClientSecret))
+            },
+        )
+        .await
+        .expect("the write and the read-back agree");
+
+        assert!(
+            readback_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a write reported without a read-back is the failure this command exists to avoid"
+        );
+        assert_eq!(
+            target
+                .values
+                .lock()
+                .unwrap()
+                .get(GovernedSecret::GoogleContactsClientSecret.name())
+                .cloned(),
+            Some("a-google-client-secret".to_string())
+        );
+        assert_eq!(report.secret, "GOOGLE_CONTACTS_CLIENT_SECRET");
+        assert_eq!(report.provider, "database");
+        assert_eq!(report.declared_by, "the hosting profile's default");
+        assert!(report.restart_required, "app secrets are read once at boot");
+
+        let rendered = format!(
+            "{}{}",
+            render_set_text(&report),
+            serde_json::to_string(&report).expect("the report serialises")
+        );
+        assert!(
+            !rendered.contains("a-google-client-secret"),
+            "the value reached a rendered line: {rendered}"
+        );
+        redaction::assert_no_leak(&report);
+    }
+
+    /// A write that lands but reads back as something else is an error, and the
+    /// error names neither value.
+    ///
+    /// Reachable in production when two operators run the command at once, or
+    /// when the provider silently truncates. Reporting success there would be
+    /// worse than the five-step procedure this command replaced.
+    #[tokio::test]
+    async fn set_fails_when_the_readback_disagrees() {
+        struct WriteOnly;
+        #[async_trait::async_trait]
+        impl AppSecretProvider for WriteOnly {
+            fn name(&self) -> &'static str {
+                "database"
+            }
+            fn get(&self, _s: GovernedSecret) -> Option<String> {
+                None
+            }
+            async fn set(&self, _s: GovernedSecret, _written: &str) -> AppResult<()> {
+                Ok(())
+            }
+        }
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
+        providers[AppSecretProviderKind::Database.index()] = Some(Arc::new(WriteOnly));
+        let selection = AppSecretsSelection {
+            provider: AppSecretProviderKind::Database,
+            source: crate::utils::deployment::EnablementSource::Profile,
+        };
+        let err = set_one_secret(
+            GovernedSecret::SmtpPassword,
+            "hunter2",
+            selection,
+            &providers,
+            || async { Ok(Some("something-else".to_string())) },
+        )
+        .await
+        .expect_err("a disagreeing read-back is an error");
+        let message = err.to_string();
+        assert!(message.contains("different value"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
+        assert!(!message.contains("something-else"), "{message}");
     }
 
     /// Migration is a per-key operation: the source's value flows through
