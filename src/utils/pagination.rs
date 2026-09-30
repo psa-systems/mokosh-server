@@ -696,17 +696,41 @@ mod pms1194_sort_guard {
     /// `Query<PaginationParams>`. Adding a tenth module means adding its
     /// file here too, or this scan silently stops covering it.
     const ROUTE_FILES: &[(&str, &str)] = &[
+        ("approvals", include_str!("../modules/approvals/routes.rs")),
         ("assets", include_str!("../modules/assets/routes.rs")),
         ("audit", include_str!("../modules/audit/routes.rs")),
         ("auth", include_str!("../modules/auth/routes.rs")),
         ("billing", include_str!("../modules/billing/routes.rs")),
+        ("branding", include_str!("../modules/branding/routes.rs")),
         ("calendar", include_str!("../modules/calendar/routes.rs")),
+        (
+            "contact_portal",
+            include_str!("../modules/contact_portal/routes.rs"),
+        ),
+        (
+            "contact_sync",
+            include_str!("../modules/contact_sync/routes.rs"),
+        ),
         ("contacts", include_str!("../modules/contacts/routes.rs")),
         ("contracts", include_str!("../modules/contracts/routes.rs")),
+        (
+            "dashboards",
+            include_str!("../modules/dashboards/routes.rs"),
+        ),
+        (
+            "email_intake",
+            include_str!("../modules/email_intake/routes.rs"),
+        ),
+        ("forms", include_str!("../modules/forms/routes.rs")),
+        (
+            "integrations",
+            include_str!("../modules/integrations/routes.rs"),
+        ),
         (
             "invitations",
             include_str!("../modules/invitations/routes.rs"),
         ),
+        ("ip_enrich", include_str!("../modules/ip_enrich/routes.rs")),
         (
             "knowledge_base",
             include_str!("../modules/knowledge_base/routes.rs"),
@@ -719,17 +743,39 @@ mod pms1194_sort_guard {
             "notifications",
             include_str!("../modules/notifications/routes.rs"),
         ),
+        (
+            "opportunities",
+            include_str!("../modules/opportunities/routes.rs"),
+        ),
+        ("platform", include_str!("../modules/platform/routes.rs")),
+        (
+            "portal_roles",
+            include_str!("../modules/portal_roles/routes.rs"),
+        ),
         ("projects", include_str!("../modules/projects/routes.rs")),
         ("quotes", include_str!("../modules/quotes/routes.rs")),
+        ("reports", include_str!("../modules/reports/routes.rs")),
         ("rmm", include_str!("../modules/rmm/routes.rs")),
+        (
+            "saved_reports",
+            include_str!("../modules/saved_reports/routes.rs"),
+        ),
+        ("search", include_str!("../modules/search/routes.rs")),
         ("settings", include_str!("../modules/settings/routes.rs")),
         ("sla", include_str!("../modules/sla/routes.rs")),
+        ("status", include_str!("../modules/status/routes.rs")),
+        ("teams", include_str!("../modules/teams/routes.rs")),
         ("tenants", include_str!("../modules/tenants/routes.rs")),
+        (
+            "ticket_templates",
+            include_str!("../modules/ticket_templates/routes.rs"),
+        ),
         ("tickets", include_str!("../modules/tickets/routes.rs")),
         (
             "time_tracking",
             include_str!("../modules/time_tracking/routes.rs"),
         ),
+        ("workflows", include_str!("../modules/workflows/routes.rs")),
     ];
 
     /// Handlers whose service call is already wired to a `sort`
@@ -794,6 +840,50 @@ mod pms1194_sort_guard {
              and add the handler to HONOURED, or call \
              `pagination.reject_unsupported_sort()?` before using \
              `pagination`."
+        );
+    }
+
+    /// PMS-1416: `ROUTE_FILES` is what reopened the gap PMS-1194 closed - the
+    /// `teams` module shipped a `routes.rs` that extracts
+    /// `Query<PaginationParams>` and was never added to this hand-maintained
+    /// list, so `every_pagination_handler_honours_or_rejects_sort` never saw
+    /// its handler at all and stayed green regardless of whether it honoured
+    /// `sort`. This scans `src/modules/*/routes.rs` on disk at test time (the
+    /// one thing `include_str!` above cannot do, since it is a compile-time
+    /// list) and fails the build the moment a module gains a `routes.rs` that
+    /// `ROUTE_FILES` does not name, before a single handler in it is even
+    /// checked.
+    #[test]
+    fn every_module_routes_file_is_registered_in_the_scan() {
+        let scanned: std::collections::BTreeSet<&str> =
+            ROUTE_FILES.iter().map(|(module, _)| *module).collect();
+
+        let modules_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules");
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&modules_dir).expect("src/modules must exist") {
+            let entry = entry.expect("readable src/modules entry");
+            if !entry.file_type().expect("readable file type").is_dir() {
+                continue;
+            }
+            if !entry.path().join("routes.rs").exists() {
+                continue;
+            }
+            let module = entry
+                .file_name()
+                .into_string()
+                .expect("module directory name is UTF-8");
+            if !scanned.contains(module.as_str()) {
+                missing.push(module);
+            }
+        }
+
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "these modules have a routes.rs that the PMS-1194 sort scan does \
+             not cover: {missing:?}. Add each to ROUTE_FILES above so its \
+             handlers are checked by \
+             `every_pagination_handler_honours_or_rejects_sort`."
         );
     }
 }
