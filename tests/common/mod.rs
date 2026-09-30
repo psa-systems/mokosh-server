@@ -79,6 +79,51 @@ impl TestApp {
 /// helpers: each integration-test binary compiles its own copy of
 /// `common::` and not every one seeds a company.
 #[allow(dead_code)]
+/// PMS-1312: record that a seeded payment gateway is connected.
+///
+/// Whether a payment provider is connected for a tenant is `integrations.status`
+/// and not `payment_gateway_configs.is_active` any more, so a suite that inserts
+/// a gateway row directly has to write the row that makes it connected too. That
+/// is what migration 256 did for every gateway a deployment already had, and what
+/// `integrations::connection::set_payment_connection` does for every request that
+/// switches one on; this is the same write, reachable from a seed.
+///
+/// `connected` is passed through rather than assumed, because two suites seed an
+/// inactive gateway on purpose and their point is that nothing serves it.
+#[allow(dead_code)]
+pub async fn connect_seeded_gateway(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    provider: &str,
+    connected: bool,
+) {
+    // `authorize_net` is in the gateway table's CHECK and in no registry entry,
+    // so `integrations.provider`'s CHECK refuses it and the production writer
+    // skips it for the same reason. A suite that seeds one is asserting that
+    // nothing serves it, which needs no row here.
+    if !["stripe", "paypal"].contains(&provider) {
+        return;
+    }
+    sqlx::query(
+        "INSERT INTO integrations \
+             (tenant_id, provider, status, enabled_capabilities, connected_at) \
+         VALUES ($1, $2, $3, ARRAY['payments']::text[], CASE WHEN $4 THEN NOW() END) \
+         ON CONFLICT (tenant_id, provider) DO UPDATE \
+         SET status = EXCLUDED.status, updated_at = NOW()",
+    )
+    .bind(tenant_id)
+    .bind(provider)
+    .bind(if connected {
+        "connected"
+    } else {
+        "not_connected"
+    })
+    .bind(connected)
+    .execute(pool)
+    .await
+    .expect("connect the seeded gateway");
+}
+
 pub async fn seed_company(pool: &PgPool) -> Uuid {
     init_tracing();
     seed_company_named(pool, "Acme Co").await

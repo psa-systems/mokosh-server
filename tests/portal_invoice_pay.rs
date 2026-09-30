@@ -533,6 +533,9 @@ async fn pay_amount_below_min_partial_is_400(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("seed active gateway config");
+    // PMS-1312: the floor read asks `integrations.status`, so the seeded gateway
+    // needs the row that makes it connected.
+    common::connect_seeded_gateway(&pool, common::DEFAULT_TENANT_ID, "stripe", true).await;
 
     let resp = app
         .client
