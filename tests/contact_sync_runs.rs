@@ -14,13 +14,16 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use mokosh_server::db::Database;
+use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::contact_sync::provider::{
     ContactSyncProvider, SourceChanges, SourceContact, SourceError, SourceGroup, SourcePhone,
     SourceResult,
 };
 use mokosh_server::modules::contact_sync::runs::{ContactSyncRunner, SourceFactory};
+use mokosh_server::modules::contact_sync::ContactSyncService;
 use mokosh_server::modules::notifications::NotificationsService;
+use mokosh_server::scheduler::JobWake;
 use mokosh_server::utils::error::AppResult;
 use reqwest::{Method, StatusCode};
 use serde_json::{json, Value};
@@ -114,6 +117,7 @@ fn person(n: usize) -> SourceContact {
 struct Fixture {
     app: common::TestApp,
     pool: PgPool,
+    db: Database,
     runner: ContactSyncRunner,
     script: Script,
     connection_id: Uuid,
@@ -136,6 +140,7 @@ impl Fixture {
         .expect("seed connection");
         let app_pool = common::build_app_role_pool(&pool).await;
         let db = Database::from_pools(app_pool, pool.clone());
+        let db_for_fixture = db.clone();
         let script = Script::default();
         let runner = ContactSyncRunner::new(
             db.clone(),
@@ -148,6 +153,7 @@ impl Fixture {
         Self {
             app,
             pool,
+            db: db_for_fixture,
             runner,
             script,
             connection_id,
@@ -809,4 +815,83 @@ async fn the_off_switch_stops_every_sync_and_keeps_the_data(pool: PgPool) {
         1,
         "on again, the schedule resumes"
     );
+}
+
+/// PMS-1429: queueing a run wakes the worker, instead of leaving it to sleep out
+/// its interval.
+///
+/// The complaint this closes was "syncing takes pretty long for 6 contacts", and
+/// the six contacts were never the cost: the request inserts a row and returns,
+/// and the worker ticks once a minute, so pressing Sync now bought a wait of up
+/// to a full minute before anything began. The scheduler half is pinned in
+/// `scheduler::pms1429_wake`; this is the other half, that the service which
+/// serves the request is what pulls the handle, and that it pulls it only after
+/// the row is committed. A wake before the commit would find nothing to claim
+/// and sleep again, which is the bug wearing the fix's clothes.
+#[mokosh_test]
+async fn queueing_a_run_wakes_the_worker(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+    let wake = JobWake::new();
+    let service = ContactSyncService::new(
+        f.db.clone(),
+        Arc::new(mokosh_server::secrets::DatabaseSecretProvider::new(
+            f.db.clone(),
+            [7u8; 32],
+        )),
+        Some("https://api.msp.example".into()),
+        "https://app.msp.example".into(),
+    )
+    .with_run_wake(wake.clone());
+
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let run = service
+        .queue_run(
+            tenant,
+            "google",
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("queue a run");
+    assert_eq!(run.status, "queued");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), wake.woken())
+        .await
+        .expect("queueing a run woke the worker");
+
+    // And the row is there to be claimed, which is what the wake is for: the
+    // worker it wakes reads the table, not the request.
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM contact_sync_runs WHERE id = $1 AND status = 'queued'",
+    )
+    .bind(run.id)
+    .fetch_one(&f.pool)
+    .await
+    .expect("count the queued run");
+    assert_eq!(queued, 1, "the wake followed a committed row");
+}
+
+/// A service with no wake still queues: the handle is an optimisation on WHEN
+/// the work starts, never a condition for it happening. Every suite and the
+/// worker's own copy of the service run without one.
+#[mokosh_test]
+async fn a_service_with_no_wake_still_queues_a_run(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+    let service = ContactSyncService::new(
+        f.db.clone(),
+        Arc::new(mokosh_server::secrets::DatabaseSecretProvider::new(
+            f.db.clone(),
+            [7u8; 32],
+        )),
+        Some("https://api.msp.example".into()),
+        "https://app.msp.example".into(),
+    );
+    let run = service
+        .queue_run(
+            TenantId::from_trusted(common::DEFAULT_TENANT_ID),
+            "google",
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("queue a run without a wake");
+    assert_eq!(run.status, "queued");
 }

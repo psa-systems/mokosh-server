@@ -359,7 +359,32 @@ impl ContactSyncRunner {
 
     async fn execute(&self, claimed: Claimed) {
         let tenant_id = TenantId::from_trusted(claimed.tenant_id);
+        // PMS-1429: one line per run saying how long the WORK took, separately
+        // from how long the run waited to be claimed. The two were
+        // indistinguishable from outside, so "the import is slow for six
+        // contacts" could not be told from "the import waited out an interval",
+        // and the first thing anybody asks is which.
+        let started = std::time::Instant::now();
         let outcome = self.attempt(tenant_id, &claimed).await;
+        match &outcome {
+            Ok(report) => tracing::info!(
+                run_id = %claimed.id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                total = report.total,
+                created = report.created,
+                linked = report.linked,
+                updated = report.updated,
+                queued = report.queued,
+                not_selected = report.not_selected,
+                failed = report.failed,
+                "contact sync: run finished"
+            ),
+            Err(e) => tracing::warn!(
+                run_id = %claimed.id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "contact sync: run failed: {e}"
+            ),
+        }
         if let Err(e) = self.settle(tenant_id, &claimed, outcome).await {
             tracing::error!(
                 run_id = %claimed.id,
