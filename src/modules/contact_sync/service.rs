@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::carddav::{self, CardDavClient};
 use super::google::GoogleContactsProvider;
 use super::icloud::{ICloudProvider, ICLOUD};
-use super::oauth::{self, OauthClient, Pkce, TokenError};
+use super::oauth::{self, OauthClient, Pkce, SharedGoogleClient, TokenError};
 use super::provider::{words, ContactSyncProvider, SourceError, UNGROUPED_ID};
 use super::runs::{RunStatus, RUN_COLUMNS};
 use super::sync::{external_id_digest, fields, ContactSyncEngine, ImportPreview, SyncReport};
@@ -57,9 +57,14 @@ pub struct ContactSyncService {
     /// card still attached on the provider. `None` in fixtures that never
     /// seed a payment method before removing imported data.
     payment_methods: Option<Arc<crate::modules::contact_portal::PaymentMethodsService>>,
-    /// The host's Google OAuth client (PMS-1430), resolved once at boot by the
-    /// startup wiring and `None` on a deployment that has not configured one.
-    host_client: Option<OauthClient>,
+    /// The host's Google OAuth client (PMS-1430), behind the handle the write
+    /// path swaps (PMS-1444).
+    ///
+    /// Shared rather than owned so an operator setting the pair from Settings
+    /// reaches the copy a customer's next Connect uses, without a restart. A
+    /// default handle holds `None`, which is the honest answer for a process
+    /// that never resolved one.
+    host_client: Arc<SharedGoogleClient>,
     /// PMS-1429: run the import worker as soon as a run is queued, instead of
     /// leaving it to sleep out its interval.
     ///
@@ -332,21 +337,31 @@ impl ContactSyncService {
             secrets,
             public_api_base,
             spa_base_url,
-            host_client: None,
+            host_client: Arc::new(SharedGoogleClient::default()),
             run_wake: None,
             payment_methods: None,
             carddav_base_url: carddav::ICLOUD_BASE_URL.to_string(),
         }
     }
 
-    /// Hand the service the host's Google OAuth client (PMS-1430).
+    /// Hand the service the shared handle holding the host's Google OAuth
+    /// client (PMS-1430, PMS-1444).
     ///
-    /// Set by `main` from [`OauthClient::from_app_secrets`]. Left unset
-    /// everywhere else, which reads as "this deployment cannot connect Google
-    /// Contacts" and is the honest answer for a process that never resolved one.
-    pub fn with_host_client(mut self, client: Option<OauthClient>) -> Self {
+    /// `main` builds ONE handle from [`OauthClient::from_app_secrets`] and
+    /// passes it here, to the worker's own service, and to the settings router.
+    /// One handle rather than one value per service is what makes a write from
+    /// Settings visible to the flow a customer is about to use. Left at the
+    /// default everywhere else, which reads as "this deployment cannot connect
+    /// Google Contacts".
+    pub fn with_host_client(mut self, client: Arc<SharedGoogleClient>) -> Self {
         self.host_client = client;
         self
+    }
+
+    /// The same handle, for a caller that has to swap it (the PMS-1444 write
+    /// path) rather than read it.
+    pub fn host_client_handle(&self) -> Arc<SharedGoogleClient> {
+        self.host_client.clone()
     }
 
     /// Hand the service the handle that wakes the import worker (PMS-1429).
@@ -804,12 +819,11 @@ impl ContactSyncService {
     /// system-tenant registration and no ladder: which Google application this
     /// installation authenticates as is a property of the deployment, and a
     /// customer never sees a client id. The value is read through
-    /// [`OauthClient::from_app_secrets`] by the startup wiring and handed here,
-    /// because the app-secret providers load once at construction anyway, so a
-    /// per-request read would buy nothing and give a second answer to a question
-    /// that has one.
+    /// [`OauthClient::from_app_secrets`] by the startup wiring and handed here
+    /// behind a handle the deployment-wide write path can swap (PMS-1444), so
+    /// this is read per call rather than cached in the caller.
     pub fn oauth_client(&self) -> Option<OauthClient> {
-        self.host_client.clone()
+        self.host_client.current()
     }
 
     fn require_oauth_client(&self) -> AppResult<OauthClient> {

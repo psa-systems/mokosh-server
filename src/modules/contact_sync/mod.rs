@@ -39,5 +39,5 @@ pub mod sync;
 pub mod vcard;
 
 pub use client_cleanup::ClientSecretCleanup;
-pub use oauth::OauthClient;
+pub use oauth::{OauthClient, SharedGoogleClient};
 pub use service::ContactSyncService;

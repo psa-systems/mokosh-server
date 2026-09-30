@@ -4,6 +4,7 @@
 // tenant like the email config next door.
 pub mod app_name;
 pub mod email;
+pub mod google_client;
 pub mod models;
 pub mod routes;
 pub mod service;

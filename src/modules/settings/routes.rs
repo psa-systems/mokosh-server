@@ -29,6 +29,9 @@ pub struct SettingsRouterState {
     pub db: Database,
     pub enc_key: [u8; 32],
     pub shared_mailer: Arc<SharedMailer>,
+    // PMS-1444: the live Google client handle, swapped after a write so the
+    // setting takes effect without a restart, exactly as `shared_mailer` is.
+    pub google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
 }
 
 pub fn settings_routes(
@@ -36,12 +39,14 @@ pub fn settings_routes(
     db: Database,
     enc_key: [u8; 32],
     shared_mailer: Arc<SharedMailer>,
+    google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
 ) -> Router {
     let state = SettingsRouterState {
         service,
         db,
         enc_key,
         shared_mailer,
+        google_client,
     };
     Router::new()
         // PMS-115 tenant settings list (paginated across categories).
@@ -73,6 +78,16 @@ pub fn settings_routes(
         // send. Behind RequireAdmin; SMTP issues a NOOP against the relay and
         // returns the failure verbatim, LogMailer's verify is trivially Ok.
         .route("/settings/email/verify", post(post_email_verify))
+        // PMS-1444: the host's Google OAuth client. Literal, before the generic
+        // `/settings/{category}` matcher, and deployment-wide like email and
+        // app-name rather than a tenant setting: one Google application per
+        // installation. The pair itself lives in the declared app-secret
+        // provider, not in `tenant_settings`, which is why this handler reaches
+        // for `app_secrets::current()` rather than for `s.db`.
+        .route(
+            "/settings/google-contacts-client",
+            get(get_google_client).put(put_google_client),
+        )
         // PMS-789: the deployment-wide product name. Literal, so it is matched
         // before the generic `/settings/{category}` below - which writes the
         // CALLER's tenant and is therefore not a way to set a system value.
@@ -113,6 +128,55 @@ async fn put_email(
     let view = super::email::put_email_settings(&s.db, &s.enc_key, input).await?;
     super::email::rebuild_and_swap(&s.db, &s.enc_key, &s.shared_mailer).await?;
     Ok(Json(view))
+}
+
+/// PMS-1444: whether this deployment's Google client is set, and where it
+/// lives. Never either half of it, not even the id.
+async fn get_google_client(
+    _operator: DeploymentOperator,
+) -> AppResult<Json<super::google_client::GoogleClientView>> {
+    let secrets = app_secrets_or_unavailable()?;
+    Ok(Json(super::google_client::get_google_client(
+        secrets.as_ref(),
+    )))
+}
+
+/// PMS-1444: set the host's Google client, then swap the one the process is
+/// using so a Connect that happens a second later uses it.
+async fn put_google_client(
+    State(s): State<SettingsRouterState>,
+    _operator: DeploymentOperator,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(input): Json<super::google_client::GoogleClientInput>,
+) -> AppResult<Json<super::google_client::GoogleClientView>> {
+    let secrets = app_secrets_or_unavailable()?;
+    let view = super::google_client::put_google_client(
+        &s.db,
+        &secrets,
+        s.google_client.as_ref(),
+        input,
+        &ctx,
+    )
+    .await?;
+    Ok(Json(view))
+}
+
+/// The process's application-tier secrets, or an error saying why this endpoint
+/// cannot answer.
+///
+/// `app_secrets::current()` is `None` only in a process that never ran
+/// `init_from_env`, which means a test binary or a seeder rather than a serving
+/// deployment. Saying so beats unwrapping: an operator who somehow reaches this
+/// on a real deployment has a boot problem, and the message points at it.
+fn app_secrets_or_unavailable() -> AppResult<std::sync::Arc<crate::app_secrets::AppSecrets>> {
+    crate::app_secrets::current().ok_or_else(|| {
+        crate::utils::error::AppError::Configuration(
+            "This process has no application-tier secret provider, so the Google client cannot be \
+             read or written. That is a startup problem: `mokosh-server provider-status` reports \
+             what is reachable."
+                .to_string(),
+        )
+    })
 }
 
 /// PMS-788: send a one-off test email to `req.to` through the live mailer, so an

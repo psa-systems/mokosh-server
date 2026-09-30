@@ -646,6 +646,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // PMS-1444: ONE handle, shared by the router's service, the worker's
+    // service and the settings write path. A deployment operator setting the
+    // pair from Settings swaps this, so the next Connect and the next token
+    // refresh use it without a restart, the way PMS-638 already swaps the live
+    // mailer. Separate values per service would have made the write take effect
+    // in the API and not in the worker, which is the worst of the three
+    // outcomes.
+    let google_client = std::sync::Arc::new(
+        mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
+    );
 
     // PMS-789: load the deployment's product name into the process cache
     // before anything can render it. Warn-and-continue rather than hard-fail:
