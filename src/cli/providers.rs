@@ -1,5 +1,6 @@
 //! PMS-1012: `provider-status`, `provider-migrate` and `provider-purge`,
-//! the three operator subcommands the Bunyip incident named.
+//! the three operator subcommands the Bunyip incident named, and PMS-1441's
+//! `provider-set` beside them.
 //!
 //! Bunyip had three failures that combined to keep a partial migration
 //! invisible until the SMTP relay stopped answering. Secrets sat in the
@@ -12,6 +13,11 @@
 //! source delete, and `provider-purge` refuses per key unless the provider
 //! being purged is disabled AND the key is live in the provider serving
 //! it now.
+//!
+//! `provider-set` (PMS-1441) is the fourth verb, for a value with no previous
+//! home rather than one being moved. It writes to the DECLARED provider only,
+//! takes the value by the name of an environment variable rather than as an
+//! argument, and reads back from a freshly built provider.
 //!
 //! # Redaction
 //!

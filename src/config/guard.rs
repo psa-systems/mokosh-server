@@ -43,7 +43,9 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
     },
     EntryPoint {
         path: "src/cli/providers.rs",
-        reason: "the provider-status / provider-migrate / provider-purge subcommands (PMS-1012) \
+        reason:
+            "the provider-status / provider-set / provider-migrate / provider-purge subcommands \
+                 (PMS-1012, PMS-1441) \
                  read SECRET_BACKEND and INFISICAL_ADDRESS directly, the same way \
                  src/app_secrets/mod.rs and src/config/mod.rs do: they build providers ahead of \
                  any read path, so the machinery a provider is chosen and constructed FROM \

@@ -14,6 +14,10 @@
 //!   reset, or remove the richer showcase demo dataset (PMS-620), fail-closed
 //!   against any tenant not explicitly marked `is_showcase`.
 //!
+//! - `provider-status` / `provider-set` / `provider-migrate` / `provider-purge`
+//!   and `verify-providers` - the operator surface over the provider seams
+//!   (PMS-1012, PMS-1013, PMS-1441), in [`providers`] and [`verify`].
+//!
 //! The former `clients register` subcommand (which registered an OAuth client
 //! in `mokosh_auth.oauth_clients`) was removed with mokosh-auth in PMS-295;
 //! bunyip is now the sole OP and owns its own client registry.
