@@ -59,26 +59,45 @@ pub use infisical::InfisicalProvider;
 /// treats as governed: the variable name, the feature its absence disables,
 /// and the file the environment provider reads.
 ///
-/// Only one today. New variants join this list the day Mokosh gains a second
-/// governed application-tier secret; when they do, `feature()` must state the
-/// impact in one sentence, because that is the sentence a warn log renders
-/// verbatim when nobody holds the value.
+/// New variants join this list the day Mokosh gains another governed
+/// application-tier secret; when they do, `feature()` must state the impact in
+/// one sentence, because that is the sentence a warn log renders verbatim when
+/// nobody holds the value.
+///
+/// PMS-1430 added the Google client as a PAIR of variants rather than as one
+/// variant holding two values, and rather than an id in configuration with only
+/// the secret governed. Both halves are governed so both resolve from the same
+/// provider: an id from one Google project with a secret from another fails at
+/// Google with an error nobody can place, and the four-way classification below
+/// then reports each half separately, which is what makes a half-configured
+/// host a boot error naming the missing key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GovernedSecret {
     /// `SMTP_PASSWORD` / `smtp_password` / the `app_secrets` row named
     /// `SMTP_PASSWORD`. The SMTP relay's password.
     SmtpPassword,
+    /// The host's Google OAuth client id (PMS-1430). Not a secret in the sense
+    /// a password is, and governed anyway: see the enum's note on the pair.
+    GoogleContactsClientId,
+    /// The host's Google OAuth client secret (PMS-1430).
+    GoogleContactsClientSecret,
 }
 
 impl GovernedSecret {
     /// Every governed secret, in report order.
-    pub const ALL: [Self; 1] = [Self::SmtpPassword];
+    pub const ALL: [Self; 3] = [
+        Self::SmtpPassword,
+        Self::GoogleContactsClientId,
+        Self::GoogleContactsClientSecret,
+    ];
 
     /// The env-style key: the plain variable name the operator writes, and
     /// the row name the database provider stores under.
     pub fn name(self) -> &'static str {
         match self {
             Self::SmtpPassword => "SMTP_PASSWORD",
+            Self::GoogleContactsClientId => "GOOGLE_CONTACTS_CLIENT_ID",
+            Self::GoogleContactsClientSecret => "GOOGLE_CONTACTS_CLIENT_SECRET",
         }
     }
 
@@ -88,6 +107,9 @@ impl GovernedSecret {
     pub fn feature(self) -> &'static str {
         match self {
             Self::SmtpPassword => "transactional email is unauthenticated, so password resets, portal setup links and notifications fail at the relay",
+            Self::GoogleContactsClientId | Self::GoogleContactsClientSecret => {
+                "Google Contacts import is off, so no tenant on this deployment can connect a Google account"
+            }
         }
     }
 
@@ -98,6 +120,8 @@ impl GovernedSecret {
     pub fn secret_file(self) -> &'static str {
         match self {
             Self::SmtpPassword => "smtp_password",
+            Self::GoogleContactsClientId => "google_contacts_client_id",
+            Self::GoogleContactsClientSecret => "google_contacts_client_secret",
         }
     }
 }
@@ -338,6 +362,25 @@ impl AppSecrets {
     /// inputs were absent.
     pub fn provider(&self, kind: AppSecretProviderKind) -> Option<&Arc<dyn AppSecretProvider>> {
         self.providers[kind.index()].as_ref()
+    }
+}
+
+#[cfg(test)]
+impl AppSecrets {
+    /// A handle serving `provider` as the declared one, for tests in this crate.
+    ///
+    /// Production builds one through [`init_from_env`], which is what applies
+    /// the four-way classification; a test that wants to drive a READER (the
+    /// Google client pair, PMS-1430) wants none of that and would otherwise have
+    /// to stand up four providers to ask one question.
+    pub fn for_test(declared: AppSecretProviderKind, provider: Arc<dyn AppSecretProvider>) -> Self {
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
+        providers[declared.index()] = Some(provider);
+        Self {
+            declared,
+            providers,
+        }
     }
 }
 
