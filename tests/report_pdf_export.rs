@@ -174,12 +174,11 @@ async fn the_format_is_matched_case_insensitively(pool: PgPool) {
     assert_eq!(header(&headers, "content-type"), Some("application/pdf"));
 }
 
-/// The CSV branch is untouched. PMS-876 assumed it carried a
-/// `Content-Disposition` filename convention for the PDF to match; it carries
-/// none, and it does not gain one here, because it is an existing response the
-/// SPA already consumes.
+/// mokosh-apps' `DownloadButton` (MAPPS-641) reads the filename the server
+/// sets in `Content-Disposition` for both formats of this export, so the CSV
+/// branch carries the same header the PDF branch does (PMS-1417).
 #[mokosh_test]
-async fn the_csv_export_is_unchanged(pool: PgPool) {
+async fn the_csv_export_carries_a_content_disposition(pool: PgPool) {
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
@@ -190,9 +189,9 @@ async fn the_csv_export_is_unchanged(pool: PgPool) {
         header(&headers, "content-type"),
         Some("text/csv; charset=utf-8")
     );
-    assert!(
-        headers.get("content-disposition").is_none(),
-        "CSV gained a header this issue was not meant to give it"
+    assert_eq!(
+        header(&headers, "content-disposition"),
+        Some("attachment; filename=\"tickets.csv\"")
     );
     assert!(!body.is_empty());
 }

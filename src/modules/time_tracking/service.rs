@@ -1748,7 +1748,7 @@ impl TimeTrackingService {
         match method {
             "up" | "down" | "nearest" => Ok(()),
             other => Err(AppError::BadRequest(format!(
-                "rounding_method {other:?} invalid; expected up | down | nearest"
+                "rounding_method `{other}` invalid; expected up | down | nearest"
             ))),
         }
     }
@@ -1902,7 +1902,7 @@ pub(crate) fn resolve_entry_kind(input: EntryKindInput<'_>) -> AppResult<Resolve
         Some(ENTRY_KIND_EMPLOYEE) => ENTRY_KIND_EMPLOYEE,
         Some(other) => {
             return Err(AppError::BadRequest(format!(
-                "entry_kind must be one of client, employee (got {other:?})"
+                "entry_kind must be one of client, employee (got `{other}`)"
             )));
         }
     };
@@ -2054,7 +2054,7 @@ fn derive_work_category(
         Some(category) => {
             if !matches!(category, "ticketed" | "project" | "general") {
                 return Err(AppError::BadRequest(format!(
-                    "work_category must be one of ticketed, project, general (got {category:?})"
+                    "work_category must be one of ticketed, project, general (got `{category}`)"
                 )));
             }
             if category == "ticketed" && ticket_id.is_none() {

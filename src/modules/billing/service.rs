@@ -1,6 +1,9 @@
 //! Billing service. Endpoints land incrementally across PMS-33.
 
 use crate::modules::auth::TenantId;
+use crate::modules::integrations::connection::{
+    CONNECTED_GATEWAY_FLAG, CONNECTED_GATEWAY_JOIN, GATEWAY_INTEGRATION_LEFT_JOIN,
+};
 use crate::modules::settings::read_default_currency;
 use chrono::{DateTime, NaiveDate, Utc};
 use mokosh_types::datetime::user_today;
@@ -2500,16 +2503,21 @@ impl BillingService {
                 .fetch_one(&mut *tx)
                 .await?;
 
-        let rows = sqlx::query_as::<_, PaymentGatewayRow>(
+        // PMS-1312: the connected flag this response carries is derived from
+        // `integrations.status`, not from the retired column beside the other
+        // settings. LEFT JOIN so a gateway whose credentials were saved and never
+        // switched on is still listed, which is the state an MSP mid-setup is in.
+        let rows = sqlx::query_as::<_, PaymentGatewayRow>(&format!(
             r#"
-            SELECT id, provider, is_active, is_test_mode, config_encrypted,
-                   client_display_name
-            FROM payment_gateway_configs
-            WHERE tenant_id = $1
-            ORDER BY provider
+            SELECT g.id, g.provider, {CONNECTED_GATEWAY_FLAG} AS is_active,
+                   g.is_test_mode, g.config_encrypted, g.client_display_name
+            FROM payment_gateway_configs g
+            {GATEWAY_INTEGRATION_LEFT_JOIN}
+            WHERE g.tenant_id = $1
+            ORDER BY g.provider
             LIMIT $2 OFFSET $3
-            "#,
-        )
+            "#
+        ))
         .bind(tenant_id)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
@@ -2673,15 +2681,14 @@ impl BillingService {
                 sqlx::query_scalar(
                     r#"
                     INSERT INTO payment_gateway_configs
-                        (tenant_id, provider, is_active, is_test_mode,
+                        (tenant_id, provider, is_test_mode,
                          config_encrypted, client_display_name)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (tenant_id, provider) DO UPDATE SET
-                        is_active           = EXCLUDED.is_active,
                         is_test_mode        = EXCLUDED.is_test_mode,
                         config_encrypted    = EXCLUDED.config_encrypted,
                         client_display_name = CASE
-                            WHEN $7 THEN EXCLUDED.client_display_name
+                            WHEN $6 THEN EXCLUDED.client_display_name
                             ELSE payment_gateway_configs.client_display_name
                         END,
                         updated_at          = NOW()
@@ -2690,7 +2697,6 @@ impl BillingService {
                 )
                 .bind(tenant_id)
                 .bind(request.provider.as_str())
-                .bind(request.is_active)
                 .bind(request.is_test_mode)
                 // NULL: the credential is in the secret provider now, at the
                 // address this row's own (tenant_id, provider) gives.
@@ -2712,10 +2718,9 @@ impl BillingService {
                 sqlx::query_scalar(
                     r#"
                     UPDATE payment_gateway_configs
-                    SET is_active           = $3,
-                        is_test_mode        = $4,
+                    SET is_test_mode        = $3,
                         client_display_name = CASE
-                            WHEN $5 THEN $6
+                            WHEN $4 THEN $5
                             ELSE client_display_name
                         END,
                         updated_at          = NOW()
@@ -2725,7 +2730,6 @@ impl BillingService {
                 )
                 .bind(tenant_id)
                 .bind(request.provider.as_str())
-                .bind(request.is_active)
                 .bind(request.is_test_mode)
                 .bind(cdn_provided)
                 .bind(&cdn_value)
@@ -2733,6 +2737,22 @@ impl BillingService {
                 .await?
             }
         };
+
+        // PMS-1312: whether this gateway is connected is `integrations.status`,
+        // and neither statement above writes it. This is the one writer, shared
+        // with the integrations surface, so switching a gateway on here and off
+        // there cannot leave two answers; it also keeps the retired
+        // `payment_gateway_configs.is_active` mirror in step for a rolled-back
+        // image. It runs BEFORE the `after` snapshot so the audit row records the
+        // flag as it ends up rather than as the row was left mid-write.
+        crate::modules::integrations::connection::set_payment_connection(
+            &mut tx,
+            tenant_id,
+            request.provider.as_str(),
+            request.is_active,
+            ctx.user_id,
+        )
+        .await?;
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) - 'config_encrypted' FROM payment_gateway_configs t \
@@ -3106,10 +3126,10 @@ impl BillingService {
         requested: Option<&str>,
     ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT provider, config_encrypted FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND is_active = TRUE",
-        )
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT g.provider, g.config_encrypted FROM payment_gateway_configs g \
+             {CONNECTED_GATEWAY_JOIN} WHERE g.tenant_id = $1"
+        ))
         .bind(tenant_id)
         .fetch_all(&mut *tx)
         .await?;
@@ -3227,10 +3247,10 @@ impl BillingService {
         tenant_id: TenantId,
     ) -> AppResult<Vec<(String, Option<String>)>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT provider, client_display_name, config_encrypted \
-             FROM payment_gateway_configs WHERE tenant_id = $1 AND is_active = TRUE",
-        )
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT g.provider, g.client_display_name, g.config_encrypted \
+             FROM payment_gateway_configs g {CONNECTED_GATEWAY_JOIN} WHERE g.tenant_id = $1"
+        ))
         .bind(tenant_id)
         .fetch_all(&mut *tx)
         .await?;
@@ -3380,10 +3400,10 @@ impl BillingService {
         tenant_id: Uuid,
         provider_id: &str,
     ) -> AppResult<Option<Box<dyn PaymentProvider>>> {
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT provider, config_encrypted FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND is_active = TRUE",
-        )
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT g.provider, g.config_encrypted FROM payment_gateway_configs g \
+             {CONNECTED_GATEWAY_JOIN} WHERE g.tenant_id = $1"
+        ))
         .bind(tenant_id)
         .fetch_all(self.db.migrator_pool())
         .await?;
@@ -3405,9 +3425,9 @@ impl BillingService {
 
     /// PMS-711: create a hosted checkout session for an invoice's outstanding
     /// balance. Fails 400 when the tenant has no active Stripe gateway, when the
-    /// invoice has nothing left to pay, or when the invoice is void / written
-    /// off. The payer is redirected to the returned `url`; the payment is
-    /// reconciled later by the webhook, not by this call.
+    /// invoice has nothing left to pay, or when the invoice is draft, pending,
+    /// void, or written off. The payer is redirected to the returned `url`;
+    /// the payment is reconciled later by the webhook, not by this call.
     pub async fn create_invoice_checkout_session(
         &self,
         tenant_id: TenantId,
@@ -3432,9 +3452,17 @@ impl BillingService {
         // row it shouldn't have) or an accident on the staff plane
         // that would charge a card for an amount not yet finalized.
         // Security review F9 (docs/mokosh-invoices/06-security-review.md).
+        // PMS-1431: refuse Pending for the same reason: record_gateway_payment
+        // and create_payment already refuse Draft|Pending (PMS-999), and
+        // letting a checkout session start against a Pending invoice let the
+        // gateway take the customer's money while the webhook that should
+        // record it hit that same refusal and silently dropped the payment.
         if matches!(
             invoice.status,
-            InvoiceStatus::Draft | InvoiceStatus::Void | InvoiceStatus::WrittenOff
+            InvoiceStatus::Draft
+                | InvoiceStatus::Pending
+                | InvoiceStatus::Void
+                | InvoiceStatus::WrittenOff
         ) {
             return Err(AppError::Conflict(format!(
                 "Invoice {} cannot be paid in status '{}'",
@@ -3540,10 +3568,10 @@ impl BillingService {
         tenant_id: TenantId,
     ) -> AppResult<Decimal> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(Option<Decimal>,)> = sqlx::query_as(
-            "SELECT MAX(min_partial_amount) FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND is_active = TRUE",
-        )
+        let row: Option<(Option<Decimal>,)> = sqlx::query_as(&format!(
+            "SELECT MAX(g.min_partial_amount) FROM payment_gateway_configs g \
+             {CONNECTED_GATEWAY_JOIN} WHERE g.tenant_id = $1"
+        ))
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -3563,10 +3591,10 @@ impl BillingService {
         provider_id: &str,
     ) -> AppResult<Decimal> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let row: Option<(Option<Decimal>,)> = sqlx::query_as(
-            "SELECT min_partial_amount FROM payment_gateway_configs \
-             WHERE tenant_id = $1 AND provider = $2 AND is_active = TRUE",
-        )
+        let row: Option<(Option<Decimal>,)> = sqlx::query_as(&format!(
+            "SELECT g.min_partial_amount FROM payment_gateway_configs g \
+             {CONNECTED_GATEWAY_JOIN} WHERE g.tenant_id = $1 AND g.provider = $2"
+        ))
         .bind(tenant_id)
         .bind(provider_id)
         .fetch_optional(&mut *tx)
@@ -8285,5 +8313,93 @@ impl From<LedgerRefundRow> for InvoiceLedgerRefund {
             amount: r.amount,
             created_at: r.created_at,
         }
+    }
+}
+
+/// PMS-1312: the retired `payment_gateway_configs.is_active` flag has one writer
+/// and no readers, enforced here rather than remembered.
+///
+/// Whether a payment provider is connected moved to `integrations.status`
+/// (migration 256). The column stays for one release so a rolled-back image
+/// still serves, and `integrations::connection::set_payment_connection` keeps it
+/// in step. A serving read that consults it again would be the one failure this
+/// area cannot afford to make quietly: the two answers agree on the day of the
+/// change and drift the first time a tenant connects from the integrations page,
+/// after which a customer's card is charged against a gateway this deployment no
+/// longer thinks is on.
+///
+/// The scan is over source text because that is what the rule is about. Each
+/// needle is assembled at runtime so this module's own prose does not match it,
+/// the way `repo_hygiene` and `mirror_writers` do it.
+#[cfg(test)]
+mod retired_gateway_flag {
+    /// Files allowed to name the table and the flag in one breath, with the
+    /// reason each is allowed.
+    const WRITERS: &[&str] = &[
+        // The one writer. Its whole job is to keep the mirror in step.
+        "src/modules/integrations/connection.rs",
+    ];
+
+    #[test]
+    fn no_serving_read_consults_the_retired_is_active_flag() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Assembled, so the sentence you are reading is not a hit.
+        let table = format!("payment{}gateway{}configs", "_", "_");
+        let flag = format!("is{}active", "_");
+        // SQL shapes rather than the bare name, because prose that EXPLAINS the
+        // retirement legitimately names the column beside the table (this
+        // module's own doc comment above does, and so do the integrations module
+        // and its registry). A read or a write spells it one of these two ways:
+        // a predicate or an assignment, or a column in a list.
+        let sql_shapes = [format!("{flag} ="), format!("{flag},")];
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        let mut files = vec![root.clone()];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).expect("read src dir") {
+                    files.push(entry.expect("dir entry").path());
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if WRITERS.contains(&relative.as_str()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            scanned += 1;
+            // One statement at a time: the flag counts as "in the same breath"
+            // only when it sits inside the window a single SQL statement spans,
+            // so a file that happens to mention both far apart is not a hit.
+            for (at, _) in text.match_indices(&table) {
+                let window = &text[at..text.len().min(at + 400)];
+                if sql_shapes
+                    .iter()
+                    .any(|shape| window.contains(shape.as_str()))
+                {
+                    offenders.push(format!("{relative} (near byte {at})"));
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            scanned > 100,
+            "the scan walked only {scanned} files, so it proves nothing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "PMS-1312: {} names the retired flag beside the gateway table; read \
+             integrations.status through CONNECTED_GATEWAY_JOIN instead",
+            offenders.join(", ")
+        );
     }
 }

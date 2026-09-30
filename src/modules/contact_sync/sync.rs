@@ -297,6 +297,7 @@ fn plan<'a>(
     selected: &BTreeSet<String>,
     snapshot: &'a Snapshot,
     mapped: &MappedContact,
+    full_read: bool,
 ) -> Plan<'a> {
     // A person said stop (PMS-1214): an unlinked record is not re-linked by
     // its email a minute later, and a removed one is not imported back.
@@ -320,7 +321,20 @@ fn plan<'a>(
         };
     }
     if !record.group_ids.iter().any(|g| selected.contains(g)) {
-        return Plan::NotSelected;
+        // iCloud's delta carries group membership on the group card, not the
+        // member's own (PMS-1341), so an incremental run whose card set held
+        // no group card for this record reports `group_ids: []` regardless of
+        // its real memberships; a full read has no such gap, and neither does
+        // an incremental one that DID carry a group card naming this record
+        // (whether adding it to a group or, on a removal, none of the
+        // selected ones), so both still refuse an already-linked contact that
+        // was genuinely deselected. Only an unlinked record is refused on
+        // empty group information regardless: it never matched a selected
+        // label to begin with, delta or not.
+        let group_reported = !record.group_ids.is_empty();
+        if full_read || group_reported || link.is_none() {
+            return Plan::NotSelected;
+        }
     }
     if let Some(link) = link {
         if link.etag.is_some() && link.etag == record.etag && link.deleted_in_source_at.is_none() {
@@ -606,6 +620,10 @@ impl ContactSyncEngine {
         if let Some(run_id) = run_id {
             self.checkpoint(tenant_id, run_id, &report, 0).await?;
         }
+        // Captured once: a full account read makes an absent `group_ids` on a
+        // record authoritative (PMS-1433), while an incremental delta's
+        // absence just means this run's card set had no group card to say so.
+        let full_read = report.full_read;
         let mut snapshot = self
             .snapshot(tenant_id, connection_id, &connection.provider)
             .await?;
@@ -632,6 +650,7 @@ impl ContactSyncEngine {
                     &selected,
                     &label_names,
                     &snapshot,
+                    full_read,
                     &ctx,
                 )
                 .await;
@@ -1063,6 +1082,7 @@ impl ContactSyncEngine {
         selected: &BTreeSet<String>,
         label_names: &HashMap<String, String>,
         snapshot: &Snapshot,
+        full_read: bool,
         ctx: &AuditCtx,
     ) -> AppResult<Outcome> {
         let mapped = map_contact(record);
@@ -1076,7 +1096,7 @@ impl ContactSyncEngine {
                 .filter_map(|g| label_names.get(g).cloned())
                 .collect()
         };
-        match plan(record, selected, snapshot, &mapped) {
+        match plan(record, selected, snapshot, &mapped, full_read) {
             Plan::Excluded => Ok(Outcome::Excluded),
             Plan::NotSelected => Ok(Outcome::NotSelected),
             Plan::Unchanged => Ok(Outcome::Unchanged),
@@ -1249,7 +1269,16 @@ impl ContactSyncEngine {
         let mut totals = PreviewTotals::default();
         for record in changes.contacts.iter().filter(|r| !r.deleted) {
             let mapped = map_contact(record);
-            let planned = plan(record, &considered, &snapshot, &mapped);
+            // The preview always reads with no cursor (`changes_since(None)`
+            // above), so it is a full read whenever the source is one that
+            // lists everything at all: `record.group_ids` is authoritative.
+            let planned = plan(
+                record,
+                &considered,
+                &snapshot,
+                &mapped,
+                source.lists_everything(),
+            );
             let outcome = match &planned {
                 Plan::NotSelected | Plan::FlagDeleted(_) => None,
                 Plan::Excluded | Plan::AlreadyReviewed => Some(PreviewOutcome::Excluded),

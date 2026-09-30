@@ -104,4 +104,6 @@ docs/              This documentation set; docs/dev-docs/ holds the internal not
 
 ## Releases
 
-`just create-release <major|minor|hotfix>` bumps the version in `Cargo.toml`, creates and pushes a `release/v<X.Y.Z>` branch, and prints the PR URL. After the PR merges, the `create-release` workflow tags and publishes the release automatically.
+`just create-release <major|minor|hotfix>` bumps the version in `Cargo.toml`, syncs `Cargo.lock`, creates and pushes a `release/v<X.Y.Z>` branch, and prints the PR URL. After the PR merges, the `create-release` workflow tags and publishes the release automatically.
+
+Both halves come from `psa-systems/common` since PMS-786: the recipe is imported from the `common` submodule (`release_layout` stays `"generic"`, the version living at the root `[package] version`), and `.forgejo/workflows/create-release.yml` is a thin caller of common's reusable workflow, so the release-notes format is shared with every other consumer rather than forked here. The notes are one line per merged pull request, grouped by conventional-commit type; the previous private copy listed every commit, which double-reported each PR.

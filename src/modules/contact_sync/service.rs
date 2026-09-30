@@ -57,6 +57,14 @@ pub struct ContactSyncService {
     /// card still attached on the provider. `None` in fixtures that never
     /// seed a payment method before removing imported data.
     payment_methods: Option<Arc<crate::modules::contact_portal::PaymentMethodsService>>,
+    /// PMS-1429: run the import worker as soon as a run is queued, instead of
+    /// leaving it to sleep out its interval.
+    ///
+    /// `None` wherever nothing is listening, which is every test and the
+    /// worker's own copy of this service; the row is still queued and the next
+    /// tick still claims it, so the wake changes when the work starts and never
+    /// whether it happens.
+    run_wake: Option<crate::scheduler::JobWake>,
     /// Where the CardDAV client points (PMS-1409). A field rather than the
     /// constant at the call site, for the reason `GoogleContactsProvider`
     /// takes `with_base_url`: verifying an app-specific password is a real
@@ -378,9 +386,20 @@ impl ContactSyncService {
             secrets,
             public_api_base,
             spa_base_url,
+            run_wake: None,
             payment_methods: None,
             carddav_base_url: carddav::ICLOUD_BASE_URL.to_string(),
         }
+    }
+
+    /// Hand the service the handle that wakes the import worker (PMS-1429).
+    ///
+    /// Set by `main` on the ROUTER's service, because that is the copy a person
+    /// pressing Sync now reaches. The worker's own copy leaves it `None`: it is
+    /// the thing being woken.
+    pub fn with_run_wake(mut self, wake: crate::scheduler::JobWake) -> Self {
+        self.run_wake = Some(wake);
+        self
     }
 
     /// Point the CardDAV client somewhere else (PMS-1409). For the suite that
@@ -1444,6 +1463,12 @@ impl ContactSyncService {
         )
         .await?;
         tx.commit().await?;
+        // AFTER the commit, never before: a worker woken by an uncommitted
+        // insert finds nothing to claim and goes back to sleep for a full
+        // interval, which is the delay this exists to remove.
+        if let Some(wake) = &self.run_wake {
+            wake.wake();
+        }
         Ok(run)
     }
 

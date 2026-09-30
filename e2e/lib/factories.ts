@@ -18,13 +18,25 @@ export async function createCompany(
 
 // Create a run-tagged contact under `companyId`. last_name carries the suffix
 // so teardown's name-based sweep can identify it.
+//
+// PMS-1427: the email is required. PMS-1329 made it so on the CREATE path (and
+// deliberately not on update, where an absent email means "leave the field
+// alone"), and this factory had been posting a body the API refuses with a
+// field-level 422 ever since. The address carries the run tag too, in the
+// `${suffix}@e2e.example` shape the vCard specs already use, so a contact is
+// identifiable from its address as well as its name.
 export async function createContact(
   request: APIRequestContext,
   companyId: string,
 ): Promise<{ id: string }> {
   const suffix = runSuffix();
   const res = await request.post(routes.contacts, {
-    data: { company_id: companyId, first_name: 'E2E', last_name: suffix },
+    data: {
+      company_id: companyId,
+      first_name: 'E2E',
+      last_name: suffix,
+      email: `${suffix}@e2e.example`,
+    },
   });
   expect(res.status(), `create contact failed: ${await res.text()}`).toBe(200);
   const body = (await res.json()) as { id: string };

@@ -11,9 +11,9 @@ with; update it in the same change that adds or moves a check (PMS-851).
 ## The one-line version
 
 `just check` runs every `check.yml` step except the two cargo test steps.
-`just pre-commit` runs those two plus fmt, clippy and compile, inside the dev
-compose `server` container. Run both and you have run `check.yml`. Run either
-one alone and you have not.
+`just pre-commit` runs the UNIT tests plus fmt, clippy and compile, inside the
+dev compose `server` container. Run both and you have run all of `check.yml`
+except its doc tests, which since PMS-786 only CI runs (see the note below).
 
 ## Step by step
 
@@ -40,18 +40,27 @@ one alone and you have not.
 | Clippy | `cargo clippy --workspace --all-targets -- -D warnings` | `check-clippy` | yes |
 | Compile check | `cargo check --workspace --all-targets` | `check-compile` | yes |
 | Unit tests | `cargo test --workspace --lib` | no | yes |
-| Doc tests | `cargo test --workspace --doc` | no | yes |
+| Doc tests | `cargo test --workspace --doc` | no | **no** (see below) |
 
 `check.yml`'s remaining steps (clone, `CARGO_BUILD_JOBS` cap, `rust-cache`) set
 the runner up and check nothing, so no recipe mirrors them.
 
 ## Where the two sides deliberately differ
 
-- **The unit and doc tests are not in `just check`.** They are in
-  `just pre-commit`, which the git hook from `just install-hooks` runs on every
-  commit, so putting them in the pre-push umbrella as well would only make the
-  slower recipe slower. `just test` runs the whole `cargo test` set, including
-  the `tests/*.rs` suite that needs Postgres.
+- **The unit tests are not in `just check`.** They are in `just pre-commit`,
+  which the git hook from `just install-hooks` runs on every commit, so putting
+  them in the pre-push umbrella as well would only make the slower recipe
+  slower. `just test` runs the whole `cargo test` set, including the
+  `tests/*.rs` suite that needs Postgres.
+- **The doc tests are CI-only since PMS-786.** `pre-commit` now comes from
+  `common/common.just` rather than being forked here, and the shared recipe runs
+  exactly one `cargo test {{ test_args }}`; `cargo` refuses `--lib` and `--doc`
+  in one invocation, so `test_args := "--workspace --lib"` can express the unit
+  tests or the doc tests but not both. The doc tests stay in `check.yml`, so
+  nothing stopped gating them - what changed is that a broken doc test now
+  surfaces in CI rather than at commit time. PC-70 asks common for a second test
+  invocation; when it lands, this row goes back to `yes` and the justfile carries
+  both.
 - **The guard scripts are not in `just pre-commit`.** They are Nushell scripts
   run on the host, while every step of `pre-commit` runs in the dev compose
   `server` container. `just check` is where they belong.

@@ -106,7 +106,7 @@ fn validate_branding_patch_with_keys(patch: &Value, allowed: &[&str]) -> AppResu
             return Err(AppError::validation_field(
                 format!("branding.{key}"),
                 format!(
-                    "`{key}` is not a branding key; the known keys are {}",
+                    "is not a branding key; the known keys are {}",
                     allowed.join(", ")
                 ),
             ));

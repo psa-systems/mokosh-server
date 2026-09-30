@@ -223,7 +223,7 @@ async fn dispatch(
             if event_tenant != tenant_id {
                 return Err(AppError::Unauthorized);
             }
-            state
+            let recorded = state
                 .billing
                 .record_gateway_payment(
                     scoped,
@@ -235,6 +235,7 @@ async fn dispatch(
                     &raw,
                 )
                 .await?;
+            outcome = if recorded { "accepted" } else { "unreconciled" };
             invoice = Some(invoice_id);
         }
         PaymentEvent::Refunded {

@@ -89,6 +89,10 @@ async fn seed_stripe_gateway(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("seed stripe gateway");
+    // PMS-1312: the connected fact is `integrations.status` now, so a seeded
+    // gateway needs the row that makes it connected, the way migration 256 gave
+    // one to every gateway a deployment already had.
+    common::connect_seeded_gateway(pool, common::DEFAULT_TENANT_ID, "stripe", true).await;
 }
 
 async fn seed_payment_method(pool: &PgPool, contact_id: Uuid, provider_pm_id: &str) {

@@ -173,6 +173,23 @@ async fn seed_draft_invoice(pool: &PgPool, tenant_id: Uuid, company_id: Uuid) ->
     id
 }
 
+async fn seed_pending_invoice(pool: &PgPool, tenant_id: Uuid, company_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO invoices (id, tenant_id, invoice_number, company_id, status, \
+         invoice_date, due_date, subtotal, total, amount_paid, balance_due, currency) \
+         VALUES ($1, $2, $3, $4, 'pending', CURRENT_DATE, CURRENT_DATE + 30, 100, 100, 0, 100, 'USD')",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(format!("PR-PENDING-{}", &id.simple().to_string()[..8]))
+    .bind(company_id)
+    .execute(pool)
+    .await
+    .expect("seed pending invoice");
+    id
+}
+
 /// Seed an active Stripe gateway row so `has_active_gateway` returns
 /// true. The credential doesn't have to be real - the readiness read
 /// never touches the provider network - but `active_provider_id` reads
@@ -201,6 +218,10 @@ async fn seed_stripe_gateway(pool: &PgPool, tenant_id: Uuid) {
     .execute(pool)
     .await
     .expect("seed stripe gateway");
+    // PMS-1312: the connected fact is `integrations.status` now, so a seeded
+    // gateway needs the row that makes it connected, the way migration 256 gave
+    // one to every gateway a deployment already had.
+    common::connect_seeded_gateway(pool, tenant_id, "stripe", true).await;
 }
 
 /// MAPPS-671: set the admin override on the tenant's active Stripe row.
@@ -331,6 +352,42 @@ async fn readiness_not_payable_when_draft(pool: PgPool) {
         body["gateway_ready"].as_bool(),
         Some(true),
         "MAPPS-666: draft-invoice does not affect gateway_ready"
+    );
+}
+
+/// PMS-1431: a Pending invoice (never sent to the customer) must not be
+/// reported payable. `create_invoice_checkout_session` and the payment-
+/// recording paths already refuse Pending (PMS-999); before this fix
+/// `invoice_payable` still included Pending, so the portal rendered a
+/// "Pay now" button for an invoice the checkout endpoint would then refuse
+/// - or worse, a webhook would silently drop if a session was already
+/// somehow minted.
+#[mokosh_test]
+async fn readiness_not_payable_when_pending(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "ready-pending", &["Billing Contact"]).await;
+    let invoice_id = seed_pending_invoice(&pool, common::DEFAULT_TENANT_ID, own_company).await;
+    seed_stripe_gateway(&pool, common::DEFAULT_TENANT_ID).await;
+
+    let resp = app
+        .client
+        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("readiness");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["invoice_payable"].as_bool(),
+        Some(false),
+        "PMS-1431: pending invoice -> invoice_payable = false"
+    );
+    assert_eq!(
+        body["gateway_ready"].as_bool(),
+        Some(true),
+        "PMS-1431: pending-invoice does not affect gateway_ready"
     );
 }
 

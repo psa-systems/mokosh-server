@@ -454,7 +454,23 @@ async fn emit<T>(
 ) -> AppResult<Response> {
     match format {
         ExportFormat::Csv => Ok((
-            [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "text/csv; charset=utf-8".to_string(),
+                ),
+                // MAPPS-641's `DownloadButton` reads the filename the server
+                // sets in `Content-Disposition` for both formats of this
+                // export, so the CSV branch carries the same header the PDF
+                // branch does (PMS-1417).
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    crate::utils::content_disposition::content_disposition(&format!(
+                        "{}.csv",
+                        descriptor.key
+                    )),
+                ),
+            ],
             to_csv(data),
         )
             .into_response()),
@@ -472,11 +488,6 @@ async fn emit<T>(
                         axum::http::header::CONTENT_TYPE,
                         "application/pdf".to_string(),
                     ),
-                    // The CSV branch deliberately keeps no `Content-Disposition`:
-                    // it is an existing response the SPA already consumes, and
-                    // changing its headers is not this issue's to do. A PDF is
-                    // new, and a browser handed one with no disposition renders
-                    // it in place under a URL ending in `/export`.
                     (
                         axum::http::header::CONTENT_DISPOSITION,
                         crate::utils::content_disposition::content_disposition(&format!(

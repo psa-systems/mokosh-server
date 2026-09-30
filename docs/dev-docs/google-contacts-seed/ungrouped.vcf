@@ -1,0 +1,6 @@
+BEGIN:VCARD
+VERSION:3.0
+N:Selected;Not;;;
+FN:Not Selected
+EMAIL;TYPE=WORK,PREF:nobody@elsewhere.example
+END:VCARD

@@ -416,7 +416,7 @@ impl PlatformAdminService {
         if new != confirm {
             return Err(AppError::validation_field(
                 "confirm_password",
-                "Passwords do not match",
+                "passwords do not match",
             ));
         }
         let pool = self.db.migrator_pool();
@@ -431,7 +431,7 @@ impl PlatformAdminService {
         if !verify_password(current, hash).await? {
             return Err(AppError::validation_field(
                 "current_password",
-                "Current password is incorrect",
+                "current password is incorrect",
             ));
         }
         let new_hash = hash_password(new).await?;

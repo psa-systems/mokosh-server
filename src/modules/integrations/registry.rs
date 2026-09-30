@@ -10,20 +10,38 @@
 //! # One home per connection
 //!
 //! Three per-tenant connection tables predate this subsystem, and two of them
-//! already answer whether a provider in this list is connected:
+//! also answered whether a provider in this list is connected:
 //! `payment_gateway_configs` for Stripe and PayPal, `contact_sync_connections`
-//! for Google. If the `integrations` table also answered that while they do,
-//! there would be two homes for one fact and the only certainty is that they
-//! would eventually disagree.
+//! for Google. If the `integrations` table answered that as well, there would be
+//! two homes for one fact and the only certainty is that they would eventually
+//! disagree.
 //!
 //! So each entry names the subsystem that owns its connection, and
 //! [`IntegrationsService`](super::service::IntegrationsService) refuses
 //! `connect`, `disconnect` and a capability change for a provider whose home is
 //! still elsewhere, naming where it is configured and the issue that moves it.
 //! No `integrations` row exists for such a provider at all, so the two tables
-//! cannot diverge in the meantime. PMS-1312 (Stripe) and PMS-1315 (contacts)
-//! each flip one entry to [`ConnectionHome::Integrations`] and backfill its
-//! rows in the same change.
+//! cannot diverge in the meantime. PMS-1315 flips the remaining entry (Google)
+//! and backfills its rows in the same change.
+//!
+//! PMS-1312 did that for Stripe and PayPal: `integrations.status` is now the
+//! home of whether a payment provider is connected for a tenant, migration 256
+//! backfilled a row per gateway, and `payment_gateway_configs.is_active` is a
+//! one-way mirror written by one function and read by nothing (see
+//! [`super::connection`]).
+//!
+//! # A connection home is not a credential home
+//!
+//! Those two came apart in the same change, which is why
+//! [`CredentialHome`] exists beside [`ConnectionHome`]. Stripe cannot be
+//! connected by pressing a button: it needs a secret key and a webhook signing
+//! secret, per-provider settings beside them (`is_test_mode`,
+//! `client_display_name`, `min_partial_amount`), and a validation pass that
+//! parses the blob into that provider's own shape. That surface is
+//! `PUT /api/v1/payment-gateways`, it already exists, and reproducing it
+//! here would be a second place to enter one credential. So the credential stays
+//! addressed as `SecretKind::PaymentGateway` and entered there, while the
+//! connected fact lives here.
 //!
 //! `rmm_connections` is deliberately absent: RMM is not one of the capabilities
 //! this subsystem arbitrates, so folding it in would widen the concept to mean
@@ -48,6 +66,44 @@ pub enum ConnectionHome {
         configured_at: &'static str,
         issue: &'static str,
     },
+}
+
+/// Which secret address holds an installation's credential, and therefore which
+/// surface the operator enters it on.
+///
+/// Separate from [`ConnectionHome`] because PMS-1312 separated them: a payment
+/// provider's connected fact moved into `integrations` while its credential
+/// stayed where the payments surface already writes it. Collapsing the two into
+/// one flag would make the next payment provider either grow a second credential
+/// form or lose its per-provider settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialHome {
+    /// `SecretKind::Integration`, written by
+    /// [`IntegrationsService::connect`](super::service::IntegrationsService::connect)
+    /// and deleted by `disconnect`. The credential arrives in the connect
+    /// request, so connecting is one act.
+    Integration,
+    /// `SecretKind::PaymentGateway`, written by
+    /// `PUT /api/v1/payment-gateways` and deleted by its DELETE.
+    ///
+    /// `connect` here therefore takes NO credential and refuses one that is
+    /// sent, because a credential written to the other address would be a secret
+    /// nothing reads; it also refuses when none is stored yet, since a
+    /// `connected` row with no credential is the state this subsystem exists to
+    /// prevent. `disconnect` leaves the stored credential alone, so an MSP who
+    /// switches payments off for a month does not have to find their keys again;
+    /// the gateway DELETE is what removes it.
+    PaymentGateway,
+    /// `SecretKind::ContactSync`, written by the contact-sync OAuth flow.
+    ///
+    /// Read by nothing today: the only provider carrying it is Google, whose
+    /// connection home is still [`ConnectionHome::Elsewhere`], so `connect` here
+    /// is refused before the credential home is consulted. It is stated rather
+    /// than left as `Integration` because that key is keyed by the CONNECTION id
+    /// as well as the provider (a reconnect must not resolve the old token), so
+    /// PMS-1315 has one more question to answer than PMS-1312 did and the
+    /// difference belongs in the registry rather than in whoever reads it next.
+    ContactSync,
 }
 
 /// How often a provider is polled, for one that is polled at all.
@@ -91,6 +147,7 @@ pub struct ProviderDescriptor {
     /// `None` for a provider nothing polls, so no poll setting is offered.
     pub polling: Option<PollingSpec>,
     pub connection_home: ConnectionHome,
+    pub credential_home: CredentialHome,
 }
 
 impl ProviderDescriptor {
@@ -118,11 +175,8 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
             Capability::PointOfSale,
         ],
         polling: None,
-        connection_home: ConnectionHome::Elsewhere {
-            table: "payment_gateway_configs",
-            configured_at: "Settings > Payment gateways",
-            issue: "PMS-1312",
-        },
+        connection_home: ConnectionHome::Integrations,
+        credential_home: CredentialHome::PaymentGateway,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Paypal,
@@ -131,11 +185,8 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
                       approval, so a payment is recorded when the capture completes.",
         supported_capabilities: &[Capability::Payments],
         polling: None,
-        connection_home: ConnectionHome::Elsewhere {
-            table: "payment_gateway_configs",
-            configured_at: "Settings > Payment gateways",
-            issue: "PMS-1312",
-        },
+        connection_home: ConnectionHome::Integrations,
+        credential_home: CredentialHome::PaymentGateway,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Quickbooks,
@@ -145,6 +196,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         supported_capabilities: &[Capability::Invoicing, Capability::BillsAndExpenses],
         polling: Some(POLLED),
         connection_home: ConnectionHome::Integrations,
+        credential_home: CredentialHome::Integration,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Xero,
@@ -154,6 +206,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         supported_capabilities: &[Capability::Invoicing, Capability::BillsAndExpenses],
         polling: Some(POLLED),
         connection_home: ConnectionHome::Integrations,
+        credential_home: CredentialHome::Integration,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Google,
@@ -167,6 +220,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
             configured_at: "Settings > Contact sync",
             issue: "PMS-1315",
         },
+        credential_home: CredentialHome::ContactSync,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Microsoft,
@@ -177,6 +231,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         supported_capabilities: &[Capability::Contacts],
         polling: Some(POLLED),
         connection_home: ConnectionHome::Integrations,
+        credential_home: CredentialHome::Integration,
     },
 ];
 
