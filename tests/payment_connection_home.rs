@@ -363,3 +363,89 @@ async fn saving_a_gateway_with_no_registry_entry_still_works(pool: PgPool) {
         "a provider the integrations CHECK refuses gets no row here"
     );
 }
+
+/// The backfill migration 256 runs, re-run against rows it never saw.
+///
+/// The template database this suite clones already has 256 applied, so there is
+/// no way to seed a gateway "before" it. Re-executing the file is the next best
+/// thing and tests the part that matters: whether the mapping it claims is the
+/// mapping it performs. The file is executed rather than transcribed, because a
+/// copy of the statement in a test can agree with the test and disagree with the
+/// migration.
+///
+/// It also pins the idempotency the `ON CONFLICT DO NOTHING` promises, since a
+/// deployment that takes this release twice (a rollback and a roll forward) runs
+/// it against rows that already have their row.
+#[mokosh_test]
+async fn the_backfill_maps_each_gateway_the_way_it_says(pool: PgPool) {
+    let tenant = common::DEFAULT_TENANT_ID;
+    // Three shapes: switched on, saved and never switched on, and a provider the
+    // integrations CHECK refuses.
+    for (provider, is_active) in [("stripe", true), ("paypal", false), ("authorize_net", true)] {
+        sqlx::query(
+            "INSERT INTO payment_gateway_configs \
+                 (tenant_id, provider, is_active, is_test_mode, config_encrypted) \
+             VALUES ($1, $2, $3, TRUE, 'ciphertext')",
+        )
+        .bind(tenant)
+        .bind(provider)
+        .bind(is_active)
+        .execute(&pool)
+        .await
+        .expect("seed a pre-migration gateway row");
+    }
+
+    let migration = include_str!("../migrations/256_payment_gateway_connection_home.sql");
+    for _ in 0..2 {
+        sqlx::raw_sql(migration)
+            .execute(&pool)
+            .await
+            .expect("run the backfill");
+    }
+
+    let rows: Vec<(
+        String,
+        String,
+        Vec<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        "SELECT provider, status, enabled_capabilities, connected_at FROM integrations \
+             WHERE tenant_id = $1 ORDER BY provider",
+    )
+    .bind(tenant)
+    .fetch_all(&pool)
+    .await
+    .expect("read the backfilled rows");
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "one row per gateway the integrations CHECK accepts, and none for \
+         authorize_net: {rows:?}"
+    );
+
+    let paypal = &rows[0];
+    assert_eq!(paypal.0, "paypal");
+    assert_eq!(
+        paypal.1, "not_connected",
+        "an inactive row could be either 'saved and never switched on' or \
+         'switched off', and nothing stored says which, so it maps to the status \
+         that asserts neither"
+    );
+    assert!(
+        paypal.3.is_none(),
+        "and it claims no connect that may never have happened"
+    );
+
+    let stripe = &rows[1];
+    assert_eq!(stripe.0, "stripe");
+    assert_eq!(stripe.1, "connected");
+    assert!(stripe.3.is_some(), "an active row records when");
+    assert_eq!(
+        stripe.2,
+        vec!["payments".to_string()],
+        "never the provider's whole supported set: enabling `invoicing` would \
+         claim this tenant handed their invoice issuing to Stripe"
+    );
+    assert_eq!(paypal.2, vec!["payments".to_string()]);
+}
