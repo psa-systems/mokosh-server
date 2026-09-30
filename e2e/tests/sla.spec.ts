@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { runSuffix } from '../lib/run';
 
 // SLA CRUD (PMS-155): policies, business hours, holiday calendars. The SLA
@@ -26,7 +26,7 @@ test.describe('SLA CRUD', () => {
     });
     expect(updP.status(), `update sla-policy failed: ${await updP.text()}`).toBe(200);
 
-    const listP = await request.get(`${routes.slaPolicies}?per_page=200`);
+    const listP = await request.get(`${routes.slaPolicies}?per_page=${MAX_PER_PAGE}`);
     expect(listP.status()).toBe(200);
     expect(((await listP.json()) as { data: Array<{ id: string }> }).data.map((p) => p.id)).toContain(
       policy.id,

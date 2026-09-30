@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { createCompany, enableModule, today } from '../lib/factories';
 import { runSuffix } from '../lib/run';
 
@@ -40,7 +40,7 @@ test.describe('contracts CRUD', () => {
     });
     expect(updC.status(), `update contract failed: ${await updC.text()}`).toBe(200);
 
-    const listC = await request.get(`${routes.contracts}?per_page=200`);
+    const listC = await request.get(`${routes.contracts}?per_page=${MAX_PER_PAGE}`);
     expect(listC.status()).toBe(200);
     expect(((await listC.json()) as { data: Array<{ id: string }> }).data.map((c) => c.id)).toContain(
       contract.id,
@@ -77,7 +77,7 @@ test.describe('contracts CRUD', () => {
     const rateCard = (await createRc.json()) as { id: string };
     expect(rateCard.id).toBeTruthy();
 
-    const listRc = await request.get(`${routes.rateCards}?per_page=200`);
+    const listRc = await request.get(`${routes.rateCards}?per_page=${MAX_PER_PAGE}`);
     expect(listRc.status()).toBe(200);
     expect(((await listRc.json()) as { data: Array<{ id: string }> }).data.map((r) => r.id)).toContain(
       rateCard.id,

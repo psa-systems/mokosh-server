@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { createCompany, enableModule, getSelf, today } from '../lib/factories';
 import { runSuffix } from '../lib/run';
 
@@ -27,7 +27,7 @@ test.describe('time-tracking CRUD', () => {
     const workType = (await createWt.json()) as { id: string; name: string };
     expect(workType.id).toBeTruthy();
 
-    const listWt = await request.get(`${routes.workTypes}?per_page=200`);
+    const listWt = await request.get(`${routes.workTypes}?per_page=${MAX_PER_PAGE}`);
     expect(listWt.status()).toBe(200);
     expect(((await listWt.json()) as { data: Array<{ id: string }> }).data.map((w) => w.id)).toContain(
       workType.id,
@@ -62,7 +62,7 @@ test.describe('time-tracking CRUD', () => {
     expect(updTe.status(), `update time-entry failed: ${await updTe.text()}`).toBe(200);
 
     const listTe = await request.get(
-      `${routes.timeEntries}?date_from=${day}&date_to=${day}&per_page=200`,
+      `${routes.timeEntries}?date_from=${day}&date_to=${day}&per_page=${MAX_PER_PAGE}`,
     );
     expect(listTe.status()).toBe(200);
     expect(((await listTe.json()) as { data: Array<{ id: string }> }).data.map((e) => e.id)).toContain(
