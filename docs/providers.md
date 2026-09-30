@@ -26,8 +26,10 @@ Payment (`PaymentProvider`) and RMM (`RmmProvider`) are also providers, but they
 integration rather than per deployment as infrastructure, so they do not appear in the tables below.
 
 `src/config/`, `src/secrets/`, `src/storage/` and `src/app_secrets/` implement the kinds above. `src/app_secrets/`
-(PMS-988) is Mokosh's application-tier `AppSecretProvider`, with a `GovernedSecret` registry that starts at
-`SMTP_PASSWORD` and grows the day another deployment-wide secret joins it. Its selection variable is `SECRET_BACKEND`,
+(PMS-988) is Mokosh's application-tier `AppSecretProvider`, with a `GovernedSecret` registry holding `SMTP_PASSWORD`
+and, since PMS-1430, the host's Google OAuth client id and secret. A pair like that one joins as TWO entries rather
+than one holding two values: both halves then resolve from the same provider, and the four-way classification reports
+each separately, which is what makes a half-configured host a boot error naming the key that is missing. Its selection variable is `SECRET_BACKEND`,
 the same variable the tenant tier reads: both tiers pick the same provider on purpose.
 [ROADMAP.md](ROADMAP.md) links the phase, and the issue, for every kind.
 
@@ -196,9 +198,11 @@ and claims nothing it did not do.
 serving it.
 
 ```
-KEY                    environment  database  infisical  serving
-SMTP_PASSWORD          -            yes       yes        infisical
-STRIPE_SECRET_KEY      -            yes       -          database   (!)
+KEY                            environment  database  infisical  serving
+SMTP_PASSWORD                  -            yes       yes        infisical
+GOOGLE_CONTACTS_CLIENT_ID      -            -         yes        infisical
+GOOGLE_CONTACTS_CLIENT_SECRET  -            -         yes        infisical
+STRIPE_SECRET_KEY              -            yes       -          database   (!)
 ```
 
 The `(!)` row is a value the declared provider does not hold. Presence is checked live, so it reflects the
