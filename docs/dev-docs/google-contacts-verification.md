@@ -18,10 +18,13 @@ fails, suspect the assumption about Google rather than the code, and check the s
 
 ## Before you start
 
-- A Google Cloud project with the People API enabled, and an OAuth client of type **Web application**.
+- The HOST's Google client configured (PMS-1430). This is the operator's job, not the tester's and not a tenant's:
+  the pair is a governed application-tier secret (`GOOGLE_CONTACTS_CLIENT_ID`, `GOOGLE_CONTACTS_CLIENT_SECRET`)
+  served by whichever provider `SECRET_BACKEND` names, which on the hosted deployment is Infisical under `/app`.
+  There is no Settings form: a tenant admin sees "configured" or "not available on this deployment".
+  The registration procedure is at the end of this file.
 - Its authorised redirect URI must be, exactly, `<PUBLIC_API_BASE_URL>/api/v1/public/contact-sync/google/callback`.
-  Copy it from the Settings card rather than typing it; one character out and the consent screen refuses before
-  Mokosh is involved.
+  One character out and the consent screen refuses before Mokosh is involved.
 - A throwaway Google account. You will be signing into it on a screen and revoking its tokens.
 - A Mokosh tenant you are an admin of, and one you are willing to leave imported records in.
 - `just check` green in both repos before you begin, so a failure during the pass is the pass's.
@@ -145,3 +148,31 @@ Disconnect from the card.
 For each run: what you did, what the card said, and the row counts you checked. Where a step passed, one line is
 enough. Where it did not, include the run row (`SELECT * FROM contact_sync_runs ORDER BY created_at DESC LIMIT 1`)
 and the connection's `last_error`, because those carry the provider's own words and the log does not repeat them.
+
+## Registering the host's Google client (operator)
+
+Done once per deployment, by whoever runs it. A tenant never does this, which is the whole of PMS-1430.
+
+1. In the Google Cloud console, create a project or pick one.
+2. APIs and Services, Library: enable the **Google People API**. Without it every import fails with `SERVICE_DISABLED`.
+3. Google Auth Platform (older consoles call it the OAuth consent screen): fill in Branding, set Audience, and while
+   the app is in Testing add the accounts that may consent.
+4. Data access: add exactly three scopes, `https://www.googleapis.com/auth/contacts.readonly`, `openid` and `email`.
+   They are what `contact_sync::oauth::SCOPES` requests; a scope missing here is a consent screen granting less than
+   the sync needs.
+5. Clients, Create client, application type **Web application**, with the redirect URI above under Authorized
+   redirect URIs. No JavaScript origins: the code exchange happens on the server.
+6. Put the id and the secret in the provider `SECRET_BACKEND` names, under the key names in step 0. Both or neither:
+   one without the other is a boot error naming the missing half.
+
+Two properties of the Google application, which belong to this procedure rather than to the code:
+
+- An **External** app still in **Testing** gets refresh tokens Google expires after **seven days**. Fine for a
+  verification pass, fatal for a deployment anyone relies on.
+- Publishing without Google's OAuth verification caps the app at **100 users** and shows each of them an unverified
+  warning. `contacts.readonly` is a sensitive scope, so verification needs a verified domain, a homepage describing
+  the data use, a published privacy policy, a consistent name and logo, a justification per scope and a demo video;
+  it does NOT need the annual third-party security assessment, which applies to restricted scopes.
+
+Record who holds the Google account, where the privacy policy lives, and what triggers a re-review, beside this
+procedure. A client nobody owns is one nobody renews.

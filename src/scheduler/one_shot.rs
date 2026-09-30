@@ -122,9 +122,16 @@ mod tests {
     /// not enough. This reads `main.rs` back: no `scheduler.register` line may
     /// name a mover, and every mover must be spawned as a one-shot.
     ///
-    /// Keyed on the `_mover` variable suffix rather than on the three type
-    /// names, so a fourth pass added later is covered by the convention
-    /// instead of needing an edit here.
+    /// Keyed on the variable suffix rather than on the type names, so a pass
+    /// added later is covered by the convention instead of needing an edit here.
+    ///
+    /// PMS-1430 widened the suffix set from `_mover` alone: not every one-time
+    /// correction moves something. That one DELETES the per-tenant Google client
+    /// secrets, and calling its variable a mover to satisfy a grep would have
+    /// been the wrong half of the convention to bend.
+    /// The variable suffixes that name a one-shot pass in `main.rs`.
+    const ONE_SHOT_SUFFIXES: [&str; 2] = ["_mover", "_cleanup"];
+
     #[test]
     fn no_mover_is_registered_on_the_scheduler() {
         let main = std::fs::read_to_string(
@@ -138,7 +145,10 @@ mod tests {
             .lines()
             .map(str::trim)
             .filter(|line| !line.starts_with("//"))
-            .filter(|line| line.contains("scheduler.register") && line.contains("_mover"))
+            .filter(|line| {
+                line.contains("scheduler.register")
+                    && ONE_SHOT_SUFFIXES.iter().any(|s| line.contains(s))
+            })
             .collect();
         assert!(
             registered.is_empty(),
@@ -147,11 +157,15 @@ mod tests {
 
         // And the complement: a mover that is constructed and then spawned by
         // nothing would be dead code that reads as wiring.
-        let constructed = main.matches("_mover =").count();
+        let constructed: usize = ONE_SHOT_SUFFIXES
+            .iter()
+            .map(|suffix| main.matches(&format!("{suffix} =")).count())
+            .sum();
         let spawned = main.matches("ONE_SHOT_NAME").count();
         assert_eq!(
             constructed, spawned,
-            "{constructed} mover(s) are built in main.rs but {spawned} are              handed to spawn_once"
+            "{constructed} one-shot pass(es) are built in main.rs but {spawned} are \
+             handed to spawn_once"
         );
     }
 }

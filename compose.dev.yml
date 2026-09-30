@@ -387,8 +387,6 @@ services:
       BUNYIP_STATUS_CLIENT_SECRET: ${BUNYIP_STATUS_CLIENT_SECRET:-}
       # PMS-1212 (PSA-70): Google Contacts OAuth client. Unset locally, so the
       # integration reports itself unconfigured rather than half-working.
-      GOOGLE_CONTACTS_CLIENT_ID: ${GOOGLE_CONTACTS_CLIENT_ID:-}
-      GOOGLE_CONTACTS_CLIENT_SECRET: ${GOOGLE_CONTACTS_CLIENT_SECRET:-}
 
       # Browser-visible origin of the client that talks to this API. Must
       # equal it byte-for-byte: it is the CORS_ORIGIN default and the base
@@ -588,6 +586,14 @@ services:
       # local hook and only failed in CI. `tests/` is compile-only here (the
       # Postgres-backed run stays in `just test-integration`).
       - ./tests:/app/tests
+      # PMS-1430: the e2e suite, read only, because a `cargo test --lib` guard
+      # reads it. `pms1427_e2e_page_size` scans `e2e/**.ts` for a `per_page`
+      # literal above what the API serves and fails loudly when the directory is
+      # absent, on purpose: a guard that skips when it cannot see its subject
+      # proves nothing. CI checks the whole repository out and passed; the
+      # container mounts the tree file by file, so `just pre-commit` failed on a
+      # missing directory rather than on anything a developer had changed.
+      - ./e2e:/app/e2e:ro
       # PMS-1183: the nextest profile `just test-integration` names
       # (`--profile ci`, from `.config/nextest.toml`, PMS-1177). This mount
       # list enumerates the source tree file by file, so a new top-level

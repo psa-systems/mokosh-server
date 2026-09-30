@@ -634,6 +634,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    // PMS-1430: the HOST's Google OAuth client, read through the seam above and
+    // resolved once. A half-configured pair is a boot error naming the missing
+    // key, which is why this is not `unwrap_or_default`: an operator who set an
+    // id and forgot its secret must not discover it when a customer presses
+    // Connect. Both unset is a deployment that cannot connect Google Contacts,
+    // which the app-secret survey has already warned about by name.
+    let google_client = match mokosh_server::app_secrets::current() {
+        Some(secrets) => {
+            mokosh_server::modules::contact_sync::OauthClient::from_app_secrets(secrets.as_ref())?
+        }
+        None => None,
+    };
+
     // PMS-789: load the deployment's product name into the process cache
     // before anything can render it. Warn-and-continue rather than hard-fail:
     // the consumers are display strings with a working default, and refusing to
@@ -876,7 +889,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             secrets.clone(),
             config.public_api_base_url.clone(),
             config.spa_base_url.clone(),
-        ),
+        )
+        // The worker refreshes each run's access token, which is an exchange
+        // with the same client the connection was made under, so it needs the
+        // host client as much as the request path does.
+        .with_host_client(google_client.clone()),
     );
     let contact_sync_notifications =
         mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
@@ -1023,6 +1040,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mokosh_server::modules::billing::GatewayCredentialMover::ONE_SHOT_NAME,
         async move { gateway_credential_mover.run_tick().await.map(|_| ()) },
     );
+    // PMS-1430: the per-tenant Google client secrets that sat beside the client
+    // ids migration 258 deleted. SQL cannot reach them: they are in whichever
+    // secret provider the deployment declared, which may be Infisical.
+    let google_client_cleanup =
+        mokosh_server::modules::contact_sync::ClientSecretCleanup::new(db.clone(), secrets.clone());
+    spawn_once(
+        mokosh_server::modules::contact_sync::ClientSecretCleanup::ONE_SHOT_NAME,
+        async move { google_client_cleanup.run_tick().await.map(|_| ()) },
+    );
+
     // PMS-1037: overdue invoice reminders, hourly so each tenant's local
     // sending hour is hit once a day. Built with delivery (the mailer and the
     // portal origin) because it mails, unlike the recurring generator above.
@@ -1118,6 +1145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.deployment_mode,
         secrets.clone(),
         Some(contact_sync_wake),
+        google_client,
     );
     let router = psa_router;
 

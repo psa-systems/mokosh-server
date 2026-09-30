@@ -29,6 +29,7 @@ use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::app_secrets::{AppSecrets, GovernedSecret};
 use crate::utils::error::{AppError, AppResult};
 
 /// Google's authorization endpoint.
@@ -80,22 +81,63 @@ pub struct OauthClient {
 }
 
 impl OauthClient {
-    /// Read from operator configuration. `None` when either key is unset,
-    /// which the Settings card renders as "not configured" rather than as a
-    /// Connect button that cannot work.
-    pub fn from_config() -> Option<Self> {
-        let client_id = crate::config::get(&crate::config::registry::GOOGLE_CONTACTS_CLIENT_ID)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())?;
-        let client_secret =
-            crate::config::get(&crate::config::registry::GOOGLE_CONTACTS_CLIENT_SECRET)
+    /// The HOST's client, read through the application-tier secret seam
+    /// (PMS-1430).
+    ///
+    /// Which Google application this Mokosh installation authenticates as is a
+    /// property of the deployment, not of a tenant, so it is one pair of
+    /// governed secrets served by whichever `AppSecretProvider` the host
+    /// declared. The hosted deployment declares Infisical and holds the pair in
+    /// `/app`; the seam itself is provider-agnostic and a self-hosted deployment
+    /// may hold it in a file, the database or `{NAME}_FILE`.
+    ///
+    /// Three outcomes, and the third is the reason this returns a `Result`.
+    /// Both halves present is a configured host. Neither is an unconfigured one,
+    /// which the Settings card renders as "not available on this deployment"
+    /// rather than as a Connect button that cannot work. One half without the
+    /// other is neither: it is a host that would connect as half an application,
+    /// so it is an error naming the key that is missing, raised at boot where an
+    /// operator is present to read it rather than at a customer's first click.
+    pub fn from_app_secrets(secrets: &AppSecrets) -> AppResult<Option<Self>> {
+        let read = |secret: GovernedSecret| {
+            secrets
+                .get(secret)
                 .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())?;
-        Some(Self {
-            client_id,
-            client_secret,
-        })
+                .filter(|v| !v.is_empty())
+        };
+        match (
+            read(GovernedSecret::GoogleContactsClientId),
+            read(GovernedSecret::GoogleContactsClientSecret),
+        ) {
+            (Some(client_id), Some(client_secret)) => Ok(Some(Self {
+                client_id,
+                client_secret,
+            })),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(half_configured(GovernedSecret::GoogleContactsClientSecret)),
+            (None, Some(_)) => Err(half_configured(GovernedSecret::GoogleContactsClientId)),
+        }
     }
+}
+
+/// The boot error for a host holding one half of the pair.
+///
+/// Names the MISSING key rather than the present one, because the operator's
+/// next action is to add it, and says where it goes without naming a provider:
+/// which provider serves it is `SECRET_BACKEND`'s answer and the app-secret
+/// survey already logs it one line above this.
+fn half_configured(missing: GovernedSecret) -> AppError {
+    AppError::Configuration(format!(
+        "Google Contacts is half configured: {} is set and {} is not. A client id and its secret \
+         have to come from the same Google project and the same provider, so add {} beside it or \
+         remove both.",
+        match missing {
+            GovernedSecret::GoogleContactsClientSecret => GovernedSecret::GoogleContactsClientId,
+            _ => GovernedSecret::GoogleContactsClientSecret,
+        },
+        missing,
+        missing,
+    ))
 }
 
 /// A PKCE verifier and the challenge derived from it.
@@ -467,5 +509,97 @@ mod tests {
                 assert!(!message.contains(secret), "{message}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pms1430_host_client {
+    use super::*;
+    use crate::app_secrets::{AppSecretProvider, AppSecretProviderKind};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// A provider holding whatever the case puts in it, so the four shapes of
+    /// the pair can be driven without standing up a real provider.
+    struct Fixed(HashMap<&'static str, String>);
+
+    #[async_trait]
+    impl AppSecretProvider for Fixed {
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+        fn get(&self, secret: GovernedSecret) -> Option<String> {
+            self.0.get(secret.name()).cloned()
+        }
+    }
+
+    fn secrets(pairs: &[(GovernedSecret, &str)]) -> AppSecrets {
+        let map = pairs
+            .iter()
+            .map(|(secret, value)| (secret.name(), (*value).to_string()))
+            .collect();
+        AppSecrets::with_provider(AppSecretProviderKind::Infisical, Arc::new(Fixed(map)))
+    }
+
+    const ID: GovernedSecret = GovernedSecret::GoogleContactsClientId;
+    const SECRET: GovernedSecret = GovernedSecret::GoogleContactsClientSecret;
+
+    /// Both halves present is a configured host.
+    #[test]
+    fn a_complete_pair_is_the_host_client() {
+        let client = OauthClient::from_app_secrets(&secrets(&[
+            (ID, "host.apps.googleusercontent.com"),
+            (SECRET, "s3cret"),
+        ]))
+        .expect("a complete pair resolves")
+        .expect("and is Some");
+        assert_eq!(client.client_id, "host.apps.googleusercontent.com");
+        assert_eq!(client.client_secret, "s3cret");
+    }
+
+    /// Neither half is a deployment that cannot connect, which is a state, not
+    /// an error: most self-hosted deployments never turn Google Contacts on.
+    #[test]
+    fn neither_half_is_an_unconfigured_host() {
+        assert!(OauthClient::from_app_secrets(&secrets(&[]))
+            .expect("unconfigured is not an error")
+            .is_none());
+    }
+
+    /// Whitespace is not configuration. A provider that hands back an empty
+    /// string (a forwarded-but-unset compose key arrives as `""`) reads as
+    /// absent rather than as half a pair.
+    #[test]
+    fn a_blank_value_reads_as_absent() {
+        assert!(
+            OauthClient::from_app_secrets(&secrets(&[(ID, "   "), (SECRET, "")]))
+                .expect("blank is unconfigured")
+                .is_none()
+        );
+    }
+
+    /// One half without the other is neither state, and it is the one worth
+    /// failing on: a host that would connect as half an application.
+    #[test]
+    fn half_a_pair_names_the_missing_key() {
+        let err =
+            OauthClient::from_app_secrets(&secrets(&[(ID, "host.apps.googleusercontent.com")]))
+                .expect_err("an id with no secret is an error");
+        let message = err.to_string();
+        assert!(message.contains(SECRET.name()), "{message}");
+        assert!(
+            !message.contains("host.apps.googleusercontent.com"),
+            "the error names keys, never values: {message}"
+        );
+
+        let err = OauthClient::from_app_secrets(&secrets(&[(SECRET, "s3cret")]))
+            .expect_err("a secret with no id is an error");
+        let message = err.to_string();
+        assert!(message.contains(ID.name()), "{message}");
+        assert!(
+            !message.contains("s3cret"),
+            "the error must never carry the secret: {message}"
+        );
     }
 }
