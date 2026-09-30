@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { createCompany, enableModule, today } from '../lib/factories';
 import { runSuffix } from '../lib/run';
 
@@ -23,7 +23,7 @@ test.describe('billing CRUD', () => {
     const taxRate = (await createTr.json()) as { id: string };
     expect(taxRate.id).toBeTruthy();
 
-    const listTr = await request.get(`${routes.taxRates}?per_page=200`);
+    const listTr = await request.get(`${routes.taxRates}?per_page=${MAX_PER_PAGE}`);
     expect(listTr.status()).toBe(200);
     expect(((await listTr.json()) as { data: Array<{ id: string }> }).data.map((r) => r.id)).toContain(
       taxRate.id,

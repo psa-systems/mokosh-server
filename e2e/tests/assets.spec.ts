@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { createCompany, enableModule } from '../lib/factories';
 import { runSuffix } from '../lib/run';
 
@@ -47,7 +47,7 @@ test.describe('assets CRUD', () => {
     });
     expect(updA.status(), `update asset failed: ${await updA.text()}`).toBe(200);
 
-    const listA = await request.get(`${routes.assets}?per_page=200`);
+    const listA = await request.get(`${routes.assets}?per_page=${MAX_PER_PAGE}`);
     expect(listA.status()).toBe(200);
     expect(((await listA.json()) as { data: Array<{ id: string }> }).data.map((a) => a.id)).toContain(
       asset.id,

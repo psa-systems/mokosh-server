@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { enableModule, getSelf, today } from '../lib/factories';
 import { runSuffix } from '../lib/run';
 
@@ -41,7 +41,7 @@ test.describe('calendar CRUD', () => {
     });
     expect(updAppt.status(), `update appointment failed: ${await updAppt.text()}`).toBe(200);
 
-    const listAppt = await request.get(`${routes.appointments}?per_page=200`);
+    const listAppt = await request.get(`${routes.appointments}?per_page=${MAX_PER_PAGE}`);
     expect(listAppt.status(), `list appointments -> ${listAppt.status()}`).toBe(200);
 
     // Time-off (type is a CHECK-constrained enum; 'personal' is accepted).

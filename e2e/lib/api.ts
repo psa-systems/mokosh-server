@@ -14,6 +14,18 @@ import type { APIRequestContext } from '@playwright/test';
 
 export const API_V1 = '/api/v1';
 
+// The largest page the API will serve, and the largest one a test may ask for.
+//
+// PMS-1427: the suite asked for 200 everywhere it listed a collection to check
+// that the row it had just created was in it. MAPPS-542 made a `per_page` above
+// `PaginationParams::MAX_PER_PAGE` a parse-time rejection rather than a silent
+// clamp, because a clamp makes truncation look like completion, so every one of
+// those became a 400 and ten specs failed at the same line. The value lives here
+// once, named after the server constant it has to match; a unit test in
+// `src/utils/pagination.rs` fails the build if any `per_page` literal under
+// `e2e/` exceeds it, so the two cannot drift apart again in silence.
+export const MAX_PER_PAGE = 100;
+
 export const routes = {
   version: `${API_V1}/version`,
   health: `${API_V1}/health`,
