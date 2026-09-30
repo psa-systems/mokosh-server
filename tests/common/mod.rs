@@ -489,6 +489,11 @@ async fn boot_with_db(
         // testing.
         mokosh_server::utils::deployment::DeploymentMode::SelfHosted,
         secrets,
+        // PMS-1429: no scheduler runs in the harness, so there is nothing to
+        // wake. A suite that wants an import to happen calls the runner
+        // directly (`execute_run`), which is what it did before the wake
+        // existed.
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")
