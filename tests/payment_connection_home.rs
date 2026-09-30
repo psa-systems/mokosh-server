@@ -364,6 +364,20 @@ async fn saving_a_gateway_with_no_registry_entry_still_works(pool: PgPool) {
     );
 }
 
+/// What migration 256 wrote, for the assertions below.
+///
+/// A named row rather than a tuple: four columns with a `Vec` and an `Option` in
+/// them is `clippy::type_complexity`, which the workspace denies, and the field
+/// names are what make the assertions readable anyway (`paypal.status` rather
+/// than `paypal.1`). The same reason `MembershipViewRow` exists in `db::identity`.
+#[derive(Debug, sqlx::FromRow)]
+struct BackfilledRow {
+    provider: String,
+    status: String,
+    enabled_capabilities: Vec<String>,
+    connected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// The backfill migration 256 runs, re-run against rows it never saw.
 ///
 /// The template database this suite clones already has 256 applied, so there is
@@ -403,12 +417,7 @@ async fn the_backfill_maps_each_gateway_the_way_it_says(pool: PgPool) {
             .expect("run the backfill");
     }
 
-    let rows: Vec<(
-        String,
-        String,
-        Vec<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
-    )> = sqlx::query_as(
+    let rows: Vec<BackfilledRow> = sqlx::query_as(
         "SELECT provider, status, enabled_capabilities, connected_at FROM integrations \
              WHERE tenant_id = $1 ORDER BY provider",
     )
@@ -425,27 +434,27 @@ async fn the_backfill_maps_each_gateway_the_way_it_says(pool: PgPool) {
     );
 
     let paypal = &rows[0];
-    assert_eq!(paypal.0, "paypal");
+    assert_eq!(paypal.provider, "paypal");
     assert_eq!(
-        paypal.1, "not_connected",
+        paypal.status, "not_connected",
         "an inactive row could be either 'saved and never switched on' or \
          'switched off', and nothing stored says which, so it maps to the status \
          that asserts neither"
     );
     assert!(
-        paypal.3.is_none(),
+        paypal.connected_at.is_none(),
         "and it claims no connect that may never have happened"
     );
 
     let stripe = &rows[1];
-    assert_eq!(stripe.0, "stripe");
-    assert_eq!(stripe.1, "connected");
-    assert!(stripe.3.is_some(), "an active row records when");
+    assert_eq!(stripe.provider, "stripe");
+    assert_eq!(stripe.status, "connected");
+    assert!(stripe.connected_at.is_some(), "an active row records when");
     assert_eq!(
-        stripe.2,
+        stripe.enabled_capabilities,
         vec!["payments".to_string()],
         "never the provider's whole supported set: enabling `invoicing` would \
          claim this tenant handed their invoice issuing to Stripe"
     );
-    assert_eq!(paypal.2, vec!["payments".to_string()]);
+    assert_eq!(paypal.enabled_capabilities, vec!["payments".to_string()]);
 }
