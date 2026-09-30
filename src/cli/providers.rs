@@ -163,6 +163,66 @@ struct MigrateArgs {
 /// `provider-purge` needs `--provider <name>`; `--confirm` and `--json`
 /// are optional. Dry-run is the default; there is no `--force` and adding
 /// one is a compile error (see the `#[cfg(test)]` scan in this file).
+/// `provider-set` needs `--secret <NAME> --from-env <VAR>`; `--json` optional.
+///
+/// There is deliberately no `--to`. The command writes to the provider the
+/// deployment DECLARES and nowhere else, because a governed secret sitting in a
+/// provider that is not the declared one is `Misplaced`, which ends boot by
+/// design. A flag that let an operator aim elsewhere would be a flag for
+/// producing that state.
+fn parse_set_args(args: &[String]) -> AppResult<SetArgs> {
+    let mut secret: Option<String> = None;
+    let mut from_env: Option<String> = None;
+    let mut mode = OutputMode::Text;
+    let mut iter = args[2..].iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--secret" => {
+                secret = Some(iter.next().cloned().ok_or_else(|| {
+                    AppError::Configuration(format!(
+                        "provider-set: --secret needs a value\n\n{}",
+                        set_help()
+                    ))
+                })?);
+            }
+            "--from-env" => {
+                from_env = Some(iter.next().cloned().ok_or_else(|| {
+                    AppError::Configuration(format!(
+                        "provider-set: --from-env needs a value\n\n{}",
+                        set_help()
+                    ))
+                })?);
+            }
+            "--json" => mode = OutputMode::Json,
+            "--text" => mode = OutputMode::Text,
+            "--help" | "-h" => return Err(AppError::Configuration(set_help())),
+            other => {
+                return Err(AppError::Configuration(format!(
+                    "provider-set: unrecognised argument {other:?}\n\n{}",
+                    set_help()
+                )));
+            }
+        }
+    }
+    let secret = secret.ok_or_else(|| {
+        AppError::Configuration(format!(
+            "provider-set: --secret is required\n\n{}",
+            set_help()
+        ))
+    })?;
+    let from_env = from_env.ok_or_else(|| {
+        AppError::Configuration(format!(
+            "provider-set: --from-env is required\n\n{}",
+            set_help()
+        ))
+    })?;
+    Ok(SetArgs {
+        secret: GovernedSecret::parse_name(&secret)?,
+        from_env,
+        mode,
+    })
+}
+
 fn parse_purge_args(args: &[String]) -> AppResult<PurgeArgs> {
     let mut provider: Option<String> = None;
     let mut mode = OutputMode::Text;
@@ -209,6 +269,14 @@ struct PurgeArgs {
     mode: OutputMode,
 }
 
+struct SetArgs {
+    secret: GovernedSecret,
+    /// The NAME of the environment variable holding the value, never the
+    /// value. See [`set_help`] for why the value cannot be an argument.
+    from_env: String,
+    mode: OutputMode,
+}
+
 fn status_help() -> String {
     "usage: mokosh-server provider-status [--json | --text]\n\
      \n\
@@ -222,6 +290,22 @@ fn migrate_help() -> String {
      \n\
      Copies every key the source holds into the target, one key at a time, with a \n\
      read-back and compare. The source is NEVER cleared; use provider-purge for that.\n"
+        .to_string()
+}
+
+fn set_help() -> String {
+    "usage: mokosh-server provider-set --secret <NAME> --from-env <VAR> [--json | --text]\n\
+     \n\
+     Writes ONE application-tier secret into the provider this deployment declares, \n\
+     reads it back, and compares. The value is read from the environment variable \n\
+     named by --from-env, so it never appears in an argument, in `ps`, in shell \n\
+     history or in a file. It is never printed.\n\
+     \n\
+     There is no --to: a governed secret held by a provider the deployment did not \n\
+     declare is a fatal boot, so this writes to the declared one or refuses.\n\
+     \n\
+     An application-tier secret is read once at boot, so the process has to be \n\
+     restarted before a value written here is served.\n"
         .to_string()
 }
 
@@ -789,6 +873,158 @@ async fn move_one_config(
         Ok(()) => "moved (write + readback + compare)".to_string(),
         Err(e) => format!("failed: {e}"),
     }
+}
+
+// -----------------------------------------------------------------------------
+// provider-set
+// -----------------------------------------------------------------------------
+
+/// PMS-1441: put one governed secret in the declared provider.
+///
+/// Before this existed, landing a value on a deployment meant creating a
+/// directory of plaintext files, mounting it into a one-off container, running
+/// `provider-migrate --from file --to database` and then deleting the files by
+/// hand, because `provider-migrate` needs a writable SOURCE and the file
+/// provider is the only one an operator can fill without the application's
+/// help. That is five steps and a credential on the host's filesystem to set
+/// one value.
+///
+/// Unlike the other three subcommands, a failure here is an `Err` and a
+/// non-zero exit rather than a reported line. Those three walk every key and an
+/// operator reads the matrix; this one is a single write in a deploy script, so
+/// "it did not happen" has to be something a script can see.
+pub async fn run_provider_set(args: &[String]) -> AppResult<()> {
+    let parsed = parse_set_args(args)?;
+    let plain = read_secret_from_env(&parsed.from_env)?;
+
+    let (db, encryption_key) = boot_shared_state().await?;
+    let providers = build_secret_providers(&db, encryption_key).await?;
+    let selection = current_secret_selection()?;
+    let declared = selection.provider;
+
+    let target = providers[declared.index()].clone().ok_or_else(|| {
+        AppError::Configuration(format!(
+            "provider-set: the declared {declared} app-secret provider could not be built, so \
+             there is nowhere to write {}. Fix its construction inputs first; \
+             `provider-status --text` reports which providers are reachable.",
+            parsed.secret
+        ))
+    })?;
+
+    if !target.is_writable() {
+        return Err(AppError::Configuration(format!(
+            "provider-set: the declared provider is {declared}, which cannot be written by this \
+             process. Point {}_FILE at a file holding the value, or set SECRET_BACKEND to a \
+             provider that accepts writes ({}).",
+            parsed.secret,
+            AppSecretProviderKind::LEGAL_VALUES
+        )));
+    }
+
+    let secret = parsed.secret;
+    let write_target = target.clone();
+    move_value_with_readback(
+        &plain,
+        move |written| async move { write_target.set(secret, written).await },
+        || async {
+            // Re-BUILD rather than re-read the handle just written to. The
+            // database provider caches the plaintext on a successful write, so
+            // reading the same handle would prove the cache agrees with itself
+            // and say nothing about the row. A fresh build re-reads the row (or
+            // re-fetches from Infisical), which is what the next boot will do.
+            let fresh = build_secret_providers(&db, encryption_key).await?;
+            Ok(fresh[declared.index()]
+                .as_ref()
+                .and_then(|provider| provider.get(secret)))
+        },
+    )
+    .await?;
+
+    let report = SetReport {
+        secret: secret.name().to_string(),
+        provider: declared.as_str().to_string(),
+        declared_by: match selection.source {
+            crate::utils::deployment::EnablementSource::Profile => {
+                "the hosting profile's default".to_string()
+            }
+            crate::utils::deployment::EnablementSource::Explicit => "SECRET_BACKEND".to_string(),
+        },
+        outcome: "written, read back and compared".to_string(),
+        restart_required: true,
+    };
+    redaction::assert_no_leak(&report);
+    match parsed.mode {
+        OutputMode::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| AppError::Configuration(format!(
+                "could not serialise provider-set: {e}"
+            )))?
+        ),
+        OutputMode::Text => print!("{}", render_set_text(&report)),
+    }
+    Ok(())
+}
+
+/// Read the value out of the environment variable the operator named.
+///
+/// By NAME, because a value passed as an argument is in `ps` output, in the
+/// shell's history and in the container's `docker inspect` argv for as long as
+/// the one-off container lives. `docker compose run --env VAR` forwards a
+/// variable by name, which is the shape `app e2e-bootstrap` in the deployment
+/// repository already uses for a password.
+///
+/// An unset variable and an empty one are separate refusals with separate
+/// messages, because they are separate operator mistakes: the first is usually
+/// a name typed twice differently, the second an export that did not happen. A
+/// present-but-empty value is not a secret anywhere else in `app_secrets`
+/// either, and writing one would report success while leaving the feature off.
+fn read_secret_from_env(var: &str) -> AppResult<String> {
+    let raw = std::env::var(var).map_err(|_| {
+        AppError::Configuration(format!(
+            "provider-set: {var} is not set in this process's environment. Export it, or pass \
+             --from-env with the name of the variable that holds the value. The value itself is \
+             never an argument."
+        ))
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Configuration(format!(
+            "provider-set: {var} is set but empty, and an empty string is not a secret. Nothing \
+             was written."
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SetReport {
+    secret: String,
+    provider: String,
+    /// What selected the provider, so the line says whether an operator chose
+    /// it or the hosting profile did.
+    declared_by: String,
+    /// One sentence. Never a value.
+    outcome: String,
+    /// Always true today, and a field rather than a hard-coded line because
+    /// `app_secrets::CURRENT` is a `OnceLock`: the day the application tier
+    /// gains a refresh, this is what stops the CLI from telling an operator to
+    /// restart for no reason.
+    restart_required: bool,
+}
+
+fn render_set_text(report: &SetReport) -> String {
+    let mut out = format!("provider-set {}\n", report.secret);
+    out.push_str(&format!(
+        "[secrets] {}: {} in the {} provider (declared by {})\n",
+        report.secret, report.outcome, report.provider, report.declared_by
+    ));
+    if report.restart_required {
+        out.push_str(
+            "restart the server before this is served: an application-tier secret is read once \
+             at boot\n",
+        );
+    }
+    out
 }
 
 // -----------------------------------------------------------------------------
