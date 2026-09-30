@@ -128,6 +128,11 @@ pub fn create_api_router(
     // still queued and the next tick still claims it, so this changes when the
     // work starts and never whether it happens.
     contact_sync_wake: Option<crate::scheduler::JobWake>,
+    // PMS-1430: the HOST's Google OAuth client, resolved once at boot from the
+    // application-tier secret provider. `None` is a deployment that cannot
+    // connect Google Contacts, which the Settings card reports; it is not a
+    // per-tenant state and no request can change it.
+    google_client: Option<crate::modules::contact_sync::OauthClient>,
 ) -> Router {
     let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
@@ -256,6 +261,7 @@ pub fn create_api_router(
     if let Some(wake) = contact_sync_wake {
         contact_sync = contact_sync.with_run_wake(wake);
     }
+    contact_sync = contact_sync.with_host_client(google_client);
     let contact_sync_service = std::sync::Arc::new(contact_sync);
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
