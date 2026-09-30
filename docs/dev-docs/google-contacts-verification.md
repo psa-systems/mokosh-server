@@ -28,20 +28,37 @@ fails, suspect the assumption about Google rather than the code, and check the s
 
 ## Seed the account
 
-Same six shapes the offline test uses, so a difference is a difference in Google rather than in the data. Put the
-first six in a label called `Clients`; leave the seventh in no label at all.
+Import the two files in [`google-contacts-seed/`](google-contacts-seed/) rather than typing seven contacts. They
+hold the same values the offline test drives
+(`tests/contact_sync_engine.rs::the_awkward_account_imports_through_the_engine`), so a difference in what lands is
+a difference in Google rather than in the data, which is the whole point of this pass.
 
-| # | Shape | Concretely |
+At <https://contacts.google.com>, left rail, Import, Select file:
+
+1. `google-contacts-seed/clients.vcf`, six contacts. Google offers the imported set straight after; select all six
+   and apply a label named exactly `Clients`.
+2. `google-contacts-seed/ungrouped.vcf`, one contact, and apply NO label to it. This one is the filter's test: it
+   must never reach Mokosh.
+
+Two files rather than one, because the alternative is "select all except that one", which is the step somebody
+skips and then spends an hour explaining a seventh contact.
+
+| # | Shape | In the file |
 |---|---|---|
-| 1 | Several emails and phones | Two addresses and two numbers, one of each marked primary in Google |
-| 2 | No email | A name and a phone number only |
-| 3 | A single name | One name in the given-name field, family name empty (`Prince`) |
+| 1 | Several emails and phones | Grace Hopper, two of each, the primary first in the card |
+| 2 | No email | Nomail Person, a phone only |
+| 3 | A single name | `Prince`, given name only, family name empty |
 | 4 | A non-Latin script name | `王小明`, with an address |
-| 5 + 6 | Two records that should match one Mokosh record | Both carrying the SAME address as an existing Mokosh contact, with slightly different names |
-| 7 | Outside every group | Any contact, in no label |
+| 5 + 6 | Two records that should match one Mokosh record | Ada Lovelace and A. Lovelace, both on `ada@acme.example` |
+| 7 | Outside every group | Not Selected, in `ungrouped.vcf` |
 
-Then, in Mokosh, make sure a contact already exists with the address you used for 5 and 6, so there is something
-for them to match.
+Two things the files cannot do for you. **Create the Mokosh contact that 5 and 6 match**, before syncing: Contacts,
+New contact, email `ada@acme.example`. Without it there is nothing for the twins to link to and run 1's expectation
+about the review queue does not apply. And **the primary flag on contact 1** is Google's to decide: the People API
+reports the first email and phone as primary, which is the order the card is written in, so what this pass checks
+is that Mokosh preserves what Google reports rather than that the vCard dictated it.
+
+The cards use `.example` addresses (RFC 2606), so nothing here can reach a real mailbox.
 
 ## The runs
 

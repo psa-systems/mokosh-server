@@ -32,6 +32,37 @@ const JUSTFILE = "justfile"
 
 # Recipe names `just --list` prints: every non-private recipe header. A header
 # is `name[ params][: deps]` at column 0; `:=` is a variable assignment.
+#
+# PMS-786: the textual scan below reads THIS file only, and since the root
+# justfile imports `common/common.just` that is no longer the whole set. A doc
+# naming an imported recipe (`just pre-commit`, `just create-release`) was
+# reported as naming a recipe that does not exist, which is the opposite of this
+# guard's job. So the imported names come from `just --summary`, which resolves
+# imports, and the two sets are unioned: the summary alone would not do, because
+# it omits `[private]` recipes and this guard's own doc-comment/attribute
+# handling is what decides whether a LOCAL recipe counts.
+def imported-recipes [] {
+    let summary = (do { ^just --summary } | complete)
+    if $summary.exit_code != 0 {
+        # A justfile that carries an `import` and will not parse is almost
+        # always the submodule missing (a fresh clone, or a CI checkout without
+        # `submodules: true`), and the first run of this guard in CI proved why
+        # that must not degrade quietly: every imported recipe went missing at
+        # once and the output blamed the DOCS for naming recipes that do not
+        # exist. Fail on the real cause instead.
+        if (open --raw $JUSTFILE | decode utf-8 | lines | any {|l| ($l | str trim | str starts-with "import ") }) {
+            print --stderr "ERROR: the justfile imports another file and `just --summary` failed, so imported recipe names cannot be resolved."
+            print --stderr "Run `git submodule update --init` (the root justfile imports common/common.just), then re-run."
+            print --stderr ($summary.stderr | str trim)
+            exit 1
+        }
+        # No import: `just` is simply absent. Not this guard's problem to
+        # report, and the local scan is the whole set anyway.
+        return []
+    }
+    $summary.stdout | split row --regex '\s+' | where {|r| ($r | is-not-empty) }
+}
+
 def justfile-recipes [] {
     let lines = (open --raw $JUSTFILE | decode utf-8 | lines)
 
@@ -102,7 +133,7 @@ def documented-recipes [file: string] {
 }
 
 def main [] {
-    let recipes = (justfile-recipes)
+    let recipes = ((justfile-recipes) | append (imported-recipes) | uniq)
     if ($recipes | is-empty) {
         print --stderr $"ERROR: no recipes parsed out of ($JUSTFILE)"
         exit 1

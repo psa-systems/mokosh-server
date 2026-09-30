@@ -255,7 +255,7 @@ impl OpportunitiesService {
         push!("expected_close_date", request.expected_close_date.is_some());
         push!("quote_id", request.quote_id.is_some());
         push!("notes", request.notes.is_some());
-        sql.push_str(" WHERE tenant_id = $1 AND id = $2");
+        sql.push_str(" WHERE tenant_id = $1 AND id = $2 AND closed_at IS NULL");
         let _ = idx;
 
         let mut q = sqlx::query(&sql).bind(*tenant_id).bind(id);
@@ -290,7 +290,13 @@ impl OpportunitiesService {
         if let Some(v) = request.notes.as_ref() {
             q = q.bind(v.as_deref());
         }
-        q.execute(&mut *tx).await?;
+        let result = q.execute(&mut *tx).await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::BadRequest(
+                "A closed opportunity is immutable. Open a new one to record follow-up work."
+                    .into(),
+            ));
+        }
 
         let row = self.load_row(&mut tx, id).await?;
         tx.commit().await?;
@@ -337,10 +343,10 @@ impl OpportunitiesService {
             existing.quote_id
         };
 
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE opportunities \
              SET stage = $3, outcome = $3, quote_id = $4, closed_at = $5, updated_at = NOW() \
-             WHERE tenant_id = $1 AND id = $2",
+             WHERE tenant_id = $1 AND id = $2 AND closed_at IS NULL",
         )
         .bind(*tenant_id)
         .bind(id)
@@ -349,6 +355,11 @@ impl OpportunitiesService {
         .bind(Utc::now())
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::BadRequest(
+                "This opportunity is already closed.".into(),
+            ));
+        }
 
         let row = self.load_row(&mut tx, id).await?;
         tx.commit().await?;

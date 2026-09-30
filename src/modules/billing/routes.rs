@@ -1114,9 +1114,12 @@ async fn get_invoice_payment_readiness(
     let button_label = active
         .first()
         .map(|(id, override_label)| payment_button_label(id, override_label.as_deref()));
+    // PMS-1431: Pending is excluded so this matches the set
+    // create_invoice_checkout_session and record_gateway_payment/create_payment
+    // will actually accept a payment against (PMS-999).
     let invoice_payable = matches!(
         invoice.status,
-        InvoiceStatus::Pending | InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid
+        InvoiceStatus::Sent | InvoiceStatus::PartiallyPaid
     ) && invoice.balance_due > rust_decimal::Decimal::ZERO;
     let currency = invoice.currency.as_deref().unwrap_or("USD");
     let balance_due_display = money(invoice.balance_due, Some(currency));

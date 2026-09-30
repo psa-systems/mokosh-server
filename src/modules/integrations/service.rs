@@ -10,18 +10,29 @@
 //! than filtered: an operator who ticks a box and is silently given a row
 //! without it has been told the delegation happened.
 //!
-//! **A provider whose connection lives elsewhere is read-only here.** Stripe
-//! and PayPal are still `payment_gateway_configs`, Google is still
-//! `contact_sync_connections` (see [`super::registry`]), so `connect`,
-//! `disconnect` and a capability change are refused for them and no row is ever
-//! written. That is what keeps one fact in one place while PMS-1312 and
-//! PMS-1315 are outstanding.
+//! **A provider whose connection lives elsewhere is read-only here.** Google is
+//! still `contact_sync_connections` (see [`super::registry`]), so `connect`,
+//! `disconnect` and a capability change are refused for it and no row is ever
+//! written. That is what keeps one fact in one place while PMS-1315 is
+//! outstanding. Stripe and PayPal came over under PMS-1312 and are writable here
+//! now, with one difference covered below.
 //!
-//! **A credential never touches the row.** [`Self::connect`] hands it to the
-//! [`SecretProvider`] under [`SecretKey::integration`] and drops it; nothing
+//! **A credential never touches the row.** For a provider whose
+//! [`CredentialHome`] is the integrations surface, [`Self::connect`] hands it to
+//! the [`SecretProvider`] under [`SecretKey::integration`] and drops it; nothing
 //! here reads it back, serves it or logs it. `disconnect` deletes it, which is
-//! what makes keying the secret by provider rather than by row id safe: there
-//! is no stale secret still resolving at an address a reconnect would reuse.
+//! what makes keying the secret by provider rather than by row id safe: there is
+//! no stale secret still resolving at an address a reconnect would reuse.
+//!
+//! **A payment gateway's credential is entered on the payments surface.** Stripe
+//! needs a secret key, a webhook signing secret, a test-mode flag and a
+//! validation pass that parses the blob into its own shape, and
+//! `PUT /api/v1/payment-gateways` is where all of that already happens.
+//! So `connect` for such a provider takes no credential, refuses one that is
+//! sent, and refuses when the gateway has not been configured yet; `disconnect`
+//! leaves the stored credential where it is. The status itself goes through
+//! [`connection::set_payment_connection`], which is the single writer shared with
+//! that surface.
 //!
 //! Reads and writes go through [`Database::begin_with_tenant`], so the
 //! `tenant_isolation` policy on the table confines them and a missing GUC
@@ -43,8 +54,9 @@ use crate::modules::auth::TenantId;
 use crate::secrets::{SecretKey, SecretProvider};
 use crate::utils::error::{AppError, AppResult};
 
+use super::connection;
 use super::models::*;
-use super::registry::{self, ConnectionHome, ProviderDescriptor};
+use super::registry::{self, ConnectionHome, CredentialHome, ProviderDescriptor};
 
 /// What `audit_log.entity_type` calls a change here.
 const AUDIT_ENTITY: &str = "integrations";
@@ -200,6 +212,12 @@ impl IntegrationsService {
         let descriptor = registry::descriptor(provider);
         assert_managed_here(descriptor)?;
 
+        if descriptor.credential_home != CredentialHome::Integration {
+            return self
+                .connect_with_credential_elsewhere(tenant_id, provider, request, ctx)
+                .await;
+        }
+
         // Omitted means every capability the provider supports: an operator who
         // connects an integration and is asked nothing else expects it to work.
         // An explicit empty list means connected and delegated nothing, which
@@ -219,10 +237,19 @@ impl IntegrationsService {
         let poll_interval_minutes =
             assert_poll_interval(descriptor, request.poll_interval_minutes)?;
 
+        // Required for this credential home, and refused for the other one, so
+        // the field being optional on the wire does not make it optional here.
+        let Some(credential) = request.credential.as_deref() else {
+            return Err(AppError::BadRequest(format!(
+                "{} is connected by storing its credential, so one has to be supplied",
+                descriptor.display_name
+            )));
+        };
+
         self.secrets
             .put(
                 &SecretKey::integration(*tenant_id, provider.as_str()),
-                &request.credential,
+                credential,
             )
             .await?;
 
@@ -270,7 +297,167 @@ impl IntegrationsService {
         Ok(compose(descriptor, Some(&row)))
     }
 
-    /// Mark the integration disconnected and delete its credential.
+    /// Connect a provider whose credential is entered on another surface
+    /// (PMS-1312).
+    ///
+    /// Today that is Stripe and PayPal, whose key, webhook signing secret,
+    /// test-mode flag and per-provider display and partial-payment settings are
+    /// entered under `PUT /api/v1/payment-gateways`. What is left for
+    /// this surface is the two things it owns: whether the tenant is connected,
+    /// and what they have delegated.
+    ///
+    /// Three refusals, each for a state that would otherwise read as working:
+    ///
+    /// - a credential in the request, because it would be written to
+    ///   `SecretKind::Integration` while the payment path reads
+    ///   `SecretKind::PaymentGateway`, so the operator would have typed a key
+    ///   into a field nothing reads;
+    /// - no gateway row, because there is nothing to connect and the honest
+    ///   answer names the surface that creates one;
+    /// - a gateway row with no credential anywhere, because a `connected` row
+    ///   with no credential behind it is exactly the state this subsystem's
+    ///   write ordering exists to prevent.
+    async fn connect_with_credential_elsewhere(
+        &self,
+        tenant_id: TenantId,
+        provider: IntegrationProvider,
+        request: ConnectIntegrationRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<IntegrationResponse> {
+        let descriptor = registry::descriptor(provider);
+
+        if descriptor.credential_home != CredentialHome::PaymentGateway {
+            // Unreachable while Google is the only `ContactSync` entry and its
+            // connection home is still elsewhere, so `assert_managed_here`
+            // refuses first. Stated rather than silently falling through,
+            // because PMS-1315 flipping that entry without writing this arm
+            // would otherwise connect a contact sync with no token.
+            return Err(AppError::BadRequest(format!(
+                "{} cannot be connected here yet: its credential is keyed by the connection \
+                 it belongs to, which this surface does not create.",
+                descriptor.display_name
+            )));
+        }
+
+        if request.credential.is_some() {
+            return Err(AppError::BadRequest(format!(
+                "{} takes its credentials under Settings > Payment gateways, not here. \
+                 Connecting here only records that the tenant is using it.",
+                descriptor.display_name
+            )));
+        }
+
+        let capabilities = match request.capabilities {
+            Some(requested) => Some(resolve_capabilities(descriptor, &requested)?),
+            None => None,
+        };
+        let config = match request.config {
+            Some(config) => Some(assert_config_object(config)?),
+            None => None,
+        };
+        let poll_interval_minutes =
+            assert_poll_interval(descriptor, request.poll_interval_minutes)?;
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // Both halves of "is there a credential" in one read: the pre-PMS-968
+        // ciphertext still on the row, and whether the row says its credential
+        // moved to the secret provider.
+        let gateway: Option<(bool,)> = sqlx::query_as(
+            "SELECT config_encrypted IS NOT NULL FROM payment_gateway_configs \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(*tenant_id)
+        .bind(provider.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let Some((ciphertext_on_row,)) = gateway else {
+            return Err(AppError::BadRequest(format!(
+                "{} has no configuration yet. Add its credentials under \
+                 Settings > Payment gateways first, then connect it here.",
+                descriptor.display_name
+            )));
+        };
+
+        if !ciphertext_on_row {
+            let stored = self
+                .secrets
+                .get(&SecretKey::payment_gateway(*tenant_id, provider.as_str()))
+                .await?;
+            if stored.is_none() {
+                return Err(AppError::BadRequest(format!(
+                    "{}'s configuration holds no credential, so connecting it would record a \
+                     gateway that cannot charge. Re-enter it under Settings > Payment gateways.",
+                    descriptor.display_name
+                )));
+            }
+        }
+
+        let existing = read_row_in_tx(&mut tx, tenant_id, provider).await?;
+
+        connection::set_payment_connection(
+            &mut tx,
+            tenant_id,
+            provider.as_str(),
+            true,
+            ctx.user_id,
+        )
+        .await?;
+
+        // Only when the request said something: `set_payment_connection` seeds
+        // `{payments}` on a row it creates and leaves an existing row's set
+        // alone, so an omitted list means "what this tenant already delegated"
+        // rather than the provider's whole supported set. Connecting must not
+        // silently widen a delegation.
+        if capabilities.is_some() || config.is_some() || poll_interval_minutes.is_some() {
+            sqlx::query(
+                "UPDATE integrations \
+                 SET enabled_capabilities = COALESCE($3, enabled_capabilities), \
+                     config = COALESCE($4, config), \
+                     poll_interval_minutes = COALESCE($5, poll_interval_minutes), \
+                     updated_at = NOW() \
+                 WHERE tenant_id = $1 AND provider = $2",
+            )
+            .bind(*tenant_id)
+            .bind(provider.as_str())
+            .bind(capabilities.as_ref())
+            .bind(config.as_ref())
+            .bind(poll_interval_minutes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
+        let row = read_row_in_tx(&mut tx, tenant_id, provider)
+            .await?
+            .ok_or_else(|| {
+                AppError::Database("the integration row vanished inside its own write".to_string())
+            })?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            if existing.is_some() {
+                AuditAction::Update
+            } else {
+                AuditAction::Create
+            },
+            AUDIT_ENTITY,
+            Some(row.id),
+            existing.as_ref().map(audit_snapshot),
+            Some(audit_snapshot(&row)),
+        )
+        .await?;
+        tx.commit().await?;
+
+        Ok(compose(descriptor, Some(&row)))
+    }
+
+    /// Mark the integration disconnected, and delete its credential when this
+    /// surface is the one that stored it.
     ///
     /// The ROW IS KEPT, the `contact_sync_connections.disconnected_at` choice:
     /// the capability set the tenant chose is worth keeping so reconnecting does
@@ -283,6 +470,13 @@ impl IntegrationsService {
     /// written first and removed last. A deleted secret with a stale
     /// `connected` row would be an integration that looks fine and fails on
     /// first use.
+    ///
+    /// PMS-1312: for a provider whose [`CredentialHome`] is the payments
+    /// surface the credential is left alone, because it is not this surface's to
+    /// delete and an MSP switching payments off for a month should not have to
+    /// find their Stripe keys again. `DELETE /api/v1/payment-gateways/{provider}`
+    /// is what removes it, and it is also what removes the gateway row, so the
+    /// two cannot end up half gone.
     pub async fn disconnect(
         &self,
         tenant_id: TenantId,
@@ -309,18 +503,35 @@ impl IntegrationsService {
             )));
         };
 
-        let row: IntegrationRow = sqlx::query_as(&format!(
-            "UPDATE integrations \
-             SET status = 'disconnected', disconnected_at = NOW(), last_error = NULL, \
-                 updated_at = NOW() \
-             WHERE tenant_id = $1 AND provider = $2 \
-             RETURNING {ROW_COLUMNS}"
-        ))
-        .bind(*tenant_id)
-        .bind(provider.as_str())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        // One writer per home: a payment provider's status is written only by
+        // `connection::set_payment_connection`, which the payments surface shares,
+        // so switching a gateway off here and switching it off there cannot leave
+        // two different answers (and the retired `is_active` mirror is written in
+        // both cases).
+        let row: IntegrationRow = if descriptor.credential_home == CredentialHome::PaymentGateway {
+            connection::set_payment_connection(&mut tx, tenant_id, provider.as_str(), false, None)
+                .await?;
+            read_row_in_tx(&mut tx, tenant_id, provider)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Database(
+                        "the integration row vanished inside its own write".to_string(),
+                    )
+                })?
+        } else {
+            sqlx::query_as(&format!(
+                "UPDATE integrations \
+                 SET status = 'disconnected', disconnected_at = NOW(), last_error = NULL, \
+                     updated_at = NOW() \
+                 WHERE tenant_id = $1 AND provider = $2 \
+                 RETURNING {ROW_COLUMNS}"
+            ))
+            .bind(*tenant_id)
+            .bind(provider.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+        };
 
         audit_write(
             &mut *tx,
@@ -335,9 +546,11 @@ impl IntegrationsService {
         .await?;
         tx.commit().await?;
 
-        self.secrets
-            .delete(&SecretKey::integration(*tenant_id, provider.as_str()))
-            .await?;
+        if descriptor.credential_home == CredentialHome::Integration {
+            self.secrets
+                .delete(&SecretKey::integration(*tenant_id, provider.as_str()))
+                .await?;
+        }
 
         Ok(compose(descriptor, Some(&row)))
     }
@@ -370,6 +583,27 @@ const ROW_COLUMNS: &str = "id, provider, status, config, enabled_capabilities, \
 const ROW_SELECT: &str = "SELECT id, provider, status, config, enabled_capabilities, \
                           poll_interval_minutes, connected_at, disconnected_at, last_error \
                           FROM integrations";
+
+/// One integration row, read inside a transaction the caller already holds.
+///
+/// The method form ([`IntegrationsService::read_row`]) opens its own transaction,
+/// which is wrong for a write path: the `before` snapshot and the write have to
+/// see the same state, and PMS-1312's payment connect needs both plus the row it
+/// produced.
+async fn read_row_in_tx(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    provider: IntegrationProvider,
+) -> AppResult<Option<IntegrationRow>> {
+    sqlx::query_as(&format!(
+        "{ROW_SELECT} WHERE tenant_id = $1 AND provider = $2"
+    ))
+    .bind(*tenant_id)
+    .bind(provider.as_str())
+    .fetch_optional(conn)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
+}
 
 /// The registry's half and the tenant's half, joined.
 fn compose(descriptor: &ProviderDescriptor, row: Option<&IntegrationRow>) -> IntegrationResponse {
@@ -580,21 +814,28 @@ mod tests {
         assert!(error.to_string().contains("more than once"), "{error}");
     }
 
-    /// The guard that keeps one connection in one place while PMS-1312 and
-    /// PMS-1315 are outstanding.
+    /// The guard that keeps one connection in one place while PMS-1315 is
+    /// outstanding.
+    ///
+    /// Google, because PMS-1312 brought the payment providers over. The guard is
+    /// exercised against whichever provider is still outside rather than deleted
+    /// with the last one that was: the message is what an operator gets back, and
+    /// it is the only thing that tells them where to go instead.
     #[test]
     fn a_provider_managed_elsewhere_is_refused_and_says_where() {
-        let error = assert_managed_here(registry::descriptor(IntegrationProvider::Stripe))
-            .expect_err("Stripe is still payment_gateway_configs");
+        let error = assert_managed_here(registry::descriptor(IntegrationProvider::Google))
+            .expect_err("Google is still contact_sync_connections");
         let message = error.to_string();
-        assert!(message.contains("Payment gateways"), "{message}");
-        assert!(message.contains("payment_gateway_configs"), "{message}");
+        assert!(message.contains("Contact sync"), "{message}");
+        assert!(message.contains("contact_sync_connections"), "{message}");
         assert!(
-            message.contains("PMS-1312"),
+            message.contains("PMS-1315"),
             "the refusal names the issue that moves it: {message}"
         );
 
         assert_managed_here(xero()).expect("Xero is managed here");
+        assert_managed_here(registry::descriptor(IntegrationProvider::Stripe))
+            .expect("PMS-1312 moved Stripe's connection here");
     }
 
     /// A poll interval on a provider nothing polls is a setting that would be

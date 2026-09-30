@@ -887,3 +887,87 @@ mod pms1194_sort_guard {
         );
     }
 }
+
+#[cfg(test)]
+mod pms1427_e2e_page_size {
+    use super::*;
+
+    /// PMS-1427: no test in `e2e/` asks for a page bigger than the API serves.
+    ///
+    /// MAPPS-542 made a `per_page` above [`PaginationParams::MAX_PER_PAGE`] a
+    /// parse-time rejection rather than a silent clamp, because a clamp makes
+    /// truncation look like completion. The e2e suite had `?per_page=200` at
+    /// fifteen call sites, every one of them a list-and-assert-the-row-is-there
+    /// step, so the change turned ten specs red at once against staging. Nothing
+    /// connected the two numbers, and the suite found out from a required check
+    /// going red on an unrelated pull request.
+    ///
+    /// This is the connection. It reads the TypeScript rather than a copy of it,
+    /// so a literal added tomorrow is caught by `cargo test --lib` with no new
+    /// script, recipe or CI step; `e2e/lib/api.ts` carries the constant the specs
+    /// interpolate, and its own declaration is the one literal allowed to equal
+    /// the maximum.
+    #[test]
+    fn no_e2e_test_asks_for_a_page_larger_than_the_api_serves() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("e2e");
+        if !root.is_dir() {
+            // The suite is checked out with the repository everywhere this runs,
+            // so its absence is worth failing on rather than skipping past: a
+            // guard that silently passes when it cannot see its subject is not a
+            // guard.
+            panic!("e2e/ is missing, so this guard proves nothing");
+        }
+
+        // Assembled, so this test's own prose is not a match.
+        let needle = format!("per{}page=", "_");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        let mut files = vec![root.clone()];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                // Not ours, and enormous.
+                if name == "node_modules" || name == "test-results" {
+                    continue;
+                }
+                for entry in std::fs::read_dir(&path).expect("read an e2e directory") {
+                    files.push(entry.expect("dir entry").path());
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("ts") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&path).expect("read an e2e source file");
+            for (at, _) in text.match_indices(&needle) {
+                let rest = &text[at + needle.len()..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if digits.is_empty() {
+                    // An interpolation such as `${MAX_PER_PAGE}`, which is the
+                    // shape this guard wants every call site to have.
+                    continue;
+                }
+                seen += 1;
+                let asked: u32 = digits.parse().expect("a run of digits parses");
+                if asked > PaginationParams::MAX_PER_PAGE {
+                    offenders.push(format!("{relative}: per page {asked}"));
+                }
+            }
+        }
+
+        assert!(
+            seen > 3,
+            "the scan found only {seen} numeric page sizes in e2e/, so it has              stopped matching that suite's shape and is no longer proving anything"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these ask the API for more than it will serve ({} is the maximum):              {offenders:?}. Use the MAX_PER_PAGE constant in e2e/lib/api.ts.",
+            PaginationParams::MAX_PER_PAGE
+        );
+    }
+}

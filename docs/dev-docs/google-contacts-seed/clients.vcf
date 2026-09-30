@@ -1,0 +1,42 @@
+BEGIN:VCARD
+VERSION:3.0
+N:Hopper;Grace;;;
+FN:Grace Hopper
+EMAIL;TYPE=WORK,PREF:grace@work.example
+EMAIL;TYPE=HOME:grace@home.example
+TEL;TYPE=WORK,VOICE,PREF:(415) 555-0100
+TEL;TYPE=CELL,VOICE:+44 20 7946 0000
+ORG:Acme Engineering
+TITLE:Rear Admiral
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+N:Person;Nomail;;;
+FN:Nomail Person
+TEL;TYPE=CELL,VOICE,PREF:(206) 555-0142
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+N:;Prince;;;
+FN:Prince
+EMAIL;TYPE=WORK,PREF:prince@paisley.example
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+N:;王小明;;;
+FN:王小明
+EMAIL;TYPE=WORK,PREF:wang@example.cn
+ADR;TYPE=WORK:;;88 Jianguo Road;Beijing;Chaoyang;100025;China
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+N:Lovelace;Ada;;;
+FN:Ada Lovelace
+EMAIL;TYPE=WORK,PREF:ada@acme.example
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+N:Lovelace;A.;;;
+FN:A. Lovelace
+EMAIL;TYPE=WORK,PREF:ada@acme.example
+END:VCARD
