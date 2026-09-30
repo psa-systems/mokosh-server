@@ -22,6 +22,7 @@
 //!   same engine, run queue and review queue as Google (PMS-1290).
 
 pub mod carddav;
+pub mod client_cleanup;
 pub mod file_import;
 pub mod google;
 pub mod icloud;
@@ -37,4 +38,6 @@ pub mod service;
 pub mod sync;
 pub mod vcard;
 
+pub use client_cleanup::ClientSecretCleanup;
+pub use oauth::OauthClient;
 pub use service::ContactSyncService;

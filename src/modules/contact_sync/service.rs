@@ -57,6 +57,9 @@ pub struct ContactSyncService {
     /// card still attached on the provider. `None` in fixtures that never
     /// seed a payment method before removing imported data.
     payment_methods: Option<Arc<crate::modules::contact_portal::PaymentMethodsService>>,
+    /// The host's Google OAuth client (PMS-1430), resolved once at boot by the
+    /// startup wiring and `None` on a deployment that has not configured one.
+    host_client: Option<OauthClient>,
     /// PMS-1429: run the import worker as soon as a run is queued, instead of
     /// leaving it to sleep out its interval.
     ///
@@ -127,63 +130,6 @@ impl From<ConnectionRow> for ConnectionStatus {
     }
 }
 
-/// The system tenant, which holds deployment-wide configuration (the email
-/// settings' `system_tenant`, `OIDC_DEFAULT_TENANT_ID`).
-fn system_tenant() -> TenantId {
-    TenantId::from_trusted(Uuid::from_u128(1))
-}
-
-/// Where the stored client id lives on the system tenant (PMS-1264).
-const CLIENT_SETTING_CATEGORY: &str = "integrations";
-const CLIENT_SETTING_KEY: &str = "google_contacts_client_id";
-
-/// Where the OAuth client in force comes from.
-///
-/// PMS-1340 split what PMS-1264 called `Database` in two. The credential is now
-/// the TENANT's own Google registration, because a Google OAuth client carries
-/// that organisation's consent screen, its quota and its verification status: a
-/// shared one means every tenant's sync competes for one quota and every
-/// customer consents to a screen naming somebody else. The deployment-wide value
-/// PMS-1264 stored on the system tenant stays readable as a fallback for one
-/// release, so a deployment that has connected through it keeps syncing until
-/// each tenant has entered its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientSource {
-    /// This tenant's own registration (PMS-1340). What a new connection uses.
-    Tenant,
-    /// The deployment-wide client on the system tenant (PMS-1264). Deprecated:
-    /// read when the tenant has none of its own, and due for removal a release
-    /// after every tenant has moved.
-    Deployment,
-    /// `GOOGLE_CONTACTS_CLIENT_ID` and `GOOGLE_CONTACTS_CLIENT_SECRET`.
-    Environment,
-    /// An id is stored with no secret beside it, at whichever level supplied it.
-    Incomplete,
-    None,
-}
-
-/// `GET /integrations/contact-sync/google/client`. The secret never leaves.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ClientSettingsView {
-    pub source: ClientSource,
-    pub client_id: Option<String>,
-    pub secret_set: bool,
-    /// What to register as an authorized redirect URI in the Google Cloud
-    /// console. `None` when `PUBLIC_API_BASE_URL` is not set, which the form
-    /// says, because nothing can connect until it is.
-    pub redirect_uri: Option<String>,
-}
-
-/// `PUT /integrations/contact-sync/google/client`: `None` keeps, `""` clears.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct ClientSettingsInput {
-    #[serde(default)]
-    pub client_id: Option<String>,
-    #[serde(default)]
-    pub client_secret: Option<String>,
-}
-
 /// What a completed consent did./// What a completed consent did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectOutcome {
@@ -200,14 +146,14 @@ pub struct ContactSyncOverview {
     /// for everyone and stops every sync; the connection and every imported
     /// contact are kept.
     pub enabled: bool,
-    /// This deployment has a Google OAuth client. Without one nobody can
-    /// connect, and the card says so rather than offering a broken button.
+    /// This deployment's host has a Google OAuth client (PMS-1430). Without one
+    /// nobody on it can connect, and the card says so rather than offering a
+    /// button that cannot work. There is nothing a tenant can do about it, which
+    /// is why no companion "you may configure it" flag rides beside this one any
+    /// more.
     pub configured: bool,
     /// `null` when never connected, or disconnected.
     pub connection: Option<ConnectionStatus>,
-    /// The caller may set the deployment's OAuth client (PMS-1264): an admin
-    /// of the system tenant. Filled by the route, which knows the caller.
-    pub client_editable: bool,
     /// `integrations/icloud_contacts_enabled` (PMS-1341), the iCloud half of
     /// `enabled`.
     pub icloud_enabled: bool,
@@ -386,10 +332,21 @@ impl ContactSyncService {
             secrets,
             public_api_base,
             spa_base_url,
+            host_client: None,
             run_wake: None,
             payment_methods: None,
             carddav_base_url: carddav::ICLOUD_BASE_URL.to_string(),
         }
+    }
+
+    /// Hand the service the host's Google OAuth client (PMS-1430).
+    ///
+    /// Set by `main` from [`OauthClient::from_app_secrets`]. Left unset
+    /// everywhere else, which reads as "this deployment cannot connect Google
+    /// Contacts" and is the honest answer for a process that never resolved one.
+    pub fn with_host_client(mut self, client: Option<OauthClient>) -> Self {
+        self.host_client = client;
+        self
     }
 
     /// Hand the service the handle that wakes the import worker (PMS-1429).
@@ -453,7 +410,7 @@ impl ContactSyncService {
     /// that, not a Google error page.
     pub async fn begin_connect(&self, tenant_id: TenantId, user_id: Uuid) -> AppResult<String> {
         self.assert_enabled(tenant_id, GOOGLE).await?;
-        let client = self.require_oauth_client(tenant_id).await?;
+        let client = self.require_oauth_client()?;
         let redirect_uri = self.redirect_uri()?;
         let pkce = Pkce::generate();
         let secret = generate_token(48);
@@ -546,7 +503,7 @@ impl ContactSyncService {
         // Now that the tenant is known, the client is too. A tenant that cleared
         // its client while a consent was in flight lands here, and the refusal
         // names its own settings rather than Google's error page.
-        let client = self.require_oauth_client(tenant_id).await?;
+        let client = self.require_oauth_client()?;
 
         // Consume BEFORE the exchange, so a slow or failing exchange cannot be
         // retried with the same state.
@@ -830,9 +787,8 @@ impl ContactSyncService {
         Ok(ContactSyncOverview {
             enabled: crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id)
                 .await?,
-            configured: self.oauth_client(tenant_id).await?.is_some(),
+            configured: self.oauth_client().is_some(),
             connection: self.connection(tenant_id, GOOGLE).await?,
-            client_editable: false,
             icloud_enabled: crate::modules::settings::read_icloud_contacts_enabled(
                 &self.db, tenant_id,
             )
@@ -841,272 +797,32 @@ impl ContactSyncService {
         })
     }
 
-    /// Whether `user` may set their own tenant's OAuth client: any admin of that
-    /// tenant (PMS-1340).
+    /// The host's Google OAuth client, resolved once at boot (PMS-1430).
     ///
-    /// PMS-1264 allowed only an admin of the system tenant, because the client
-    /// was the deployment's and "a customer organisation must not be able to swap
-    /// the client every other tenant connects through". With the credential per
-    /// tenant there is no such client: an admin editing theirs changes what their
-    /// own organisation connects as, which is the same authority they already
-    /// have over their own payment gateway credentials.
-    pub fn may_configure_client(user: &mokosh_types::auth::CurrentUser) -> bool {
-        user.role.is_admin()
+    /// `None` on a deployment whose host has not configured one, which the
+    /// Settings card renders as unavailable. There is no per-tenant or
+    /// system-tenant registration and no ladder: which Google application this
+    /// installation authenticates as is a property of the deployment, and a
+    /// customer never sees a client id. The value is read through
+    /// [`OauthClient::from_app_secrets`] by the startup wiring and handed here,
+    /// because the app-secret providers load once at construction anyway, so a
+    /// per-request read would buy nothing and give a second answer to a question
+    /// that has one.
+    pub fn oauth_client(&self) -> Option<OauthClient> {
+        self.host_client.clone()
     }
 
-    /// The system tenant's id, for the platform-or-tenant gate.
-    pub fn system_tenant_id() -> Uuid {
-        system_tenant().get()
-    }
-
-    /// The OAuth client this deployment connects with (PMS-1264): the one set
-    /// in the app, else operator env, else none. A stored client is used as a
-    /// PAIR, never mixed field by field with env: an id from one Google project
-    /// and a secret from another fail at Google with an error nobody can place.
-    /// A stored id with no stored secret is half a client and reads as none.
-    pub async fn oauth_client(&self, tenant_id: TenantId) -> AppResult<Option<OauthClient>> {
-        Ok(self.resolve_client(tenant_id).await?.0)
-    }
-
-    async fn require_oauth_client(&self, tenant_id: TenantId) -> AppResult<OauthClient> {
-        self.oauth_client(tenant_id).await?.ok_or_else(|| {
-            // PMS-1340: "this organisation" rather than "this deployment". With
-            // the credential per tenant, an unconfigured tenant is the ordinary
-            // case on a deployment where another tenant is syncing happily, and
-            // the old wording sent the admin to the operator instead of to their
-            // own settings page.
+    fn require_oauth_client(&self) -> AppResult<OauthClient> {
+        self.oauth_client().ok_or_else(|| {
+            // Addressed to a tenant admin, who cannot fix this and should not be
+            // sent to the Google Cloud console for it: on a hosted deployment
+            // the client is the operator's.
             AppError::Configuration(
-                "Google Contacts is not configured for this organisation. Add your Google OAuth \
-                 client id and secret in Settings, Contact sync."
+                "Google Contacts is not available on this deployment. Its Google sign-in client \
+                 is configured by whoever runs it."
                     .to_string(),
             )
         })
-    }
-
-    /// The client id stored against one tenant, if any. `tenant_settings` is
-    /// tenant-scoped, so the same read serves a tenant's own registration and
-    /// the deployment-wide one on the system tenant; which tenant is passed is
-    /// the whole difference between them.
-    async fn stored_client_id(&self, tenant_id: TenantId) -> AppResult<Option<String>> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let value: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT value FROM tenant_settings \
-             WHERE tenant_id = $1 AND category = $2 AND key = $3",
-        )
-        .bind(tenant_id)
-        .bind(CLIENT_SETTING_CATEGORY)
-        .bind(CLIENT_SETTING_KEY)
-        .fetch_optional(&mut *tx)
-        .await?;
-        Ok(value
-            .and_then(|v| v.as_str().map(str::trim).map(str::to_string))
-            .filter(|v| !v.is_empty()))
-    }
-
-    /// One level of the ladder: the id and secret stored against `tenant_id`,
-    /// read as a PAIR. An id from one Google project with a secret from another
-    /// fails at Google with an error nobody can place, so a stored id with no
-    /// secret beside it is half a client and reads as `Incomplete` rather than
-    /// falling through to the next level and silently connecting as somebody
-    /// else's application.
-    async fn stored_client(
-        &self,
-        tenant_id: TenantId,
-    ) -> AppResult<Option<(Option<OauthClient>, ClientSource)>> {
-        let found = if tenant_id == system_tenant() {
-            ClientSource::Deployment
-        } else {
-            ClientSource::Tenant
-        };
-        let Some(client_id) = self.stored_client_id(tenant_id).await? else {
-            return Ok(None);
-        };
-        let secret = self
-            .secrets
-            .get(&SecretKey::oauth_client(tenant_id.get(), GOOGLE))
-            .await?
-            .filter(|s| !s.trim().is_empty());
-        Ok(Some(match secret {
-            Some(client_secret) => (
-                Some(OauthClient {
-                    client_id,
-                    client_secret,
-                }),
-                found,
-            ),
-            None => (None, ClientSource::Incomplete),
-        }))
-    }
-
-    /// PMS-1340: the tenant's own registration, else the deprecated
-    /// deployment-wide one, else operator env.
-    ///
-    /// The order is the migration: a tenant that has entered its own client uses
-    /// it from that moment, and one that has not keeps connecting through
-    /// whatever was working before, so moving is a per-tenant decision rather
-    /// than a deployment-wide outage. `crate::modules::contact_sync` is the only
-    /// reader, and the view below says which level answered so an operator can
-    /// tell whether this tenant has moved.
-    async fn resolve_client(
-        &self,
-        tenant_id: TenantId,
-    ) -> AppResult<(Option<OauthClient>, ClientSource)> {
-        if let Some(found) = self.stored_client(tenant_id).await? {
-            return Ok(found);
-        }
-        if tenant_id != system_tenant() {
-            if let Some(found) = self.stored_client(system_tenant()).await? {
-                return Ok(found);
-            }
-        }
-        Ok(match OauthClient::from_config() {
-            Some(client) => (Some(client), ClientSource::Environment),
-            None => (None, ClientSource::None),
-        })
-    }
-
-    /// What the client settings form shows for one tenant. The secret never
-    /// leaves.
-    ///
-    /// The id shown is the one IN FORCE for this tenant, at whatever level
-    /// answered, because the question the form exists to answer is "what will
-    /// this organisation connect as". `source` says which level that was, so a
-    /// tenant still riding the deprecated deployment-wide client can see that it
-    /// is (PMS-1340).
-    pub async fn client_settings(&self, tenant_id: TenantId) -> AppResult<ClientSettingsView> {
-        let (client, source) = self.resolve_client(tenant_id).await?;
-        let stored_id = match source {
-            ClientSource::Tenant | ClientSource::Incomplete => {
-                self.stored_client_id(tenant_id).await?
-            }
-            ClientSource::Deployment => self.stored_client_id(system_tenant()).await?,
-            ClientSource::Environment | ClientSource::None => None,
-        };
-        let secret_set = matches!(
-            source,
-            ClientSource::Tenant | ClientSource::Deployment | ClientSource::Environment
-        );
-        Ok(ClientSettingsView {
-            source,
-            client_id: stored_id.or_else(|| {
-                (source == ClientSource::Environment)
-                    .then(|| client.map(|c| c.client_id))
-                    .flatten()
-            }),
-            secret_set,
-            redirect_uri: self.redirect_uri().ok(),
-        })
-    }
-
-    /// Set or clear the in-app client (PMS-1264). `None` keeps a field, an
-    /// empty string clears it; clearing the id clears the stored secret with
-    /// it, and falls back to env. The secret goes to the secret provider, never
-    /// to `tenant_settings`.
-    pub async fn put_client_settings(
-        &self,
-        tenant_id: TenantId,
-        input: &ClientSettingsInput,
-        actor: &str,
-    ) -> AppResult<ClientSettingsView> {
-        // PMS-1340: written against the CALLER's tenant. The system tenant is no
-        // longer special on the write path; an admin of it edits the deprecated
-        // deployment-wide value by virtue of being in that tenant, which is the
-        // same code path rather than a second one.
-        let key = SecretKey::oauth_client(tenant_id.get(), GOOGLE);
-        let new_id = input.client_id.as_deref().map(str::trim);
-        let new_secret = input.client_secret.as_deref().map(str::trim);
-        if let Some(id) = new_id.filter(|id| !id.is_empty()) {
-            if !id.ends_with(".apps.googleusercontent.com") || id.chars().any(char::is_whitespace) {
-                return Err(AppError::validation_field(
-                    "client_id",
-                    "must be a Google OAuth client id, ending in .apps.googleusercontent.com",
-                ));
-            }
-        }
-        if let Some(secret) = new_secret.filter(|s| !s.is_empty()) {
-            if secret.len() > 255 || secret.chars().any(char::is_whitespace) {
-                return Err(AppError::validation_field(
-                    "client_secret",
-                    "must be the client secret from the Google Cloud console, with no spaces",
-                ));
-            }
-        }
-        let current_id = self.stored_client_id(tenant_id).await?;
-        let resulting_id = match new_id {
-            Some("") => None,
-            Some(id) => Some(id.to_string()),
-            None => current_id.clone(),
-        };
-        let secret_stored = self
-            .secrets
-            .get(&key)
-            .await?
-            .is_some_and(|s| !s.trim().is_empty());
-        let resulting_secret = match new_secret {
-            Some("") => false,
-            Some(_) => true,
-            None => secret_stored,
-        };
-        if resulting_id.is_some() && !resulting_secret {
-            return Err(AppError::validation_field(
-                "client_secret",
-                "a client id needs its client secret",
-            ));
-        }
-
-        // Secret first, the PMS-968 ordering: an orphaned secret is harmless, a
-        // stored id pointing at no secret is a client that cannot connect.
-        match (resulting_id.as_ref(), new_secret) {
-            (Some(_), Some(secret)) if !secret.is_empty() => self.secrets.put(&key, secret).await?,
-            (None, _) | (_, Some("")) => self.secrets.delete(&key).await?,
-            _ => {}
-        }
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        match resulting_id.as_ref() {
-            Some(id) => {
-                sqlx::query(
-                    "INSERT INTO tenant_settings (tenant_id, category, key, value) \
-                     VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (tenant_id, category, key) \
-                     DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
-                )
-                .bind(tenant_id)
-                .bind(CLIENT_SETTING_CATEGORY)
-                .bind(CLIENT_SETTING_KEY)
-                .bind(serde_json::json!(id))
-                .execute(&mut *tx)
-                .await?;
-            }
-            None => {
-                sqlx::query(
-                    "DELETE FROM tenant_settings WHERE tenant_id = $1 AND category = $2 AND key = $3",
-                )
-                .bind(tenant_id)
-                .bind(CLIENT_SETTING_CATEGORY)
-                .bind(CLIENT_SETTING_KEY)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
-        audit_write(
-            &mut *tx,
-            tenant_id,
-            &AuditCtx::system(tenant_id.get()),
-            AuditAction::Update,
-            "contact_sync_oauth_client",
-            None,
-            Some(serde_json::json!({ "client_id": current_id })),
-            Some(serde_json::json!({
-                "event": "contact_sync.client_changed",
-                "provider": GOOGLE,
-                "client_id": resulting_id,
-                "secret_changed": new_secret.is_some(),
-                "changed_by": actor,
-            })),
-        )
-        .await?;
-        tx.commit().await?;
-        self.client_settings(tenant_id).await
     }
 
     /// Refuse while `integrations/google_contacts_enabled` is off (PSA-70 K).
@@ -2108,7 +1824,7 @@ impl ContactSyncService {
         connection_id: Uuid,
         provider: &str,
     ) -> AppResult<String> {
-        let client = self.require_oauth_client(tenant_id).await?;
+        let client = self.require_oauth_client()?;
         let refresh_token = self
             .secrets
             .get(&SecretKey::contact_sync(
