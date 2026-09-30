@@ -63,8 +63,8 @@ default:
 
 # -- Checks ----------------------------------------------------------------------
 
-# Every check.yml step except its two cargo test steps: all thirteen repo guard
-# steps plus compile, clippy and fmt. `just pre-commit` runs the unit and doc
+# Every check.yml step except its two cargo test steps: every repo guard step
+# plus compile, clippy and fmt. `just pre-commit` runs the unit and doc
 # tests, so the two recipes together cover check.yml and neither covers it alone
 # (PMS-851; per-step mapping in docs/dev-docs/local-vs-ci-checks.md).
 #
@@ -77,7 +77,7 @@ default:
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-doc-links
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-doc-links check-claude-md
 
 # Keep every relative Markdown link pointing at a file that exists (PMS-850).
 # The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and
@@ -86,6 +86,14 @@ check: check-compile check-clippy check-fmt check-migrations check-migration-imm
 [group: 'check']
 check-doc-links:
     nu scripts/check-doc-links.nu
+
+# Keep CLAUDE.md an index over docs/ (PMS-1437): at most 20,000 bytes, no prose
+# line over 400 characters, and every docs/ link and anchor it names resolves.
+[doc("Fail if CLAUDE.md outgrows its budget or a docs/ link or anchor in it breaks (PMS-1437).")]
+[group: 'check']
+check-claude-md:
+    nu scripts/check-claude-md.nu --self-test
+    nu scripts/check-claude-md.nu
 
 # Keep build artifacts off memory-backed storage (PMS-973). The shared
 # development machines carry a large tmpfs at /tmp, and this workspace's target
