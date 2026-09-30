@@ -79,6 +79,9 @@ pub const TICKETS_BARE: &[&str] = &["created_at", "updated_at", "sla_due_date", 
 /// `GET /api/v1/time-entries`.
 pub const TIME_ENTRIES: &[&str] = &["date", "duration_minutes", "created_at"];
 
+/// `GET /api/v1/tenants` (super-admin cross-tenant list).
+pub const TENANTS: &[&str] = &["name", "user_count", "created_at"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +106,7 @@ mod tests {
             ("TICKETS", TICKETS),
             ("TICKETS_BARE", TICKETS_BARE),
             ("TIME_ENTRIES", TIME_ENTRIES),
+            ("TENANTS", TENANTS),
         ];
         for (name, keys) in lists {
             assert!(!keys.is_empty(), "{name} is empty");
