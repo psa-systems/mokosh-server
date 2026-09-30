@@ -347,6 +347,57 @@ async fn contact_with_invoices_pay_refuses_draft_400(pool: PgPool) {
     );
 }
 
+/// PMS-1431: a Pending invoice (never sent to the customer) must refuse a
+/// checkout session the same way Draft does. `record_gateway_payment` and
+/// `create_payment` already refuse Draft|Pending (PMS-999); before this fix
+/// `create_invoice_checkout_session` only refused Draft|Void|WrittenOff, so a
+/// contact could start (and complete) a real checkout against a Pending
+/// invoice while the webhook that should record the payment hit the
+/// Draft|Pending guard and silently dropped it.
+#[mokosh_test]
+async fn contact_with_invoices_pay_refuses_pending_409(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let (own_company, _c, _e, token) =
+        seed_contact_with_roles(&app, &pool, "pay-pending", &["Billing Contact"]).await;
+    let invoice_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO invoices (id, tenant_id, invoice_number, company_id, status, \
+         invoice_date, due_date, subtotal, total, amount_paid, balance_due, currency) \
+         VALUES ($1, $2, $3, $4, 'pending', CURRENT_DATE, CURRENT_DATE + 30, 100, 100, 0, 100, 'USD')",
+    )
+    .bind(invoice_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(format!("PIP-PENDING-{}", &invoice_id.simple().to_string()[..8]))
+    .bind(own_company)
+    .execute(&pool)
+    .await
+    .expect("seed pending invoice");
+
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/invoices/{invoice_id}/pay")))
+        .bearer_auth(&token)
+        .json(&pay_body())
+        .send()
+        .await
+        .expect("pay");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "PMS-1431: pay on a Pending invoice must refuse before the gateway check, \
+         the same as Draft"
+    );
+    let body: serde_json::Value = resp.json().await.expect("json");
+    let msg = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or("");
+    assert!(
+        msg.contains("'pending'"),
+        "PMS-1431: refusal message must name the status, got {body}"
+    );
+}
+
 /// MAPPS-677: the pay-mint rate limiter is wired on the route with the
 /// production 20/min-per-caller + 10/min-per-invoice quotas. This
 /// integration test proves the WIRING: an 11th mint on one invoice, from

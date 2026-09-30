@@ -3425,9 +3425,9 @@ impl BillingService {
 
     /// PMS-711: create a hosted checkout session for an invoice's outstanding
     /// balance. Fails 400 when the tenant has no active Stripe gateway, when the
-    /// invoice has nothing left to pay, or when the invoice is void / written
-    /// off. The payer is redirected to the returned `url`; the payment is
-    /// reconciled later by the webhook, not by this call.
+    /// invoice has nothing left to pay, or when the invoice is draft, pending,
+    /// void, or written off. The payer is redirected to the returned `url`;
+    /// the payment is reconciled later by the webhook, not by this call.
     pub async fn create_invoice_checkout_session(
         &self,
         tenant_id: TenantId,
@@ -3452,9 +3452,17 @@ impl BillingService {
         // row it shouldn't have) or an accident on the staff plane
         // that would charge a card for an amount not yet finalized.
         // Security review F9 (docs/mokosh-invoices/06-security-review.md).
+        // PMS-1431: refuse Pending for the same reason: record_gateway_payment
+        // and create_payment already refuse Draft|Pending (PMS-999), and
+        // letting a checkout session start against a Pending invoice let the
+        // gateway take the customer's money while the webhook that should
+        // record it hit that same refusal and silently dropped the payment.
         if matches!(
             invoice.status,
-            InvoiceStatus::Draft | InvoiceStatus::Void | InvoiceStatus::WrittenOff
+            InvoiceStatus::Draft
+                | InvoiceStatus::Pending
+                | InvoiceStatus::Void
+                | InvoiceStatus::WrittenOff
         ) {
             return Err(AppError::Conflict(format!(
                 "Invoice {} cannot be paid in status '{}'",
