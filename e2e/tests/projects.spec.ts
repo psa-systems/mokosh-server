@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { enableModule } from '../lib/factories';
 import { runSuffix } from '../lib/run';
 
@@ -30,7 +30,7 @@ test.describe('projects CRUD', () => {
     });
     expect(updP.status(), `update project failed: ${await updP.text()}`).toBe(200);
 
-    const listP = await request.get(`${routes.projects}?per_page=200`);
+    const listP = await request.get(`${routes.projects}?per_page=${MAX_PER_PAGE}`);
     expect(listP.status()).toBe(200);
     expect(((await listP.json()) as { data: Array<{ id: string }> }).data.map((p) => p.id)).toContain(
       project.id,

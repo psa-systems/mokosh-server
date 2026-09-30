@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { runSuffix } from '../lib/run';
 
 // Notifications CRUD (PMS-155): templates and channels. The module is NOT
@@ -25,7 +25,7 @@ test.describe('notifications CRUD', () => {
     const template = (await createTpl.json()) as { id: string };
     expect(template.id).toBeTruthy();
 
-    const listTpl = await request.get(`${routes.notificationTemplates}?per_page=200`);
+    const listTpl = await request.get(`${routes.notificationTemplates}?per_page=${MAX_PER_PAGE}`);
     expect(listTpl.status()).toBe(200);
     expect(((await listTpl.json()) as { data: Array<{ id: string }> }).data.map((t) => t.id)).toContain(
       template.id,
@@ -40,7 +40,7 @@ test.describe('notifications CRUD', () => {
     const channel = (await createCh.json()) as { id: string };
     expect(channel.id).toBeTruthy();
 
-    const listCh = await request.get(`${routes.notificationChannels}?per_page=200`);
+    const listCh = await request.get(`${routes.notificationChannels}?per_page=${MAX_PER_PAGE}`);
     expect(listCh.status()).toBe(200);
     expect(((await listCh.json()) as { data: Array<{ id: string }> }).data.map((c) => c.id)).toContain(
       channel.id,
