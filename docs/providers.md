@@ -180,8 +180,21 @@ handle just written, because the database provider caches the plaintext on a suc
 would only prove the cache agrees with itself.
 
 A read-only declared provider (`environment`) is refused with the `{NAME}_FILE` route named, since a process
-cannot set a variable for its own next boot. A restart is required before the value is served: `app_secrets`
-resolves once per process.
+cannot set a variable for its own next boot. A restart is required before a value written this way is served: `app_secrets` resolves once per process, and
+the process that wrote the row is not the one serving requests. The page below is the exception, because it runs
+inside the serving process and swaps what that process holds.
+
+### From the product, for the one value that has a page
+
+`PUT /settings/google-contacts-client` (PMS-1444) writes the host's Google OAuth client through the declared
+provider, gated to the deployment's operator, and then swaps the client the running process is using, so the
+setting does not wait for a deploy. It is the same shape as the deployment-wide SMTP settings (PMS-638), including
+the write-only secret and the live swap, and it refuses exactly where `provider-set` refuses: a declared provider
+that cannot be built, or one that cannot be written, and never a fallback to another provider.
+
+It is deliberately the only such page. A governed secret gets one when an operator has to set it repeatedly or
+under time pressure; the CLI remains the path for a deployment with nobody signed in yet, which is every
+deployment on its first day.
 
 ## Moving a value to a different provider
 
