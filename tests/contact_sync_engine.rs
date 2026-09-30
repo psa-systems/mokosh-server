@@ -817,6 +817,139 @@ async fn a_contact_that_leaves_the_selected_label_is_kept_and_stops_being_update
     assert_eq!(f.scalar::<i64>("SELECT count(*) FROM contacts").await, 1);
 }
 
+/// PMS-1433: iCloud's delta carries group membership on the group card, not
+/// the contact's own, so an incremental run whose card set held no group card
+/// for a record reports `group_ids: []` even though the contact's real
+/// membership has not changed. An already-linked contact must keep syncing
+/// its own-card edits on such a delta instead of being routed to
+/// `Plan::NotSelected` on the strength of an empty `group_ids` alone.
+#[mokosh_test]
+async fn a_linked_contact_keeps_syncing_on_a_delta_with_no_group_card(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+
+    let mut linked = person("people/c1", "e1", "Jane", "Doe");
+    linked.emails = vec!["jane@acme.example".into()];
+    let source = FakeSource::new(vec![read(vec![linked], "t1", false)]);
+    assert_eq!(
+        f.sync(&source).await.expect("the first sync"),
+        SyncReport {
+            full_read: true,
+            created: 1,
+            total: 1,
+            ..SyncReport::default()
+        }
+    );
+    let jane = f.link_contact("people/c1").await;
+
+    // A phone-number edit only: a new etag, no group card in this delta, so
+    // `group_ids` arrives empty even though Jane is still in Clients.
+    let mut edited = person("people/c1", "e2", "Jane", "Doe");
+    edited.emails = vec!["jane@acme.example".into()];
+    edited.group_ids = vec![];
+    edited.phones = vec![SourcePhone {
+        number: "+14155551234".into(),
+        canonical: Some("+14155551234".into()),
+        label: Some("mobile".into()),
+        is_primary: true,
+    }];
+    source.push(read(vec![edited], "t2", false));
+    assert_eq!(
+        f.sync(&source).await.expect("the incremental sync"),
+        SyncReport {
+            full_read: false,
+            updated: 1,
+            total: 1,
+            ..SyncReport::default()
+        },
+        "an empty group_ids on an incremental delta must not route an already-linked record to NotSelected"
+    );
+
+    #[derive(sqlx::FromRow)]
+    struct After {
+        phones: i64,
+    }
+    let after: After = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM contact_phones WHERE contact_id = $1) AS phones",
+    )
+    .bind(jane)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(after.phones, 1, "the phone-number edit was applied");
+
+    let etag: Option<String> =
+        sqlx::query_scalar("SELECT etag FROM contact_sync_links WHERE external_id = $1")
+            .bind("people/c1")
+            .fetch_one(&f.pool)
+            .await
+            .expect("the link");
+    assert_eq!(
+        etag.as_deref(),
+        Some("e2"),
+        "the link's etag advanced with the applied edit"
+    );
+}
+
+/// PMS-1433: the fix above must not mask a genuine deselection. A contact
+/// removed from every selected group still resolves to `Plan::NotSelected`
+/// even on an incremental delta, because the group card that changed to drop
+/// the member is itself present in that delta and reports the membership
+/// (`group_ids`) explicitly, just no longer including a selected group.
+#[mokosh_test]
+async fn a_contact_dropped_from_every_selected_group_on_a_delta_is_still_not_selected(
+    pool: PgPool,
+) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+
+    let mut linked = person("people/c1", "e1", "Jane", "Doe");
+    linked.emails = vec!["jane@acme.example".into()];
+    let source = FakeSource::new(vec![read(vec![linked], "t1", false)]);
+    assert_eq!(
+        f.sync(&source).await.expect("the first sync"),
+        SyncReport {
+            full_read: true,
+            created: 1,
+            total: 1,
+            ..SyncReport::default()
+        }
+    );
+    let jane = f.link_contact("people/c1").await;
+
+    // The provider reports the group card that changed: Jane moved out of
+    // Clients into Friends, a real membership answer, not an absent one.
+    let mut moved = person("people/c1", "e2", "Jane", "Doe");
+    moved.emails = vec!["jane@acme.example".into()];
+    moved.group_ids = vec![FRIENDS.into()];
+    source.push(read(vec![moved], "t2", false));
+    assert_eq!(
+        f.sync(&source).await.expect("the incremental sync"),
+        SyncReport {
+            full_read: false,
+            not_selected: 1,
+            total: 1,
+            ..SyncReport::default()
+        },
+        "a record whose delta explicitly reports its (non-selected) groups is still refused"
+    );
+
+    let etag: Option<String> =
+        sqlx::query_scalar("SELECT etag FROM contact_sync_links WHERE external_id = $1")
+            .bind("people/c1")
+            .fetch_one(&f.pool)
+            .await
+            .expect("the link survives");
+    assert_eq!(
+        etag.as_deref(),
+        Some("e1"),
+        "the deselected edit was never applied"
+    );
+    assert_eq!(
+        jane,
+        f.link_contact("people/c1").await,
+        "the link is untouched, not deleted"
+    );
+}
+
 /// A question a human answered is not asked again when the record changes.
 #[mokosh_test]
 async fn an_answered_question_is_not_asked_again(pool: PgPool) {
