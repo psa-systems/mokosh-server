@@ -60,6 +60,24 @@ async fn seed_sent_invoice(pool: &sqlx::PgPool, company_id: Uuid, total: Decimal
     id
 }
 
+async fn seed_pending_invoice(pool: &sqlx::PgPool, company_id: Uuid, total: Decimal) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO invoices (id, tenant_id, invoice_number, company_id, status, \
+         invoice_date, due_date, subtotal, total, balance_due, currency) \
+         VALUES ($1, $2, $3, $4, 'pending', CURRENT_DATE, CURRENT_DATE, $5, $5, $5, 'USD')",
+    )
+    .bind(id)
+    .bind(DEFAULT_TENANT_ID)
+    .bind(format!("WD-{}", &id.simple().to_string()[..8]))
+    .bind(company_id)
+    .bind(total)
+    .execute(pool)
+    .await
+    .expect("seed pending invoice");
+    id
+}
+
 async fn seed_stripe_gateway(pool: &sqlx::PgPool) {
     let plaintext = serde_json::json!({
         "secret_key": "sk_test_unused_in_webhook_path",
@@ -155,6 +173,55 @@ async fn an_accepted_delivery_is_recorded_with_its_event_and_invoice(pool: sqlx:
     assert_eq!(event_id.as_deref(), Some("evt_delivery_1"));
     assert_eq!(*invoice_id, Some(invoice));
     assert_eq!(detail.as_deref(), None);
+}
+
+/// PMS-1432: a webhook that verifies but whose reconciliation is refused (the
+/// `Pending`-status guard, PMS-1444) must not read as "accepted" beside a
+/// delivery that actually recorded a payment.
+#[mokosh_test]
+async fn a_refused_reconciliation_is_recorded_as_unreconciled(pool: sqlx::PgPool) {
+    let app = boot_rls(pool).await;
+    let company = seed_company(&app.pool).await;
+    let invoice = seed_pending_invoice(&app.pool, company, dec("100.00")).await;
+    seed_stripe_gateway(&app.pool).await;
+
+    let body = checkout_completed_event(invoice, 10_000);
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/stripe/webhooks/{DEFAULT_TENANT_ID}")))
+        .header(
+            "Stripe-Signature",
+            sign(WEBHOOK_SECRET, body.as_bytes(), now_unix()),
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("post webhook");
+    assert_eq!(resp.status(), 200, "the provider must not retry this");
+
+    let rows = deliveries(&app.pool).await;
+    assert_eq!(rows.len(), 1, "one delivery, one row: {rows:?}");
+    let (provider, outcome, event_type, event_id, invoice_id, _detail) = &rows[0];
+    assert_eq!(provider, "stripe");
+    assert_eq!(
+        outcome, "unreconciled",
+        "distinguishable from a real success: {rows:?}"
+    );
+    assert_ne!(outcome, "accepted");
+    assert_eq!(event_type.as_deref(), Some("checkout.session.completed"));
+    assert_eq!(event_id.as_deref(), Some("evt_delivery_1"));
+    assert_eq!(*invoice_id, Some(invoice));
+
+    // No payment was recorded, and the invoice is untouched.
+    let (status, count): (String, i64) = sqlx::query_as(
+        "SELECT status, (SELECT COUNT(*) FROM payments WHERE invoice_id = $1) FROM invoices WHERE id = $1",
+    )
+    .bind(invoice)
+    .fetch_one(&app.pool)
+    .await
+    .expect("read invoice");
+    assert_eq!(status, "pending");
+    assert_eq!(count, 0, "no payment row was recorded");
 }
 
 /// The row that matters most. A delivery this deployment would not accept is
