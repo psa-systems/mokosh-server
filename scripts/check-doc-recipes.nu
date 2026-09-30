@@ -26,6 +26,8 @@ const DOCS = [
     "docs/binaries.md"
     "docs/configuration.md"
     "docs/recipes.md"
+    "docs/invariants/ci-release.md"
+    "docs/invariants/config-providers.md"
 ]
 
 const JUSTFILE = "justfile"

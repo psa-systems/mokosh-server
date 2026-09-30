@@ -41,8 +41,8 @@ directory, plus the quickstart that developers reach from here.
 ## Where current state actually lives
 
 1. [`src/api/router.rs`](../../src/api/router.rs) for what is mounted,
-   and the "Routing model" section of the repo
-   [`CLAUDE.md`](../../CLAUDE.md) for what authenticates a request to
+   and the "Routing model" section of
+   [`architecture.md`](../architecture.md#routing-model) for what authenticates a request to
    each top-level nest under `/api/v1`, including the unauthenticated
    `/api/v1/public/*` subtree, the portal router, and the bunyip and
    Stripe webhook receivers.
@@ -68,7 +68,7 @@ directory, plus the quickstart that developers reach from here.
 
 - Do not append to [`codebase-state.md`](codebase-state.md). It is
   frozen at its snapshot date. A new route group is recorded in the
-  "Routing model" list in the repo [`CLAUDE.md`](../../CLAUDE.md),
+  "Routing model" list in [`architecture.md`](../architecture.md#routing-model),
   which is the list that is maintained.
 - Never write a derivable count into prose here. It will be wrong
   within a month and a reader cannot tell. Name the command instead.

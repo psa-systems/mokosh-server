@@ -15,7 +15,7 @@
 #
 # Migration 208 (`mokosh_assert_content_rows_matched`) gives every future
 # guarded content UPDATE a way to assert its own match count and RAISE instead
-# of silently no-opping; CLAUDE.md's Migrations section documents the
+# of silently no-opping; docs/architecture.md's "Migration rules" section documents the
 # convention. This script is the CI half: any migration numbered above the
 # cutoff that guards an UPDATE's WHERE clause on a free-text column's literal
 # value must also call `GET DIAGNOSTICS` in the same file, which is what using

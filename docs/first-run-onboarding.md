@@ -14,7 +14,7 @@ So read this document as mokosh's downstream posture and not as the fix for firs
 
 ## Production: bootstrap admin via bunyip-as-OP
 
-Production authenticates through bunyip-as-OP (the sole OP; see the "Auth" section of `CLAUDE.md`). The first admin signs in with bunyip, and bunyip's access token carries the platform-admin claim (`bunyip_role = "admin"`).
+Production authenticates through bunyip-as-OP (the sole OP; see the "Auth" section of [`architecture.md`](architecture.md#auth-two-independent-mechanisms-pms-295)). The first admin signs in with bunyip, and bunyip's access token carries the platform-admin claim (`bunyip_role = "admin"`).
 
 On that login mokosh runs `place_bunyip_user` (`src/modules/auth/middleware.rs`), which:
 

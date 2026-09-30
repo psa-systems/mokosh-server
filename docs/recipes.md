@@ -41,6 +41,7 @@ just check-build-target-storage # fail if the cargo target directory sits on a m
 just check-doc-recipes      # fail if a guarded doc names a recipe the justfile lacks
 just check-config-doc-paths # fail if a docs/ path in .env.example, compose.dev.yml or the justfile is missing
 just check-doc-links        # fail if a relative Markdown link does not resolve to an existing path
+just check-claude-md        # fail if CLAUDE.md passes 20,000 bytes, a prose line passes 400 chars, or a docs/ link or anchor breaks
 
 # CI history (not part of `just check`: needs the network)
 just ci-stalls [days]       # report CI runs that outlived their job's timeout-minutes; needs FORGEJO_TOKEN

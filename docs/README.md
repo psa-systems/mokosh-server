@@ -15,7 +15,8 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 
 | Page | Purpose |
 | --- | --- |
-| [`architecture.md`](architecture.md) | Runtime shape, module layout, repository layout, database migrations, the two Docker images, and how a release is cut. |
+| [`architecture.md`](architecture.md) | Runtime shape, module layout, repository layout, database migrations, the two Docker images, how a release is cut, and the auth, contact-plane, routing and migration rules moved out of `CLAUDE.md`. |
+| [`invariants/`](invariants/) | The repo conventions `CLAUDE.md` indexes, one file per topic (billing, documents, time, identity and auth, config and providers, CI and release, KB, contacts), each rule in full with its issue ids. |
 | [`binaries.md`](binaries.md) | The two binaries, and the operator subcommands `mokosh-server` dispatches instead of serving. |
 | [`postgres-security.md`](postgres-security.md) | How Postgres roles are provisioned, extensions installed, and row-level security enforced, kept in the question-and-answer form the design conversation took. |
 | [`rls-per-user-isolation.md`](rls-per-user-isolation.md) | The per-user data isolation reference: schema inventory, the chosen model, and the table classification. |
