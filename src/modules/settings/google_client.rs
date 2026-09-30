@@ -169,10 +169,10 @@ pub async fn put_google_client(
         return Err(AppError::validation_field(
             "client_id",
             format!(
-                "This deployment declares the {declared} secret provider, which cannot be written \
-                 from the application. Set GOOGLE_CONTACTS_CLIENT_ID_FILE and \
+                "cannot be stored: this deployment declares the {declared} secret provider, which \
+                 the application cannot write, so set GOOGLE_CONTACTS_CLIENT_ID_FILE and \
                  GOOGLE_CONTACTS_CLIENT_SECRET_FILE, or point SECRET_BACKEND at a provider that \
-                 accepts writes."
+                 accepts writes"
             ),
         ));
     }
@@ -263,16 +263,16 @@ fn validate(client_id: &str, client_secret: &str) -> AppResult<()> {
             } else {
                 "client_secret"
             },
-            "A Google client id and its client secret are both required. An empty value reads as \
-             absent everywhere else, so half a pair cannot be stored.",
+            "is required, and so is the other half: an empty value reads as absent in every \
+             provider, so half a pair cannot be stored",
         ));
     }
     if client_id.starts_with(SECRET_PREFIX) {
         return Err(AppError::validation_field(
             "client_id",
             format!(
-                "The client id starts with {SECRET_PREFIX}, which is how Google's client SECRETS \
-                 begin. The two fields look swapped."
+                "starts with {SECRET_PREFIX}, which is how Google's client secrets begin, so the \
+                 two fields look swapped"
             ),
         ));
     }
@@ -280,8 +280,8 @@ fn validate(client_id: &str, client_secret: &str) -> AppResult<()> {
         return Err(AppError::validation_field(
             "client_secret",
             format!(
-                "The client secret ends with {ID_SUFFIX}, which is how Google's client IDS end. \
-                 The two fields look swapped."
+                "ends with {ID_SUFFIX}, which is how Google's client ids end, so the two fields \
+                 look swapped"
             ),
         ));
     }
@@ -318,12 +318,12 @@ mod tests {
         };
 
         for (id, secret, field, expected) in [
-            ("", "GOCSPX-fine", "client_id", "both required"),
+            ("", "GOCSPX-fine", "client_id", "is required"),
             (
                 "x.apps.googleusercontent.com",
                 "",
                 "client_secret",
-                "both required",
+                "is required",
             ),
             (
                 "GOCSPX-secret-in-the-id-field",
