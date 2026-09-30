@@ -365,15 +365,24 @@ impl AppSecrets {
     }
 }
 
-#[cfg(test)]
 impl AppSecrets {
-    /// A handle serving `provider` as the declared one, for tests in this crate.
+    /// A handle serving one already-built `provider` as the declared one.
     ///
-    /// Production builds one through [`init_from_env`], which is what applies
-    /// the four-way classification; a test that wants to drive a READER (the
-    /// Google client pair, PMS-1430) wants none of that and would otherwise have
-    /// to stand up four providers to ask one question.
-    pub fn for_test(declared: AppSecretProviderKind, provider: Arc<dyn AppSecretProvider>) -> Self {
+    /// The startup path does NOT use this: it goes through [`init_from_env`],
+    /// which builds every provider whose inputs are present and applies the
+    /// four-way classification, and skipping that is skipping the whole
+    /// contract. This exists for a caller that already holds a provider and
+    /// wants to drive a READER through the same seam production reads through:
+    /// the Google client pair's four shapes (PMS-1430) and the Infisical suite
+    /// that proves the hosted deployment resolves it from `/app`.
+    ///
+    /// `pub` rather than `#[cfg(test)]` because an integration test links the
+    /// library compiled WITHOUT `cfg(test)`, so a test-only constructor is
+    /// invisible exactly where the deployment claim is made.
+    pub fn with_provider(
+        declared: AppSecretProviderKind,
+        provider: Arc<dyn AppSecretProvider>,
+    ) -> Self {
         let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
             vec![None; AppSecretProviderKind::ALL.len()];
         providers[declared.index()] = Some(provider);

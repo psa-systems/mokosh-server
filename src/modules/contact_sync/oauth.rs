@@ -539,7 +539,7 @@ mod pms1430_host_client {
             .iter()
             .map(|(secret, value)| (secret.name(), (*value).to_string()))
             .collect();
-        AppSecrets::for_test(AppSecretProviderKind::Infisical, Arc::new(Fixed(map)))
+        AppSecrets::with_provider(AppSecretProviderKind::Infisical, Arc::new(Fixed(map)))
     }
 
     const ID: GovernedSecret = GovernedSecret::GoogleContactsClientId;

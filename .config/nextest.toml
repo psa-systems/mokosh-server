@@ -32,7 +32,7 @@
 # Everything except the unsupported suites. `default-filter` rather than an
 # `-E` on the command line so `just test-integration` and the CI job select the
 # same set without either naming it.
-default-filter = 'not binary(s3_storage)'
+default-filter = 'not binary(s3_storage) and not binary(google_client_from_infisical)'
 
 # nextest schedules test CASES across every archived binary at once instead
 # of running one binary to completion before starting the next (what
@@ -78,7 +78,7 @@ threads-required = "num-test-threads"
 # was split out of. Only the filter differs.
 [profile.unsupported]
 inherits = "ci"
-default-filter = 'binary(s3_storage)'
+default-filter = 'binary(s3_storage) or binary(google_client_from_infisical)'
 
 # The whole point of this profile is a suite that needs external setup, so a
 # failure has to say what it was. Printing the output of a failing case
