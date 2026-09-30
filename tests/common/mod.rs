@@ -521,6 +521,22 @@ async fn boot_with_db(
         std::sync::Arc::new(
             mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
         ),
+        // PMS-1444: application-tier secrets over THIS suite's database, which
+        // is what lets the deployment-wide Google client handler be exercised
+        // per test. `app_secrets::current()` would be the wrong answer here: it
+        // is a process-global `OnceLock`, so every test in a binary would share
+        // whichever database happened to initialise it first.
+        std::sync::Arc::new(mokosh_server::app_secrets::AppSecrets::with_provider(
+            mokosh_server::app_secrets::AppSecretProviderKind::Database,
+            std::sync::Arc::new(
+                mokosh_server::app_secrets::DatabaseProvider::load(
+                    &Database::from_pool(pool.clone()),
+                    [0u8; 32],
+                )
+                .await
+                .expect("load the app-tier database provider for the harness"),
+            ),
+        )),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

@@ -135,6 +135,13 @@ pub fn create_api_router(
     // a deployment that cannot connect Google Contacts, which the Settings card
     // reports; it is never a per-tenant state.
     google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    // PMS-1444: the application-tier secrets this process serves, for the
+    // deployment-wide handler that writes the Google client into them. Passed
+    // rather than read from `app_secrets::current()` inside the handler: a
+    // request path that reaches for process-global state cannot be tested
+    // against a database of its own, and the provider it would find is
+    // whichever one initialised the global first.
+    app_secrets: Arc<crate::app_secrets::AppSecrets>,
 ) -> Router {
     let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
@@ -652,6 +659,7 @@ pub fn create_api_router(
             encryption_key,
             shared_mailer.clone(),
             google_client.clone(),
+            app_secrets,
         ))
         // Audit log read. PMS-118.
         .merge(audit_routes(audit_service))

@@ -32,6 +32,8 @@ pub struct SettingsRouterState {
     // PMS-1444: the live Google client handle, swapped after a write so the
     // setting takes effect without a restart, exactly as `shared_mailer` is.
     pub google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    // PMS-1444: the providers the Google client is read from and written to.
+    pub app_secrets: Arc<crate::app_secrets::AppSecrets>,
 }
 
 pub fn settings_routes(
@@ -40,6 +42,7 @@ pub fn settings_routes(
     enc_key: [u8; 32],
     shared_mailer: Arc<SharedMailer>,
     google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    app_secrets: Arc<crate::app_secrets::AppSecrets>,
 ) -> Router {
     let state = SettingsRouterState {
         service,
@@ -47,6 +50,7 @@ pub fn settings_routes(
         enc_key,
         shared_mailer,
         google_client,
+        app_secrets,
     };
     Router::new()
         // PMS-115 tenant settings list (paginated across categories).
@@ -133,11 +137,11 @@ async fn put_email(
 /// PMS-1444: whether this deployment's Google client is set, and where it
 /// lives. Never either half of it, not even the id.
 async fn get_google_client(
+    State(s): State<SettingsRouterState>,
     _operator: DeploymentOperator,
 ) -> AppResult<Json<super::google_client::GoogleClientView>> {
-    let secrets = app_secrets_or_unavailable()?;
     Ok(Json(super::google_client::get_google_client(
-        secrets.as_ref(),
+        s.app_secrets.as_ref(),
     )))
 }
 
@@ -149,34 +153,15 @@ async fn put_google_client(
     ctx: crate::modules::audit::AuditCtx,
     Json(input): Json<super::google_client::GoogleClientInput>,
 ) -> AppResult<Json<super::google_client::GoogleClientView>> {
-    let secrets = app_secrets_or_unavailable()?;
     let view = super::google_client::put_google_client(
         &s.db,
-        &secrets,
+        &s.app_secrets,
         s.google_client.as_ref(),
         input,
         &ctx,
     )
     .await?;
     Ok(Json(view))
-}
-
-/// The process's application-tier secrets, or an error saying why this endpoint
-/// cannot answer.
-///
-/// `app_secrets::current()` is `None` only in a process that never ran
-/// `init_from_env`, which means a test binary or a seeder rather than a serving
-/// deployment. Saying so beats unwrapping: an operator who somehow reaches this
-/// on a real deployment has a boot problem, and the message points at it.
-fn app_secrets_or_unavailable() -> AppResult<std::sync::Arc<crate::app_secrets::AppSecrets>> {
-    crate::app_secrets::current().ok_or_else(|| {
-        crate::utils::error::AppError::Configuration(
-            "This process has no application-tier secret provider, so the Google client cannot be \
-             read or written. That is a startup problem: `mokosh-server provider-status` reports \
-             what is reachable."
-                .to_string(),
-        )
-    })
 }
 
 /// PMS-788: send a one-off test email to `req.to` through the live mailer, so an

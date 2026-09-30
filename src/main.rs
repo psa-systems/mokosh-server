@@ -656,6 +656,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let google_client = std::sync::Arc::new(
         mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
     );
+    // PMS-1444: the router's deployment-wide Google client handler writes
+    // through these. `init_from_env` above installed them, so `current()` is
+    // Some; the error path exists because an `expect` in `main` would be a
+    // panic with no sentence for an operator.
+    let app_secrets = mokosh_server::app_secrets::current().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the application-tier secret providers were not installed, so no deployment-wide \
+             secret can be read or written"
+        )
+    })?;
 
     // PMS-789: load the deployment's product name into the process cache
     // before anything can render it. Warn-and-continue rather than hard-fail:
@@ -1156,6 +1166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secrets.clone(),
         Some(contact_sync_wake),
         google_client,
+        app_secrets,
     );
     let router = psa_router;
 
