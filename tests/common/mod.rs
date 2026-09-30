@@ -526,17 +526,32 @@ async fn boot_with_db(
         // per test. `app_secrets::current()` would be the wrong answer here: it
         // is a process-global `OnceLock`, so every test in a binary would share
         // whichever database happened to initialise it first.
-        std::sync::Arc::new(mokosh_server::app_secrets::AppSecrets::with_provider(
-            mokosh_server::app_secrets::AppSecretProviderKind::Database,
-            std::sync::Arc::new(
-                mokosh_server::app_secrets::DatabaseProvider::load(
-                    &Database::from_pool(pool.clone()),
-                    [0u8; 32],
-                )
-                .await
-                .expect("load the app-tier database provider for the harness"),
-            ),
-        )),
+        //
+        // A load failure is not a harness failure. `readiness` boots an app on
+        // a CLOSED pool on purpose, and a provider that could not be built is a
+        // real boot state the serving path models as an empty slot, so the
+        // harness models it the same way rather than panicking.
+        {
+            let key = [0u8; 32];
+            match mokosh_server::app_secrets::DatabaseProvider::load(
+                &Database::from_pool(pool.clone()),
+                key,
+            )
+            .await
+            {
+                Ok(provider) => {
+                    std::sync::Arc::new(mokosh_server::app_secrets::AppSecrets::with_provider(
+                        mokosh_server::app_secrets::AppSecretProviderKind::Database,
+                        std::sync::Arc::new(provider),
+                    ))
+                }
+                Err(_) => {
+                    std::sync::Arc::new(mokosh_server::app_secrets::AppSecrets::without_provider(
+                        mokosh_server::app_secrets::AppSecretProviderKind::Database,
+                    ))
+                }
+            }
+        },
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")
