@@ -38,7 +38,7 @@
 //! secret, per-provider settings beside them (`is_test_mode`,
 //! `client_display_name`, `min_partial_amount`), and a validation pass that
 //! parses the blob into that provider's own shape. That surface is
-//! `PUT /api/v1/billing/payment-gateways`, it already exists, and reproducing it
+//! `PUT /api/v1/payment-gateways`, it already exists, and reproducing it
 //! here would be a second place to enter one credential. So the credential stays
 //! addressed as `SecretKind::PaymentGateway` and entered there, while the
 //! connected fact lives here.
@@ -84,7 +84,7 @@ pub enum CredentialHome {
     /// request, so connecting is one act.
     Integration,
     /// `SecretKind::PaymentGateway`, written by
-    /// `PUT /api/v1/billing/payment-gateways` and deleted by its DELETE.
+    /// `PUT /api/v1/payment-gateways` and deleted by its DELETE.
     ///
     /// `connect` here therefore takes NO credential and refuses one that is
     /// sent, because a credential written to the other address would be a secret

@@ -27,7 +27,7 @@
 //! **A payment gateway's credential is entered on the payments surface.** Stripe
 //! needs a secret key, a webhook signing secret, a test-mode flag and a
 //! validation pass that parses the blob into its own shape, and
-//! `PUT /api/v1/billing/payment-gateways` is where all of that already happens.
+//! `PUT /api/v1/payment-gateways` is where all of that already happens.
 //! So `connect` for such a provider takes no credential, refuses one that is
 //! sent, and refuses when the gateway has not been configured yet; `disconnect`
 //! leaves the stored credential where it is. The status itself goes through
@@ -302,7 +302,7 @@ impl IntegrationsService {
     ///
     /// Today that is Stripe and PayPal, whose key, webhook signing secret,
     /// test-mode flag and per-provider display and partial-payment settings are
-    /// entered under `PUT /api/v1/billing/payment-gateways`. What is left for
+    /// entered under `PUT /api/v1/payment-gateways`. What is left for
     /// this surface is the two things it owns: whether the tenant is connected,
     /// and what they have delegated.
     ///
@@ -474,7 +474,7 @@ impl IntegrationsService {
     /// PMS-1312: for a provider whose [`CredentialHome`] is the payments
     /// surface the credential is left alone, because it is not this surface's to
     /// delete and an MSP switching payments off for a month should not have to
-    /// find their Stripe keys again. `DELETE /api/v1/billing/payment-gateways/{provider}`
+    /// find their Stripe keys again. `DELETE /api/v1/payment-gateways/{provider}`
     /// is what removes it, and it is also what removes the gateway row, so the
     /// two cannot end up half gone.
     pub async fn disconnect(

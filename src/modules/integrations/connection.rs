@@ -88,6 +88,23 @@ pub async fn set_payment_connection(
     connected: bool,
     connected_by_user_id: Option<uuid::Uuid>,
 ) -> AppResult<()> {
+    // `integrations.provider`'s CHECK does not accept every value
+    // `payment_gateway_configs.provider`'s does: `authorize_net` is in the
+    // gateway table's CHECK, in `GatewayProvider`, and in nothing else - no
+    // provider implementation and no registry entry - so a row for it here would
+    // name a provider this subsystem cannot describe and the INSERT would be a
+    // constraint violation on an ordinary save. Skipping it cannot hide an
+    // activation: `upsert_payment_gateway` refuses to activate any provider
+    // outside `billing::provider::SUPPORTED` before reaching this call, and a
+    // provider with no row is never connected by `CONNECTED_GATEWAY_JOIN`.
+    if mokosh_types::integrations::IntegrationProvider::from_str(provider).is_none() {
+        tracing::debug!(
+            provider,
+            "payment connection not recorded: the provider has no integrations entry"
+        );
+        return Ok(());
+    }
+
     // Not the same status on both arms, and the difference is the point. A row
     // this call CREATES while not connecting is a gateway whose credentials were
     // saved and never switched on, which is `not_connected`; migration 256 maps
