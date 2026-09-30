@@ -884,7 +884,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             encryption_key,
         )
         .with_public_api_base(config.public_api_base_url.clone());
-    scheduler.register(
+    // PMS-1429: the interval below is the cadence for the sync nobody is
+    // watching. A person pressing Sync now IS watching, and waited up to a full
+    // minute for six contacts because the request only inserts a row. The
+    // router's service holds this handle and wakes the worker the moment a run
+    // is committed; the request still does not run the import, so a closed tab
+    // still cannot stop one.
+    let contact_sync_wake = mokosh_server::scheduler::JobWake::new();
+    scheduler.register_wakeable(
         mokosh_server::modules::contact_sync::runs::ContactSyncRunner::new(
             db.clone(),
             std::sync::Arc::new(
@@ -896,6 +903,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.spa_base_url.clone(),
         ),
         std::time::Duration::from_secs(60),
+        &contact_sync_wake,
     );
     scheduler.register(contract_worker, std::time::Duration::from_secs(3600));
     scheduler.register(
@@ -1109,6 +1117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.max_tenants,
         config.deployment_mode,
         secrets.clone(),
+        Some(contact_sync_wake),
     );
     let router = psa_router;
 

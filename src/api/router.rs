@@ -122,6 +122,12 @@ pub fn create_api_router(
     // every `BillingService` below on Infisical rather than whichever ones
     // remembered to ask.
     secrets: Arc<dyn crate::secrets::SecretProvider>,
+    // PMS-1429: the handle that runs the contact-import worker as soon as a
+    // person queues an import, instead of leaving it to sleep out its 60s
+    // interval. `None` where nothing is listening (every suite): the run is
+    // still queued and the next tick still claims it, so this changes when the
+    // work starts and never whether it happens.
+    contact_sync_wake: Option<crate::scheduler::JobWake>,
 ) -> Router {
     let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
@@ -238,15 +244,19 @@ pub fn create_api_router(
     // secret provider for the tenant's refresh token, the PUBLIC api base
     // because that is the origin GOOGLE returns the browser to, and the SPA
     // origin because that is where the admin is sent afterwards.
-    let contact_sync_service = std::sync::Arc::new(
-        crate::modules::contact_sync::ContactSyncService::new(
-            db.clone(),
-            secrets.clone(),
-            public_api_base_url.clone(),
-            spa_base_url.clone(),
-        )
-        .with_payment_methods(payment_methods_service.clone()),
-    );
+    let mut contact_sync = crate::modules::contact_sync::ContactSyncService::new(
+        db.clone(),
+        secrets.clone(),
+        public_api_base_url.clone(),
+        spa_base_url.clone(),
+    )
+    .with_payment_methods(payment_methods_service.clone());
+    // PMS-1429: only this copy gets the wake. The worker builds its own service
+    // in `main` and is the thing being woken.
+    if let Some(wake) = contact_sync_wake {
+        contact_sync = contact_sync.with_run_wake(wake);
+    }
+    let contact_sync_service = std::sync::Arc::new(contact_sync);
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
     let projects_service = ProjectsService::new(db.clone());
