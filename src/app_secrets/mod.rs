@@ -101,6 +101,37 @@ impl GovernedSecret {
         }
     }
 
+    /// Legal names, for the operator-facing error on an unrecognised value.
+    /// Assembled from [`Self::ALL`] so a new variant cannot be left out of the
+    /// message that lists them.
+    pub fn legal_values() -> String {
+        Self::ALL
+            .iter()
+            .map(|secret| secret.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// A NAME to a governed secret, for the operator surfaces that address one
+    /// by name (PMS-1441's `provider-set`).
+    ///
+    /// Case-insensitive, because the name is an env-style key an operator
+    /// types, and an unrecognised value is a hard error naming the legal ones
+    /// rather than a no-op: a typo that wrote nothing while reporting success
+    /// is the shape this CLI exists to prevent.
+    pub fn parse_name(raw: &str) -> AppResult<Self> {
+        let wanted = raw.trim();
+        Self::ALL
+            .into_iter()
+            .find(|secret| secret.name().eq_ignore_ascii_case(wanted))
+            .ok_or_else(|| {
+                AppError::Configuration(format!(
+                    "{wanted:?} is not a governed application-tier secret; expected one of: {}",
+                    Self::legal_values()
+                ))
+            })
+    }
+
     /// What stops working when no provider holds this secret. Rendered
     /// verbatim by the warn log for the `Missing` case, so it is a complete
     /// sentence rather than a phrase.
@@ -701,6 +732,38 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use AppSecretProviderKind::{Database as Db, Environment as Env, Infisical as Inf};
+
+    /// PMS-1441: a secret NAME round-trips, case does not matter, and an
+    /// unrecognised name is refused with the legal list rather than defaulting
+    /// to a variant.
+    ///
+    /// The last part is the one worth a test. `provider-set` writes whatever
+    /// `parse_name` returns into the declared provider, so a parser that fell
+    /// back to a default would put the Google client secret in the SMTP
+    /// password's row and report success.
+    #[test]
+    fn a_governed_secret_parses_from_its_name() {
+        for secret in GovernedSecret::ALL {
+            assert_eq!(
+                GovernedSecret::parse_name(secret.name()).expect("its own name parses"),
+                secret
+            );
+        }
+        assert_eq!(
+            GovernedSecret::parse_name("  google_contacts_client_id  ")
+                .expect("case and surrounding space do not matter"),
+            GovernedSecret::GoogleContactsClientId
+        );
+        let refused = GovernedSecret::parse_name("GOOGLE_CONTACTS_CLIENT")
+            .expect_err("a prefix of a real name is not a name");
+        let message = refused.to_string();
+        for secret in GovernedSecret::ALL {
+            assert!(
+                message.contains(secret.name()),
+                "the refusal lists every legal name so an operator can fix the typo: {message}"
+            );
+        }
+    }
 
     /// A provider driven from a fixed map, so tests can build any survey by
     /// hand without touching the DB, Infisical or the filesystem.
