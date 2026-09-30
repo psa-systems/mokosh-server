@@ -21,7 +21,7 @@ mod common;
 
 use mokosh_server::modules::contact_sync::OauthClient;
 use mokosh_test::mokosh_test;
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 use sqlx::PgPool;
 
 const CLIENT_PATH: &str = "/api/v1/integrations/contact-sync/google/client";
@@ -218,4 +218,58 @@ async fn the_migration_statement_clears_every_stored_id(pool: PgPool) {
     .await
     .expect("count the enable flag");
     assert_eq!(kept, 1, "the DELETE took a setting it was not aimed at");
+}
+
+/// PMS-1430: a connection made under a client that is no longer in force is
+/// asked to reconnect, and the card says so.
+///
+/// This is the one unavoidable cost of moving the client. Google binds a refresh
+/// token to the application that issued it, so every connection made under a
+/// tenant's own registration is refused against the host client with
+/// `invalid_grant`, and no migration can help: Google does not re-issue a token
+/// to a different client.
+///
+/// What the deployment owes the admin is therefore not a working connection but
+/// an accurate one. `contact_sync::oauth` already classifies `invalid_grant` as
+/// `GrantRevoked` (unit-tested there) and `refresh` already calls
+/// `mark_reconnect_required` on it; what was untested is the half an admin
+/// actually meets, which is that the state reaches the Settings card rather than
+/// sitting in a column. Driven through the connection row rather than through
+/// Google, because the classification is pinned where it happens and standing a
+/// fake token endpoint up here would test reqwest.
+#[mokosh_test]
+async fn a_connection_that_needs_reconnecting_says_so_on_the_card(pool: PgPool) {
+    let (_id, email, password) = common::seed_admin(&pool).await;
+    let tenant = common::DEFAULT_TENANT_ID;
+    sqlx::query(
+        "INSERT INTO contact_sync_connections \
+             (tenant_id, provider, account_email, selected_groups, sync_status) \
+         VALUES ($1, 'google', 'ops@msp.example', '[]'::jsonb, 'reconnect_required')",
+    )
+    .bind(tenant)
+    .execute(&pool)
+    .await
+    .expect("seed a connection made under the old client");
+
+    let app = common::boot_with_google_client(pool, host_client()).await;
+    let token = common::login(&app, &email, &password).await;
+    let body: serde_json::Value = app
+        .client
+        .get(app.url(OVERVIEW_PATH))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("overview")
+        .json()
+        .await
+        .expect("overview json");
+
+    assert_eq!(
+        body["connection"]["sync_status"], "reconnect_required",
+        "the card has to carry the state, or the admin is never told: {body}"
+    );
+    assert_eq!(
+        body["configured"], true,
+        "the host client is fine; it is the tenant's grant that is not: {body}"
+    );
 }
