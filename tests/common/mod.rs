@@ -79,6 +79,11 @@ impl TestApp {
 /// helpers: each integration-test binary compiles its own copy of
 /// `common::` and not every one seeds a company.
 #[allow(dead_code)]
+pub async fn seed_company(pool: &PgPool) -> Uuid {
+    init_tracing();
+    seed_company_named(pool, "Acme Co").await
+}
+
 /// PMS-1312: record that a seeded payment gateway is connected.
 ///
 /// Whether a payment provider is connected for a tenant is `integrations.status`
@@ -122,11 +127,6 @@ pub async fn connect_seeded_gateway(
     .execute(pool)
     .await
     .expect("connect the seeded gateway");
-}
-
-pub async fn seed_company(pool: &PgPool) -> Uuid {
-    init_tracing();
-    seed_company_named(pool, "Acme Co").await
 }
 
 /// `idx_companies_tenant_name_unique` is on `(tenant_id, lower(btrim(name)))`,

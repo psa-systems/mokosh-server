@@ -213,7 +213,7 @@ async fn connecting_on_the_integrations_page_is_what_the_payment_path_serves(poo
     let response = put_gateway(&app, &token, "stripe", false, Some(stripe_config())).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
-        listed_is_active(&app, &token, "stripe").await == false,
+        !listed_is_active(&app, &token, "stripe").await,
         "a saved-but-inactive gateway is still listed, and not as active"
     );
 
