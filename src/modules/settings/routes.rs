@@ -88,6 +88,14 @@ pub fn settings_routes(
         // installation. The pair itself lives in the declared app-secret
         // provider, not in `tenant_settings`, which is why this handler reaches
         // for `app_secrets::current()` rather than for `s.db`.
+        //
+        // No client consumer yet: parity record 2026-09-30. The page is
+        // MAPPS-980 and cannot be written until this response shape exists to
+        // write against, which is the ordering every server-first pair in this
+        // repository has. The route is not dark in the meantime: it is the
+        // documented first-run step (`docs/first-run-onboarding.md`) and an
+        // operator can call it directly, which is more than the CLI needed
+        // before PMS-1441.
         .route(
             "/settings/google-contacts-client",
             get(get_google_client).put(put_google_client),
