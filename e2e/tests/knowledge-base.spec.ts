@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { enableModule } from '../lib/factories';
 import { runSuffix } from '../lib/run';
 
@@ -55,7 +55,7 @@ test.describe('knowledge-base CRUD', () => {
     });
     expect(updArt.status(), `update kb-article failed: ${await updArt.text()}`).toBe(200);
 
-    const listArt = await request.get(`${routes.kbArticles}?per_page=200`);
+    const listArt = await request.get(`${routes.kbArticles}?per_page=${MAX_PER_PAGE}`);
     expect(listArt.status()).toBe(200);
     expect(((await listArt.json()) as { data: Array<{ id: string }> }).data.map((a) => a.id)).toContain(
       article.id,

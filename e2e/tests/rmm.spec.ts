@@ -1,5 +1,5 @@
 import { expect, test } from '../lib/fixtures';
-import { routes } from '../lib/api';
+import { MAX_PER_PAGE, routes } from '../lib/api';
 import { enableModule } from '../lib/factories';
 import { runSuffix } from '../lib/run';
 
@@ -40,7 +40,7 @@ test.describe('RMM CRUD', () => {
     });
     expect(updConn.status(), `update connection failed: ${await updConn.text()}`).toBe(200);
 
-    const listConn = await request.get(`${routes.rmmConnections}?per_page=200`);
+    const listConn = await request.get(`${routes.rmmConnections}?per_page=${MAX_PER_PAGE}`);
     expect(listConn.status()).toBe(200);
     expect(((await listConn.json()) as { data: Array<{ id: string }> }).data.map((c) => c.id)).toContain(
       connection.id,
@@ -55,7 +55,7 @@ test.describe('RMM CRUD', () => {
     const rule = (await createRule.json()) as { id: string };
     expect(rule.id).toBeTruthy();
 
-    const listRules = await request.get(`${routes.rmmAlertRules}?per_page=200`);
+    const listRules = await request.get(`${routes.rmmAlertRules}?per_page=${MAX_PER_PAGE}`);
     expect(listRules.status()).toBe(200);
     expect(((await listRules.json()) as { data: Array<{ id: string }> }).data.map((r) => r.id)).toContain(
       rule.id,
@@ -74,7 +74,7 @@ test.describe('RMM CRUD', () => {
     const mapping = (await createMap.json()) as { id: string };
     expect(mapping.id).toBeTruthy();
 
-    const listMaps = await request.get(`${routes.rmmDeviceMappings}?per_page=200`);
+    const listMaps = await request.get(`${routes.rmmDeviceMappings}?per_page=${MAX_PER_PAGE}`);
     expect(listMaps.status()).toBe(200);
     expect(((await listMaps.json()) as { data: Array<{ id: string }> }).data.map((m) => m.id)).toContain(
       mapping.id,
