@@ -335,7 +335,24 @@ pub fn init_tracing() {
 #[allow(dead_code)]
 pub async fn boot(pool: PgPool) -> TestApp {
     let db = Database::from_pool(pool.clone());
-    boot_with_db(pool, db, None, None).await
+    boot_with_db(pool, db, None, None, None).await
+}
+
+/// PMS-1430: bring up the API on a deployment whose HOST has a Google OAuth
+/// client configured.
+///
+/// The client is no longer a tenant setting a suite can write through the API,
+/// because there is no such route any more: it is a pair of governed
+/// application-tier secrets the startup wiring resolves once. A suite that needs
+/// a connectable deployment therefore states it here, which is also what the
+/// production path does, one layer down.
+#[allow(dead_code)]
+pub async fn boot_with_google_client(
+    pool: PgPool,
+    client: mokosh_server::modules::contact_sync::OauthClient,
+) -> TestApp {
+    let db = Database::from_pool(pool.clone());
+    boot_with_db(pool, db, None, None, Some(client)).await
 }
 
 /// PMS-698: bring up the API with the bunyip Resource-Server verifier mounted,
@@ -346,7 +363,7 @@ pub async fn boot_with_bunyip(
     verifier: mokosh_server::modules::auth::oidc_rs::Verifier,
 ) -> TestApp {
     let db = Database::from_pool(pool.clone());
-    boot_with_db(pool, db, None, Some(verifier)).await
+    boot_with_db(pool, db, None, Some(verifier), None).await
 }
 
 /// PMS-285: bring up the API with the request-serving connection running as an
@@ -363,7 +380,7 @@ pub async fn boot_with_bunyip(
 pub async fn boot_rls(pool: PgPool) -> TestApp {
     let app_pool = build_app_role_pool(&pool).await;
     let db = Database::from_pools(app_pool.clone(), pool.clone());
-    boot_with_db(pool, db, Some(app_pool), None).await
+    boot_with_db(pool, db, Some(app_pool), None, None).await
 }
 
 /// Create a per-test `NOSUPERUSER NOBYPASSRLS` role, grant it the same
@@ -421,6 +438,7 @@ async fn boot_with_db(
     db: Database,
     app_pool: Option<PgPool>,
     bunyip: Option<mokosh_server::modules::auth::oidc_rs::Verifier>,
+    google_client: Option<mokosh_server::modules::contact_sync::OauthClient>,
 ) -> TestApp {
     // PMS-958: the object provider is process-wide and built on first use, so
     // the root has to be chosen before anything in this binary can ask for
@@ -494,6 +512,10 @@ async fn boot_with_db(
         // directly (`execute_run`), which is what it did before the wake
         // existed.
         None,
+        // PMS-1430: the host's Google client. `None` for every suite that does
+        // not care, which reads as a deployment that cannot connect Google
+        // Contacts; `boot_with_google_client` supplies one.
+        google_client,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

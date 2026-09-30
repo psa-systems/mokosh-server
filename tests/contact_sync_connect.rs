@@ -10,14 +10,18 @@ mod common;
 
 use mokosh_test::mokosh_test;
 use reqwest::StatusCode;
-use serde_json::{json, Value};
+use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// The integration is unconfigured in the test environment (no
-/// `GOOGLE_CONTACTS_CLIENT_ID`), which is itself the first thing worth
-/// pinning: an operator who has not set the client gets told so, not a Google
-/// error page.
+/// The host has no Google client in the test environment, which is itself the
+/// first thing worth pinning: a tenant on a deployment whose operator has not
+/// configured one gets told so, not a Google error page.
+///
+/// PMS-1430: the refusal is addressed to somebody who cannot fix it. The client
+/// is the host's, so a tenant admin is told the deployment cannot connect rather
+/// than being sent to the Google Cloud console for a credential that is not
+/// theirs to create.
 #[mokosh_test]
 async fn an_unconfigured_deployment_says_so_rather_than_offering_a_broken_connect(pool: PgPool) {
     let (_id, email, password) = common::seed_admin(&pool).await;
@@ -38,8 +42,12 @@ async fn an_unconfigured_deployment_says_so_rather_than_offering_a_broken_connec
     );
     let body = resp.text().await.unwrap_or_default();
     assert!(
-        body.contains("not configured"),
+        body.contains("not available on this deployment"),
         "the refusal should name the cause: {body}"
+    );
+    assert!(
+        !body.contains("Google Cloud"),
+        "a tenant admin cannot register the host's client, so do not send them there: {body}"
     );
 }
 
@@ -276,224 +284,4 @@ async fn reconnecting_the_same_account_keeps_the_connection(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(connections, 1);
-}
-
-/// PMS-1264: the deployment's Google client set in the app, by an admin of
-/// the system tenant. The secret goes to the secret provider and never comes
-/// back; the connect flow uses the stored client; clearing it falls back to
-/// env (unset here, so "not configured").
-#[mokosh_test]
-async fn the_google_client_is_set_in_the_app_and_the_secret_never_returns(pool: PgPool) {
-    let (_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-    let client_path = "/api/v1/integrations/contact-sync/google/client";
-    let put = |body: Value| {
-        let app = &app;
-        let token = &token;
-        async move {
-            let resp = app
-                .client
-                .put(app.url(client_path))
-                .bearer_auth(token)
-                .json(&body)
-                .send()
-                .await
-                .expect("put client");
-            let status = resp.status();
-            (status, resp.json::<Value>().await.unwrap_or(Value::Null))
-        }
-    };
-    let get = |path: &'static str| {
-        let app = &app;
-        let token = &token;
-        async move {
-            app.client
-                .get(app.url(path))
-                .bearer_auth(token)
-                .send()
-                .await
-                .expect("get")
-                .json::<Value>()
-                .await
-                .expect("json")
-        }
-    };
-
-    let empty = get(client_path).await;
-    assert_eq!(empty["source"], "none", "{empty}");
-    assert_eq!(empty["secret_set"], false);
-    assert_eq!(
-        empty["redirect_uri"], "http://api.localhost/api/v1/public/contact-sync/google/callback",
-        "the form shows what to register in the Google Cloud console"
-    );
-    let overview = get("/api/v1/integrations/contact-sync").await;
-    assert_eq!(overview["client_editable"], true);
-    assert_eq!(overview["configured"], false);
-
-    let id = "1234-abc.apps.googleusercontent.com";
-    let (status, _) = put(json!({ "client_id": id })).await;
-    assert_eq!(
-        status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "an id needs its secret"
-    );
-    let (status, _) = put(json!({ "client_id": "not-a-client", "client_secret": "s3cret" })).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-
-    let (status, saved) = put(json!({ "client_id": id, "client_secret": "GOCSPX-s3cret" })).await;
-    assert_eq!(status, StatusCode::OK, "{saved}");
-    assert_eq!(
-        (
-            saved["source"].as_str(),
-            saved["client_id"].as_str(),
-            saved["secret_set"].as_bool()
-        ),
-        // PMS-1340 split `database` in two. `seed_admin` is in the DEFAULT
-        // tenant, which is the system tenant, so what it writes IS the
-        // deployment-wide value and reads back as `deployment`.
-        (Some("deployment"), Some(id), Some(true))
-    );
-    assert!(
-        !saved.to_string().contains("GOCSPX"),
-        "the secret never returns: {saved}"
-    );
-    let stored_plain: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM tenant_settings WHERE value::text LIKE '%GOCSPX%'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(stored_plain, 0, "the secret is not a tenant setting");
-    assert_eq!(
-        get("/api/v1/integrations/contact-sync").await["configured"],
-        true
-    );
-
-    // The connect flow now uses the stored client.
-    let resp = app
-        .client
-        .post(app.url("/api/v1/integrations/contact-sync/google/authorize"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("authorize");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = resp.json().await.unwrap();
-    assert!(
-        body["authorize_url"].as_str().unwrap().contains(id),
-        "{body}"
-    );
-
-    // Keep the secret while renaming nothing; then clear back to env.
-    let (status, kept) = put(json!({})).await;
-    assert_eq!(
-        (status, kept["source"].as_str()),
-        (StatusCode::OK, Some("deployment"))
-    );
-    let (status, cleared) = put(json!({ "client_id": "" })).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(cleared["source"], "none", "{cleared}");
-    assert_eq!(
-        cleared["secret_set"], false,
-        "clearing the id clears its secret"
-    );
-    assert_eq!(
-        get("/api/v1/integrations/contact-sync").await["configured"],
-        false
-    );
-    let audited: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM audit_log WHERE new_values->>'event' = 'contact_sync.client_changed' \
-         AND new_values::text NOT LIKE '%GOCSPX%'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(audited, 3, "every change is audited, without the secret");
-}
-
-/// PMS-1340 reversed this test's rule, on purpose, and it is worth reading why
-/// rather than treating the change as a loosened gate.
-///
-/// PMS-1264 refused every tenant but the system one, because the client was the
-/// deployment's: "an admin of any other organisation cannot read or swap the
-/// client every tenant on the deployment connects through". PMS-1340 made the
-/// credential per tenant, so there is no longer a client every other tenant
-/// connects through, and an admin editing theirs changes only what their own
-/// organisation connects as - the same authority they already hold over their own
-/// payment gateway credentials.
-///
-/// What must still hold is that they reach their OWN and nobody else's, which is
-/// what this now asserts, and `tests/contact_sync_client_per_tenant.rs` covers
-/// the isolation and the fallback ladder in full.
-#[mokosh_test]
-async fn a_tenant_admin_configures_their_own_google_client(pool: PgPool) {
-    let (_tenant, _user, email, password) =
-        common::seed_tenant_with_admin(&pool, "customer-msp").await;
-    let app = common::boot(pool.clone()).await;
-    let login: Value = app
-        .client
-        .post(app.url("/api/v1/auth/login"))
-        .json(&json!({ "email": email, "password": password, "tenant_slug": "customer-msp" }))
-        .send()
-        .await
-        .expect("login")
-        .json()
-        .await
-        .expect("login json");
-    let token = login["access_token"]
-        .as_str()
-        .expect("an admin of the customer tenant signs in")
-        .to_string();
-    let path = "/api/v1/integrations/contact-sync/google/client";
-
-    let get = app
-        .client
-        .get(app.url(path))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        get.status(),
-        StatusCode::OK,
-        "an admin reads their own organisation's client"
-    );
-    let put = app
-        .client
-        .put(app.url(path))
-        .bearer_auth(&token)
-        .json(&json!({ "client_id": "1-x.apps.googleusercontent.com", "client_secret": "s" }))
-        .send()
-        .await
-        .unwrap();
-    assert!(put.status().is_success(), "and writes it: {}", put.status());
-    let saved: Value = app
-        .client
-        .get(app.url(path))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        saved["source"], "tenant",
-        "what it wrote is its own, not the deployment's: {saved}"
-    );
-    let overview: Value = app
-        .client
-        .get(app.url("/api/v1/integrations/contact-sync"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        overview["client_editable"], true,
-        "the card offers the form to an admin of this tenant"
-    );
 }
