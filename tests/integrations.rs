@@ -18,9 +18,13 @@ use sqlx::PgPool;
 /// Xero is managed by this subsystem (`ConnectionHome::Integrations`), so it is
 /// the provider every write path is exercised through.
 const MANAGED_HERE: &str = "xero";
-/// Stripe's connection still lives in `payment_gateway_configs` until PMS-1312
-/// moves it, so it is the provider every refusal is exercised through.
-const MANAGED_ELSEWHERE: &str = "stripe";
+/// Google's connection still lives in `contact_sync_connections` until PMS-1315
+/// moves it, so it is the provider every refusal is exercised through. It was
+/// Stripe until PMS-1312 brought the payment providers over, and the refusal has
+/// to keep being exercised against whichever provider is still outside: the
+/// message is what an operator gets back, and there is nothing else that tells
+/// them where to go instead.
+const MANAGED_ELSEWHERE: &str = "google";
 
 async fn list(app: &common::TestApp, token: &str) -> Vec<Value> {
     let response = app
@@ -144,17 +148,25 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
         "the poll default PMS-1310 settled on"
     );
 
-    // Stripe is listed, but the page is told where it is actually configured
+    // Google is listed, but the page is told where it is actually configured
     // rather than being offered a Connect button that would 409.
-    let stripe = entry(&entries, MANAGED_ELSEWHERE);
+    let elsewhere = entry(&entries, MANAGED_ELSEWHERE);
     assert_eq!(
-        stripe["managed_elsewhere"]["table"],
-        "payment_gateway_configs"
+        elsewhere["managed_elsewhere"]["table"],
+        "contact_sync_connections"
     );
-    assert_eq!(stripe["managed_elsewhere"]["issue"], "PMS-1312");
+    assert_eq!(elsewhere["managed_elsewhere"]["issue"], "PMS-1315");
     assert!(
         xero.get("managed_elsewhere").is_none(),
         "a provider managed here says nothing about being managed elsewhere: {xero}"
+    );
+    // PMS-1312: Stripe is no longer one of them. Its connection came over, so
+    // the page must stop pointing at the payments settings for the connected
+    // fact even though the credential is still entered there.
+    let stripe = entry(&entries, "stripe");
+    assert!(
+        stripe.get("managed_elsewhere").is_none(),
+        "Stripe's connection home moved to integrations under PMS-1312: {stripe}"
     );
 }
 
@@ -219,8 +231,8 @@ async fn a_capability_the_provider_does_not_support_is_refused(pool: PgPool) {
     );
 }
 
-/// The guard that keeps one connection in one place while PMS-1312 is
-/// outstanding. A 409 rather than a 404, because Stripe exists and is listed;
+/// The guard that keeps one connection in one place while PMS-1315 is
+/// outstanding. A 409 rather than a 404, because Google exists and is listed;
 /// what is wrong is that this is the wrong surface for it.
 #[mokosh_test]
 async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
@@ -232,14 +244,14 @@ async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
         &app,
         &token,
         MANAGED_ELSEWHERE,
-        json!({ "credential": "sk_test_x" }),
+        json!({ "credential": "refresh-token-x" }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let body: Value = response.json().await.expect("refusal json");
     let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("Payment gateways"), "{message}");
-    assert!(message.contains("PMS-1312"), "{message}");
+    assert!(message.contains("Contact sync"), "{message}");
+    assert!(message.contains("PMS-1315"), "{message}");
 
     assert_eq!(
         row_count(&pool, MANAGED_ELSEWHERE).await,

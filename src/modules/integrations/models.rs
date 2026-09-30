@@ -183,8 +183,17 @@ pub struct UpdateIntegrationRequest {
 /// learning any of them.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct ConnectIntegrationRequest {
+    /// The credential to store, for a provider whose
+    /// [`CredentialHome`](super::registry::CredentialHome) is this surface.
+    ///
+    /// Optional because PMS-1312 made whether one is needed a property of the
+    /// provider: a payment gateway's key, webhook secret and per-provider
+    /// settings are entered under Settings > Payment gateways, so `connect` here
+    /// refuses a credential rather than writing one to an address nothing reads.
+    /// A provider that does need one is refused without it, so the requirement
+    /// did not become optional, only per provider.
     #[validate(length(min = 1, max = 8192))]
-    pub credential: String,
+    pub credential: Option<String>,
     /// Omitted means every capability the provider supports, because an
     /// operator who connects an integration and is asked nothing else expects
     /// it to work. Present and empty means connected and delegated nothing.

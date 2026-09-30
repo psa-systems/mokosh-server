@@ -85,6 +85,10 @@ async fn seed_stripe_gateway(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("seed stripe gateway");
+    // PMS-1312: the connected fact is `integrations.status` now, so a seeded
+    // gateway needs the row that makes it connected, the way migration 256 gave
+    // one to every gateway a deployment already had.
+    common::connect_seeded_gateway(pool, common::DEFAULT_TENANT_ID, "stripe", true).await;
 }
 
 async fn seed_paypal_gateway(pool: &PgPool) {
@@ -104,6 +108,7 @@ async fn seed_paypal_gateway(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("seed paypal gateway");
+    common::connect_seeded_gateway(pool, common::DEFAULT_TENANT_ID, "paypal", true).await;
 }
 
 /// Same shape as `seed_payment_method` but with an explicit `created_at`,
