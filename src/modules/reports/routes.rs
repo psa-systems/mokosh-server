@@ -506,7 +506,7 @@ async fn emit<T>(
 fn csv_for_dashboard(r: &DashboardResponse) -> String {
     let mut s = String::from("priority,open_count\n");
     for b in &r.open_by_priority {
-        s.push_str(&format!("{},{}\n", b.label, b.count));
+        s.push_str(&format!("{},{}\n", custom::csv_cell(&b.label), b.count));
     }
     s.push_str(&format!("\nsla_warnings,{}\n", r.sla_warnings));
     s.push_str(&format!("sla_breached,{}\n", r.sla_breached));
@@ -520,7 +520,7 @@ fn csv_for_dashboard(r: &DashboardResponse) -> String {
 fn csv_for_tickets(r: &TicketsReportResponse) -> String {
     let mut s = format!("from,to\n{},{}\n\nstatus,opened\n", r.from, r.to);
     for b in &r.opened_by_status {
-        s.push_str(&format!("{},{}\n", b.label, b.count));
+        s.push_str(&format!("{},{}\n", custom::csv_cell(&b.label), b.count));
     }
     s.push_str(&format!(
         "\nclosed_total,{}\n\nassignee_id,opened\n",
@@ -582,7 +582,7 @@ fn csv_for_billing(r: &BillingReportResponse) -> String {
     s.push_str(&format!("outstanding,{}\n", r.outstanding));
     s.push_str("\nbucket,total\n");
     for b in &r.aging {
-        s.push_str(&format!("{},{}\n", b.bucket, b.total));
+        s.push_str(&format!("{},{}\n", custom::csv_cell(&b.bucket), b.total));
     }
     s
 }
@@ -590,7 +590,7 @@ fn csv_for_billing(r: &BillingReportResponse) -> String {
 fn csv_for_projects(r: &ProjectsReportResponse) -> String {
     let mut s = String::from("status,count\n");
     for b in &r.by_status {
-        s.push_str(&format!("{},{}\n", b.label, b.count));
+        s.push_str(&format!("{},{}\n", custom::csv_cell(&b.label), b.count));
     }
     s.push_str("\nmetric,value\n");
     s.push_str(&format!("budget_hours,{}\n", r.budget_hours));
@@ -619,11 +619,11 @@ fn csv_for_clients(r: &ClientsReportResponse) -> String {
     ));
     s.push_str("\nasset_type,count\n");
     for b in &r.assets_by_type {
-        s.push_str(&format!("{},{}\n", b.label, b.count));
+        s.push_str(&format!("{},{}\n", custom::csv_cell(&b.label), b.count));
     }
     s.push_str("\nasset_status,count\n");
     for b in &r.assets_by_status {
-        s.push_str(&format!("{},{}\n", b.label, b.count));
+        s.push_str(&format!("{},{}\n", custom::csv_cell(&b.label), b.count));
     }
     s
 }
@@ -699,11 +699,6 @@ fn pdf_for_tickets(r: &TicketsReportResponse, title: &str) -> pdf::Document {
 }
 
 fn pdf_for_time(r: &TimeReportResponse, title: &str) -> pdf::Document {
-    let by_id = |rows: &[IdCount]| -> Vec<Vec<String>> {
-        rows.iter()
-            .map(|i| vec![i.id.to_string(), i.count.to_string()])
-            .collect()
-    };
     pdf::Document::new(title)
         .subtitle(format!("{} to {}", r.from, r.to))
         .table(
@@ -717,7 +712,10 @@ fn pdf_for_time(r: &TimeReportResponse, title: &str) -> pdf::Document {
         .table(
             "Minutes by work type",
             vec!["Work type".into(), "Minutes".into()],
-            by_id(&r.minutes_by_work_type),
+            r.minutes_by_work_type
+                .iter()
+                .map(|i| vec![i.name.clone(), i.count.to_string()])
+                .collect(),
         )
 }
 
@@ -757,6 +755,10 @@ fn pdf_for_request_types(r: &RequestTypeDurationsResponse, title: &str) -> pdf::
 
 fn pdf_for_billing(r: &BillingReportResponse, title: &str) -> pdf::Document {
     pdf::Document::new(title)
+        .subtitle(match &r.company_name {
+            Some(name) => name.clone(),
+            None => "All clients".to_string(),
+        })
         .fields(
             "Totals",
             vec![
@@ -844,6 +846,7 @@ async fn request_types_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
 
     /// PMS-839: the exhaustive match in `export_report` only gates a new
     /// registry entry if that entry needs a new `ReportKind`. Reusing a
@@ -887,5 +890,62 @@ mod tests {
                 "descriptor {entry}"
             );
         }
+    }
+
+    /// PMS-1418: every CSV exporter routes a free-text label through
+    /// `custom::csv_cell`, so a label containing a comma or a quote survives
+    /// the round trip quoted rather than corrupting the row it sits in.
+    #[test]
+    fn csv_exporters_quote_a_label_containing_a_comma_or_quote() {
+        let label = |s: &str| Bucket {
+            label: s.to_string(),
+            count: 1,
+        };
+
+        let dashboard = DashboardResponse {
+            open_by_priority: vec![label("Urgent, escalated")],
+            sla_warnings: 0,
+            sla_breached: 0,
+            ticket_trend_30d: vec![],
+        };
+        assert!(csv_for_dashboard(&dashboard).contains("\"Urgent, escalated\",1\n"));
+
+        let billing = BillingReportResponse {
+            invoiced: Decimal::ZERO,
+            paid: Decimal::ZERO,
+            outstanding: Decimal::ZERO,
+            aging: vec![AgingBucket {
+                bucket: "31-60\" days".to_string(),
+                total: Decimal::ZERO,
+            }],
+            company_name: None,
+        };
+        assert!(csv_for_billing(&billing).contains("\"31-60\"\" days\",0\n"));
+
+        let clients = ClientsReportResponse {
+            companies_total: 0,
+            companies_active: 0,
+            assets_total: 0,
+            assets_by_type: vec![label("Laptop, desktop")],
+            assets_by_status: vec![label("In repair, pending parts")],
+            warranty_expiring_90d: 0,
+            contracts_active: 0,
+            contracts_renewing_90d: 0,
+        };
+        let clients_csv = csv_for_clients(&clients);
+        assert!(clients_csv.contains("\"Laptop, desktop\",1\n"));
+        assert!(clients_csv.contains("\"In repair, pending parts\",1\n"));
+
+        let projects = ProjectsReportResponse {
+            by_status: vec![label("On hold, awaiting client")],
+            budget_hours: Decimal::ZERO,
+            budget_amount: Decimal::ZERO,
+            actual_hours: Decimal::ZERO,
+            actual_amount: Decimal::ZERO,
+            tasks_total: 0,
+            tasks_completed: 0,
+            overdue: 0,
+        };
+        assert!(csv_for_projects(&projects).contains("\"On hold, awaiting client\",1\n"));
     }
 }

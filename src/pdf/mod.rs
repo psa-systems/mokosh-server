@@ -834,6 +834,16 @@ fn render_sync(document: &Document, generated_on: NaiveDate) -> AppResult<Vec<u8
         // Whichever of the two blocks is taller decides where the body starts.
         layout.y_mm = layout.y_mm.min(title_top - logo_height);
     }
+    // Every document states when it was made, in the same place regardless of
+    // whether its own subtitle names a period or a scope: right under the
+    // title block, before the first section. One caller (`render_sync`
+    // itself) rather than each report writer, so a document cannot ship with
+    // no generated-on line the way four of the seven reports did.
+    layout.line(
+        &format!("Generated {generated_on}"),
+        Weight::Regular,
+        theme.body_pt,
+    );
     layout.gap(theme.gap_mm);
 
     for section in &document.sections {
