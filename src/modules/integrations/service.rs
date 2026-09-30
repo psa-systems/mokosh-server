@@ -814,21 +814,28 @@ mod tests {
         assert!(error.to_string().contains("more than once"), "{error}");
     }
 
-    /// The guard that keeps one connection in one place while PMS-1312 and
-    /// PMS-1315 are outstanding.
+    /// The guard that keeps one connection in one place while PMS-1315 is
+    /// outstanding.
+    ///
+    /// Google, because PMS-1312 brought the payment providers over. The guard is
+    /// exercised against whichever provider is still outside rather than deleted
+    /// with the last one that was: the message is what an operator gets back, and
+    /// it is the only thing that tells them where to go instead.
     #[test]
     fn a_provider_managed_elsewhere_is_refused_and_says_where() {
-        let error = assert_managed_here(registry::descriptor(IntegrationProvider::Stripe))
-            .expect_err("Stripe is still payment_gateway_configs");
+        let error = assert_managed_here(registry::descriptor(IntegrationProvider::Google))
+            .expect_err("Google is still contact_sync_connections");
         let message = error.to_string();
-        assert!(message.contains("Payment gateways"), "{message}");
-        assert!(message.contains("payment_gateway_configs"), "{message}");
+        assert!(message.contains("Contact sync"), "{message}");
+        assert!(message.contains("contact_sync_connections"), "{message}");
         assert!(
-            message.contains("PMS-1312"),
+            message.contains("PMS-1315"),
             "the refusal names the issue that moves it: {message}"
         );
 
         assert_managed_here(xero()).expect("Xero is managed here");
+        assert_managed_here(registry::descriptor(IntegrationProvider::Stripe))
+            .expect("PMS-1312 moved Stripe's connection here");
     }
 
     /// A poll interval on a provider nothing polls is a setting that would be
