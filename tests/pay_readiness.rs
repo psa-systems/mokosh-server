@@ -201,6 +201,10 @@ async fn seed_stripe_gateway(pool: &PgPool, tenant_id: Uuid) {
     .execute(pool)
     .await
     .expect("seed stripe gateway");
+    // PMS-1312: the connected fact is `integrations.status` now, so a seeded
+    // gateway needs the row that makes it connected, the way migration 256 gave
+    // one to every gateway a deployment already had.
+    common::connect_seeded_gateway(pool, tenant_id, "stripe", true).await;
 }
 
 /// MAPPS-671: set the admin override on the tenant's active Stripe row.

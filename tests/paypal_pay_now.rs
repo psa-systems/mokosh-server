@@ -133,6 +133,10 @@ async fn seed_paypal_gateway(pool: &sqlx::PgPool) {
     .execute(pool)
     .await
     .expect("seed paypal gateway");
+    // PMS-1312: the connected fact is `integrations.status` now, so a seeded
+    // gateway needs the row that makes it connected, the way migration 256 gave
+    // one to every gateway a deployment already had.
+    common::connect_seeded_gateway(pool, DEFAULT_TENANT_ID, "paypal", true).await;
 }
 
 async fn seed_sent_invoice(pool: &sqlx::PgPool, company_id: Uuid, total: Decimal) -> Uuid {

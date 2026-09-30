@@ -66,6 +66,10 @@ async fn seed_gateway(pool: &PgPool, provider: &str, is_active: bool) {
     .execute(pool)
     .await
     .expect("seed gateway");
+    // PMS-1312: the connected fact is `integrations.status` now, so a seeded
+    // gateway needs the row that makes it connected, the way migration 256 gave
+    // one to every gateway a deployment already had.
+    common::connect_seeded_gateway(pool, common::DEFAULT_TENANT_ID, provider, is_active).await;
 }
 
 async fn put_gateway(

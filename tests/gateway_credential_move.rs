@@ -105,6 +105,10 @@ async fn seed_legacy_gateway(pool: &PgPool, tenant_id: Uuid, provider: &str, sec
     .execute(pool)
     .await
     .expect("seed gateway");
+    // PMS-1312: the connected fact is `integrations.status` now, so a seeded
+    // gateway needs the row that makes it connected, the way migration 256 gave
+    // one to every gateway a deployment already had.
+    common::connect_seeded_gateway(pool, tenant_id, provider, true).await;
 }
 
 async fn column_for(pool: &PgPool, tenant_id: Uuid, provider: &str) -> Option<String> {
