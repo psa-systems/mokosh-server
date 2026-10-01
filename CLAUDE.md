@@ -214,6 +214,7 @@ One line per rule, linking its full text. A new convention adds its text under `
 - Release image caches dependencies in their own layer ([PMS-781](docs/invariants/ci-release.md#image-layers-pms-781))
 - A config read needs registry, `.env.example` and compose entries ([PMS-836](docs/invariants/ci-release.md#env-parity-pms-836))
 - Two migrations cannot share a version ([PMS-965](docs/invariants/ci-release.md#migration-versions-pms-965))
+- A red integration run blocks the merge ([PMS-1426](docs/invariants/ci-release.md#integration-required-pms-1426))
 - `just create-release` opens the release PR ([details](docs/invariants/ci-release.md#releases))
 - A database test is `#[mokosh_test]` ([PMS-1254](docs/invariants/ci-release.md#test-databases-pms-1254))
 - The SPA repository is `mokosh-apps` ([PMS-856](docs/invariants/ci-release.md#client-repo-pms-856))

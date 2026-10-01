@@ -64,16 +64,43 @@ fail-fast = false
 period = "60s"
 terminate-after = 3
 
-# The p99 assertion in this test measures /health latency against a 30ms
-# bound while 15 concurrent logins run; under the shared 12-thread budget
-# above it contends with up to 11 other DB-heavy cases, so a loaded runner
-# can push its wall-clock p99 past the bound with no code regression (PMS-1283,
-# observed in PR #837 #824 #839 #843 #844 #846). Reserving the whole
-# test-thread budget for it means its p99 measures the code and not its
-# neighbours; the bound and the test body stay unchanged.
+# PMS-1426: the two cases whose verdict is a WALL CLOCK, retried.
+#
+# Between PMS-1398 and PMS-1426 the integration job failed 10 of 64
+# pull-request runs, and all 10 were these two tests: 9 the /health p99 and 1
+# the open-transaction age. Not one was a real assertion failure, and not one
+# was on a change that could have affected the thing measured. That is the
+# whole flake budget of this suite, which is why it is addressed here rather
+# than by leaving the job advisory.
+#
+# Each test was fixed first, because a retry hides a weak assertion as happily
+# as it absorbs a slow machine: the p99 bound is now relative to the same
+# machine's idle baseline instead of a fixed 30ms, and the transaction-age
+# threshold moved to 400ms, half of the 500ms relay latency it has to
+# discriminate against. The retry is the second line, for the residue that
+# cannot be designed out: both numbers are measured on a runner shared with
+# `check.yml` and `e2e.yml`, and no assertion can tell "this machine is busy"
+# from "this code got slower" when the two produce the same figure.
+#
+# Retries cannot hide a real regression. Both failures are DETERMINISTIC when
+# the code is wrong: removing the `spawn_blocking` wrap puts the p99 at ~129ms
+# on every attempt, and a transaction genuinely held across the relay is
+# observed at 500ms or more on every attempt. What a retry absorbs is the
+# single-attempt case where a neighbour's load landed inside a 300ms
+# measurement window, and nextest reports that as FLAKY rather than silently,
+# so a test that starts needing its retries is visible in the job output.
+#
+# PMS-1283's thread reservation stays on the p99 case. It was the right idea
+# and it is not sufficient: it governs nextest's own concurrency and says
+# nothing about the other workflows on the runner.
 [[profile.ci.overrides]]
 filter = 'test(health_p99_does_not_regress_under_concurrent_argon2_burst)'
 threads-required = "num-test-threads"
+retries = 2
+
+[[profile.ci.overrides]]
+filter = 'test(a_tick_sends_with_no_transaction_open)'
+retries = 2
 
 # PMS-1394: the complement of `ci`, run weekly by
 # `integration-unsupported.yml` and locally by
