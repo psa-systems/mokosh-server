@@ -258,6 +258,35 @@ One binary, two shapes, selected by `MOKOSH_DEPLOYMENT_MODE`:
 The profile supplies defaults only. Explicit configuration overrides it per kind, and the status report shows both
 the active profile and every deviation from it.
 
+### What the hosted deployments actually declare (PMS-1440)
+
+`saas` is not a synonym for "the managed services". Its default for `ProviderKind::Secrets` is the DATABASE, and
+`SECRET_BACKEND` is unset on both hosted deployments, so both serve their application-tier and tenant-tier secrets
+from Postgres, encrypted under `ENCRYPTION_KEY`. Neither serves them from Infisical.
+
+Both boxes do carry the full `INFISICAL_*` set in their SOPS compose secrets, which is construction input, not
+selection. The providers are therefore BUILT, surveyed at boot, and never asked for a value. An Infisical reachable
+from the process and read by nothing is the shape most likely to mislead a reader, which is the whole reason this
+section exists.
+
+The consequence is not cosmetic. A governed secret present in a built provider and absent from the declared one is
+`Classification::Misplaced`, which `app_secrets::enforce` makes a fatal boot. So writing an application-tier secret
+into Infisical `/app` on either deployment takes it down at the next restart, with an error naming Infisical. That
+nearly happened while landing PMS-1430, whose own title says the Google client is "served by the secret provider
+from Infisical": it is served through the SEAM, and on these deployments the seam answers from Postgres.
+
+Two rules follow, and both are enforceable rather than advisory:
+
+- Read the declared provider rather than inferring it. `mokosh-server provider-status --text` names it in its first
+  line and works on a box whose app is down, since it is a one-off container.
+- Write through `mokosh-server provider-set` (PMS-1441) or the Settings page (PMS-1444). Both write to the declared
+  provider and refuse rather than fall back, which is what makes them safe to run without first checking.
+
+Whether the hosted deployment SHOULD declare Infisical is open. It is not a flag flip: `SECRET_BACKEND` selects both
+tiers at once by design, `provider-migrate` moves the application tier only, and tenant secrets in Postgres include
+every TOTP secret (PMS-1055) and every contact-sync refresh token, so flipping it with those unmigrated makes them
+unreadable. BUNYIP-855 is the design discussion, and a tenant-tier migrator is the missing piece.
+
 ## Authentication, and what its modes are called
 
 Two providers, not three, and the naming is worth stating because the same deployment shape has been asked for under
