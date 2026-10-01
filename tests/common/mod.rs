@@ -512,10 +512,46 @@ async fn boot_with_db(
         // directly (`execute_run`), which is what it did before the wake
         // existed.
         None,
-        // PMS-1430: the host's Google client. `None` for every suite that does
-        // not care, which reads as a deployment that cannot connect Google
-        // Contacts; `boot_with_google_client` supplies one.
-        google_client,
+        // PMS-1430: the host's Google client, behind the handle PMS-1444 made
+        // swappable. `None` for every suite that does not care, which reads as
+        // a deployment that cannot connect Google Contacts;
+        // `boot_with_google_client` supplies one. Built here rather than taken
+        // as a parameter because a suite that wants to observe a swap does it
+        // the way a person would, through the API, not by holding the handle.
+        std::sync::Arc::new(
+            mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
+        ),
+        // PMS-1444: application-tier secrets over THIS suite's database, which
+        // is what lets the deployment-wide Google client handler be exercised
+        // per test. `app_secrets::current()` would be the wrong answer here: it
+        // is a process-global `OnceLock`, so every test in a binary would share
+        // whichever database happened to initialise it first.
+        //
+        // A load failure is not a harness failure. `readiness` boots an app on
+        // a CLOSED pool on purpose, and a provider that could not be built is a
+        // real boot state the serving path models as an empty slot, so the
+        // harness models it the same way rather than panicking.
+        {
+            let key = [0u8; 32];
+            match mokosh_server::app_secrets::DatabaseProvider::load(
+                &Database::from_pool(pool.clone()),
+                key,
+            )
+            .await
+            {
+                Ok(provider) => {
+                    std::sync::Arc::new(mokosh_server::app_secrets::AppSecrets::with_provider(
+                        mokosh_server::app_secrets::AppSecretProviderKind::Database,
+                        std::sync::Arc::new(provider),
+                    ))
+                }
+                Err(_) => {
+                    std::sync::Arc::new(mokosh_server::app_secrets::AppSecrets::without_provider(
+                        mokosh_server::app_secrets::AppSecretProviderKind::Database,
+                    ))
+                }
+            }
+        },
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

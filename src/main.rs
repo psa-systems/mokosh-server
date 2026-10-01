@@ -646,6 +646,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // PMS-1444: ONE handle, shared by the router's service, the worker's
+    // service and the settings write path. A deployment operator setting the
+    // pair from Settings swaps this, so the next Connect and the next token
+    // refresh use it without a restart, the way PMS-638 already swaps the live
+    // mailer. Separate values per service would have made the write take effect
+    // in the API and not in the worker, which is the worst of the three
+    // outcomes.
+    let google_client = std::sync::Arc::new(
+        mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
+    );
+    // PMS-1444: the router's deployment-wide Google client handler writes
+    // through these. `init_from_env` above installed them, so `current()` is
+    // Some; the error path exists because an `expect` in `main` would be a
+    // panic with no sentence for an operator.
+    let app_secrets = mokosh_server::app_secrets::current().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the application-tier secret providers were not installed, so no deployment-wide \
+             secret can be read or written"
+        )
+    })?;
 
     // PMS-789: load the deployment's product name into the process cache
     // before anything can render it. Warn-and-continue rather than hard-fail:
@@ -1146,6 +1166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secrets.clone(),
         Some(contact_sync_wake),
         google_client,
+        app_secrets,
     );
     let router = psa_router;
 

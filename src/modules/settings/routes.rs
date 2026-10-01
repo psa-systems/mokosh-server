@@ -29,6 +29,11 @@ pub struct SettingsRouterState {
     pub db: Database,
     pub enc_key: [u8; 32],
     pub shared_mailer: Arc<SharedMailer>,
+    // PMS-1444: the live Google client handle, swapped after a write so the
+    // setting takes effect without a restart, exactly as `shared_mailer` is.
+    pub google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    // PMS-1444: the providers the Google client is read from and written to.
+    pub app_secrets: Arc<crate::app_secrets::AppSecrets>,
 }
 
 pub fn settings_routes(
@@ -36,12 +41,16 @@ pub fn settings_routes(
     db: Database,
     enc_key: [u8; 32],
     shared_mailer: Arc<SharedMailer>,
+    google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    app_secrets: Arc<crate::app_secrets::AppSecrets>,
 ) -> Router {
     let state = SettingsRouterState {
         service,
         db,
         enc_key,
         shared_mailer,
+        google_client,
+        app_secrets,
     };
     Router::new()
         // PMS-115 tenant settings list (paginated across categories).
@@ -73,6 +82,24 @@ pub fn settings_routes(
         // send. Behind RequireAdmin; SMTP issues a NOOP against the relay and
         // returns the failure verbatim, LogMailer's verify is trivially Ok.
         .route("/settings/email/verify", post(post_email_verify))
+        // PMS-1444: the host's Google OAuth client. Literal, before the generic
+        // `/settings/{category}` matcher, and deployment-wide like email and
+        // app-name rather than a tenant setting: one Google application per
+        // installation. The pair itself lives in the declared app-secret
+        // provider, not in `tenant_settings`, which is why this handler reaches
+        // for `app_secrets::current()` rather than for `s.db`.
+        //
+        // No client consumer yet: parity record 2026-09-30. The page is
+        // MAPPS-980 and cannot be written until this response shape exists to
+        // write against, which is the ordering every server-first pair in this
+        // repository has. The route is not dark in the meantime: it is the
+        // documented first-run step (`docs/first-run-onboarding.md`) and an
+        // operator can call it directly, which is more than the CLI needed
+        // before PMS-1441.
+        .route(
+            "/settings/google-contacts-client",
+            get(get_google_client).put(put_google_client),
+        )
         // PMS-789: the deployment-wide product name. Literal, so it is matched
         // before the generic `/settings/{category}` below - which writes the
         // CALLER's tenant and is therefore not a way to set a system value.
@@ -112,6 +139,36 @@ async fn put_email(
 ) -> AppResult<Json<super::email::EmailSettingsView>> {
     let view = super::email::put_email_settings(&s.db, &s.enc_key, input).await?;
     super::email::rebuild_and_swap(&s.db, &s.enc_key, &s.shared_mailer).await?;
+    Ok(Json(view))
+}
+
+/// PMS-1444: whether this deployment's Google client is set, and where it
+/// lives. Never either half of it, not even the id.
+async fn get_google_client(
+    State(s): State<SettingsRouterState>,
+    _operator: DeploymentOperator,
+) -> AppResult<Json<super::google_client::GoogleClientView>> {
+    Ok(Json(super::google_client::get_google_client(
+        s.app_secrets.as_ref(),
+    )))
+}
+
+/// PMS-1444: set the host's Google client, then swap the one the process is
+/// using so a Connect that happens a second later uses it.
+async fn put_google_client(
+    State(s): State<SettingsRouterState>,
+    _operator: DeploymentOperator,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(input): Json<super::google_client::GoogleClientInput>,
+) -> AppResult<Json<super::google_client::GoogleClientView>> {
+    let view = super::google_client::put_google_client(
+        &s.db,
+        &s.app_secrets,
+        s.google_client.as_ref(),
+        input,
+        &ctx,
+    )
+    .await?;
     Ok(Json(view))
 }
 

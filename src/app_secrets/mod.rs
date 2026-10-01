@@ -422,6 +422,28 @@ impl AppSecrets {
             providers,
         }
     }
+
+    /// A handle whose declared provider could not be BUILT.
+    ///
+    /// Not the same as a provider holding nothing, and the difference is the
+    /// one this module exists to keep: a provider that answers "no value" has
+    /// been asked, while one that could not be constructed has not, and
+    /// reporting the second as the first is how an unreachable Infisical
+    /// becomes "the feature is off". `provider-status` renders them as
+    /// different rows and the PMS-1444 write path refuses on this one instead
+    /// of writing somewhere else.
+    ///
+    /// The serving path reaches this through [`init_from_env`], which leaves a
+    /// slot `None` when its construction inputs are absent or its load failed.
+    /// This constructor is for the callers that assemble a handle directly: the
+    /// test harness booting an app whose pool is deliberately closed, and any
+    /// caller reproducing that state on purpose.
+    pub fn without_provider(declared: AppSecretProviderKind) -> Self {
+        Self {
+            declared,
+            providers: vec![None; AppSecretProviderKind::ALL.len()],
+        }
+    }
 }
 
 /// A membership snapshot: which providers hold which governed secret at the

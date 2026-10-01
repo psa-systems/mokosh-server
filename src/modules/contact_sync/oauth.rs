@@ -87,9 +87,10 @@ impl OauthClient {
     /// Which Google application this Mokosh installation authenticates as is a
     /// property of the deployment, not of a tenant, so it is one pair of
     /// governed secrets served by whichever `AppSecretProvider` the host
-    /// declared. The hosted deployment declares Infisical and holds the pair in
-    /// `/app`; the seam itself is provider-agnostic and a self-hosted deployment
-    /// may hold it in a file, the database or `{NAME}_FILE`.
+    /// declared. The seam is provider-agnostic: the hosted deployment declares
+    /// the DATABASE provider (`SECRET_BACKEND` unset, so the `saas` hosting
+    /// profile's default stands, PMS-1440), and a deployment may equally hold
+    /// the pair in Infisical, a file or `{NAME}_FILE`.
     ///
     /// Three outcomes, and the third is the reason this returns a `Result`.
     /// Both halves present is a configured host. Neither is an unconfigured one,
@@ -117,6 +118,73 @@ impl OauthClient {
             (Some(_), None) => Err(half_configured(GovernedSecret::GoogleContactsClientSecret)),
             (None, Some(_)) => Err(half_configured(GovernedSecret::GoogleContactsClientId)),
         }
+    }
+}
+
+/// The client the running process is using, swappable while it runs
+/// (PMS-1444).
+///
+/// `OauthClient::from_app_secrets` resolves once, in `main`, and the resolved
+/// value is handed to the API service and to the worker service. That was fine
+/// while the only way to set the pair was a shell on the box, because writing it
+/// and restarting were the same action. PMS-1444 lets a deployment operator set
+/// it from the product, and a setting whose effect waits for a deploy is a
+/// setting that looks broken.
+///
+/// So the two services hold this instead of the value, and the write path swaps
+/// it. This is `utils::email::SharedMailer` (PMS-638), deliberately: that is how
+/// the deployment-wide SMTP settings already take effect without a restart, and
+/// a second mechanism for the same problem would be a second thing to reason
+/// about.
+///
+/// `None` is a configured state, not an uninitialised one: it is a deployment
+/// with no Google client, which the Settings card renders as unavailable.
+pub struct SharedGoogleClient {
+    inner: std::sync::RwLock<Option<OauthClient>>,
+}
+
+impl SharedGoogleClient {
+    pub fn new(inner: Option<OauthClient>) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(inner),
+        }
+    }
+
+    /// Replace the client. Takes effect on every consumer's next read, which
+    /// for an OAuth flow means the next Connect or the next token refresh.
+    pub fn swap(&self, inner: Option<OauthClient>) {
+        *self
+            .inner
+            .write()
+            .expect("SharedGoogleClient lock poisoned") = inner;
+    }
+
+    /// The client as of now. Cloned rather than borrowed so no caller holds the
+    /// lock across an await: an OAuth exchange is a network round trip.
+    pub fn current(&self) -> Option<OauthClient> {
+        self.inner
+            .read()
+            .expect("SharedGoogleClient lock poisoned")
+            .clone()
+    }
+}
+
+impl std::fmt::Debug for SharedGoogleClient {
+    /// Says whether a client is held, never which one. The struct holds a
+    /// secret, so a derived `Debug` would put it in any error that formatted a
+    /// service holding this.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedGoogleClient")
+            .field("configured", &self.current().is_some())
+            .finish()
+    }
+}
+
+impl Default for SharedGoogleClient {
+    /// An unconfigured deployment, for the test and seeder paths that never
+    /// reach `main`.
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 

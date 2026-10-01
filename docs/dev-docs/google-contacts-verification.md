@@ -162,8 +162,15 @@ Done once per deployment, by whoever runs it. A tenant never does this, which is
    the sync needs.
 5. Clients, Create client, application type **Web application**, with the redirect URI above under Authorized
    redirect URIs. No JavaScript origins: the code exchange happens on the server.
-6. Put the id and the secret in the provider this deployment DECLARES, one command each (PMS-1441). Both or
-   neither: one without the other is a boot error naming the missing half.
+6. Put the id and the secret in the provider this deployment DECLARES. Both or neither: one without the other is
+   a boot error naming the missing half.
+
+   On a deployment somebody can already sign in to, Settings has a page for this (PMS-1444): two fields, the
+   secret write-only, and the value is live as soon as it saves, with no restart. That is the normal path and it
+   needs no shell.
+
+   What follows is the BOOTSTRAP path, for a deployment with nobody signed in yet, which is every deployment on
+   its first day (PMS-1441).
 
    ```
    MOKOSH_SECRET_INPUT=<the id>     mokosh-server provider-set --secret GOOGLE_CONTACTS_CLIENT_ID     --from-env MOKOSH_SECRET_INPUT
