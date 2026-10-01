@@ -1,9 +1,11 @@
 //! HTTP surface for the integrations page (PMS-1310).
 //!
-//! parity record 2026-09-25: no route in this file has an SPA caller yet. The
-//! admin integrations page is the mokosh-apps half of PMS-1310 and is its own
-//! issue; this module is what it will read. The note covers every route here
-//! and comes off with the first one the client calls.
+//! Called by Settings > Integrations in mokosh-apps (MAPPS-971,
+//! `src/pages/settings_integrations.rs`), which is the client half PMS-1310's
+//! last acceptance criterion asked for. This module carried a dated exemption
+//! from `check-route-consumers` until that page existed; it exists, so the
+//! exemption is gone rather than re-dated, and the guard now holds these routes
+//! to a real caller.
 //!
 //! Mounted at `/api/v1/integrations` by `create_api_router`, so the paths here
 //! are relative to that prefix. `/capabilities` is registered BEFORE
