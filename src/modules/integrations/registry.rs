@@ -106,6 +106,36 @@ pub enum CredentialHome {
     ContactSync,
 }
 
+impl CredentialHome {
+    /// The key a client switches on, matching the `snake_case` the rest of this
+    /// surface serialises enums with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Integration => "integration",
+            Self::PaymentGateway => "payment_gateway",
+            Self::ContactSync => "contact_sync",
+        }
+    }
+
+    /// The settings surface an operator enters the credential on, or `None`
+    /// when it arrives in the connect request.
+    ///
+    /// On the home rather than on each descriptor, because it IS a property of
+    /// the home: two payment providers do not get to disagree about where the
+    /// payments surface is. The strings match the SPA's own page titles, since
+    /// their only job is to be read by somebody looking for that screen
+    /// (PMS-1447).
+    pub fn entered_at(self) -> Option<&'static str> {
+        match self {
+            // The credential arrives with the connect request, so there is no
+            // other surface to name.
+            Self::Integration => None,
+            Self::PaymentGateway => Some("Settings > Payment Gateways"),
+            Self::ContactSync => Some("Settings > Google Contacts"),
+        }
+    }
+}
+
 /// How often a provider is polled, for one that is polled at all.
 ///
 /// PMS-1310 set the default at fifteen minutes and said to revise it if

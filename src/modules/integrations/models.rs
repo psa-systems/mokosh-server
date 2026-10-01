@@ -52,6 +52,26 @@ pub struct ManagedElsewhereResponse {
     pub issue: String,
 }
 
+/// Where a provider's credential is entered, when it is not entered here
+/// (PMS-1447).
+///
+/// Served rather than inferred, for the same reason
+/// [`ManagedElsewhereResponse`] is: a client cannot tell whether to render a
+/// credential field without this, and the alternative is a provider-to-surface
+/// table in the client that the server already owns. PMS-1312 is why that would
+/// not survive: it moved the payment providers' CONNECTION into `integrations`
+/// while leaving their CREDENTIAL on the payments surface, so any client-side
+/// copy of this mapping was wrong the day it shipped.
+///
+/// `kind` is for a client that branches, `entered_at` is for one that has to
+/// name the screen. Both, because a page needs to do both and deriving one from
+/// the other is how the two drift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialElsewhereResponse {
+    pub kind: String,
+    pub entered_at: String,
+}
+
 /// The poll setting a provider offers, absent for one nothing polls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollingResponse {
@@ -76,6 +96,13 @@ pub struct IntegrationResponse {
     /// connect, disconnect and capability changes are refused here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_elsewhere: Option<ManagedElsewhereResponse>,
+    /// `Some` when the credential is entered on another settings surface, in
+    /// which case `connect` here takes none and refuses one that is sent.
+    /// Absent means the credential arrives in the connect request, so a client
+    /// that renders a credential field exactly when this is absent is right by
+    /// construction rather than by a list (PMS-1447).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_elsewhere: Option<CredentialElsewhereResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub polling: Option<PollingResponse>,
     /// The tenant's override, or `None` to mean the registry's default.
@@ -90,6 +117,21 @@ pub struct IntegrationResponse {
     pub disconnected_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+/// The descriptor's credential home as the response carries it.
+///
+/// A free function rather than a method on the descriptor so the mapping from
+/// "which home" to "what the client is told" lives beside the DTO it fills,
+/// which is where a reader looking at the JSON will come looking for it.
+fn credential_elsewhere(descriptor: &ProviderDescriptor) -> Option<CredentialElsewhereResponse> {
+    descriptor
+        .credential_home
+        .entered_at()
+        .map(|entered_at| CredentialElsewhereResponse {
+            kind: descriptor.credential_home.as_str().to_string(),
+            entered_at: entered_at.to_string(),
+        })
 }
 
 impl IntegrationResponse {
@@ -123,6 +165,7 @@ impl IntegrationResponse {
                     issue: issue.to_string(),
                 }),
             },
+            credential_elsewhere: credential_elsewhere(descriptor),
             polling: descriptor.polling.map(|polling| PollingResponse {
                 default_minutes: polling.default_minutes,
                 min_minutes: polling.min_minutes,
