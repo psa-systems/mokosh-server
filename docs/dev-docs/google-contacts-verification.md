@@ -196,5 +196,57 @@ Two properties of the Google application, which belong to this procedure rather 
   the data use, a published privacy policy, a consistent name and logo, a justification per scope and a demo video;
   it does NOT need the annual third-party security assessment, which applies to restricted scopes.
 
-Record who holds the Google account, where the privacy policy lives, and what triggers a re-review, beside this
-procedure. A client nobody owns is one nobody renews.
+A client nobody owns is one nobody renews, so what follows is the record rather than an instruction to keep one.
+
+## Who owns this client (as of 2026-09-30)
+
+| | |
+|---|---|
+| Google Cloud project | `psa-systems-495317`, project number `106937243070` |
+| Owner | david@niceguyit.biz |
+| Developer contact | david@niceguyit.biz |
+| User support email | vas@niceguyit.biz |
+| Application home page | not recorded |
+| Privacy policy URL | not recorded |
+| Authorized domains | not recorded |
+| Publishing status | not recorded |
+| Verification status | not recorded |
+
+The project number is also the first field of every client id it issues
+(`106937243070-....apps.googleusercontent.com`), which is the quickest way to confirm a client belongs to this
+project without opening the console.
+
+The blanks are written down as blanks on purpose. Each one is a thing Google needs before `contacts.readonly` can
+be verified, and a gap in a table is findable in a way an unasked question is not. Three of them are the same
+question in different clothes: which domain this application claims as its own.
+
+### Two things this record makes visible
+
+**One Owner, one named person.** The accounts are on the `niceguyit.biz` Workspace rather than personal Gmail,
+which is better than the common case, but `david@` is the single Owner of the project every deployment's Google
+Contacts integration depends on. If that account is suspended, offboarded or simply loses access, the client
+cannot be rotated and the integration cannot be repaired on any deployment at once. The fix is one console action:
+add a second Owner (`vas@` is already the support contact) or hand the project to a Workspace group. Worth doing
+before verification rather than after, because Google's correspondence goes to the developer contact and a
+transfer mid-review restarts it.
+
+**The product and the project are on different domains.** The account domain is `niceguyit.biz`; the product,
+its API and its apex are `psa.systems`. Google requires the home page and the privacy policy to sit on a domain
+verified to the submitting account, so verification needs `psa.systems` verified in Search Console by an account
+with access to this project, and the authorized-domains list has to name the domain actually used. `psa.systems`
+is served by bunyip-web, which is the natural host for the policy page. That is the thing to settle before
+submitting, because a privacy-policy URL that 404s or sits on an unverified domain is a rejection rather than a
+question.
+
+### What sends it back through verification
+
+Not a judgement call, it is Google's published list, and any one of these is a re-review:
+
+- adding or changing scopes, above all a new sensitive or restricted one
+- changing the app name, the logo, the user support email or the developer contact
+- changing the home page URL, the privacy policy URL, or the authorized domains
+- moving from Testing to In production, or republishing after a return to Testing
+- transferring project ownership, or moving the project between organisations
+
+Reference: <https://support.google.com/cloud/answer/13463073>. Google corresponds through the developer contact,
+so an address nobody reads is how verification lapses without anyone noticing.
