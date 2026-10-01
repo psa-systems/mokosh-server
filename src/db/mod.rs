@@ -18,6 +18,9 @@ pub mod identity;
 
 // MAPPS-513 (MAPPS-474 stage A follow-up): read + write helpers for
 // `platform_admins`. Distinct credential store for the platform
-// super-admin persona (see migrations 131 + 132).
+// super-admin persona (created by migration 160, backfilled from the
+// `users` rows by 161, which 162 then retired; "131 + 132" here and in
+// 162's own comment was wrong, and 162 is immutable, so PMS-1425's
+// migration carries the correction beside the fix).
 #[cfg(feature = "server")]
 pub mod platform_admin;
