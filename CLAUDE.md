@@ -109,12 +109,16 @@ A contact (`contacts` row) owns its credential lifecycle on `/api/v1/contact/*` 
 
 ### Providers (PMS-1009)
 
-`docs/providers.md` is the contract for every selectable-implementation seam: the provider kinds, the three tiers (bootstrap / application / tenant, separated by bootstrap order rather than by sensitivity), where each is configured, priority, the four boot classifications, refresh, and the migrate-verify-purge
-workflow. Read it before adding a seam or a second implementation of one, because the parts that are easy to get wrong (a silent fallback to the default, a purge that deletes a value not verified elsewhere, an unreachable provider reported as absent) are exactly the parts it fixes. `src/config/`, `src/secrets/`
-and `src/storage/` are the three seams that already follow it; application secrets, authentication and email do not yet, and `docs/ROADMAP.md` carries the sequencing with each phase linked to its issue.
+[`docs/providers.md`](docs/providers.md) is the contract for every selectable-implementation seam: the kinds, the
+three tiers, where each is configured, priority, the four boot classifications, refresh, and migrate-verify-purge.
+Read it before adding a seam or a second implementation of one. `src/config/`, `src/secrets/` and `src/storage/`
+follow it; application secrets, authentication and email do not yet ([`docs/ROADMAP.md`](docs/ROADMAP.md) sequences
+them).
 
-Two rules from that document bind any change here. Provider enablement is bootstrap configuration, never served by a provider, because configuration that locates configuration cannot live inside what it locates. And a key read outside its provider is the defect the model exists to prevent: Bunyip had
-a working Infisical client and still served secrets from the database, because nothing forced the read through the seam.
+Two rules from it bind any change here. Provider enablement is bootstrap configuration, never served by a provider,
+because configuration that locates configuration cannot live inside what it locates. And a key read outside its
+provider is the defect the model exists to prevent: Bunyip had a working Infisical client and still served secrets
+from the database, because nothing forced the read through the seam.
 
 ### Routing model
 
@@ -122,9 +126,7 @@ a working Infisical client and still served secrets from the database, because n
 
 ### Multi-tenancy
 
-No middleware-level tenant scoping: every service method takes the scope explicitly. Since PMS-139 that scope is a `TenantId` newtype (`src/modules/auth/tenant.rs`) whose in-crate constructor is `pub(crate)` and is reached only through `CurrentUser::tenant()`, so a handler that forgets to thread the
-caller's tenant no longer compiles instead of leaking across tenants. The deliberate escape hatch is `TenantId::from_trusted`, for the paths where the scope genuinely is not a `CurrentUser` claim: the Stripe and RMM webhook receivers, super-admin `tenants` handlers addressing a path tenant, portal contact
-sessions, the seeders, and the cross-tenant workers (`calendar/worker.rs`, `sla/worker.rs`, the billing sweep). Cross-cutting issue #8 in `docs/dev-docs/codebase-state.md` records the rollout.
+No middleware-level tenant scoping: every service method takes a `TenantId` whose constructor is reachable only through `CurrentUser::tenant()`, so a handler that forgets the caller's tenant does not compile. `TenantId::from_trusted` is the listed escape hatch for the paths whose scope is not a session claim. [Full text](docs/architecture.md#multi-tenancy).
 
 ### Migrations
 
@@ -132,11 +134,7 @@ Embedded via `sqlx::migrate!` and run at startup. Committed migrations are immut
 
 ### Module status
 
-Most route groups have real handlers. `src/api/router.rs` nests/merges ~30 implemented modules (`auth`, `contacts`, `tenants`, `tickets`, `billing`, `projects`, `calendar`, `contracts`, `quotes`, `assets`, `rmm`, `sla`, `saved_reports`, `workflows`, `time_tracking`, and more); the old `stub_routes()`
-501 placeholder mechanism is gone. The report-export route (`src/modules/reports/routes.rs`) serves `csv` and `pdf` (PMS-876) and rejects every other `format` with 400 and not 501: `format` is an enumerated query parameter, so a value outside the implemented set is an out-of-range request rather than
-a server-side gap (PMS-854). The schema is still ahead of the handler layer in places. `docs/dev-docs/codebase-state.md` is a frozen 2026-05-06 snapshot (PMS-849), not a current per-module status: read it for the `F1..F14` fix ids, the numbered cross-cutting issues that source comments cite, and the
-shallow-DTO traps in tickets, and read `src/api/router.rs` plus the "Routing model" section above for what is actually mounted. Do not append to it; a new route group is recorded in the "Routing model" list.
-That list is in [`docs/architecture.md`](docs/architecture.md#routing-model).
+Around thirty modules are mounted and the 501 placeholder mechanism is gone; the schema is still ahead of the handler layer in places. `docs/dev-docs/codebase-state.md` is a frozen 2026-05-06 snapshot (PMS-849), not a current status: read `src/api/router.rs` and the Routing model list for what is mounted. [Full text](docs/architecture.md#module-status).
 
 ## Conventions specific to this repo
 
