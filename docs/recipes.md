@@ -44,6 +44,7 @@ just check-doc-links        # fail if a relative Markdown link does not resolve 
 just check-claude-md        # fail if CLAUDE.md passes 20,000 bytes, a prose line passes 400 chars, or a docs/ link or anchor breaks
 
 # CI history (not part of `just check`: needs the network)
+just ci-log [args]          # print a Forgejo Actions job's log (--list, --workflow, --sha, --run)
 just ci-stalls [days]       # report CI runs that outlived their job's timeout-minutes; needs FORGEJO_TOKEN
 just ci-stalls-self-test    # prove the stall report still reports, on fixtures, with no token
 

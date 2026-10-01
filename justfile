@@ -179,6 +179,21 @@ check-pool-safety:
 ci-stalls days="3":
     nu scripts/check-ci-stalls.nu {{days}}
 
+# Read a Forgejo Actions job's log (PMS-1426). The route needs a JOB id, which
+# comes from a run, so it is two calls before the one that returns anything;
+# every obvious single-call route answers 404, and believing the log was
+# unreachable is what made CI triage guesswork for a while. Uses the token `fj`
+# already stores, so there is nothing to set up.
+#
+#   just ci-log                            # the newest failing run
+#   just ci-log --workflow integration.yml # that workflow's newest failure
+#   just ci-log --sha <commit>             # that commit's run
+#   just ci-log --list                     # recent runs, no log
+[doc("Print a Forgejo Actions job's log (PMS-1426). --list, --workflow, --sha, --run.")]
+[group: 'ci']
+ci-log *args:
+    nu scripts/ci-job-log.nu {{args}}
+
 # Prove the stall report still reports (PMS-906). Fixtures, no network.
 [doc("Self-test for `just ci-stalls`; runs on fixtures, needs no token.")]
 [group: 'ci']
