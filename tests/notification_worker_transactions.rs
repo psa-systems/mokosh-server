@@ -55,9 +55,24 @@ use mokosh_server::Database;
 /// past [`MAX_XACT_AGE_MS`] on the second send.
 const RELAY_LATENCY: Duration = Duration::from_millis(500);
 
-/// The issue's threshold: no transaction in this database may be older than
-/// this while a send is in flight.
-const MAX_XACT_AGE_MS: f64 = 100.0;
+/// No transaction in this database may be older than this while a send is in
+/// flight.
+///
+/// PMS-932 set this at the issue's 100ms. PMS-1426 raised it, because it was 1
+/// of the 10 integration failures on pull requests in the window it reviewed,
+/// at 188ms on a change that could not have affected it, and the number is
+/// measured on a runner shared with other workflows.
+///
+/// Raising it costs no discrimination, which is why this is the fix rather than
+/// a retry. The failure being guarded against is a transaction held ACROSS the
+/// relay round trip, and [`RELAY_LATENCY`] is 500ms, so a genuinely held
+/// transaction is observed at 500ms or more while the probe runs 500ms into the
+/// send. Anything under half of that is another backend's short transaction or
+/// a slow machine, which is what this threshold has to tolerate rather than
+/// report. The deterministic half of the proof is unaffected: the statement log
+/// below is what catches a short transaction opened mid-send, and it does not
+/// depend on a clock.
+const MAX_XACT_AGE_MS: f64 = 400.0;
 
 /// Statements observed while [`Recorder::armed`] is set, interleaved with a
 /// marker for each send so the ordering is checkable.
