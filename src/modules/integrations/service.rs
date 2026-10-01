@@ -821,6 +821,86 @@ mod tests {
     /// exercised against whichever provider is still outside rather than deleted
     /// with the last one that was: the message is what an operator gets back, and
     /// it is the only thing that tells them where to go instead.
+    /// PMS-1447: what the response SAYS about a provider's credential is what
+    /// `connect` actually does about it, for every provider in the registry.
+    ///
+    /// The two could drift trivially: `credential_elsewhere` is composed in
+    /// `models.rs` and the behaviour is branched in `connect` above, and the
+    /// only thing holding them together is that both read
+    /// `descriptor.credential_home`. This walks the registry and asserts the
+    /// pair agrees, so adding a provider with the wrong home fails here rather
+    /// than shipping a page that renders a credential field for a provider that
+    /// refuses one.
+    ///
+    /// A pure test: it reads the registry and the composed response, and never
+    /// calls `connect`, which needs a pool. What it pins is the AGREEMENT, and
+    /// the behaviour either side of it is covered where it happens.
+    #[test]
+    fn the_credential_home_the_response_reports_is_the_one_connect_enforces() {
+        for descriptor in registry::REGISTRY {
+            let response = IntegrationResponse::not_installed(descriptor);
+            let takes_credential_here = descriptor.credential_home == CredentialHome::Integration;
+            assert_eq!(
+                response.credential_elsewhere.is_none(),
+                takes_credential_here,
+                "{}: the response says credential_elsewhere {:?} while connect {} a credential \
+                 here",
+                descriptor.display_name,
+                response.credential_elsewhere.as_ref().map(|c| &c.kind),
+                if takes_credential_here {
+                    "takes"
+                } else {
+                    "refuses"
+                },
+            );
+            if let Some(elsewhere) = &response.credential_elsewhere {
+                assert_eq!(elsewhere.kind, descriptor.credential_home.as_str());
+                assert!(
+                    elsewhere.entered_at.starts_with("Settings > "),
+                    "{}: entered_at has to name a settings screen so a page can point at it, \
+                     got {:?}",
+                    descriptor.display_name,
+                    elsewhere.entered_at,
+                );
+            }
+        }
+    }
+
+    /// The two payment providers report the payments surface and Google reports
+    /// the contact-sync one, which is the distinction a boolean would have lost.
+    ///
+    /// Named providers rather than a loop, because these three are the reason
+    /// the field carries a surface at all: an admin sent to the wrong screen is
+    /// no better off than one sent to none.
+    #[test]
+    fn each_credential_home_names_its_own_surface() {
+        for (provider, expected) in [
+            (IntegrationProvider::Stripe, "Payment Gateways"),
+            (IntegrationProvider::Paypal, "Payment Gateways"),
+            (IntegrationProvider::Google, "Google Contacts"),
+        ] {
+            let response = IntegrationResponse::not_installed(registry::descriptor(provider));
+            let elsewhere = response
+                .credential_elsewhere
+                .expect("this provider's credential is entered on another surface");
+            assert!(
+                elsewhere.entered_at.contains(expected),
+                "{provider:?} points at {:?}, expected it to name {expected}",
+                elsewhere.entered_at
+            );
+        }
+        // And one that takes its credential here, so the absence is asserted
+        // rather than assumed from the loop above.
+        assert!(
+            IntegrationResponse::not_installed(registry::descriptor(
+                IntegrationProvider::Quickbooks
+            ))
+            .credential_elsewhere
+            .is_none(),
+            "QuickBooks takes its credential in the connect request"
+        );
+    }
+
     #[test]
     fn a_provider_managed_elsewhere_is_refused_and_says_where() {
         let error = assert_managed_here(registry::descriptor(IntegrationProvider::Google))
