@@ -209,7 +209,7 @@ A client nobody owns is one nobody renews, so what follows is the record rather 
 | Application home page | not recorded |
 | Privacy policy URL | not recorded |
 | Authorized domains | not recorded |
-| Publishing status | not recorded |
+| Publishing status | In production, unverified (confirmed 2026-10-01: the app was published rather than left in Testing) |
 | Verification status | not recorded |
 
 The project number is also the first field of every client id it issues
@@ -221,6 +221,17 @@ be verified, and a gap in a table is findable in a way an unasked question is no
 question in different clothes: which domain this application claims as its own.
 
 ### Two things this record makes visible
+
+### What "In production, unverified" costs, and what it does not
+
+The seven-day refresh-token expiry does NOT apply. That is a property of an External app left in **Testing**, and this one is published, so a tenant that connects stays connected. The procedure above still describes the Testing rule because a self-hosted operator following it may well be in Testing, but it is not this deployment's situation.
+
+What publishing unverified does cost, until verification completes:
+
+- every person reaching the consent screen sees "Google hasn't verified this app" and has to click through an advanced-options warning
+- the app is capped at **100 grants**, cumulatively, after which no new user can connect at all
+
+The cap is the one with a hard edge. It is not 100 concurrent users or 100 per tenant; it is 100 users who have ever granted, so for a product sold to MSPs whose staff each connect an account it is a ceiling that arrives without warning and cannot be raised except by verification.
 
 **One Owner, one named person.** The accounts are on the `niceguyit.biz` Workspace rather than personal Gmail,
 which is better than the common case, but `david@` is the single Owner of the project every deployment's Google
