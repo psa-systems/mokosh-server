@@ -25,6 +25,7 @@ pub mod credential_move;
 pub mod dashboards;
 pub mod data_transfer;
 pub mod email_intake;
+pub mod features;
 pub mod forms;
 // PMS-1310: installed integrations per tenant, and which capabilities each one
 // is handed. The registry declares what a provider supports; the row records

@@ -91,7 +91,7 @@ just dev --detach
 What `just dev` does:
 
 1. Generates `.env` from `.env.example` (via the `ensure-env` recipe) if `.env` is missing, minting fresh self-owned secrets.
-2. Writes `USER` to `.env`: it names your containers, volumes, network and your `${USER}-mokosh-api.a8n.run` route. No LAN IP is discovered or written, because no service publishes a host port on one (PMS-496, PMS-863).
+2. Writes `USER` to `.env`: it names your containers, volumes, network and your `${USER}-mokosh-api.a8n.run` route. No LAN IP is discovered or written, because no service publishes a host port on one (PMS-496, PMS-863). Every host publish in `compose.dev.yml` is `127.0.0.1:`, and a new one belongs there too: the API is reached through Traefik, so a port on a LAN address exposes a dev database or mailbox to the rest of the network for nothing. A convention bullet claiming the opposite survived in `docs/invariants/` until PMS-1439 removed it.
 3. Runs `docker compose --file compose.dev.yml up --detach`, starting `server`, `postgres` and `mailpit`. Infisical is behind a compose profile and does NOT start here (step 7). Cold first build compiles every Rust crate inside the `server` container (5 to 15 min). Subsequent boots reuse the `dev-mokosh-server-target-${USER}` volume and are about 30 seconds.
 
 Watch the server compile and boot:

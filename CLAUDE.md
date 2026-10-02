@@ -198,6 +198,7 @@ One line per rule, linking its full text. A new convention adds its text under `
 - `integrations.status` has one writer ([PMS-1312](docs/invariants/config-providers.md#payment-status-pms-1312))
 - The Google OAuth client is the host's ([PMS-1430](docs/invariants/config-providers.md#google-client-pms-1340))
 - A one-time correction runs once per boot ([PMS-1320](docs/invariants/config-providers.md#one-shots-pms-1320))
+- A feature toggle is a registry entry, off unless a row says otherwise ([PMS-1414](docs/feature-toggles.md))
 - Every stored object puts its tenant first ([PMS-1318](docs/invariants/config-providers.md#tenant-first-pms-1318))
 - Storage settings are `STORAGE_`-prefixed ([PMS-1317](docs/invariants/config-providers.md#storage-names-pms-1317))
 
@@ -218,7 +219,6 @@ One line per rule, linking its full text. A new convention adds its text under `
 - A database test is `#[mokosh_test]` ([PMS-1254](docs/invariants/ci-release.md#test-databases-pms-1254))
 - The SPA repository is `mokosh-apps` ([PMS-856](docs/invariants/ci-release.md#client-repo-pms-856))
 - Docker resources carry the app prefix ([details](docs/invariants/ci-release.md#docker-naming))
-- Dev stack binds to a private LAN IP ([details](docs/invariants/ci-release.md#lan-bind))
 
 ### Knowledge base
 

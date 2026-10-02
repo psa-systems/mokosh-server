@@ -55,24 +55,34 @@ use mokosh_server::Database;
 /// past [`MAX_XACT_AGE_MS`] on the second send.
 const RELAY_LATENCY: Duration = Duration::from_millis(500);
 
-/// No transaction in this database may be older than this while a send is in
-/// flight.
+/// No transaction held by the WORKER may be older than this while a send is in
+/// flight. The issue's own number (PMS-932), restored by PMS-1436.
 ///
-/// PMS-932 set this at the issue's 100ms. PMS-1426 raised it, because it was 1
-/// of the 10 integration failures on pull requests in the window it reviewed,
-/// at 188ms on a change that could not have affected it, and the number is
-/// measured on a runner shared with other workflows.
+/// It went to 400ms under PMS-1426, which was the wrong fix and is worth
+/// recording as such. That change tolerated the noise instead of excluding it:
+/// the probe measured every backend on the database, the test shares its pool
+/// with the worker, and a 188ms transaction belonging to something other than
+/// the worker failed a pull request that only touched PDF export. Widening the
+/// threshold made that stop happening and also made the test blind to a worker
+/// holding a transaction for a third of a second, which is the regression it
+/// exists to catch (PMS-782, PMS-1122).
 ///
-/// Raising it costs no discrimination, which is why this is the fix rather than
-/// a retry. The failure being guarded against is a transaction held ACROSS the
-/// relay round trip, and [`RELAY_LATENCY`] is 500ms, so a genuinely held
-/// transaction is observed at 500ms or more while the probe runs 500ms into the
-/// send. Anything under half of that is another backend's short transaction or
-/// a slow machine, which is what this threshold has to tolerate rather than
-/// report. The deterministic half of the proof is unaffected: the statement log
-/// below is what catches a short transaction opened mid-send, and it does not
-/// depend on a clock.
-const MAX_XACT_AGE_MS: f64 = 400.0;
+/// PMS-1436 scopes the probe to [`WORKER_APP_NAME`] instead, so the number can
+/// go back to meaning what it says. A transaction held across the relay shows up
+/// at [`RELAY_LATENCY`] or more, five times this bound, so the discrimination is
+/// wide while the tolerance for noise is zero, which is the right way round.
+const MAX_XACT_AGE_MS: f64 = 100.0;
+
+/// `application_name` on the pool the worker is given, so the probe can tell the
+/// worker's backends from every other connection to the same database.
+///
+/// This is the fix. The test and the worker shared one pool, so no `pid` filter
+/// could separate them, and `datname = current_database()` was the closest the
+/// probe could get: it caught the harness's own connections, sqlx's, and
+/// anything else that happened to be mid-transaction. Tagging the worker's pool
+/// turns "some backend on this database" into "the worker", which is what the
+/// test's contract was always about.
+const WORKER_APP_NAME: &str = "mokosh-notification-worker";
 
 /// Statements observed while [`Recorder::armed`] is set, interleaved with a
 /// marker for each send so the ordering is checkable.
@@ -146,7 +156,7 @@ struct SlowProbingMailer {
     recorder: Arc<Recorder>,
     /// Oldest open transaction (milliseconds) seen by any send, and how many
     /// other backends were in a transaction at that moment.
-    observations: Mutex<Vec<(f64, i64)>>,
+    observations: Mutex<Vec<Observation>>,
 }
 
 #[async_trait]
@@ -162,29 +172,91 @@ impl Mailer for SlowProbingMailer {
         tokio::time::sleep(RELAY_LATENCY).await;
 
         // Every backend with an open transaction has a non-null `xact_start`,
-        // whether it is `active` or parked `idle in transaction`. Our own
-        // backend is excluded: this probe is itself a statement.
-        let (oldest_ms, open): (Option<f64>, i64) = sqlx::query_as(
-            r#"SELECT MAX(EXTRACT(EPOCH FROM (clock_timestamp() - xact_start)) * 1000)::float8,
-                      COUNT(*)
+        // whether it is `active` or parked `idle in transaction`.
+        //
+        // PMS-1436: scoped to the WORKER's connections by `application_name`.
+        // The old predicate was `datname = current_database()`, which is every
+        // connection to this database including the harness's own, and that is
+        // what made a 188ms transaction nobody owned fail a pull request about
+        // PDF export. `pid <> pg_backend_pid()` stays as belt and braces; the
+        // probe itself runs on the UNTAGGED test pool, so the tag already
+        // excludes it.
+        //
+        // The offender's pid, state and statement travel with the row, because
+        // the previous failure message said only "1 backend(s) in a transaction"
+        // and left nobody able to say which one. Truncated, since a statement is
+        // unbounded and this ends up in a panic message.
+        let offender: Option<(f64, i32, String, String)> = sqlx::query_as(
+            r#"SELECT EXTRACT(EPOCH FROM (clock_timestamp() - xact_start))::float8 * 1000,
+                      pid,
+                      COALESCE(state, '(none)'),
+                      COALESCE(left(query, 200), '(none)')
                FROM pg_stat_activity
                WHERE datname = current_database()
+                 AND application_name = $1
                  AND pid <> pg_backend_pid()
-                 AND xact_start IS NOT NULL"#,
+                 AND xact_start IS NOT NULL
+               ORDER BY xact_start
+               LIMIT 1"#,
         )
-        .fetch_one(&self.pool)
+        .bind(WORKER_APP_NAME)
+        .fetch_optional(&self.pool)
         .await
         .expect("probe pg_stat_activity");
         self.observations
             .lock()
             .expect("observations")
-            .push((oldest_ms.unwrap_or(0.0), open));
+            .push(match offender {
+                Some((age_ms, pid, state, query)) => Observation {
+                    age_ms,
+                    detail: format!("pid {pid}, state {state}, running: {query}"),
+                },
+                // Nothing of the worker's is in a transaction, which is the
+                // answer this test wants. Zero rather than `None` keeps the
+                // assertion one comparison.
+                None => Observation {
+                    age_ms: 0.0,
+                    detail: "no worker backend was in a transaction".to_string(),
+                },
+            });
         Ok(())
     }
 }
 
+/// What one probe saw: how long the worker's oldest transaction had been open,
+/// and enough about the backend holding it to act on a failure.
+///
+/// PMS-1436: the detail exists because the previous message was "188.552 ms (1
+/// backend(s) in a transaction)", which says a transaction existed and nothing
+/// about whose it was, so the first thing anyone had to do was reproduce it.
+#[derive(Debug, Clone)]
+struct Observation {
+    age_ms: f64,
+    detail: String,
+}
+
 /// Rows delivered over SMTP in the measured tick.
 const EMAIL_ROWS: usize = 3;
+
+/// A pool on the same per-test database whose connections announce themselves as
+/// the notification worker.
+///
+/// `max_connections(2)` on purpose: the worker's own claim-and-settle path needs
+/// one, and holding a second is what the injected-violation test below does, so a
+/// larger pool would let a leaked connection hide between runs instead of being
+/// the thing the probe sees.
+async fn worker_tagged_pool(pool: &PgPool) -> PgPool {
+    let opts = pool
+        .connect_options()
+        .as_ref()
+        .clone()
+        .application_name(WORKER_APP_NAME);
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(opts)
+        .await
+        .expect("connect the worker-tagged pool")
+}
 
 #[mokosh_test]
 async fn a_tick_sends_with_no_transaction_open(pool: PgPool) {
@@ -226,7 +298,12 @@ async fn a_tick_sends_with_no_transaction_open(pool: PgPool) {
         recorder: recorder.clone(),
         observations: Mutex::new(Vec::new()),
     });
-    let worker = DispatcherWorker::new(Database::from_pool(pool.clone()), mailer.clone());
+    // PMS-1436: the worker gets its OWN pool, tagged, so the probe can name it.
+    // Derived from the test pool's options so it is the same per-test database
+    // with nothing but `application_name` changed, the shape
+    // `common::build_app_role_pool` already uses to swap a login role.
+    let worker_pool = worker_tagged_pool(&pool).await;
+    let worker = DispatcherWorker::new(Database::from_pool(worker_pool), mailer.clone());
 
     recorder.armed.store(true, Ordering::SeqCst);
     let stats = worker.run_tick(10).await.expect("worker tick");
@@ -249,26 +326,21 @@ async fn a_tick_sends_with_no_transaction_open(pool: PgPool) {
         EMAIL_ROWS,
         "the probe must have run once per send",
     );
-    for (age_ms, open) in &observations {
-        // PMS-932: the AGE is the verdict, and the count is context.
+    for observed in &observations {
+        // PMS-932: the AGE is the verdict. PMS-1436: and it is now the worker's
+        // age, not the database's, so the number can be the issue's own again.
         //
-        // This assertion used to be `open == 0` first, which failed CI on a
-        // transaction 8 ms old belonging to a backend this test does not own,
-        // and failed it BEFORE the criterion the issue actually specifies was
-        // ever evaluated. The probe counts every backend on `current_database()`
-        // other than its own, and the test controls none of them beyond its own
-        // pool.
-        //
-        // `oldest_ms` is a MAX over every open transaction and the probe runs
-        // 500 ms into the send, so a transaction genuinely held across the round
-        // trip is well past the threshold; when nothing is open the query
-        // returns NULL and this reads 0.0, which is the right answer. The
-        // deterministic half of the proof is the statement log below, which is
-        // where a SHORT transaction opened mid-send gets caught.
+        // The probe fires 500ms into a send, and a transaction genuinely held
+        // across that round trip is observed at `RELAY_LATENCY` or more, which is
+        // five times this bound. Nothing of the worker's being open reads as 0.0,
+        // which is the answer this test wants. The deterministic half of the
+        // proof is the statement log below, which catches a SHORT transaction
+        // opened mid-send and depends on no clock at all.
         assert!(
-            *age_ms < MAX_XACT_AGE_MS,
-            "oldest open transaction during a send was {age_ms} ms \
-             ({open} backend(s) in a transaction)",
+            observed.age_ms < MAX_XACT_AGE_MS,
+            "the worker held a transaction for {} ms during a send ({})",
+            observed.age_ms,
+            observed.detail,
         );
     }
 
