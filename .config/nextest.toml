@@ -64,7 +64,14 @@ fail-fast = false
 period = "60s"
 terminate-after = 3
 
-# PMS-1426: the two cases whose verdict is a WALL CLOCK, retried.
+# PMS-1426: the case whose verdict is a WALL CLOCK, retried.
+#
+# It was two until PMS-1436. The notification worker's open-transaction test is
+# no longer one of them: it measured every backend on its database, and scoping
+# the probe to the worker's `application_name` removed the noise instead of
+# tolerating it, so its retry and its widened threshold both came off. A retry
+# that is still needed after the measurement is fixed is a different question
+# from one that stands in for fixing it.
 #
 # Between PMS-1398 and PMS-1426 the integration job failed 10 of 64
 # pull-request runs, and all 10 were these two tests: 9 the /health p99 and 1
@@ -98,9 +105,6 @@ filter = 'test(health_p99_does_not_regress_under_concurrent_argon2_burst)'
 threads-required = "num-test-threads"
 retries = 2
 
-[[profile.ci.overrides]]
-filter = 'test(a_tick_sends_with_no_transaction_open)'
-retries = 2
 
 # PMS-1394: the complement of `ci`, run weekly by
 # `integration-unsupported.yml` and locally by
