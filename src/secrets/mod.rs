@@ -332,6 +332,27 @@ impl SecretProviderKind {
         match raw.trim() {
             provider::DATABASE => Ok(SecretProviderKind::Database),
             provider::INFISICAL => Ok(SecretProviderKind::Infisical),
+            // PMS-1424: a value the APPLICATION tier accepts and this one does
+            // not is the single most likely way to get here, and the generic
+            // message sent the operator looking for a typo in a correctly
+            // spelled provider name. It is a real provider; it is just not one
+            // this tier can use, because a tenant secret is a per-tenant write
+            // and neither of these can hold one.
+            //
+            // Before PMS-1424 the application tier read this same variable, so
+            // `SECRET_BACKEND=file` was the documented way to move
+            // `SMTP_PASSWORD` to a file and also a way to stop the server
+            // booting. Naming the other variable is what turns that into one
+            // edit rather than an outage.
+            other if crate::app_secrets::AppSecretProviderKind::parse_name(other).is_ok() => {
+                Err(AppError::Configuration(format!(
+                    "SECRET_BACKEND {other:?} selects the TENANT secret provider, which stores a \
+                     secret per tenant and therefore accepts only 'database' or 'infisical'. \
+                     {other:?} is an APPLICATION-tier provider: set {} to it instead and leave \
+                     SECRET_BACKEND on a provider that can hold a per-tenant write (PMS-1424).",
+                    crate::app_secrets::APP_SECRET_BACKEND_VAR
+                )))
+            }
             other => Err(AppError::Configuration(format!(
                 "SECRET_BACKEND {other:?} is not a known provider; expected 'database' or 'infisical'"
             ))),

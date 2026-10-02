@@ -277,11 +277,11 @@ impl AppSecretProviderKind {
     pub const LEGAL_VALUES: &'static str = "environment, file, database, infisical";
 
     /// A provider NAME to a kind. Blank is not a name: the caller resolves an
-    /// unset `SECRET_BACKEND` against the hosting profile's default before it
+    /// unset `APP_SECRET_BACKEND` against the hosting profile's default before it
     /// reaches here.
     ///
     /// An unrecognised value is a hard error, not a fall back to the
-    /// hosting-profile default: an operator who wrote `SECRET_BACKEND=file `
+    /// hosting-profile default: an operator who wrote `APP_SECRET_BACKEND=file `
     /// with a typo asked for the file provider, and quietly giving them the
     /// database is the same silent degrade this model exists to remove
     /// everywhere else.
@@ -292,7 +292,7 @@ impl AppSecretProviderKind {
             provider::DATABASE => Ok(Self::Database),
             provider::INFISICAL => Ok(Self::Infisical),
             other => Err(AppError::Configuration(format!(
-                "SECRET_BACKEND {other:?} is not a known application-tier secret provider; \
+                "APP_SECRET_BACKEND {other:?} is not a known application-tier secret provider; \
                  expected one of: {}",
                 Self::LEGAL_VALUES
             ))),
@@ -328,15 +328,26 @@ pub struct AppSecretsSelection {
 }
 
 impl AppSecretsSelection {
-    /// Read `SECRET_BACKEND`, the same variable the tenant tier reads.
+    /// Read `APP_SECRET_BACKEND`, this tier's own selector (PMS-1424).
     ///
-    /// Both tiers pick the SAME provider on purpose: operator intent is
-    /// "hold my secrets over there", and a deployment with tenant secrets in
-    /// the database while application secrets sat in Infisical is a shape
-    /// nobody asked for. The two tiers keep their own readers because the
-    /// tenant tier accepts a strict subset (database, infisical) and this
-    /// tier accepts all four; a value only this tier accepts still ends the
-    /// tenant tier's boot the same way this one would, with a clear error.
+    /// It used to read `SECRET_BACKEND`, the tenant tier's variable, on the
+    /// theory that operator intent is "hold my secrets over there" and two
+    /// tiers in two places is a shape nobody asked for. That was wrong, and the
+    /// way it was wrong is worth keeping: the tenant tier accepts only
+    /// `database` and `infisical`, because a tenant secret is a per-tenant WRITE
+    /// and neither the file nor the environment provider can hold one. So
+    /// `SECRET_BACKEND=file` was a hard boot error from the tenant selector, and
+    /// this tier's `file` and `environment` providers could not be selected on
+    /// any deployment that boots. Two of the four were decoration.
+    ///
+    /// `docs/operator-provider-runbook.md` walked an operator through setting
+    /// `SECRET_BACKEND=file` and restarting, which would have taken the server
+    /// down.
+    ///
+    /// So the tiers are selected independently now. The cost is that an operator
+    /// who wants both in Infisical sets two variables; the benefit is that
+    /// `SMTP_PASSWORD` can come from a file without moving every tenant's
+    /// secrets, which is the whole reason this tier has four providers.
     ///
     /// It is deliberately not a registry key and is read here rather than
     /// through [`crate::config::get`]: provider enablement is bootstrap
@@ -345,7 +356,7 @@ impl AppSecretsSelection {
     pub fn from_env(profile_default: &str) -> AppResult<Self> {
         Self::resolve(
             profile_default,
-            &std::env::var("SECRET_BACKEND").unwrap_or_default(),
+            &std::env::var(APP_SECRET_BACKEND_VAR).unwrap_or_default(),
         )
     }
 
@@ -588,7 +599,7 @@ pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
                     "{} is absent from the declared {} provider but present in the {}. \
                      mokosh will not silently use a provider the deployment did not \
                      declare. Copy it with `mokosh-server secrets-migrate --to {}`, \
-                     or set SECRET_BACKEND to the provider that holds it.",
+                     or set APP_SECRET_BACKEND to the provider that holds it.",
                     row.secret.name(),
                     survey.declared.as_str(),
                     provider_list(&elsewhere),
@@ -633,6 +644,19 @@ pub struct AppSecretStatus {
     pub served_by: Option<&'static str>,
 }
 
+/// This tier's provider selector (PMS-1424).
+///
+/// Separate from the tenant tier's `SECRET_BACKEND` because the two accept
+/// different value sets, not as a matter of taste: a tenant secret is a
+/// per-tenant write, so the read-only `file` and `environment` providers are
+/// legal here and impossible there.
+///
+/// Read directly rather than through the configuration seam for the reason every
+/// provider selector is: enablement is bootstrap configuration, and
+/// configuration that locates configuration cannot live inside what it locates
+/// (`docs/providers.md`).
+pub const APP_SECRET_BACKEND_VAR: &str = "APP_SECRET_BACKEND";
+
 /// Every declared secret, with the providers that hold it and which one
 /// serves it. No secret value, ever.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -675,7 +699,7 @@ pub fn current() -> Option<Arc<AppSecrets>> {
 }
 
 /// Build every application-tier secret provider whose construction inputs
-/// are present, choose the declared one from `SECRET_BACKEND`, enforce the
+/// are present, choose the declared one from `APP_SECRET_BACKEND`, enforce the
 /// four-way classification, and install the result as the process-wide
 /// [`current`] handle.
 ///
@@ -1067,17 +1091,99 @@ mod tests {
         }
     }
 
-    /// One reader of `SECRET_BACKEND` in this module, so the app-tier's own
-    /// setting is read in one place, the shape `crate::secrets` pins for the
-    /// tenant tier. The tenant tier's test scans its own file too, so both
-    /// halves stay independently guarded.
+    /// PMS-1424: the two tiers resolve independently, and the combination the
+    /// issue is about now works.
+    ///
+    /// `APP_SECRET_BACKEND=file` with the tenant tier left on `database` was
+    /// impossible before: the app tier read `SECRET_BACKEND`, so selecting the
+    /// file provider meant setting the variable the tenant selector refuses, and
+    /// the boot stopped. Both halves are asserted here because the bug was the
+    /// RELATIONSHIP between them, not either one alone.
+    #[test]
+    fn the_app_tier_can_take_a_file_provider_while_tenants_stay_on_the_database() {
+        let app = AppSecretsSelection::resolve("database", "file")
+            .expect("the application tier accepts the file provider");
+        assert_eq!(app.provider, AppSecretProviderKind::File);
+        assert_eq!(app.source, EnablementSource::Explicit);
+
+        // The tenant tier, asked the same question it is actually asked, is
+        // untouched by that and stays on its profile default.
+        let tenants = crate::secrets::SecretsConfig::resolve("database", "")
+            .expect("an unset SECRET_BACKEND takes the profile default");
+        assert_eq!(
+            tenants.provider,
+            crate::secrets::SecretProviderKind::Database
+        );
+
+        // And `environment` likewise, which is the other of the two providers
+        // that could not be selected before.
+        assert_eq!(
+            AppSecretsSelection::resolve("database", "environment")
+                .expect("the application tier accepts the environment provider")
+                .provider,
+            AppSecretProviderKind::Environment
+        );
+    }
+
+    /// PMS-1424: `SECRET_BACKEND=file` is refused by name, and the refusal says
+    /// which variable the operator wanted.
+    ///
+    /// The old message said `file` "is not a known provider", which is false:
+    /// it is a known provider of the other tier. An operator told that goes
+    /// looking for a typo in a correctly spelled word, which is how the runbook
+    /// step that set this value survived as long as it did.
+    #[test]
+    fn a_tenant_selector_set_to_an_app_tier_provider_names_the_right_variable() {
+        for value in ["file", "environment"] {
+            let err = crate::secrets::SecretProviderKind::parse_name(value)
+                .expect_err("the tenant tier cannot hold a per-tenant write in these");
+            let message = err.to_string();
+            assert!(
+                message.contains(APP_SECRET_BACKEND_VAR),
+                "the refusal has to name the variable that would have worked: {message}"
+            );
+            assert!(
+                !message.contains("is not a known provider"),
+                "{value} IS a known provider, of the other tier; saying otherwise sends an \
+                 operator after a typo that is not there: {message}"
+            );
+        }
+        // A genuine typo still gets the generic message, which is the right one
+        // for it.
+        let typo = crate::secrets::SecretProviderKind::parse_name("databse")
+            .expect_err("a misspelling is still a misspelling");
+        assert!(
+            typo.to_string().contains("is not a known provider"),
+            "{typo}"
+        );
+    }
+
+    /// This module reads its OWN selector, once, and never the tenant tier's.
+    ///
+    /// PMS-1424 split the two. The second half of this assertion is the one that
+    /// matters: before the split, this module read `SECRET_BACKEND`, and the
+    /// consequence was that `file` and `environment` could not be selected on
+    /// any deployment that boots, because the tenant selector refuses them. A
+    /// future edit that reaches for the tenant tier's variable again brings that
+    /// back, so it fails here rather than in a deployment.
+    ///
+    /// Needles assembled at run time so this test's own source is not a hit.
     #[test]
     fn there_is_one_reader_of_the_provider_setting() {
         const SRC: &str = include_str!("mod.rs");
+        let own = concat!("var(APP_SECRET", "_BACKEND_VAR)");
         assert_eq!(
-            SRC.matches(concat!("var(\"SECRET", "_BACKEND\")")).count(),
+            SRC.matches(own).count(),
             1,
-            "SECRET_BACKEND is read in exactly one place in this module"
+            "APP_SECRET_BACKEND is read in exactly one place in this module"
+        );
+        let tenants = format!("var(\"{}\")", concat!("SECRET", "_BACKEND"));
+        assert_eq!(
+            SRC.matches(tenants.as_str()).count(),
+            0,
+            "this module must not read SECRET_BACKEND: it selects the TENANT tier, which accepts \
+             only database and infisical, so coupling to it is what made this tier's file and \
+             environment providers unselectable (PMS-1424)"
         );
     }
 
