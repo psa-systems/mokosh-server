@@ -219,7 +219,6 @@ One line per rule, linking its full text. A new convention adds its text under `
 - A database test is `#[mokosh_test]` ([PMS-1254](docs/invariants/ci-release.md#test-databases-pms-1254))
 - The SPA repository is `mokosh-apps` ([PMS-856](docs/invariants/ci-release.md#client-repo-pms-856))
 - Docker resources carry the app prefix ([details](docs/invariants/ci-release.md#docker-naming))
-- Dev stack binds to a private LAN IP ([details](docs/invariants/ci-release.md#lan-bind))
 
 ### Knowledge base
 
