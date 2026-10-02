@@ -68,6 +68,3 @@ Client repository name (PMS-856): the SPA repository is `mokosh-apps`, and the n
 
 Docker resource naming: every service/volume/network is prefixed with the app name; dev resources get an extra `dev-` prefix. Sub-service data stores sort adjacent to their parent (`dev-backup-infisical-postgres`, not `dev-backup-postgres-infisical`).
 
-## LAN bind
-
-Dev stack binds to a private LAN IP (br0/eth0), not 127.0.0.1, so sibling containers on the host can reach the API while the public internet cannot.
