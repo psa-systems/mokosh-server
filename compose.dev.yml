@@ -323,6 +323,12 @@ services:
       # reproduces the code's own fallback in SecretsConfig::from_env, so an
       # unset variable behaves the same here as it does in production.
       SECRET_BACKEND: ${SECRET_BACKEND:-database}
+      # PMS-1424: the APPLICATION tier's own selector. Separate from the line
+      # above, which selects the tenant tier: that one accepts only `database`
+      # and `infisical`, because a tenant secret is a per-tenant write, so
+      # pointing it at `file` stopped the boot while appearing to be the
+      # documented way to move SMTP_PASSWORD.
+      APP_SECRET_BACKEND: ${APP_SECRET_BACKEND:-database}
       # PMS-988: directory the application-tier file secret provider reads.
       # Empty means the file provider is not built; the `:-` default reproduces
       # the code's own behaviour when APP_SECRETS_DIR is unset.
