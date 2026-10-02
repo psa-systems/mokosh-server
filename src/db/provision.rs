@@ -41,6 +41,16 @@ const ADMIN_DATABASE_URL_VAR: &str = "MOKOSH_ADMIN_DATABASE_URL";
 const MIGRATOR_PASSWORD_VAR: &str = "MOKOSH_MIGRATOR_PASSWORD";
 /// Password set on the `mokosh_app` role when it is created.
 const APP_PASSWORD_VAR: &str = "MOKOSH_APP_PASSWORD";
+/// The connection string the request pool authenticates as `mokosh_app` with.
+/// Read here, not through the config seam, for the reason every other var in
+/// this file is: provisioning runs before configuration is built. Unset means
+/// the request pool uses `DATABASE_URL` too (`db::pool`), so there is no second
+/// credential to get wrong and the mismatch probe below is skipped.
+const APP_DATABASE_URL_VAR: &str = "MOKOSH_APP_DATABASE_URL";
+/// Postgres `invalid_password`. The ONLY error that means the stored password
+/// and the configured one disagree; anything else is a different problem and is
+/// not reported as this one.
+const INVALID_PASSWORD: &str = "28P01";
 
 /// Create the `mokosh_migrator` / `mokosh_app` roles if they do not yet exist.
 ///
@@ -75,6 +85,17 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
                 "DATABASE_URL connects but mokosh_app is missing or cannot log in; falling through to full provision via {ADMIN_DATABASE_URL_VAR}"
             );
         }
+        RolesProbe::AppPasswordMismatch => {
+            // Falls through to the same full provision path, which already
+            // ends with `ALTER ROLE mokosh_app ... PASSWORD`, so the
+            // reconciliation is the existing statement rather than a new one.
+            // Named separately only because the operator-facing message for a
+            // wrong password is not the message for a missing role.
+            tracing::warn!(
+                "mokosh_app exists but {APP_DATABASE_URL_VAR} cannot authenticate as it; \
+                 reconciling its password from {APP_PASSWORD_VAR} via {ADMIN_DATABASE_URL_VAR}"
+            );
+        }
         RolesProbe::MigratorCannotConnect => {
             // Fall through to the full provision path.
         }
@@ -86,10 +107,7 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
             // No admin credentials to create or reconcile the roles with. Fail
             // loud now rather than let the later request-pool connect fail with
             // a bare auth error.
-            return Err(AppError::Database(admin_unset_message(matches!(
-                probe,
-                RolesProbe::MigratorConnectsAppMissing
-            ))));
+            return Err(AppError::Database(admin_unset_message(&probe)));
         }
     };
 
@@ -196,6 +214,16 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
 enum RolesProbe {
     BothExist,
     MigratorConnectsAppMissing,
+    /// PMS-1423: `mokosh_app` exists and can log in, but not with the password
+    /// this deployment is configured to use.
+    ///
+    /// Invisible to every earlier probe, because all of them ask the MIGRATOR
+    /// connection about `pg_roles` and never try to authenticate as the app
+    /// role. A rotated or newly added `MOKOSH_APP_PASSWORD` therefore took the
+    /// fast path, and the request pool then failed with a bare
+    /// `password authentication failed for user "mokosh_app"` and the container
+    /// restart-looped, which is what nc-01 did on 2026-09-29 at 12:45 UTC.
+    AppPasswordMismatch,
     MigratorCannotConnect,
 }
 
@@ -247,7 +275,13 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
     pool.close().await;
 
     if app_can_login {
-        RolesProbe::BothExist
+        // PMS-1423: `pg_roles` says the role can log in. It does NOT say it can
+        // log in with OUR password, and nothing before this ever asked. So ask,
+        // once, with the credential the request pool is about to use.
+        match app_password_matches().await {
+            AppLogin::Unconfigured | AppLogin::Ok => RolesProbe::BothExist,
+            AppLogin::WrongPassword => RolesProbe::AppPasswordMismatch,
+        }
     } else {
         // Covers both "row missing" and "row exists but NOLOGIN". The
         // downstream branch runs the same ALTER either way, so one variant
@@ -260,6 +294,86 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
     }
 }
 
+/// What one authentication attempt as `mokosh_app` told us (PMS-1423).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AppLogin {
+    /// `MOKOSH_APP_DATABASE_URL` is unset, so the request pool shares
+    /// `DATABASE_URL` and there is no second credential to disagree.
+    Unconfigured,
+    /// It authenticated, so the stored password is the configured one.
+    Ok,
+    /// Postgres answered `28P01`.
+    WrongPassword,
+}
+
+/// Try one connection with `MOKOSH_APP_DATABASE_URL`.
+///
+/// Deliberately narrow: ONLY `28P01` counts as a mismatch. Every other failure
+/// is reported as `Ok`, which reads backwards until you consider what the
+/// alternative costs. A timeout, an unreachable host, a missing database or a
+/// `too many connections` would otherwise route a healthy deployment into the
+/// full provision path, which demands `MOKOSH_ADMIN_DATABASE_URL` and fails the
+/// boot when it is absent. That turns a transient blip into an outage, for a
+/// condition this function was not asked about. The migrator connected moments
+/// ago, so the host is reachable; anything that is not a wrong password is
+/// somebody else's problem to report, and the app pool will report it in its own
+/// words seconds later.
+///
+/// The password is never logged. The error is matched on its SQLSTATE rather
+/// than its text for the same reason: a Postgres auth error renders the role
+/// name and the message, and formatting the whole thing into a log line is how
+/// a credential ends up in one.
+async fn app_password_matches() -> AppLogin {
+    match std::env::var(APP_DATABASE_URL_VAR) {
+        Ok(url) if !url.trim().is_empty() => app_login_with(&url).await,
+        _ => AppLogin::Unconfigured,
+    }
+}
+
+/// The attempt itself, against an explicit URL.
+///
+/// Split from the env read so it can be driven against a real Postgres role
+/// without a test writing to process-global environment, which this repository
+/// avoids because `cargo test` shares one process across threads. The `from_env`
+/// / `resolve` split in `config` and `app_secrets` is the same shape.
+///
+/// `pub` rather than `pub(crate)` for the reason `AppSecrets::with_provider` is
+/// (PMS-1441): the test that matters here drives a REAL Postgres role, so it is
+/// an integration test, and an integration test links the library compiled
+/// without `cfg(test)`. The startup path does not call this directly; it goes
+/// through [`app_password_matches`].
+pub async fn app_login_with(url: &str) -> AppLogin {
+    match PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(url)
+        .await
+    {
+        Ok(pool) => {
+            pool.close().await;
+            AppLogin::Ok
+        }
+        Err(e) => {
+            let sqlstate = match &e {
+                sqlx::Error::Database(db) => db.code().map(|c| c.to_string()),
+                _ => None,
+            };
+            if sqlstate.as_deref() == Some(INVALID_PASSWORD) {
+                AppLogin::WrongPassword
+            } else {
+                // Named by code, not by rendering the error, so no connection
+                // string or credential reaches the log through this path.
+                tracing::debug!(
+                    sqlstate = sqlstate.as_deref().unwrap_or("none"),
+                    "mokosh_app login probe failed for a reason other than a wrong password; \
+                     treating the role as usable and leaving the app pool to report it"
+                );
+                AppLogin::Ok
+            }
+        }
+    }
+}
+
 /// PMS-1153: the error when role provisioning is needed and
 /// `MOKOSH_ADMIN_DATABASE_URL` is unset, told truthfully for each state.
 ///
@@ -268,21 +382,31 @@ async fn roles_probe(migrator_url: &str) -> RolesProbe {
 /// staging reached in September 2026, where `DATABASE_URL` connected fine and
 /// `mokosh_app` was the thing missing (and, after PMS-1163, present but
 /// `NOLOGIN`). An operator told the wrong problem fixes the wrong thing.
-fn admin_unset_message(database_url_connected: bool) -> String {
-    if database_url_connected {
-        format!(
+fn admin_unset_message(probe: &RolesProbe) -> String {
+    match probe {
+        // PMS-1423: a wrong password is not a missing role, and telling an
+        // operator to create `mokosh_app` when it already exists sends them to
+        // check the one thing that is fine. This names the two variables whose
+        // disagreement caused it.
+        RolesProbe::AppPasswordMismatch => format!(
+            "mokosh_app exists and can log in, but {APP_PASSWORD_VAR} is not the password it \
+             holds, so the request pool would fail with a bare authentication error; set \
+             {ADMIN_DATABASE_URL_VAR} to a privileged (superuser) connection string and the next \
+             boot reconciles the role's password from {APP_PASSWORD_VAR}, or set \
+             {APP_PASSWORD_VAR} to the password the role already has"
+        ),
+        RolesProbe::MigratorConnectsAppMissing => format!(
             "DATABASE_URL connects, but mokosh_app is missing or cannot log in, and \
              {ADMIN_DATABASE_URL_VAR} is unset; set {ADMIN_DATABASE_URL_VAR} to a privileged \
              (superuser) connection string so the server can create mokosh_app, or reconcile \
-             an existing one to LOGIN with MOKOSH_APP_PASSWORD. A hand-created NOLOGIN \
-             mokosh_app is not enough when MOKOSH_APP_DATABASE_URL logs in as it."
-        )
-    } else {
-        format!(
+             an existing one to LOGIN with {APP_PASSWORD_VAR}. A hand-created NOLOGIN \
+             mokosh_app is not enough when {APP_DATABASE_URL_VAR} logs in as it."
+        ),
+        RolesProbe::BothExist | RolesProbe::MigratorCannotConnect => format!(
             "mokosh_migrator cannot connect and {ADMIN_DATABASE_URL_VAR} is unset; set \
              {ADMIN_DATABASE_URL_VAR} to a privileged (superuser) connection string so the \
              server can create the mokosh_migrator / mokosh_app roles on first boot"
-        )
+        ),
     }
 }
 
@@ -321,7 +445,7 @@ mod tests {
     /// which is exactly the state staging reached.
     #[test]
     fn the_admin_unset_error_does_not_say_a_connection_failed_when_it_did_not() {
-        let connected = admin_unset_message(true);
+        let connected = admin_unset_message(&RolesProbe::MigratorConnectsAppMissing);
         assert!(!connected.contains("cannot connect"), "{connected}");
         assert!(
             connected.contains("mokosh_app is missing or cannot log in"),
@@ -330,11 +454,36 @@ mod tests {
         assert!(connected.contains("NOLOGIN"), "names the trap: {connected}");
         assert!(connected.contains(ADMIN_DATABASE_URL_VAR), "{connected}");
 
-        let first_boot = admin_unset_message(false);
+        let first_boot = admin_unset_message(&RolesProbe::MigratorCannotConnect);
         assert!(
             first_boot.contains("mokosh_migrator cannot connect"),
             "{first_boot}"
         );
+
+        // PMS-1423: the third state. A wrong password is not a missing role,
+        // and the message that says "mokosh_app is missing" sends an operator
+        // to check the one thing that is fine. It has to name both variables
+        // whose disagreement caused it, because fixing either one resolves it
+        // and only the operator knows which is right.
+        let mismatch = admin_unset_message(&RolesProbe::AppPasswordMismatch);
+        assert!(
+            mismatch.contains(APP_PASSWORD_VAR) && mismatch.contains(ADMIN_DATABASE_URL_VAR),
+            "names both variables: {mismatch}"
+        );
+        assert!(
+            !mismatch.contains("missing") && !mismatch.contains("cannot connect"),
+            "the role is present and connectable; saying otherwise is the PMS-1153 mistake \
+             again: {mismatch}"
+        );
+        for other in [
+            admin_unset_message(&RolesProbe::MigratorConnectsAppMissing),
+            admin_unset_message(&RolesProbe::MigratorCannotConnect),
+        ] {
+            assert_ne!(
+                other, mismatch,
+                "each probe state gets its own sentence, or the operator is told the wrong problem"
+            );
+        }
     }
 
     #[test]
