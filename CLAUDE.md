@@ -74,7 +74,7 @@ src/
   main.rs               mokosh-server entrypoint: AppConfig::from_env, build router
   lib.rs                library crate root
   api/router.rs         create_api_router: builds every /api/v1 nest (see "Routing model"), wires middleware + CORS
-  app_secrets/          AppSecretProviderKind: application-tier secrets (database, file, env, Infisical), chosen by SECRET_BACKEND (PMS-988)
+  app_secrets/          AppSecretProviderKind: application-tier secrets (database, file, env, Infisical), chosen by APP_SECRET_BACKEND (PMS-988, split from the tenant tier by PMS-1424)
   bin/mokosh-bootstrap.rs CLI: bootstrap-infisical, qa-seed/qa-teardown, normalize-company-industries
   cli/                  Operator subcommands mokosh-server dispatches before binding a port (PMS-494); providers.rs and verify.rs add the four provider subcommands (PMS-1012/1013)
   config/               ConfigProvider: the declared key registry and the one configuration read path (PMS-982)
