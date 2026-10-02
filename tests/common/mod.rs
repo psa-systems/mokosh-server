@@ -552,6 +552,13 @@ async fn boot_with_db(
                 }
             }
         },
+        // PMS-1414: a fresh feature-toggle snapshot per booted app, every
+        // feature off. Off is what a database with no rows means, so a suite
+        // that does not care about toggles sees the state a new deployment has.
+        // A suite that DOES care flips a row and reads the public probe, which
+        // is what `feature_toggles.rs` does: the snapshot is swapped by the
+        // write path, so no scheduler tick is needed in the harness.
+        mokosh_server::modules::features::FeatureSnapshot::default(),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0")

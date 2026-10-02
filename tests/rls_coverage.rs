@@ -101,6 +101,12 @@ const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
 ///   persona's credential lifecycle never intersects a tenant admin's identity.
 ///   Read on the pre-auth login path; every `PlatformAdminRepo::*` call site in
 ///   `src/modules/platform/service.rs` uses the migrator pool. PMS-1040.
+/// * `feature_toggles` - deployment-wide feature switches (PMS-1414). One row per
+///   switch for the whole installation, so there is no `tenant_id` for a policy
+///   to scope on and no per-tenant answer to give: a feature is finished or it is
+///   not. The same shape as `app_config` and `app_secrets` above, and read on the
+///   migrator pool behind `DeploymentOperator`. Per-tenant entitlement is
+///   `ModuleGate`, which is tenant-scoped and answers a different question.
 /// * `tenants` - the isolation root. It is the table every policy's `tenant_id`
 ///   points at, so it cannot itself be scoped by one; `TenantService` reaches it
 ///   on the migrator pool behind a `super_admin` route.
@@ -112,6 +118,7 @@ const TENANTLESS_WITHOUT_RLS: &[&str] = &[
     "_sqlx_migrations",
     "app_config",
     "app_secrets",
+    "feature_toggles",
     "identities",
     "mokosh_bunyip_grants",
     "platform_admins",

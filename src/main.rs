@@ -890,7 +890,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     provider_selection.record();
 
+    // PMS-1414: ONE feature-toggle snapshot, shared by the refresh job and both
+    // routers. Separate handles would mean the interval tick updated a copy the
+    // request paths never read, which is the failure mode that looks like the
+    // toggles not working at all.
+    //
+    // It starts every feature off, which is also what a database with no rows
+    // means, and the scheduler fires each job once immediately at startup, so the
+    // first real load happens before the port is bound rather than a minute in.
+    let features = mokosh_server::modules::features::FeatureSnapshot::default();
+
     let mut scheduler = mokosh_server::scheduler::Scheduler::new();
+    scheduler.register(
+        mokosh_server::modules::features::FeatureToggleRefresh::new(db.clone(), features.clone()),
+        std::time::Duration::from_secs(
+            mokosh_server::modules::features::job::REFRESH_INTERVAL_SECS,
+        ),
+    );
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
     // now run on the Scheduler too; the intervals match their former raw
     // `tokio::spawn(run_forever(..))` cadences.
@@ -1167,6 +1183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(contact_sync_wake),
         google_client,
         app_secrets,
+        features,
     );
     let router = psa_router;
 

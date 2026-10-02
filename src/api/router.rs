@@ -142,6 +142,10 @@ pub fn create_api_router(
     // against a database of its own, and the provider it would find is
     // whichever one initialised the global first.
     app_secrets: Arc<crate::app_secrets::AppSecrets>,
+    // PMS-1414: the process's feature-toggle snapshot. Passed rather than built
+    // here so `main` can hand the SAME handle to the refresh job: a router with
+    // its own copy would never see a flip made by the interval tick.
+    features: crate::modules::features::FeatureSnapshot,
 ) -> Router {
     let cors_matcher = CorsOriginMatcher::from_entries(&cors_origins);
     let mailer: Arc<dyn crate::utils::email::Mailer> = shared_mailer.clone();
@@ -661,6 +665,12 @@ pub fn create_api_router(
             google_client.clone(),
             app_secrets,
         ))
+        // PMS-1414: feature toggles, deployment-wide and operator-gated, in the
+        // same family as the email relay and the product name above.
+        .merge(crate::modules::features::routes::feature_routes(
+            db.clone(),
+            features.clone(),
+        ))
         // Audit log read. PMS-118.
         .merge(audit_routes(audit_service))
         // BUNYIP-475: advisory ASN / VPN enrichment lookup (admin-gated),
@@ -932,6 +942,13 @@ pub fn create_api_router(
     // identity, and it resolves its own tenant. Same envelope normalization as
     // the other trees so a 400 here looks like a 400 anywhere else.
     let public_api = Router::new()
+        // PMS-1414: what a client needs to know about the deployment BEFORE it
+        // has a session. Public because a feature gating part of the sign-in
+        // path could never be gated by a map that required signing in first; it
+        // publishes keys and booleans only, never a row's metadata.
+        .merge(crate::modules::features::routes::public_config_routes(
+            features.clone(),
+        ))
         // PMS-1212 (PSA-70): the OAuth redirect Google sends an admin's
         // browser to. Unauthenticated by construction - a redirect carries no
         // session - and its credential is the single-use `state` parameter,
