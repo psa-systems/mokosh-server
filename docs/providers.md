@@ -29,8 +29,11 @@ integration rather than per deployment as infrastructure, so they do not appear 
 (PMS-988) is Mokosh's application-tier `AppSecretProvider`, with a `GovernedSecret` registry holding `SMTP_PASSWORD`
 and, since PMS-1430, the host's Google OAuth client id and secret. A pair like that one joins as TWO entries rather
 than one holding two values: both halves then resolve from the same provider, and the four-way classification reports
-each separately, which is what makes a half-configured host a boot error naming the key that is missing. Its selection variable is `SECRET_BACKEND`,
-the same variable the tenant tier reads: both tiers pick the same provider on purpose.
+each separately, which is what makes a half-configured host a boot error naming the key that is missing. Its selection
+variable is `APP_SECRET_BACKEND`, and NOT the tenant tier's `SECRET_BACKEND`: PMS-1424 split them, because this tier
+accepts all four providers while the tenant tier accepts only `database` and `infisical`. A tenant secret is a
+per-tenant write, which a read-only file or environment provider cannot hold, so sharing one variable made two of this
+tier's providers unselectable on any deployment that boots.
 [ROADMAP.md](ROADMAP.md) links the phase, and the issue, for every kind.
 
 ## The three tiers
@@ -261,8 +264,9 @@ the active profile and every deviation from it.
 ### What the hosted deployments actually declare (PMS-1440)
 
 `saas` is not a synonym for "the managed services". Its default for `ProviderKind::Secrets` is the DATABASE, and
-`SECRET_BACKEND` is unset on both hosted deployments, so both serve their application-tier and tenant-tier secrets
-from Postgres, encrypted under `ENCRYPTION_KEY`. Neither serves them from Infisical.
+`SECRET_BACKEND` and `APP_SECRET_BACKEND` are both unset on both hosted deployments, so both tiers serve their
+secrets from Postgres, encrypted under `ENCRYPTION_KEY`. Neither serves them from Infisical. (Before PMS-1424 one
+variable selected both tiers, so the sentence was shorter and the conclusion was the same.)
 
 Both boxes do carry the full `INFISICAL_*` set in their SOPS compose secrets, which is construction input, not
 selection. The providers are therefore BUILT, surveyed at boot, and never asked for a value. An Infisical reachable
@@ -282,10 +286,12 @@ Two rules follow, and both are enforceable rather than advisory:
 - Write through `mokosh-server provider-set` (PMS-1441) or the Settings page (PMS-1444). Both write to the declared
   provider and refuse rather than fall back, which is what makes them safe to run without first checking.
 
-Whether the hosted deployment SHOULD declare Infisical is open. It is not a flag flip: `SECRET_BACKEND` selects both
-tiers at once by design, `provider-migrate` moves the application tier only, and tenant secrets in Postgres include
-every TOTP secret (PMS-1055) and every contact-sync refresh token, so flipping it with those unmigrated makes them
-unreadable. BUNYIP-855 is the design discussion, and a tenant-tier migrator is the missing piece.
+Whether the hosted deployment SHOULD declare Infisical is open, and PMS-1424 makes the two halves separable: the
+APPLICATION tier can move on its own with `APP_SECRET_BACKEND`, which is what `provider-migrate` already supports.
+The TENANT tier is the part that is not a flag flip, because tenant secrets in Postgres include every TOTP secret
+(PMS-1055) and every contact-sync refresh token, `provider-migrate` moves the application tier only, and flipping
+`SECRET_BACKEND` with those unmigrated makes them unreadable. BUNYIP-855 is the design discussion, and a tenant-tier
+migrator is the missing piece.
 
 ## Authentication, and what its modes are called
 

@@ -16,11 +16,37 @@ provider. The shape is identical for any pair the two tiers accept
 - The deployment is up and healthy today. Everything below runs against
   the running deployment; making a failed boot the discovery mechanism is
   what this whole workflow exists to prevent.
-- `SECRET_BACKEND=database` right now, and `SMTP_PASSWORD` lives in
-  `app_secrets` (see migration 207).
+- `APP_SECRET_BACKEND` is unset or `database` right now, and `SMTP_PASSWORD`
+  already lives in `app_secrets`. **On a fresh deployment it does not**: nothing
+  imports a plain `SMTP_PASSWORD` environment value, since the environment
+  provider reads `SMTP_PASSWORD_FILE` only (BUNYIP-38's `docker inspect`
+  protection). Seed it first, below.
 - The new provider's construction inputs are already present in the
   environment (for the file provider that is `APP_SECRETS_DIR` pointing at
   a mounted directory).
+
+## First install: getting `SMTP_PASSWORD` into a provider at all
+
+Skip this if `provider-status` already shows `SMTP_PASSWORD` held somewhere. On a
+fresh deployment it is held nowhere, and the reason is deliberate: the
+environment provider reads `SMTP_PASSWORD_FILE` and never a plain
+`SMTP_PASSWORD`, so a value in `compose-secrets.yml` is invisible to this tier.
+
+One command, from the deployment's directory (PMS-1441):
+
+```
+MOKOSH_SECRET_INPUT=<the relay password> \
+  mokosh-server provider-set --secret SMTP_PASSWORD --from-env MOKOSH_SECRET_INPUT
+```
+
+`provider-set` writes to the provider the deployment DECLARES and refuses rather
+than falling back, so it cannot put the value somewhere the next boot would call
+`Misplaced`. Then restart: an application-tier secret is read once per process.
+
+The older route, for a deployment that already has the value in a file, is
+`provider-migrate --from file --to database` with `APP_SECRETS_DIR` pointing at
+it. That needs the file provider built, which is what step 1 below does, and it
+never clears the source, so remove the file afterwards.
 
 ## Step 1: enable the new provider at a higher priority
 
@@ -31,8 +57,14 @@ environment (`docs/providers.md`, "Where each is configured"). Set:
 APP_SECRETS_DIR=/run/secrets/app
 ```
 
-Leave `SECRET_BACKEND=database` for now. Restart the process so the file
+Leave `APP_SECRET_BACKEND` as it is for now. Restart the process so the file
 provider is built at boot beside the database one. Boot logs report both.
+
+Note which variable this is. `APP_SECRET_BACKEND` selects the APPLICATION tier
+and accepts all four providers; `SECRET_BACKEND` selects the TENANT tier and
+accepts only `database` and `infisical`, because a tenant secret is a per-tenant
+write that a read-only provider cannot hold. Until PMS-1424 this runbook told
+you to set `SECRET_BACKEND=file`, which would have stopped the boot.
 
 ## Step 2: check what each provider holds
 
@@ -84,7 +116,9 @@ so above; re-run it before going further.
 
 ## Step 5: cut over
 
-Change `SECRET_BACKEND=file` in the operator's environment and restart.
+Change `APP_SECRET_BACKEND=file` in the operator's environment and restart.
+Leave `SECRET_BACKEND` alone: it governs the tenant tier and has nothing to do
+with where `SMTP_PASSWORD` lives.
 Boot logs report the new selection; `provider-status` now shows:
 
 ```
@@ -107,7 +141,7 @@ mokosh-server provider-purge --provider database
 The default is dry-run. The output lists every key the command WOULD
 delete, refusing per key unless both:
 
-1. The provider being purged is DISABLED (not selected as `SECRET_BACKEND`
+1. The provider being purged is DISABLED (not selected as `APP_SECRET_BACKEND`
    any more).
 2. The key is verified LIVE in the provider now serving it.
 
@@ -128,6 +162,6 @@ finished; fix the refusal and re-run.
 ## Rollback
 
 Up to and including step 4 the source still holds the value, so switching
-`SECRET_BACKEND` back to the old provider and restarting is enough. After
+`APP_SECRET_BACKEND` back to the old provider and restarting is enough. After
 step 6 with `--confirm` the old copy is gone, so a rollback needs another
 `provider-migrate --from file --to database` first.
