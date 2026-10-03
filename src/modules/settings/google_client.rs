@@ -171,7 +171,7 @@ pub async fn put_google_client(
             format!(
                 "cannot be stored: this deployment declares the {declared} secret provider, which \
                  the application cannot write, so set GOOGLE_CONTACTS_CLIENT_ID_FILE and \
-                 GOOGLE_CONTACTS_CLIENT_SECRET_FILE, or point SECRET_BACKEND at a provider that \
+                 GOOGLE_CONTACTS_CLIENT_SECRET_FILE, or point APP_SECRET_BACKEND at a provider that \
                  accepts writes"
             ),
         ));
