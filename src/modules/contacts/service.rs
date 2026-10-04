@@ -4971,7 +4971,7 @@ mod tests {
     use validator::Validate;
 
     // These live in the server crate, not `mokosh-types`, because `cargo test
-    // --lib` (the pre-commit and check.yml gate) only builds the root package's
+    // --lib` (the pre-push and check.yml gate) only builds the root package's
     // lib target. The `mokosh-types` test target does not compile today, which
     // is tracked separately; mirroring the PMS-806 rules here means they are
     // actually enforced on every run.

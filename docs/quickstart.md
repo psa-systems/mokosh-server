@@ -16,7 +16,7 @@ You need:
 - `docker compose` v2 (the `compose` subcommand, not legacy `docker-compose`).
 - The shared Traefik ingress network `network-traefik-public`. `compose.dev.yml` attaches to it as an `external` network, so `just dev` fails immediately if it does not exist.
 
-The shared `just` recipes (`pre-commit`, `install-hooks`, `create-release`) come
+The shared `just` recipes (`pre-commit`, `pre-push`, `install-hooks`, `create-release`) come
 from `psa-systems/common`, vendored as the `common` submodule (PMS-786), so a
 fresh clone needs it fetched before `just` can parse the justfile at all:
 
@@ -200,7 +200,8 @@ just dev-clean               # stop + drop this repo's volumes + target/ + .env 
 just dev-clean-all           # everything dev-clean does, plus this repo's images and its buildx cache
 
 just check                   # every check.yml step except its cargo test steps (run before pushing)
-just pre-commit              # the unit tests `just check` leaves out, plus fmt/clippy/compile (doc tests are CI-only, PMS-786)
+just pre-commit              # fmt-only check plus check-tree-ownership, runs on every commit
+just pre-push                 # the unit tests `just check` leaves out, plus fmt/clippy/compile; runs on every push (doc tests are CI-only, PMS-786)
 just test                    # cargo test workspace-wide
 just test-integration        # the Postgres-backed tests/*.rs suite
 just fmt                     # cargo fmt --all

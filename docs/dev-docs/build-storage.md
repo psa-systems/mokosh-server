@@ -12,7 +12,7 @@ artifacts go.
 
 | How it is run | Target directory | Filesystem |
 | --- | --- | --- |
-| `just check`, `just pre-commit`, `just test-integration`, anything in the dev container | `/app/target`, the `dev-mokosh-server-target-${USER}` volume | Docker's storage directory, which on desktop-02 is `/srv/d4/docker-daemon` on one of the drives added in August 2026 |
+| `just check`, `just pre-commit`, `just pre-push`, `just test-integration`, anything in the dev container | `/app/target`, the `dev-mokosh-server-target-${USER}` volume | Docker's storage directory, which on desktop-02 is `/srv/d4/docker-daemon` on one of the drives added in August 2026 |
 | `cargo` run directly in a checkout on the host | `<repo>/target` | Whatever the checkout sits on, which on desktop-02 is `/home` |
 
 Both are disk-backed on desktop-02 as of 2026-09-27, and `CARGO_TARGET_DIR` is

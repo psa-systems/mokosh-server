@@ -8,7 +8,7 @@
 //! proving cross-table FK remap (over deferrable constraints, migration 088)
 //! over the full tenant dataset - and that no secret column leaked into the
 //! export. Runs against
-//! Postgres in CI (`integration.yml`); the local `--lib` pre-commit only
+//! Postgres in CI (`integration.yml`); the local `--lib` pre-push only
 //! compiles it. Uses unique names so it is robust to the tenant's pre-seeded
 //! sample rows (no exact-count assertions).
 
