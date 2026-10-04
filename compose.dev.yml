@@ -585,7 +585,7 @@ services:
       # cannot find the file, and fails the workspace compile.
       - ./build.rs:/app/build.rs
       - ./migrations:/app/migrations
-      # PMS-640: mount the integration tests so `just pre-commit`'s
+      # PMS-640: mount the integration tests so `just pre-push`'s
       # `cargo {check,clippy} --all-targets` inside this container compiles the
       # tests/*.rs binaries. Without this the container never sees tests/, so a
       # harness-breaking signature change (e.g. create_api_router) passed the
@@ -597,7 +597,7 @@ services:
       # literal above what the API serves and fails loudly when the directory is
       # absent, on purpose: a guard that skips when it cannot see its subject
       # proves nothing. CI checks the whole repository out and passed; the
-      # container mounts the tree file by file, so `just pre-commit` failed on a
+      # container mounts the tree file by file, so `just pre-push` failed on a
       # missing directory rather than on anything a developer had changed.
       - ./e2e:/app/e2e:ro
       # PMS-1183: the nextest profile `just test-integration` names

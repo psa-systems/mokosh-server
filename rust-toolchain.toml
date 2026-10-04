@@ -3,8 +3,8 @@
 # `rust-builder-glibc:v1.2.0-rust1.98.1-trixie` (dev `Dockerfile`) and
 # `rust-builder-musl:v1.1.0-rust1.98.1-alpine` (`oci-build/Dockerfile`). The two
 # tags move independently. This keeps the rustfmt/clippy that
-# `just check`, the `just pre-commit` hook, and CI run identical, so formatting
-# done in the dev container always passes CI.
+# `just check`, the `just pre-commit` and `just pre-push` hooks, and CI run
+# identical, so formatting done in the dev container always passes CI.
 #
 # rustfmt/clippy output is version-sensitive: an unpinned CI runner with a newer
 # rustfmt silently rejected dev-container-clean code on 2026-06-18 (PMS-399,

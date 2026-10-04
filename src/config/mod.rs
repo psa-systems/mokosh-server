@@ -639,7 +639,7 @@ pub(crate) fn refresh_test_lock() -> std::sync::MutexGuard<'static, ()> {
 /// all - and an optional key's line is `KEY: ${KEY:-}`. A forwarded-but-unset
 /// variable arrives as an empty string, and `get` answers `Some("")` for a
 /// blank value by design, so inside that container the key IS held. That is
-/// how `just pre-commit` came to fail on `main` for every developer while CI
+/// how `just pre-push` came to fail on `main` for every developer while CI
 /// stayed green: `check.yml` runs the tests on the runner, where no such
 /// variable exists.
 ///

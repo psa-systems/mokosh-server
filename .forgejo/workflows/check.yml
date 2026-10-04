@@ -14,7 +14,7 @@
 #
 # The steps below are spelled out rather than delegated to `just`, so they drift
 # from the local recipes silently. `just check` covers every step here except
-# the two cargo test ones, and `just pre-commit` covers those plus fmt / clippy
+# the two cargo test ones, and `just pre-push` covers those plus fmt / clippy
 # / compile; running both locally covers this workflow. Keep the three in step
 # and record any deliberate difference in docs/dev-docs/local-vs-ci-checks.md
 # (PMS-851).

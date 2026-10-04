@@ -40,10 +40,11 @@ compile_args := "--workspace --all-targets"
 
 # `--workspace --lib` is what the forked recipe ran for unit tests. Its SECOND
 # test step, `cargo test --workspace --doc`, has no expression here: common's
-# pre-commit runs exactly one `cargo test {{ test_args }}`, and cargo refuses
-# `--lib --doc` in one invocation. Doc tests therefore run in CI (check.yml's
-# `Doc tests` step) and no longer in the hook; PC-70 asks common for the second
-# invocation, and this line goes back to carrying both when it lands.
+# full suite (`just pre-push` under the default `hook_layout`) runs exactly one
+# `cargo test {{ test_args }}`, and cargo refuses `--lib --doc` in one
+# invocation. Doc tests therefore run in CI (check.yml's `Doc tests` step) and
+# no longer in the hook; PC-70 asks common for the second invocation, and this
+# line goes back to carrying both when it lands.
 test_args := "--workspace --lib"
 
 # `dev_extra_volumes` is deliberately unset: it configures common's `dev-clean`,
@@ -64,7 +65,7 @@ default:
 # -- Checks ----------------------------------------------------------------------
 
 # Every check.yml step except its two cargo test steps: every repo guard step
-# plus compile, clippy and fmt. `just pre-commit` runs the unit and doc
+# plus compile, clippy and fmt. `just pre-push` runs the unit and doc
 # tests, so the two recipes together cover check.yml and neither covers it alone
 # (PMS-851; per-step mapping in docs/dev-docs/local-vs-ci-checks.md).
 #
