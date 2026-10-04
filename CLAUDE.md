@@ -33,8 +33,9 @@ just check-single-build    # fail if a compiling workflow builds the same tree t
 just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
 just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
-just install-hooks         # install the git pre-commit hook -> runs `just pre-commit` (from common)
-just pre-commit            # check.yml's cargo steps except doc tests: fmt/clippy/compile/unit, in the dev container
+just install-hooks         # install the git pre-commit and pre-push hooks -> run `just pre-commit` and `just pre-push` (from common)
+just pre-commit            # fmt check plus check-tree-ownership only; the full suite moved to `just pre-push`
+just pre-push              # check.yml's cargo steps except doc tests: fmt/clippy/compile/unit, in the dev container
 just build                 # cargo build --release --bins
 just migrate-run           # sqlx migrate run against $DATABASE_URL
 just migrate-create <name> # new migration in migrations/
@@ -42,9 +43,9 @@ just check-docker          # validate OCI image builder stage (NOT part of `just
 just build-docker          # build production OCI image (oci-build/Dockerfile)
 ```
 
-`just check` and `just pre-commit` are complements: together they cover `check.yml` except its doc tests. `pre-commit`, `install-hooks` and `create-release` come from the `common` submodule, so a fresh clone runs `git submodule update --init` first. Details: [local vs CI checks](docs/dev-docs/local-vs-ci-checks.md#how-the-two-recipes-relate).
+`just check` and `just pre-push` are complements: together they cover `check.yml` except its doc tests. `pre-commit`, `pre-push`, `install-hooks` and `create-release` come from the `common` submodule, so a fresh clone runs `git submodule update --init` first. Details: [local vs CI checks](docs/dev-docs/local-vs-ci-checks.md#how-the-two-recipes-relate).
 
-Adding a step to `check.yml` means adding the matching recipe to `just check` (or `just pre-commit`), the row in that file, and its line in `docs/recipes.md`.
+Adding a step to `check.yml` means adding the matching recipe to `just check` (or `just pre-push`), the row in that file, and its line in `docs/recipes.md`.
 
 Single test: `cargo test -p <crate> <test_name>` (workspace), e.g. `cargo test -p mokosh-server utils::totp::tests::rfc6238_vector`.
 
