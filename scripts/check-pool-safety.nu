@@ -9,7 +9,7 @@
 # isolation root, migration 038) or a pre-auth / cross-tenant path, and must
 # carry an adjacent `// SAFETY (PMS-285` note saying why. This gate fails a PR
 # that adds a bare `.pool()` serving call without that note - mirroring how
-# check-migration-immutability.nu is wired into check.yml.
+# check-migration-immutability is wired into check.yml.
 #
 # `migrator_pool()` is the sanctioned BYPASSRLS accessor and is exempt. The
 # `Database` accessors themselves are defined in src/db/pool.rs and are skipped.

@@ -139,15 +139,6 @@ check-env-example:
 check-migrations:
     nu scripts/check-migration-prefixes.nu
 
-# Enforce migration immutability (DEV-395). sqlx re-verifies applied-migration
-# checksums on boot, so editing one stops every deployed database. Needs
-# origin/main fetched with history (check.yml clones with fetch-depth: 0); run
-# `git fetch origin main` first on a shallow clone.
-[doc("Fail if a migration already on main is modified, renamed, or deleted (DEV-395).")]
-[group: 'check']
-check-migration-immutability:
-    nu scripts/check-migration-immutability.nu
-
 # Keep a guarded content UPDATE from matching zero rows in silence (PMS-1117).
 # A migration after prefix 209 that guards a WHERE clause on a content-column
 # literal (e.g. notification_templates.subject) must also assert its own
