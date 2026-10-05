@@ -1,4 +1,10 @@
 //! Ticket API routes
+//!
+//! parity record 2026-10-05: `/saved-views` and `/saved-views/{id}` have no
+//! SPA caller yet. They land first (slice 1 of MAPPS-998) so the mokosh-apps
+//! pin can pick them up; the SPA Views Select, save modal and per-view
+//! rename/delete controls land in slice 2 under the same ticket as soon as
+//! this merges and the pin bumps. Note covers ONLY the saved-views routes.
 
 use crate::utils::json::Json;
 use axum::{
