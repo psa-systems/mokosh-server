@@ -276,6 +276,16 @@ declare_keys! {
     Application ADMIN_PASSWORD = "ADMIN_PASSWORD";
     Application LOGIN_APPROVAL_ENABLED = "LOGIN_APPROVAL_ENABLED";
 
+    /// PMS-1457: let a bunyip-authenticated identity with a verified email
+    /// JIT-provision a personal tenant on first sight, rather than taking the
+    /// MAPPS-458 refusal (`middleware::handle_bunyip_placement`). Off in
+    /// production (invite-only onboarding, the current main behaviour) and
+    /// explicitly turned on in the staging compose so a brand-new signup can
+    /// reach the mokosh instance without an admin issuing an invite first.
+    /// Verified-email is a hard requirement at the gate; this flag never
+    /// relaxes it.
+    Application ALLOW_UNINVITED_BUNYIP_SIGNUP = "ALLOW_UNINVITED_BUNYIP_SIGNUP";
+
     /// PMS-1193 / BUNYIP-641: the Bunyip machine-credential client_id this
     /// deployment accepts on the admin provider-status routes. Set together
     /// with `BUNYIP_STATUS_CLIENT_SECRET`; when either is unset the machine-
