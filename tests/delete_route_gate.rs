@@ -22,6 +22,10 @@ const EXEMPT: &[(&str, &str)] = &[
         "soft_delete_team",
         "admin or the team's own manager_id, inline via assert_can_manage_team",
     ),
+    (
+        "delete_ticket_saved_view",
+        "owner-scoped: the service matches on (tenant_id, user_id) so a view id this user does not own answers 404",
+    ),
 ];
 
 fn handler_names(src: &str) -> Vec<String> {

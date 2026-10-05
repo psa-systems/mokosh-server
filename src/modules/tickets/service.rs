@@ -2958,6 +2958,172 @@ impl TicketService {
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
+
+    // ========================================================================
+    // MAPPS-998: per-user saved views for the Tickets list.
+    //
+    // Every method scopes on `(tenant_id, user_id)`: the UNIQUE on
+    // `(tenant_id, user_id, name)` is per-user, and a view id this user does
+    // not own answers 404 rather than 403 so a cross-user caller cannot use
+    // the endpoint as an existence oracle. RLS handles the tenant half.
+    // ========================================================================
+
+    /// List this user's saved views for the Tickets list, name-ascending so
+    /// a dashboard reads deterministically.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, user_id = %user_id))]
+    pub async fn list_ticket_saved_views(
+        &self,
+        tenant_id: TenantId,
+        user_id: Uuid,
+    ) -> AppResult<Vec<mokosh_types::tickets::TicketSavedView>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<TicketSavedViewRow> = sqlx::query_as(
+            r#"
+            SELECT id, tenant_id, user_id, name, filter, sort, created_at, updated_at
+            FROM ticket_saved_views
+            WHERE tenant_id = $1 AND user_id = $2
+            ORDER BY name ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Save a new view for this user. Name collision inside this user's set
+    /// is a 409, so the SPA can render an inline error on the name field.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, user_id = %user_id))]
+    pub async fn create_ticket_saved_view(
+        &self,
+        tenant_id: TenantId,
+        user_id: Uuid,
+        request: mokosh_types::tickets::CreateTicketSavedViewRequest,
+    ) -> AppResult<mokosh_types::tickets::TicketSavedView> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as::<_, TicketSavedViewRow>(
+            r#"
+            INSERT INTO ticket_saved_views (tenant_id, user_id, name, filter, sort)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, tenant_id, user_id, name, filter, sort, created_at, updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(request.name.trim())
+        .bind(request.filter)
+        .bind(request.sort)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db_err) if db_err.is_unique_violation() => {
+                AppError::conflict("A saved view with that name already exists.")
+            }
+            other => AppError::from(other),
+        })?;
+
+        tx.commit().await?;
+        Ok(row.into())
+    }
+
+    /// Rename a view, overwrite its filter or sort, or any combination. A
+    /// view id this user does not own answers 404.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, user_id = %user_id, view_id = %view_id))]
+    pub async fn update_ticket_saved_view(
+        &self,
+        tenant_id: TenantId,
+        user_id: Uuid,
+        view_id: Uuid,
+        request: mokosh_types::tickets::UpdateTicketSavedViewRequest,
+    ) -> AppResult<mokosh_types::tickets::TicketSavedView> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as::<_, TicketSavedViewRow>(
+            r#"
+            UPDATE ticket_saved_views
+            SET name       = COALESCE($4, name),
+                filter     = COALESCE($5, filter),
+                sort       = COALESCE($6, sort),
+                updated_at = NOW()
+            WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+            RETURNING id, tenant_id, user_id, name, filter, sort, created_at, updated_at
+            "#,
+        )
+        .bind(view_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(request.name.as_deref().map(str::trim))
+        .bind(request.filter)
+        .bind(request.sort)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(ref db_err) if db_err.is_unique_violation() => {
+                AppError::conflict("A saved view with that name already exists.")
+            }
+            other => AppError::from(other),
+        })?
+        .ok_or_else(|| AppError::not_found("Saved view not found."))?;
+
+        tx.commit().await?;
+        Ok(row.into())
+    }
+
+    /// Delete a view. A view id this user does not own answers 404.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, user_id = %user_id, view_id = %view_id))]
+    pub async fn delete_ticket_saved_view(
+        &self,
+        tenant_id: TenantId,
+        user_id: Uuid,
+        view_id: Uuid,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let affected = sqlx::query(
+            "DELETE FROM ticket_saved_views WHERE id = $1 AND tenant_id = $2 AND user_id = $3",
+        )
+        .bind(view_id)
+        .bind(tenant_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        if affected == 0 {
+            return Err(AppError::not_found("Saved view not found."));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+/// Column projection for `ticket_saved_views`. `filter` and `sort` are JSONB
+/// in the database and carried through as `serde_json::Value`.
+#[derive(sqlx::FromRow)]
+struct TicketSavedViewRow {
+    id: Uuid,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    name: String,
+    filter: serde_json::Value,
+    sort: serde_json::Value,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<TicketSavedViewRow> for mokosh_types::tickets::TicketSavedView {
+    fn from(row: TicketSavedViewRow) -> Self {
+        Self {
+            id: row.id,
+            tenant_id: row.tenant_id,
+            user_id: row.user_id,
+            name: row.name,
+            filter: row.filter,
+            sort: row.sort,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
 }
 
 /// One filter value, bound to both the data and count query in the
