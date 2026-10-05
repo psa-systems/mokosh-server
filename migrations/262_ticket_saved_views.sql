@@ -43,6 +43,7 @@ CREATE INDEX idx_ticket_saved_views_owner
     ON ticket_saved_views (tenant_id, user_id);
 
 ALTER TABLE ticket_saved_views ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ticket_saved_views FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON ticket_saved_views
     USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
     WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
