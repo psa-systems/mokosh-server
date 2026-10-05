@@ -464,6 +464,11 @@ services:
       # 1/true/yes or 0/false/no to override.
       ORGANIZATIONS_ENABLED: ${ORGANIZATIONS_ENABLED:-}
 
+      # Let a verified bunyip identity JIT-provision a personal tenant on
+      # first sight. Off by default; staging opts in. Parses the same way
+      # as LOGIN_APPROVAL_ENABLED.
+      ALLOW_UNINVITED_BUNYIP_SIGNUP: ${ALLOW_UNINVITED_BUNYIP_SIGNUP:-}
+
       # PMS-904: self-hosted (default) or saas. Empty means unset, which the
       # code resolves to self-hosted, so the dev stack sends every email.
       MOKOSH_DEPLOYMENT_MODE: ${MOKOSH_DEPLOYMENT_MODE:-}

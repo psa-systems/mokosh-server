@@ -276,6 +276,13 @@ declare_keys! {
     Application ADMIN_PASSWORD = "ADMIN_PASSWORD";
     Application LOGIN_APPROVAL_ENABLED = "LOGIN_APPROVAL_ENABLED";
 
+    /// Opts in to JIT-provisioning a personal tenant for a first-sight
+    /// bunyip identity whose email the OP has verified. Off by default so
+    /// production stays invitation-only; staging turns it on explicitly.
+    /// Verified-email is a hard requirement at the gate; this flag never
+    /// relaxes it.
+    Application ALLOW_UNINVITED_BUNYIP_SIGNUP = "ALLOW_UNINVITED_BUNYIP_SIGNUP";
+
     /// PMS-1193 / BUNYIP-641: the Bunyip machine-credential client_id this
     /// deployment accepts on the admin provider-status routes. Set together
     /// with `BUNYIP_STATUS_CLIENT_SECRET`; when either is unset the machine-
