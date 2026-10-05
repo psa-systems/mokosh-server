@@ -234,27 +234,17 @@ pub static LOGIN_APPROVAL_ENABLED: Flag<bool> = Flag::new(
     FlagDefault::Constant(false),
 );
 
-/// PMS-1457: let a bunyip-authenticated identity with a verified email
-/// JIT-provision a personal tenant on first sight.
+/// Opts in to JIT-provisioning a personal tenant for a first-sight bunyip
+/// identity whose email the OP has verified. Off by default so production
+/// stays invitation-only; staging opts in through its compose.
 ///
-/// Off by default in both hosting profiles. The gate at
-/// [`crate::modules::auth::middleware::handle_bunyip_placement`] stays on
-/// MAPPS-458's invitation-only policy for production (nc-01), where a mokosh
-/// seat sits behind a paid membership and silent JIT would hand it out. The
-/// staging compose (c-01) turns the flag on so a brand-new signup on bunyip
-/// can reach their own mokosh instance without an admin issuing an invite
-/// first.
+/// `FlagDefault::Constant(false)` rather than a per-profile default: both
+/// hosting profiles use `saas`, so a profile default would pick the wrong
+/// policy for one of them. Opt-in is explicit per deployment.
 ///
-/// `FlagDefault::Constant(false)` rather than a per-profile default: staging
-/// and production both run `MOKOSH_DEPLOYMENT_MODE=saas`, so a profile default
-/// picks the wrong policy for exactly one of them. Opt-in is explicit per
-/// deployment.
-///
-/// The verified-email conjunction is enforced AT THE GATE, not here: this
-/// flag opens the door for a first-sight identity, and the gate still refuses
-/// one whose email the OP has not verified (that was the hole
-/// `b7aa8af4 fix(auth): restore the MAPPS-458 reject and drop the staging
-/// bypass` closed and this change keeps closed).
+/// The verified-email conjunction lives at the gate, not here: this flag
+/// opens the door for a first-sight identity, and the gate still refuses
+/// one whose email the OP has not verified.
 pub static ALLOW_UNINVITED_BUNYIP_SIGNUP: Flag<bool> = Flag::new(
     &registry::ALLOW_UNINVITED_BUNYIP_SIGNUP,
     FlagDefault::Constant(false),

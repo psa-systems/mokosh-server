@@ -185,13 +185,11 @@ async fn uninvited_bunyip_user_without_invite_is_rejected(pool: PgPool) {
     );
 }
 
-/// PMS-1457: with `ALLOW_UNINVITED_BUNYIP_SIGNUP=true`, an uninvited
-/// first-sight identity whose email the OP has VERIFIED is placed in a
-/// personal tenant, matching the staging policy. The gate stays on
-/// `email_verified`; a `sub` resolves to a `users` row and `tenants` row
-/// without any invitation ever being issued. The flag is set at the start of
-/// the case and cleared at the end, so sibling tests on this binary (which
-/// share the process environment) see the default policy.
+/// With `ALLOW_UNINVITED_BUNYIP_SIGNUP=true`, an uninvited first-sight
+/// identity whose email the OP has VERIFIED is placed in a personal tenant.
+/// The flag is set at the start of the case and cleared at the end, so
+/// sibling tests on this binary (which share the process environment) see
+/// the default policy.
 #[mokosh_test]
 async fn verified_signup_passes_the_gate_when_the_flag_is_on(pool: PgPool) {
     std::env::set_var("ALLOW_UNINVITED_BUNYIP_SIGNUP", "true");
@@ -238,9 +236,9 @@ async fn verified_signup_passes_the_gate_when_the_flag_is_on(pool: PgPool) {
     mokosh_server::config::refresh();
 }
 
-/// PMS-1457: the flag opens the door, but the gate still refuses an
-/// identity whose email the OP has NOT verified. This is the hole b7aa8af4
-/// restored MAPPS-458 to close, and the flag never relaxes it.
+/// The flag opens the door, but the gate still refuses an identity whose
+/// email the OP has NOT verified. An escape hatch that does not require a
+/// verified email accepts any Bunyip token holding an unverified address.
 #[mokosh_test]
 async fn unverified_signup_is_rejected_even_when_the_flag_is_on(pool: PgPool) {
     std::env::set_var("ALLOW_UNINVITED_BUNYIP_SIGNUP", "true");

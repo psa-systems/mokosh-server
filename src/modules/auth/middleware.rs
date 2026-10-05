@@ -1644,12 +1644,9 @@ async fn place_bunyip_caller(
     // pre-existing invitation - matches the `bootstrap_admin_*`
     // regression pins in `tests/bunyip_login.rs`.
     let is_platform_admin = claims.bunyip_role.as_deref() == Some("admin");
-    // PMS-1457: a deployment that OPTS IN to uninvited self-signup lets a
-    // first-sight bunyip identity through here, but only when the OP has
-    // verified the email. The verified-email conjunction is non-negotiable:
-    // b7aa8af4 pulled the staging bypass precisely because it did not require
-    // one. Staging (c-01) sets the flag; production (nc-01) leaves it unset
-    // and keeps today's invitation-only policy.
+    // The flag opens the door for a first-sight bunyip identity; the
+    // verified-email conjunction stays here so an unverified address can
+    // never JIT-provision a row.
     let allow_self_signup =
         crate::config::flags::ALLOW_UNINVITED_BUNYIP_SIGNUP.read() && email_verified;
     if placement.is_none() && invite.is_none() && !is_platform_admin && !allow_self_signup {
@@ -2490,17 +2487,14 @@ mod pms_1309_tests {
 
     #[test]
     fn the_mapps_458_reject_still_refuses_an_uninvited_identity() {
-        // PMS-1457 extended the condition with `&& !allow_self_signup`, so the
-        // reject block now has an explicit staging opt-in. Match on the stable
-        // prefix (through the `!is_platform_admin` operand) rather than the
-        // old exact-literal line, and then assert on the full block body for
-        // the two properties PMS-1309 was watching: the `return (None, None);`
-        // is still present (the MAPPS-924 shape where the block kept the
-        // scaffolding but deleted the return), and the escape hatch is still
-        // gated on BOTH the flag AND `email_verified` (the shape 6e47ec74 ->
-        // 35e26265 shipped without the verified-email check, which is what
-        // b7aa8af4 tore out as "an unverified address was enough to be
-        // placed as whoever holds that address locally").
+        // Match on the stable prefix (through `!is_platform_admin`) rather
+        // than the whole line, because the condition carries an opt-in
+        // operand after it. Then assert the two properties this guard
+        // watches: the `return (None, None);` is still present, and when
+        // an escape operand is there, it is still gated on BOTH a flag
+        // AND `email_verified`. An escape hatch that does not require a
+        // verified email accepts any Bunyip token holding an unverified
+        // address.
         let guard_prefix = format!(
             "if placement.is_none() && invite.is_none() && {}is_platform_admin",
             '!'
@@ -2518,23 +2512,17 @@ mod pms_1309_tests {
             "the MAPPS-458 reject no longer returns, so an uninvited Bunyip identity \
              falls through to personal-tenant provisioning (the MAPPS-924 bypass): {body}"
         );
-        // PMS-1457: if a `!allow_self_signup` operand (or similar) appears, it
-        // MUST read a flag AND conjoin `email_verified`. Encoded as "the escape
-        // operand that is NOT `!is_platform_admin` names a flag read and
-        // email_verified in the same expression that computes it." The flag
-        // and the conjunction live a few lines above the block.
         let has_escape_operand =
-            body.contains("&& !allow_self_signup") || body.contains("&& !is_platform_admin && !"); // defensive: any other `&& !X`
+            body.contains("&& !allow_self_signup") || body.contains("&& !is_platform_admin && !");
         if has_escape_operand {
             let preamble = &SELF[at.saturating_sub(600)..at];
             assert!(
                 preamble.contains("ALLOW_UNINVITED_BUNYIP_SIGNUP")
                     && preamble.contains("email_verified"),
-                "the MAPPS-458 reject carries an escape hatch, but the preamble no longer \
-                 derives it from ALLOW_UNINVITED_BUNYIP_SIGNUP AND email_verified. b7aa8af4 \
-                 pulled the earlier staging bypass for exactly this reason: a bypass that \
-                 does not require a verified email accepted any Bunyip token holding an \
-                 unverified address: {preamble}"
+                "the reject carries an escape hatch, but the preamble no longer derives \
+                 it from ALLOW_UNINVITED_BUNYIP_SIGNUP AND email_verified in the same \
+                 expression. An escape hatch that does not require a verified email \
+                 accepts any Bunyip token holding an unverified address: {preamble}"
             );
         }
     }
