@@ -289,6 +289,10 @@ fn claims_with_grant(sub: Uuid, mokosh_account_id: Option<&str>) -> AtClaims {
         // PMS-998: no OP session named, so the back-channel logout check
         // cannot apply to these fixtures.
         sid: None,
+        // PMS-1458: grant tokens do not request `profile`; the drift
+        // check sees `None` and no-ops.
+        given_name: None,
+        family_name: None,
     }
 }
 
