@@ -214,7 +214,7 @@ pub fn map_contact(source: &SourceContact) -> MappedContact {
             }
             // The same number twice under two labels is one number.
             Some(_) => {}
-            None => dropped.push(format!("unstorable phone number {:?}", phone.number)),
+            None => dropped.push(format!("unstorable phone number {}", phone.number)),
         }
     }
     // Exactly one primary, or the `contact_phones` one-primary index refuses
@@ -340,6 +340,24 @@ mod tests {
         assert!(m.phones.is_empty());
         assert!(
             m.dropped.iter().any(|d| d.contains("unstorable phone")),
+            "{:?}",
+            m.dropped
+        );
+    }
+
+    /// The dropped-phone entry is a plain sentence, not Debug-escaped: a
+    /// number containing a literal `"` renders with no backslash-escaping.
+    #[test]
+    fn an_unstorable_number_is_not_debug_quoted() {
+        let mut s = source();
+        s.given_name = Some("Ada".into());
+        s.phones = vec![phone("not-a-number \"weird\"", None, "mobile", true)];
+        let m = map_contact(&s);
+        assert!(m.phones.is_empty());
+        assert!(
+            m.dropped
+                .iter()
+                .any(|d| d == "unstorable phone number not-a-number \"weird\""),
             "{:?}",
             m.dropped
         );
