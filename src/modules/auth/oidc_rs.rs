@@ -73,6 +73,20 @@ pub struct AtClaims {
     /// moment this shipped.
     #[serde(default)]
     pub sid: Option<String>,
+    /// PMS-1458 / BUNYIP-879: standard OIDC `profile` claims, now carried
+    /// on the at+jwt (previously userinfo-only). Bunyip emits them when
+    /// (a) `profile` is in the token's scope set AND (b) the source
+    /// column is non-NULL + non-empty; absent / empty on either side
+    /// deserializes to `None`. Read on every authenticated request and
+    /// fed to `refresh_names_from_oidc` so a bunyip-side profile edit
+    /// propagates to mokosh's `users` row within one access-token
+    /// lifetime, without reintroducing the `/oauth2/userinfo` round-trip
+    /// the PMS-713 fast path exists to skip. `None` on a pre-BUNYIP-879
+    /// token so a rolling deploy stays correct.
+    #[serde(default)]
+    pub given_name: Option<String>,
+    #[serde(default)]
+    pub family_name: Option<String>,
 }
 
 /// PMS-998: the claims of an OIDC Back-Channel Logout token
@@ -713,6 +727,52 @@ mod tests {
         }))
         .expect("deserialize userinfo without email_verified");
         assert_eq!(missing.email_verified, None);
+    }
+
+    /// PMS-1458 / BUNYIP-879: a bunyip at+jwt whose scope set includes
+    /// `profile` and whose user has first_name / last_name set carries
+    /// both as top-level JSON claims (via bunyip's flattened `extra`
+    /// map). The RS deserializes them into the two new `AtClaims`
+    /// fields and `place_bunyip_user_from_local_state` passes them to
+    /// the name-refresh drift check.
+    #[test]
+    fn at_claims_deserialize_profile_names() {
+        let body = serde_json::json!({
+            "iss": "https://bunyip.example.com",
+            "sub": "11111111-1111-1111-1111-111111111111",
+            "aud": "mokosh-api",
+            "client_id": "mokosh-spa",
+            "scope": "openid profile email",
+            "exp": 1_700_000_000i64,
+            "iat": 1_699_999_000i64,
+            "given_name": "Ada",
+            "family_name": "Lovelace",
+        });
+        let claims: AtClaims = serde_json::from_value(body).expect("deserialize");
+        assert_eq!(claims.given_name.as_deref(), Some("Ada"));
+        assert_eq!(claims.family_name.as_deref(), Some("Lovelace"));
+    }
+
+    /// Rolling-deploy safety: a token minted by a bunyip without BUNYIP-879
+    /// still deserializes cleanly, with both profile fields `None`. The
+    /// name-refresh drift check sees `None` hints and takes its no-op path,
+    /// so behavior is identical to pre-BUNYIP-879 for every placed user
+    /// until bunyip's rev lands.
+    #[test]
+    fn at_claims_deserialize_without_profile_names() {
+        let body = serde_json::json!({
+            "iss": "https://bunyip.example.com",
+            "sub": "22222222-2222-2222-2222-222222222222",
+            "aud": "mokosh-api",
+            "client_id": "mokosh-spa",
+            "scope": "openid email",
+            "exp": 1_700_000_000i64,
+            "iat": 1_699_999_000i64,
+        });
+        let claims: AtClaims =
+            serde_json::from_value(body).expect("deserialize pre-BUNYIP-879 at+jwt");
+        assert_eq!(claims.given_name, None);
+        assert_eq!(claims.family_name, None);
     }
 
     /// PMS-982: the rule is tested against values rather than by mutating the

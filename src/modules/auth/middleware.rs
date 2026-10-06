@@ -1090,8 +1090,15 @@ pub async fn place_bunyip_user_from_local_state(
                     sub,
                     None,
                     false,
-                    None,
-                    None,
+                    // PMS-1458 / BUNYIP-879: the at+jwt carries given_name /
+                    // family_name under the `profile` scope now, so a profile
+                    // edit on bunyip propagates to a placed user even on the
+                    // userinfo-free path. The name-refresh drift check in
+                    // `place_bunyip_caller` leaves the stored value untouched
+                    // when the hint is `None` or empty, so a pre-BUNYIP-879
+                    // token (no claim) is identical to today's behavior.
+                    claims.given_name.clone(),
+                    claims.family_name.clone(),
                     claims,
                     None,
                 )
@@ -1106,13 +1113,17 @@ pub async fn place_bunyip_user_from_local_state(
             tenants,
             invitations,
             sub,
-            // No userinfo, so no email / name hints: the placement, the
-            // placeholder repair and the name refresh all no-op, and the row
-            // comes from `principal`.
+            // No userinfo, so no email hint; the placeholder repair stays a
+            // no-op on this path. PMS-1458 / BUNYIP-879: the at+jwt now
+            // carries given_name / family_name under the `profile` scope, so
+            // the name-refresh drift check fires for a placed user without
+            // the `/oauth2/userinfo` round-trip the PMS-713 fast path exists
+            // to skip. A pre-BUNYIP-879 token has `None` on both and the
+            // behaviour matches the old no-op path exactly.
             None,
             false,
-            None,
-            None,
+            claims.given_name.clone(),
+            claims.family_name.clone(),
             claims,
             Some(principal),
         )

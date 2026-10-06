@@ -143,6 +143,9 @@ fn claims(sub: Uuid) -> AtClaims {
         // PMS-998: no OP session named, so the back-channel logout check
         // cannot apply to these fixtures.
         sid: None,
+        // PMS-1458: not requesting `profile`; keep the budget stable.
+        given_name: None,
+        family_name: None,
     }
 }
 
