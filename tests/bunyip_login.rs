@@ -62,6 +62,11 @@ fn claims(sub: Uuid, bunyip_role: Option<&str>) -> AtClaims {
         // PMS-998: no OP session named, so the back-channel logout check
         // cannot apply to these fixtures.
         sid: None,
+        // PMS-1458: these fixtures do not request `profile` scope, so
+        // bunyip's at+jwt would omit the two name claims; the drift
+        // check in `place_bunyip_caller` sees `None` and no-ops.
+        given_name: None,
+        family_name: None,
     }
 }
 
