@@ -8,7 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 // ============================================================================
 // TICKET SOURCE
@@ -925,11 +925,24 @@ pub struct TicketSavedView {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Reject a saved-view name that is empty or all whitespace. The `length`
+/// validator measures the untrimmed string, but the service persists
+/// `name.trim()` and the column CHECK enforces the trimmed length, so a
+/// whitespace-only name passes `length(min = 1)` here and then fails the
+/// CHECK as an unhandled SQLSTATE 23514 (PMS-1474).
+fn validate_not_blank(value: &str) -> Result<(), ValidationError> {
+    if value.trim().is_empty() {
+        Err(ValidationError::new("blank"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Request body for `POST /api/v1/tickets/saved-views`. Name is capped at 100
 /// characters to match the column CHECK.
 #[derive(Debug, Clone, Deserialize, validator::Validate)]
 pub struct CreateTicketSavedViewRequest {
-    #[validate(length(min = 1, max = 100))]
+    #[validate(length(min = 1, max = 100), custom(function = "validate_not_blank"))]
     pub name: String,
     #[serde(default)]
     pub filter: serde_json::Value,
@@ -942,7 +955,7 @@ pub struct CreateTicketSavedViewRequest {
 /// this user's views already holds answers 409.
 #[derive(Debug, Clone, Deserialize, validator::Validate)]
 pub struct UpdateTicketSavedViewRequest {
-    #[validate(length(min = 1, max = 100))]
+    #[validate(length(min = 1, max = 100), custom(function = "validate_not_blank"))]
     pub name: Option<String>,
     pub filter: Option<serde_json::Value>,
     pub sort: Option<serde_json::Value>,
@@ -951,6 +964,40 @@ pub struct UpdateTicketSavedViewRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whitespace_only_saved_view_name_rejected_on_create_and_update() {
+        let create = CreateTicketSavedViewRequest {
+            name: " ".to_string(),
+            filter: serde_json::Value::Null,
+            sort: serde_json::Value::Null,
+        };
+        assert!(create.validate().is_err());
+
+        let update = UpdateTicketSavedViewRequest {
+            name: Some(" ".to_string()),
+            filter: None,
+            sort: None,
+        };
+        assert!(update.validate().is_err());
+    }
+
+    #[test]
+    fn non_blank_saved_view_name_accepted() {
+        let create = CreateTicketSavedViewRequest {
+            name: "Morning queue".to_string(),
+            filter: serde_json::Value::Null,
+            sort: serde_json::Value::Null,
+        };
+        assert!(create.validate().is_ok());
+
+        let update = UpdateTicketSavedViewRequest {
+            name: None,
+            filter: None,
+            sort: None,
+        };
+        assert!(update.validate().is_ok());
+    }
 
     #[test]
     fn note_is_editable_covers_every_row_state() {
