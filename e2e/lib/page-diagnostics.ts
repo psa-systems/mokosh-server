@@ -95,6 +95,26 @@ function truncate(text: string, cap: number): string {
   return text.length > cap ? `${text.slice(0, cap)}... (truncated)` : text;
 }
 
+export type ApiErrorLog = {
+  errors(): string[];
+};
+
+/// Record every response from `apiBaseURL` with a 4xx/5xx status (PMS-1461).
+/// `mainFrameResponseLog` above only sees main-frame document navigations,
+/// but the SPA is a WASM app whose pages render from background XHR/fetch
+/// calls, not navigations - a selector that goes empty because its backing
+/// fetch 404d would otherwise pass the UI assertions silently. Attach before
+/// the page navigation you care about.
+export function trackApiErrors(page: Page, apiBaseURL: string): ApiErrorLog {
+  const errors: string[] = [];
+  page.on('response', (res: Response) => {
+    if (!res.url().startsWith(apiBaseURL)) return;
+    if (res.status() < 400) return;
+    errors.push(`${res.status()} ${res.request().method()} ${res.url()}`);
+  });
+  return { errors: () => errors.slice() };
+}
+
 /// Attach request + framenavigated + response listeners to `page` and return a
 /// `snapshot(label)` that renders the accumulated trail as a multi-line
 /// string suitable for folding into a thrown error message. The page is

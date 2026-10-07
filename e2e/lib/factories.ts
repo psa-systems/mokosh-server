@@ -69,10 +69,10 @@ export async function enableModule(
 // own id to create one.
 export async function getSelf(
   request: APIRequestContext,
-): Promise<{ id: string; role: string }> {
+): Promise<{ id: string; role: string; full_name: string }> {
   const res = await request.get(routes.authMe);
   expect(res.ok(), `GET /auth/me -> ${res.status()}`).toBeTruthy();
-  const body = (await res.json()) as { id: string; role: string };
+  const body = (await res.json()) as { id: string; role: string; full_name: string };
   expect(body.id).toBeTruthy();
   return body;
 }
