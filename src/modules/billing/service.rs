@@ -3637,7 +3637,7 @@ impl BillingService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Lock the invoice so this read-modify-write serialises with manual
         // payments and concurrent webhook deliveries (PMS-695).
-        let Some((_, _, _, status)) =
+        let Some((total, prior_paid, prior_credited, status)) =
             Self::lock_invoice_totals(&mut tx, tenant_id, invoice_id).await?
         else {
             // Invoice deleted between checkout and webhook. Nothing to
@@ -3660,6 +3660,27 @@ impl BillingService {
                 %status,
                 provider_id,
                 "gateway payment for an invoice that was never sent; not recording it"
+            );
+            return Ok(false);
+        }
+
+        // PMS-1468: the webhook twin of `create_payment`'s overpayment guard
+        // (PMS-194/PMS-1225). A gateway confirmation can arrive after staff
+        // already recorded a manual payment covering the invoice (or any
+        // other prior payment/credit), so the amount is checked against the
+        // remaining balance under the same lock, not just the invoice's
+        // draft/pending status above. Refusing here, rather than inserting
+        // and letting `recompute_invoice_balance` derive a negative
+        // `balance_due`, keeps the invariant `create_payment` already
+        // enforces true for this path too.
+        let remaining = total - prior_paid - prior_credited;
+        if amount > remaining {
+            tracing::error!(
+                %invoice_id,
+                %amount,
+                %remaining,
+                provider_id,
+                "gateway payment exceeds invoice balance due; not recording it"
             );
             return Ok(false);
         }

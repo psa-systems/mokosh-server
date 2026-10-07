@@ -224,6 +224,83 @@ async fn a_refused_reconciliation_is_recorded_as_unreconciled(pool: sqlx::PgPool
     assert_eq!(count, 0, "no payment row was recorded");
 }
 
+/// PMS-1468: a gateway confirmation that arrives after staff already recorded
+/// a manual payment covering the invoice must not double it up. Before this
+/// fix `record_gateway_payment` only refused Draft/Pending (PMS-1431); a
+/// `sent` invoice already paid in full had no guard at all, so the webhook
+/// would insert a second payment and drive `balance_due` negative.
+#[mokosh_test]
+async fn a_gateway_payment_that_would_overpay_is_recorded_as_unreconciled(pool: sqlx::PgPool) {
+    let (_admin_id, admin_email, admin_password) = common::seed_admin(&pool).await;
+    let app = boot_rls(pool).await;
+    let token = common::login(&app, &admin_email, &admin_password).await;
+    let company = seed_company(&app.pool).await;
+    let invoice = seed_sent_invoice(&app.pool, company, dec("100.00")).await;
+    seed_stripe_gateway(&app.pool).await;
+
+    // Staff records the full payment through the existing manual path first.
+    let pay_resp = app
+        .client
+        .post(app.url("/api/v1/payments"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "invoice_id": invoice,
+            "company_id": company,
+            "payment_date": chrono::Utc::now().date_naive().to_string(),
+            "amount": "100.00",
+            "payment_method": "check",
+        }))
+        .send()
+        .await
+        .expect("record manual payment");
+    assert!(
+        pay_resp.status().is_success(),
+        "manual payment should 2xx, got {}",
+        pay_resp.status()
+    );
+
+    // The contact's checkout session then completes for the same amount.
+    let body = checkout_completed_event(invoice, 10_000);
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/v1/stripe/webhooks/{DEFAULT_TENANT_ID}")))
+        .header(
+            "Stripe-Signature",
+            sign(WEBHOOK_SECRET, body.as_bytes(), now_unix()),
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("post webhook");
+    assert_eq!(resp.status(), 200, "the provider must not retry this");
+
+    let rows = deliveries(&app.pool).await;
+    assert_eq!(rows.len(), 1, "one delivery, one row: {rows:?}");
+    let (provider, outcome, event_type, event_id, invoice_id, _detail) = &rows[0];
+    assert_eq!(provider, "stripe");
+    assert_eq!(
+        outcome, "unreconciled",
+        "an overpaying webhook must not read as accepted: {rows:?}"
+    );
+    assert_eq!(event_type.as_deref(), Some("checkout.session.completed"));
+    assert_eq!(event_id.as_deref(), Some("evt_delivery_1"));
+    assert_eq!(*invoice_id, Some(invoice));
+
+    let (balance_due, count): (Decimal, i64) = sqlx::query_as(
+        "SELECT balance_due, (SELECT COUNT(*) FROM payments WHERE invoice_id = $1) \
+         FROM invoices WHERE id = $1",
+    )
+    .bind(invoice)
+    .fetch_one(&app.pool)
+    .await
+    .expect("read invoice");
+    assert_eq!(balance_due, dec("0.00"), "balance_due must not go negative");
+    assert_eq!(
+        count, 1,
+        "only the manual payment; the webhook must not insert a second row"
+    );
+}
+
 /// The row that matters most. A delivery this deployment would not accept is
 /// still an event that happened here, and the endpoint answers 401 exactly as
 /// it did before.
