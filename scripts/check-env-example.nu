@@ -100,7 +100,7 @@ const TEMPLATE_UNREAD = {}
 const REGISTRY_FILE = "src/config/registry.rs"
 
 # Every key `declare_keys!` declares, with its tier. The macro body is
-# `<Tier> <IDENT> = "NAME";` per line, and the tier is captured so a mismatch
+# `<Tier> <IDENT> = "NAME", since "vX.Y.Z", required|optional;` per line (PMS-1442), and the tier is captured so a mismatch
 # between the name and the constant is visible rather than silently accepted.
 def registry-keys [] {
     if not ($REGISTRY_FILE | path exists) {
@@ -110,7 +110,7 @@ def registry-keys [] {
     let declared = (
         open --raw $REGISTRY_FILE
         | decode utf-8
-        | parse --regex '(?m)^\s*(?<tier>Bootstrap|Application)\s+(?<ident>[A-Z][A-Z0-9_]*)\s*=\s*"(?<name>[A-Z][A-Z0-9_]*)"\s*;'
+        | parse --regex '(?m)^\s*(?<tier>Bootstrap|Application)\s+(?<ident>[A-Z][A-Z0-9_]*)\s*=\s*"(?<name>[A-Z][A-Z0-9_]*)"\s*,[^;\n]*;'
     )
     if ($declared | is-empty) {
         print --stderr $"ERROR: no keys parsed out of ($REGISTRY_FILE); the declare_keys! shape changed and this check is no longer proving anything"

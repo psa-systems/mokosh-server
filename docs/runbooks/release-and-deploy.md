@@ -31,6 +31,12 @@ just create-release minor
 
 (`major` and `hotfix` are the other two valid bump kinds; `minor` is what a routine three-repo release uses.) Before anything on disk changes, the recipe enforces, in order: `fj` is installed, `fj` has a working login for `dev.a8n.run`, and `fj` can read this repository with its stored credential (a read-only token still fails later, at PR creation, after the push). Only then does it: abort on a dirty tree, switch to and pull `main`, bump the version in the manifest (`Cargo.toml` here; the equivalent version file in Mokosh apps and Bunyip), sync `Cargo.lock` where applicable, commit as `Release vX.Y.Z`, push `release/vX.Y.Z`, and open the release PR with `fj pr create`. Re-running it after a failed or already-merged attempt is safe: it detects and cleans up a leftover local or remote `release/vX.Y.Z` branch rather than erroring on raw git output.
 
+### Configuration changes in the release
+
+Before opening the release PR, the release's configuration facts have to be complete, because the deploy step below works from them (PMS-1442). Every change that adds a required variable, removes or renames one, or makes one required carries a `[[change]]` record in `src/config/variables.toml` with the operator action and the issue that introduced it, and `just check-config-docs` (part of `just check` and the required `Check` job) refuses a Breaking entry without both. Until the tag exists, `docs/configuration.md`'s Recently added section lists those changes under `Unreleased (vX.Y.Z)`, where `vX.Y.Z` is the `since` the change declared; the first `just config-docs` after the tag drops the "Unreleased" label.
+
+Once the Forgejo release exists, edit its notes and add the block `just config-release-notes vX.Y.Z` prints: a link to the release's entry in `docs/configuration.md` at that tag, and each Breaking change with its variables, action and issue. The release-notes generator in `psa-systems/common` does not emit it yet, so this is a manual step.
+
 ## The release PR, and what merging it triggers
 
 Review and merge the release PR like any other PR - the required checks (`Check`, `E2E`, `Integration`) still gate it. What happens next differs by repo (see "The three repos release together" above):
@@ -56,9 +62,10 @@ This is the procedure David dictated at the 2026-10-06 standup, specifically for
 2. Restart staging so it is running the current `main` (`:latest`).
 3. Verify everything works in staging - sign in, and exercise the features the release touched.
 4. If staging looks good, cut the release (see above), which starts the CI build.
-5. When the build is done, update the deploy repo's compose variables with the new version. **Bump the server pin before the apps pin, then restart**, in that order - the 2026-09-29 production break came from bumping Mokosh apps while the server stayed pinned at an older version whose compose secrets did not match what the new apps release expected, compounded by Traefik listing routers for networks that no longer existed.
-6. After restarting production, check the Traefik routers resolve (no routes pointing at a network or service that no longer exists) and verify sign-in works, the same way it was verified in staging.
-7. Work through any issues or breaking changes found at that point before calling the deploy done.
+5. **Read the configuration changes before touching production.** From a checkout of the new release tag, run `just config-since <version production runs now>` (or open the release's entry under "Recently added" in `docs/configuration.md`). Apply every `BREAKING` action to the deploy repo's compose variables and secrets, and set every newly `REQUIRED` variable, in the same change as the version bump. Do not restart production while a Breaking entry is unhandled: a missing required variable stops the server at boot.
+6. When the build is done, update the deploy repo's compose variables with the new version. **Bump the server pin before the apps pin, then restart**, in that order - the 2026-09-29 production break came from bumping Mokosh apps while the server stayed pinned at an older version whose compose secrets did not match what the new apps release expected, compounded by Traefik listing routers for networks that no longer existed.
+7. After restarting production, check the Traefik routers resolve (no routes pointing at a network or service that no longer exists) and verify sign-in works, the same way it was verified in staging.
+8. Work through any issues or breaking changes found at that point before calling the deploy done.
 
 Server and apps versions are **not** required to be pinned equal - Mokosh apps ships its own patch releases independently of the server, and production has run mismatched-but-compatible pairs before (e.g. `mokosh-server:v0.15.0` with `mokosh-www:v0.15.1`). Record the *compatible pair* that was actually deployed together for a release, rather than enforcing version equality.
 

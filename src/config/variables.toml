@@ -1,0 +1,395 @@
+# Release facts `declare_keys!` cannot carry (PMS-1442); `just config-docs` renders them.
+# [[variable]]: read outside crate::config::get; `required` = boot refuses it outside dev/test.
+
+[[variable]]
+name = "MOKOSH_DEPLOYMENT_MODE"
+since = "v0.14.0"
+required = true
+reader = "src/utils/deployment.rs"
+
+[[variable]]
+name = "CONFIG_BACKEND"
+since = "v0.14.0"
+required = false
+reader = "src/config/mod.rs"
+
+[[variable]]
+name = "SECRET_BACKEND"
+since = "v0.14.0"
+required = false
+reader = "src/secrets/mod.rs"
+
+[[variable]]
+name = "APP_SECRET_BACKEND"
+since = "v0.16.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "GOOGLE_CONTACTS_CLIENT_ID"
+since = "v0.14.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "GOOGLE_CONTACTS_CLIENT_SECRET"
+since = "v0.14.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "MOKOSH_ADMIN_DATABASE_URL"
+since = "v0.4.0"
+required = false
+reader = "src/db/provision.rs"
+
+[[variable]]
+name = "MOKOSH_MIGRATOR_PASSWORD"
+since = "v0.3.0"
+required = false
+reader = "src/db/provision.rs"
+
+[[variable]]
+name = "MOKOSH_APP_PASSWORD"
+since = "v0.3.0"
+required = false
+reader = "src/db/provision.rs"
+
+[[variable]]
+name = "INFISICAL_PROJECT_ID"
+since = "v0.1.0"
+required = false
+reader = "src/secrets/infisical.rs"
+
+[[variable]]
+name = "INFISICAL_CLIENT_ID"
+since = "v0.1.0"
+required = false
+reader = "src/secrets/infisical.rs"
+
+[[variable]]
+name = "INFISICAL_CLIENT_SECRET"
+since = "v0.1.0"
+required = false
+reader = "src/secrets/infisical.rs"
+
+[[variable]]
+name = "INFISICAL_ENVIRONMENT"
+since = "v0.1.0"
+required = false
+reader = "src/secrets/infisical.rs"
+
+[[variable]]
+name = "STORAGE_PROVIDER"
+since = "v0.15.0"
+required = false
+reader = "src/storage/env.rs"
+
+[[variable]]
+name = "STORAGE_ROOT"
+since = "v0.15.0"
+required = false
+reader = "src/storage/env.rs"
+
+[[variable]]
+name = "STORAGE_S3_ENDPOINT"
+since = "v0.15.0"
+required = false
+reader = "src/storage/env.rs"
+
+[[variable]]
+name = "STORAGE_S3_BUCKET"
+since = "v0.15.0"
+required = false
+reader = "src/storage/env.rs"
+
+[[variable]]
+name = "STORAGE_S3_REGION"
+since = "v0.15.0"
+required = false
+reader = "src/storage/env.rs"
+
+[[variable]]
+name = "STORAGE_S3_PATH_STYLE"
+since = "v0.15.0"
+required = false
+reader = "src/storage/env.rs"
+
+[[variable]]
+name = "STORAGE_S3_ACCESS_KEY_ID"
+since = "v0.15.0"
+required = false
+reader = "src/storage/env.rs"
+
+[[variable]]
+name = "STORAGE_S3_SECRET_ACCESS_KEY"
+since = "v0.15.0"
+required = false
+reader = "src/storage/env.rs"
+
+[[variable]]
+name = "STORAGE_BACKEND"
+since = "v0.14.0"
+required = false
+reader = "src/storage/env.rs"
+deprecated = { release = "v0.15.0", replacement = "STORAGE_PROVIDER", issue = "PMS-1317" }
+
+[[variable]]
+name = "ATTACHMENT_DIR"
+since = "v0.4.0"
+required = false
+reader = "src/storage/env.rs"
+deprecated = { release = "v0.15.0", replacement = "STORAGE_ROOT", issue = "PMS-1317" }
+
+[[variable]]
+name = "S3_ENDPOINT"
+since = "v0.14.0"
+required = false
+reader = "src/storage/env.rs"
+deprecated = { release = "v0.15.0", replacement = "STORAGE_S3_ENDPOINT", issue = "PMS-1317" }
+
+[[variable]]
+name = "S3_BUCKET"
+since = "v0.14.0"
+required = false
+reader = "src/storage/env.rs"
+deprecated = { release = "v0.15.0", replacement = "STORAGE_S3_BUCKET", issue = "PMS-1317" }
+
+[[variable]]
+name = "S3_REGION"
+since = "v0.14.0"
+required = false
+reader = "src/storage/env.rs"
+deprecated = { release = "v0.15.0", replacement = "STORAGE_S3_REGION", issue = "PMS-1317" }
+
+[[variable]]
+name = "S3_PATH_STYLE"
+since = "v0.14.0"
+required = false
+reader = "src/storage/env.rs"
+deprecated = { release = "v0.15.0", replacement = "STORAGE_S3_PATH_STYLE", issue = "PMS-1317" }
+
+[[variable]]
+name = "S3_ACCESS_KEY_ID"
+since = "v0.14.0"
+required = false
+reader = "src/storage/env.rs"
+deprecated = { release = "v0.15.0", replacement = "STORAGE_S3_ACCESS_KEY_ID", issue = "PMS-1317" }
+
+[[variable]]
+name = "S3_SECRET_ACCESS_KEY"
+since = "v0.14.0"
+required = false
+reader = "src/storage/env.rs"
+deprecated = { release = "v0.15.0", replacement = "STORAGE_S3_SECRET_ACCESS_KEY", issue = "PMS-1317" }
+
+[[variable]]
+name = "RUST_LOG"
+since = "v0.1.0"
+required = false
+reader = "src/main.rs"
+
+# Variables the server no longer reads; each keeps a doc row for old compose files.
+
+[[removed]]
+name = "GOOGLE_OAUTH_CLIENT_ID"
+since = "v0.2.0"
+removed = "v0.14.0"
+issue = "PMS-837"
+action = "Delete it from the compose variables; the Google sign-in routes it served are gone."
+
+[[removed]]
+name = "GOOGLE_OAUTH_CLIENT_SECRET"
+since = "v0.2.0"
+removed = "v0.14.0"
+issue = "PMS-837"
+action = "Delete it from the compose secrets; the Google sign-in routes it served are gone."
+
+[[removed]]
+name = "GOOGLE_OAUTH_REDIRECT_URI"
+since = "v0.2.0"
+removed = "v0.14.0"
+issue = "PMS-837"
+action = "Delete it from the compose variables; the Google sign-in routes it served are gone."
+
+[[removed]]
+name = "OAUTH_SUPER_ADMIN_EMAILS"
+since = "v0.3.0"
+removed = "v0.14.0"
+issue = "PMS-837"
+action = "Delete it from the compose variables; only the removed Google sign-in path read it."
+
+# Authored changelog wording, attached to the entry the facts imply; Changed may also be a behavior change.
+# Every Breaking entry needs a record with `issue` and `action`.
+
+[[change]]
+release = "v0.16.0"
+group = "Added"
+variables = ["APP_SECRET_BACKEND"]
+issue = "PMS-1424"
+action = "Optional. Selects where application-tier secrets live; unset keeps the hosting profile's default."
+
+[[change]]
+release = "v0.16.0"
+group = "Added"
+variables = ["ALLOW_UNINVITED_BUNYIP_SIGNUP"]
+issue = "PMS-1457"
+action = "Optional, off by default. Set `true` only where uninvited Bunyip sign-up is wanted (staging)."
+
+[[change]]
+release = "v0.16.0"
+group = "Changed"
+variables = ["SECRET_BACKEND"]
+issue = "PMS-1424"
+breaking = true
+action = "Now selects tenant-tier secrets only. If you set it expecting application secrets (`SMTP_PASSWORD`, the Google client pair) to move too, also set `APP_SECRET_BACKEND` to the same provider before restarting."
+
+[[change]]
+release = "v0.16.0"
+group = "Changed"
+variables = ["GOOGLE_CONTACTS_CLIENT_ID", "GOOGLE_CONTACTS_CLIENT_SECRET"]
+issue = "PMS-1430"
+breaking = true
+action = "Now an application-tier secret served by `APP_SECRET_BACKEND`'s provider, no longer a plain variable. Move both halves there (an `app_secrets` row, Infisical `/app`, a `{NAME}_FILE` compose secret or an `APP_SECRETS_DIR` file); setting only one half refuses boot."
+
+[[change]]
+release = "v0.15.0"
+group = "Added"
+variables = ["OIDC_BACKCHANNEL_CLIENT_ID"]
+issue = "PMS-998"
+action = "Optional. Set it to the OIDC client id Bunyip addresses back-channel logout tokens to; unset refuses every logout token."
+
+[[change]]
+release = "v0.15.0"
+group = "Added"
+variables = ["STORAGE_PROVIDER", "STORAGE_ROOT", "STORAGE_S3_ENDPOINT", "STORAGE_S3_BUCKET", "STORAGE_S3_REGION", "STORAGE_S3_PATH_STYLE", "STORAGE_S3_ACCESS_KEY_ID", "STORAGE_S3_SECRET_ACCESS_KEY"]
+issue = "PMS-1317"
+action = "Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["MOKOSH_DEPLOYMENT_MODE"]
+issue = "PMS-1160"
+action = "Set `self-hosted` or `saas` before restarting; boot refuses without it outside dev/test. Introduced by PMS-1011."
+
+[[change]]
+release = "v0.14.0"
+group = "Changed"
+variables = ["MOKOSH_APP_DATABASE_URL", "BASE_URL", "CLIENT_ORIGIN", "SPA_BASE_URL"]
+issue = "PMS-1160"
+breaking = true
+action = "Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["CONFIG_BACKEND"]
+issue = "PMS-982"
+action = "Optional. `environment` is the only accepted value and the default."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["CONFIG_PROVIDERS", "CONFIG_FILE_DIR", "BUNYIP_CONFIG_URL", "BUNYIP_CONFIG_CLIENT_ID", "BUNYIP_CONFIG_CLIENT_SECRET"]
+issue = "PMS-987"
+action = "Optional. Configuration provider chain and its construction values; unset keeps the hosting profile's default."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["AUTH_PROVIDERS"]
+issue = "PMS-981"
+action = "Optional. Unset keeps the hosting profile's default (`bunyip,local` in saas, `local` self-hosted)."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["APP_SECRETS_DIR"]
+issue = "PMS-988"
+action = "Optional. Directory the file application-secret provider reads; unset disables that provider."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["SECRET_BACKEND", "STORAGE_BACKEND"]
+issue = "PMS-910"
+action = "Optional. Unset keeps the default provider (`database` for secrets, `local` for storage)."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["MAIL_PROVIDER"]
+issue = "PMS-1013"
+action = "Optional. Unset keeps the profile default, or `smtp` when `SMTP_HOST` is set."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["BUNYIP_STATUS_CLIENT_ID", "BUNYIP_STATUS_CLIENT_SECRET"]
+issue = "PMS-1193"
+action = "Optional. Set both to let Bunyip read provider status with its machine credential."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["ORGANIZATIONS_ENABLED"]
+issue = "PMS-983"
+action = "Optional. Unset follows the hosting profile (off self-hosted, on saas)."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["KB_ATTACHMENT_MAX_BYTES"]
+issue = "PMS-923"
+action = "Optional. Unset keeps the built-in cap."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["BRANDING_TENANT_FAVICON_MAX_BYTES", "BRANDING_TENANT_BACKGROUND_MAX_BYTES", "BRANDING_COMPANY_LOGO_MAX_BYTES", "BRANDING_COMPANY_FAVICON_MAX_BYTES", "BRANDING_COMPANY_BACKGROUND_MAX_BYTES"]
+issue = "MAPPS-622"
+action = "Optional. Unset keeps the built-in cap for that asset."
+
+[[change]]
+release = "v0.14.0"
+group = "Added"
+variables = ["MOKOSH_MAX_TENANTS"]
+issue = "MAPPS-457"
+action = "Optional. Unset means no tenant cap."
+
+[[change]]
+release = "v0.12.0"
+group = "Added"
+variables = ["SPA_BASE_URL"]
+issue = "MAPPS-425"
+action = "Optional at the time (required since v0.14.0). Set it to the mokosh-apps origin so SPA-only email links land there."
+
+[[change]]
+release = "v0.12.0"
+group = "Added"
+variables = ["PUBLIC_API_BASE_URL", "ABUSE_CONTACT_EMAIL"]
+issue = "PMS-748"
+action = "Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces."
+
+[[change]]
+release = "v0.12.0"
+group = "Added"
+variables = ["INFISICAL_ADDRESS"]
+issue = "GOV-50"
+action = "Optional. Blank reports Infisical as skipped in the readiness probe."
+
+[[change]]
+release = "v0.6.0"
+group = "Added"
+variables = ["BUNYIP_WEBHOOK_SECRET"]
+issue = "PMS-591"
+action = "Set it to bunyip-api's `BUNYIP_WEBHOOK_SIGNING_SECRET` before restarting; boot refuses without it outside dev/test."
+
+[[change]]
+release = "v0.4.0"
+group = "Changed"
+variables = ["JWT_SECRET", "ENCRYPTION_KEY"]
+issue = "PMS-499"
+breaking = true
+action = "Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting."

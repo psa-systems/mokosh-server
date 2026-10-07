@@ -27,6 +27,7 @@ just check-unused-deps     # cargo-machete: fail on a dependency with no call si
 just check-env-example     # every var the code reads has a .env.example key and a compose.dev.yml line
 just check-doc-recipes     # every `just <recipe>` in a doc listed in scripts/check-doc-recipes.nu exists in the justfile
 just check-config-doc-paths # every docs/ path named in .env.example / compose.dev.yml / justfile exists
+just check-config-docs     # docs/configuration.md matches the registry's since/required facts; `just config-docs` regenerates it
 just check-doc-links       # every relative Markdown link resolves to a path that exists
 just check-claude-md       # CLAUDE.md stays under 20,000 bytes and its docs/ links resolve (PMS-1437)
 just check-single-build    # fail if a compiling workflow builds the same tree twice (DEV-612)
@@ -214,6 +215,7 @@ One line per rule, linking its full text. A new convention adds its text under `
 - `cargo machete` fails an unused dependency ([PMS-780](docs/invariants/ci-release.md#unused-deps-pms-780))
 - Release image caches dependencies in their own layer ([PMS-781](docs/invariants/ci-release.md#image-layers-pms-781))
 - A config read needs registry, `.env.example` and compose entries ([PMS-836](docs/invariants/ci-release.md#env-parity-pms-836))
+- A config key states `since` and `required`; the config doc is generated ([PMS-1442](docs/invariants/ci-release.md#config-docs-pms-1442))
 - Two migrations cannot share a version ([PMS-965](docs/invariants/ci-release.md#migration-versions-pms-965))
 - A red integration run blocks the merge ([PMS-1426](docs/invariants/ci-release.md#integration-required-pms-1426))
 - `just create-release` opens the release PR ([details](docs/invariants/ci-release.md#releases))

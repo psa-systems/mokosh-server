@@ -7,7 +7,7 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 | Page | Purpose |
 | --- | --- |
 | [`quickstart.md`](quickstart.md) | Get a fresh clone running on a Linux host: toolchain, generating `.env`, booting the stack, verifying it, and the footguns that bite first. |
-| [`configuration.md`](configuration.md) | Every environment variable a developer touches and, for each, where the value is actually set. |
+| [`configuration.md`](configuration.md) | Every variable the server reads: whether it is required, the release that added it, where it is set, and a changelog of configuration changes over the last five releases. |
 | [`recipes.md`](recipes.md) | The task runner, recipe by recipe, grouped the way `just --list` groups them. |
 | [`first-run-onboarding.md`](first-run-onboarding.md) | How the very first administrator gets in, in production and in local dev, including with no SMTP configured. |
 

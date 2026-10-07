@@ -37,6 +37,7 @@ PMS-786 only CI runs (see the note below).
 | Build target storage | `nu scripts/check-build-target-storage.nu` | `check-build-target-storage` | no | no |
 | Documented just recipes | `nu scripts/check-doc-recipes.nu` | `check-doc-recipes` | no | no |
 | Config doc paths | `nu scripts/check-config-doc-paths.nu` | `check-config-doc-paths` | no | no |
+| Configuration docs | `nu scripts/config-docs.nu check` (plus `self-test`) | `check-config-docs` | no | no |
 | Markdown link targets | `nu scripts/check-doc-links.nu` | `check-doc-links` | no | no |
 | CLAUDE.md index budget | `nu scripts/check-claude-md.nu` (plus `--self-test`) | `check-claude-md` | no | no |
 | Unused dependencies | `cargo machete` | `check-unused-deps` | no | no |

@@ -17,7 +17,12 @@
 //! Keys read OUTSIDE the provider are not here. They are the bootstrap entry
 //! points and the providers of record, each listed in
 //! [`crate::config::guard::ENTRY_POINTS`] with the reason it may go around the
-//! seam.
+//! seam; their release facts live in `src/config/variables.toml` (PMS-1442).
+//!
+//! # Release facts (PMS-1442)
+//!
+//! Each key states its `since` release and whether boot requires it; `just
+//! config-docs` renders both into `docs/configuration.md`.
 //!
 //! # Feature annotation (PMS-1075)
 //!
@@ -87,6 +92,13 @@ pub struct ConfigKey {
     /// absence is not something to warn about at boot; see the module-level
     /// note for why the default is silence.
     feature: Option<&'static str>,
+    /// PMS-1442: the release that introduced the key, e.g. `v0.14.0`.
+    since: &'static str,
+    /// PMS-1442: the server refuses to start without it outside dev/test.
+    required: bool,
+    /// PMS-1442: the release that made an older key required; `None` when it
+    /// was required from `since` or is optional.
+    required_since: Option<&'static str>,
 }
 
 impl ConfigKey {
@@ -105,6 +117,23 @@ impl ConfigKey {
         self.feature
     }
 
+    /// The release that introduced this key (`docs/configuration.md`'s
+    /// "Added in" column, PMS-1442).
+    pub fn since(&self) -> &'static str {
+        self.since
+    }
+
+    /// Whether the server refuses to start without this key outside
+    /// development/dev/test (`docs/configuration.md`'s "Required" column).
+    pub fn required(&self) -> bool {
+        self.required
+    }
+
+    /// The release that made this key required, when that came after `since`.
+    pub fn required_since(&self) -> Option<&'static str> {
+        self.required_since
+    }
+
     /// Test-only constructor: the real registry marks no key with a feature
     /// today (see the module note above), so PMS-1075's filter behaviour is
     /// exercised through a fabricated key whose name never leaks into the
@@ -120,6 +149,9 @@ impl ConfigKey {
             name,
             tier,
             feature: Some(feature),
+            since: "v0.1.0",
+            required: false,
+            required_since: None,
         }
     }
 }
@@ -149,7 +181,9 @@ pub fn tier_of(name: &str) -> Option<Tier> {
 ///
 /// The macro exists so [`REGISTRY`] cannot fall out of step with the constants:
 /// there is no way to add one without the other. Each declaration reads as
-/// `Tier NAME = "NAME";` and may be preceded by doc comments and, optionally,
+/// `Tier NAME = "NAME", since "vX.Y.Z", optional;` (or `required;`, or
+/// `required "vA.B.C";` for a key that became required after it was added,
+/// PMS-1442) and may be preceded by doc comments and, optionally,
 /// a single `#[feature = "sentence"]` attribute (PMS-1075) that boot uses to
 /// name what will not work if no provider holds the key. Keys without a
 /// feature attribute are legitimately-unset by design; see the module-level
@@ -158,7 +192,7 @@ macro_rules! declare_keys {
     ($(
         $(#[doc = $doc:literal])*
         $(#[feature = $feature:literal])?
-        $tier:ident $ident:ident = $name:literal;
+        $tier:ident $ident:ident = $name:literal, since $since:literal, $req:ident $($req_since:literal)?;
     )*) => {
         $(
             $(#[doc = $doc])*
@@ -166,6 +200,9 @@ macro_rules! declare_keys {
                 name: $name,
                 tier: Tier::$tier,
                 feature: declare_keys!(@feature $($feature)?),
+                since: $since,
+                required: declare_keys!(@required $req),
+                required_since: declare_keys!(@required_since $($req_since)?),
             };
         )*
 
@@ -176,6 +213,10 @@ macro_rules! declare_keys {
     };
     (@feature $feature:literal) => { Some($feature) };
     (@feature) => { None };
+    (@required required) => { true };
+    (@required optional) => { false };
+    (@required_since $since:literal) => { Some($since) };
+    (@required_since) => { None };
 }
 
 declare_keys! {
@@ -185,16 +226,16 @@ declare_keys! {
     // the credential used to reach the database.
 
     /// Privileged (`mokosh_migrator`) connection string.
-    Bootstrap DATABASE_URL = "DATABASE_URL";
+    Bootstrap DATABASE_URL = "DATABASE_URL", since "v0.1.0", required;
     /// Request-serving (`mokosh_app`) connection string (PMS-285).
-    Bootstrap MOKOSH_APP_DATABASE_URL = "MOKOSH_APP_DATABASE_URL";
+    Bootstrap MOKOSH_APP_DATABASE_URL = "MOKOSH_APP_DATABASE_URL", since "v0.3.0", required "v0.14.0";
     /// AES-256-GCM key for at-rest encryption, which a database-backed
     /// provider would need in order to read anything it stored.
-    Bootstrap ENCRYPTION_KEY = "ENCRYPTION_KEY";
+    Bootstrap ENCRYPTION_KEY = "ENCRYPTION_KEY", since "v0.1.0", required "v0.4.0";
     /// PMS-988: directory the file-backed application-tier secret provider
     /// reads. A provider is built from this at boot, so it is bootstrap; unset
     /// means the file provider is not enabled and holds nothing.
-    Bootstrap APP_SECRETS_DIR = "APP_SECRETS_DIR";
+    Bootstrap APP_SECRETS_DIR = "APP_SECRETS_DIR", since "v0.14.0", optional;
 
     // PMS-987: the configuration chain and the two providers whose
     // construction values themselves live under Configuration. Bootstrap
@@ -204,42 +245,42 @@ declare_keys! {
     // locates.
 
     /// Directory the file configuration provider reads, one file per key.
-    Bootstrap CONFIG_FILE_DIR = "CONFIG_FILE_DIR";
+    Bootstrap CONFIG_FILE_DIR = "CONFIG_FILE_DIR", since "v0.14.0", optional;
     /// Comma-separated priority list of enabled configuration providers,
     /// e.g. `file,database,environment`. Empty falls back to the hosting
     /// profile's default. This is provider ENABLEMENT and cannot be
     /// served by any provider it enables.
-    Bootstrap CONFIG_PROVIDERS = "CONFIG_PROVIDERS";
+    Bootstrap CONFIG_PROVIDERS = "CONFIG_PROVIDERS", since "v0.14.0", optional;
     /// Base URL of the Bunyip API the Bunyip configuration provider reads.
-    Bootstrap BUNYIP_CONFIG_URL = "BUNYIP_CONFIG_URL";
+    Bootstrap BUNYIP_CONFIG_URL = "BUNYIP_CONFIG_URL", since "v0.14.0", optional;
     /// Machine-credential client id for `POST /v1/oauth2/token`.
-    Bootstrap BUNYIP_CONFIG_CLIENT_ID = "BUNYIP_CONFIG_CLIENT_ID";
+    Bootstrap BUNYIP_CONFIG_CLIENT_ID = "BUNYIP_CONFIG_CLIENT_ID", since "v0.14.0", optional;
     /// Machine-credential client secret for `POST /v1/oauth2/token`.
-    Bootstrap BUNYIP_CONFIG_CLIENT_SECRET = "BUNYIP_CONFIG_CLIENT_SECRET";
+    Bootstrap BUNYIP_CONFIG_CLIENT_SECRET = "BUNYIP_CONFIG_CLIENT_SECRET", since "v0.14.0", optional;
     /// PMS-981: authentication provider enablement, a comma-separated priority
     /// list (`bunyip,local` by default in `saas`; `local` in `self-hosted`).
     /// Bootstrap because provider enablement is bootstrap configuration
     /// (PMS-1009): the resolved chain is built once at startup and a change
     /// needs a restart, since the trait objects the chain is made of are
     /// already holding the old shape.
-    Bootstrap AUTH_PROVIDERS = "AUTH_PROVIDERS";
+    Bootstrap AUTH_PROVIDERS = "AUTH_PROVIDERS", since "v0.14.0", optional;
 
     // -- Application: the server's own shape ---------------------------------
 
-    Application ENVIRONMENT = "ENVIRONMENT";
-    Application HOST = "HOST";
-    Application PORT = "PORT";
-    Application BASE_URL = "BASE_URL";
-    Application RUN_MIGRATIONS = "RUN_MIGRATIONS";
-    Application JWT_SECRET = "JWT_SECRET";
-    Application BUNYIP_WEBHOOK_SECRET = "BUNYIP_WEBHOOK_SECRET";
-    Application CLIENT_ORIGIN = "CLIENT_ORIGIN";
-    Application CORS_ORIGIN = "CORS_ORIGIN";
-    Application SPA_BASE_URL = "SPA_BASE_URL";
-    Application PUBLIC_API_BASE_URL = "PUBLIC_API_BASE_URL";
-    Application ABUSE_CONTACT_EMAIL = "ABUSE_CONTACT_EMAIL";
-    Application MOKOSH_MAX_TENANTS = "MOKOSH_MAX_TENANTS";
-    Application MOKOSH_UPDATE_CHECK_URL = "MOKOSH_UPDATE_CHECK_URL";
+    Application ENVIRONMENT = "ENVIRONMENT", since "v0.1.0", optional;
+    Application HOST = "HOST", since "v0.1.0", optional;
+    Application PORT = "PORT", since "v0.1.0", optional;
+    Application BASE_URL = "BASE_URL", since "v0.1.0", required "v0.14.0";
+    Application RUN_MIGRATIONS = "RUN_MIGRATIONS", since "v0.1.0", optional;
+    Application JWT_SECRET = "JWT_SECRET", since "v0.1.0", required "v0.4.0";
+    Application BUNYIP_WEBHOOK_SECRET = "BUNYIP_WEBHOOK_SECRET", since "v0.6.0", required;
+    Application CLIENT_ORIGIN = "CLIENT_ORIGIN", since "v0.2.0", required "v0.14.0";
+    Application CORS_ORIGIN = "CORS_ORIGIN", since "v0.2.0", optional;
+    Application SPA_BASE_URL = "SPA_BASE_URL", since "v0.12.0", required "v0.14.0";
+    Application PUBLIC_API_BASE_URL = "PUBLIC_API_BASE_URL", since "v0.12.0", optional;
+    Application ABUSE_CONTACT_EMAIL = "ABUSE_CONTACT_EMAIL", since "v0.12.0", optional;
+    Application MOKOSH_MAX_TENANTS = "MOKOSH_MAX_TENANTS", since "v0.14.0", optional;
+    Application MOKOSH_UPDATE_CHECK_URL = "MOKOSH_UPDATE_CHECK_URL", since "v0.3.0", optional;
 
     // -- Mail ----------------------------------------------------------------
 
@@ -251,37 +292,37 @@ declare_keys! {
     /// An unusable `smtp` selection (no host) is a boot error, and an explicit
     /// `log` while `SMTP_HOST` is set warns rather than silently discarding
     /// the operator's relay configuration.
-    Application MAIL_PROVIDER = "MAIL_PROVIDER";
-    Application SMTP_HOST = "SMTP_HOST";
-    Application SMTP_PORT = "SMTP_PORT";
-    Application SMTP_USERNAME = "SMTP_USERNAME";
-    Application SMTP_PASSWORD = "SMTP_PASSWORD";
-    Application SMTP_FROM = "SMTP_FROM";
-    Application SMTP_TLS = "SMTP_TLS";
+    Application MAIL_PROVIDER = "MAIL_PROVIDER", since "v0.14.0", optional;
+    Application SMTP_HOST = "SMTP_HOST", since "v0.2.0", optional;
+    Application SMTP_PORT = "SMTP_PORT", since "v0.2.0", optional;
+    Application SMTP_USERNAME = "SMTP_USERNAME", since "v0.2.0", optional;
+    Application SMTP_PASSWORD = "SMTP_PASSWORD", since "v0.2.0", optional;
+    Application SMTP_FROM = "SMTP_FROM", since "v0.2.0", optional;
+    Application SMTP_TLS = "SMTP_TLS", since "v0.2.0", optional;
 
     // -- Authentication ------------------------------------------------------
 
-    Application OIDC_ISSUER = "OIDC_ISSUER";
-    Application OIDC_AUDIENCE = "OIDC_AUDIENCE";
-    Application OIDC_JWKS_CACHE_TTL_SECS = "OIDC_JWKS_CACHE_TTL_SECS";
-    Application OIDC_LEEWAY_SECONDS = "OIDC_LEEWAY_SECONDS";
-    Application OIDC_DEFAULT_TENANT_ID = "OIDC_DEFAULT_TENANT_ID";
+    Application OIDC_ISSUER = "OIDC_ISSUER", since "v0.3.0", optional;
+    Application OIDC_AUDIENCE = "OIDC_AUDIENCE", since "v0.3.0", optional;
+    Application OIDC_JWKS_CACHE_TTL_SECS = "OIDC_JWKS_CACHE_TTL_SECS", since "v0.3.0", optional;
+    Application OIDC_LEEWAY_SECONDS = "OIDC_LEEWAY_SECONDS", since "v0.3.0", optional;
+    Application OIDC_DEFAULT_TENANT_ID = "OIDC_DEFAULT_TENANT_ID", since "v0.3.0", optional;
     // PMS-998: the OIDC client id bunyip addresses a back-channel logout
     // token to. NOT OIDC_AUDIENCE, which is the resource-server audience the
     // access token carries: bunyip mints a logout token with `aud =
     // client_id`, so the two are different values and the receiver refuses
     // everything while this is unset.
-    Application OIDC_BACKCHANNEL_CLIENT_ID = "OIDC_BACKCHANNEL_CLIENT_ID";
-    Application ADMIN_EMAIL = "ADMIN_EMAIL";
-    Application ADMIN_PASSWORD = "ADMIN_PASSWORD";
-    Application LOGIN_APPROVAL_ENABLED = "LOGIN_APPROVAL_ENABLED";
+    Application OIDC_BACKCHANNEL_CLIENT_ID = "OIDC_BACKCHANNEL_CLIENT_ID", since "v0.15.0", optional;
+    Application ADMIN_EMAIL = "ADMIN_EMAIL", since "v0.1.0", optional;
+    Application ADMIN_PASSWORD = "ADMIN_PASSWORD", since "v0.1.0", optional;
+    Application LOGIN_APPROVAL_ENABLED = "LOGIN_APPROVAL_ENABLED", since "v0.8.0", optional;
 
     /// Opts in to JIT-provisioning a personal tenant for a first-sight
     /// bunyip identity whose email the OP has verified. Off by default so
     /// production stays invitation-only; staging turns it on explicitly.
     /// Verified-email is a hard requirement at the gate; this flag never
     /// relaxes it.
-    Application ALLOW_UNINVITED_BUNYIP_SIGNUP = "ALLOW_UNINVITED_BUNYIP_SIGNUP";
+    Application ALLOW_UNINVITED_BUNYIP_SIGNUP = "ALLOW_UNINVITED_BUNYIP_SIGNUP", since "v0.16.0", optional;
 
     /// PMS-1193 / BUNYIP-641: the Bunyip machine-credential client_id this
     /// deployment accepts on the admin provider-status routes. Set together
@@ -289,13 +330,13 @@ declare_keys! {
     /// credential path is disabled and the routes gate on `RequireAdmin`
     /// alone (the pre-PMS-1193 behaviour). Presented by Bunyip as HTTP
     /// Basic per `bunyip/docs/provider-status-contract.md`.
-    Application BUNYIP_STATUS_CLIENT_ID = "BUNYIP_STATUS_CLIENT_ID";
+    Application BUNYIP_STATUS_CLIENT_ID = "BUNYIP_STATUS_CLIENT_ID", since "v0.14.0", optional;
     /// PMS-1193 / BUNYIP-641: the plaintext client_secret paired with
     /// `BUNYIP_STATUS_CLIENT_ID`. Compared in constant time against the
     /// Basic auth Bunyip presents. Unset disables the machine-credential
     /// path; a set value stays in the operator's SOPS-encrypted
     /// compose-secrets on staging and prod.
-    Application BUNYIP_STATUS_CLIENT_SECRET = "BUNYIP_STATUS_CLIENT_SECRET";
+    Application BUNYIP_STATUS_CLIENT_SECRET = "BUNYIP_STATUS_CLIENT_SECRET", since "v0.14.0", optional;
 
 
     // -- Feature flags (PMS-983) ---------------------------------------------
@@ -307,25 +348,25 @@ declare_keys! {
     /// PMS-983: the organizations feature. Read through
     /// `crate::config::flags::ORGANIZATIONS_ENABLED`, which defaults per
     /// hosting profile (off on self-hosted, on for SaaS).
-    Application ORGANIZATIONS_ENABLED = "ORGANIZATIONS_ENABLED";
-    Application IP2LOCATION_DB_PATH = "IP2LOCATION_DB_PATH";
-    Application IP2PROXY_DB_PATH = "IP2PROXY_DB_PATH";
+    Application ORGANIZATIONS_ENABLED = "ORGANIZATIONS_ENABLED", since "v0.14.0", optional;
+    Application IP2LOCATION_DB_PATH = "IP2LOCATION_DB_PATH", since "v0.7.0", optional;
+    Application IP2PROXY_DB_PATH = "IP2PROXY_DB_PATH", since "v0.11.0", optional;
 
     // -- Network ------------------------------------------------------------
 
-    Application TRUSTED_PROXY_CIDR = "TRUSTED_PROXY_CIDR";
-    Application OUTBOUND_PRIVATE_ALLOWLIST = "OUTBOUND_PRIVATE_ALLOWLIST";
+    Application TRUSTED_PROXY_CIDR = "TRUSTED_PROXY_CIDR", since "v0.7.0", optional;
+    Application OUTBOUND_PRIVATE_ALLOWLIST = "OUTBOUND_PRIVATE_ALLOWLIST", since "v0.14.0", optional;
     /// The in-network Infisical base the readiness probe reports on. Blank
     /// means unconfigured (PMS-707), never a failing probe. The Infisical
     /// SECRET provider reads its own copy at its entry point, because a
     /// provider cannot be built out of values served by itself.
-    Application INFISICAL_ADDRESS = "INFISICAL_ADDRESS";
+    Application INFISICAL_ADDRESS = "INFISICAL_ADDRESS", since "v0.12.0", optional;
 
     // -- Payment provider hosts ----------------------------------------------
     // Overridable so an integration test can point the calls at a stub.
 
-    Application STRIPE_API_BASE = "STRIPE_API_BASE";
-    Application PAYPAL_API_BASE = "PAYPAL_API_BASE";
+    Application STRIPE_API_BASE = "STRIPE_API_BASE", since "v0.10.0", optional;
+    Application PAYPAL_API_BASE = "PAYPAL_API_BASE", since "v0.14.0", optional;
 
     // -- Uploads -------------------------------------------------------------
     // The storage ROOT is not declared here. It is `STORAGE_ROOT` (PMS-1317),
@@ -335,23 +376,23 @@ declare_keys! {
     // `STORAGE_S3_*` block are. Branding used to declare it here and read it a
     // second time; it now asks `crate::storage`, so there is one reader again.
 
-    Application ATTACHMENT_MAX_BYTES = "ATTACHMENT_MAX_BYTES";
-    Application KB_ATTACHMENT_MAX_BYTES = "KB_ATTACHMENT_MAX_BYTES";
+    Application ATTACHMENT_MAX_BYTES = "ATTACHMENT_MAX_BYTES", since "v0.4.0", optional;
+    Application KB_ATTACHMENT_MAX_BYTES = "KB_ATTACHMENT_MAX_BYTES", since "v0.14.0", optional;
 
     // The six `BrandingAssetStore::max_bytes` caps. They are a closed match on
     // `(AssetScope, BrandAssetKind)`, which is why all six are declarable and
     // why a literal-only scan of the read site saw none of them.
-    Application TENANT_LOGO_MAX_BYTES = "TENANT_LOGO_MAX_BYTES";
-    Application BRANDING_TENANT_FAVICON_MAX_BYTES = "BRANDING_TENANT_FAVICON_MAX_BYTES";
-    Application BRANDING_TENANT_BACKGROUND_MAX_BYTES = "BRANDING_TENANT_BACKGROUND_MAX_BYTES";
-    Application BRANDING_COMPANY_LOGO_MAX_BYTES = "BRANDING_COMPANY_LOGO_MAX_BYTES";
-    Application BRANDING_COMPANY_FAVICON_MAX_BYTES = "BRANDING_COMPANY_FAVICON_MAX_BYTES";
-    Application BRANDING_COMPANY_BACKGROUND_MAX_BYTES = "BRANDING_COMPANY_BACKGROUND_MAX_BYTES";
+    Application TENANT_LOGO_MAX_BYTES = "TENANT_LOGO_MAX_BYTES", since "v0.12.0", optional;
+    Application BRANDING_TENANT_FAVICON_MAX_BYTES = "BRANDING_TENANT_FAVICON_MAX_BYTES", since "v0.14.0", optional;
+    Application BRANDING_TENANT_BACKGROUND_MAX_BYTES = "BRANDING_TENANT_BACKGROUND_MAX_BYTES", since "v0.14.0", optional;
+    Application BRANDING_COMPANY_LOGO_MAX_BYTES = "BRANDING_COMPANY_LOGO_MAX_BYTES", since "v0.14.0", optional;
+    Application BRANDING_COMPANY_FAVICON_MAX_BYTES = "BRANDING_COMPANY_FAVICON_MAX_BYTES", since "v0.14.0", optional;
+    Application BRANDING_COMPANY_BACKGROUND_MAX_BYTES = "BRANDING_COMPANY_BACKGROUND_MAX_BYTES", since "v0.14.0", optional;
 
     // -- Seeding -------------------------------------------------------------
 
-    Application MOKOSH_SEED_TENANT_ID = "MOKOSH_SEED_TENANT_ID";
-    Application MOKOSH_DEMO_SEED = "MOKOSH_DEMO_SEED";
+    Application MOKOSH_SEED_TENANT_ID = "MOKOSH_SEED_TENANT_ID", since "v0.3.0", optional;
+    Application MOKOSH_DEMO_SEED = "MOKOSH_DEMO_SEED", since "v0.3.0", optional;
 }
 
 #[cfg(test)]
@@ -390,6 +431,59 @@ mod tests {
                 "{name} must start with a letter"
             );
         }
+    }
+
+    fn version(v: &str) -> (u32, u32, u32) {
+        let parts: Vec<u32> = v
+            .strip_prefix('v')
+            .unwrap_or_else(|| panic!("{v} must start with v"))
+            .split('.')
+            .map(|p| p.parse().unwrap_or_else(|_| panic!("{v} is not vX.Y.Z")))
+            .collect();
+        assert_eq!(parts.len(), 3, "{v} is not vX.Y.Z");
+        (parts[0], parts[1], parts[2])
+    }
+
+    /// PMS-1442: the "Added in" column is rendered from `since`, so a malformed
+    /// one would print a release that never existed.
+    #[test]
+    fn every_key_names_the_release_that_added_it() {
+        for key in REGISTRY {
+            let since = version(key.since());
+            if let Some(later) = key.required_since() {
+                assert!(key.required(), "{key}: required_since on an optional key");
+                assert!(
+                    version(later) > since,
+                    "{key}: required_since must come after since"
+                );
+            }
+        }
+    }
+
+    /// PMS-1442: `required` means boot refuses the key outside dev/test
+    /// (`resolve_secret`, PMS-1160's essential list, the database URL).
+    #[test]
+    fn the_required_keys_are_the_ones_boot_refuses_without() {
+        let required: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|k| k.required())
+            .map(|k| k.name())
+            .collect();
+        assert_eq!(
+            required,
+            [
+                "DATABASE_URL",
+                "MOKOSH_APP_DATABASE_URL",
+                "ENCRYPTION_KEY",
+                "BASE_URL",
+                "JWT_SECRET",
+                "BUNYIP_WEBHOOK_SECRET",
+                "CLIENT_ORIGIN",
+                "SPA_BASE_URL",
+            ],
+            "a key that boot now refuses without needs `required` in its \
+             declaration and a Breaking entry in docs/configuration.md"
+        );
     }
 
     /// The bootstrap tier is small and stated, because every key in it either
