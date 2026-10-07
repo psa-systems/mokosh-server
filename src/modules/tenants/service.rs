@@ -287,6 +287,14 @@ impl TenantService {
             Some(b) => serde_json::to_value(b).unwrap_or_else(|_| serde_json::json!({})),
             None => serde_json::json!({}),
         };
+        // PMS-1472: create_tenant writes the same branding column
+        // update_tenant does, so it runs the same two checks
+        // update_tenant's write path runs (PMS-776 / PMS-1371): the shape
+        // check first, then the ownership check once `tenant_id` (minted
+        // above) is available, before anything lands in the INSERT below.
+        validate_branding_patch(&branding_json)?;
+        super::branding::assert_branding_patch_owned_by_tenant(&branding_json, tenant_id, &self.db)
+            .await?;
         sqlx::query(
             // `kind = 'org'` is set explicitly: migration 019_tenant_kind dropped
             // the column default, so every caller must supply it. This is the
