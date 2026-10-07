@@ -141,13 +141,30 @@ impl OauthClient {
 /// with no Google client, which the Settings card renders as unavailable.
 pub struct SharedGoogleClient {
     inner: std::sync::RwLock<Option<OauthClient>>,
+    /// PMS-1473: held for the full id-then-secret write in
+    /// `settings::google_client::put_google_client`, so two concurrent `PUT`s
+    /// cannot interleave their two underlying key writes into a mismatched
+    /// pair. This struct is already the one long-lived, per-process handle
+    /// this setting's write path is given, so it is the natural home for the
+    /// lock rather than a second piece of shared state threaded through just
+    /// for this.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl SharedGoogleClient {
     pub fn new(inner: Option<OauthClient>) -> Self {
         Self {
             inner: std::sync::RwLock::new(inner),
+            write_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Serialize a write to the id/secret pair this client is built from.
+    /// Held for the duration of both underlying key writes, so a second
+    /// concurrent caller waits for the first to fully finish rather than
+    /// interleaving with it.
+    pub async fn lock_write(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().await
     }
 
     /// Replace the client. Takes effect on every consumer's next read, which
