@@ -966,6 +966,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn whitespace_only_saved_view_name_rejected_on_create_and_update() {
+        let create = CreateTicketSavedViewRequest {
+            name: " ".to_string(),
+            filter: serde_json::Value::Null,
+            sort: serde_json::Value::Null,
+        };
+        assert!(create.validate().is_err());
+
+        let update = UpdateTicketSavedViewRequest {
+            name: Some(" ".to_string()),
+            filter: None,
+            sort: None,
+        };
+        assert!(update.validate().is_err());
+    }
+
+    #[test]
+    fn non_blank_saved_view_name_accepted() {
+        let create = CreateTicketSavedViewRequest {
+            name: "Morning queue".to_string(),
+            filter: serde_json::Value::Null,
+            sort: serde_json::Value::Null,
+        };
+        assert!(create.validate().is_ok());
+
+        let update = UpdateTicketSavedViewRequest {
+            name: None,
+            filter: None,
+            sort: None,
+        };
+        assert!(update.validate().is_ok());
+    }
+
+    #[test]
     fn note_is_editable_covers_every_row_state() {
         // The role gate refuses whatever the row says.
         assert!(!note_is_editable(NoteType::Internal, false, None, false));
