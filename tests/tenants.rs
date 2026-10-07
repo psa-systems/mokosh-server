@@ -745,11 +745,19 @@ async fn create_tenant_provisions_internal_own_company(pool: PgPool) {
 /// SPA can create-and-brand in one round-trip rather than a
 /// create-then-update pair. Round-trip: create -> read column ->
 /// GET response -> assert every populated field.
+///
+/// `logo_url` is not exercised here: PMS-1472 made `create_tenant` run the
+/// same `validate_branding_patch` / `assert_branding_patch_owned_by_tenant`
+/// checks `update_tenant` runs, and an image path can only name an asset
+/// under the tenant's own (not-yet-minted) id, so a legal `logo_url` for
+/// THIS tenant cannot be known before `create_tenant` returns it; the
+/// format and ownership checks on `logo_url` have their own coverage in
+/// `create_tenant_rejects_an_invalid_branding_value` and
+/// `create_tenant_rejects_a_logo_url_naming_another_tenants_path`.
 #[mokosh_test]
 async fn create_tenant_persists_optional_branding(pool: PgPool) {
     let svc = TenantService::new(Database::from_pool(pool.clone()));
     let branding = mokosh_types::tenants::TenantBranding {
-        logo_url: Some("https://cdn.example/logo.svg".to_string()),
         primary_color: Some("#2563eb".to_string()),
         support_email: Some("help@acme-mapps396.example".to_string()),
         ..Default::default()
@@ -776,11 +784,6 @@ async fn create_tenant_persists_optional_branding(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .expect("read branding");
-    assert_eq!(
-        raw["logo_url"].as_str(),
-        Some("https://cdn.example/logo.svg"),
-        "branding.logo_url must round-trip through create_tenant"
-    );
     assert_eq!(
         raw["primary_color"].as_str(),
         Some("#2563eb"),
@@ -825,6 +828,94 @@ async fn create_tenant_omitting_branding_uses_empty_default(pool: PgPool) {
         raw,
         serde_json::json!({}),
         "omitted branding must land as empty object, not NULL / null"
+    );
+}
+
+/// PMS-1472: `POST /api/v1/tenants` must refuse an invalid branding value
+/// with the same validation error `update_tenant` gives, not write it
+/// verbatim. Mirrors the format check `update_tenant` already runs
+/// (`validate_branding_patch`).
+#[mokosh_test]
+async fn create_tenant_rejects_an_invalid_branding_value(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::platform_login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/tenants"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "PMS-1472 Bad Color",
+            "slug": "pms1472-bad-color",
+            "admin_email": "owner-pms1472-bad-color@example.test",
+            "admin_first_name": "Owner",
+            "admin_last_name": "BadColor",
+            "branding": { "primary_color": "not-a-color" }
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/tenants with a bad hex color");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "an invalid branding format must be refused on create_tenant, the same as update_tenant"
+    );
+
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tenants WHERE slug = 'pms1472-bad-color')")
+            .fetch_one(&pool)
+            .await
+            .expect("check tenant was not created");
+    assert!(
+        !exists,
+        "a tenant must not be created when its branding fails validation"
+    );
+}
+
+/// PMS-1472: `POST /api/v1/tenants` must refuse a `logo_url` naming a path
+/// owned by a different tenant, the same ownership error `update_tenant`
+/// gives (PMS-1371's `assert_branding_patch_owned_by_tenant`).
+#[mokosh_test]
+async fn create_tenant_rejects_a_logo_url_naming_another_tenants_path(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let (other_tenant_id, _other_admin_id, _other_email, _other_password) =
+        common::seed_tenant_with_admin(&pool, "pms1472-other-tenant").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::platform_login(&app, &email, &password).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/tenants"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "PMS-1472 Cross Tenant Logo",
+            "slug": "pms1472-cross-tenant-logo",
+            "admin_email": "owner-pms1472-cross-logo@example.test",
+            "admin_first_name": "Owner",
+            "admin_last_name": "CrossLogo",
+            "branding": {
+                "logo_url": format!("/api/v1/public/tenants/{other_tenant_id}/logo"),
+            }
+        }))
+        .send()
+        .await
+        .expect("POST /api/v1/tenants with a cross-tenant logo_url");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a logo_url naming another tenant's path must be refused on create_tenant too"
+    );
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM tenants WHERE slug = 'pms1472-cross-tenant-logo')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("check tenant was not created");
+    assert!(
+        !exists,
+        "a tenant must not be created when its branding names another tenant's asset"
     );
 }
 
