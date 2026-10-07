@@ -309,7 +309,54 @@ async fn channel_credentials_are_encrypted_at_rest(pool: PgPool) {
     );
 }
 
+#[mokosh_test]
+async fn run_tick_marks_connection_failed_with_last_error_on_provider_failure(pool: PgPool) {
+    common::seed_admin(&pool).await;
+
+    // `datto` passes the `rmm_connections_provider_check` constraint but has
+    // no `build_provider` match arm, so it resolves to `UnimplementedProvider`,
+    // which fails loudly on `list_devices` without making a network call
+    // (PMS-1463: the failure path through `run_tick`, not `sync_one`, is what
+    // this test exercises).
+    let conn_id = seed_connection_with_provider(&pool, "datto").await;
+
+    let worker = RmmSyncWorker::new(Database::from_pool(pool.clone()), TEST_KEY);
+    worker.run_tick().await.expect("run_tick");
+
+    let (status, last_error): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT sync_status, last_error FROM rmm_connections WHERE id = $1")
+            .bind(conn_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read conn");
+    assert_eq!(status.as_deref(), Some("failed"));
+    assert!(
+        last_error.is_some_and(|e| !e.is_empty()),
+        "last_error should be populated for a failing provider"
+    );
+}
+
 // --- helpers ---------------------------------------------------------------
+
+async fn seed_connection_with_provider(pool: &PgPool, provider: &str) -> Uuid {
+    let key_enc = crypto::encrypt("some-api-key", &TEST_KEY).expect("encrypt api_key");
+    let id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO rmm_connections
+           (id, tenant_id, name, provider, api_url, api_key_encrypted, api_secret_encrypted,
+            is_active, sync_interval_minutes, sync_status)
+           VALUES ($1, $2, 'Test RMM', $3, 'https://rmm.example.test',
+                   $4, NULL, TRUE, 60, 'never')"#,
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(provider)
+    .bind(&key_enc)
+    .execute(pool)
+    .await
+    .expect("seed connection");
+    id
+}
 
 async fn seed_connection(pool: &PgPool, api_key: &str, api_secret: Option<&str>) -> Uuid {
     let key_enc = crypto::encrypt(api_key, &TEST_KEY).expect("encrypt api_key");

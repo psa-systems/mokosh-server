@@ -124,7 +124,15 @@ impl ScheduledReportsWorker {
 
             let (last_err, ok) = match outcome {
                 Ok(()) => (None::<String>, true),
-                Err(e) => (Some(e.to_string()), false),
+                Err(e) => {
+                    tracing::warn!(
+                        schedule_id = %id,
+                        tenant_id = %tenant_id,
+                        error = %e,
+                        "scheduled report delivery failed"
+                    );
+                    (Some(e.to_string()), false)
+                }
             };
             sqlx::query(
                 "UPDATE scheduled_reports \
