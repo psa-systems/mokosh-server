@@ -106,6 +106,23 @@ export default defineConfig({
       dependencies: ['preflight'],
       use: { ...devices['Desktop Safari'], baseURL: env.baseURL },
     },
+    // 2b. Browser-level reference-list selector coverage (PMS-1461): Log
+    //    time, rate cards, appointment technician assignment and project
+    //    task status, with the shared `request` fixture replaced by a raw
+    //    API context for seeding. Runs in ONE engine only (firefox, the
+    //    same one `setup` already proves logs in) rather than joining the
+    //    `chromium`/`firefox`/`webkit` projects above: it does its own
+    //    `loginViaSpa` on top of setup's, and each one spends from the
+    //    hub's 5/min per-email rate limit (see lib/login.ts), so adding it
+    //    to all three would triple that spend for no extra coverage of the
+    //    selectors themselves. Depends on `setup` for the bearer token its
+    //    seeding requests need (lib/auth-state.ts's `readToken`).
+    {
+      name: 'ui-selectors',
+      testMatch: /ui-selectors\.spec\.ts$/,
+      dependencies: ['setup'],
+      use: { ...devices['Desktop Firefox'], baseURL: env.baseURL },
+    },
     // 3. Request-context API coverage. The lib/fixtures.ts custom `test`
     //    fixture loads the bearer token written by `setup` and attaches it
     //    via extraHTTPHeaders on every request. Uses the API host, not the
