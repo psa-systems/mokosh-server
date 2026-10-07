@@ -9,8 +9,11 @@
 //! stamped; on failure it goes to `failed` with `last_error` set.
 //!
 //! Spawned from `src/main.rs`. One worker per replica; concurrent
-//! workers race-skip via the `sync_status = 'in_progress'` optimistic
-//! guard. The `sync_one` API is exposed so the integration test can
+//! workers race-skip via `mark_in_progress`'s atomic
+//! `WHERE sync_status <> 'in_progress'` claim: only the replica whose
+//! `UPDATE` actually flips the row proceeds into the sync, so two
+//! replicas that both pick the same due connection cannot both claim
+//! it. The `sync_one` API is exposed so the integration test can
 //! drive a deterministic tick against a mocked provider without
 //! waiting on the tick interval.
 //!
@@ -137,7 +140,12 @@ impl RmmSyncWorker {
         connection_id: Uuid,
         provider: &dyn RmmProvider,
     ) -> AppResult<SyncStats> {
-        self.mark_in_progress(connection_id).await?;
+        if !self.mark_in_progress(connection_id).await? {
+            // Lost the claim race to another replica (or the connection was
+            // already mid-sync): skip rather than proceed, so only the
+            // winner calls into `link_or_create_asset`.
+            return Ok(SyncStats::default());
+        }
 
         let devices = provider.list_devices().await?;
         let mut stats = SyncStats {
@@ -176,11 +184,14 @@ impl RmmSyncWorker {
         Ok(stats)
     }
 
-    async fn mark_in_progress(&self, connection_id: Uuid) -> AppResult<()> {
-        sqlx::query(
+    /// Atomically claim the connection: flips it to `in_progress` only if it
+    /// was not already there, so two replicas racing on the same due row
+    /// cannot both proceed. Returns `true` when this call won the claim.
+    async fn mark_in_progress(&self, connection_id: Uuid) -> AppResult<bool> {
+        let result = sqlx::query(
             r#"UPDATE rmm_connections
                SET sync_status = 'in_progress', updated_at = NOW()
-               WHERE id = $1"#,
+               WHERE id = $1 AND sync_status <> 'in_progress'"#,
         )
         .bind(connection_id)
         // SAFETY (PMS-285): cross-tenant RMM worker connection-status write keyed
@@ -188,7 +199,7 @@ impl RmmSyncWorker {
         .execute(self.db.migrator_pool())
         .await
         .map_err(|e| AppError::Database(format!("rmm mark in_progress: {e}")))?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     async fn mark_failed(&self, connection_id: Uuid, err: String) -> AppResult<()> {

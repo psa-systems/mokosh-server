@@ -153,6 +153,80 @@ async fn sync_writes_mapping_asset_audit_and_status(pool: PgPool) {
 }
 
 #[mokosh_test]
+async fn sync_one_skips_a_connection_already_claimed_by_another_replica(pool: PgPool) {
+    // Simulates two replicas racing `run_tick` in the same window: both pass
+    // the picker's `sync_status <> 'in_progress'` filter before either
+    // claims. Here the first replica's claim is represented by setting
+    // `sync_status = 'in_progress'` directly, then the second replica's
+    // `sync_one` call must lose the atomic claim (PMS-1470) and return
+    // without ever reaching `link_or_create_asset`.
+    common::seed_admin(&pool).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+
+    let company_id = common::seed_company(&pool).await;
+    let conn_id = seed_connection(&pool, "canary-key-not-in-cipher", Some("hmac-secret")).await;
+    seed_unlinked_mapping(&pool, conn_id, "device-A", company_id).await;
+
+    sqlx::query("UPDATE rmm_connections SET sync_status = 'in_progress' WHERE id = $1")
+        .bind(conn_id)
+        .execute(&pool)
+        .await
+        .expect("simulate other replica's claim");
+
+    let worker = RmmSyncWorker::new(Database::from_pool(pool.clone()), TEST_KEY);
+    let provider = StaticProvider {
+        devices: vec![ProviderDevice {
+            rmm_device_id: "device-A".into(),
+            hostname: Some("web-01".into()),
+            serial_number: Some("SN0001".into()),
+            last_seen: Some(Utc::now()),
+            raw: serde_json::json!({"agent_id": "device-A"}),
+        }],
+    };
+    let stats = worker
+        .sync_one(tenant_id, conn_id, &provider)
+        .await
+        .expect("sync_one should not error on a lost claim");
+    assert_eq!(
+        stats,
+        mokosh_server::modules::rmm::worker::SyncStats::default(),
+        "a lost claim should skip the sync entirely, not partially process it"
+    );
+
+    // No mapping was touched and no asset was created: `link_or_create_asset`
+    // was never reached.
+    let (asset_id, sync_status): (Option<Uuid>, Option<String>) = sqlx::query_as(
+        r#"SELECT asset_id, sync_status FROM rmm_device_mappings
+           WHERE tenant_id = $1 AND rmm_connection_id = $2 AND rmm_device_id = $3"#,
+    )
+    .bind(tenant_id)
+    .bind(conn_id)
+    .bind("device-A")
+    .fetch_one(&pool)
+    .await
+    .expect("read mapping");
+    assert!(asset_id.is_none(), "mapping should stay unlinked");
+    assert_eq!(sync_status.as_deref(), Some("pending"));
+
+    let asset_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count assets");
+    assert_eq!(asset_count, 0, "no asset should be created on a lost claim");
+
+    // The connection's status is left as the other replica's claim set it;
+    // the losing call does not touch it.
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT sync_status FROM rmm_connections WHERE id = $1")
+            .bind(conn_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read conn");
+    assert_eq!(status.as_deref(), Some("in_progress"));
+}
+
+#[mokosh_test]
 async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_dedupe(
     pool: PgPool,
 ) {
