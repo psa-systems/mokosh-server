@@ -133,11 +133,11 @@ check-env-example:
     nu scripts/check-env-example.nu
 
 # Enforce unique migration prefixes (PMS-198). Fails if two migrations
-# share a numeric prefix (sqlx keys its ledger on that prefix).
+# share a numeric prefix (sqlx keys its ledger on that prefix). Runs
+# common's shared recipe (PC-79).
 [doc("Fail if two migrations share a numeric prefix (PMS-198).")]
 [group: 'check']
-check-migrations:
-    nu scripts/check-migration-prefixes.nu
+check-migrations: check-migration-versions
 
 # Keep a guarded content UPDATE from matching zero rows in silence (PMS-1117).
 # A migration after prefix 209 that guards a WHERE clause on a content-column
