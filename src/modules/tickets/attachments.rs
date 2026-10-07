@@ -607,7 +607,11 @@ impl AttachmentService {
         self.store
             .delete(&ObjectKey::ticket_attachment(tenant_id, attachment_id))
             .await?;
-        let _ = self.ledger.forget(tenant_id, attachment_id).await;
+        // Best-effort (see `Ledger::forget`): the DB row and blob are already
+        // gone, so a stale ledger row only overstates usage, not an error.
+        if let Err(e) = self.ledger.forget(tenant_id, attachment_id).await {
+            tracing::warn!(tenant_id = %tenant_id, attachment_id = %attachment_id, error = %e, "failed to forget ticket attachment from ledger");
+        }
         Ok(())
     }
 }

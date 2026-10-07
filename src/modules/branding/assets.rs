@@ -464,14 +464,17 @@ impl BrandingAssetStore {
                 if keep_mime == Some(*mime) {
                     continue;
                 }
-                let _ = self
-                    .logo_store
-                    .delete(&ObjectKey::tenant_logo(tenant_id, *extension))
-                    .await;
-                let _ = self
-                    .logo_store
-                    .delete(&ObjectKey::legacy_tenant_logo(tenant_id, *extension))
-                    .await;
+                // Best-effort (see `remove` above): a superseded file left
+                // behind is invisible, so a failed unlink is logged, not
+                // propagated.
+                let current = ObjectKey::tenant_logo(tenant_id, *extension);
+                if let Err(e) = self.logo_store.delete(&current).await {
+                    tracing::warn!(tenant_id = %tenant_id, key = ?current, error = %e, "failed to delete superseded tenant logo");
+                }
+                let legacy = ObjectKey::legacy_tenant_logo(tenant_id, *extension);
+                if let Err(e) = self.logo_store.delete(&legacy).await {
+                    tracing::warn!(tenant_id = %tenant_id, key = ?legacy, error = %e, "failed to delete legacy tenant logo");
+                }
             }
             return;
         }
@@ -480,7 +483,11 @@ impl BrandingAssetStore {
             if keep_mime == Some(*mime) {
                 continue;
             }
-            let _ = tokio::fs::remove_file(self.path_for(scope, kind, mime)).await;
+            // Best-effort: same reasoning as above, for the local-path asset.
+            let path = self.path_for(scope, kind, mime);
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                tracing::warn!(path = %path.display(), error = %e, "failed to delete superseded brand asset");
+            }
         }
     }
 }

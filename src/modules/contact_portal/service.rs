@@ -224,10 +224,12 @@ impl ContactAuthService {
 
         let stored_hash = password_hash.ok_or(AppError::Unauthorized)?;
         if !verify_password(password, &stored_hash).await? {
-            // Best-effort: bump the failed-login counter + arm lockout
-            // if we cross the threshold. Errors here do not fail the
-            // response - they just skip the lockout write.
-            let _ = self.register_failed_login(tenant_id, contact_id).await;
+            // The lockout counter must not silently stop advancing, so a
+            // write failure is logged at error; the response still answers
+            // Unauthorized for the bad password regardless.
+            if let Err(e) = self.register_failed_login(tenant_id, contact_id).await {
+                tracing::error!(tenant_id = %tenant_id, contact_id = %contact_id, error = %e, "failed to register failed login attempt");
+            }
             self.audit(
                 tenant_id,
                 Some(contact_id),
@@ -270,7 +272,12 @@ impl ContactAuthService {
                 )
                 .await?;
             if !second_factor_ok {
-                let _ = self.register_failed_login(tenant_id, contact_id).await;
+                // The lockout counter must not silently stop advancing, so a
+                // write failure is logged at error; the response still
+                // answers Unauthorized for the bad code regardless.
+                if let Err(e) = self.register_failed_login(tenant_id, contact_id).await {
+                    tracing::error!(tenant_id = %tenant_id, contact_id = %contact_id, error = %e, "failed to register failed login attempt");
+                }
                 self.audit(
                     tenant_id,
                     Some(contact_id),
@@ -1433,8 +1440,12 @@ impl ContactAuthService {
                     // Wrong code: tick the counter, leave the link
                     // live (its expiry and the lockout bound the
                     // retries), and say so with the login's 401
-                    // rather than the link's 400.
-                    let _ = self.register_failed_login(tid, contact_id).await;
+                    // rather than the link's 400. The counter must not
+                    // silently stop advancing, so a write failure is
+                    // logged at error; the response is unchanged.
+                    if let Err(e) = self.register_failed_login(tid, contact_id).await {
+                        tracing::error!(tenant_id = %tid, contact_id = %contact_id, error = %e, "failed to register failed login attempt");
+                    }
                     // PMS-1089: the same row the password login writes
                     // for a wrong code. The transaction is released
                     // first so the audit write does not wait on a

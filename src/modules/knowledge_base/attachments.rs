@@ -278,15 +278,22 @@ impl KbAttachmentService {
             .await;
         // PMS-960: and wherever it was before the move, because the row is
         // gone either way and a blob nothing can name is litter that still
-        // counts against the volume.
-        let _ = self
+        // counts against the volume. Best-effort: logged, not propagated.
+        if let Err(e) = self
             .store
             .delete(&ObjectKey::legacy_kb_attachment(
                 tenant_id.get(),
                 attachment_id,
             ))
-            .await;
-        let _ = self.ledger.forget(tenant_id.get(), attachment_id).await;
+            .await
+        {
+            tracing::warn!(tenant_id = %tenant_id.get(), attachment_id = %attachment_id, error = %e, "failed to delete legacy kb attachment blob");
+        }
+        // Best-effort (see `Ledger::forget`): the DB row and blob are already
+        // gone, so a stale ledger row only overstates usage, not an error.
+        if let Err(e) = self.ledger.forget(tenant_id.get(), attachment_id).await {
+            tracing::warn!(tenant_id = %tenant_id.get(), attachment_id = %attachment_id, error = %e, "failed to forget kb attachment from ledger");
+        }
         unlinked
     }
 

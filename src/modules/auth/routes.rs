@@ -347,7 +347,12 @@ async fn logout(
             ua,
         )
         .await;
-        let _ = tx.commit().await;
+        // The log-write failure must not fail the logout (see above), so
+        // this still returns Ok below; the lost audit row is logged at
+        // error so it is not silent.
+        if let Err(e) = tx.commit().await {
+            tracing::error!(user_id = %user.id, tenant_id = %user.tenant_id, error = %e, "failed to commit logout audit row");
+        }
     }
 
     Ok(())

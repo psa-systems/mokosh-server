@@ -809,7 +809,11 @@ impl AuthService {
                     Some(serde_json::json!({ "outcome": "failed", "reason": "bad_password" })),
                 )
                 .await;
-                let _ = tx.commit().await;
+                // The client still sees the 401 below either way; a lost
+                // audit row is logged at error so it is not silent.
+                if let Err(e) = tx.commit().await {
+                    tracing::error!(user_id = %user.id, tenant_id = %user.tenant_id, error = %e, "failed to commit failed-login audit row");
+                }
             }
             return Err(AppError::Unauthorized);
         }
@@ -1014,7 +1018,12 @@ impl AuthService {
                 audit_ua,
             )
             .await;
-            let _ = tx.commit().await;
+            // The log-write failure must not fail the login itself (see
+            // above), so this still returns Ok below; the lost audit row
+            // is logged at error so it is not silent.
+            if let Err(e) = tx.commit().await {
+                tracing::error!(user_id = %user.id, tenant_id = %user.tenant_id, error = %e, "failed to commit successful-login audit row");
+            }
         }
 
         Ok(LoginResponse {

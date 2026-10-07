@@ -229,12 +229,16 @@ impl TenantLogoStore {
         for (_, extension) in EXTENSIONS {
             let current = ObjectKey::tenant_logo(tenant_id, *extension);
             if keep != Some(&current) {
-                let _ = self.store.delete(&current).await;
+                // Best-effort (see `remove` above): a stale file left behind
+                // is invisible, so a failed unlink is logged, not propagated.
+                if let Err(e) = self.store.delete(&current).await {
+                    tracing::warn!(tenant_id = %tenant_id, key = ?current, error = %e, "failed to delete superseded tenant logo");
+                }
             }
-            let _ = self
-                .store
-                .delete(&ObjectKey::legacy_tenant_logo(tenant_id, *extension))
-                .await;
+            let legacy = ObjectKey::legacy_tenant_logo(tenant_id, *extension);
+            if let Err(e) = self.store.delete(&legacy).await {
+                tracing::warn!(tenant_id = %tenant_id, key = ?legacy, error = %e, "failed to delete legacy tenant logo");
+            }
         }
     }
 }
