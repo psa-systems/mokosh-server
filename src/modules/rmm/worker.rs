@@ -83,7 +83,21 @@ impl RmmSyncWorker {
             let cfg = match self.decrypt_config(&row) {
                 Ok(c) => c,
                 Err(e) => {
-                    self.mark_failed(row.id, format!("decrypt: {e}")).await.ok();
+                    tracing::error!(
+                        connection_id = %row.id,
+                        tenant_id = %row.tenant_id,
+                        provider = %row.provider,
+                        error = %e,
+                        "rmm sync: could not decrypt connection credentials"
+                    );
+                    if let Err(e) = self.mark_failed(row.id, format!("decrypt: {e}")).await {
+                        tracing::error!(
+                            connection_id = %row.id,
+                            tenant_id = %row.tenant_id,
+                            error = %e,
+                            "rmm sync: could not record a failed sync; the row may stay in_progress"
+                        );
+                    }
                     continue;
                 }
             };
@@ -92,7 +106,21 @@ impl RmmSyncWorker {
                 .sync_one(row.tenant_id, row.id, provider.as_ref())
                 .await
             {
-                self.mark_failed(row.id, e.to_string()).await.ok();
+                tracing::warn!(
+                    connection_id = %row.id,
+                    tenant_id = %row.tenant_id,
+                    provider = %row.provider,
+                    error = %e,
+                    "rmm sync failed"
+                );
+                if let Err(e) = self.mark_failed(row.id, e.to_string()).await {
+                    tracing::error!(
+                        connection_id = %row.id,
+                        tenant_id = %row.tenant_id,
+                        error = %e,
+                        "rmm sync: could not record a failed sync; the row may stay in_progress"
+                    );
+                }
             }
             count += 1;
         }
