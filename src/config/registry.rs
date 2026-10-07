@@ -482,7 +482,7 @@ mod tests {
                 "SPA_BASE_URL",
             ],
             "a key that boot now refuses without needs `required` in its \
-             declaration and a Breaking entry in docs/configuration.md"
+             declaration and a won't-start entry in docs/configuration.md"
         );
     }
 

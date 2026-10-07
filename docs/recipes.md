@@ -64,7 +64,7 @@ just build-docker           # build the production OCI image (oci-build/Dockerfi
 
 # Configuration docs (PMS-1442)
 just config-docs            # regenerate docs/configuration.md's Recently added changelog and Required / Added in columns
-just config-since <version> # every configuration change after <version>, required and Breaking ones marked (pre-upgrade checklist)
+just config-since <version> [--json] # every configuration change after <version>, each with its level: won't start, feature off, or unmarked (pre-upgrade checklist)
 
 # Database
 just migrate-run            # apply pending migrations against $DATABASE_URL

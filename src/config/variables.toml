@@ -190,37 +190,38 @@ required = false
 reader = "src/main.rs"
 
 # Variables the server no longer reads; each keeps a doc row for old compose files.
+# Unmarked when the server just ignores them; `breaking = "wont-start"` only if boot refuses them.
 
 [[removed]]
 name = "GOOGLE_OAUTH_CLIENT_ID"
 since = "v0.2.0"
 removed = "v0.14.0"
 issue = "PMS-837"
-action = "Delete it from the compose variables; the Google sign-in routes it served are gone."
+action = "No action needed: the server ignores it. Cleanup: delete it from the compose variables; the Google sign-in routes it served are gone."
 
 [[removed]]
 name = "GOOGLE_OAUTH_CLIENT_SECRET"
 since = "v0.2.0"
 removed = "v0.14.0"
 issue = "PMS-837"
-action = "Delete it from the compose secrets; the Google sign-in routes it served are gone."
+action = "No action needed: the server ignores it. Cleanup: delete it from the compose secrets; the Google sign-in routes it served are gone."
 
 [[removed]]
 name = "GOOGLE_OAUTH_REDIRECT_URI"
 since = "v0.2.0"
 removed = "v0.14.0"
 issue = "PMS-837"
-action = "Delete it from the compose variables; the Google sign-in routes it served are gone."
+action = "No action needed: the server ignores it. Cleanup: delete it from the compose variables; the Google sign-in routes it served are gone."
 
 [[removed]]
 name = "OAUTH_SUPER_ADMIN_EMAILS"
 since = "v0.3.0"
 removed = "v0.14.0"
 issue = "PMS-837"
-action = "Delete it from the compose variables; only the removed Google sign-in path read it."
+action = "No action needed: the server ignores it. Cleanup: delete it from the compose variables; only the removed Google sign-in path read it."
 
 # Authored changelog wording, attached to the entry the facts imply; Changed may also be a behavior change.
-# Every Breaking entry needs a record with `issue` and `action`.
+# `breaking` is "wont-start" (restart fails) or "feature-off" (needs `feature`); either needs `issue` and `action`.
 
 [[change]]
 release = "v0.16.0"
@@ -241,7 +242,8 @@ release = "v0.16.0"
 group = "Changed"
 variables = ["SECRET_BACKEND"]
 issue = "PMS-1424"
-breaking = true
+breaking = "feature-off"
+feature = "application-tier secrets (`SMTP_PASSWORD` for outbound mail, the Google Contacts client pair)"
 action = "Now selects tenant-tier secrets only. If you set it expecting application secrets (`SMTP_PASSWORD`, the Google client pair) to move too, also set `APP_SECRET_BACKEND` to the same provider before restarting."
 
 [[change]]
@@ -249,7 +251,8 @@ release = "v0.16.0"
 group = "Changed"
 variables = ["GOOGLE_CONTACTS_CLIENT_ID", "GOOGLE_CONTACTS_CLIENT_SECRET"]
 issue = "PMS-1430"
-breaking = true
+breaking = "feature-off"
+feature = "Google Contacts import"
 action = "Now an application-tier secret served by `APP_SECRET_BACKEND`'s provider, no longer a plain variable. Move both halves there (an `app_secrets` row, Infisical `/app`, a `{NAME}_FILE` compose secret or an `APP_SECRETS_DIR` file); setting only one half refuses boot."
 
 [[change]]
@@ -278,7 +281,7 @@ release = "v0.14.0"
 group = "Changed"
 variables = ["MOKOSH_APP_DATABASE_URL", "BASE_URL", "CLIENT_ORIGIN", "SPA_BASE_URL"]
 issue = "PMS-1160"
-breaking = true
+breaking = "wont-start"
 action = "Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting."
 
 [[change]]
@@ -391,5 +394,5 @@ release = "v0.4.0"
 group = "Changed"
 variables = ["JWT_SECRET", "ENCRYPTION_KEY"]
 issue = "PMS-499"
-breaking = true
+breaking = "wont-start"
 action = "Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting."

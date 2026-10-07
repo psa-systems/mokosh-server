@@ -96,10 +96,10 @@ config-docs:
     nu scripts/config-docs.nu generate
 
 # The pre-upgrade checklist for a jump longer than the changelog window.
-[doc("List every configuration change after <version>, required and Breaking ones marked (PMS-1442).")]
+[doc("List every configuration change after <version> with its won't-start / feature-off level; --json for tooling (PMS-1442).")]
 [group: 'docs']
-config-since version:
-    nu scripts/config-docs.nu since {{ version }}
+config-since version *args:
+    nu scripts/config-docs.nu since {{ version }} {{ args }}
 
 # The block a release's notes carry, linking its Recently added entry. Pass
 # `--ref main` for a release tagged before its entry existed.

@@ -14,6 +14,8 @@ const LIST_HEADING = "## All variables"
 const GROUPS = ["Added" "Changed" "Deprecated" "Removed"]
 # Keys that predate the first tag are dated here; nothing upgrades into it.
 const BASELINE = "v0.1.0"
+# Breaking levels: the restart fails, or the app runs with a named feature off.
+const LEVELS = { "wont-start": "Breaking: won't start", "feature-off": "Breaking: feature off" }
 
 # Names the code reads that are not server configuration, each with its reason.
 const NOT_SERVER_CONFIG = {
@@ -104,7 +106,7 @@ def build-catalog [registry: list, meta: record] {
             required_since: null
             source: "removed"
             deprecated: null
-            removed: { release: $v.removed, issue: ($v.issue? | default ""), action: ($v.action? | default "") }
+            removed: { release: $v.removed, issue: ($v.issue? | default ""), action: ($v.action? | default ""), level: ($v.breaking? | default "") }
         }
     })
     $registry | append $vars | append $removed
@@ -143,18 +145,18 @@ def build-entries [catalog: list, meta: record] {
     mut auto = []
     for v in $catalog {
         let at_add = ($v.required and $v.required_since == null)
-        let breaking = ($at_add and $v.since != $BASELINE)
-        $auto = ($auto | append { release: $v.since, group: "Added", var: $v.name, required: $at_add, breaking: $breaking, issue: "", action: "" })
+        let level = if $at_add and $v.since != $BASELINE { "wont-start" } else { "" }
+        $auto = ($auto | append { release: $v.since, group: "Added", var: $v.name, required: $at_add, level: $level, feature: "", issue: "", action: "" })
         if $v.required_since != null {
-            $auto = ($auto | append { release: $v.required_since, group: "Changed", var: $v.name, required: true, breaking: true, issue: "", action: "" })
+            $auto = ($auto | append { release: $v.required_since, group: "Changed", var: $v.name, required: true, level: "wont-start", feature: "", issue: "", action: "" })
         }
         if $v.deprecated != null {
             let d = $v.deprecated
-            $auto = ($auto | append { release: $d.release, group: "Deprecated", var: $v.name, required: false, breaking: false, issue: ($d.issue? | default ""), action: $"Renamed to `($d.replacement)`. The old name still works and logs a warning naming the new one; rename it at your next compose edit." })
+            $auto = ($auto | append { release: $d.release, group: "Deprecated", var: $v.name, required: false, level: "", feature: "", issue: ($d.issue? | default ""), action: $"Renamed to `($d.replacement)`. The old name still works and logs a warning naming the new one; rename it at your next compose edit." })
         }
         if $v.removed != null {
             let r = $v.removed
-            $auto = ($auto | append { release: $r.release, group: "Removed", var: $v.name, required: false, breaking: true, issue: $r.issue, action: $r.action })
+            $auto = ($auto | append { release: $r.release, group: "Removed", var: $v.name, required: false, level: $r.level, feature: "", issue: $r.issue, action: $r.action })
         }
     }
 
@@ -164,6 +166,11 @@ def build-entries [catalog: list, meta: record] {
     for c in ($meta.change? | default []) {
         if not ($c.group in $GROUPS) {
             $errors = ($errors | append $"change record for ($c.release): group '($c.group)' is not one of ($GROUPS | str join ', ')")
+            continue
+        }
+        let level = ($c.breaking? | default "")
+        if not ($level in ["" "wont-start" "feature-off"]) {
+            $errors = ($errors | append $"change record ($c.release) ($c.group): breaking '($level)' is not wont-start or feature-off")
             continue
         }
         for var in ($c.variables? | default []) {
@@ -179,14 +186,15 @@ def build-entries [catalog: list, meta: record] {
                 }
                 let v = ($catalog | where name == $var | first)
                 let req = ($v.required and ($v.required_since == null or (vnum $v.required_since) <= (vnum $c.release)))
-                $explicit = ($explicit | append { release: $c.release, group: "Changed", var: $var, required: $req, breaking: ($c.breaking? | default false), issue: ($c.issue? | default ""), action: ($c.action? | default "") })
+                $explicit = ($explicit | append { release: $c.release, group: "Changed", var: $var, required: $req, level: $level, feature: ($c.feature? | default ""), issue: ($c.issue? | default ""), action: ($c.action? | default "") })
             } else {
                 let i = $hit.0.index
                 let e = $hit.0.item
                 $auto = ($auto | update $i ($e | merge {
                     issue: ($c.issue? | default $e.issue)
                     action: ($c.action? | default $e.action)
-                    breaking: ($e.breaking or ($c.breaking? | default false))
+                    level: (if ($level | is-empty) { $e.level } else { $level })
+                    feature: ($c.feature? | default $e.feature)
                 }))
             }
         }
@@ -196,8 +204,11 @@ def build-entries [catalog: list, meta: record] {
         if ($e.action | is-empty) { $e | update action (default-action $e) } else { $e }
     })
     for e in $all {
-        if $e.breaking and (($e.action | is-empty) or not ($e.issue =~ '^[A-Z]+-\d+$')) {
-            $errors = ($errors | append $"Breaking ($e.group) ($e.var) in ($e.release) needs a [[change]] record in ($VARIABLES_FILE) with the operator action and the issue that introduced it")
+        if ($e.level | is-not-empty) and (($e.action | is-empty) or not ($e.issue =~ '^[A-Z]+-\d+$')) {
+            $errors = ($errors | append $"($LEVELS | get $e.level) ($e.group) ($e.var) in ($e.release) needs a [[change]] record in ($VARIABLES_FILE) with the operator action and the issue that introduced it")
+        }
+        if $e.level == "feature-off" and ($e.feature | str trim | is-empty) {
+            $errors = ($errors | append $"Breaking: feature off ($e.group) ($e.var) in ($e.release) needs `feature` naming what stops working")
         }
         if ($e.issue | is-not-empty) and not ($e.issue =~ '^[A-Z]+-\d+$') {
             $errors = ($errors | append $"($e.var) in ($e.release): issue '($e.issue)' is not an issue id")
@@ -215,15 +226,20 @@ def window [entries: list, tags: list] {
     { unreleased: $unreleased, released: ($sorted | first ([$WINDOW ($sorted | length)] | math min)) }
 }
 
+def level-rank [level: string] {
+    match $level { "wont-start" => 0, "feature-off" => 1, _ => 2 }
+}
+
 def entry-sort [rows: list] {
-    $rows | sort-by {|e| $"(if $e.breaking { 0 } else { 1 })(if $e.required { 0 } else { 1 })($e.var)" }
+    $rows | sort-by {|e| $"(level-rank $e.level)(if $e.required { 0 } else { 1 })($e.var)" }
 }
 
 def render-entry [e: record] {
-    let mark = if $e.breaking { "**Breaking:** " } else { "" }
+    let mark = if ($e.level | is-empty) { "" } else { $"**($LEVELS | get $e.level):** " }
     let req = if $e.required { "yes" } else { "no" }
+    let feature = if $e.level == "feature-off" { $"Feature: ($e.feature). " } else { "" }
     let issue = if ($e.issue | is-empty) { "" } else { $" \(($e.issue))" }
-    $"- ($mark)[`($e.var)`]\(#(slug $e.var)) \(Required: ($req)) - ($e.action)($issue)"
+    $"- ($mark)[`($e.var)`]\(#(slug $e.var)) \(Required: ($req)) - ($feature)($e.action)($issue)"
 }
 
 def render-recent [entries: list, tags: list] {
@@ -231,7 +247,7 @@ def render-recent [entries: list, tags: list] {
     mut out = [
         $BEGIN
         ""
-        $"Configuration changes in the last ($WINDOW) releases, newest first, rendered by `just config-docs` from `src/config/registry.rs` and `src/config/variables.toml` \(edit those, not this section). **Breaking** marks a change that stops the server starting, or turns off a feature that worked, unless the operator acts first; each one names the action and the issue that introduced it. Upgrading across more releases than this? Run `just config-since <running version>`."
+        $"Configuration changes in the last ($WINDOW) releases, newest first, rendered by `just config-docs` from `src/config/registry.rs` and `src/config/variables.toml` \(edit those, not this section). **Breaking: won't start** marks a change after which the restart fails until the operator acts; apply it before restarting. **Breaking: feature off** marks a change after which the server runs but the named feature stops working or changes until the operator acts; review it before restarting. Both name the operator action and the issue that introduced them. An unmarked entry needs no action unless you relied on the old behavior. Upgrading across more releases than this? Run `just config-since <running version>`."
     ]
     let versions = ($w.unreleased | each {|v| { v: $v, label: $"Unreleased \(($v))" } } | append ($w.released | each {|v| { v: $v, label: $v } }))
     for r in $versions {
@@ -323,7 +339,7 @@ def check-list [lines: list, catalog: list] {
     $errors
 }
 
-const ENTRY_RE = '^- (?<b>\*\*Breaking:\*\* )?\[`(?<var>[A-Z][A-Z0-9_]*)`\]\(#(?<anchor>[a-z0-9-]+)\) \(Required: (?<req>yes|no)\) - (?<text>.+)$'
+const ENTRY_RE = r#'^- (?:\*\*Breaking: (?<b>won't start|feature off):\*\* )?\[`(?<var>[A-Z][A-Z0-9_]*)`\]\(#(?<anchor>[a-z0-9-]+)\) \(Required: (?<req>yes|no)\) - (?<text>.+)$'#
 
 def check-recent [lines: list, entries: list, tags: list] {
     let bounds = (recent-bounds $lines)
@@ -361,11 +377,15 @@ def check-recent [lines: list, entries: list, tags: list] {
         if $d.req != $req {
             $errors = ($errors | append $"($DOC_FILE): ($release) ($group) ($d.var) says Required: ($d.req), the facts say ($req)")
         }
-        if ($d.b | is-not-empty) != $e.breaking {
-            $errors = ($errors | append $"($DOC_FILE): ($release) ($group) ($d.var) Breaking mark is wrong \(expected ($e.breaking))")
+        let want = if ($e.level | is-empty) { "" } else { $LEVELS | get $e.level | str replace "Breaking: " "" }
+        if ($d.b | default "") != $want {
+            $errors = ($errors | append $"($DOC_FILE): ($release) ($group) ($d.var) mark is '($d.b | default "none")', the facts say '(if ($want | is-empty) { "none" } else { $want })'")
         }
-        if $e.breaking and not ($d.text | str contains $e.issue) {
+        if ($e.level | is-not-empty) and not ($d.text | str contains $e.issue) {
             $errors = ($errors | append $"($DOC_FILE): ($release) Breaking ($d.var) does not name its issue ($e.issue)")
+        }
+        if $e.level == "feature-off" and not ($d.text | str starts-with $"Feature: ($e.feature). ") {
+            $errors = ($errors | append $"($DOC_FILE): ($release) feature-off ($d.var) does not name its feature '($e.feature)'")
         }
         if $d.anchor != (slug $d.var) or not ($d.anchor in $anchors) {
             $errors = ($errors | append $"($DOC_FILE): ($release) ($d.var) links to #($d.anchor), which is not that variable's row anchor")
@@ -375,7 +395,7 @@ def check-recent [lines: list, entries: list, tags: list] {
     let covered = ($w.unreleased | append $w.released)
     for e in ($entries | where {|e| $e.release in $covered }) {
         if not ($"($e.release)|($e.group)|($e.var)" in $found) {
-            let what = if $e.breaking { "Breaking " } else { "" }
+            let what = if ($e.level | is-empty) { "" } else { $"($LEVELS | get $e.level) " }
             $errors = ($errors | append $"($DOC_FILE): ($what)($e.group) ($e.var) in ($e.release) is missing from Recently added; run `just config-docs`")
         }
     }
@@ -523,24 +543,31 @@ def "main check" [] {
 
 def "main since" [
     version: string   # the release you run now, e.g. v0.13.0
+    --json            # machine-readable: one record per entry with its `level`
 ] {
     let repo = (load-repo)
     let after = ($repo.entries | where {|e| (vnum $e.release) > (vnum $version) })
+    let sorted = ($after | sort-by {|e| $"((vnum $e.release) + 1000000000)(level-rank $e.level)($e.var)" })
+    if $json {
+        print ($sorted | each {|e| { release: $e.release, group: $e.group, variable: $e.var, required: $e.required, level: (if ($e.level | is-empty) { "none" } else { $e.level }), feature: $e.feature, issue: $e.issue, action: $e.action } } | to json)
+        return
+    }
     if ($after | is-empty) { print $"No configuration changes after ($version)."; return }
-    let rows = ($after | sort-by {|e| $"((vnum $e.release) + 1000000000)(if $e.breaking { 0 } else { 1 })($e.var)" } | each {|e|
+    let rows = ($sorted | each {|e|
         {
             release: $e.release
             change: $e.group
             variable: $e.var
             required: (if $e.required { "REQUIRED" } else { "no" })
-            breaking: (if $e.breaking { "BREAKING" } else { "" })
+            level: (match $e.level { "wont-start" => "WON'T START", "feature-off" => $"FEATURE OFF: ($e.feature)", _ => "" })
             issue: $e.issue
             action: $e.action
         }
     })
     print ($rows | table --expand --width 200)
-    let breaking = ($rows | where breaking == "BREAKING" | length)
-    print $"($rows | length) changes after ($version), ($breaking) breaking: apply every BREAKING action before restarting."
+    let wont = ($after | where level == "wont-start" | length)
+    let off = ($after | where level == "feature-off" | length)
+    print $"($rows | length) changes after ($version): ($wont) WON'T START \(apply before restarting), ($off) FEATURE OFF \(review and acknowledge before restarting)."
 }
 
 def "main release-notes" [
@@ -558,11 +585,15 @@ def "main release-notes" [
         print $"No configuration changes in ($version). Full list: [docs/configuration.md]\(($link))."
         return
     }
-    let breaking = ($rows | where breaking)
-    print $"[Configuration changes in ($version)]\(($link)): ($rows | length) entries, ($breaking | length) breaking."
+    let breaking = ($rows | where {|e| $e.level | is-not-empty } | sort-by {|e| $"(level-rank $e.level)($e.var)" })
+    let wont = ($breaking | where level == "wont-start" | length)
+    print $"[Configuration changes in ($version)]\(($link)): ($rows | length) entries, ($wont) won't start, (($breaking | length) - $wont) feature off."
     if ($breaking | is-not-empty) {
         print ""
-        for e in $breaking { print $"- **Breaking:** `($e.var)` - ($e.action) \(($e.issue))" }
+        for e in $breaking {
+            let feature = if $e.level == "feature-off" { $"Feature: ($e.feature). " } else { "" }
+            print $"- **($LEVELS | get $e.level):** `($e.var)` - ($feature)($e.action) \(($e.issue))"
+        }
     }
 }
 
@@ -577,7 +608,10 @@ def fixture [] {
     let meta = {
         variable: [{ name: "BOOT_KEY", since: "v9.1.0", required: false, reader: "src/x.rs" }]
         removed: [{ name: "GONE_KEY", since: "v9.0.0", removed: "v9.1.0", issue: "PMS-2", action: "Delete it." }]
-        change: [{ release: "v9.1.0", group: "Changed", variables: ["LATE_REQ"], issue: "PMS-1", breaking: true, action: "Set it." }]
+        change: [
+            { release: "v9.1.0", group: "Changed", variables: ["LATE_REQ"], issue: "PMS-1", breaking: "wont-start", action: "Set it." }
+            { release: "v9.1.0", group: "Changed", variables: ["OLD_KEY"], issue: "PMS-4", breaking: "feature-off", feature: "Widget export", action: "Move it." }
+        ]
     }
     { registry_text: $registry_text, meta: $meta, tags: ["v0.1.0" "v9.0.0" "v9.1.0"] }
 }
@@ -638,7 +672,14 @@ def "main self-test" [] {
         ["a removed row with its note passes", (all-errors $f.registry_text $f.meta $f.tags $good | where {|e| $e | str contains "GONE_KEY" }), 0]
         ["a new required key passes with its Breaking entry", (all-errors $new_req $new_req_meta $f.tags $new_req_doc), 0]
         ["a new required key missing from the changelog fails", (all-errors $new_req $new_req_meta $f.tags ($new_req_doc | lines | where {|l| not (($l starts-with "- ") and ($l | str contains "NEW_REQ")) } | str join "\n")), 1]
-        ["a new required key without its Breaking mark fails", (all-errors $new_req $new_req_meta $f.tags ($new_req_doc | str replace '- **Breaking:** [`NEW_REQ`]' '- [`NEW_REQ`]')), 1]
+        ["a new required key without its Breaking mark fails", (all-errors $new_req $new_req_meta $f.tags ($new_req_doc | str replace "- **Breaking: won't start:** [`NEW_REQ`]" '- [`NEW_REQ`]')), 1]
+        ["a won't-start entry marked feature off fails", (all-errors $new_req $new_req_meta $f.tags ($new_req_doc | str replace "- **Breaking: won't start:** [`NEW_REQ`]" '- **Breaking: feature off:** [`NEW_REQ`]')), 1]
+        ["a feature-off entry passes with its feature named", (all-errors $f.registry_text $f.meta $f.tags $good | where {|e| $e | str contains "OLD_KEY" }), 0]
+        ["a feature-off entry whose doc line drops the feature fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace "Feature: Widget export. " "")), 1]
+        ["a feature-off record without a feature fails", (build-entries (build-catalog (parse-registry $f.registry_text) $f.meta) ($f.meta | update change ($f.meta.change | update 1 {|c| $c | reject feature })) | get errors), 1]
+        ["a feature-off entry shown unmarked fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace "- **Breaking: feature off:** [`OLD_KEY`]" '- [`OLD_KEY`]')), 1]
+        ["an unknown breaking level fails", (build-entries (build-catalog (parse-registry $f.registry_text) $f.meta) ($f.meta | update change ($f.meta.change | update 0 {|c| $c | update breaking "maybe" })) | get errors), 1]
+        ["an ignored removal is unmarked", (do { let c = (build-catalog (parse-registry $f.registry_text) $f.meta); build-entries $c $f.meta | get entries | where {|e| $e.group == "Removed" and ($e.level | is-not-empty) } }), 0]
         ["a Breaking change without an issue and action fails", (build-entries (build-catalog (parse-registry $new_req) $f.meta) $f.meta | get errors), 1]
         ["a wrong Required flag in the changelog fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace '[`OPT_KEY`](#var-opt-key) (Required: no)' '[`OPT_KEY`](#var-opt-key) (Required: yes)')), 1]
         ["an entry linking to a missing anchor fails", (all-errors $f.registry_text $f.meta $f.tags ($good | str replace '[`OPT_KEY`](#var-opt-key)' '[`OPT_KEY`](#var-nope)')), 1]

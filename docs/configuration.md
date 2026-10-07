@@ -2,7 +2,7 @@
 
 Every variable the server reads, which release added it, and whether the server starts without it. An operator upgrading reads [Recently added](#recently-added) first; for a jump across more than five releases, `just config-since <running version>` lists every change since that release, and the [All variables](#all-variables) list carries the same facts row by row.
 
-The facts are not hand-maintained. `src/config/registry.rs` declares each configuration key with the release that added it and whether it is required (PMS-1442), `src/config/variables.toml` does the same for the variables read outside the registry (the bootstrap and provider-of-record reads in `config::guard::ENTRY_POINTS`) and for removed ones, and `just config-docs` renders them into this page. `just check-config-docs` (part of `just check`) fails when a variable has no row, a row's Required or Added in disagrees with the facts, a row names a variable nothing declares, or the changelog below is missing an entry or a Breaking mark. Adding a variable therefore means declaring it with `since` and `required`, running `just config-docs`, and describing its row.
+The facts are not hand-maintained. `src/config/registry.rs` declares each configuration key with the release that added it and whether it is required (PMS-1442), `src/config/variables.toml` does the same for the variables read outside the registry (the bootstrap and provider-of-record reads in `config::guard::ENTRY_POINTS`) and for removed ones, and `just config-docs` renders them into this page. `just check-config-docs` (part of `just check`) fails when a variable has no row, a row's Required or Added in disagrees with the facts, a row names a variable nothing declares, or the changelog below is missing an entry, has the wrong level (`Breaking: won't start`, `Breaking: feature off` or unmarked), or a feature-off entry does not name its feature. Adding a variable therefore means declaring it with `since` and `required`, running `just config-docs`, and describing its row.
 
 In development, `.env` is generated once per clone from the committed `.env.example` by the first `just dev`, minting fresh random values for every self-owned secret; see step 3 of [`quickstart.md`](quickstart.md). `just check-env-example` keeps `.env.example` and `compose.dev.yml` in step with the same registry.
 
@@ -10,7 +10,7 @@ In development, `.env` is generated once per clone from the committed `.env.exam
 
 <!-- BEGIN GENERATED: recently-added (just config-docs) -->
 
-Configuration changes in the last 5 releases, newest first, rendered by `just config-docs` from `src/config/registry.rs` and `src/config/variables.toml` (edit those, not this section). **Breaking** marks a change that stops the server starting, or turns off a feature that worked, unless the operator acts first; each one names the action and the issue that introduced it. Upgrading across more releases than this? Run `just config-since <running version>`.
+Configuration changes in the last 5 releases, newest first, rendered by `just config-docs` from `src/config/registry.rs` and `src/config/variables.toml` (edit those, not this section). **Breaking: won't start** marks a change after which the restart fails until the operator acts; apply it before restarting. **Breaking: feature off** marks a change after which the server runs but the named feature stops working or changes until the operator acts; review it before restarting. Both name the operator action and the issue that introduced them. An unmarked entry needs no action unless you relied on the old behavior. Upgrading across more releases than this? Run `just config-since <running version>`.
 
 <a id="release-v0-16-0"></a>
 
@@ -23,9 +23,9 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 #### Changed
 
-- **Breaking:** [`GOOGLE_CONTACTS_CLIENT_ID`](#var-google-contacts-client-id) (Required: no) - Now an application-tier secret served by `APP_SECRET_BACKEND`'s provider, no longer a plain variable. Move both halves there (an `app_secrets` row, Infisical `/app`, a `{NAME}_FILE` compose secret or an `APP_SECRETS_DIR` file); setting only one half refuses boot. (PMS-1430)
-- **Breaking:** [`GOOGLE_CONTACTS_CLIENT_SECRET`](#var-google-contacts-client-secret) (Required: no) - Now an application-tier secret served by `APP_SECRET_BACKEND`'s provider, no longer a plain variable. Move both halves there (an `app_secrets` row, Infisical `/app`, a `{NAME}_FILE` compose secret or an `APP_SECRETS_DIR` file); setting only one half refuses boot. (PMS-1430)
-- **Breaking:** [`SECRET_BACKEND`](#var-secret-backend) (Required: no) - Now selects tenant-tier secrets only. If you set it expecting application secrets (`SMTP_PASSWORD`, the Google client pair) to move too, also set `APP_SECRET_BACKEND` to the same provider before restarting. (PMS-1424)
+- **Breaking: feature off:** [`GOOGLE_CONTACTS_CLIENT_ID`](#var-google-contacts-client-id) (Required: no) - Feature: Google Contacts import. Now an application-tier secret served by `APP_SECRET_BACKEND`'s provider, no longer a plain variable. Move both halves there (an `app_secrets` row, Infisical `/app`, a `{NAME}_FILE` compose secret or an `APP_SECRETS_DIR` file); setting only one half refuses boot. (PMS-1430)
+- **Breaking: feature off:** [`GOOGLE_CONTACTS_CLIENT_SECRET`](#var-google-contacts-client-secret) (Required: no) - Feature: Google Contacts import. Now an application-tier secret served by `APP_SECRET_BACKEND`'s provider, no longer a plain variable. Move both halves there (an `app_secrets` row, Infisical `/app`, a `{NAME}_FILE` compose secret or an `APP_SECRETS_DIR` file); setting only one half refuses boot. (PMS-1430)
+- **Breaking: feature off:** [`SECRET_BACKEND`](#var-secret-backend) (Required: no) - Feature: application-tier secrets (`SMTP_PASSWORD` for outbound mail, the Google Contacts client pair). Now selects tenant-tier secrets only. If you set it expecting application secrets (`SMTP_PASSWORD`, the Google client pair) to move too, also set `APP_SECRET_BACKEND` to the same provider before restarting. (PMS-1424)
 
 <a id="release-v0-15-0"></a>
 
@@ -60,7 +60,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 #### Added
 
-- **Breaking:** [`MOKOSH_DEPLOYMENT_MODE`](#var-mokosh-deployment-mode) (Required: yes) - Set `self-hosted` or `saas` before restarting; boot refuses without it outside dev/test. Introduced by PMS-1011. (PMS-1160)
+- **Breaking: won't start:** [`MOKOSH_DEPLOYMENT_MODE`](#var-mokosh-deployment-mode) (Required: yes) - Set `self-hosted` or `saas` before restarting; boot refuses without it outside dev/test. Introduced by PMS-1011. (PMS-1160)
 - [`APP_SECRETS_DIR`](#var-app-secrets-dir) (Required: no) - Optional. Directory the file application-secret provider reads; unset disables that provider. (PMS-988)
 - [`AUTH_PROVIDERS`](#var-auth-providers) (Required: no) - Optional. Unset keeps the hosting profile's default (`bunyip,local` in saas, `local` self-hosted). (PMS-981)
 - [`BRANDING_COMPANY_BACKGROUND_MAX_BYTES`](#var-branding-company-background-max-bytes) (Required: no) - Optional. Unset keeps the built-in cap for that asset. (MAPPS-622)
@@ -95,17 +95,17 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 #### Changed
 
-- **Breaking:** [`BASE_URL`](#var-base-url) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
-- **Breaking:** [`CLIENT_ORIGIN`](#var-client-origin) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
-- **Breaking:** [`MOKOSH_APP_DATABASE_URL`](#var-mokosh-app-database-url) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
-- **Breaking:** [`SPA_BASE_URL`](#var-spa-base-url) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
+- **Breaking: won't start:** [`BASE_URL`](#var-base-url) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
+- **Breaking: won't start:** [`CLIENT_ORIGIN`](#var-client-origin) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
+- **Breaking: won't start:** [`MOKOSH_APP_DATABASE_URL`](#var-mokosh-app-database-url) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
+- **Breaking: won't start:** [`SPA_BASE_URL`](#var-spa-base-url) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
 
 #### Removed
 
-- **Breaking:** [`GOOGLE_OAUTH_CLIENT_ID`](#var-google-oauth-client-id) (Required: no) - Delete it from the compose variables; the Google sign-in routes it served are gone. (PMS-837)
-- **Breaking:** [`GOOGLE_OAUTH_CLIENT_SECRET`](#var-google-oauth-client-secret) (Required: no) - Delete it from the compose secrets; the Google sign-in routes it served are gone. (PMS-837)
-- **Breaking:** [`GOOGLE_OAUTH_REDIRECT_URI`](#var-google-oauth-redirect-uri) (Required: no) - Delete it from the compose variables; the Google sign-in routes it served are gone. (PMS-837)
-- **Breaking:** [`OAUTH_SUPER_ADMIN_EMAILS`](#var-oauth-super-admin-emails) (Required: no) - Delete it from the compose variables; only the removed Google sign-in path read it. (PMS-837)
+- [`GOOGLE_OAUTH_CLIENT_ID`](#var-google-oauth-client-id) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; the Google sign-in routes it served are gone. (PMS-837)
+- [`GOOGLE_OAUTH_CLIENT_SECRET`](#var-google-oauth-client-secret) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose secrets; the Google sign-in routes it served are gone. (PMS-837)
+- [`GOOGLE_OAUTH_REDIRECT_URI`](#var-google-oauth-redirect-uri) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; the Google sign-in routes it served are gone. (PMS-837)
+- [`OAUTH_SUPER_ADMIN_EMAILS`](#var-oauth-super-admin-emails) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; only the removed Google sign-in path read it. (PMS-837)
 
 <a id="release-v0-13-0"></a>
 
