@@ -908,6 +908,67 @@ mod pms1427_e2e_page_size {
     /// script, recipe or CI step; `e2e/lib/api.ts` carries the constant the specs
     /// interpolate, and its own declaration is the one literal allowed to equal
     /// the maximum.
+    /// Scans `text` (as if it were the file `relative`) for `per_page=` call
+    /// sites, returning how many it found and which ones ask for more than
+    /// [`PaginationParams::MAX_PER_PAGE`]. A numeric literal is an offender
+    /// above the cap; an interpolation (`${...}`) is an offender unless it is
+    /// exactly `${MAX_PER_PAGE}`, since any other identifier (e.g. a local
+    /// `PER_PAGE` constant) could hold any value and is unverifiable here.
+    fn scan_for_over_cap_per_page(relative: &str, text: &str) -> (usize, Vec<String>) {
+        // Assembled, so this test's own prose is not a match.
+        let needle = format!("per{}page=", "_");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        for (at, _) in text.match_indices(&needle) {
+            let rest = &text[at + needle.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() {
+                // An interpolation. Only `${MAX_PER_PAGE}` is the shape this
+                // guard wants every call site to have; any other identifier
+                // (e.g. a local `PER_PAGE` constant) is an offender just as
+                // much as an over-cap literal would be.
+                seen += 1;
+                if let Some(ident) = rest
+                    .strip_prefix("${")
+                    .and_then(|after| after.split_once('}'))
+                    .map(|(ident, _)| ident)
+                {
+                    if ident != "MAX_PER_PAGE" {
+                        offenders.push(format!("{relative}: per_page=${{{ident}}}"));
+                    }
+                }
+                continue;
+            }
+            seen += 1;
+            let asked: u32 = digits.parse().expect("a run of digits parses");
+            if asked > PaginationParams::MAX_PER_PAGE {
+                offenders.push(format!("{relative}: per page {asked}"));
+            }
+        }
+        (seen, offenders)
+    }
+
+    /// A local constant interpolated into `per_page=` is exactly the shape
+    /// that let MAPPS-542's cap drift from `e2e/global.teardown.ts`'s own
+    /// `PER_PAGE = 200`: the pre-PMS-1464 scan only matched digit runs, so
+    /// `per_page=${PER_PAGE}` passed silently no matter what `PER_PAGE` held.
+    #[test]
+    fn an_interpolated_identifier_other_than_max_per_page_is_an_offender() {
+        let (seen, offenders) =
+            scan_for_over_cap_per_page("e2e/fixture.ts", "per_page=${PER_PAGE}");
+        assert_eq!(seen, 1);
+        assert_eq!(offenders, vec!["e2e/fixture.ts: per_page=${PER_PAGE}"]);
+    }
+
+    /// The one interpolation shape the guard accepts.
+    #[test]
+    fn an_interpolated_max_per_page_is_not_an_offender() {
+        let (seen, offenders) =
+            scan_for_over_cap_per_page("e2e/fixture.ts", "per_page=${MAX_PER_PAGE}");
+        assert_eq!(seen, 1);
+        assert!(offenders.is_empty());
+    }
+
     #[test]
     fn no_e2e_test_asks_for_a_page_larger_than_the_api_serves() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("e2e");
@@ -919,8 +980,6 @@ mod pms1427_e2e_page_size {
             panic!("e2e/ is missing, so this guard proves nothing");
         }
 
-        // Assembled, so this test's own prose is not a match.
-        let needle = format!("per{}page=", "_");
         let mut offenders: Vec<String> = Vec::new();
         let mut seen = 0usize;
         let mut files = vec![root.clone()];
@@ -945,20 +1004,9 @@ mod pms1427_e2e_page_size {
                 .to_string_lossy()
                 .replace('\\', "/");
             let text = std::fs::read_to_string(&path).expect("read an e2e source file");
-            for (at, _) in text.match_indices(&needle) {
-                let rest = &text[at + needle.len()..];
-                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-                if digits.is_empty() {
-                    // An interpolation such as `${MAX_PER_PAGE}`, which is the
-                    // shape this guard wants every call site to have.
-                    continue;
-                }
-                seen += 1;
-                let asked: u32 = digits.parse().expect("a run of digits parses");
-                if asked > PaginationParams::MAX_PER_PAGE {
-                    offenders.push(format!("{relative}: per page {asked}"));
-                }
-            }
+            let (file_seen, file_offenders) = scan_for_over_cap_per_page(&relative, &text);
+            seen += file_seen;
+            offenders.extend(file_offenders);
         }
 
         assert!(
