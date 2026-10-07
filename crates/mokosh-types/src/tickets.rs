@@ -8,7 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 // ============================================================================
 // TICKET SOURCE
@@ -925,11 +925,24 @@ pub struct TicketSavedView {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Reject a saved-view name that is empty or all whitespace. The `length`
+/// validator measures the untrimmed string, but the service persists
+/// `name.trim()` and the column CHECK enforces the trimmed length, so a
+/// whitespace-only name passes `length(min = 1)` here and then fails the
+/// CHECK as an unhandled SQLSTATE 23514 (PMS-1474).
+fn validate_not_blank(value: &str) -> Result<(), ValidationError> {
+    if value.trim().is_empty() {
+        Err(ValidationError::new("blank"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Request body for `POST /api/v1/tickets/saved-views`. Name is capped at 100
 /// characters to match the column CHECK.
 #[derive(Debug, Clone, Deserialize, validator::Validate)]
 pub struct CreateTicketSavedViewRequest {
-    #[validate(length(min = 1, max = 100))]
+    #[validate(length(min = 1, max = 100), custom(function = "validate_not_blank"))]
     pub name: String,
     #[serde(default)]
     pub filter: serde_json::Value,
@@ -942,7 +955,7 @@ pub struct CreateTicketSavedViewRequest {
 /// this user's views already holds answers 409.
 #[derive(Debug, Clone, Deserialize, validator::Validate)]
 pub struct UpdateTicketSavedViewRequest {
-    #[validate(length(min = 1, max = 100))]
+    #[validate(length(min = 1, max = 100), custom(function = "validate_not_blank"))]
     pub name: Option<String>,
     pub filter: Option<serde_json::Value>,
     pub sort: Option<serde_json::Value>,
