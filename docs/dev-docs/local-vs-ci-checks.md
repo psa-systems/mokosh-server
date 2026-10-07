@@ -23,7 +23,7 @@ PMS-786 only CI runs (see the note below).
 | `check.yml` step | Command | `just check` | `just pre-commit` | `just pre-push` |
 | --- | --- | --- | --- | --- |
 | Migration prefix uniqueness | `nu scripts/check-migration-prefixes.nu` | `check-migrations` | no | no |
-| Migration immutability | `nu scripts/check-migration-immutability.nu` | `check-migration-immutability` | no | no |
+| Migration immutability | `just check-migration-immutability` | `check-migration-immutability` | no | no |
 | No duplicate mail copy | `nu scripts/check-no-duplicate-mail-copy.nu` | `check-mail-copy` | no | no |
 | Pool safety (RLS tenant GUC) | `nu scripts/check-pool-safety.nu` | `check-pool-safety` | no | no |
 | Create/update validate parity | `nu scripts/check-create-update-validate-parity.nu` | `check-validate-parity` | no | no |
