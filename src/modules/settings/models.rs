@@ -251,14 +251,78 @@ pub fn validate_setting_value(
         // experiment doesn't require a server change before the
         // validator can be taught the shape.
         _ => {
+            let value_type = setting_value_type(value);
+            let value_len = serde_json::to_string(value)
+                .map(|s| s.len())
+                .unwrap_or_default();
+            let value = loggable_setting_value(category, key, value);
             tracing::warn!(
                 category,
                 key,
+                value,
+                value_type,
+                value_len,
                 "tenant_setting value validation: unknown (category, key); accepting verbatim. Add a match arm to validate_setting_value when the shape is finalized."
             );
             Ok(())
         }
     }
+}
+
+/// The JSON shape name `loggable_setting_value`'s caller logs alongside the
+/// value itself, so a reader knows what the (possibly redacted) value was.
+fn setting_value_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// The longest value logged verbatim before it is cut with a trailing `...`.
+const MAX_LOGGED_SETTING_VALUE_BYTES: usize = 1024;
+
+/// Words that mark a `(category, key)` as likely holding a secret: tenant
+/// settings have no shape contract for an unknown key, so this is the only
+/// gate before `value` reaches the log. A real secret belongs in
+/// `SecretProvider`, not here, but this branch cannot assume that an unknown
+/// key is not one.
+const SENSITIVE_WORDS: &[&str] = &[
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "credential",
+    "private",
+    "apikey",
+    "api_key",
+    "auth",
+];
+
+/// The compact-JSON form of `value`, safe to log: `<redacted>` when `category`
+/// or `key` looks like a secret, otherwise the value itself, cut at
+/// [`MAX_LOGGED_SETTING_VALUE_BYTES`] with a trailing `...` when longer.
+fn loggable_setting_value(category: &str, key: &str, value: &serde_json::Value) -> String {
+    let category = category.to_ascii_lowercase();
+    let key = key.to_ascii_lowercase();
+    if SENSITIVE_WORDS
+        .iter()
+        .any(|word| category.contains(word) || key.contains(word))
+    {
+        return "<redacted>".to_string();
+    }
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+    if json.len() <= MAX_LOGGED_SETTING_VALUE_BYTES {
+        return json;
+    }
+    let mut cut = MAX_LOGGED_SETTING_VALUE_BYTES;
+    while cut > 0 && !json.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &json[..cut])
 }
 
 /// The one hex-colour predicate in the tree (PMS-776). `pub(crate)` rather than
@@ -336,5 +400,46 @@ mod tests {
                 "{illegal} is not"
             );
         }
+    }
+
+    #[test]
+    fn loggable_setting_value_shows_a_plain_value() {
+        assert_eq!(
+            loggable_setting_value("experiments", "new_knob", &json!({"a": 1})),
+            r#"{"a":1}"#
+        );
+    }
+
+    #[test]
+    fn loggable_setting_value_redacts_a_sensitive_category_or_key() {
+        for (category, key) in [
+            ("secrets", "e2e"),
+            ("e2e", "api_token"),
+            ("e2e", "PASSWORD"),
+            ("e2e", "passwd"),
+            ("e2e", "credential_blob"),
+            ("private_stuff", "e2e"),
+            ("e2e", "apikey"),
+            ("e2e", "api_key"),
+            ("e2e", "basic_auth"),
+        ] {
+            assert_eq!(
+                loggable_setting_value(category, key, &json!("super-secret-value")),
+                "<redacted>",
+                "({category}, {key}) should be redacted"
+            );
+        }
+        assert_eq!(
+            loggable_setting_value("e2e", "e2e-1791335857567-50227-35", &json!("fine")),
+            r#""fine""#
+        );
+    }
+
+    #[test]
+    fn loggable_setting_value_cuts_a_long_value_at_1024_bytes() {
+        let long = "x".repeat(2000);
+        let out = loggable_setting_value("e2e", "e2e-1", &json!(long));
+        assert!(out.len() <= MAX_LOGGED_SETTING_VALUE_BYTES + 3);
+        assert!(out.ends_with("..."));
     }
 }
