@@ -4116,6 +4116,10 @@ impl ContactService {
         .fetch_optional(&mut *tx)
         .await?;
 
+        if before.is_none() {
+            return Err(AppError::NotFound("Contact".to_string()));
+        }
+
         // PMS-1369: detach every saved card on the provider side BEFORE the
         // `DELETE FROM contacts` below, so `contact_payment_methods
         // .contact_id ON DELETE CASCADE` never removes a local row while the
