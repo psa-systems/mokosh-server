@@ -26,6 +26,7 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 | [`ROADMAP.md`](ROADMAP.md) | Durable narrative: goals, phases, sequencing and the reasoning behind the order for the provider rollout. |
 | [`upgrade-blocked-by-duplicates.md`](upgrade-blocked-by-duplicates.md) | What to do when an upgrade stops because a migration cannot build a unique index over rows that predate it: the detect and repair queries for all five such indexes, and why the fix cannot live in a migration. |
 | [`operator-provider-runbook.md`](operator-provider-runbook.md) | The six-step operator workflow for moving a governed secret to a new provider. |
+| [`runbooks/release-and-deploy.md`](runbooks/release-and-deploy.md) | Cutting and deploying a release across the three-repo chain (Mokosh server, Mokosh apps, Bunyip): prerequisites, `just create-release`, what merging the PR triggers per repo, image tags and the registry, staging-then-production promotion, and the known 2026-09-18 failure modes. |
 
 ## Internal notes
 
