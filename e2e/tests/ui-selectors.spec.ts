@@ -105,6 +105,11 @@ test.describe('UI reference-list selectors (PMS-1461)', () => {
       ).toHaveCount(1);
       await apptDialog.getByRole('button', { name: 'Cancel' }).click();
 
+      // The per-technician board lives on /dispatch, a separate route from
+      // /calendar: #calendar-dispatch-scroll is rendered by DispatchBoardPage
+      // only (mokosh-apps src/pages/calendar.rs), not by the calendar page
+      // above, so the assertion has to navigate there first.
+      await page.goto('/dispatch');
       await page.getByRole('button', { name: 'Today' }).click();
       await page.getByRole('button', { name: 'Day', exact: true }).click();
       const dispatchBoard = page.locator('#calendar-dispatch-scroll');
