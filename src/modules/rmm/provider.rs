@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::net::{
-    guard_outbound_url, private_target_allowlist, HostResolver, SystemResolver,
+    guard_outbound_url, loggable_url_authority, private_target_allowlist, HostResolver,
+    SystemResolver,
 };
 
 /// One device as returned by a provider. Field names mirror the
@@ -141,8 +142,9 @@ impl TacticalRmmProvider {
             path.trim_start_matches('/'),
         );
         let url = Url::parse(&raw).map_err(|e| {
+            let url_authority = loggable_url_authority(&raw);
             tracing::warn!(
-                connection_id = %self.cfg.connection_id, error = %e,
+                connection_id = %self.cfg.connection_id, url_authority, error = %e,
                 "RMM connection has an unusable api_url",
             );
             AppError::Configuration(format!("RMM api_url is not a valid URL: {e}"))
@@ -157,13 +159,17 @@ impl TacticalRmmProvider {
         )
         .await
         .map_err(|e| {
+            let host = url.host_str().unwrap_or_default();
             tracing::warn!(
-                connection_id = %self.cfg.connection_id, blocked = %e,
-                "RMM connection refused: api_url is not on the public internet",
+                connection_id = %self.cfg.connection_id, host, blocked = %e,
+                "RMM connection refused by the outbound URL guard",
             );
-            AppError::Configuration(format!(
-                "RMM api_url refused: {e}. Set OUTBOUND_PRIVATE_ALLOWLIST if this target is deliberately private."
-            ))
+            let hint = matches!(e, crate::utils::net::UrlGuardError::Blocked { .. })
+                .then_some(
+                    " Set OUTBOUND_PRIVATE_ALLOWLIST if this target is deliberately private.",
+                )
+                .unwrap_or_default();
+            AppError::Configuration(format!("RMM api_url refused: {e}.{hint}"))
         })?;
         Ok(url)
     }

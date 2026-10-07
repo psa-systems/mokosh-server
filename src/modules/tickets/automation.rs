@@ -18,8 +18,8 @@ use crate::modules::notifications::NotificationsService;
 use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::AppResult;
 use crate::utils::net::{
-    guard_outbound_url, private_target_allowlist, HostResolver, PrivateTargetAllowlist,
-    SystemResolver, UrlGuardError,
+    guard_outbound_url, loggable_url_authority, private_target_allowlist, HostResolver,
+    PrivateTargetAllowlist, SystemResolver, UrlGuardError,
 };
 
 use super::models::*;
@@ -440,8 +440,9 @@ impl AutomationEngine {
                     let target = match Url::parse(url) {
                         Ok(t) => t,
                         Err(e) => {
+                            let url_authority = loggable_url_authority(url);
                             tracing::warn!(
-                                %ticket_id, rule_id = %rule.id, rule = %rule.name, error = %e,
+                                %ticket_id, rule_id = %rule.id, rule = %rule.name, url_authority, error = %e,
                                 "webhook action has an unusable 'url' param",
                             );
                             continue;
@@ -562,10 +563,13 @@ impl AutomationEngine {
                     ),
                     // PMS-809: a refused target is a failed action naming
                     // the rule and the address, not a silent no-op.
-                    Err(WebhookError::Refused(guard)) => tracing::warn!(
-                        %ticket_id, %rule_id, rule = %rule_name, blocked = %guard,
-                        "automation webhook refused: target is not on the public internet",
-                    ),
+                    Err(WebhookError::Refused(guard)) => {
+                        let host = target.host_str().unwrap_or_default();
+                        tracing::warn!(
+                            %ticket_id, %rule_id, rule = %rule_name, host, blocked = %guard,
+                            "automation webhook refused by the outbound URL guard",
+                        );
+                    }
                     Err(e) => tracing::warn!(
                         %ticket_id, %rule_id, rule = %rule_name, error = %e,
                         "automation webhook send failed",
@@ -763,7 +767,7 @@ mod tests {
         .await
         .expect_err("a loopback webhook target is refused");
         assert!(
-            matches!(&err, WebhookError::Refused(UrlGuardError::Blocked(ip)) if ip.to_string() == "127.0.0.1"),
+            matches!(&err, WebhookError::Refused(UrlGuardError::Blocked { address, .. }) if address.to_string() == "127.0.0.1"),
             "expected a refusal naming the address, got {err:?}"
         );
     }
@@ -778,7 +782,7 @@ mod tests {
         .await
         .expect_err("an RFC1918 webhook target is refused");
         assert!(
-            matches!(&err, WebhookError::Refused(UrlGuardError::Blocked(ip)) if ip.to_string() == "10.1.2.3"),
+            matches!(&err, WebhookError::Refused(UrlGuardError::Blocked { address, .. }) if address.to_string() == "10.1.2.3"),
             "expected a refusal naming the address, got {err:?}"
         );
     }

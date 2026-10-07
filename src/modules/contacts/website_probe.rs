@@ -32,6 +32,17 @@ use crate::utils::net::{
     WEB_PORTS,
 };
 
+/// `url` with any userinfo cleared, safe to log: a company website is public,
+/// but a redirect `Location` a remote origin controls could set
+/// `user:pass@host`, so every log of a URL that may have followed a hop logs
+/// this instead of the URL itself.
+fn loggable_url(url: &Url) -> Url {
+    let mut cleaned = url.clone();
+    let _ = cleaned.set_username("");
+    let _ = cleaned.set_password(None);
+    cleaned
+}
+
 /// Redirect hops followed before the probe gives up.
 const MAX_HOPS: usize = 5;
 
@@ -400,7 +411,7 @@ async fn attempt<F: WebsiteFetcher + ?Sized>(fetcher: &F, host: &str, scheme: &s
                     host,
                     scheme,
                     hop,
-                    url = %url,
+                    url = %loggable_url(&url),
                     error = ?e,
                     "website probe request failed"
                 );
@@ -435,7 +446,7 @@ async fn attempt<F: WebsiteFetcher + ?Sized>(fetcher: &F, host: &str, scheme: &s
             tracing::warn!(
                 host,
                 scheme,
-                url = %url,
+                url = %loggable_url(&url),
                 location,
                 "website probe reached MAX_HOPS with the chain still redirecting"
             );
@@ -484,9 +495,9 @@ async fn guard_url<F: WebsiteFetcher + ?Sized>(
         Err(e) => {
             // Logged with the real cause before it is flattened, so a refused
             // probe is never an unexplained `blocked_host`.
-            tracing::warn!(url = %url, error = %e, "website probe refused a hop");
+            tracing::warn!(url = %loggable_url(url), error = %e, "website probe refused a hop");
             Err(match e {
-                UrlGuardError::Dns(_) => UnreachableReason::Dns,
+                UrlGuardError::Dns { .. } => UnreachableReason::Dns,
                 _ => UnreachableReason::BlockedHost,
             })
         }
@@ -555,7 +566,7 @@ impl ReqwestFetcher {
             // A Location the transport cannot read as text is not silently a
             // "no redirect": say so, then let the caller end the chain here.
             Some(Err(e)) => {
-                tracing::warn!(url = %url, error = %e, "website probe got an unreadable Location header");
+                tracing::warn!(url = %loggable_url(url), error = %e, "website probe got an unreadable Location header");
                 None
             }
             None => None,
