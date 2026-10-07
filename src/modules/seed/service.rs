@@ -246,8 +246,11 @@ impl SeedService {
         }
         self.seed_rows(tenant_id, user_id).await?;
         // Keep the auto-seed bookkeeping consistent so the middleware never
-        // re-seeds this tenant: claim the flag (best-effort) and mark it seen.
-        let _ = self.try_claim(tenant_id).await;
+        // re-seeds this tenant: claim the flag (best-effort, the rows are
+        // already seeded either way) and mark it seen.
+        if let Err(e) = self.try_claim(tenant_id).await {
+            tracing::warn!(tenant_id = %tenant_id, error = %e, "failed to claim demo_seeded flag after loading demo data");
+        }
         self.mark_seen(tenant_id);
         Ok(LoadDemoOutcome::Seeded)
     }

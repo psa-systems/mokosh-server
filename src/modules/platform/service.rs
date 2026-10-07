@@ -161,7 +161,9 @@ impl PlatformAdminService {
         }
 
         // Best-effort last_login stamp; failure does not block the login.
-        let _ = PlatformAdminRepo::update_last_login(pool, admin.id).await;
+        if let Err(e) = PlatformAdminRepo::update_last_login(pool, admin.id).await {
+            tracing::warn!(admin_id = %admin.id, error = %e, "failed to stamp platform admin last_login");
+        }
 
         // MAPPS-520 walkthrough: ensure the platform admin also has a
         // tenant admin users row in the default tenant. Without this,
@@ -188,7 +190,7 @@ impl PlatformAdminService {
         // from the platform password over time; the client's
         // chained login will still succeed for whichever password
         // it holds at the moment of login.
-        let _ = self.ensure_tenant_admin_row(&admin).await;
+        self.ensure_tenant_admin_row(&admin).await?;
 
         let (access_token, expires_at) = self.mint_token(&admin)?;
         Ok(PlatformLoginResponse {
