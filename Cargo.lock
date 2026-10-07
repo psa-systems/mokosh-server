@@ -2228,7 +2228,7 @@ dependencies = [
 
 [[package]]
 name = "mokosh-server"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "aes-gcm",
  "allsorts-azul",
