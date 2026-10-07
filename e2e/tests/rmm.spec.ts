@@ -12,8 +12,10 @@ import { runSuffix } from '../lib/run';
 // separate /test route), and the connection response never echoes the key, so
 // no real RMM system is needed. provider is a CHECK-constrained enum
 // ('tactical_rmm'). Alert rules and device mappings reference the connection
-// (FK), so they are deleted before it. Every delete runs before the asserts so
-// one failure cannot orphan the rest.
+// (FK), so they are deleted before it. The cleanup runs in a `finally` so an
+// assertion failure above cannot orphan the connection: an active connection
+// on a fake api_url is a live staging worker retrying a sync that can never
+// succeed, so the connection is also never armed (`is_active` stays false).
 test.describe('RMM CRUD', () => {
   test('connection + alert rule + device mapping lifecycle', async ({ request }) => {
     await enableModule(request, 'rmm_integration');
@@ -32,64 +34,70 @@ test.describe('RMM CRUD', () => {
     const connection = (await createConn.json()) as { id: string };
     expect(connection.id).toBeTruthy();
 
-    const getConn = await request.get(routes.rmmConnection(connection.id));
-    expect(getConn.status()).toBe(200);
+    let rule: { id: string } | undefined;
+    let mapping: { id: string } | undefined;
+    try {
+      const getConn = await request.get(routes.rmmConnection(connection.id));
+      expect(getConn.status()).toBe(200);
 
-    const updConn = await request.put(routes.rmmConnection(connection.id), {
-      data: { name: `${connName}-upd`, is_active: true },
-    });
-    expect(updConn.status(), `update connection failed: ${await updConn.text()}`).toBe(200);
+      // is_active stays false: the worker syncs active connections against
+      // their api_url, and this one is a fake URL that must never be armed.
+      const updConn = await request.put(routes.rmmConnection(connection.id), {
+        data: { name: `${connName}-upd`, sync_interval_minutes: 30 },
+      });
+      expect(updConn.status(), `update connection failed: ${await updConn.text()}`).toBe(200);
 
-    const listConn = await request.get(`${routes.rmmConnections}?per_page=${MAX_PER_PAGE}`);
-    expect(listConn.status()).toBe(200);
-    expect(((await listConn.json()) as { data: Array<{ id: string }> }).data.map((c) => c.id)).toContain(
-      connection.id,
-    );
+      const listConn = await request.get(`${routes.rmmConnections}?per_page=${MAX_PER_PAGE}`);
+      expect(listConn.status()).toBe(200);
+      expect(((await listConn.json()) as { data: Array<{ id: string }> }).data.map((c) => c.id)).toContain(
+        connection.id,
+      );
 
-    // Alert rule (create/list/delete only; references the connection).
-    const ruleName = runSuffix();
-    const createRule = await request.post(routes.rmmAlertRules, {
-      data: { rmm_connection_id: connection.id, name: ruleName },
-    });
-    expect(createRule.status(), `create alert-rule failed: ${await createRule.text()}`).toBe(200);
-    const rule = (await createRule.json()) as { id: string };
-    expect(rule.id).toBeTruthy();
+      // Alert rule (create/list/delete only; references the connection).
+      const ruleName = runSuffix();
+      const createRule = await request.post(routes.rmmAlertRules, {
+        data: { rmm_connection_id: connection.id, name: ruleName },
+      });
+      expect(createRule.status(), `create alert-rule failed: ${await createRule.text()}`).toBe(200);
+      rule = (await createRule.json()) as { id: string };
+      expect(rule.id).toBeTruthy();
 
-    const listRules = await request.get(`${routes.rmmAlertRules}?per_page=${MAX_PER_PAGE}`);
-    expect(listRules.status()).toBe(200);
-    expect(((await listRules.json()) as { data: Array<{ id: string }> }).data.map((r) => r.id)).toContain(
-      rule.id,
-    );
+      const listRules = await request.get(`${routes.rmmAlertRules}?per_page=${MAX_PER_PAGE}`);
+      expect(listRules.status()).toBe(200);
+      expect(((await listRules.json()) as { data: Array<{ id: string }> }).data.map((r) => r.id)).toContain(
+        rule.id,
+      );
 
-    // Device mapping (create/list/delete only; references the connection).
-    // device_name carries the run suffix so teardown can sweep it as a backstop.
-    const createMap = await request.post(routes.rmmDeviceMappings, {
-      data: {
-        rmm_connection_id: connection.id,
-        rmm_device_id: runSuffix(),
-        device_name: runSuffix(),
-      },
-    });
-    expect(createMap.status(), `create device-mapping failed: ${await createMap.text()}`).toBe(200);
-    const mapping = (await createMap.json()) as { id: string };
-    expect(mapping.id).toBeTruthy();
+      // Device mapping (create/list/delete only; references the connection).
+      // device_name carries the run suffix so teardown can sweep it as a backstop.
+      const createMap = await request.post(routes.rmmDeviceMappings, {
+        data: {
+          rmm_connection_id: connection.id,
+          rmm_device_id: runSuffix(),
+          device_name: runSuffix(),
+        },
+      });
+      expect(createMap.status(), `create device-mapping failed: ${await createMap.text()}`).toBe(200);
+      mapping = (await createMap.json()) as { id: string };
+      expect(mapping.id).toBeTruthy();
 
-    const listMaps = await request.get(`${routes.rmmDeviceMappings}?per_page=${MAX_PER_PAGE}`);
-    expect(listMaps.status()).toBe(200);
-    expect(((await listMaps.json()) as { data: Array<{ id: string }> }).data.map((m) => m.id)).toContain(
-      mapping.id,
-    );
-
-    // Cleanup, reverse-dependency order: the alert rule and device mapping
-    // reference the connection, so they go first. Run every delete before
-    // asserting so one failure cannot orphan the rest.
-    const cleanup = [
-      await request.delete(routes.rmmAlertRule(rule.id)),
-      await request.delete(routes.rmmDeviceMapping(mapping.id)),
-      await request.delete(routes.rmmConnection(connection.id)),
-    ];
-    for (const res of cleanup) {
-      expect(res.ok(), `cleanup delete -> ${res.status()}`).toBeTruthy();
+      const listMaps = await request.get(`${routes.rmmDeviceMappings}?per_page=${MAX_PER_PAGE}`);
+      expect(listMaps.status()).toBe(200);
+      expect(((await listMaps.json()) as { data: Array<{ id: string }> }).data.map((m) => m.id)).toContain(
+        mapping.id,
+      );
+    } finally {
+      // Reverse-dependency order: the alert rule and device mapping
+      // reference the connection, so they go first. Only delete what was
+      // actually created, and tolerate 404 (already gone).
+      const deletes: Array<Promise<{ ok: () => boolean; status: () => number }>> = [];
+      if (rule) deletes.push(request.delete(routes.rmmAlertRule(rule.id)));
+      if (mapping) deletes.push(request.delete(routes.rmmDeviceMapping(mapping.id)));
+      deletes.push(request.delete(routes.rmmConnection(connection.id)));
+      for (const p of deletes) {
+        const res = await p;
+        expect(res.ok() || res.status() === 404, `cleanup delete -> ${res.status()}`).toBeTruthy();
+      }
     }
   });
 });

@@ -2,13 +2,14 @@ import { request, type APIRequestContext } from '@playwright/test';
 import { existsSync } from 'node:fs';
 import { TOKEN_FILE, readToken } from './lib/auth-state';
 import { env } from './lib/env';
-import { routes } from './lib/api';
+import { MAX_PER_PAGE, routes } from './lib/api';
 import { isOwnedByThisRun, isStale } from './lib/run';
 
 // Global teardown: remove everything THIS run created, then sweep e2e-prefixed
-// residue older than 24h left by earlier failed runs. Best-effort by design -
-// a teardown failure must not mask a green/red test result, so every deletion
-// is wrapped and we never throw.
+// residue older than 24h left by earlier failed runs. A teardown that cannot
+// clean up is a failure: a list or delete that fails is collected rather than
+// swallowed, and the run throws after the full sweep so the cause lands in the
+// log instead of a silent "nothing to sweep".
 //
 // Auth: reuses the bearer token the setup project wrote to TOKEN_FILE; the
 // auth middleware reads Bearer only, so cookie-based reuse is not an option
@@ -18,8 +19,6 @@ import { isOwnedByThisRun, isStale } from './lib/run';
 // (src/modules/tickets/routes.rs, added in PMS-149). They carry run-suffixed
 // titles and are swept before companies, since delete_company refuses while a
 // ticket still references the company. See e2e/README.md.
-
-const PER_PAGE = 200;
 
 interface Named {
   id: string;
@@ -33,12 +32,21 @@ interface Named {
 async function listAll(api: APIRequestContext, path: string): Promise<Named[]> {
   const out: Named[] = [];
   for (let page = 1; page <= 50; page += 1) {
-    const res = await api.get(`${path}?page=${page}&per_page=${PER_PAGE}`);
-    if (!res.ok()) break;
+    const url = `${path}?page=${page}&per_page=${MAX_PER_PAGE}`;
+    const res = await api.get(url);
+    if (res.status() === 404) {
+      // A disabled module's list route 404s (RequireModuleEnabled,
+      // src/modules/auth/middleware.rs); a disabled module created no
+      // records, so an empty list here is correct, not a failure to report.
+      return out;
+    }
+    if (!res.ok()) {
+      throw new Error(`GET ${url} -> ${res.status()}: ${await res.text()}`);
+    }
     const body = (await res.json()) as { data?: Named[]; meta?: { total?: number } };
     const rows = body.data ?? [];
     out.push(...rows);
-    if (rows.length < PER_PAGE) break;
+    if (rows.length < MAX_PER_PAGE) break;
   }
   return out;
 }
@@ -62,50 +70,47 @@ async function sweep(
   listPath: string,
   del: (id: string) => string,
   now: number,
-): Promise<{ removed: number; failed: number }> {
+): Promise<{ removed: number; failed: number; errors: string[] }> {
   let removed = 0;
   let failed = 0;
-  let rows: Named[] = [];
+  const errors: string[] = [];
+  let rows: Named[];
   try {
     rows = await listAll(api, listPath);
   } catch (err) {
-    console.warn(`[teardown] could not list ${listPath}: ${String(err)}`);
-    return { removed, failed };
+    errors.push(`list ${listPath}: ${String(err)}`);
+    return { removed, failed, errors };
   }
   for (const row of rows) {
     if (!shouldRemove(label(row), now)) continue;
+    const path = del(row.id);
     try {
-      const res = await api.delete(del(row.id));
-      if (res.ok()) removed += 1;
-      else {
+      const res = await api.delete(path);
+      if (res.ok()) {
+        removed += 1;
+      } else {
         failed += 1;
-        console.warn(`[teardown] DELETE ${del(row.id)} -> ${res.status()}`);
+        errors.push(`delete ${path} -> ${res.status()}: ${await res.text()}`);
       }
     } catch (err) {
       failed += 1;
-      console.warn(`[teardown] DELETE ${del(row.id)} threw: ${String(err)}`);
+      errors.push(`delete ${path} threw: ${String(err)}`);
     }
   }
-  return { removed, failed };
+  return { removed, failed, errors };
 }
 
 export default async function globalTeardown(): Promise<void> {
   if (!existsSync(TOKEN_FILE)) {
-    console.warn('[teardown] no bearer token on disk; skipping cleanup (setup likely failed)');
-    return;
+    throw new Error('[teardown] no bearer token on disk; setup failed, so cleanup did not run');
   }
-  let token: string;
-  try {
-    token = readToken();
-  } catch (err) {
-    console.warn(`[teardown] cannot read token: ${String(err)}`);
-    return;
-  }
+  const token = readToken();
   const api = await request.newContext({
     baseURL: env.apiBaseURL,
     extraHTTPHeaders: { Authorization: `Bearer ${token}` },
   });
   const now = Date.now();
+  const allErrors: string[] = [];
   try {
     // Order matters: a parent refuses deletion while a child still references
     // it. Sweep children before parents, and the company (referenced by almost
@@ -157,9 +162,13 @@ export default async function globalTeardown(): Promise<void> {
     for (const t of targets) {
       const r = await sweep(api, t.list, t.del, now);
       if (r.removed || r.failed) summary.push(`${t.name} removed=${r.removed} failed=${r.failed}`);
+      allErrors.push(...r.errors.map((e) => `${t.name}: ${e}`));
     }
     console.log(`[teardown] ${summary.length ? summary.join('; ') : 'nothing to sweep'}`);
   } finally {
     await api.dispose();
+  }
+  if (allErrors.length > 0) {
+    throw new Error(`[teardown] ${allErrors.length} failure(s):\n${allErrors.join('\n')}`);
   }
 }
