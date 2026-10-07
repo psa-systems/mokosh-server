@@ -1100,7 +1100,7 @@ fn not_a_frontend_body(hub_link: &str) -> String {
          <html lang=\"en\">\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
-         <title>Not a frontend</title>\n\
+         <title>API endpoint</title>\n\
          <meta name=\"robots\" content=\"noindex\">\n\
          {viewport}\n\
          <style>{shell_css}a{{color:#0066cc}}</style>\n\
