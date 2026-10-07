@@ -62,6 +62,11 @@ fn claims(sub: Uuid, bunyip_role: Option<&str>) -> AtClaims {
         // PMS-998: no OP session named, so the back-channel logout check
         // cannot apply to these fixtures.
         sid: None,
+        // PMS-1458: these fixtures do not request `profile` scope, so
+        // bunyip's at+jwt would omit the two name claims; the drift
+        // check in `place_bunyip_caller` sees `None` and no-ops.
+        given_name: None,
+        family_name: None,
     }
 }
 
@@ -183,6 +188,96 @@ async fn uninvited_bunyip_user_without_invite_is_rejected(pool: PgPool) {
         count, 0,
         "no `users` row is inserted for a rejected placement"
     );
+}
+
+/// With `ALLOW_UNINVITED_BUNYIP_SIGNUP=true`, an uninvited first-sight
+/// identity whose email the OP has VERIFIED is placed in a personal tenant.
+/// The flag is set at the start of the case and cleared at the end, so
+/// sibling tests on this binary (which share the process environment) see
+/// the default policy.
+#[mokosh_test]
+async fn verified_signup_passes_the_gate_when_the_flag_is_on(pool: PgPool) {
+    std::env::set_var("ALLOW_UNINVITED_BUNYIP_SIGNUP", "true");
+    mokosh_server::config::refresh();
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    let state = place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("new-signup@example.com".to_string()),
+        true,
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await;
+
+    assert!(
+        state.is_some(),
+        "ALLOW_UNINVITED_BUNYIP_SIGNUP + verified email must pass the gate"
+    );
+
+    let (user_count, tenant_kind): (i64, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint, \
+                (SELECT kind::text FROM tenants t JOIN users u ON u.tenant_id = t.id \
+                 WHERE u.id = $1 LIMIT 1) \
+         FROM users WHERE id = $1",
+    )
+    .bind(sub)
+    .fetch_one(&pool)
+    .await
+    .expect("count + kind");
+    assert_eq!(user_count, 1, "exactly one `users` row for the fresh sub");
+    assert_eq!(
+        tenant_kind.as_deref(),
+        Some("personal"),
+        "a self-signup lands in a `personal` tenant, not the shared default"
+    );
+
+    std::env::remove_var("ALLOW_UNINVITED_BUNYIP_SIGNUP");
+    mokosh_server::config::refresh();
+}
+
+/// The flag opens the door, but the gate still refuses an identity whose
+/// email the OP has NOT verified. An escape hatch that does not require a
+/// verified email accepts any Bunyip token holding an unverified address.
+#[mokosh_test]
+async fn unverified_signup_is_rejected_even_when_the_flag_is_on(pool: PgPool) {
+    std::env::set_var("ALLOW_UNINVITED_BUNYIP_SIGNUP", "true");
+    mokosh_server::config::refresh();
+    let (auth, tenants, invitations) = services(&pool);
+
+    let sub = Uuid::new_v4();
+    let state = place_bunyip_user(
+        &auth,
+        Some(&tenants),
+        Some(&invitations),
+        sub,
+        Some("unverified@example.com".to_string()),
+        false, // email_verified = false
+        None,
+        None,
+        &claims(sub, None),
+    )
+    .await;
+
+    assert!(
+        state.is_none(),
+        "flag ON but email_verified=false must still be refused: an \
+         unverified Bunyip address is enough to claim any mokosh row otherwise"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = $1")
+        .bind(sub)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "no `users` row is inserted for an unverified sub");
+
+    std::env::remove_var("ALLOW_UNINVITED_BUNYIP_SIGNUP");
+    mokosh_server::config::refresh();
 }
 
 /// MAPPS-458: two uninvited (non-platform-admin) Bunyip users both get

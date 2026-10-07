@@ -1,4 +1,10 @@
 //! Ticket API routes
+//!
+//! parity record 2026-10-05: `/saved-views` and `/saved-views/{id}` have no
+//! SPA caller yet. They land first (slice 1 of MAPPS-998) so the mokosh-apps
+//! pin can pick them up; the SPA Views Select, save modal and per-view
+//! rename/delete controls land in slice 2 under the same ticket as soon as
+//! this merges and the pin bumps. Note covers ONLY the saved-views routes.
 
 use crate::utils::json::Json;
 use axum::{
@@ -142,6 +148,18 @@ pub fn ticket_routes(
         .route(
             "/categories/{id}",
             put(update_category).delete(delete_category),
+        )
+        // MAPPS-998: per-user saved views for the Tickets list. `RequireAuth`
+        // (not `RequireManager`): every signed-in operator owns their own
+        // list, with no RBAC above that. The handlers scope every query on
+        // `(tenant_id, user_id)` so a cross-user id is unreachable.
+        .route(
+            "/saved-views",
+            get(list_ticket_saved_views).post(create_ticket_saved_view),
+        )
+        .route(
+            "/saved-views/{id}",
+            put(update_ticket_saved_view).delete(delete_ticket_saved_view),
         )
         .with_state(state)
 }
@@ -1102,5 +1120,58 @@ async fn delete_category(
     state
         .ticket_service
         .delete_category(user.tenant(), id)
+        .await
+}
+
+// ============================================================================
+// MAPPS-998: per-user saved views for the Tickets list.
+// ============================================================================
+
+async fn list_ticket_saved_views(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<Vec<mokosh_types::tickets::TicketSavedView>>> {
+    let views = state
+        .ticket_service
+        .list_ticket_saved_views(user.tenant(), user.id)
+        .await?;
+    Ok(Json(views))
+}
+
+async fn create_ticket_saved_view(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    Json(request): Json<mokosh_types::tickets::CreateTicketSavedViewRequest>,
+) -> AppResult<Json<mokosh_types::tickets::TicketSavedView>> {
+    request.validate()?;
+    let view = state
+        .ticket_service
+        .create_ticket_saved_view(user.tenant(), user.id, request)
+        .await?;
+    Ok(Json(view))
+}
+
+async fn update_ticket_saved_view(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(id): Path<Uuid>,
+    Json(request): Json<mokosh_types::tickets::UpdateTicketSavedViewRequest>,
+) -> AppResult<Json<mokosh_types::tickets::TicketSavedView>> {
+    request.validate()?;
+    let view = state
+        .ticket_service
+        .update_ticket_saved_view(user.tenant(), user.id, id, request)
+        .await?;
+    Ok(Json(view))
+}
+
+async fn delete_ticket_saved_view(
+    State(state): State<TicketRouterState>,
+    RequireAuth(user): RequireAuth,
+    Path(id): Path<Uuid>,
+) -> AppResult<()> {
+    state
+        .ticket_service
+        .delete_ticket_saved_view(user.tenant(), user.id, id)
         .await
 }

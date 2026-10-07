@@ -1090,8 +1090,15 @@ pub async fn place_bunyip_user_from_local_state(
                     sub,
                     None,
                     false,
-                    None,
-                    None,
+                    // PMS-1458 / BUNYIP-879: the at+jwt carries given_name /
+                    // family_name under the `profile` scope now, so a profile
+                    // edit on bunyip propagates to a placed user even on the
+                    // userinfo-free path. The name-refresh drift check in
+                    // `place_bunyip_caller` leaves the stored value untouched
+                    // when the hint is `None` or empty, so a pre-BUNYIP-879
+                    // token (no claim) is identical to today's behavior.
+                    claims.given_name.clone(),
+                    claims.family_name.clone(),
                     claims,
                     None,
                 )
@@ -1106,13 +1113,17 @@ pub async fn place_bunyip_user_from_local_state(
             tenants,
             invitations,
             sub,
-            // No userinfo, so no email / name hints: the placement, the
-            // placeholder repair and the name refresh all no-op, and the row
-            // comes from `principal`.
+            // No userinfo, so no email hint; the placeholder repair stays a
+            // no-op on this path. PMS-1458 / BUNYIP-879: the at+jwt now
+            // carries given_name / family_name under the `profile` scope, so
+            // the name-refresh drift check fires for a placed user without
+            // the `/oauth2/userinfo` round-trip the PMS-713 fast path exists
+            // to skip. A pre-BUNYIP-879 token has `None` on both and the
+            // behaviour matches the old no-op path exactly.
             None,
             false,
-            None,
-            None,
+            claims.given_name.clone(),
+            claims.family_name.clone(),
             claims,
             Some(principal),
         )
@@ -1644,7 +1655,12 @@ async fn place_bunyip_caller(
     // pre-existing invitation - matches the `bootstrap_admin_*`
     // regression pins in `tests/bunyip_login.rs`.
     let is_platform_admin = claims.bunyip_role.as_deref() == Some("admin");
-    if placement.is_none() && invite.is_none() && !is_platform_admin {
+    // The flag opens the door for a first-sight bunyip identity; the
+    // verified-email conjunction stays here so an unverified address can
+    // never JIT-provision a row.
+    let allow_self_signup =
+        crate::config::flags::ALLOW_UNINVITED_BUNYIP_SIGNUP.read() && email_verified;
+    if placement.is_none() && invite.is_none() && !is_platform_admin && !allow_self_signup {
         tracing::info!(
             sub = %sub,
             email = email.as_deref().unwrap_or("<absent>"),
@@ -2482,25 +2498,44 @@ mod pms_1309_tests {
 
     #[test]
     fn the_mapps_458_reject_still_refuses_an_uninvited_identity() {
-        let guard_line = format!(
-            "if placement.is_none() && invite.is_none() && {}is_platform_admin {{",
+        // Match on the stable prefix (through `!is_platform_admin`) rather
+        // than the whole line, because the condition carries an opt-in
+        // operand after it. Then assert the two properties this guard
+        // watches: the `return (None, None);` is still present, and when
+        // an escape operand is there, it is still gated on BOTH a flag
+        // AND `email_verified`. An escape hatch that does not require a
+        // verified email accepts any Bunyip token holding an unverified
+        // address.
+        let guard_prefix = format!(
+            "if placement.is_none() && invite.is_none() && {}is_platform_admin",
             '!'
         );
         let at = SELF
-            .find(&guard_line)
+            .find(&guard_prefix)
             .expect("the MAPPS-458 reject block is gone entirely, not merely disabled");
-        // The block is short; the return is what was deleted last time, so look
-        // for it inside the block rather than anywhere after it.
-        let block = &SELF[at..at + 600.min(SELF.len() - at)];
+        let block = &SELF[at..at + 800.min(SELF.len() - at)];
         let end = block
             .find("\n    }\n")
-            .expect("the reject block does not close within 600 bytes");
+            .expect("the reject block does not close within 800 bytes");
         let body = &block[..end];
         assert!(
             body.contains(&format!("{} (None, None);", "return")),
             "the MAPPS-458 reject no longer returns, so an uninvited Bunyip identity \
              falls through to personal-tenant provisioning (the MAPPS-924 bypass): {body}"
         );
+        let has_escape_operand =
+            body.contains("&& !allow_self_signup") || body.contains("&& !is_platform_admin && !");
+        if has_escape_operand {
+            let preamble = &SELF[at.saturating_sub(600)..at];
+            assert!(
+                preamble.contains("ALLOW_UNINVITED_BUNYIP_SIGNUP")
+                    && preamble.contains("email_verified"),
+                "the reject carries an escape hatch, but the preamble no longer derives \
+                 it from ALLOW_UNINVITED_BUNYIP_SIGNUP AND email_verified in the same \
+                 expression. An escape hatch that does not require a verified email \
+                 accepts any Bunyip token holding an unverified address: {preamble}"
+            );
+        }
     }
 
     #[test]

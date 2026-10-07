@@ -234,6 +234,22 @@ pub static LOGIN_APPROVAL_ENABLED: Flag<bool> = Flag::new(
     FlagDefault::Constant(false),
 );
 
+/// Opts in to JIT-provisioning a personal tenant for a first-sight bunyip
+/// identity whose email the OP has verified. Off by default so production
+/// stays invitation-only; staging opts in through its compose.
+///
+/// `FlagDefault::Constant(false)` rather than a per-profile default: both
+/// hosting profiles use `saas`, so a profile default would pick the wrong
+/// policy for one of them. Opt-in is explicit per deployment.
+///
+/// The verified-email conjunction lives at the gate, not here: this flag
+/// opens the door for a first-sight identity, and the gate still refuses
+/// one whose email the OP has not verified.
+pub static ALLOW_UNINVITED_BUNYIP_SIGNUP: Flag<bool> = Flag::new(
+    &registry::ALLOW_UNINVITED_BUNYIP_SIGNUP,
+    FlagDefault::Constant(false),
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

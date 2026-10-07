@@ -903,6 +903,51 @@ pub struct AutomationAction {
     pub params: serde_json::Value,
 }
 
+// ============================================================================
+// TICKET SAVED VIEWS (MAPPS-998)
+// ============================================================================
+
+/// Response row for `GET /api/v1/tickets/saved-views`. The `filter` and `sort`
+/// payloads are JSON so the SPA can save new filter axes without a migration;
+/// the regular `TicketFilter` validator and `sort::TICKETS` allow-list refuse
+/// an unknown key when the view is applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TicketSavedView {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub user_id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub filter: serde_json::Value,
+    #[serde(default)]
+    pub sort: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Request body for `POST /api/v1/tickets/saved-views`. Name is capped at 100
+/// characters to match the column CHECK.
+#[derive(Debug, Clone, Deserialize, validator::Validate)]
+pub struct CreateTicketSavedViewRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: String,
+    #[serde(default)]
+    pub filter: serde_json::Value,
+    #[serde(default)]
+    pub sort: serde_json::Value,
+}
+
+/// Request body for `PUT /api/v1/tickets/saved-views/{id}`. Every field is
+/// optional; omitting one leaves it unchanged. A rename to a name another of
+/// this user's views already holds answers 409.
+#[derive(Debug, Clone, Deserialize, validator::Validate)]
+pub struct UpdateTicketSavedViewRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub name: Option<String>,
+    pub filter: Option<serde_json::Value>,
+    pub sort: Option<serde_json::Value>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
