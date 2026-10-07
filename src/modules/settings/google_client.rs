@@ -178,26 +178,7 @@ pub async fn put_google_client(
     }
 
     let previously = GoogleClientView::of(secrets);
-    for (secret, value) in [
-        (GovernedSecret::GoogleContactsClientId, &client_id),
-        (GovernedSecret::GoogleContactsClientSecret, &client_secret),
-    ] {
-        let target = provider.clone();
-        let readback = provider.clone();
-        move_value_with_readback(
-            value,
-            move |written| async move { target.set(secret, written).await },
-            || async move { Ok(readback.get(secret)) },
-        )
-        .await
-        .map_err(|e| {
-            AppError::Configuration(format!(
-                "Storing {secret} in the {declared} provider failed: {e}. The Google client is \
-                 unchanged if this was the first of the two, and half written if it was the \
-                 second, which `mokosh-server provider-status` will show."
-            ))
-        })?;
-    }
+    write_pair_locked(live, provider.clone(), &client_id, &client_secret, declared).await?;
 
     // Live before audit, so a failing audit write cannot leave the process
     // serving a client the operator was told did not save.
@@ -243,6 +224,47 @@ pub async fn put_google_client(
     tx.commit().await?;
 
     Ok(view)
+}
+
+/// Write the id then the secret, with both writes serialized against any
+/// other concurrent caller of this same setting.
+///
+/// PMS-1473: `live.lock_write()` is held across both
+/// [`move_value_with_readback`] calls, not just one, so a second concurrent
+/// `PUT` either waits here for the first request's id-and-secret pair to
+/// finish together, or runs fully after it. Without the lock, two requests'
+/// writes could interleave key by key and leave the provider holding one
+/// caller's id paired with the other's secret, which Google rejects as
+/// `invalid_client` on every later contact-sync attempt.
+async fn write_pair_locked(
+    live: &SharedGoogleClient,
+    provider: Arc<dyn crate::app_secrets::AppSecretProvider>,
+    client_id: &str,
+    client_secret: &str,
+    declared: crate::app_secrets::AppSecretProviderKind,
+) -> AppResult<()> {
+    let _write_guard = live.lock_write().await;
+    for (secret, value) in [
+        (GovernedSecret::GoogleContactsClientId, client_id),
+        (GovernedSecret::GoogleContactsClientSecret, client_secret),
+    ] {
+        let target = provider.clone();
+        let readback = provider.clone();
+        move_value_with_readback(
+            value,
+            move |written| async move { target.set(secret, written).await },
+            || async move { Ok(readback.get(secret)) },
+        )
+        .await
+        .map_err(|e| {
+            AppError::Configuration(format!(
+                "Storing {secret} in the {declared} provider failed: {e}. The Google client is \
+                 unchanged if this was the first of the two, and half written if it was the \
+                 second, which `mokosh-server provider-status` will show."
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Refuse a write that cannot be a working client.
@@ -445,6 +467,98 @@ mod tests {
         assert!(
             !view.configured,
             "half a pair is a boot error, never a configured deployment"
+        );
+    }
+
+    /// PMS-1473: two concurrent writers cannot leave the provider holding a
+    /// mismatched id/secret pair.
+    ///
+    /// The fake provider sleeps right after storing the id and before
+    /// `write_pair_locked` moves on to the secret, the exact window the bug
+    /// report interleaves in: without `live.lock_write()`, both callers could
+    /// write their ids, then both write their secrets in whatever order,
+    /// landing one caller's id next to the other's secret. With the lock,
+    /// one caller's full id-then-secret pair always finishes before the
+    /// other's starts.
+    #[tokio::test]
+    async fn concurrent_writes_are_serialized_not_interleaved() {
+        use crate::app_secrets::{AppSecretProvider, AppSecretProviderKind};
+        use async_trait::async_trait;
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+
+        struct DelayedStore {
+            id: StdMutex<Option<String>>,
+            secret: StdMutex<Option<String>>,
+        }
+
+        #[async_trait]
+        impl AppSecretProvider for DelayedStore {
+            fn name(&self) -> &'static str {
+                "database"
+            }
+            fn get(&self, secret: GovernedSecret) -> Option<String> {
+                match secret {
+                    GovernedSecret::GoogleContactsClientId => self.id.lock().unwrap().clone(),
+                    GovernedSecret::GoogleContactsClientSecret => {
+                        self.secret.lock().unwrap().clone()
+                    }
+                    GovernedSecret::SmtpPassword => None,
+                }
+            }
+            async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
+                match secret {
+                    GovernedSecret::GoogleContactsClientId => {
+                        *self.id.lock().unwrap() = Some(value.to_string());
+                        // The interleaving window: give a concurrent caller a
+                        // chance to run between this caller's id write and its
+                        // secret write.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    GovernedSecret::GoogleContactsClientSecret => {
+                        *self.secret.lock().unwrap() = Some(value.to_string());
+                    }
+                    GovernedSecret::SmtpPassword => {}
+                }
+                Ok(())
+            }
+        }
+
+        let provider: Arc<dyn AppSecretProvider> = Arc::new(DelayedStore {
+            id: StdMutex::new(None),
+            secret: StdMutex::new(None),
+        });
+        let live = SharedGoogleClient::default();
+
+        let a = write_pair_locked(
+            &live,
+            provider.clone(),
+            "a.apps.googleusercontent.com",
+            "GOCSPX-a-secret",
+            AppSecretProviderKind::Database,
+        );
+        let b = write_pair_locked(
+            &live,
+            provider.clone(),
+            "b.apps.googleusercontent.com",
+            "GOCSPX-b-secret",
+            AppSecretProviderKind::Database,
+        );
+        let (a_result, b_result) = tokio::join!(a, b);
+        a_result.expect("a's write must succeed");
+        b_result.expect("b's write must succeed");
+
+        let id = provider
+            .get(GovernedSecret::GoogleContactsClientId)
+            .expect("id stored");
+        let secret = provider
+            .get(GovernedSecret::GoogleContactsClientSecret)
+            .expect("secret stored");
+        let matches_a = id == "a.apps.googleusercontent.com" && secret == "GOCSPX-a-secret";
+        let matches_b = id == "b.apps.googleusercontent.com" && secret == "GOCSPX-b-secret";
+        assert!(
+            matches_a || matches_b,
+            "stored pair is a mix of two callers: id={id}, secret={secret}"
         );
     }
 }
