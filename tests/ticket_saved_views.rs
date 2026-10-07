@@ -229,6 +229,59 @@ async fn a_cross_user_id_answers_404(pool: PgPool) {
 }
 
 #[mokosh_test]
+async fn a_whitespace_only_name_is_a_400_not_a_500(pool: PgPool) {
+    // " " passes the untrimmed `length(min = 1)` check but trims to "",
+    // which the column CHECK rejects; the request-layer validator must
+    // catch this before it ever reaches the database (PMS-1474).
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let create = app
+        .client
+        .post(app.url("/api/v1/tickets/saved-views"))
+        .bearer_auth(&token)
+        .json(&json!({ "name": " ", "filter": {}, "sort": {} }))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(
+        create.status(),
+        422,
+        "create with a whitespace-only name must be a validation error, not 500: {}",
+        create.status()
+    );
+
+    let view: Value = app
+        .client
+        .post(app.url("/api/v1/tickets/saved-views"))
+        .bearer_auth(&token)
+        .json(&json!({ "name": "Morning queue", "filter": {}, "sort": {} }))
+        .send()
+        .await
+        .expect("seed create")
+        .json()
+        .await
+        .expect("seed create body");
+    let view_id = view["id"].as_str().expect("view id");
+
+    let update = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/saved-views/{view_id}")))
+        .bearer_auth(&token)
+        .json(&json!({ "name": " " }))
+        .send()
+        .await
+        .expect("update");
+    assert_eq!(
+        update.status(),
+        422,
+        "update with a whitespace-only name must be a validation error, not 500: {}",
+        update.status()
+    );
+}
+
+#[mokosh_test]
 async fn two_users_in_one_tenant_can_hold_the_same_view_name(pool: PgPool) {
     // Uniqueness is per (tenant_id, user_id, name), not per tenant: two
     // operators should each be able to have their own "Morning queue".
