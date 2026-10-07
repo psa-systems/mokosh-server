@@ -18,8 +18,14 @@ use super::models::*;
 /// to it (PMS-809). The error string is what the endpoint reports back, so a
 /// refused target reads as unreachable-with-a-reason rather than a bare false.
 async fn screened_target(api_url: &str, connection_id: Uuid) -> Result<url::Url, String> {
-    let target =
-        url::Url::parse(api_url).map_err(|e| format!("api_url is not a valid URL: {e}"))?;
+    let target = url::Url::parse(api_url).map_err(|e| {
+        let url_authority = crate::utils::net::loggable_url_authority(api_url);
+        tracing::warn!(
+            %connection_id, url_authority, error = %e,
+            "RMM connection test has an unusable api_url",
+        );
+        format!("api_url is not a valid URL: {e}")
+    })?;
     match crate::utils::net::guard_outbound_url(
         &crate::utils::net::SystemResolver,
         &target,
@@ -30,13 +36,17 @@ async fn screened_target(api_url: &str, connection_id: Uuid) -> Result<url::Url,
     {
         Ok(()) => Ok(target),
         Err(e) => {
+            let host = target.host_str().unwrap_or_default();
             tracing::warn!(
-                %connection_id, blocked = %e,
-                "RMM connection test refused: api_url is not on the public internet",
+                %connection_id, host, blocked = %e,
+                "RMM connection test refused by the outbound URL guard",
             );
-            Err(format!(
-                "api_url refused: {e}. Set OUTBOUND_PRIVATE_ALLOWLIST if this target is deliberately private."
-            ))
+            let hint = matches!(e, crate::utils::net::UrlGuardError::Blocked { .. })
+                .then_some(
+                    " Set OUTBOUND_PRIVATE_ALLOWLIST if this target is deliberately private.",
+                )
+                .unwrap_or_default();
+            Err(format!("api_url refused: {e}.{hint}"))
         }
     }
 }

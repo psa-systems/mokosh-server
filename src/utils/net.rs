@@ -86,9 +86,15 @@ pub struct SystemResolver;
 #[async_trait]
 impl HostResolver for SystemResolver {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
-        // A bracketed IPv6 literal reaches us with the brackets stripped by
-        // `Url::host_str`, so it parses directly and needs no resolver.
-        if let Ok(ip) = host.parse::<IpAddr>() {
+        // `Url::host_str` reports an IPv6 literal with its brackets
+        // (`[::1]`), which `IpAddr::from_str` does not accept; strip them
+        // before the literal check so it still parses directly and needs no
+        // resolver.
+        let unbracketed = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = unbracketed.parse::<IpAddr>() {
             return Ok(vec![ip]);
         }
         let addresses = tokio::net::lookup_host((host, port))
@@ -99,20 +105,20 @@ impl HostResolver for SystemResolver {
 }
 
 /// Why [`guard_outbound_url`] refused a URL. Every variant carries what the
-/// caller needs to log: the port it rejected, the DNS failure, or the exact
-/// address that failed the screen.
+/// caller needs to log: the host, plus the port it rejected, the DNS failure,
+/// or the exact address that failed the screen.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UrlGuardError {
     #[error("scheme {0:?} is not http or https")]
     Scheme(String),
-    #[error("port {0} is not allowed")]
-    Port(u16),
+    #[error("port {port} on host {host} is not allowed")]
+    Port { host: String, port: u16 },
     #[error("the URL has no host")]
     NoHost,
-    #[error("the host could not be resolved: {0}")]
-    Dns(String),
-    #[error("the host resolves to {0}, which is not on the public internet")]
-    Blocked(IpAddr),
+    #[error("the host {host} could not be resolved: {error}")]
+    Dns { host: String, error: String },
+    #[error("the host {host} resolves to {address}, which is not on the public internet")]
+    Blocked { host: String, address: IpAddr },
 }
 
 /// Hosts and networks an operator has declared reachable even though
@@ -208,15 +214,18 @@ pub async fn guard_outbound_url<R: HostResolver + ?Sized>(
     if !matches!(url.scheme(), "http" | "https") {
         return Err(UrlGuardError::Scheme(url.scheme().to_string()));
     }
-    let port = url.port_or_known_default().unwrap_or(0);
-    if let Some(ports) = allowed_ports {
-        if !ports.contains(&port) {
-            return Err(UrlGuardError::Port(port));
-        }
-    }
     let Some(host) = url.host_str().filter(|h| !h.is_empty()) else {
         return Err(UrlGuardError::NoHost);
     };
+    let port = url.port_or_known_default().unwrap_or(0);
+    if let Some(ports) = allowed_ports {
+        if !ports.contains(&port) {
+            return Err(UrlGuardError::Port {
+                host: host.to_string(),
+                port,
+            });
+        }
+    }
 
     // An operator naming the host itself exempts whatever it resolves to,
     // because that is the case where they do not control the answer.
@@ -227,19 +236,42 @@ pub async fn guard_outbound_url<R: HostResolver + ?Sized>(
     let addresses = resolver
         .resolve(host, port)
         .await
-        .map_err(UrlGuardError::Dns)?;
+        .map_err(|error| UrlGuardError::Dns {
+            host: host.to_string(),
+            error,
+        })?;
     if addresses.is_empty() {
-        return Err(UrlGuardError::Dns(format!(
-            "{host} resolved to no addresses"
-        )));
+        return Err(UrlGuardError::Dns {
+            host: host.to_string(),
+            error: "it resolved to no addresses".to_string(),
+        });
     }
     if let Some(blocked) = addresses
         .iter()
         .find(|ip| is_non_public_ip(ip) && !allowlist.allows_address(ip))
     {
-        return Err(UrlGuardError::Blocked(*blocked));
+        return Err(UrlGuardError::Blocked {
+            host: host.to_string(),
+            address: *blocked,
+        });
     }
     Ok(())
+}
+
+/// Redact a URL-shaped string down to its authority (`host[:port]`), safe to
+/// log even when the input does not parse as a URL at all: an unparsable
+/// string can still carry `user:password@`, a secret path, a query or a
+/// fragment, and this works on the raw text rather than a successful parse.
+pub fn loggable_url_authority(raw: &str) -> String {
+    let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+    let end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..end];
+    match authority.rsplit_once('@') {
+        Some((_, host)) => host.to_string(),
+        None => authority.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -379,7 +411,10 @@ mod tests {
         let resolver = FakeResolver::answering(&["127.0.0.1"]);
         assert_eq!(
             guard(&resolver, "http://hook.internal/t").await,
-            Err(UrlGuardError::Blocked("127.0.0.1".parse().unwrap()))
+            Err(UrlGuardError::Blocked {
+                host: "hook.internal".to_string(),
+                address: "127.0.0.1".parse().unwrap()
+            })
         );
     }
 
@@ -388,7 +423,10 @@ mod tests {
         let resolver = FakeResolver::answering(&["::ffff:127.0.0.1"]);
         assert_eq!(
             guard(&resolver, "http://[::ffff:127.0.0.1]/").await,
-            Err(UrlGuardError::Blocked("::ffff:127.0.0.1".parse().unwrap()))
+            Err(UrlGuardError::Blocked {
+                host: "[::ffff:7f00:1]".to_string(),
+                address: "::ffff:127.0.0.1".parse().unwrap()
+            })
         );
     }
 
@@ -397,7 +435,10 @@ mod tests {
         let resolver = FakeResolver::answering(&["10.1.2.3"]);
         assert_eq!(
             guard(&resolver, "http://rmm.internal:8000/api").await,
-            Err(UrlGuardError::Blocked("10.1.2.3".parse().unwrap()))
+            Err(UrlGuardError::Blocked {
+                host: "rmm.internal".to_string(),
+                address: "10.1.2.3".parse().unwrap()
+            })
         );
     }
 
@@ -406,7 +447,10 @@ mod tests {
         let resolver = FakeResolver::answering(&["93.184.216.34", "169.254.169.254"]);
         assert_eq!(
             guard(&resolver, "http://metadata.example.com/").await,
-            Err(UrlGuardError::Blocked("169.254.169.254".parse().unwrap()))
+            Err(UrlGuardError::Blocked {
+                host: "metadata.example.com".to_string(),
+                address: "169.254.169.254".parse().unwrap()
+            })
         );
     }
 
@@ -447,7 +491,7 @@ mod tests {
         // A host the operator did not name is still screened.
         assert!(matches!(
             guard_outbound_url(&resolver, &url("https://other.internal/"), None, &allowlist).await,
-            Err(UrlGuardError::Dns(_))
+            Err(UrlGuardError::Dns { .. })
         ));
     }
 
@@ -462,7 +506,10 @@ mod tests {
                 &PrivateTargetAllowlist::default()
             )
             .await,
-            Err(UrlGuardError::Port(8443))
+            Err(UrlGuardError::Port {
+                host: "example.com".to_string(),
+                port: 8443
+            })
         );
         // The same URL passes when the caller does not pin ports, because a
         // tenant integration legitimately runs on its own port.
@@ -487,13 +534,83 @@ mod tests {
         let resolver = FakeResolver::failing();
         assert!(matches!(
             guard(&resolver, "https://nx.example.com/").await,
-            Err(UrlGuardError::Dns(_))
+            Err(UrlGuardError::Dns { .. })
         ));
         let empty = FakeResolver::answering(&[]);
         assert!(matches!(
             guard(&empty, "https://nx.example.com/").await,
-            Err(UrlGuardError::Dns(_))
+            Err(UrlGuardError::Dns { .. })
         ));
+    }
+
+    // ---- UrlGuardError::Display names the host ----
+
+    #[test]
+    fn dns_display_names_the_host() {
+        let err = UrlGuardError::Dns {
+            host: "rmm.example.com".to_string(),
+            error: "failed to lookup address information: Name has no usable address".to_string(),
+        };
+        assert!(err.to_string().contains("rmm.example.com"));
+    }
+
+    #[test]
+    fn blocked_display_names_the_host() {
+        let err = UrlGuardError::Blocked {
+            host: "rmm.example.com".to_string(),
+            address: "127.0.0.1".parse().unwrap(),
+        };
+        assert!(err.to_string().contains("rmm.example.com"));
+    }
+
+    #[test]
+    fn port_display_names_the_host() {
+        let err = UrlGuardError::Port {
+            host: "rmm.example.com".to_string(),
+            port: 8443,
+        };
+        assert!(err.to_string().contains("rmm.example.com"));
+    }
+
+    // ---- loggable_url_authority ----
+
+    #[test]
+    fn loggable_url_authority_strips_userinfo_path_query_and_fragment() {
+        assert_eq!(
+            loggable_url_authority(
+                "https://user:sekret@rmm.example.com:8443/api/secret-path?token=abc#frag"
+            ),
+            "rmm.example.com:8443"
+        );
+    }
+
+    #[test]
+    fn loggable_url_authority_handles_input_with_no_scheme() {
+        assert_eq!(
+            loggable_url_authority("user:sekret@rmm.example.com/path"),
+            "rmm.example.com"
+        );
+    }
+
+    #[test]
+    fn loggable_url_authority_handles_unparsable_input() {
+        assert_eq!(loggable_url_authority("not a url"), "not a url");
+        assert_eq!(
+            loggable_url_authority("not a url://user:pw@host/path?q#f"),
+            "host"
+        );
+    }
+
+    #[test]
+    fn loggable_url_authority_never_leaks_userinfo_or_path() {
+        let raw = "https://admin:topsecret@hooks.example.com/t/XXXX/YYYY?key=zzz#frag";
+        let out = loggable_url_authority(raw);
+        assert!(!out.contains("admin"));
+        assert!(!out.contains("topsecret"));
+        assert!(!out.contains('/'));
+        assert!(!out.contains('?'));
+        assert!(!out.contains('#'));
+        assert_eq!(out, "hooks.example.com");
     }
 
     #[test]
