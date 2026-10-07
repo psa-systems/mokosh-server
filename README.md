@@ -23,6 +23,7 @@ Everything else is in [`docs/`](docs/README.md), indexed there in full:
 - [binaries.md](docs/binaries.md) - the two binaries and the operator subcommands they dispatch
 - [configuration.md](docs/configuration.md) - every environment variable and where its value comes from
 - [recipes.md](docs/recipes.md) - the task runner, recipe by recipe
+- [runbooks/release-and-deploy.md](docs/runbooks/release-and-deploy.md) - cutting and deploying a release across the three-repo chain (Mokosh server, Mokosh apps, Bunyip)
 
 Conventions for AI agents working in this repository are in [CLAUDE.md](CLAUDE.md).
 
