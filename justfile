@@ -78,7 +78,35 @@ default:
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-doc-links check-claude-md
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md
+
+# Keep docs/configuration.md's Required / Added in facts and changelog true to
+# the registry and src/config/variables.toml (PMS-1442).
+[doc("Fail if docs/configuration.md disagrees with the registry's since/required facts (PMS-1442).")]
+[group: 'check']
+check-config-docs:
+    nu scripts/config-docs.nu self-test
+    nu scripts/config-docs.nu check
+
+# Regenerate docs/configuration.md's Recently added changelog and its Required
+# and Added in columns from the registry and src/config/variables.toml.
+[doc("Regenerate the generated parts of docs/configuration.md (PMS-1442).")]
+[group: 'docs']
+config-docs:
+    nu scripts/config-docs.nu generate
+
+# The pre-upgrade checklist for a jump longer than the changelog window.
+[doc("List every configuration change after <version> with its won't-start / feature-off level; --json for tooling (PMS-1442).")]
+[group: 'docs']
+config-since version *args:
+    nu scripts/config-docs.nu since {{ version }} {{ args }}
+
+# The block a release's notes carry, linking its Recently added entry. Pass
+# `--ref main` for a release tagged before its entry existed.
+[doc("Print <version>'s configuration-changes block for its release notes (PMS-1442).")]
+[group: 'release']
+config-release-notes version *args:
+    nu scripts/config-docs.nu release-notes {{ version }} {{ args }}
 
 # Keep every relative Markdown link pointing at a file that exists (PMS-850).
 # The 2026-07-01 docs move left 72 `](../...)` targets one directory short, and

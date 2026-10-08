@@ -41,6 +41,7 @@ just check-env-example      # fail if a var the code reads is missing from .env.
 just check-build-target-storage # fail if the cargo target directory sits on a memory-backed filesystem
 just check-doc-recipes      # fail if a guarded doc names a recipe the justfile lacks
 just check-config-doc-paths # fail if a docs/ path in .env.example, compose.dev.yml or the justfile is missing
+just check-config-docs      # fail if docs/configuration.md disagrees with the registry's since/required facts
 just check-doc-links        # fail if a relative Markdown link does not resolve to an existing path
 just check-claude-md        # fail if CLAUDE.md passes 20,000 bytes, a prose line passes 400 chars, or a docs/ link or anchor breaks
 
@@ -61,12 +62,17 @@ just test-e2e [args]        # Playwright E2E suite against staging or $E2E_BASE_
 just build                  # cargo build --release --bins
 just build-docker           # build the production OCI image (oci-build/Dockerfile)
 
+# Configuration docs (PMS-1442)
+just config-docs            # regenerate docs/configuration.md's Recently added changelog and Required / Added in columns
+just config-since <version> [--json] # every configuration change after <version>, each with its level: won't start, feature off, or unmarked (pre-upgrade checklist)
+
 # Database
 just migrate-run            # apply pending migrations against $DATABASE_URL
 just migrate-create <name>  # create a new migration file
 
 # Release
 just create-release <bump>  # bump version (major|minor|hotfix), push release branch, print PR link [from common]
+just config-release-notes <version> [--ref main] # the configuration-changes block for that release's notes, linking its changelog entry
 ```
 
 `ensure-env` is the one `[private]` recipe: it generates `.env` on first run and is a dependency of the recipes that need it, so it never has to be run by hand.

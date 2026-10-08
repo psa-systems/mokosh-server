@@ -1334,6 +1334,24 @@ mod tests {
         assert!(check_jwt_secret_len(&ok, "production").is_ok());
     }
 
+    // PMS-1442: every essential requirement that is a registry key is marked
+    // `required`, so docs/configuration.md says "yes" for what boot refuses.
+    #[test]
+    fn every_essential_registry_key_is_declared_required() {
+        for req in ESSENTIAL_DEPLOYMENT_REQUIREMENTS {
+            if let Some(key) = keys::REGISTRY.iter().find(|k| k.name() == req.name) {
+                assert!(key.required(), "{} must be declared required", req.name);
+            }
+        }
+        for key in [
+            &keys::JWT_SECRET,
+            &keys::ENCRYPTION_KEY,
+            &keys::BUNYIP_WEBHOOK_SECRET,
+        ] {
+            assert!(key.required(), "{key} goes through resolve_secret");
+        }
+    }
+
     // PMS-1160: the essential deployment-shape variables list is closed and
     // ordered. Its shape is source-tested here rather than at boot so the
     // gates below cannot be circumvented by adding a sixth entry that fails
