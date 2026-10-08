@@ -104,12 +104,18 @@ async fn draft_invoice(app: &common::TestApp, token: &str, company_id: Uuid) -> 
     invoice["id"].as_str().expect("id").to_string()
 }
 
-async fn send_invoice(app: &common::TestApp, token: &str, invoice_id: &str, skip_email: bool) {
+async fn send_invoice(app: &common::TestApp, token: &str, invoice_id: &str, _skip_email: bool) {
+    // PMS-1462: `skip_email` is gone; every call site here attested to a
+    // hand-delivered send, so this bulk helper issues an `other` delivery
+    // regardless of the (now-ignored) parameter.
     let resp = app
         .client
         .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
         .bearer_auth(token)
-        .json(&json!({ "status": "sent", "skip_email": skip_email }))
+        .json(&json!({
+            "status": "sent",
+            "delivery": { "method": "other", "note": "Test seed, delivered outside Mokosh" }
+        }))
         .send()
         .await
         .expect("send invoice");

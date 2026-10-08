@@ -346,7 +346,7 @@ async fn the_draft_preview_prints_the_same_attn_line_as_the_stored_document(pool
         .client
         .put(app.url(&format!("/api/v1/invoices/{id}")))
         .bearer_auth(&token)
-        .json(&json!({ "status": "sent", "skip_email": true }))
+        .json(&json!({ "status": "sent", "delivery": { "method": "other", "note": "Test seed, delivered outside Mokosh" } }))
         .send()
         .await
         .expect("send invoice");

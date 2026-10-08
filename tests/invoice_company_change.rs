@@ -164,7 +164,7 @@ async fn a_sent_invoice_cannot_move(pool: PgPool) {
     let f = Fixture::new(pool).await;
     let invoice = f.draft(f.acme, None).await;
     let (status, sent) = f
-        .update(&invoice, json!({ "status": "sent", "skip_email": true }))
+        .update(&invoice, json!({ "status": "sent", "delivery": { "method": "other", "note": "Test seed, delivered outside Mokosh" } }))
         .await;
     assert_eq!(status, StatusCode::OK, "{sent}");
 
@@ -274,7 +274,7 @@ async fn a_payment_still_has_to_match_its_invoices_company(pool: PgPool) {
         .call(
             reqwest::Method::PUT,
             &format!("/api/v1/invoices/{invoice}"),
-            json!({ "status": "sent", "skip_email": true }),
+            json!({ "status": "sent", "delivery": { "method": "other", "note": "Test seed, delivered outside Mokosh" } }),
         )
         .await;
     assert!(

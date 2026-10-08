@@ -53,7 +53,7 @@ async fn send(app: &common::TestApp, token: &str, invoice_id: &str) -> reqwest::
     app.client
         .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
         .bearer_auth(token)
-        .json(&json!({ "status": "sent", "skip_email": true }))
+        .json(&json!({ "status": "sent", "delivery": { "method": "other", "note": "Test seed, delivered outside Mokosh" } }))
         .send()
         .await
         .expect("send invoice")

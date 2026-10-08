@@ -235,10 +235,10 @@ struct QaSeeder {
 }
 
 impl QaSeeder {
-    /// Issue a seeded invoice without emailing anybody (PMS-992's
-    /// `skip_email`). Shared by the paid invoices and the credited one
-    /// because both need the same thing for the same reason: an invoice the
-    /// customer has not been given can be neither paid (PMS-999) nor credited
+    /// Issue a seeded invoice without emailing anybody (PMS-1462 `other`
+    /// delivery). Shared by the paid invoices and the credited one because
+    /// both need the same thing for the same reason: an invoice the customer
+    /// has not been given can be neither paid (PMS-999) nor credited
     /// (PMS-953), and seeded data is issued rather than sent to a real
     /// address.
     async fn issue_for_qa(
@@ -247,6 +247,7 @@ impl QaSeeder {
         invoice_id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
+        use crate::modules::billing::models::{DeliveryMethod, DeliveryRequest};
         self.billing
             .update_invoice(
                 tenant,
@@ -266,7 +267,11 @@ impl QaSeeder {
                     po_number: None,
                     lines: None,
                     status: Some(InvoiceStatus::Sent),
-                    skip_email: true,
+                    delivery: Some(DeliveryRequest {
+                        method: DeliveryMethod::Other,
+                        note: Some("Seeded invoice, delivered outside Mokosh".to_string()),
+                    }),
+                    legacy_skip_email: None,
                 },
                 ctx,
             )
