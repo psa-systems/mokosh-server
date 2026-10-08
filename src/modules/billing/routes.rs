@@ -106,6 +106,14 @@ pub fn billing_routes(service: BillingService, public_api_base: Option<String>) 
             "/invoices/{invoice_id}/pdf",
             axum::routing::get(get_invoice_pdf),
         )
+        // PMS-1462: the Send dialog asks per-document which methods are
+        // available (and why not, when `email` is not). Staff-only, same
+        // auth and finance gating as `GET /invoices/{id}`; a contact never
+        // sends an invoice.
+        .route(
+            "/invoices/{invoice_id}/delivery-options",
+            axum::routing::get(invoice_delivery_options),
+        )
         // PMS-914: dual-plane "Pay Now" surface. The PMS-711 service
         // method (`create_invoice_checkout_session`) has been in
         // place since the Stripe adapter landed but the retired
@@ -547,6 +555,20 @@ async fn update_invoice(
         .update_invoice(user.tenant(), invoice_id, &request, &ctx)
         .await?;
     Ok(Json(inv))
+}
+
+/// PMS-1462: see [`BillingService::invoice_delivery_options`].
+async fn invoice_delivery_options(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Path(invoice_id): Path<Uuid>,
+) -> AppResult<Json<DeliveryOptionsResponse>> {
+    let options = state
+        .service
+        .invoice_delivery_options(user.tenant(), invoice_id)
+        .await?;
+    Ok(Json(options))
 }
 
 async fn create_invoice(

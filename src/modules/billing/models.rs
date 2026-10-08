@@ -113,11 +113,25 @@ pub struct InvoiceResponse {
     pub po_number: Option<String>,
     pub sent_at: Option<DateTime<Utc>>,
     /// PMS-992: who the invoice was emailed to on the send, and when. `None`
-    /// on a draft, and on an invoice marked sent without emailing
-    /// (`skip_email`), so the record says what happened rather than implying
-    /// a delivery.
+    /// on a draft and on a non-email delivery (postal / other), so the
+    /// record says what happened rather than implying one.
     pub emailed_at: Option<DateTime<Utc>>,
     pub emailed_to: Option<String>,
+    /// PMS-1462: how this invoice reached the customer. `None` on a draft
+    /// and on a sent invoice with no recorded delivery (pre-PMS-1462 rows
+    /// without the audit evidence to backfill a method), rendered as
+    /// "Delivery not recorded" by the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_method: Option<String>,
+    /// PMS-1462: the operator's note for an `other` delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_note: Option<String>,
+    /// PMS-1462: the user who performed the delivery, resolved on
+    /// `GET /:id` the way `voided_by_name` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_by_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_by_name: Option<String>,
     pub paid_at: Option<DateTime<Utc>>,
     /// PMS-1037: derived on every read in the tenant's day, never stored.
     /// `true` when the invoice is `sent` or `partially_paid`, has a balance,
@@ -331,13 +345,78 @@ pub struct UpdateInvoiceRequest {
     /// (PMS-1227): those are terminal states owned by `void_invoice` and
     /// `write_off_invoice`, each with its own preconditions.
     pub status: Option<InvoiceStatus>,
-    /// PMS-992: mark the invoice sent WITHOUT emailing it, for one delivered
-    /// by hand (printed, or attached to a message the operator writes). Off,
-    /// a transition to `sent` requires a resolvable recipient and an accepted
-    /// send, and is refused otherwise; on, the invoice freezes and records
-    /// nobody as emailed. Only meaningful alongside `status: sent`.
+    /// PMS-1462: the delivery choice on a `sent` transition.
+    ///
+    /// `None` on a sent transition defaults to `email`, which is what the
+    /// pre-PMS-1462 app meant by Send; the server can therefore deploy ahead
+    /// of the SPA without changing the behaviour of any existing button.
+    /// `postal` and `other` freeze the invoice without emailing it; `other`
+    /// requires `note` and the service returns a 422 for a missing or blank
+    /// one. `email` and `postal` ignore `note`.
     #[serde(default)]
-    pub skip_email: bool,
+    pub delivery: Option<DeliveryRequest>,
+    /// PMS-1462: catches a client still sending `skip_email`. The service
+    /// refuses any request where this is `Some(_)` with a 422 naming
+    /// `delivery` as the replacement; letting it deserialize silently would
+    /// mean an old "Mark as sent" button still sent an email.
+    #[serde(default, rename = "skip_email")]
+    pub legacy_skip_email: Option<bool>,
+}
+
+/// PMS-1462: delivery methods for an invoice or quote send. The set is
+/// extensible: adding a method is a migration widening the CHECK and a
+/// variant here. `serde(rename_all = "snake_case")` keeps the wire exactly
+/// the strings the CHECK accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryMethod {
+    Email,
+    Postal,
+    Other,
+}
+
+impl DeliveryMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryMethod::Email => "email",
+            DeliveryMethod::Postal => "postal",
+            DeliveryMethod::Other => "other",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "email" => Some(Self::Email),
+            "postal" => Some(Self::Postal),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
+/// PMS-1462: how the invoice or quote reached the customer.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct DeliveryRequest {
+    pub method: DeliveryMethod,
+    /// Required (non-blank) on `other`, ignored on `email` / `postal`.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// PMS-1462: response from
+/// `GET /invoices/{id}/delivery-options` and
+/// `GET /quotes/{id}/delivery-options`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryOptionsResponse {
+    pub methods: Vec<DeliveryOptionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryOptionResponse {
+    pub method: String,
+    pub available: bool,
+    pub recipient: Option<String>,
+    pub reason: Option<String>,
 }
 
 // ============================================================================
