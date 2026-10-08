@@ -335,7 +335,7 @@ async fn a_send_with_no_billing_contact_is_refused_and_names_the_company(pool: P
     );
     assert!(message.contains("no billing contact"), "{message}");
     assert!(
-        message.contains("sent without emailing"),
+        message.contains("postal mail or other delivery"),
         "points at the alternative: {message}"
     );
 

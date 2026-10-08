@@ -52,7 +52,12 @@ pub fn quotes_routes(service: QuotesService) -> Router {
         // sign-off stays on the existing `/quotes/{id}/approvals`
         // surface, which this module does not touch.
         .route("/quotes/{quote_id}/send", post(send_quote))
-        // PMS-1462: Send dialog mirror of /invoices/{id}/delivery-options.
+        // parity record 2026-10-08: `/quotes/{quote_id}/delivery-options`
+        // mirrors `/invoices/{id}/delivery-options` (PMS-1462). The MAPPS-1014
+        // SPA Send dialog pre-fetches options on invoices only in the first
+        // slice and does not call this one yet; the endpoint ships here so the
+        // next slice (quote-side pre-fetch) is a client-only change. Review
+        // again if the quote slice has not landed by 2026-11-30.
         .route(
             "/quotes/{quote_id}/delivery-options",
             get(quote_delivery_options),
