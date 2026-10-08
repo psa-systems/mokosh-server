@@ -238,7 +238,7 @@ async fn overdue_invoice(app: &common::TestApp, token: &str, company_id: Uuid) -
         .client
         .put(app.url(&format!("/api/v1/invoices/{invoice_id}")))
         .bearer_auth(token)
-        .json(&serde_json::json!({ "status": "sent", "skip_email": true }))
+        .json(&serde_json::json!({ "status": "sent", "delivery": { "method": "other", "note": "Test seed, delivered outside Mokosh" } }))
         .send()
         .await
         .expect("send invoice");

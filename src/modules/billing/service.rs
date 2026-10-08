@@ -906,7 +906,8 @@ impl BillingService {
                    written_off_at, written_off_by_id, write_off_reason, write_off_amount,
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
-                   tax_rate_id, tax_rate, amends_invoice_id
+                   tax_rate_id, tax_rate, amends_invoice_id,
+                   delivery_method, delivery_note, delivered_by_id
             FROM invoices
             WHERE {data_where}
             ORDER BY {order_by}
@@ -4140,6 +4141,49 @@ impl BillingService {
         request: &UpdateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
+        // PMS-1462: `skip_email` is gone. A request still carrying it must be
+        // refused with a named replacement, not silently ignored: silently
+        // ignoring would turn an old "Mark as sent without emailing" button
+        // into an invoice that WAS emailed, which is the inverse of the
+        // operator's stated intent.
+        if request.legacy_skip_email.is_some() {
+            return Err(AppError::validation(
+                "`skip_email` is no longer supported; use `delivery`",
+                vec![FieldError::new(
+                    "skip_email",
+                    "`skip_email` was removed in PMS-1462; send `delivery: { method: \"postal\" | \"other\", note: \"...\" }` instead",
+                    "unknown_field",
+                )],
+            ));
+        }
+
+        // Resolve the delivery choice on a `sent` transition. Omitted means
+        // email, which is what the pre-PMS-1462 app meant by Send so the
+        // server deploys ahead of the SPA without changing any existing
+        // button's behaviour. `other` without a non-blank note is a 422 here,
+        // before any state is touched.
+        let delivery_choice = request.delivery.as_ref().map(|d| {
+            let note = d
+                .note
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            (d.method, note)
+        });
+        if let Some((DeliveryMethod::Other, note)) = &delivery_choice {
+            if note.is_none() {
+                return Err(AppError::validation(
+                    "describe how the invoice was delivered",
+                    vec![FieldError::new(
+                        "delivery.note",
+                        "A note describing the delivery is required when `method` is `other`.",
+                        "required",
+                    )],
+                ));
+            }
+        }
+
         // PMS-1227: `void` and `written_off` are terminal states owned by
         // `void_invoice` and `write_off_invoice`, each with its own
         // preconditions and its own write-off/void detail columns. Accepting
@@ -4388,13 +4432,24 @@ impl BillingService {
             (_, given) => given,
         };
 
-        // PMS-992: the recipient is resolved BEFORE the transition, and a send
-        // with nobody to email is refused rather than recorded. `sent` used to
-        // mean "the operator pressed Send"; it now means the invoice was
-        // emailed to the address recorded on it, or was marked sent without
-        // emailing on purpose (`skip_email`), which is a hand-delivered invoice
-        // and says so.
-        let recipient = if just_sent && !request.skip_email {
+        // PMS-1462: the delivery method chosen on this `sent` transition.
+        // Omitted means `email`, so an existing SPA's Send button keeps its
+        // meaning. On `email`, the recipient is resolved BEFORE the
+        // transition and a send with nobody to email is refused rather than
+        // recorded; on `postal` / `other`, no recipient is resolved and no
+        // email is attempted (the operator is attesting to a delivery they
+        // already performed).
+        let sent_method = if just_sent {
+            Some(
+                delivery_choice
+                    .as_ref()
+                    .map(|(m, _)| *m)
+                    .unwrap_or(DeliveryMethod::Email),
+            )
+        } else {
+            None
+        };
+        let recipient = if sent_method == Some(DeliveryMethod::Email) {
             // A company change drops the old company's contact (below), so
             // the recipient is resolved from the new company alone.
             let contact = if company_change.is_some() {
@@ -4541,105 +4596,171 @@ impl BillingService {
                 &bytes,
             )
             .await?;
-            // PMS-992: the email goes inside this transaction, so a send the
-            // mailer refuses rolls the transition back and the invoice stays
-            // a draft rather than a `sent` nobody received. The relay's
-            // acceptance is what "sent" means from here; delivery beyond it is
-            // the relay's.
-            if let Some((contact_id, address)) = &recipient {
-                // PMS-1186: the mail carries a pay link, so the person it goes
-                // to has to be able to open the invoice it links to. Being
-                // sent an invoice is the MSP saying this person handles them,
-                // and until this the two facts were unconnected: the recipient
-                // is resolved from `billing_contact_id` and the company's
-                // default pointer, while what the portal shows comes from
-                // capabilities, so a customer could be mailed a Pay link into
-                // a portal that would not show them the invoice.
-                //
-                // Inside this transaction with the send, so a mail the relay
-                // refuses rolls the grant back with the rest of it.
-                crate::modules::contacts::portal_access::ensure_can_read_invoices(
-                    &mut tx,
-                    tenant_id,
-                    *contact_id,
-                    ctx,
-                )
-                .await?;
-                if let Some(user_id) = ctx.user_id {
-                    static INVOICE_MAIL_LIMITER: std::sync::LazyLock<
-                        std::sync::Arc<crate::modules::auth::rate_limit::UserMailLimiter>,
-                    > = std::sync::LazyLock::new(|| {
-                        crate::modules::auth::rate_limit::UserMailLimiter::new(
-                            crate::modules::auth::rate_limit::USER_MAIL_PER_HOUR,
-                        )
-                    });
-                    // PMS-1299 (F7c): per-user hourly budget on invoice mail.
-                    INVOICE_MAIL_LIMITER
-                        .check(user_id)
-                        .map_err(|retry_after| AppError::rate_limited(Some(retry_after)))?;
-                }
-                self.email_invoice(tenant_id, &document, address, &bytes)
+            // PMS-1462: dispatch on the method the operator chose.
+            //
+            // `email`: Mokosh mails the PDF inside this transaction, so a
+            // relay refusal rolls the send back and the invoice stays a
+            // draft. On the refusal the failure is recorded in a NEW
+            // transaction (after this one rolls back) as an
+            // `invoice.send_failed` audit row, so the attempt leaves a trace
+            // this transaction's rollback cannot take with it.
+            //
+            // `postal` / `other`: the operator attests to a delivery they
+            // already performed. No mail, no recipient; the invoice freezes
+            // with the method and (for `other`) the note recorded, and the
+            // audit row names them.
+            let delivery_method = sent_method.expect(
+                "sent_method is Some whenever issuer_snapshot is Some, both key off just_sent",
+            );
+            let delivery_note = delivery_choice.as_ref().and_then(|(_, n)| n.clone());
+            match delivery_method {
+                DeliveryMethod::Email => {
+                    let (contact_id, address) = recipient
+                        .as_ref()
+                        .expect("recipient is Some whenever sent_method == Email");
+                    // PMS-1186: the mail carries a pay link, so the person it
+                    // goes to has to be able to open the invoice it links to.
+                    // Inside this transaction with the send, so a mail the
+                    // relay refuses rolls the grant back with the rest of it.
+                    crate::modules::contacts::portal_access::ensure_can_read_invoices(
+                        &mut tx,
+                        tenant_id,
+                        *contact_id,
+                        ctx,
+                    )
                     .await?;
-                sqlx::query(
-                    "UPDATE invoices SET emailed_at = NOW(), emailed_to = $3 \
-                     WHERE tenant_id = $1 AND id = $2",
-                )
-                .bind(tenant_id)
-                .bind(invoice_id)
-                .bind(address)
-                .execute(&mut *tx)
-                .await?;
-                // PMS-978: the delivery gets its own audit row, the shape
-                // PMS-977 gave the company move. The whole-row snapshot below
-                // carries `emailed_to` and `emailed_at` too, but only as two
-                // columns that differ between two JSON blobs; "this invoice
-                // was emailed to this address at this time, by this user" is
-                // the question an operator actually asks, and it should not
-                // require diffing a row to answer. Inside the transaction
-                // with the send, so a relay refusal takes the record of it
-                // away as well.
-                audit_write(
-                    &mut *tx,
-                    tenant_id,
-                    ctx,
-                    AuditAction::Update,
-                    "invoices",
-                    Some(invoice_id),
-                    None,
-                    Some(serde_json::json!({
-                        "event": "invoice.sent",
-                        "invoice_number": document.invoice_number,
-                        "emailed_to": address,
-                        "billing_contact_id": contact_id,
-                    })),
-                )
-                .await?;
-            } else {
-                tracing::info!(
-                    target: "mokosh_server.billing",
-                    %invoice_id,
-                    "invoice marked sent without emailing (skip_email)",
-                );
-                // PMS-978: the deliberate no-email send says so in the
-                // history too. Without a row of its own it is indistinguishable
-                // afterwards from a send whose mail was lost: both leave a
-                // `sent` invoice with no `emailed_to`, and only one of them
-                // was somebody's decision.
-                audit_write(
-                    &mut *tx,
-                    tenant_id,
-                    ctx,
-                    AuditAction::Update,
-                    "invoices",
-                    Some(invoice_id),
-                    None,
-                    Some(serde_json::json!({
-                        "event": "invoice.marked_sent",
-                        "invoice_number": document.invoice_number,
-                        "emailed_to": serde_json::Value::Null,
-                    })),
-                )
-                .await?;
+                    if let Some(user_id) = ctx.user_id {
+                        static INVOICE_MAIL_LIMITER: std::sync::LazyLock<
+                            std::sync::Arc<crate::modules::auth::rate_limit::UserMailLimiter>,
+                        > = std::sync::LazyLock::new(|| {
+                            crate::modules::auth::rate_limit::UserMailLimiter::new(
+                                crate::modules::auth::rate_limit::USER_MAIL_PER_HOUR,
+                            )
+                        });
+                        // PMS-1299 (F7c): per-user hourly budget on invoice
+                        // mail.
+                        INVOICE_MAIL_LIMITER
+                            .check(user_id)
+                            .map_err(|retry_after| AppError::rate_limited(Some(retry_after)))?;
+                    }
+                    match self
+                        .email_invoice(tenant_id, &document, address, &bytes)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(mail_err) => {
+                            // Capture everything we need before dropping tx
+                            // (which releases its borrow and rolls back on
+                            // drop).
+                            let number = document.invoice_number.clone();
+                            let addr = address.to_string();
+                            let err_text = mail_err.to_string();
+                            drop(tx);
+                            tracing::warn!(
+                                target: "mokosh_server.billing",
+                                %invoice_id,
+                                invoice_number = %number,
+                                recipient = %addr,
+                                error = %err_text,
+                                "invoice email: send refused, invoice stays unsent"
+                            );
+                            // The failure survives the rollback by living in
+                            // a new transaction. A failure to write THIS row
+                            // is itself logged at `error`, and the mail
+                            // error is still what we return.
+                            if let Err(audit_err) = self
+                                .record_invoice_send_failed(
+                                    tenant_id, invoice_id, &number, &addr, &err_text, ctx,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    target: "mokosh_server.billing",
+                                    %invoice_id,
+                                    error = %audit_err,
+                                    "could not persist invoice.send_failed audit row"
+                                );
+                            }
+                            return Err(mail_err);
+                        }
+                    }
+                    sqlx::query(
+                        "UPDATE invoices SET \
+                             emailed_at = NOW(), emailed_to = $3, \
+                             delivery_method = 'email', \
+                             delivery_note = NULL, \
+                             delivered_by_id = COALESCE(delivered_by_id, $4) \
+                         WHERE tenant_id = $1 AND id = $2",
+                    )
+                    .bind(tenant_id)
+                    .bind(invoice_id)
+                    .bind(address.as_str())
+                    .bind(ctx.user_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    // PMS-978 + PMS-1462: one audit row per send, naming the
+                    // method and (for `other`) the operator's note. Inside
+                    // this transaction so a later rollback takes it too.
+                    audit_write(
+                        &mut *tx,
+                        tenant_id,
+                        ctx,
+                        AuditAction::Update,
+                        "invoices",
+                        Some(invoice_id),
+                        None,
+                        Some(serde_json::json!({
+                            "event": "invoice.sent",
+                            "invoice_number": document.invoice_number,
+                            "method": "email",
+                            "note": serde_json::Value::Null,
+                            "emailed_to": address,
+                            "billing_contact_id": contact_id,
+                        })),
+                    )
+                    .await?;
+                }
+                DeliveryMethod::Postal | DeliveryMethod::Other => {
+                    let method_str = delivery_method.as_str();
+                    sqlx::query(
+                        "UPDATE invoices SET \
+                             delivery_method = $3, \
+                             delivery_note = $4, \
+                             delivered_by_id = COALESCE(delivered_by_id, $5) \
+                         WHERE tenant_id = $1 AND id = $2",
+                    )
+                    .bind(tenant_id)
+                    .bind(invoice_id)
+                    .bind(method_str)
+                    .bind(delivery_note.as_deref())
+                    .bind(ctx.user_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    tracing::info!(
+                        target: "mokosh_server.billing",
+                        %invoice_id,
+                        method = method_str,
+                        "invoice sent by {method_str}: no email"
+                    );
+                    audit_write(
+                        &mut *tx,
+                        tenant_id,
+                        ctx,
+                        AuditAction::Update,
+                        "invoices",
+                        Some(invoice_id),
+                        None,
+                        Some(serde_json::json!({
+                            "event": "invoice.sent",
+                            "invoice_number": document.invoice_number,
+                            "method": method_str,
+                            "note": delivery_note,
+                            "emailed_to": serde_json::Value::Null,
+                            "billing_contact_id": serde_json::Value::Null,
+                        })),
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -4865,10 +4986,12 @@ impl BillingService {
             ));
         };
         let Some(contact_id) = invoice_contact.or(company_contact) else {
+            // PMS-1462: the removed delivery path is gone from the sentence
+            // too; the SPA's dialog now offers postal / other beside Email.
             return Ok(Err(format!(
                 "{company_name} has no billing contact, so this invoice cannot be sent. \
-                 Set a billing contact on the invoice or on the company, or mark the invoice \
-                 sent without emailing."
+                 Set a billing contact on the invoice or on the company, or choose postal \
+                 mail or other delivery."
             )));
         };
         let contact: Option<(Option<String>, String, String)> = sqlx::query_as(
@@ -4885,7 +5008,7 @@ impl BillingService {
             Some((_, first, last)) => Ok(Err(format!(
                 "{company_name}'s billing contact {first} {last} has no email address, so this \
                  invoice cannot be sent. Add an address to the contact, choose another billing \
-                 contact, or mark the invoice sent without emailing."
+                 contact, or choose postal mail or other delivery."
             ))),
             None => Ok(Err(format!(
                 "{company_name}'s billing contact no longer exists, so this invoice cannot be \
@@ -5165,6 +5288,178 @@ impl BillingService {
     /// invoice the relay refused stays a draft rather than becoming a `sent`
     /// nobody received. A service with no mailer cannot send an invoice at
     /// all and says so, rather than marking it sent.
+    /// PMS-1462: `GET /invoices/{id}/delivery-options`.
+    ///
+    /// The server owns the "can this invoice be emailed" rule, so the
+    /// SPA's Send dialog shows an availability that cannot disagree with
+    /// what the send itself would refuse. The same resolver the send uses
+    /// also feeds the options check; only the wording differs (the 409 on
+    /// send keeps its full sentence).
+    ///
+    /// `email.available` is false when any of these in order holds. The
+    /// `reason` returned matches:
+    ///
+    /// 1. no mailer configured -> "Email is not configured on this server"
+    /// 2. no billing contact resolvable -> "No billing contact is set"
+    /// 3. the resolved contact is missing -> "Billing contact no longer exists"
+    /// 4. the resolved contact has no address -> "Billing contact is missing email address"
+    ///
+    /// `postal` and `other` are available whenever the invoice's status
+    /// allows sending (draft, approved). On a frozen invoice every method
+    /// is unavailable with the reason the send would refuse with.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, invoice_id = %invoice_id))]
+    pub async fn invoice_delivery_options(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+    ) -> AppResult<DeliveryOptionsResponse> {
+        let invoice = self.get_invoice(tenant_id, invoice_id).await?;
+        if invoice.status.is_frozen() {
+            let reason = format!(
+                "This invoice is in status '{}' and cannot be sent again.",
+                invoice.status.as_str()
+            );
+            return Ok(DeliveryOptionsResponse {
+                methods: vec![
+                    DeliveryOptionResponse {
+                        method: "email".to_string(),
+                        available: false,
+                        recipient: None,
+                        reason: Some(reason.clone()),
+                    },
+                    DeliveryOptionResponse {
+                        method: "postal".to_string(),
+                        available: false,
+                        recipient: None,
+                        reason: Some(reason.clone()),
+                    },
+                    DeliveryOptionResponse {
+                        method: "other".to_string(),
+                        available: false,
+                        recipient: None,
+                        reason: Some(reason),
+                    },
+                ],
+            });
+        }
+        let email_option = self.resolve_email_option(tenant_id, &invoice).await?;
+        Ok(DeliveryOptionsResponse {
+            methods: vec![
+                email_option,
+                DeliveryOptionResponse {
+                    method: "postal".to_string(),
+                    available: true,
+                    recipient: None,
+                    reason: None,
+                },
+                DeliveryOptionResponse {
+                    method: "other".to_string(),
+                    available: true,
+                    recipient: None,
+                    reason: None,
+                },
+            ],
+        })
+    }
+
+    async fn resolve_email_option(
+        &self,
+        tenant_id: TenantId,
+        invoice: &InvoiceResponse,
+    ) -> AppResult<DeliveryOptionResponse> {
+        if self.mailer.is_none() {
+            return Ok(DeliveryOptionResponse {
+                method: "email".to_string(),
+                available: false,
+                recipient: None,
+                reason: Some("Email is not configured on this server".to_string()),
+            });
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Fall through the same chain the send uses.
+        let company_contact: Option<Uuid> = sqlx::query_scalar(
+            "SELECT default_billing_contact_id FROM companies \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice.company_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        let Some(contact_id) = invoice.billing_contact_id.or(company_contact) else {
+            return Ok(DeliveryOptionResponse {
+                method: "email".to_string(),
+                available: false,
+                recipient: None,
+                reason: Some("No billing contact is set".to_string()),
+            });
+        };
+        let contact: Option<Option<String>> =
+            sqlx::query_scalar("SELECT email FROM contacts WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(contact_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match contact {
+            None => Ok(DeliveryOptionResponse {
+                method: "email".to_string(),
+                available: false,
+                recipient: None,
+                reason: Some("Billing contact no longer exists".to_string()),
+            }),
+            Some(email) => match email {
+                Some(e) if !e.trim().is_empty() => Ok(DeliveryOptionResponse {
+                    method: "email".to_string(),
+                    available: true,
+                    recipient: Some(e.trim().to_string()),
+                    reason: None,
+                }),
+                _ => Ok(DeliveryOptionResponse {
+                    method: "email".to_string(),
+                    available: false,
+                    recipient: None,
+                    reason: Some("Billing contact is missing email address".to_string()),
+                }),
+            },
+        }
+    }
+
+    /// PMS-1462: record a failed invoice email attempt in a NEW transaction,
+    /// so the audit row survives the rollback of the one that just rolled
+    /// back the send. Any failure here is logged and swallowed by the
+    /// caller; the mail error itself is still what the caller returns.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, invoice_id = %invoice_id))]
+    async fn record_invoice_send_failed(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        invoice_number: &str,
+        address: &str,
+        reason: &str,
+        ctx: &AuditCtx,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "invoices",
+            Some(invoice_id),
+            None,
+            Some(serde_json::json!({
+                "event": "invoice.send_failed",
+                "invoice_number": invoice_number,
+                "method": "email",
+                "address": address,
+                "reason": reason,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn email_invoice(
         &self,
         tenant_id: TenantId,
@@ -5173,9 +5468,12 @@ impl BillingService {
         pdf: &[u8],
     ) -> AppResult<()> {
         let Some(mailer) = self.mailer.as_ref() else {
+            // PMS-1462: no mention of a removed delivery path. The caller
+            // (the SPA's Send dialog) will greyed-out the Email option and
+            // the operator picks postal / other instead.
             return Err(AppError::external_service(
                 "mail",
-                "this service cannot send email, so the invoice cannot be sent; mark it sent without emailing if it was delivered another way",
+                "this service cannot send email, so the invoice cannot be emailed; choose postal mail or other delivery",
             ));
         };
         // The pay link is offered only when something can take the payment.
@@ -5750,7 +6048,8 @@ impl BillingService {
                    written_off_at, written_off_by_id, write_off_reason, write_off_amount,
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
-                   tax_rate_id, tax_rate, amends_invoice_id
+                   tax_rate_id, tax_rate, amends_invoice_id,
+                   delivery_method, delivery_note, delivered_by_id
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -5845,6 +6144,20 @@ impl BillingService {
         // say who without a users lookup it has no route for.
         if let Some(user_id) = resp.voided_by_id {
             resp.voided_by_name = sqlx::query_scalar(
+                "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
+                 FROM users WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant_id)
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+        }
+        // PMS-1462: the display name behind delivered_by_id, resolved the
+        // same way as voided_by_name. The detail page says who delivered the
+        // invoice, not a UUID.
+        if let Some(user_id) = resp.delivered_by_id {
+            resp.delivered_by_name = sqlx::query_scalar(
                 "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
                  FROM users WHERE tenant_id = $1 AND id = $2",
             )
@@ -7587,6 +7900,11 @@ struct InvoiceRow {
     amends_invoice_id: Option<Uuid>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
+    /// PMS-1462: delivery record, NULL on draft and on sent rows the backfill
+    /// could not place.
+    delivery_method: Option<String>,
+    delivery_note: Option<String>,
+    delivered_by_id: Option<Uuid>,
 }
 
 impl From<InvoiceRow> for InvoiceResponse {
@@ -7645,6 +7963,11 @@ impl From<InvoiceRow> for InvoiceResponse {
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,
+            delivery_method: r.delivery_method,
+            delivery_note: r.delivery_note,
+            delivered_by_id: r.delivered_by_id,
+            // Resolved by `enrich_invoices` the way `voided_by_name` is.
+            delivered_by_name: None,
         }
     }
 }

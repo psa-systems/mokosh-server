@@ -52,6 +52,11 @@ pub fn quotes_routes(service: QuotesService) -> Router {
         // sign-off stays on the existing `/quotes/{id}/approvals`
         // surface, which this module does not touch.
         .route("/quotes/{quote_id}/send", post(send_quote))
+        // PMS-1462: Send dialog mirror of /invoices/{id}/delivery-options.
+        .route(
+            "/quotes/{quote_id}/delivery-options",
+            get(quote_delivery_options),
+        )
         // PMS-674: the accepted quote becomes the Project the MSP works.
         .route("/quotes/{quote_id}/convert", post(convert_quote))
         // mokosh-contact-login prompt 008: contact-plane accept /
@@ -386,20 +391,45 @@ async fn delete_line(
     Ok(Json(quote))
 }
 
-/// Send an approved quote to the client (PMS-673). 409 unless the quote
-/// is internally `approved`; see [`QuotesService::send_quote`].
+/// Send an approved quote to the client (PMS-673, PMS-1462). 409 unless
+/// the quote is internally `approved`; see [`QuotesService::send_quote`].
+///
+/// Body is optional (`{}`): absent `method` defaults to `email`. On
+/// `other`, `note` is required.
 async fn send_quote(
     State(state): State<QuotesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
     ctx: crate::modules::audit::AuditCtx,
     Path(quote_id): Path<Uuid>,
+    body: Option<Json<crate::modules::billing::models::DeliveryRequest>>,
 ) -> AppResult<Json<QuoteResponse>> {
+    let delivery = body.map(|Json(d)| d);
     let quote = state
         .service
-        .send_quote(user.tenant(), today_for(&user.timezone), quote_id, &ctx)
+        .send_quote(
+            user.tenant(),
+            today_for(&user.timezone),
+            quote_id,
+            delivery,
+            &ctx,
+        )
         .await?;
     Ok(Json(quote))
+}
+
+/// PMS-1462: see [`QuotesService::quote_delivery_options`].
+async fn quote_delivery_options(
+    State(state): State<QuotesRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Path(quote_id): Path<Uuid>,
+) -> AppResult<Json<crate::modules::billing::models::DeliveryOptionsResponse>> {
+    let options = state
+        .service
+        .quote_delivery_options(user.tenant(), today_for(&user.timezone), quote_id)
+        .await?;
+    Ok(Json(options))
 }
 
 /// Convert an accepted quote into a Project (PMS-674).

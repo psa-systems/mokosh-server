@@ -231,6 +231,19 @@ pub struct QuoteResponse {
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
     pub lines: Option<Vec<QuoteLineResponse>>,
+    /// PMS-1462: delivery record. Matches the invoice shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_by_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_by_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emailed_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emailed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, Validate)]

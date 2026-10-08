@@ -373,10 +373,11 @@ async fn a_send_to_a_contact_without_an_address_is_refused(pool: PgPool) {
     assert!(mailer.sent.lock().unwrap().is_empty());
 }
 
-/// `skip_email` is the explicit path for an invoice delivered by hand: it
-/// freezes and records nobody as emailed, and the record says so.
+/// PMS-1462: `other` is the explicit path for an invoice delivered by
+/// hand: it freezes and records that nobody was emailed, and the record
+/// says how it was delivered.
 #[mokosh_test]
-async fn skip_email_marks_sent_without_emailing_and_records_nobody(pool: PgPool) {
+async fn other_delivery_marks_sent_without_emailing_and_records_nobody(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -389,7 +390,10 @@ async fn skip_email_marks_sent_without_emailing_and_records_nobody(pool: PgPool)
         &app,
         &token,
         id,
-        json!({ "status": "sent", "skip_email": true }),
+        json!({
+            "status": "sent",
+            "delivery": { "method": "other", "note": "Attached to an Outlook message" }
+        }),
     )
     .await;
     assert!(resp.status().is_success(), "{}", resp.status());
@@ -398,6 +402,8 @@ async fn skip_email_marks_sent_without_emailing_and_records_nobody(pool: PgPool)
     assert!(sent["sent_at"].is_string());
     assert!(sent["emailed_to"].is_null(), "{sent}");
     assert!(sent["emailed_at"].is_null(), "{sent}");
+    assert_eq!(sent["delivery_method"], "other");
+    assert_eq!(sent["delivery_note"], "Attached to an Outlook message");
     assert!(mailer.sent.lock().unwrap().is_empty());
     // The document is still stored: hand-delivered is still issued.
     assert!(mokosh_server::modules::billing::documents::read_issued(
@@ -519,11 +525,11 @@ async fn a_send_is_a_named_event_in_the_audit_log(pool: PgPool) {
     );
 }
 
-/// The deliberate no-email send says so, because otherwise it is
-/// indistinguishable afterwards from a send whose mail was lost: both leave a
-/// `sent` invoice with no `emailed_to`, and only one of them was a decision.
+/// PMS-1462: a non-email send says HOW the operator delivered it, because
+/// otherwise it is indistinguishable afterwards from a send whose mail was
+/// lost; both would leave a `sent` invoice with no `emailed_to`.
 #[mokosh_test]
-async fn a_skip_email_send_records_that_nobody_was_emailed(pool: PgPool) {
+async fn a_non_email_send_records_the_method_and_note(pool: PgPool) {
     install_test_attachment_env();
     let (_id, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
@@ -536,7 +542,10 @@ async fn a_skip_email_send_records_that_nobody_was_emailed(pool: PgPool) {
         &app,
         &token,
         &id,
-        json!({ "status": "sent", "skip_email": true }),
+        json!({
+            "status": "sent",
+            "delivery": { "method": "postal" }
+        }),
     )
     .await;
     assert!(resp.status().is_success(), "{}", resp.status());
@@ -544,8 +553,78 @@ async fn a_skip_email_send_records_that_nobody_was_emailed(pool: PgPool) {
 
     let events = sent_events(&pool, &id).await;
     assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0].2["event"], "invoice.marked_sent");
+    assert_eq!(events[0].2["event"], "invoice.sent");
+    assert_eq!(events[0].2["method"], "postal");
     assert!(events[0].2["emailed_to"].is_null());
+}
+
+/// PMS-1462: a client still carrying the removed `skip_email` key is
+/// refused with a 422, named replacement in the message.
+#[mokosh_test]
+async fn a_request_with_the_removed_skip_email_is_422(pool: PgPool) {
+    install_test_attachment_env();
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let (app, mailer) = boot_capturing(pool.clone(), CapturingMailer::default()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let draft = create_draft(&app, &token, company_id, None).await;
+    let id = draft["id"].as_str().unwrap();
+    let resp = send(
+        &app,
+        &token,
+        id,
+        json!({ "status": "sent", "skip_email": true }),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 422, "{}", resp.status());
+    assert!(mailer.sent.lock().unwrap().is_empty());
+}
+
+/// PMS-1462: a refused email leaves an `invoice.send_failed` audit row
+/// written in a transaction that survives the rollback of the send.
+#[mokosh_test]
+async fn a_refused_send_leaves_a_send_failed_audit_row(pool: PgPool) {
+    install_test_attachment_env();
+    let (_id, email, pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let contact = seed_contact(&pool, company_id, Some("ap@client.example")).await;
+    let (app, _mailer) = boot_capturing(
+        pool.clone(),
+        CapturingMailer {
+            sent: Mutex::new(Vec::new()),
+            refuse: Some("relay unreachable".to_string()),
+        },
+    )
+    .await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let draft = create_draft(&app, &token, company_id, Some(contact)).await;
+    let id = draft["id"].as_str().unwrap().to_string();
+    let resp = send(&app, &token, &id, json!({ "status": "sent" })).await;
+    assert_eq!(resp.status().as_u16(), 502, "{}", resp.status());
+
+    let failures: Vec<Value> = sqlx::query_scalar(
+        "SELECT new_values FROM audit_log \
+         WHERE tenant_id = $1 AND entity_type = 'invoices' AND entity_id = $2 \
+           AND new_values ->> 'event' = 'invoice.send_failed'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(Uuid::parse_str(&id).unwrap())
+    .fetch_all(&pool)
+    .await
+    .expect("audit rows");
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let failure = &failures[0];
+    assert_eq!(failure["method"], "email");
+    assert_eq!(failure["address"], "ap@client.example");
+    assert!(
+        failure["reason"]
+            .as_str()
+            .unwrap()
+            .contains("relay unreachable"),
+        "{failure:?}"
+    );
 }
 
 /// A refused send writes no delivery event, for the same reason it leaves the
@@ -578,8 +657,10 @@ async fn a_refused_send_records_no_delivery(pool: PgPool) {
     );
 }
 
-/// The `invoice.sent` / `invoice.marked_sent` rows for one invoice, newest
-/// last, as (actor, when, payload).
+/// The `invoice.sent` rows for one invoice, newest last, as
+/// (actor, when, payload). PMS-1462: `invoice.marked_sent` is gone, so
+/// every delivery (email, postal, other) rides on `invoice.sent` carrying
+/// a `method` field.
 async fn sent_events(
     pool: &PgPool,
     invoice_id: &str,
@@ -587,7 +668,7 @@ async fn sent_events(
     sqlx::query_as::<_, (Option<Uuid>, chrono::DateTime<Utc>, Value)>(
         "SELECT user_id, \"timestamp\", new_values FROM audit_log \
          WHERE tenant_id = $1 AND entity_type = 'invoices' AND entity_id = $2 \
-           AND new_values ->> 'event' IN ('invoice.sent', 'invoice.marked_sent') \
+           AND new_values ->> 'event' = 'invoice.sent' \
          ORDER BY \"timestamp\"",
     )
     .bind(common::DEFAULT_TENANT_ID)
