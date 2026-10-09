@@ -1015,8 +1015,10 @@ impl TicketService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         sqlx::query(
             r#"
-            INSERT INTO ticket_notes (id, tenant_id, ticket_id, note_type, content, created_by_id)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO ticket_notes
+                (id, tenant_id, ticket_id, note_type, content, created_by_id,
+                 time_minutes, work_summary, parts_used, follow_up)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
         )
         .bind(note_id)
@@ -1025,6 +1027,10 @@ impl TicketService {
         .bind(request.note_type.as_str())
         .bind(&request.content)
         .bind(user_id)
+        .bind(request.time_minutes)
+        .bind(request.work_summary.as_deref())
+        .bind(request.parts_used.as_deref())
+        .bind(request.follow_up.as_ref())
         .execute(&mut *tx)
         .await?;
 
@@ -1402,6 +1408,7 @@ impl TicketService {
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
                    n.is_email_sent, n.email_sent_at, n.created_by_id,
                    n.created_by_contact_id,
+                   n.time_minutes, n.work_summary, n.parts_used, n.follow_up,
                    n.created_at, n.updated_at,
                    u.first_name || ' ' || u.last_name as created_by_name
             FROM ticket_notes n
@@ -1440,6 +1447,7 @@ impl TicketService {
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
                    n.is_email_sent, n.email_sent_at, n.created_by_id,
                    n.created_by_contact_id,
+                   n.time_minutes, n.work_summary, n.parts_used, n.follow_up,
                    n.created_at, n.updated_at,
                    u.first_name || ' ' || u.last_name as created_by_name
             FROM ticket_notes n
@@ -2478,6 +2486,7 @@ impl TicketService {
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
                    n.is_email_sent, n.email_sent_at, n.created_by_id,
                    n.created_by_contact_id,
+                   n.time_minutes, n.work_summary, n.parts_used, n.follow_up,
                    n.created_at, n.updated_at,
                    COALESCE(
                        NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''),
@@ -2530,6 +2539,7 @@ impl TicketService {
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
                    n.is_email_sent, n.email_sent_at, n.created_by_id,
                    n.created_by_contact_id,
+                   n.time_minutes, n.work_summary, n.parts_used, n.follow_up,
                    n.created_at, n.updated_at,
                    COALESCE(
                        NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''),
@@ -2632,6 +2642,7 @@ impl TicketService {
             SELECT n.id, n.tenant_id, n.ticket_id, n.note_type, n.content, n.content_html,
                    n.is_email_sent, n.email_sent_at, n.created_by_id,
                    n.created_by_contact_id,
+                   n.time_minutes, n.work_summary, n.parts_used, n.follow_up,
                    n.created_at, n.updated_at,
                    COALESCE(
                        NULLIF(TRIM(CONCAT(c.first_name, ' ', c.last_name)), ''),
@@ -3612,6 +3623,11 @@ struct TicketNoteRow {
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     created_by_name: Option<String>,
+    // PMS-1359: structured fields (all optional).
+    time_minutes: Option<i32>,
+    work_summary: Option<String>,
+    parts_used: Option<Vec<String>>,
+    follow_up: Option<serde_json::Value>,
 }
 
 impl From<TicketNoteRow> for TicketNote {
@@ -3628,6 +3644,10 @@ impl From<TicketNoteRow> for TicketNote {
             created_by_id: row.created_by_id,
             created_by_name: row.created_by_name,
             created_by_contact_id: row.created_by_contact_id,
+            time_minutes: row.time_minutes,
+            work_summary: row.work_summary,
+            parts_used: row.parts_used,
+            follow_up: row.follow_up,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -3813,6 +3833,10 @@ mod pms931_note_edit_tests {
             created_by_id: Uuid::new_v4(),
             created_by_name: None,
             created_by_contact_id: contact,
+            time_minutes: None,
+            work_summary: None,
+            parts_used: None,
+            follow_up: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
