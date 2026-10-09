@@ -25,6 +25,14 @@ pub struct Team {
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// MAPPS-877: how many `team_members` rows reference this team.
+    /// `Option` so an older client reading a mixed-version response
+    /// degrades to `None` instead of a deserialize failure; a zero-member
+    /// team gets `Some(0)`, never `None`, when the server batched the
+    /// count. Populated by `list_teams`; one-off `GET /teams/{id}` paths
+    /// may leave it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<u64>,
 }
 
 /// A `team_members` row, projected verbatim from the DB.
