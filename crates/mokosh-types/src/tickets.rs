@@ -699,6 +699,17 @@ pub struct TicketNote {
     /// `created_by_name`.
     #[serde(default)]
     pub created_by_contact_id: Option<Uuid>,
+    /// PMS-1359: structured fields captured directly in the note form so
+    /// downstream reports do not need to parse the body. All four are
+    /// optional; a plain free-text note carries `None` for each.
+    #[serde(default)]
+    pub time_minutes: Option<i32>,
+    #[serde(default)]
+    pub work_summary: Option<String>,
+    #[serde(default)]
+    pub parts_used: Option<Vec<String>>,
+    #[serde(default)]
+    pub follow_up: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -713,6 +724,20 @@ pub struct CreateNoteRequest {
     /// Send email notification to contact
     #[serde(default)]
     pub send_email: bool,
+    /// PMS-1359: structured fields the technician enters alongside the body.
+    /// Each is optional; a plain note omits all four. The server rejects a
+    /// non-positive `time_minutes` and a `follow_up` without a boolean
+    /// `needed`, matching the migration's CHECK constraints.
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub time_minutes: Option<i32>,
+    #[serde(default)]
+    #[validate(length(max = 200))]
+    pub work_summary: Option<String>,
+    #[serde(default)]
+    pub parts_used: Option<Vec<String>>,
+    #[serde(default)]
+    pub follow_up: Option<serde_json::Value>,
 }
 
 /// Edit an existing note's text (PMS-931).
@@ -760,6 +785,17 @@ pub struct TicketNoteResponse {
     /// for a reason it could have seen. Always `false` for a contact session.
     #[serde(default)]
     pub can_edit: bool,
+    /// PMS-1359: structured fields a technician captured alongside the body.
+    /// Omitted from the serialized shape when not set, so a plain free-text
+    /// note stays wire-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_minutes: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parts_used: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<serde_json::Value>,
 }
 
 // ============================================================================
