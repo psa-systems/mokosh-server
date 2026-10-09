@@ -260,22 +260,29 @@ async fn list_members_gates_on_require_manager(pool: PgPool) {
 
 /// T13: the MAPPS-562 `system+<slug>@mokosh.local` attribution user is
 /// hidden here the same way `list_users` hides it.
+///
+/// The row is provisioned by migration 166 for every pre-existing
+/// tenant (and by `TenantService::create` for every new one), so a
+/// per-test database already carries `system+default@mokosh.local`
+/// against the DEFAULT tenant; the test does not seed it, because
+/// doing so would collide on the `(tenant_id, email)` unique index.
+/// Confirming the row IS present rather than relying on the migration
+/// in silence belongs to the test's shape.
 #[mokosh_test]
 async fn list_members_hides_the_system_attribution_user(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    sqlx::query(
-        r#"INSERT INTO users
-               (id, tenant_id, email, first_name, last_name, role, status, bunyip_user_id,
-                email_verified_at)
-               VALUES ($1, $2, $3, 'System', 'Attribution', 'technician', 'active', $4, NOW())"#,
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE tenant_id = $1 AND email = $2)",
     )
-    .bind(Uuid::new_v4())
     .bind(common::DEFAULT_TENANT_ID)
     .bind("system+default@mokosh.local")
-    .bind(Uuid::new_v4())
-    .execute(&pool)
+    .fetch_one(&pool)
     .await
-    .expect("seed system user");
+    .expect("check system user");
+    assert!(
+        exists,
+        "migration 166 should have provisioned system+default@mokosh.local on the default tenant"
+    );
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
