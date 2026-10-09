@@ -244,6 +244,7 @@ pub struct TicketCategory {
 pub struct TicketCategoryResponse {
     pub id: Uuid,
     pub parent_id: Option<Uuid>,
+    pub parent_name: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub is_active: bool,
