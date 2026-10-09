@@ -63,6 +63,12 @@ pub struct EntityHistoryEntry {
     pub entity_id: Option<Uuid>,
     pub action: String,
     pub user_id: Option<Uuid>,
+    /// Resolved actor display name, joined server-side so the client never
+    /// has to look `user_id` up against its own roster (PMS-1478). `"<first>
+    /// <last>"`, falling back to the user's email when the profile name is
+    /// still empty (a JIT-provisioned user), and `None` only when `user_id`
+    /// is `NULL` or the user row is gone.
+    pub user_name: Option<String>,
     pub changed_fields: Vec<String>,
     pub changes: Vec<FieldChange>,
     pub timestamp: DateTime<Utc>,

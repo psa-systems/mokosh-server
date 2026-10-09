@@ -379,6 +379,12 @@ pub struct AssetAuditLogResponse {
     pub action: String,
     pub changes: Option<serde_json::Value>,
     pub performed_by_id: Option<Uuid>,
+    /// Resolved actor display name, joined server-side so the client never
+    /// has to look `performed_by_id` up against its own roster (PMS-1478).
+    /// `"<first> <last>"`, falling back to the user's email when the
+    /// profile name is still empty (a JIT-provisioned user), and `None`
+    /// only when `performed_by_id` is `NULL` or the user row is gone.
+    pub performed_by_name: Option<String>,
     pub performed_at: DateTime<Utc>,
 }
 

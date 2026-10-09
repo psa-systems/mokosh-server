@@ -1140,10 +1140,17 @@ impl AssetsService {
         .fetch_one(&mut *tx)
         .await?;
 
+        // `u` is joined on `id` AND `tenant_id` (not RLS alone) so a user in
+        // another tenant is never resolved, and the name falls back to the
+        // email when the profile name is still blank (a JIT-provisioned
+        // user), matching the `/audit-log` expression plus that fallback.
         let rows = sqlx::query_as::<_, AuditRow>(
-            r#"SELECT id, asset_id, action, changes, performed_by_id, performed_at
-               FROM asset_audit_log WHERE tenant_id = $1 AND asset_id = $2
-               ORDER BY performed_at DESC
+            r#"SELECT a.id, a.asset_id, a.action, a.changes, a.performed_by_id, a.performed_at,
+                      COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), u.email) AS performed_by_name
+               FROM asset_audit_log a
+               LEFT JOIN users u ON u.id = a.performed_by_id AND u.tenant_id = a.tenant_id
+               WHERE a.tenant_id = $1 AND a.asset_id = $2
+               ORDER BY a.performed_at DESC
                LIMIT $3 OFFSET $4"#,
         )
         .bind(tenant_id)
@@ -1152,7 +1159,26 @@ impl AssetsService {
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
         .await?;
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+
+        let entries: Vec<AssetAuditLogResponse> = rows.into_iter().map(Into::into).collect();
+        // PMS-1477's shared unresolved-person helper has not landed yet; log
+        // once per read rather than once per row so a long page does not
+        // spam the log.
+        let unresolved: Vec<Uuid> = entries
+            .iter()
+            .filter(|e| e.performed_by_id.is_some() && e.performed_by_name.is_none())
+            .filter_map(|e| e.performed_by_id)
+            .collect();
+        if !unresolved.is_empty() {
+            tracing::info!(
+                surface = "assets.list_asset_audit_log",
+                count = unresolved.len(),
+                ids = ?unresolved,
+                "unresolved actor id in asset audit log"
+            );
+        }
+
+        Ok((entries, total as u64))
     }
 }
 
@@ -1399,6 +1425,7 @@ struct AuditRow {
     changes: Option<serde_json::Value>,
     performed_by_id: Option<Uuid>,
     performed_at: chrono::DateTime<chrono::Utc>,
+    performed_by_name: Option<String>,
 }
 
 impl From<AuditRow> for AssetAuditLogResponse {
@@ -1409,6 +1436,7 @@ impl From<AuditRow> for AssetAuditLogResponse {
             action: r.action,
             changes: r.changes,
             performed_by_id: r.performed_by_id,
+            performed_by_name: r.performed_by_name,
             performed_at: r.performed_at,
         }
     }
