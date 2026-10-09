@@ -237,15 +237,6 @@ async fn an_uploaded_file_previews_imports_and_is_then_discarded(pool: PgPool) {
         .join("contact-imports")
         .join(file_id.to_string());
     assert!(!object.exists(), "the upload is discarded after its run");
-    let (_, file) = f
-        .call(
-            Method::GET,
-            &format!("/api/v1/integrations/contact-sync/vcard/uploads/{file_id}"),
-            None,
-        )
-        .await;
-    assert!(file["discarded_at"].is_string(), "{file}");
-    assert_eq!(file["latest_run"]["status"], "completed");
 
     // The Google card still reads "not connected": the file's source row is
     // not the Google connection.

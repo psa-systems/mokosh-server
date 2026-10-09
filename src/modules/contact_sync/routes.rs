@@ -106,10 +106,6 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
                 .layer(DefaultBodyLimit::max(body_limit_bytes(max_upload_bytes()))),
         )
         .route(
-            "/integrations/contact-sync/vcard/uploads/{file_id}",
-            get(get_vcard_upload),
-        )
-        .route(
             "/integrations/contact-sync/vcard/uploads/{file_id}/preview",
             post(preview_vcard),
         )
@@ -418,17 +414,6 @@ async fn list_vcard_uploads(
             .service
             .vcard_files(user.tenant(), query.limit.unwrap_or(20))
             .await?,
-    ))
-}
-
-async fn get_vcard_upload(
-    State(state): State<ContactSyncRouterState>,
-    _admin: RequireAdmin,
-    RequireAuth(user): RequireAuth,
-    Path(file_id): Path<Uuid>,
-) -> AppResult<Json<ImportFileView>> {
-    Ok(Json(
-        state.service.vcard_file(user.tenant(), file_id).await?,
     ))
 }
 
