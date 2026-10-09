@@ -74,9 +74,9 @@ async fn seed_grant(pool: &PgPool, grantee: Uuid, role: &str) -> Uuid {
 
 async fn get_members(app: &common::TestApp, token: &str, query: &str) -> Value {
     let path = if query.is_empty() {
-        "/api/v1/members/".to_string()
+        "/api/v1/members".to_string()
     } else {
-        format!("/api/v1/members/?{}", query)
+        format!("/api/v1/members?{}", query)
     };
     let resp = app
         .client
@@ -241,7 +241,7 @@ async fn list_members_gates_on_require_manager(pool: PgPool) {
 
     let tech_resp = app
         .client
-        .get(app.url("/api/v1/members/"))
+        .get(app.url("/api/v1/members"))
         .bearer_auth(&tech_token)
         .send()
         .await
@@ -250,7 +250,7 @@ async fn list_members_gates_on_require_manager(pool: PgPool) {
 
     let admin_resp = app
         .client
-        .get(app.url("/api/v1/members/"))
+        .get(app.url("/api/v1/members"))
         .bearer_auth(&admin_token)
         .send()
         .await
@@ -326,7 +326,7 @@ async fn team_list_carries_member_count(pool: PgPool) {
     let token = common::login(&app, &email, &password).await;
     let resp = app
         .client
-        .get(app.url("/api/v1/teams/"))
+        .get(app.url("/api/v1/teams"))
         .bearer_auth(&token)
         .send()
         .await
@@ -355,7 +355,7 @@ async fn list_members_rejects_an_unknown_kind_at_validation(pool: PgPool) {
     let token = common::login(&app, &email, &password).await;
     let resp = app
         .client
-        .get(app.url("/api/v1/members/?kind=robots"))
+        .get(app.url("/api/v1/members?kind=robots"))
         .bearer_auth(&token)
         .send()
         .await

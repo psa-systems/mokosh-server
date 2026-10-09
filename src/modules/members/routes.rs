@@ -30,7 +30,7 @@ pub struct MembersRouterState {
 pub fn members_routes(members_service: Arc<MembersService>) -> Router {
     let state = MembersRouterState { members_service };
     Router::new()
-        .route("/", get(list_members))
+        .route("/members", get(list_members))
         .with_state(state)
 }
 
@@ -42,6 +42,11 @@ async fn list_members(
 ) -> AppResult<Json<MembersResponse>> {
     filter.validate()?;
     filter.validate_enums()?;
+    // PMS-1194: the service sorts the merged set in Rust after the fan-out
+    // (there is no single ORDER BY to delegate `?sort=` to), so an
+    // unsupported `sort` query parameter is refused here rather than
+    // silently ignored.
+    pagination.reject_unsupported_sort()?;
     let caller = manager.0;
     let response = state
         .members_service

@@ -495,13 +495,12 @@ pub fn create_api_router(
     // tenant users) with the active cross-account grants from
     // `mokosh_bunyip_grants` so the SPA has one page to render for "who
     // has access to this workspace" without reconciling two paginated
-    // feeds. Gated on `RequireManager`, matching `list_users`.
-    let api_v1 = api_v1.nest(
-        "/members",
-        crate::modules::members::members_routes(
-            crate::modules::members::service::MembersService::arc(db.clone()),
-        ),
-    );
+    // feeds. Gated on `RequireManager`, matching `list_users`. Merged
+    // (not nested) so `/api/v1/members` resolves without a trailing
+    // slash, matching the `invitations` / `opportunities` posture.
+    let api_v1 = api_v1.merge(crate::modules::members::members_routes(
+        crate::modules::members::service::MembersService::arc(db.clone()),
+    ));
     let api_v1 = api_v1
         // Contact management. The canonical company endpoints live
         // under `/api/v1/contacts/companies/...` (one router for
