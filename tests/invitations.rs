@@ -126,12 +126,21 @@ async fn rejects_non_invitable_role(pool: PgPool) {
 
 #[mokosh_test]
 async fn create_with_app_url_enqueues_invite_email(pool: PgPool) {
-    // PMS-246: with a SPA URL configured, creating an invite enqueues an email
-    // notification (channel=email, recipient=invitee) for the worker to deliver.
+    // PMS-246 + PMS-1378: with a SPA URL AND the dispatcher wired, creating
+    // an invite dispatches the `invitations.created` event. The dispatcher
+    // renders the seeded template (migration 265) and INSERTs a
+    // `notifications` row for the worker to deliver; the test reads that
+    // row back and asserts on the rendered recipient / body.
     let (admin_id, _e, _p) = common::seed_admin(&pool).await;
     let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let notifications =
+        mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
+            Database::from_pool(pool.clone()),
+            [0u8; 32],
+        );
     let s = InvitationsService::new(Database::from_pool(pool.clone()))
-        .with_app_url("https://app.example.test".to_string());
+        .with_app_url("https://app.example.test".to_string())
+        .with_notifications(notifications);
 
     s.create(
         tenant,
@@ -152,16 +161,24 @@ async fn create_with_app_url_enqueues_invite_email(pool: PgPool) {
     .await
     .expect("query notification");
 
-    let (channel, recipient, body) = row.expect("an invite email was enqueued");
+    let (channel, recipient, body) = row.expect("an invite email was dispatched");
     assert_eq!(channel, "email");
     assert_eq!(recipient.as_deref(), Some("invitee@example.com"));
     assert!(
         body.contains("https://app.example.test"),
-        "body carries the accept link"
+        "rendered body carries the accept link: {body}"
     );
 
-    // Without a SPA URL, no email is enqueued (tests / unconfigured deploys).
-    let s2 = InvitationsService::new(Database::from_pool(pool.clone()));
+    // Without a SPA URL, no email is dispatched (tests / unconfigured
+    // deploys). The dispatcher is still wired here to prove it is the
+    // app_url check and not the dispatcher's own absence that short-circuits.
+    let notifications2 =
+        mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
+            Database::from_pool(pool.clone()),
+            [0u8; 32],
+        );
+    let s2 = InvitationsService::new(Database::from_pool(pool.clone()))
+        .with_notifications(notifications2);
     s2.create(
         tenant,
         admin_id,
@@ -176,7 +193,7 @@ async fn create_with_app_url_enqueues_invite_email(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("count");
-    assert_eq!(count, 0, "no email enqueued when app_url is unset");
+    assert_eq!(count, 0, "no email dispatched when app_url is unset");
 }
 
 #[mokosh_test]

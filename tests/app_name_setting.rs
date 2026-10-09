@@ -508,9 +508,14 @@ async fn no_seeded_template_still_names_the_product_literally(pool: PgPool) {
     // PMS-1215 made it four: `contact_sync.failing` goes to the MSP admin who
     // connected Google Contacts and points them at the integration in the
     // product, so it names the product through the placeholder too.
+    //
+    // PMS-1378 made it five: `invitations.created` is the new dispatcher
+    // entry for the team-invite mail (seeded by migration 265). The invitee
+    // is an MSP-side identity being onboarded onto the product, same
+    // audience as `auth.welcome`, so it carries `{{app_name}}` too.
     assert_eq!(
-        templated, 4,
-        "expected the four MSP-side transactional templates to carry the placeholder"
+        templated, 5,
+        "expected the five MSP-side transactional templates to carry the placeholder"
     );
 }
 
