@@ -281,6 +281,149 @@ async fn ticket_history_records_description_edit(pool: PgPool) {
     );
 }
 
+/// PMS-1478: `EntityHistoryEntry.user_name` is resolved server-side by a
+/// tenant-scoped JOIN on `users`, covering a named user, a user whose
+/// profile name is still blank (falls back to email), a user id that no
+/// longer resolves to any row ("deleted"), a NULL user id, and a user who
+/// exists but in a different tenant (never resolved, even though the id
+/// matches). The rows are inserted directly into `audit_log` rather than
+/// produced by API calls, since the write path (which user_id lands on a
+/// row) is already covered by other tests; this test is only about the read
+/// side's name resolution.
+#[mokosh_test]
+async fn ticket_history_resolves_actor_name(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let created: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Actor name resolution",
+            "company_id": company_id,
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("create ticket")
+        .json()
+        .await
+        .expect("create ticket JSON");
+    let ticket_id: Uuid = created["id"].as_str().expect("ticket id").parse().unwrap();
+
+    // Named user: first_name/last_name populated.
+    let (named_id, _, _) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "named@example.com",
+        "technician",
+    )
+    .await;
+
+    // Empty-name user: profile name still blank (JIT-provisioned), falls
+    // back to email.
+    let empty_name_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status) \
+         VALUES ($1, $2, $3, 'x', '', '', 'technician', 'active')",
+    )
+    .bind(empty_name_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("blank-profile@example.com")
+    .execute(&pool)
+    .await
+    .expect("seed empty-name user");
+
+    // Another tenant's user: id exists, but not in this tenant, so the
+    // tenant-scoped join must never resolve it.
+    let (_other_tenant_id, other_tenant_user_id, _, _) =
+        common::seed_tenant_with_admin(&pool, "pms-1478-other-tenant").await;
+
+    // "Deleted" user: an id that resolves to no `users` row at all. The FK
+    // on `audit_log.user_id` is RESTRICT, so a real row can never go stale
+    // in production (PMS-1478's invariant assumes the id is trustworthy);
+    // drop it here, test-DB only, to exercise the defensive `None` fallback.
+    let fk_name: String = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint WHERE conrelid = 'audit_log'::regclass \
+         AND contype = 'f' AND conname LIKE '%user_id%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("find audit_log user_id FK");
+    sqlx::query(&format!("ALTER TABLE audit_log DROP CONSTRAINT {fk_name}"))
+        .execute(&pool)
+        .await
+        .expect("drop audit_log user_id FK for this test DB");
+    let deleted_user_id = Uuid::new_v4();
+
+    for (user_id, label) in [
+        (Some(named_id), "named"),
+        (Some(empty_name_id), "empty-name"),
+        (Some(other_tenant_user_id), "other-tenant"),
+        (Some(deleted_user_id), "deleted"),
+        (None, "null"),
+    ] {
+        sqlx::query(
+            "INSERT INTO audit_log (tenant_id, user_id, action, entity_type, entity_id, new_values) \
+             VALUES ($1, $2, 'update', 'tickets', $3, $4)",
+        )
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(user_id)
+        .bind(ticket_id)
+        .bind(serde_json::json!({ "label": label }))
+        .execute(&pool)
+        .await
+        .expect("insert audit_log row");
+    }
+
+    let hist: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/audit-log/entity/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get ticket history")
+        .json()
+        .await
+        .expect("history JSON");
+    let entries = hist["data"].as_array().expect("history has data");
+    let find_by_user = |id: Option<Uuid>| {
+        entries
+            .iter()
+            .find(|e| e["user_id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) == id)
+            .unwrap_or_else(|| panic!("no history entry for user_id {id:?}"))
+    };
+
+    assert_eq!(
+        find_by_user(Some(named_id))["user_name"].as_str(),
+        Some("Test User"),
+        "named user resolves to first + last name"
+    );
+    assert_eq!(
+        find_by_user(Some(empty_name_id))["user_name"].as_str(),
+        Some("blank-profile@example.com"),
+        "a user with no profile name falls back to their email"
+    );
+    assert_eq!(
+        find_by_user(Some(other_tenant_user_id))["user_name"].as_str(),
+        None,
+        "a user who exists only in another tenant is never resolved"
+    );
+    assert_eq!(
+        find_by_user(Some(deleted_user_id))["user_name"].as_str(),
+        None,
+        "a user id with no matching row resolves to None, not an error"
+    );
+    assert_eq!(
+        find_by_user(None)["user_name"].as_str(),
+        None,
+        "a NULL user_id resolves to None by contract"
+    );
+}
+
 /// PMS-370 (PMS-359 follow-up): a Status edit via the inline editor must show
 /// up in the change history with the humanised field name `status`, not the
 /// raw column `status_id`. The SPA capitalises for display, so a leaked `_id`

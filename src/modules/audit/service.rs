@@ -208,7 +208,7 @@ impl AuditService {
     ) -> AppResult<(Vec<EntityHistoryEntry>, u64)> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM audit_log WHERE {HISTORY_WHERE}"
+            "SELECT COUNT(*) FROM audit_log al WHERE {HISTORY_WHERE}"
         ))
         .bind(tenant_id)
         .bind(entity_type)
@@ -217,10 +217,18 @@ impl AuditService {
         .fetch_one(&mut *tx)
         .await?;
 
+        // `u` is joined on `id` AND `tenant_id` (not RLS alone) so a user in
+        // another tenant is never resolved, and the name falls back to the
+        // email when the profile name is still blank (a JIT-provisioned
+        // user), matching the `/audit-log` expression plus that fallback.
         let rows = sqlx::query_as::<_, HistoryRow>(&format!(
-            "SELECT id, entity_type, entity_id, action, user_id, old_values, new_values, timestamp \
-             FROM audit_log WHERE {HISTORY_WHERE} \
-             ORDER BY timestamp DESC LIMIT $5 OFFSET $6"
+            "SELECT al.id, al.entity_type, al.entity_id, al.action, al.user_id, \
+                    al.old_values, al.new_values, al.timestamp, \
+                    COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), u.email) AS user_name \
+             FROM audit_log al \
+             LEFT JOIN users u ON u.id = al.user_id AND u.tenant_id = al.tenant_id \
+             WHERE {HISTORY_WHERE} \
+             ORDER BY al.timestamp DESC LIMIT $5 OFFSET $6"
         ))
         .bind(tenant_id)
         .bind(entity_type)
@@ -230,7 +238,28 @@ impl AuditService {
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
         .await?;
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+
+        let entries: Vec<EntityHistoryEntry> = rows.into_iter().map(Into::into).collect();
+        // PMS-1477's shared unresolved-person helper has not landed yet; log
+        // once per read rather than once per row so a long page does not
+        // spam the log. A `Some` user_id with no resolved name means the
+        // user row is gone (or cross-tenant, impossible given the join
+        // above), which an absent `user_id` (`None`, by contract) is not.
+        let unresolved: Vec<Uuid> = entries
+            .iter()
+            .filter(|e| e.user_id.is_some() && e.user_name.is_none())
+            .filter_map(|e| e.user_id)
+            .collect();
+        if !unresolved.is_empty() {
+            tracing::info!(
+                surface = "audit.list_entity_history",
+                count = unresolved.len(),
+                ids = ?unresolved,
+                "unresolved actor id in entity history"
+            );
+        }
+
+        Ok((entries, total as u64))
     }
 }
 
@@ -241,10 +270,10 @@ impl AuditService {
 /// child arm compares the ticket id inside the JSONB snapshot as text, which
 /// migration 205 indexes; the id is bound twice rather than cast in SQL so
 /// the parameter's type is never inferred two ways.
-const HISTORY_WHERE: &str = "tenant_id = $1 AND ( \
-       (entity_type = $2 AND entity_id = $3) \
-    OR ($2 = 'tickets' AND entity_type = 'ticket_notes' AND action <> 'create' \
-        AND (new_values ->> 'ticket_id') = $4) \
+const HISTORY_WHERE: &str = "al.tenant_id = $1 AND ( \
+       (al.entity_type = $2 AND al.entity_id = $3) \
+    OR ($2 = 'tickets' AND al.entity_type = 'ticket_notes' AND al.action <> 'create' \
+        AND (al.new_values ->> 'ticket_id') = $4) \
    )";
 
 /// Entity types whose change history may be read through the non-admin
@@ -351,6 +380,7 @@ struct HistoryRow {
     old_values: Option<serde_json::Value>,
     new_values: Option<serde_json::Value>,
     timestamp: chrono::DateTime<chrono::Utc>,
+    user_name: Option<String>,
 }
 
 impl From<HistoryRow> for EntityHistoryEntry {
@@ -373,6 +403,7 @@ impl From<HistoryRow> for EntityHistoryEntry {
             entity_id: r.entity_id,
             action: r.action,
             user_id: r.user_id,
+            user_name: r.user_name,
             changed_fields,
             changes,
             timestamp: r.timestamp,

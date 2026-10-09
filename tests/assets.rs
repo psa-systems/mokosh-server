@@ -161,6 +161,136 @@ async fn asset_crud_and_filtering(pool: PgPool) {
     assert_eq!(status_change["new"].as_str(), Some("in_repair"));
 }
 
+/// PMS-1478: `AssetAuditLogResponse.performed_by_name` is resolved
+/// server-side by a tenant-scoped JOIN on `users`, covering a named user, a
+/// user whose profile name is still blank (falls back to email), a user id
+/// that no longer resolves to any row ("deleted"), a NULL user id, and a
+/// user who exists but in a different tenant (never resolved, even though
+/// the id matches). Rows are inserted directly into `asset_audit_log`
+/// rather than produced by API calls, since the write path is already
+/// covered by `asset_crud_and_filtering`; this test is only about the read
+/// side's name resolution.
+#[mokosh_test]
+async fn asset_audit_log_resolves_actor_name(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let type_id = create_asset_type(&app, &token, "Server").await;
+    let asset_id: Uuid = create_asset(&app, &token, "web-01", &type_id, company)
+        .await
+        .parse()
+        .unwrap();
+
+    let (named_id, _, _) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "named-asset@example.com",
+        "technician",
+    )
+    .await;
+
+    let empty_name_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, status) \
+         VALUES ($1, $2, $3, 'x', '', '', 'technician', 'active')",
+    )
+    .bind(empty_name_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind("blank-profile-asset@example.com")
+    .execute(&pool)
+    .await
+    .expect("seed empty-name user");
+
+    let (_other_tenant_id, other_tenant_user_id, _, _) =
+        common::seed_tenant_with_admin(&pool, "pms-1478-asset-other-tenant").await;
+
+    let fk_name: String = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint WHERE conrelid = 'asset_audit_log'::regclass \
+         AND contype = 'f' AND conname LIKE '%performed_by_id%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("find asset_audit_log performed_by_id FK");
+    sqlx::query(&format!(
+        "ALTER TABLE asset_audit_log DROP CONSTRAINT {fk_name}"
+    ))
+    .execute(&pool)
+    .await
+    .expect("drop asset_audit_log performed_by_id FK for this test DB");
+    let deleted_user_id = Uuid::new_v4();
+
+    for (user_id, label) in [
+        (Some(named_id), "named"),
+        (Some(empty_name_id), "empty-name"),
+        (Some(other_tenant_user_id), "other-tenant"),
+        (Some(deleted_user_id), "deleted"),
+        (None, "null"),
+    ] {
+        sqlx::query(
+            "INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes) \
+             VALUES ($1, $2, 'updated', $3, $4)",
+        )
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(asset_id)
+        .bind(user_id)
+        .bind(serde_json::json!({ "label": label }))
+        .execute(&pool)
+        .await
+        .expect("insert asset_audit_log row");
+    }
+
+    let audit: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{asset_id}/audit-log")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("asset audit log")
+        .json()
+        .await
+        .expect("audit JSON");
+    let entries = audit["data"].as_array().expect("audit has data");
+    let find_by_user = |id: Option<Uuid>| {
+        entries
+            .iter()
+            .find(|e| {
+                e["performed_by_id"]
+                    .as_str()
+                    .and_then(|s| s.parse::<Uuid>().ok())
+                    == id
+            })
+            .unwrap_or_else(|| panic!("no audit entry for performed_by_id {id:?}"))
+    };
+
+    assert_eq!(
+        find_by_user(Some(named_id))["performed_by_name"].as_str(),
+        Some("Test User"),
+        "named user resolves to first + last name"
+    );
+    assert_eq!(
+        find_by_user(Some(empty_name_id))["performed_by_name"].as_str(),
+        Some("blank-profile-asset@example.com"),
+        "a user with no profile name falls back to their email"
+    );
+    assert_eq!(
+        find_by_user(Some(other_tenant_user_id))["performed_by_name"].as_str(),
+        None,
+        "a user who exists only in another tenant is never resolved"
+    );
+    assert_eq!(
+        find_by_user(Some(deleted_user_id))["performed_by_name"].as_str(),
+        None,
+        "a user id with no matching row resolves to None, not an error"
+    );
+    assert_eq!(
+        find_by_user(None)["performed_by_name"].as_str(),
+        None,
+        "a NULL performed_by_id resolves to None by contract"
+    );
+}
+
 // AC3: asset relationships with the four relationship types.
 #[mokosh_test]
 async fn asset_relationships(pool: PgPool) {
