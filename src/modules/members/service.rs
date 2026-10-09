@@ -225,7 +225,9 @@ impl MembersService {
         // --- pair grants with users via bunyip_user_id -----------------
         let mut users_by_bunyip: HashMap<Uuid, Uuid> = HashMap::new();
         for u in &user_rows {
-            users_by_bunyip.insert(u.bunyip_user_id, u.id);
+            if let Some(bunyip_id) = u.bunyip_user_id {
+                users_by_bunyip.insert(bunyip_id, u.id);
+            }
         }
         let mut placed_grant_by_user: HashMap<Uuid, (String, String)> = HashMap::new();
         grants.retain(|g| {
@@ -387,7 +389,11 @@ struct UserScan {
     role: String,
     status: String,
     last_login_at: Option<chrono::DateTime<chrono::Utc>>,
-    bunyip_user_id: Uuid,
+    /// Nullable per migration 226: pre-BUNYIP-673 rows have no bunyip
+    /// mirror, and nothing in the schema forbids a manual insert from
+    /// omitting it. A row without a mirror cannot pair with a grant;
+    /// the pairing loop below treats `None` as "no grant match".
+    bunyip_user_id: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
