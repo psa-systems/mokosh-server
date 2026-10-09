@@ -39,25 +39,7 @@ pub struct SenderIdentity<'a> {
     pub contact_line: &'a str,
 }
 
-/// What the quote sign-off email renders, beyond who it is from.
-///
-/// A struct rather than five positional `&str`s: four of them are strings in a
-/// row, so a transposed pair would email the title as the total and nothing
-/// would fail. Named fields make that impossible to write by accident, and
-/// they keep the method under clippy's argument limit as the copy grows.
-#[derive(Debug, Clone, Copy)]
-pub struct QuoteReady<'a> {
-    pub quote_number: &'a str,
-    pub title: &'a str,
-    pub total: &'a str,
-    /// `None` when the quote carries no expiry, in which case the body omits
-    /// the deadline line rather than printing a date the customer might act on.
-    pub valid_until: Option<&'a str>,
-    pub portal_link: &'a str,
-}
-
-/// What the invoice email renders, beyond who it is from. Same reasoning as
-/// [`QuoteReady`].
+/// What the invoice email renders, beyond who it is from.
 ///
 /// PMS-991: the message is the invoice, not the payment link. `portal_link` is
 /// `Some` only when the tenant has a connected payment gateway and the server
@@ -149,57 +131,6 @@ pub trait Mailer: Send + Sync {
     /// `POST /settings/email/verify` action.
     async fn verify(&self) -> AppResult<()> {
         Ok(())
-    }
-
-    /// PMS-673: tell a client contact that a quote is ready for their
-    /// sign-off, linking them to the portal where they accept or decline.
-    /// The default composes a plain-text body and routes it through
-    /// [`Mailer::send_text`], so every mailer inherits it without a
-    /// per-impl override.
-    ///
-    /// `valid_until` is optional because a quote need not carry an expiry;
-    /// when absent the body simply omits the deadline line rather than
-    /// printing a placeholder date the customer might act on.
-    ///
-    /// PMS-761: `from` is required. This message asks a client to commit money
-    /// to a piece of work, and it used to do so without naming who was asking.
-    async fn send_quote_ready(
-        &self,
-        to: &str,
-        from: SenderIdentity<'_>,
-        quote: QuoteReady<'_>,
-    ) -> AppResult<()> {
-        let SenderIdentity {
-            org_name,
-            contact_line,
-        } = from;
-        let QuoteReady {
-            quote_number,
-            title,
-            total,
-            valid_until,
-            portal_link,
-        } = quote;
-        let deadline = match valid_until {
-            Some(d) => format!("This quote is valid until {d}.\n\n"),
-            None => String::new(),
-        };
-        let body = format!(
-            "{org_name} has sent you a quote for your review and approval.\n\n\
-             Quote: {quote_number}\n\
-             For: {title}\n\
-             Total: {total}\n\n\
-             {deadline}\
-             Review the full scope and accept or decline it here:\n\n\
-             {portal_link}\n\n\
-             {contact_line}"
-        );
-        self.send_text(
-            to,
-            &format!("Quote {quote_number} from {org_name} for your approval"),
-            &body,
-        )
-        .await
     }
 
     /// PMS-711, reshaped by PMS-991: tell a client contact that an invoice has
@@ -1352,66 +1283,14 @@ mod tests {
         }
     }
 
-    /// PMS-761: a client asked to approve spend is told who is asking, in the
-    /// subject as well as the body. The subject matters on its own: it is what
-    /// the recipient decides to open on, and "Quote Q-1001 for your approval"
-    /// from an unknown sender reads like the fraud it is not.
-    #[tokio::test]
-    async fn the_quote_email_names_the_organisation_and_how_to_reach_it() {
-        let mailer = Capturing::default();
-        mailer
-            .send_quote_ready(
-                "client@recipient.example",
-                contoso(),
-                QuoteReady {
-                    quote_number: "Q-1001",
-                    title: "Network refresh",
-                    total: "4500.00 USD",
-                    valid_until: Some("2026-09-01"),
-                    portal_link: "http://portal.example/portal/quotes/1",
-                },
-            )
-            .await
-            .unwrap();
-
-        let (to, subject, body) = mailer.taken();
-        assert_eq!(to, "client@recipient.example");
-        assert_eq!(subject, "Quote Q-1001 from Contoso IT for your approval");
-        assert!(
-            body.starts_with("Contoso IT has sent you a quote"),
-            "the body opens by naming the sender:\n{body}"
-        );
-        assert!(
-            body.ends_with(contoso().contact_line),
-            "the contact line closes the message:\n{body}"
-        );
-        assert!(body.contains("valid until 2026-09-01"), "{body}");
-    }
-
-    /// The deadline line is the one optional piece; without an expiry it must
-    /// vanish rather than print a date the customer might act on.
-    #[tokio::test]
-    async fn a_quote_without_an_expiry_omits_the_deadline() {
-        let mailer = Capturing::default();
-        mailer
-            .send_quote_ready(
-                "client@recipient.example",
-                contoso(),
-                QuoteReady {
-                    quote_number: "Q-1002",
-                    title: "Ad-hoc work",
-                    total: "100.00 USD",
-                    valid_until: None,
-                    portal_link: "http://portal.example/portal/quotes/2",
-                },
-            )
-            .await
-            .unwrap();
-
-        let (_, _, body) = mailer.taken();
-        assert!(!body.contains("valid until"), "{body}");
-        assert!(body.contains("Contoso IT"), "{body}");
-    }
+    // PMS-1378 retired `Mailer::send_quote_ready` + its two unit tests
+    // (`the_quote_email_names_the_organisation_and_how_to_reach_it`,
+    // `a_quote_without_an_expiry_omits_the_deadline`); the quote send now
+    // routes through `NotificationsService::dispatch("quote.sent", ..)` and
+    // the subject / body wording lives on the seeded `notification_templates`
+    // row (migration 265). `tests/notifications_branding.rs` and the
+    // integration tests under `tests/quote_signoff.rs` cover the rendered
+    // shape end-to-end against the actual template.
 
     /// PMS-761: same for the invoice. An unattributed request for payment is
     /// the exact shape of invoice fraud, so the organisation is named in the

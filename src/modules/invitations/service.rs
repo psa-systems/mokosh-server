@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
+use crate::modules::notifications::NotificationsService;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -18,14 +19,23 @@ const INVITE_TTL_DAYS: i64 = 14;
 pub struct InvitationsService {
     db: Database,
     /// Base URL the invitee follows to accept (the SPA origin). When set, a
-    /// `POST /invitations` enqueues an email notification with this link
-    /// (PMS-246); when `None` (tests / no SPA configured) no email is sent.
+    /// `POST /invitations` dispatches an email with this link (PMS-246);
+    /// when `None` (tests / no SPA configured) no email is sent.
     app_url: Option<String>,
+    /// Dispatcher used to send the invite mail. When set, the service
+    /// routes through `invitations.created` so the SPA preview button
+    /// shows what the recipient will actually read (PMS-1378). When `None`
+    /// the invite still writes to the DB; only the email is skipped.
+    notifications: Option<NotificationsService>,
 }
 
 impl InvitationsService {
     pub fn new(db: Database) -> Self {
-        Self { db, app_url: None }
+        Self {
+            db,
+            app_url: None,
+            notifications: None,
+        }
     }
 
     /// Set the accept-link base (the SPA origin) so created invites email the
@@ -33,6 +43,14 @@ impl InvitationsService {
     /// and the PMS-244 resolution places the invitee on their next sign-in.
     pub fn with_app_url(mut self, app_url: String) -> Self {
         self.app_url = Some(app_url);
+        self
+    }
+
+    /// Attach the shared notifications dispatcher so the invite mail flows
+    /// through `invitations.created` and the SPA preview matches what gets
+    /// sent (PMS-1378).
+    pub fn with_notifications(mut self, notifications: NotificationsService) -> Self {
+        self.notifications = Some(notifications);
         self
     }
 
@@ -132,39 +150,20 @@ impl InvitationsService {
             .await?;
         }
 
-        // PMS-246: email the invitee. Enqueue a `notifications` email row in the
-        // same transaction; the dispatcher worker (with the SMTP mailer) drains
-        // it - same path used for password-reset / welcome mail. Acceptance is
-        // login-driven, so the link is just the Mokosh login (PMS-244). Skipped
-        // when no SPA URL is configured (tests).
-        if let Some(app_url) = self.app_url.as_deref() {
-            let tenant_name: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
-                .bind(tenant_id)
-                .fetch_one(&mut *tx)
-                .await?;
-            // PMS-789: the product name is the deployment's, read from the
-            // in-process cache rather than queried - this is inside an open
-            // tenant transaction, and the value lives on the system tenant.
-            let app = crate::utils::app_name::app_name();
-            let subject = format!("You have been invited to {tenant_name} on {app}");
-            let body = format!(
-                "You have been invited to join {tenant_name} on {app} as a {role}.\n\n\
-                 Sign in to accept the invitation:\n{app_url}\n\n\
-                 The invitation expires in {ttl} days. If you did not expect this, you can ignore this email.",
-                role = request.role,
-                ttl = INVITE_TTL_DAYS,
-            );
-            sqlx::query(
-                "INSERT INTO notifications (tenant_id, channel_type, recipient, subject, body)
-                 VALUES ($1, 'email', $2, $3, $4)",
+        // PMS-1378: resolve the tenant name while the tenant tx is open; the
+        // dispatcher call below opens its own transaction, so we fetch what
+        // the template context needs before committing.
+        let tenant_name: Option<String> = if self.app_url.is_some() && self.notifications.is_some()
+        {
+            Some(
+                sqlx::query_scalar("SELECT name FROM tenants WHERE id = $1")
+                    .bind(tenant_id)
+                    .fetch_one(&mut *tx)
+                    .await?,
             )
-            .bind(tenant_id)
-            .bind(&email)
-            .bind(&subject)
-            .bind(&body)
-            .execute(&mut *tx)
-            .await?;
-        }
+        } else {
+            None
+        };
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tenant_invitations t WHERE tenant_id = $1 AND id = $2",
@@ -186,6 +185,42 @@ impl InvitationsService {
         .await?;
 
         tx.commit().await?;
+
+        // PMS-1378: dispatch the invite mail through `invitations.created`
+        // so the SPA preview button at `POST /notifications/preview` renders
+        // what the recipient will actually read. The dispatch runs AFTER the
+        // tenant tx commits because the dispatcher opens its own transaction;
+        // a dispatch failure leaves the committed invite in place and is
+        // logged as a warning rather than rolled back (a successful invite
+        // whose mail did not go is a visible operator state the SPA can
+        // surface, which was already the shape of the old `INSERT INTO
+        // notifications` after the row landed).
+        if let (Some(app_url), Some(notifications), Some(tenant_name)) = (
+            self.app_url.as_deref(),
+            self.notifications.as_ref(),
+            tenant_name,
+        ) {
+            let app = crate::utils::app_name::app_name();
+            let context = serde_json::json!({
+                "recipient_email": email,
+                "tenant_name": tenant_name,
+                "role": request.role,
+                "ttl_days": INVITE_TTL_DAYS,
+                "app_name": app,
+                "app_url": app_url,
+            });
+            if let Err(e) = notifications
+                .dispatch(tenant_id, "invitations.created", &context)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    invite_id = %invite.id,
+                    recipient = %email,
+                    "invitation mail dispatch failed; the invite row is committed",
+                );
+            }
+        }
         Ok(invite)
     }
 

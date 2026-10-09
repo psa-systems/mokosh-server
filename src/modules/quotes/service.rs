@@ -6,8 +6,6 @@
 //! `docs/dev-docs/codebase-state.md` cross-cutting issue #8), so the
 //! discipline is deliberate rather than incidental.
 
-use std::sync::Arc;
-
 use chrono::{NaiveDate, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -16,7 +14,6 @@ use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
 use crate::modules::notifications::NotificationsService;
-use crate::utils::email::Mailer;
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
 
@@ -27,14 +24,13 @@ use super::models::*;
 #[derive(Clone)]
 pub struct QuotesService {
     db: Database,
-    /// Mailer used to send the client their sign-off link (PMS-673).
-    /// `None` for the plain `new()` constructor so non-production callers
-    /// and unit tests stay compilable; sending then skips the mail and
-    /// still performs the state transition, matching how `TicketService`
-    /// treats its optional dispatcher.
-    mailer: Option<Arc<dyn Mailer>>,
-    /// Rule-driven fanout used to tell the quote's owner that the client
-    /// decided. Optional for the same reason as `mailer`.
+    /// Dispatcher used both to mail the client their sign-off link and to
+    /// fan out the staff-side notification when the client decides.
+    /// Optional for the same reason the other services treat their
+    /// dispatcher as optional: `None` for the plain `new()` constructor
+    /// so non-production callers and unit tests stay compilable, and the
+    /// sender surfaces that unavailability through
+    /// `resolve_quote_email_option` rather than silently skipping.
     notifications: Option<NotificationsService>,
     /// Base origin of the client portal, used to build the sign-off link
     /// in the outbound mail.
@@ -45,25 +41,22 @@ impl QuotesService {
     pub fn new(db: Database) -> Self {
         Self {
             db,
-            mailer: None,
             notifications: None,
             portal_origin: String::new(),
         }
     }
 
-    /// Full constructor used by `create_api_router`: adds the mailer that
-    /// carries the sign-off link to the client, the notifications
-    /// dispatcher that tells staff about the client's decision, and the
+    /// Full constructor used by `create_api_router`: adds the notifications
+    /// dispatcher (used both for the client sign-off mail via `quote.sent`
+    /// per PMS-1378, and for the staff-side decision notification) and the
     /// portal origin those links are built from.
     pub fn with_delivery(
         db: Database,
-        mailer: Arc<dyn Mailer>,
         notifications: NotificationsService,
         portal_origin: String,
     ) -> Self {
         Self {
             db,
-            mailer: Some(mailer),
             notifications: Some(notifications),
             portal_origin,
         }
@@ -1078,7 +1071,9 @@ impl QuotesService {
         quote: &QuoteResponse,
     ) -> AppResult<crate::modules::billing::models::DeliveryOptionResponse> {
         use crate::modules::billing::models::DeliveryOptionResponse;
-        if self.mailer.is_none() {
+        // PMS-1378: the dispatcher is the gate now; without it the service
+        // cannot route quote mail at all.
+        if self.notifications.is_none() {
             return Ok(DeliveryOptionResponse {
                 method: "email".to_string(),
                 available: false,
@@ -1172,13 +1167,19 @@ impl QuotesService {
     /// mail error so the caller can roll the transition back and record a
     /// `quote.send_failed` audit row. The surrounding transaction stays
     /// open until the caller returns here.
+    ///
+    /// PMS-1378: routes through `NotificationsService::dispatch` with the
+    /// `quote.sent` event type so the SPA preview button at
+    /// `POST /notifications/preview` renders what the recipient will
+    /// actually read, rather than taking the previous direct
+    /// `mailer.send_quote_ready` path that bypassed the dispatcher.
     async fn mail_quote_to_client(
         &self,
         tenant_id: TenantId,
         quote: &QuoteResponse,
         email: &str,
     ) -> AppResult<()> {
-        let Some(mailer) = self.mailer.as_ref() else {
+        let Some(notifications) = self.notifications.as_ref() else {
             return Err(AppError::external_service(
                 "mail",
                 "this service cannot send email, so the quote cannot be emailed; choose postal mail or other delivery",
@@ -1211,7 +1212,7 @@ impl QuotesService {
             ));
         };
         let number = quote.quote_number.as_deref().unwrap_or("(unnumbered)");
-        let valid_until = quote.valid_until.map(|d| d.to_string());
+        let valid_until = quote.valid_until.map(|d| d.to_string()).unwrap_or_default();
 
         // PMS-761: the client is being asked to approve spend, so the message
         // says who is asking. Not sending anonymously is still the rule, but
@@ -1227,24 +1228,22 @@ impl QuotesService {
                 )
             })?;
         let contact_line = org.contact_line("Questions about this quote?", None);
-        let from = crate::utils::email::SenderIdentity {
-            org_name: org.name(),
-            contact_line: &contact_line,
-        };
 
-        mailer
-            .send_quote_ready(
-                email,
-                from,
-                crate::utils::email::QuoteReady {
-                    quote_number: number,
-                    title: &quote.title,
-                    total: &quote.total.to_string(),
-                    valid_until: valid_until.as_deref(),
-                    portal_link: &link,
-                },
-            )
+        let context = serde_json::json!({
+            "recipient_email": email,
+            "quote_number": number,
+            "title": quote.title,
+            "total": quote.total.to_string(),
+            "valid_until": valid_until,
+            "portal_link": link,
+            "sender_org_name": org.name(),
+            "sender_contact_line": contact_line,
+        });
+
+        notifications
+            .dispatch(tenant_id, "quote.sent", &context)
             .await
+            .map(|_| ())
             .map_err(|e| {
                 AppError::external_service(
                     "mail",
