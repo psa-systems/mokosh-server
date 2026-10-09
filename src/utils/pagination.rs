@@ -736,6 +736,7 @@ mod pms1194_sort_guard {
             "knowledge_base",
             include_str!("../modules/knowledge_base/routes.rs"),
         ),
+        ("members", include_str!("../modules/members/routes.rs")),
         (
             "mileage_tracking",
             include_str!("../modules/mileage_tracking/routes.rs"),

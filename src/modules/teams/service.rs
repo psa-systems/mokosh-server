@@ -405,7 +405,38 @@ impl TeamsService {
             .bind(pagination.offset() as i64);
         let rows = rows_q.fetch_all(&mut *tx).await?;
 
-        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+        // MAPPS-877: one batched COUNT across the whole page's team ids so
+        // the SPA can render the "members" column without an N+1 fan-out
+        // from the client. An empty page skips the query entirely; a team
+        // with zero members gets `Some(0)` (never `None`) once this runs.
+        let team_ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+        let mut counts: std::collections::HashMap<Uuid, u64> = std::collections::HashMap::new();
+        if !team_ids.is_empty() {
+            let count_rows: Vec<(Uuid, i64)> = sqlx::query_as(
+                "SELECT team_id, COUNT(*)::bigint FROM team_members \
+                 WHERE tenant_id = $1 AND team_id = ANY($2) \
+                 GROUP BY team_id",
+            )
+            .bind(*tenant_id)
+            .bind(&team_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            for (team_id, count) in count_rows {
+                counts.insert(team_id, count as u64);
+            }
+        }
+
+        let teams: Vec<Team> = rows
+            .into_iter()
+            .map(|r| {
+                let id = r.id;
+                let mut t: Team = r.into();
+                t.member_count = Some(counts.get(&id).copied().unwrap_or(0));
+                t
+            })
+            .collect();
+
+        Ok((teams, total as u64))
     }
 
     /// Member roster for a team, joined to `users` so the client gets
@@ -809,6 +840,10 @@ impl From<TeamRow> for Team {
             is_active: r.is_active,
             created_at: r.created_at,
             updated_at: r.updated_at,
+            // MAPPS-877: `list_teams` fills this in a second batched query;
+            // single-team paths leave it `None` because the count is a
+            // list-view concern.
+            member_count: None,
         }
     }
 }
