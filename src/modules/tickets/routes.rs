@@ -523,6 +523,10 @@ fn note_response(
         created_at: note.created_at,
         updated_at: note.updated_at,
         can_edit,
+        time_minutes: note.time_minutes,
+        work_summary: note.work_summary,
+        parts_used: note.parts_used,
+        follow_up: note.follow_up,
     }
 }
 

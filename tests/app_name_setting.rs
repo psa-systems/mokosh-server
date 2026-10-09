@@ -52,8 +52,19 @@ async fn isolated() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 fn invites(pool: &PgPool) -> InvitationsService {
+    // PMS-1378: InvitationsService now dispatches the invite mail through
+    // NotificationsService::dispatch, so a test that creates an invite and
+    // reads back the queued row has to wire the dispatcher too; without
+    // it the invite path short-circuits by design and no `notifications`
+    // row is written.
+    let notifications =
+        mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
+            Database::from_pool(pool.clone()),
+            [0u8; 32],
+        );
     InvitationsService::new(Database::from_pool(pool.clone()))
         .with_app_url("https://app.example.test".to_string())
+        .with_notifications(notifications)
 }
 
 /// One admin per test. `seed_admin` uses a fixed address, so calling it twice
@@ -508,9 +519,14 @@ async fn no_seeded_template_still_names_the_product_literally(pool: PgPool) {
     // PMS-1215 made it four: `contact_sync.failing` goes to the MSP admin who
     // connected Google Contacts and points them at the integration in the
     // product, so it names the product through the placeholder too.
+    //
+    // PMS-1378 made it five: `invitations.created` is the new dispatcher
+    // entry for the team-invite mail (seeded by migration 265). The invitee
+    // is an MSP-side identity being onboarded onto the product, same
+    // audience as `auth.welcome`, so it carries `{{app_name}}` too.
     assert_eq!(
-        templated, 4,
-        "expected the four MSP-side transactional templates to carry the placeholder"
+        templated, 5,
+        "expected the five MSP-side transactional templates to carry the placeholder"
     );
 }
 
