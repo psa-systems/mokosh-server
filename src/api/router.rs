@@ -287,11 +287,14 @@ pub fn create_api_router(
         CalendarService::with_dispatcher(db.clone(), notifications_service.clone());
     let contracts_service = ContractsService::new(db.clone());
     // PMS-673: quotes mail the client their sign-off link and notify the
-    // owner when the client decides, so the service carries the mailer,
-    // the dispatcher, and the portal origin those links are built from.
+    // owner when the client decides, so the service carries the dispatcher
+    // and the portal origin those links are built from. PMS-1378 routed
+    // the client sign-off mail through `NotificationsService::dispatch`
+    // (`quote.sent`) so the SPA preview button renders what the recipient
+    // will read; the direct `mailer.send_quote_ready` path and its DTO are
+    // retired alongside this change.
     let quotes_service = QuotesService::with_delivery(
         db.clone(),
-        mailer.clone(),
         notifications_service.clone(),
         // MAPPS-425: the emailed quote link is a mokosh-apps route, so it
         // takes the SPA origin. MAPPS-779: it is the company's portal login
@@ -302,9 +305,15 @@ pub fn create_api_router(
     // PMS-1129: an @mention in a KB comment notifies through the queue.
     let kb_service = KbService::new(db.clone()).with_notifications(notifications_service.clone());
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
-    // acceptance), so created invites email the invitee.
-    let invitations_service =
-        Arc::new(InvitationsService::new(db.clone()).with_app_url(client_origin.clone()));
+    // acceptance), so created invites email the invitee. PMS-1378 routed
+    // the invite mail through `NotificationsService::dispatch`
+    // (`invitations.created`) so the SPA preview button renders what the
+    // recipient will read.
+    let invitations_service = Arc::new(
+        InvitationsService::new(db.clone())
+            .with_app_url(client_origin.clone())
+            .with_notifications(notifications_service.clone()),
+    );
     // PMS-1310: installed integrations and the capabilities each is handed. It
     // takes the same `secrets` provider every other credential holder does, so a
     // deployment on Infisical keeps its integration credentials there too.
