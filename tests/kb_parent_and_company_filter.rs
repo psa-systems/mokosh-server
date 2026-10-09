@@ -212,3 +212,142 @@ async fn list_filters_by_company_id(pool: PgPool) {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["title"], "Onboarding an Acme workstation");
 }
+
+/// PMS-816: a variant of a variant collapses the "generic / client-specific"
+/// shape into an untyped tree. A create pointing at a parent that itself has
+/// a parent must be refused.
+#[mokosh_test]
+async fn a_parent_that_already_has_a_parent_is_refused(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company = common::seed_company_named(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let generic = create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Generic",
+            "slug": "generic",
+            "content": "x",
+            "visibility": "internal",
+            "status": "draft",
+        }),
+    )
+    .await;
+    let generic_id = generic["id"].as_str().expect("id");
+
+    let variant = create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Variant",
+            "slug": "variant",
+            "content": "x",
+            "visibility": "client_specific",
+            "status": "draft",
+            "company_ids": [company],
+            "parent_article_id": generic_id,
+        }),
+    )
+    .await;
+    let variant_id = variant["id"].as_str().expect("id");
+
+    // Try to make a third article's parent be the variant (which already
+    // has a parent). The service refuses with a 422 naming the field.
+    let resp = app
+        .client
+        .post(app.url("/api/v1/kb/articles"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Grand-variant",
+            "slug": "grand-variant",
+            "content": "x",
+            "visibility": "client_specific",
+            "status": "draft",
+            "company_ids": [company],
+            "parent_article_id": variant_id,
+        }))
+        .send()
+        .await
+        .expect("send create");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.expect("err JSON");
+    let dump = body.to_string();
+    assert!(
+        dump.contains("parent_article_id"),
+        "error names the field: {dump}"
+    );
+}
+
+/// PMS-816: an article that already has children cannot be given a parent
+/// of its own, for the same one-level-only reason. An update that would
+/// turn an existing parent into a child must be refused.
+#[mokosh_test]
+async fn giving_an_article_with_children_a_parent_is_refused(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company = common::seed_company_named(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let parent = create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Parent",
+            "slug": "parent",
+            "content": "x",
+            "visibility": "internal",
+            "status": "draft",
+        }),
+    )
+    .await;
+    let parent_id = parent["id"].as_str().expect("id");
+
+    create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Child",
+            "slug": "child",
+            "content": "x",
+            "visibility": "client_specific",
+            "status": "draft",
+            "company_ids": [company],
+            "parent_article_id": parent_id,
+        }),
+    )
+    .await;
+
+    let other_top_level = create_article(
+        &app,
+        &token,
+        serde_json::json!({
+            "title": "Other top level",
+            "slug": "other-top-level",
+            "content": "x",
+            "visibility": "internal",
+            "status": "draft",
+        }),
+    )
+    .await;
+    let other_id = other_top_level["id"].as_str().expect("id");
+
+    // Try to point `parent` at `other_top_level`. Refused: parent has a child,
+    // so it cannot itself become a child.
+    let resp = app
+        .client
+        .put(app.url(&format!("/api/v1/kb/articles/{parent_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "parent_article_id": other_id }))
+        .send()
+        .await
+        .expect("send update");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.expect("err JSON");
+    let dump = body.to_string();
+    assert!(
+        dump.contains("parent_article_id"),
+        "error names the field: {dump}"
+    );
+}
