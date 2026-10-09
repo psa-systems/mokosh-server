@@ -40,10 +40,12 @@ impl KbService {
     /// article itself. A `None` parent is always accepted (that is the
     /// "top-level article" state).
     ///
-    /// Cycle prevention beyond self-reference is deliberately NOT
-    /// enforced here: the SPA today builds one generic-to-client-specific
-    /// hop, and richer trees are out of scope. If a future feature
-    /// admits deeper hierarchies, the walk goes here.
+    /// One-level hierarchy only. A variant of a variant collapses the
+    /// "generic article" / "client-specific version" relationship this link
+    /// exists to express into an untyped tree, so the parent itself must be
+    /// top-level, and an article that already has children cannot pick one
+    /// up (otherwise an existing variant would become the parent of a
+    /// grand-variant). PMS-816.
     async fn validate_parent_article(
         &self,
         tx: &mut sqlx::PgConnection,
@@ -57,17 +59,43 @@ impl KbService {
                 "an article cannot be its own parent",
             ));
         }
-        let found: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM kb_articles WHERE tenant_id = $1 AND id = $2")
-                .bind(tenant_id)
-                .bind(parent_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if found.is_none() {
-            return Err(AppError::validation_field(
-                "parent_article_id",
-                "parent article does not exist in this tenant",
-            ));
+        let parent_row: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT parent_article_id FROM kb_articles WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(parent_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match parent_row {
+            None => {
+                return Err(AppError::validation_field(
+                    "parent_article_id",
+                    "parent article does not exist in this tenant",
+                ));
+            }
+            Some(Some(_)) => {
+                return Err(AppError::validation_field(
+                    "parent_article_id",
+                    "parent article is itself a variant; one-level hierarchy only",
+                ));
+            }
+            Some(None) => {}
+        }
+        if let Some(self_id) = self_id {
+            let has_children: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM kb_articles \
+                 WHERE tenant_id = $1 AND parent_article_id = $2)",
+            )
+            .bind(tenant_id)
+            .bind(self_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if has_children {
+                return Err(AppError::validation_field(
+                    "parent_article_id",
+                    "this article already has children; it cannot itself be given a parent",
+                ));
+            }
         }
         Ok(())
     }
