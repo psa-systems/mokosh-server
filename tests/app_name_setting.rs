@@ -52,8 +52,19 @@ async fn isolated() -> tokio::sync::MutexGuard<'static, ()> {
 }
 
 fn invites(pool: &PgPool) -> InvitationsService {
+    // PMS-1378: InvitationsService now dispatches the invite mail through
+    // NotificationsService::dispatch, so a test that creates an invite and
+    // reads back the queued row has to wire the dispatcher too; without
+    // it the invite path short-circuits by design and no `notifications`
+    // row is written.
+    let notifications =
+        mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
+            Database::from_pool(pool.clone()),
+            [0u8; 32],
+        );
     InvitationsService::new(Database::from_pool(pool.clone()))
         .with_app_url("https://app.example.test".to_string())
+        .with_notifications(notifications)
 }
 
 /// One admin per test. `seed_admin` uses a fixed address, so calling it twice
