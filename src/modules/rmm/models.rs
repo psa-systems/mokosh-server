@@ -60,6 +60,7 @@ pub struct UpdateRmmConnectionRequest {
 pub struct RmmDeviceMappingResponse {
     pub id: Uuid,
     pub rmm_connection_id: Uuid,
+    pub rmm_connection_name: Option<String>,
     pub rmm_device_id: String,
     pub asset_id: Option<Uuid>,
     pub company_id: Option<Uuid>,
@@ -97,6 +98,7 @@ pub struct UpdateRmmDeviceMappingRequest {
 pub struct RmmAlertRuleResponse {
     pub id: Uuid,
     pub rmm_connection_id: Uuid,
+    pub rmm_connection_name: Option<String>,
     pub name: String,
     pub alert_type: Option<String>,
     pub auto_create_ticket: bool,

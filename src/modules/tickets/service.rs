@@ -2144,10 +2144,11 @@ impl TicketService {
 
         let rows = sqlx::query_as::<_, TicketCategoryRow>(
             r#"
-            SELECT id, parent_id, name, description, is_active, sort_order
-            FROM ticket_categories
-            WHERE tenant_id = $1
-            ORDER BY sort_order, name
+            SELECT c.id, c.parent_id, p.name AS parent_name, c.name, c.description, c.is_active, c.sort_order
+            FROM ticket_categories c
+            LEFT JOIN ticket_categories p ON p.id = c.parent_id AND p.tenant_id = c.tenant_id
+            WHERE c.tenant_id = $1
+            ORDER BY c.sort_order, c.name
             LIMIT $2 OFFSET $3
             "#,
         )
@@ -2158,6 +2159,30 @@ impl TicketService {
         .await?;
 
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// Looks up a category's name within the same tenant-scoped transaction,
+    /// for stamping `parent_name` on a freshly created or updated row
+    /// without a second list query.
+    async fn category_name<'e, E>(
+        executor: E,
+        tenant_id: TenantId,
+        id: Option<Uuid>,
+    ) -> AppResult<Option<String>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let name: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM ticket_categories WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(executor)
+        .await?;
+        Ok(name)
     }
 
     /// Create a ticket category. A `parent_id` must reference a category in
@@ -2204,10 +2229,12 @@ impl TicketService {
             after,
         )
         .await?;
+        let parent_name = Self::category_name(&mut *tx, tenant_id, request.parent_id).await?;
         tx.commit().await?;
         Ok(TicketCategoryResponse {
             id,
             parent_id: request.parent_id,
+            parent_name,
             name: request.name.clone(),
             description: request.description.clone(),
             is_active: request.is_active,
@@ -2285,10 +2312,12 @@ impl TicketService {
         if n == 0 {
             return Err(AppError::NotFound("Ticket category".to_string()));
         }
+        let parent_name = Self::category_name(&mut *tx, tenant_id, request.parent_id).await?;
         tx.commit().await?;
         Ok(TicketCategoryResponse {
             id,
             parent_id: request.parent_id,
+            parent_name,
             name: request.name.clone(),
             description: request.description.clone(),
             is_active: request.is_active,
@@ -3762,6 +3791,7 @@ impl From<TicketTypeRow> for TicketType {
 struct TicketCategoryRow {
     id: Uuid,
     parent_id: Option<Uuid>,
+    parent_name: Option<String>,
     name: String,
     description: Option<String>,
     is_active: bool,
@@ -3773,6 +3803,7 @@ impl From<TicketCategoryRow> for TicketCategoryResponse {
         Self {
             id: row.id,
             parent_id: row.parent_id,
+            parent_name: row.parent_name,
             name: row.name,
             description: row.description,
             is_active: row.is_active,

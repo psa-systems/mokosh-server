@@ -357,16 +357,18 @@ impl RmmService {
         let total: i64 = count_qb.build_query_scalar().fetch_one(&mut *tx).await?;
 
         let mut rows_qb = sqlx::QueryBuilder::new(
-            r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
-                      device_name, last_seen, sync_status
-               FROM rmm_device_mappings WHERE tenant_id = "#,
+            r#"SELECT m.id, m.rmm_connection_id, c.name AS rmm_connection_name, m.rmm_device_id,
+                      m.asset_id, m.company_id, m.device_name, m.last_seen, m.sync_status
+               FROM rmm_device_mappings m
+               LEFT JOIN rmm_connections c ON c.id = m.rmm_connection_id AND c.tenant_id = m.tenant_id
+               WHERE m.tenant_id = "#,
         );
         rows_qb.push_bind(tenant_id);
         if let Some(cid) = connection_id {
-            rows_qb.push(" AND rmm_connection_id = ");
+            rows_qb.push(" AND m.rmm_connection_id = ");
             rows_qb.push_bind(cid);
         }
-        rows_qb.push(" ORDER BY device_name LIMIT ");
+        rows_qb.push(" ORDER BY m.device_name LIMIT ");
         rows_qb.push_bind(pagination.limit() as i64);
         rows_qb.push(" OFFSET ");
         rows_qb.push_bind(pagination.offset() as i64);
@@ -420,16 +422,7 @@ impl RmmService {
         )
         .await?;
         tx.commit().await?;
-        Ok(RmmDeviceMappingResponse {
-            id,
-            rmm_connection_id: request.rmm_connection_id,
-            rmm_device_id: request.rmm_device_id.clone(),
-            asset_id: request.asset_id,
-            company_id: request.company_id,
-            device_name: request.device_name.clone(),
-            last_seen: None,
-            sync_status: "pending".into(),
-        })
+        self.get_device_mapping(tenant_id, id).await
     }
 
     /// `GET`-style fetch of a single device mapping. Returns 404 when
@@ -443,9 +436,11 @@ impl RmmService {
     ) -> AppResult<RmmDeviceMappingResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<DevMapRow> = sqlx::query_as(
-            r#"SELECT id, rmm_connection_id, rmm_device_id, asset_id, company_id,
-                      device_name, last_seen, sync_status
-               FROM rmm_device_mappings WHERE tenant_id = $1 AND id = $2"#,
+            r#"SELECT m.id, m.rmm_connection_id, c.name AS rmm_connection_name, m.rmm_device_id,
+                      m.asset_id, m.company_id, m.device_name, m.last_seen, m.sync_status
+               FROM rmm_device_mappings m
+               LEFT JOIN rmm_connections c ON c.id = m.rmm_connection_id AND c.tenant_id = m.tenant_id
+               WHERE m.tenant_id = $1 AND m.id = $2"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -526,10 +521,13 @@ impl RmmService {
             .await?;
 
             let rows = sqlx::query_as::<_, AlertRuleRow>(
-                r#"SELECT id, rmm_connection_id, name, alert_type, auto_create_ticket,
-                          assign_to_id, queue_id, is_active, ticket_template, suppression_rules
-                   FROM rmm_alert_rules WHERE tenant_id = $1 AND rmm_connection_id = $2
-                   ORDER BY name
+                r#"SELECT r.id, r.rmm_connection_id, c.name AS rmm_connection_name, r.name,
+                          r.alert_type, r.auto_create_ticket, r.assign_to_id, r.queue_id,
+                          r.is_active, r.ticket_template, r.suppression_rules
+                   FROM rmm_alert_rules r
+                   LEFT JOIN rmm_connections c ON c.id = r.rmm_connection_id AND c.tenant_id = r.tenant_id
+                   WHERE r.tenant_id = $1 AND r.rmm_connection_id = $2
+                   ORDER BY r.name
                    LIMIT $3 OFFSET $4"#,
             )
             .bind(tenant_id)
@@ -548,10 +546,13 @@ impl RmmService {
                     .await?;
 
             let rows = sqlx::query_as::<_, AlertRuleRow>(
-                r#"SELECT id, rmm_connection_id, name, alert_type, auto_create_ticket,
-                          assign_to_id, queue_id, is_active, ticket_template, suppression_rules
-                   FROM rmm_alert_rules WHERE tenant_id = $1
-                   ORDER BY name
+                r#"SELECT r.id, r.rmm_connection_id, c.name AS rmm_connection_name, r.name,
+                          r.alert_type, r.auto_create_ticket, r.assign_to_id, r.queue_id,
+                          r.is_active, r.ticket_template, r.suppression_rules
+                   FROM rmm_alert_rules r
+                   LEFT JOIN rmm_connections c ON c.id = r.rmm_connection_id AND c.tenant_id = r.tenant_id
+                   WHERE r.tenant_id = $1
+                   ORDER BY r.name
                    LIMIT $2 OFFSET $3"#,
             )
             .bind(tenant_id)
@@ -610,16 +611,7 @@ impl RmmService {
         )
         .await?;
         tx.commit().await?;
-        Ok(RmmAlertRuleResponse {
-            id,
-            rmm_connection_id: request.rmm_connection_id,
-            name: request.name.clone(),
-            alert_type: request.alert_type.clone(),
-            auto_create_ticket: request.auto_create_ticket,
-            assign_to_id: request.assign_to_id,
-            queue_id: request.queue_id,
-            is_active: request.is_active,
-        })
+        self.get_alert_rule(tenant_id, id).await
     }
 
     /// `GET`-style fetch of a single alert rule. Returns 404 when the
@@ -633,9 +625,12 @@ impl RmmService {
     ) -> AppResult<RmmAlertRuleResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<AlertRuleRow> = sqlx::query_as(
-            r#"SELECT id, rmm_connection_id, name, alert_type, auto_create_ticket,
-                      assign_to_id, queue_id, is_active, ticket_template, suppression_rules
-               FROM rmm_alert_rules WHERE tenant_id = $1 AND id = $2"#,
+            r#"SELECT r.id, r.rmm_connection_id, c.name AS rmm_connection_name, r.name,
+                      r.alert_type, r.auto_create_ticket, r.assign_to_id, r.queue_id,
+                      r.is_active, r.ticket_template, r.suppression_rules
+               FROM rmm_alert_rules r
+               LEFT JOIN rmm_connections c ON c.id = r.rmm_connection_id AND c.tenant_id = r.tenant_id
+               WHERE r.tenant_id = $1 AND r.id = $2"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -725,8 +720,9 @@ impl RmmService {
     ) -> AppResult<u64> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rules: Vec<AlertRuleRow> = sqlx::query_as(
-            r#"SELECT id, rmm_connection_id, name, alert_type, auto_create_ticket,
-                      assign_to_id, queue_id, is_active, ticket_template, suppression_rules
+            r#"SELECT id, rmm_connection_id, NULL::text AS rmm_connection_name, name, alert_type,
+                      auto_create_ticket, assign_to_id, queue_id, is_active, ticket_template,
+                      suppression_rules
                FROM rmm_alert_rules
                WHERE tenant_id = $1 AND rmm_connection_id = $2
                  AND (alert_type = $3 OR alert_type IS NULL)
@@ -919,6 +915,7 @@ impl From<ConnRow> for RmmConnectionResponse {
 struct DevMapRow {
     id: Uuid,
     rmm_connection_id: Uuid,
+    rmm_connection_name: Option<String>,
     rmm_device_id: String,
     asset_id: Option<Uuid>,
     company_id: Option<Uuid>,
@@ -932,6 +929,7 @@ impl From<DevMapRow> for RmmDeviceMappingResponse {
         Self {
             id: r.id,
             rmm_connection_id: r.rmm_connection_id,
+            rmm_connection_name: r.rmm_connection_name,
             rmm_device_id: r.rmm_device_id,
             asset_id: r.asset_id,
             company_id: r.company_id,
@@ -946,6 +944,7 @@ impl From<DevMapRow> for RmmDeviceMappingResponse {
 struct AlertRuleRow {
     id: Uuid,
     rmm_connection_id: Uuid,
+    rmm_connection_name: Option<String>,
     name: String,
     alert_type: Option<String>,
     auto_create_ticket: Option<bool>,
@@ -971,6 +970,7 @@ impl From<AlertRuleRow> for RmmAlertRuleResponse {
         Self {
             id: r.id,
             rmm_connection_id: r.rmm_connection_id,
+            rmm_connection_name: r.rmm_connection_name,
             name: r.name,
             alert_type: r.alert_type,
             auto_create_ticket: r.auto_create_ticket.unwrap_or(false),

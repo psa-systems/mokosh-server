@@ -410,6 +410,105 @@ async fn run_tick_marks_connection_failed_with_last_error_on_provider_failure(po
     );
 }
 
+/// PMS-1479: device mapping and alert rule list/get reads resolve
+/// `rmm_connection_name` via a join, never a per-row lookup. Covers a
+/// named connection and a connection that belongs to another tenant
+/// (unreachable through the API, since `rmm_connection_id` is validated
+/// against the caller's tenant on create, so seeded directly) to prove
+/// the join is tenant-scoped and resolves to `None` rather than leaking
+/// a cross-tenant name.
+#[mokosh_test]
+async fn device_mapping_and_alert_rule_resolve_connection_name(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let company_id = common::seed_company(&pool).await;
+    let conn_id = seed_connection(&pool, "key-a", None).await;
+    seed_unlinked_mapping(&pool, conn_id, "device-A", company_id).await;
+    seed_alert_rule(&pool, conn_id, "disk_full", None, None).await;
+
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tenants (id, name, slug, kind) VALUES ($1, 'Other Tenant', $2, 'org')",
+    )
+    .bind(foreign_tenant)
+    .bind(format!("other-{foreign_tenant}"))
+    .execute(&pool)
+    .await
+    .expect("insert foreign tenant");
+    let foreign_conn_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO rmm_connections
+           (id, tenant_id, name, provider, api_url, api_key_encrypted, is_active,
+            sync_interval_minutes, sync_status)
+           VALUES ($1, $2, 'Foreign RMM', 'tactical_rmm', 'https://rmm.example.test',
+                   $3, TRUE, 60, 'never')"#,
+    )
+    .bind(foreign_conn_id)
+    .bind(foreign_tenant)
+    .bind(crypto::encrypt("key-b", &TEST_KEY).expect("encrypt"))
+    .execute(&pool)
+    .await
+    .expect("insert foreign connection");
+    // Belongs to the default tenant but points at a connection id that
+    // only exists in the foreign tenant: the join's `c.tenant_id = m.tenant_id`
+    // guard must keep this from resolving.
+    sqlx::query(
+        r#"INSERT INTO rmm_device_mappings
+           (tenant_id, rmm_connection_id, rmm_device_id, company_id, sync_status)
+           VALUES ($1, $2, 'device-B', $3, 'pending')"#,
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(foreign_conn_id)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed cross-tenant mapping");
+
+    let mappings: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/rmm/device-mappings?per_page=100"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list mappings")
+        .json()
+        .await
+        .expect("list mappings JSON");
+    let rows = mappings["data"].as_array().expect("mappings data");
+    let named = rows
+        .iter()
+        .find(|r| r["rmm_device_id"] == "device-A")
+        .expect("device-A listed");
+    assert_eq!(named["rmm_connection_name"].as_str(), Some("Test RMM"));
+    let dangling = rows
+        .iter()
+        .find(|r| r["rmm_device_id"] == "device-B")
+        .expect("device-B listed");
+    assert!(
+        dangling["rmm_connection_name"].is_null(),
+        "a connection id scoped to another tenant must not resolve a name"
+    );
+
+    let rules: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/rmm/alert-rules?per_page=100"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send list alert rules")
+        .json()
+        .await
+        .expect("list alert rules JSON");
+    let rule_rows = rules["data"].as_array().expect("alert rules data");
+    let rule = rule_rows
+        .iter()
+        .find(|r| r["name"] == "Test Rule")
+        .expect("Test Rule listed");
+    assert_eq!(rule["rmm_connection_name"].as_str(), Some("Test RMM"));
+}
+
 // --- helpers ---------------------------------------------------------------
 
 async fn seed_connection_with_provider(pool: &PgPool, provider: &str) -> Uuid {

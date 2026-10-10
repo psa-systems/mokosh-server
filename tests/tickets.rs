@@ -956,6 +956,10 @@ async fn category_crud_and_parent_validation(pool: PgPool) {
         .await
         .expect("parent category JSON");
     let parent_id = parent["id"].as_str().expect("parent id").to_string();
+    assert!(
+        parent["parent_name"].is_null(),
+        "a root category has no parent_name"
+    );
 
     // Child referencing the parent.
     let child_resp = app
@@ -967,13 +971,16 @@ async fn category_crud_and_parent_validation(pool: PgPool) {
         .await
         .expect("send create child category");
     assert_eq!(child_resp.status(), reqwest::StatusCode::OK);
-    let child_id = child_resp
+    let child_json = child_resp
         .json::<serde_json::Value>()
         .await
-        .expect("child JSON")["id"]
-        .as_str()
-        .expect("child id")
-        .to_string();
+        .expect("child JSON");
+    assert_eq!(
+        child_json["parent_name"].as_str(),
+        Some("Hardware"),
+        "a child category resolves its parent's name"
+    );
+    let child_id = child_json["id"].as_str().expect("child id").to_string();
 
     // List shows both.
     let list: serde_json::Value = app
@@ -993,6 +1000,17 @@ async fn category_crud_and_parent_validation(pool: PgPool) {
         .filter_map(|c| c["id"].as_str())
         .collect();
     assert!(ids.contains(&parent_id.as_str()) && ids.contains(&child_id.as_str()));
+    let listed_child = list["data"]
+        .as_array()
+        .expect("categories data")
+        .iter()
+        .find(|c| c["id"].as_str() == Some(child_id.as_str()))
+        .expect("child listed");
+    assert_eq!(
+        listed_child["parent_name"].as_str(),
+        Some("Hardware"),
+        "the list read resolves parent_name via the same join, no follow-up query"
+    );
 
     // A parent_id that is not a category in this tenant is rejected (400).
     let unknown_parent = uuid::Uuid::new_v4();
