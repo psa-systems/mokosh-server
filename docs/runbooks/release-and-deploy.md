@@ -8,7 +8,7 @@ Three Forgejo repositories under the `psa-systems` organisation release as one u
 
 The three repos do **not** all release off the same trigger shape:
 
-- **Mokosh server** and **Mokosh apps** release off a *merged release pull request*: `.forgejo/workflows/create-release.yml` fires on `pull_request: closed`, gated on `github.event.pull_request.merged == true && startsWith(head.ref, 'release/v')`.
+- **Mokosh server** and **Mokosh apps** release off a *merged release pull request*: `.forgejo/workflows/create-release.yml` fires on `pull_request_target: closed`, gated on `github.event.pull_request.merged == true && startsWith(head.ref, 'release/v')`.
 - **Bunyip** releases off a *pushed `release/v*` tag*, not the PR merge itself: its `create-release.yml` triggers on `push: tags: ['release/v*']`. Merging Bunyip's release PR alone does not start anything; `just publish-release` still has to run afterward to push that tag.
 
 Both shapes call the same reusable workflow in `psa-systems/common` (`common/.forgejo/workflows/create-release.yml`), which creates the `vX.Y.Z` git tag and the Forgejo release via the API. That tag creation is what each repo's build workflow is actually watching for (`tags: ["v*"]` in `build-oci-image.yml` for the server and apps, `build-api.yml` + `build-web.yml` for Bunyip) - so for the server and apps the tag+release is created automatically right after the PR-merge event, and for Bunyip it only happens after the explicit `just publish-release` push.
