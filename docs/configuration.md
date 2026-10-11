@@ -20,110 +20,15 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 - [`ALLOW_UNINVITED_BUNYIP_SIGNUP`](#var-allow-uninvited-bunyip-signup) (Required: no) - Optional, off by default. Set `true` only where uninvited Bunyip sign-up is wanted (staging). (PMS-1457)
 - [`APP_SECRET_BACKEND`](#var-app-secret-backend) (Required: no) - Optional. Selects where application-tier secrets live; unset keeps the hosting profile's default. (PMS-1424)
+- [`BUNYIP_MAILER_CLIENT_ID`](#var-bunyip-mailer-client-id) (Required: no) - Optional. Base URL and machine credential for Bunyip's mailer relay, read only when MAIL_PROVIDER=bunyip; unset keeps that provider unselectable. (PMS-1482)
+- [`BUNYIP_MAILER_CLIENT_SECRET`](#var-bunyip-mailer-client-secret) (Required: no) - Optional. Base URL and machine credential for Bunyip's mailer relay, read only when MAIL_PROVIDER=bunyip; unset keeps that provider unselectable. (PMS-1482)
+- [`BUNYIP_MAILER_URL`](#var-bunyip-mailer-url) (Required: no) - Optional. Base URL and machine credential for Bunyip's mailer relay, read only when MAIL_PROVIDER=bunyip; unset keeps that provider unselectable. (PMS-1482)
 
 #### Changed
 
 - **Breaking: feature off:** [`GOOGLE_CONTACTS_CLIENT_ID`](#var-google-contacts-client-id) (Required: no) - Feature: Google Contacts import. Now an application-tier secret served by `APP_SECRET_BACKEND`'s provider, no longer a plain variable. Move both halves there (an `app_secrets` row, Infisical `/app`, a `{NAME}_FILE` compose secret or an `APP_SECRETS_DIR` file); setting only one half refuses boot. (PMS-1430)
 - **Breaking: feature off:** [`GOOGLE_CONTACTS_CLIENT_SECRET`](#var-google-contacts-client-secret) (Required: no) - Feature: Google Contacts import. Now an application-tier secret served by `APP_SECRET_BACKEND`'s provider, no longer a plain variable. Move both halves there (an `app_secrets` row, Infisical `/app`, a `{NAME}_FILE` compose secret or an `APP_SECRETS_DIR` file); setting only one half refuses boot. (PMS-1430)
 - **Breaking: feature off:** [`SECRET_BACKEND`](#var-secret-backend) (Required: no) - Feature: application-tier secrets (`SMTP_PASSWORD` for outbound mail, the Google Contacts client pair). Now selects tenant-tier secrets only. If you set it expecting application secrets (`SMTP_PASSWORD`, the Google client pair) to move too, also set `APP_SECRET_BACKEND` to the same provider before restarting. (PMS-1424)
-
-<a id="release-v0-15-0"></a>
-
-### v0.15.0
-
-#### Added
-
-- [`OIDC_BACKCHANNEL_CLIENT_ID`](#var-oidc-backchannel-client-id) (Required: no) - Optional. Set it to the OIDC client id Bunyip addresses back-channel logout tokens to; unset refuses every logout token. (PMS-998)
-- [`STORAGE_PROVIDER`](#var-storage-provider) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_ROOT`](#var-storage-root) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_ACCESS_KEY_ID`](#var-storage-s3-access-key-id) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_BUCKET`](#var-storage-s3-bucket) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_ENDPOINT`](#var-storage-s3-endpoint) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_PATH_STYLE`](#var-storage-s3-path-style) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_REGION`](#var-storage-s3-region) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_SECRET_ACCESS_KEY`](#var-storage-s3-secret-access-key) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-
-#### Deprecated
-
-- [`ATTACHMENT_DIR`](#var-attachment-dir) (Required: no) - Renamed to `STORAGE_ROOT`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_ACCESS_KEY_ID`](#var-s3-access-key-id) (Required: no) - Renamed to `STORAGE_S3_ACCESS_KEY_ID`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_BUCKET`](#var-s3-bucket) (Required: no) - Renamed to `STORAGE_S3_BUCKET`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_ENDPOINT`](#var-s3-endpoint) (Required: no) - Renamed to `STORAGE_S3_ENDPOINT`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_PATH_STYLE`](#var-s3-path-style) (Required: no) - Renamed to `STORAGE_S3_PATH_STYLE`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_REGION`](#var-s3-region) (Required: no) - Renamed to `STORAGE_S3_REGION`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_SECRET_ACCESS_KEY`](#var-s3-secret-access-key) (Required: no) - Renamed to `STORAGE_S3_SECRET_ACCESS_KEY`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`STORAGE_BACKEND`](#var-storage-backend) (Required: no) - Renamed to `STORAGE_PROVIDER`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-
-<a id="release-v0-14-0"></a>
-
-### v0.14.0
-
-#### Added
-
-- **Breaking: won't start:** [`MOKOSH_DEPLOYMENT_MODE`](#var-mokosh-deployment-mode) (Required: yes) - Set `self-hosted` or `saas` before restarting; boot refuses without it outside dev/test. Introduced by PMS-1011. (PMS-1160)
-- [`APP_SECRETS_DIR`](#var-app-secrets-dir) (Required: no) - Optional. Directory the file application-secret provider reads; unset disables that provider. (PMS-988)
-- [`AUTH_PROVIDERS`](#var-auth-providers) (Required: no) - Optional. Unset keeps the hosting profile's default (`bunyip,local` in saas, `local` self-hosted). (PMS-981)
-- [`BRANDING_COMPANY_BACKGROUND_MAX_BYTES`](#var-branding-company-background-max-bytes) (Required: no) - Optional. Unset keeps the built-in cap for that asset. (MAPPS-622)
-- [`BRANDING_COMPANY_FAVICON_MAX_BYTES`](#var-branding-company-favicon-max-bytes) (Required: no) - Optional. Unset keeps the built-in cap for that asset. (MAPPS-622)
-- [`BRANDING_COMPANY_LOGO_MAX_BYTES`](#var-branding-company-logo-max-bytes) (Required: no) - Optional. Unset keeps the built-in cap for that asset. (MAPPS-622)
-- [`BRANDING_TENANT_BACKGROUND_MAX_BYTES`](#var-branding-tenant-background-max-bytes) (Required: no) - Optional. Unset keeps the built-in cap for that asset. (MAPPS-622)
-- [`BRANDING_TENANT_FAVICON_MAX_BYTES`](#var-branding-tenant-favicon-max-bytes) (Required: no) - Optional. Unset keeps the built-in cap for that asset. (MAPPS-622)
-- [`BUNYIP_CONFIG_CLIENT_ID`](#var-bunyip-config-client-id) (Required: no) - Optional. Configuration provider chain and its construction values; unset keeps the hosting profile's default. (PMS-987)
-- [`BUNYIP_CONFIG_CLIENT_SECRET`](#var-bunyip-config-client-secret) (Required: no) - Optional. Configuration provider chain and its construction values; unset keeps the hosting profile's default. (PMS-987)
-- [`BUNYIP_CONFIG_URL`](#var-bunyip-config-url) (Required: no) - Optional. Configuration provider chain and its construction values; unset keeps the hosting profile's default. (PMS-987)
-- [`BUNYIP_STATUS_CLIENT_ID`](#var-bunyip-status-client-id) (Required: no) - Optional. Set both to let Bunyip read provider status with its machine credential. (PMS-1193)
-- [`BUNYIP_STATUS_CLIENT_SECRET`](#var-bunyip-status-client-secret) (Required: no) - Optional. Set both to let Bunyip read provider status with its machine credential. (PMS-1193)
-- [`CONFIG_BACKEND`](#var-config-backend) (Required: no) - Optional. `environment` is the only accepted value and the default. (PMS-982)
-- [`CONFIG_FILE_DIR`](#var-config-file-dir) (Required: no) - Optional. Configuration provider chain and its construction values; unset keeps the hosting profile's default. (PMS-987)
-- [`CONFIG_PROVIDERS`](#var-config-providers) (Required: no) - Optional. Configuration provider chain and its construction values; unset keeps the hosting profile's default. (PMS-987)
-- [`GOOGLE_CONTACTS_CLIENT_ID`](#var-google-contacts-client-id) (Required: no) - Optional. Leave it unset to keep the default.
-- [`GOOGLE_CONTACTS_CLIENT_SECRET`](#var-google-contacts-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
-- [`KB_ATTACHMENT_MAX_BYTES`](#var-kb-attachment-max-bytes) (Required: no) - Optional. Unset keeps the built-in cap. (PMS-923)
-- [`MAIL_PROVIDER`](#var-mail-provider) (Required: no) - Optional. Unset keeps the profile default, or `smtp` when `SMTP_HOST` is set. (PMS-1013)
-- [`MOKOSH_MAX_TENANTS`](#var-mokosh-max-tenants) (Required: no) - Optional. Unset means no tenant cap. (MAPPS-457)
-- [`ORGANIZATIONS_ENABLED`](#var-organizations-enabled) (Required: no) - Optional. Unset follows the hosting profile (off self-hosted, on saas). (PMS-983)
-- [`OUTBOUND_PRIVATE_ALLOWLIST`](#var-outbound-private-allowlist) (Required: no) - Optional. Leave it unset to keep the default.
-- [`PAYPAL_API_BASE`](#var-paypal-api-base) (Required: no) - Optional. Leave it unset to keep the default.
-- [`S3_ACCESS_KEY_ID`](#var-s3-access-key-id) (Required: no) - Optional. Leave it unset to keep the default.
-- [`S3_BUCKET`](#var-s3-bucket) (Required: no) - Optional. Leave it unset to keep the default.
-- [`S3_ENDPOINT`](#var-s3-endpoint) (Required: no) - Optional. Leave it unset to keep the default.
-- [`S3_PATH_STYLE`](#var-s3-path-style) (Required: no) - Optional. Leave it unset to keep the default.
-- [`S3_REGION`](#var-s3-region) (Required: no) - Optional. Leave it unset to keep the default.
-- [`S3_SECRET_ACCESS_KEY`](#var-s3-secret-access-key) (Required: no) - Optional. Leave it unset to keep the default.
-- [`SECRET_BACKEND`](#var-secret-backend) (Required: no) - Optional. Unset keeps the default provider (`database` for secrets, `local` for storage). (PMS-910)
-- [`STORAGE_BACKEND`](#var-storage-backend) (Required: no) - Optional. Unset keeps the default provider (`database` for secrets, `local` for storage). (PMS-910)
-
-#### Changed
-
-- **Breaking: won't start:** [`BASE_URL`](#var-base-url) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
-- **Breaking: won't start:** [`CLIENT_ORIGIN`](#var-client-origin) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
-- **Breaking: won't start:** [`MOKOSH_APP_DATABASE_URL`](#var-mokosh-app-database-url) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
-- **Breaking: won't start:** [`SPA_BASE_URL`](#var-spa-base-url) (Required: yes) - Now required outside dev/test: boot refuses when it is unset instead of falling back to a localhost or single-role default. Set it before restarting. (PMS-1160)
-
-#### Removed
-
-- [`GOOGLE_OAUTH_CLIENT_ID`](#var-google-oauth-client-id) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; the Google sign-in routes it served are gone. (PMS-837)
-- [`GOOGLE_OAUTH_CLIENT_SECRET`](#var-google-oauth-client-secret) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose secrets; the Google sign-in routes it served are gone. (PMS-837)
-- [`GOOGLE_OAUTH_REDIRECT_URI`](#var-google-oauth-redirect-uri) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; the Google sign-in routes it served are gone. (PMS-837)
-- [`OAUTH_SUPER_ADMIN_EMAILS`](#var-oauth-super-admin-emails) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; only the removed Google sign-in path read it. (PMS-837)
-
-<a id="release-v0-13-0"></a>
-
-### v0.13.0
-
-No configuration changes.
-
-<a id="release-v0-12-0"></a>
-
-### v0.12.0
-
-#### Added
-
-- [`ABUSE_CONTACT_EMAIL`](#var-abuse-contact-email) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
-- [`INFISICAL_ADDRESS`](#var-infisical-address) (Required: no) - Optional. Blank reports Infisical as skipped in the readiness probe. (GOV-50)
-- [`PUBLIC_API_BASE_URL`](#var-public-api-base-url) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
-- [`SPA_BASE_URL`](#var-spa-base-url) (Required: no) - Optional at the time (required since v0.14.0). Set it to the mokosh-apps origin so SPA-only email links land there. (MAPPS-425)
-- [`TENANT_LOGO_MAX_BYTES`](#var-tenant-logo-max-bytes) (Required: no) - Optional. Leave it unset to keep the default.
 
 <!-- END GENERATED: recently-added -->
 
@@ -274,6 +179,9 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-google-oauth-client-secret"></a>`GOOGLE_OAUTH_CLIENT_SECRET` | no | v0.2.0; removed in v0.14.0 | nowhere | Client secret of the retired Google sign-in routes (PMS-837). |
 | <a id="var-google-oauth-redirect-uri"></a>`GOOGLE_OAUTH_REDIRECT_URI` | no | v0.2.0; removed in v0.14.0 | nowhere | Redirect URI of the retired Google sign-in routes (PMS-837). |
 | <a id="var-oauth-super-admin-emails"></a>`OAUTH_SUPER_ADMIN_EMAILS` | no | v0.3.0; removed in v0.14.0 | nowhere | Super-admin allowlist only the retired Google sign-in read (PMS-837). |
+| <a id="var-bunyip-mailer-url"></a>`BUNYIP_MAILER_URL` | no, unset makes `MAIL_PROVIDER=bunyip` refuse to boot | v0.16.0 | `.env` | Base URL of Bunyip's mailer relay that `MAIL_PROVIDER=bunyip` sends through (`POST /v1/mailer/send`, BUNYIP-602). |
+| <a id="var-bunyip-mailer-client-id"></a>`BUNYIP_MAILER_CLIENT_ID` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client id presented as HTTP Basic to the mailer relay. |
+| <a id="var-bunyip-mailer-client-secret"></a>`BUNYIP_MAILER_CLIENT_SECRET` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client secret presented as HTTP Basic to the mailer relay. |
 
 ## Development stack variables
 

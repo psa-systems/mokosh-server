@@ -226,6 +226,13 @@ action = "No action needed: the server ignores it. Cleanup: delete it from the c
 [[change]]
 release = "v0.16.0"
 group = "Added"
+variables = ["BUNYIP_MAILER_URL", "BUNYIP_MAILER_CLIENT_ID", "BUNYIP_MAILER_CLIENT_SECRET"]
+issue = "PMS-1482"
+action = "Optional. Base URL and machine credential for Bunyip's mailer relay, read only when MAIL_PROVIDER=bunyip; unset keeps that provider unselectable."
+
+[[change]]
+release = "v0.16.0"
+group = "Added"
 variables = ["APP_SECRET_BACKEND"]
 issue = "PMS-1424"
 action = "Optional. Selects where application-tier secrets live; unset keeps the hosting profile's default."
