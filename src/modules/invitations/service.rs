@@ -203,6 +203,7 @@ impl InvitationsService {
             let app = crate::utils::app_name::app_name();
             let context = serde_json::json!({
                 "recipient_email": email,
+                "salutation": crate::utils::email::salutation(""),
                 "tenant_name": tenant_name,
                 "role": request.role,
                 "ttl_days": INVITE_TTL_DAYS,

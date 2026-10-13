@@ -1231,6 +1231,7 @@ impl QuotesService {
 
         let context = serde_json::json!({
             "recipient_email": email,
+            "salutation": crate::utils::email::salutation(""),
             "quote_number": number,
             "title": quote.title,
             "total": quote.total.to_string(),
