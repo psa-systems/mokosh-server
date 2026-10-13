@@ -491,7 +491,12 @@ async fn seeded_templates_have_real_newlines_and_flat_placeholders(pool: PgPool)
 #[mokosh_test]
 async fn the_seeded_greetings_read_correctly_without_a_name(pool: PgPool) {
     type BodyRow = (String, Option<String>, Option<String>);
-    for event_type in ["forms.request_link", "auth.welcome"] {
+    for event_type in [
+        "forms.request_link",
+        "auth.welcome",
+        "invitations.created",
+        "quote.sent",
+    ] {
         let rows: Vec<BodyRow> = sqlx::query_as(
             "SELECT name, body_text, body_html FROM notification_templates \
              WHERE event_type = $1 AND channel_type = 'email'",
