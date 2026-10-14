@@ -22,7 +22,13 @@ use crate::modules::approvals::{approval_routes, ApprovalsService};
 use crate::modules::assets::{assets_routes, AssetsService};
 use crate::modules::audit::{audit_routes, AuditService};
 use crate::modules::auth::{
-    auth_routes, bunyip_webhook::BunyipWebhookState, AuthMiddleware, AuthService,
+    auth_routes,
+    bunyip_webhook::BunyipWebhookState,
+    grant_invitations_routes::{
+        grant_invitations_by_token_routes, grant_invitations_grantee_routes,
+        grant_invitations_owner_routes,
+    },
+    AuthMiddleware, AuthService,
 };
 use crate::modules::billing::{
     billing_routes, provider_webhook_handler, BillingService, ProviderWebhookState,
@@ -166,6 +172,27 @@ pub fn create_api_router(
              auth path this instance has. Configure the verifier, or set the mode to self-hosted.",
         );
     }
+
+    // PMS-1208: construct the Bunyip user-directory client for the SaaS-mode
+    // gate on grant-invitation creation. Returns `None` in standalone mode
+    // (no bunyip config) and an `Err` on partial config, which this call
+    // site logs and treats as "disabled": the gate is a warn-and-degrade
+    // rather than fail-boot so a deployment that later fills the config in
+    // gets the gate on the next restart, and one that meant to leave it
+    // off is unaffected.
+    let bunyip_directory =
+        match crate::modules::auth::bunyip_directory::BunyipUserDirectory::from_config() {
+            Ok(Some(client)) => Some(std::sync::Arc::new(client)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "PMS-1208 Bunyip directory client disabled: partial configuration. Grant \
+                     invitations will be created without the SaaS-mode existence check."
+                );
+                None
+            }
+        };
 
     // Create services. NotificationsService is constructed first so a
     // shared clone can be threaded into AuthService and TicketService,
@@ -450,6 +477,33 @@ pub fn create_api_router(
         // cheap Arc bump. PMS-837 removed the Google OAuth popup routes and
         // their `google_oauth` / `cookie_secure` parameters.
         .nest("/auth", auth_routes(auth_service.clone()))
+        // PMS-1208: cross-account Mokosh grants with a Cloudflare-shaped
+        // pending / accept / expire lifecycle. Three mounts:
+        //   /grants/invitations/*          - owner surface (RequireAdmin)
+        //   /grants/invitations/by-token/* - unauthenticated token-driven
+        //   /my-grants/invitations         - grantee inbox (RequireAuth)
+        // The by-token mount is UNAUTHENTICATED at the middleware level
+        // because the token IS the credential; the accept/decline handlers
+        // still gate on the caller's identity when they have one, but a
+        // first-sight grantee bouncing through OIDC can hit the metadata
+        // endpoint before the auth chain sees them.
+        .nest(
+            "/grants/invitations/by-token",
+            grant_invitations_by_token_routes(Arc::new(db.clone()), bunyip_directory.clone()),
+        )
+        .nest(
+            "/grants/invitations",
+            grant_invitations_owner_routes(
+                Arc::new(db.clone()),
+                Arc::new(spa_base_url.clone()),
+                Some(Arc::new(notifications_service.clone())),
+                bunyip_directory.clone(),
+            ),
+        )
+        .nest(
+            "/my-grants/invitations",
+            grant_invitations_grantee_routes(Arc::new(db.clone())),
+        )
         // PMS-1210: the grantee-side "Leave account" endpoint. Placed at
         // the top of `/api/v1` rather than under `/auth` because the
         // gesture is a caller acting on themselves through the identity
@@ -607,7 +661,11 @@ pub fn create_api_router(
         // PMS-936: also carries a `TicketService` clone so the
         // `POST /assets/{id}/report-issue` endpoint can create the
         // linked ticket through the shared portal-ticket path.
-        .merge(assets_routes(assets_service, ticket_service.clone()))
+        .merge(assets_routes(
+            assets_service,
+            ticket_service.clone(),
+            features.clone(),
+        ))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
         // PMS-923: images an article embeds. Upload / list / delete are

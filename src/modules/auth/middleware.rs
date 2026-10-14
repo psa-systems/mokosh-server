@@ -1107,6 +1107,38 @@ pub async fn place_bunyip_user_from_local_state(
         }
         UserinfoDecision::Skip(principal) => *principal,
     };
+    // BUNYIP-674 option B: keep grant-scoped tokens off the owner path on
+    // the FAST path too. `place_bunyip_user_with_rejection` (the userinfo-
+    // needed dispatcher above `place_bunyip_caller`) already branches to
+    // `place_grantee_caller` when the token carries a
+    // `mokosh_grant_account_id` claim; the same branch was missing here,
+    // so a subsequent request from a grantee with an already-placed row
+    // hit `place_bunyip_caller` (owner path), which runs
+    // `effective_role_from_bunyip` and promoted the grantee's role to
+    // Admin. That is a full-privilege escalation on every request the
+    // grantee makes: a `read_only` grant becomes an `admin` users row
+    // within one round-trip. PMS-1208 finding 9. `place_grantee_caller`
+    // re-reads the row rather than reusing the resolved principal (its
+    // shape does not yet take a pre-resolved principal, and the DB read
+    // is cheap next to the correctness the branch buys).
+    if claims.mokosh_grant_account_id.is_some() {
+        let _ = principal;
+        return LocalPlacement::Placed(Box::new(
+            place_grantee_caller(
+                auth_service,
+                sub,
+                // No userinfo on the fast path: an existing placement
+                // reconciles from the grant claim and the row, no name
+                // hints needed.
+                None,
+                false,
+                None,
+                None,
+                claims,
+            )
+            .await,
+        ));
+    }
     LocalPlacement::Placed(Box::new(
         place_bunyip_caller(
             auth_service,
@@ -1472,9 +1504,29 @@ async fn place_grantee_caller(
                     tracing::info!(
                         sub = %sub,
                         target = %target_slug,
+                        has_email = email.as_deref().is_some_and(|s| !s.trim().is_empty()),
+                        email_verified = email_verified,
                         "grantee JIT provision refused: no verified email from userinfo"
                     );
-                    return (None, None);
+                    // PMS-1208 finding 8: return a specific 403 so the SPA
+                    // does not paint the generic "You don't have permission"
+                    // copy over a refusal whose cause is logged. The message
+                    // does NOT tell the grantee to verify their email in
+                    // Bunyip: on the current wire their address IS verified,
+                    // but bunyip's userinfo only returns `email` /
+                    // `email_verified` under the `email` scope, so a grantee
+                    // reading "verify in Bunyip" is sent to the one place
+                    // the fix is not. The support-facing wording names the
+                    // shape so a support agent can trace the right layer.
+                    return (
+                        None,
+                        Some(AppError::Forbidden(
+                            "Couldn't confirm your identity for this shared account. Contact \
+                             the account owner or support with the time of this attempt so \
+                             they can check the server log."
+                                .to_string(),
+                        )),
+                    );
                 }
             };
             match auth_service
@@ -1492,7 +1544,20 @@ async fn place_grantee_caller(
                 Ok(u) => u,
                 Err(e) => {
                     tracing::warn!(error = %e, sub = %sub, "grantee JIT provision failed");
-                    return (None, None);
+                    // PMS-1208 finding 8: a JIT WRITE failure is distinct
+                    // from the unverified-email refusal above (unique-index
+                    // race, constraint, transient DB error). Same generic-
+                    // 403 override reasoning; copy says "try again" rather
+                    // than "verify your email".
+                    return (
+                        None,
+                        Some(AppError::Forbidden(
+                            "Couldn't place you in this shared account. Try switching again \
+                             in a moment; if it keeps failing, ask the account owner to \
+                             re-share it with you."
+                                .to_string(),
+                        )),
+                    );
                 }
             }
         }

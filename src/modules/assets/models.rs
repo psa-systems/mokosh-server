@@ -156,6 +156,140 @@ pub struct AssetFilter {
     pub q: Option<String>,
 }
 
+// -- PMS-1486 (asset search v2) ---------------------------------------------
+//
+// The structured-filter body `POST /api/v1/assets/search` accepts. The
+// `AssetField` + `FacetOp` enums are the ONLY vocab the server honours; a
+// pill the SPA composes against anything else is a 422 at the validate
+// boundary rather than an empty list. `q` lowers to one ILIKE scan against
+// the `search_haystack` column migration 267 adds. See
+// docs/mokosh-assets/02-search-redesign.md for the design.
+
+/// A single filter pill. One field, one operator, one or more values.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FacetFilter {
+    pub field: AssetField,
+    pub op: FacetOp,
+    /// Zero or more values, interpreted per `op`:
+    /// - `Eq` / `In` / `NotIn`: one or more scalars; `In` and `NotIn`
+    ///   compile to `IN (...)` / `NOT IN (...)`.
+    /// - `IsNull` / `IsNotNull`: must be empty; a non-empty values list
+    ///   is a 422 at the handler.
+    /// - `Before` / `After`: exactly one scalar, parsed as a date (or
+    ///   a timestamp lowered to a date).
+    /// - `Within`: exactly one object `{"days": N}`; lowered to
+    ///   `field BETWEEN NOW()::date AND (NOW()::date + N)`.
+    /// - `ContainsTag`: exactly one string; valid only for `AssetField::Tags`.
+    #[serde(default)]
+    pub values: Vec<serde_json::Value>,
+}
+
+/// Every field the server knows how to filter by. Snake-case over the
+/// wire so the SPA sends `assigned_user` rather than `AssignedUser`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetField {
+    AssetType,
+    Status,
+    Company,
+    Site,
+    AssignedUser,
+    Department,
+    ItilLifecycleStage,
+    WarrantyExpiry,
+    EndOfLife,
+    PurchaseDate,
+    InstalledDate,
+    Tags,
+    Manufacturer,
+    Model,
+    LicenseVendor,
+}
+
+/// The operator vocab. The handler and the service enforce every (field, op)
+/// pair that is legal; a pair that is not is a 422 at the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FacetOp {
+    Eq,
+    In,
+    NotIn,
+    IsNull,
+    IsNotNull,
+    Before,
+    After,
+    /// `{"days": N}` convenience for "the next N days from today".
+    Within,
+    /// `AssetField::Tags` only.
+    ContainsTag,
+}
+
+/// One sort clause. The default sort when `sort` is empty is `name ASC`,
+/// which matches today's list.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SortClause {
+    pub field: AssetField,
+    #[serde(default)]
+    pub direction: SortDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+/// The POST body for `/api/v1/assets/search`.
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct AssetSearchRequest {
+    /// Trimmed, lowercased, ILIKE'd with surrounding wildcards against
+    /// the `search_haystack` column. Empty / absent => no haystack
+    /// filter. pg_trgm needs 3+ chars to reach the GIN, so a shorter
+    /// string falls back to a sequential scan the service accepts; the
+    /// facet filters alone keep the plan bounded in practice.
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
+    /// Facet filters, AND-combined. Validated per (field, op) pair.
+    #[serde(default)]
+    pub filters: Vec<FacetFilter>,
+    /// Overrides the default `name ASC`.
+    #[serde(default)]
+    pub sort: Vec<SortClause>,
+}
+
+/// One row of the `/api/v1/assets/search/facets` response. The SPA's
+/// sidebar renders a row per value with its count under the currently-
+/// applied filter set.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetValueCount {
+    /// JSON scalar (string / uuid / i64). `null` for `IsNull` buckets.
+    pub value: serde_json::Value,
+    /// Human label; same string as `value` for a text facet, the
+    /// resolved tenant/company/user name for a Uuid facet.
+    pub label: Option<String>,
+    pub count: i64,
+}
+
+/// The facets endpoint's response. One key per facet the SPA renders in
+/// its sidebar. Keys the current filter has already pinned (e.g. a
+/// `status` pill is applied) return the top values AMONG THE REMAINING
+/// rows so the sidebar leads with "next pill worth adding".
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AssetFacetsResponse {
+    pub status: Vec<FacetValueCount>,
+    pub company: Vec<FacetValueCount>,
+    pub asset_type: Vec<FacetValueCount>,
+    pub assigned_user: Vec<FacetValueCount>,
+    pub department: Vec<FacetValueCount>,
+    pub manufacturer: Vec<FacetValueCount>,
+    pub itil_lifecycle_stage: Vec<FacetValueCount>,
+    /// Canned saved-view counts; one entry each when non-zero.
+    pub warranty_expiring_in_30_days: i64,
+    pub end_of_life_passed: i64,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateAssetRequest {
     pub asset_tag: Option<String>,

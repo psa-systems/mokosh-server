@@ -24,6 +24,43 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+// Macro defined up here so the `search_assets` + `asset_facets` methods below
+// can reach it; a macro_rules! is visible from the point of definition
+// onward within its module. The implementation + doc continue below the
+// `SearchWhereBuilder` struct (bottom of this file).
+macro_rules! bind_all {
+    ($q:ident, $base:expr) => {{
+        let mut $q = $q;
+        for value in $base.binds() {
+            use serde_json::Value;
+            $q = match value {
+                Value::Null => $q.bind::<Option<String>>(None),
+                Value::Bool(b) => $q.bind(*b),
+                Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        $q.bind(i)
+                    } else if let Some(f) = n.as_f64() {
+                        $q.bind(f)
+                    } else {
+                        $q.bind(n.to_string())
+                    }
+                }
+                Value::String(s) => {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+                        $q.bind(uuid)
+                    } else if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                        $q.bind(date)
+                    } else {
+                        $q.bind(s.clone())
+                    }
+                }
+                other => $q.bind(other.to_string()),
+            };
+        }
+        $q
+    }};
+}
+
 #[derive(Clone)]
 pub struct AssetsService {
     db: Database,
@@ -281,6 +318,186 @@ impl AssetsService {
             .bind(pagination.offset() as i64);
         let rows = q.fetch_all(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// PMS-1486 (asset search v2): the structured-filter sibling of
+    /// `list_assets`. `q` lowers to one ILIKE against `search_haystack`
+    /// (migration 267); every `filters` entry lowers to its own clause
+    /// via the private `WhereBuilder` helper below. Returns the same
+    /// `(rows, total)` shape as `list_assets` so the handler composes a
+    /// `PaginatedResponse` from either source.
+    ///
+    /// Validation of the (field, op, values) triples happens at the
+    /// handler boundary; this method trusts the shapes it is handed and
+    /// turns an unexpected pair into a 500 at the SQL layer rather than
+    /// a 422. The handler calls `AssetSearchRequest::validate_shape`
+    /// first.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn search_assets(
+        &self,
+        tenant_id: TenantId,
+        req: &AssetSearchRequest,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<AssetResponse>, u64)> {
+        let mut wb = SearchWhereBuilder::new();
+        wb.push_bind_tenant(tenant_id);
+        // Haystack. pg_trgm reaches the GIN at 3+ chars; shorter strings
+        // land a sequential scan the planner still answers in bounded
+        // time because the facets below usually pare the set first.
+        if let Some(q) = req.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            wb.push_clause("a.search_haystack ILIKE ");
+            wb.push_bind_json(serde_json::Value::String(format!("%{}%", q.to_lowercase())));
+        }
+        for filter in &req.filters {
+            wb.apply_filter(filter);
+        }
+        let where_clause = wb.where_clause();
+
+        // Count.
+        let count_sql = format!("SELECT COUNT(*) FROM assets a WHERE {where_clause}");
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        let total: i64 = bind_all!(count_q, &wb).fetch_one(&mut *tx).await?;
+
+        // Sort allowlist: lower each `AssetField` to a column reference.
+        // Any field the enum knows is safe; the enum IS the allowlist.
+        let mut order_by = String::from(" ORDER BY ");
+        if req.sort.is_empty() {
+            order_by.push_str("a.name ASC");
+        } else {
+            let parts: Vec<String> = req
+                .sort
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} {}",
+                        column_for(c.field),
+                        match c.direction {
+                            SortDirection::Asc => "ASC",
+                            SortDirection::Desc => "DESC",
+                        }
+                    )
+                })
+                .collect();
+            order_by.push_str(&parts.join(", "));
+        }
+
+        let (limit_idx, offset_idx) = wb.next_two_slots();
+        let query = format!(
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
+                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
+                      a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
+                      a.ip_address::text AS ip_address, a.hostname, a.mac_address,
+                      a.installed_date, a.department, a.in_transit_ticket_id,
+                      a.itil_lifecycle_stage,
+                      a.license_vendor, a.license_seat_count, a.license_expiry,
+                      a.created_at, a.updated_at
+               FROM assets a
+               LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
+               LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               WHERE {where_clause}{order_by}
+               LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
+        );
+        let list_q = sqlx::query_as::<_, AssetRow>(&query);
+        let bound = bind_all!(list_q, &wb)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64);
+        let rows = bound.fetch_all(&mut *tx).await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// PMS-1486: companion to `search_assets`. Returns per-facet value
+    /// counts under the same filter set the search is applied to, so
+    /// the SPA's sidebar renders "next pill worth adding" without a
+    /// second round trip per facet. The named canned-view counts
+    /// (`warranty_expiring_in_30_days`, `end_of_life_passed`) ride on
+    /// the same request.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn asset_facets(
+        &self,
+        tenant_id: TenantId,
+        req: &AssetSearchRequest,
+    ) -> AppResult<AssetFacetsResponse> {
+        let base = {
+            let mut wb = SearchWhereBuilder::new();
+            wb.push_bind_tenant(tenant_id);
+            if let Some(q) = req.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                wb.push_clause("a.search_haystack ILIKE ");
+                wb.push_bind_json(serde_json::Value::String(format!("%{}%", q.to_lowercase())));
+            }
+            for filter in &req.filters {
+                wb.apply_filter(filter);
+            }
+            wb
+        };
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let where_clause = base.where_clause();
+
+        let status = facet_text_counts(&mut tx, &base, "a.status", &where_clause).await?;
+        let company = facet_uuid_counts(
+            &mut tx,
+            &base,
+            "a.company_id",
+            Some("co.name"),
+            Some("LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id"),
+            &where_clause,
+        )
+        .await?;
+        let asset_type = facet_uuid_counts(
+            &mut tx,
+            &base,
+            "a.asset_type_id",
+            Some("at.name"),
+            Some("LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id"),
+            &where_clause,
+        )
+        .await?;
+        let assigned_user = facet_uuid_counts(
+            &mut tx,
+            &base,
+            "a.assigned_user_id",
+            Some("NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '')"),
+            Some("LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id"),
+            &where_clause,
+        )
+        .await?;
+        let department = facet_text_counts(&mut tx, &base, "a.department", &where_clause).await?;
+        let manufacturer =
+            facet_text_counts(&mut tx, &base, "a.manufacturer", &where_clause).await?;
+        let itil_lifecycle_stage =
+            facet_text_counts(&mut tx, &base, "a.itil_lifecycle_stage", &where_clause).await?;
+
+        // Canned saved-view counts. BETWEEN current and current+30d for
+        // the warranty one; `< NOW()::date` for the end-of-life one.
+        let warranty_sql = format!(
+            "SELECT COUNT(*) FROM assets a WHERE {where_clause} \
+             AND a.warranty_expiry IS NOT NULL \
+             AND a.warranty_expiry BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL '30 days')::date"
+        );
+        let warranty_q = sqlx::query_scalar::<_, i64>(&warranty_sql);
+        let warranty_expiring_in_30_days: i64 =
+            bind_all!(warranty_q, &base).fetch_one(&mut *tx).await?;
+        let eol_sql = format!(
+            "SELECT COUNT(*) FROM assets a WHERE {where_clause} \
+             AND a.end_of_life IS NOT NULL \
+             AND a.end_of_life < CURRENT_DATE"
+        );
+        let eol_q = sqlx::query_scalar::<_, i64>(&eol_sql);
+        let end_of_life_passed: i64 = bind_all!(eol_q, &base).fetch_one(&mut *tx).await?;
+
+        Ok(AssetFacetsResponse {
+            status,
+            company,
+            asset_type,
+            assigned_user,
+            department,
+            manufacturer,
+            itil_lifecycle_stage,
+            warranty_expiring_in_30_days,
+            end_of_life_passed,
+        })
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -1655,4 +1872,250 @@ impl From<AuditRow> for AssetAuditLogResponse {
             performed_at: r.performed_at,
         }
     }
+}
+
+// -- PMS-1486 asset-search helpers ------------------------------------------
+//
+// A query-builder-ish helper that threads one Vec of serde_json::Value
+// bindings through the count + list + facet queries, so every scope-
+// defining filter is applied once and re-bound in each SQL round trip.
+//
+// Why not sqlx::QueryBuilder: the facet method runs seven count queries
+// over the same WHERE, and QueryBuilder's bindings are consumed when the
+// query is built; a per-query build would re-walk the filters each time.
+// Collecting the (sql, Vec<Value>) once and re-binding is cheaper and
+// keeps the WHERE text in sync across the seven calls.
+
+struct SearchWhereBuilder {
+    clauses: Vec<String>,
+    binds: Vec<serde_json::Value>,
+    tenant_id: Option<Uuid>,
+}
+
+impl SearchWhereBuilder {
+    fn new() -> Self {
+        Self {
+            clauses: Vec::new(),
+            binds: Vec::new(),
+            tenant_id: None,
+        }
+    }
+
+    fn push_bind_tenant(&mut self, tenant_id: TenantId) {
+        self.tenant_id = Some(*tenant_id);
+        let idx = self.binds.len() + 1;
+        self.clauses.push(format!("a.tenant_id = ${idx}"));
+        self.binds
+            .push(serde_json::Value::String((*tenant_id).to_string()));
+    }
+
+    fn push_clause(&mut self, prefix: &str) {
+        let idx = self.binds.len() + 1;
+        if let Some(last) = self.clauses.last_mut() {
+            // The prefix already carries the field + operator (e.g.
+            // "a.status = "), so we append its $N anchor to the previous
+            // clause only when the caller is extending a composite.
+            // Simpler: just push a new clause string with the slot.
+            let _ = last;
+        }
+        self.clauses.push(format!("{prefix}${idx}"));
+    }
+
+    fn push_bind_json(&mut self, value: serde_json::Value) {
+        self.binds.push(value);
+    }
+
+    fn apply_filter(&mut self, filter: &FacetFilter) {
+        let column = column_for(filter.field);
+        match filter.op {
+            FacetOp::Eq => {
+                if let Some(v) = filter.values.first() {
+                    let idx = self.binds.len() + 1;
+                    self.clauses.push(format!("{column} = ${idx}"));
+                    self.binds.push(v.clone());
+                }
+            }
+            FacetOp::In => {
+                if !filter.values.is_empty() {
+                    let start = self.binds.len() + 1;
+                    let placeholders: Vec<String> = (0..filter.values.len())
+                        .map(|i| format!("${}", start + i))
+                        .collect();
+                    self.clauses
+                        .push(format!("{column} IN ({})", placeholders.join(", ")));
+                    for v in &filter.values {
+                        self.binds.push(v.clone());
+                    }
+                }
+            }
+            FacetOp::NotIn => {
+                if !filter.values.is_empty() {
+                    let start = self.binds.len() + 1;
+                    let placeholders: Vec<String> = (0..filter.values.len())
+                        .map(|i| format!("${}", start + i))
+                        .collect();
+                    self.clauses
+                        .push(format!("{column} NOT IN ({})", placeholders.join(", ")));
+                    for v in &filter.values {
+                        self.binds.push(v.clone());
+                    }
+                }
+            }
+            FacetOp::IsNull => {
+                self.clauses.push(format!("{column} IS NULL"));
+            }
+            FacetOp::IsNotNull => {
+                self.clauses.push(format!("{column} IS NOT NULL"));
+            }
+            FacetOp::Before => {
+                if let Some(v) = filter.values.first() {
+                    let idx = self.binds.len() + 1;
+                    self.clauses.push(format!("{column} < ${idx}"));
+                    self.binds.push(v.clone());
+                }
+            }
+            FacetOp::After => {
+                if let Some(v) = filter.values.first() {
+                    let idx = self.binds.len() + 1;
+                    self.clauses.push(format!("{column} > ${idx}"));
+                    self.binds.push(v.clone());
+                }
+            }
+            FacetOp::Within => {
+                if let Some(days) = filter
+                    .values
+                    .first()
+                    .and_then(|v| v.get("days"))
+                    .and_then(|v| v.as_i64())
+                {
+                    let days = days.clamp(0, 3650);
+                    self.clauses.push(format!(
+                        "{column} BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL '{days} days')::date"
+                    ));
+                }
+            }
+            FacetOp::ContainsTag => {
+                if let Some(tag) = filter.values.first().and_then(|v| v.as_str()) {
+                    let idx = self.binds.len() + 1;
+                    // tags is TEXT[]; `?` is `contains`.
+                    self.clauses.push(format!("${idx} = ANY(a.tags)"));
+                    self.binds.push(serde_json::Value::String(tag.to_string()));
+                }
+            }
+        }
+    }
+
+    fn where_clause(&self) -> String {
+        if self.clauses.is_empty() {
+            "TRUE".to_string()
+        } else {
+            self.clauses.join(" AND ")
+        }
+    }
+
+    fn next_two_slots(&self) -> (usize, usize) {
+        let start = self.binds.len() + 1;
+        (start, start + 1)
+    }
+
+    /// The ordered bindings this builder has collected. The call-site macro
+    /// `bind_all!` walks it and applies every value to the live query via
+    /// repeated `.bind(...)` chain. A function-based helper would need a
+    /// trait exposing `bind` across `Query` / `QueryAs` / `QueryScalar`;
+    /// sqlx does not ship one, so the macro is the lightest shape here.
+    fn binds(&self) -> &[serde_json::Value] {
+        &self.binds
+    }
+}
+
+/// Map an `AssetField` to the aliased column reference the WHERE clause
+/// uses. Every variant has to appear here; a missing arm is a compile
+/// error, which is what makes the enum the allowlist.
+fn column_for(field: AssetField) -> &'static str {
+    match field {
+        AssetField::AssetType => "a.asset_type_id",
+        AssetField::Status => "a.status",
+        AssetField::Company => "a.company_id",
+        AssetField::Site => "a.site_id",
+        AssetField::AssignedUser => "a.assigned_user_id",
+        AssetField::Department => "a.department",
+        AssetField::ItilLifecycleStage => "a.itil_lifecycle_stage",
+        AssetField::WarrantyExpiry => "a.warranty_expiry",
+        AssetField::EndOfLife => "a.end_of_life",
+        AssetField::PurchaseDate => "a.purchase_date",
+        AssetField::InstalledDate => "a.installed_date",
+        AssetField::Tags => "a.tags",
+        AssetField::Manufacturer => "a.manufacturer",
+        AssetField::Model => "a.model",
+        AssetField::LicenseVendor => "a.license_vendor",
+    }
+}
+
+/// Facet counts for a text column. Returns the top 10 non-null values by
+/// count. The IS NOT NULL filter keeps the facet focused on values an
+/// operator can meaningfully pick; absence lives in a separate `IsNull`
+/// pill the SPA offers from the sidebar.
+async fn facet_text_counts(
+    conn: &mut sqlx::PgConnection,
+    base: &SearchWhereBuilder,
+    column: &str,
+    where_clause: &str,
+) -> AppResult<Vec<FacetValueCount>> {
+    let sql = format!(
+        "SELECT {column} AS value, COUNT(*) AS cnt \
+         FROM assets a \
+         WHERE {where_clause} AND {column} IS NOT NULL \
+         GROUP BY {column} \
+         ORDER BY cnt DESC, {column} ASC \
+         LIMIT 10"
+    );
+    let q = sqlx::query_as::<_, (Option<String>, i64)>(&sql);
+    let rows = bind_all!(q, base).fetch_all(&mut *conn).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(v, c)| {
+            v.map(|s| FacetValueCount {
+                value: serde_json::Value::String(s.clone()),
+                label: Some(s),
+                count: c,
+            })
+        })
+        .collect())
+}
+
+/// Facet counts for a UUID column with an optional display label.
+/// `label_expr` is a SELECT fragment that resolves to the human label
+/// (company name, user full name, asset type name) under the LEFT JOIN
+/// `join_clause` adds.
+async fn facet_uuid_counts(
+    conn: &mut sqlx::PgConnection,
+    base: &SearchWhereBuilder,
+    column: &str,
+    label_expr: Option<&str>,
+    join_clause: Option<&str>,
+    where_clause: &str,
+) -> AppResult<Vec<FacetValueCount>> {
+    let select_label = label_expr.unwrap_or("NULL::text");
+    let joins = join_clause.unwrap_or("");
+    let sql = format!(
+        "SELECT {column} AS value, {select_label} AS label, COUNT(*) AS cnt \
+         FROM assets a \
+         {joins} \
+         WHERE {where_clause} AND {column} IS NOT NULL \
+         GROUP BY {column}, {select_label} \
+         ORDER BY cnt DESC \
+         LIMIT 10"
+    );
+    let q = sqlx::query_as::<_, (Option<Uuid>, Option<String>, i64)>(&sql);
+    let rows = bind_all!(q, base).fetch_all(&mut *conn).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, label, c)| {
+            id.map(|u| FacetValueCount {
+                value: serde_json::Value::String(u.to_string()),
+                label,
+                count: c,
+            })
+        })
+        .collect())
 }
