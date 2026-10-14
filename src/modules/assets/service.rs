@@ -253,6 +253,7 @@ impl AssetsService {
                       -- PMS-456: per-CI lifecycle stage. Free-text VARCHAR(50).
                       a.itil_lifecycle_stage,
                       a.license_vendor, a.license_seat_count, a.license_expiry,
+                      a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
@@ -379,6 +380,7 @@ impl AssetsService {
                       a.installed_date, a.department, a.in_transit_ticket_id,
                       a.itil_lifecycle_stage,
                       a.license_vendor, a.license_seat_count, a.license_expiry,
+                      a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
@@ -490,6 +492,214 @@ impl AssetsService {
         };
         // Persist the before -> after diff as a JSON array of {field, old, new}
         // so the asset detail page can show the actual content of the edit.
+        let changes = serde_json::to_value(crate::modules::audit::field_changes(&before, &after))
+            .unwrap_or(serde_json::Value::Null);
+        sqlx::query(
+            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(action)
+        .bind(performer)
+        .bind(changes)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_asset(tenant_id, id).await
+    }
+
+    /// PMS-1487: partial update with explicit null semantics. The SPA's
+    /// inline-edit drawer sends one PATCH per blurred field with ONLY
+    /// the keys it changed; `None` on an outer `Option<Option<T>>`
+    /// means "leave the column untouched", `Some(None)` means "write
+    /// NULL", `Some(Some(v))` means "write v".
+    ///
+    /// Returns the refreshed row + the list of changed field names so
+    /// the SPA can show a precise undo toast. Writes one audit-log
+    /// entry carrying the full before -> after diff, matching the
+    /// shape `update_asset` emits so the audit panel renders both
+    /// surfaces uniformly.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn patch_asset(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        performer: Uuid,
+        request: &PatchAssetRequest,
+    ) -> AppResult<AssetResponse> {
+        let prior = self.get_asset(tenant_id, id).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM assets a WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        // Build a dynamic UPDATE from the keys the request actually sent.
+        // Each present field appends `col = $N` and binds the value.
+        // Nothing-present is a 204-shaped no-op (we still refresh the row
+        // so the client sees the current state).
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Postgres> =
+            sqlx::QueryBuilder::new("UPDATE assets SET ");
+        let mut first = true;
+        let mut touched = false;
+        let push = |qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>,
+                    first: &mut bool,
+                    touched: &mut bool,
+                    col: &str| {
+            if !*first {
+                qb.push(", ");
+            }
+            qb.push(col);
+            qb.push(" = ");
+            *first = false;
+            *touched = true;
+        };
+
+        if let Some(ref v) = request.name {
+            push(&mut qb, &mut first, &mut touched, "name");
+            qb.push_bind(v);
+        }
+        if let Some(v) = request.asset_type_id {
+            push(&mut qb, &mut first, &mut touched, "asset_type_id");
+            qb.push_bind(v);
+        }
+        if let Some(ref v) = request.status {
+            push(&mut qb, &mut first, &mut touched, "status");
+            qb.push_bind(v);
+        }
+        if let Some(ref opt) = request.asset_tag {
+            push(&mut qb, &mut first, &mut touched, "asset_tag");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.site_id {
+            push(&mut qb, &mut first, &mut touched, "site_id");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.contact_id {
+            push(&mut qb, &mut first, &mut touched, "contact_id");
+            qb.push_bind(opt);
+        }
+        if let Some(ref opt) = request.manufacturer {
+            push(&mut qb, &mut first, &mut touched, "manufacturer");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(ref opt) = request.model {
+            push(&mut qb, &mut first, &mut touched, "model");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(ref opt) = request.serial_number {
+            push(&mut qb, &mut first, &mut touched, "serial_number");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.purchase_date {
+            push(&mut qb, &mut first, &mut touched, "purchase_date");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.purchase_price {
+            push(&mut qb, &mut first, &mut touched, "purchase_price");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.warranty_expiry {
+            push(&mut qb, &mut first, &mut touched, "warranty_expiry");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.end_of_life {
+            push(&mut qb, &mut first, &mut touched, "end_of_life");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.assigned_user_id {
+            push(&mut qb, &mut first, &mut touched, "assigned_user_id");
+            qb.push_bind(opt);
+        }
+        if let Some(ref opt) = request.ip_address {
+            // `::inet` cast at write time so a malformed IP surfaces as
+            // 400 at the DB rather than silently writing garbage.
+            push(&mut qb, &mut first, &mut touched, "ip_address");
+            match opt.as_ref() {
+                None => {
+                    qb.push("NULL");
+                }
+                Some(s) => {
+                    qb.push_bind(s.clone());
+                    qb.push("::inet");
+                }
+            }
+        }
+        if let Some(ref opt) = request.hostname {
+            push(&mut qb, &mut first, &mut touched, "hostname");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(ref opt) = request.mac_address {
+            push(&mut qb, &mut first, &mut touched, "mac_address");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.installed_date {
+            push(&mut qb, &mut first, &mut touched, "installed_date");
+            qb.push_bind(opt);
+        }
+        if let Some(ref opt) = request.department {
+            push(&mut qb, &mut first, &mut touched, "department");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.in_transit_ticket_id {
+            push(&mut qb, &mut first, &mut touched, "in_transit_ticket_id");
+            qb.push_bind(opt);
+        }
+        if let Some(ref opt) = request.itil_lifecycle_stage {
+            push(&mut qb, &mut first, &mut touched, "itil_lifecycle_stage");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(ref opt) = request.license_vendor {
+            push(&mut qb, &mut first, &mut touched, "license_vendor");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.license_seat_count {
+            push(&mut qb, &mut first, &mut touched, "license_seat_count");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.license_expiry {
+            push(&mut qb, &mut first, &mut touched, "license_expiry");
+            qb.push_bind(opt);
+        }
+        if let Some(ref tags) = request.tags {
+            push(&mut qb, &mut first, &mut touched, "tags");
+            qb.push_bind(tags);
+        }
+        if let Some(ref opt) = request.notes {
+            push(&mut qb, &mut first, &mut touched, "notes");
+            qb.push_bind(opt.as_ref());
+        }
+
+        if !touched {
+            // Empty body: return the current row without touching anything.
+            // Not an error - a GET-shaped idempotent probe is a legitimate
+            // SPA shape (e.g. "re-fetch after Esc").
+            return self.get_asset(tenant_id, id).await;
+        }
+
+        qb.push(", updated_at = NOW() WHERE tenant_id = ");
+        qb.push_bind(tenant_id);
+        qb.push(" AND id = ");
+        qb.push_bind(id);
+        let n = qb.build().execute(&mut *tx).await?.rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("Asset".to_string()));
+        }
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM assets a WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let action = if request.status.is_some() && request.status.as_ref() != Some(&prior.status) {
+            "status_changed"
+        } else {
+            "updated"
+        };
         let changes = serde_json::to_value(crate::modules::audit::field_changes(&before, &after))
             .unwrap_or(serde_json::Value::Null);
         sqlx::query(
@@ -1242,6 +1452,9 @@ struct AssetRow {
     license_vendor: Option<String>,
     license_seat_count: Option<i32>,
     license_expiry: Option<chrono::NaiveDate>,
+    // PMS-1487: surfaced on the wire for the inline-edit drawer.
+    tags: Option<Vec<String>>,
+    notes: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1277,6 +1490,8 @@ impl From<AssetRow> for AssetResponse {
             license_vendor: r.license_vendor,
             license_seat_count: r.license_seat_count,
             license_expiry: r.license_expiry,
+            tags: r.tags.unwrap_or_default(),
+            notes: r.notes,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }

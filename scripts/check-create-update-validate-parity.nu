@@ -50,7 +50,7 @@ def struct-bodies [source: string] {
 
     for line in ($source | lines) {
         if $current_name == null {
-            let m = ($line | parse --regex '^pub struct (?<name>(?:Create|Update|Upsert)\w*Request)\s*\{')
+            let m = ($line | parse --regex '^pub struct (?<name>(?:Create|Update|Upsert|Patch)\w*Request)\s*\{')
             if not ($m | is-empty) {
                 $current_name = ($m | first | get name)
                 $depth = 1
@@ -172,6 +172,12 @@ def main [] {
         }
     )
 
+    # Updates and patches are each keyed by `X` separately, so a module
+    # that carries BOTH `UpdateXRequest` and `PatchXRequest` compares
+    # both against `CreateXRequest`. A module with only Update (or only
+    # Patch) still compares. Collisions where two different Update
+    # structs share `X` would silently overwrite - avoid by naming each
+    # pair uniquely.
     let updates = (
         $structs
         | where {|s| $s.name | str starts-with 'Update' }
@@ -180,13 +186,26 @@ def main [] {
             $acc | upsert $key $s
         }
     )
+    let patches = (
+        $structs
+        | where {|s| $s.name | str starts-with 'Patch' }
+        | reduce --fold {} {|s, acc|
+            let key = ($s.name | str replace --regex '^Patch' '' | str replace --regex 'Request$' '')
+            $acc | upsert $key $s
+        }
+    )
 
-    let paired = ($updates | columns | where {|k| $k in ($creates | columns) })
+    let paired_updates = ($updates | columns | where {|k| $k in ($creates | columns) })
+    let paired_patches = ($patches | columns | where {|k| $k in ($creates | columns) })
 
     let differences = (
-        $paired
-        | each {|pair| compare-pair $pair ($creates | get $pair) ($updates | get $pair) }
-        | flatten
+        ($paired_updates
+            | each {|pair| compare-pair $pair ($creates | get $pair) ($updates | get $pair) }
+            | flatten)
+        | append
+        ($paired_patches
+            | each {|pair| compare-pair $pair ($creates | get $pair) ($patches | get $pair) }
+            | flatten)
     )
 
     let allowed_keys = ($ALLOWED | each {|a| $'($a.pair).($a.field)' })
@@ -201,11 +220,11 @@ def main [] {
     let stale = ($ALLOWED | where {|a| $'($a.pair).($a.field)' not-in $difference_keys })
 
     if ($violations | is-empty) and ($stale | is-empty) {
-        print $"create/update validate parity OK: ($paired | length) pairs, every same-named field validates identically"
+        print $"create/update validate parity OK: (($paired_updates | length) + ($paired_patches | length)) pairs, every same-named field validates identically"
         return
     }
 
-    print --stderr $"ERROR: a Create*Request and its Update*Request disagree about a field \(PMS-867\). ($paired | length) pairs checked."
+    print --stderr $"ERROR: a Create*Request and its Update*/Patch*Request disagree about a field \(PMS-867\). (($paired_updates | length) + ($paired_patches | length)) pairs checked."
     print --stderr "Copy the create-side #[validate(...)] onto the update field, or add an ALLOWED row"
     print --stderr "in this script stating why the two sides differ on purpose."
 

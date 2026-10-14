@@ -54,7 +54,10 @@ pub fn assets_routes(service: AssetsService, ticket_service: TicketService) -> R
         .route("/assets", get(list_assets).post(create_asset))
         .route(
             "/assets/{id}",
-            get(get_asset).put(update_asset).delete(delete_asset),
+            get(get_asset)
+                .put(update_asset)
+                .patch(patch_asset)
+                .delete(delete_asset),
         )
         // PMS-75 relationships
         .route(
@@ -258,6 +261,25 @@ async fn update_asset(
     req.validate()?;
     Ok(Json(
         s.service.update_asset(u.tenant(), id, u.id, &req).await?,
+    ))
+}
+
+/// PMS-1487: partial update sibling of `PUT /assets/{id}`.
+///
+/// The SPA's inline-edit drawer PATCHes one field at a time on blur;
+/// the body is the subset of `AssetResponse` keys the operator changed.
+/// `null` on the wire clears a nullable column; an omitted key leaves
+/// it untouched. See [`PatchAssetRequest`]'s doc for the three-state
+/// semantics.
+async fn patch_asset(
+    State(s): State<AssetsRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    Path(id): Path<Uuid>,
+    Json(req): Json<PatchAssetRequest>,
+) -> AppResult<Json<AssetResponse>> {
+    req.validate()?;
+    Ok(Json(
+        s.service.patch_asset(u.tenant(), id, u.id, &req).await?,
     ))
 }
 
