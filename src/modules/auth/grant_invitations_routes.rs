@@ -479,7 +479,13 @@ async fn cancel_invitation(
 ) -> AppResult<StatusCode> {
     // SAFETY (PMS-285): no RLS on `mokosh_grant_invitations`; cancel's UPDATE
     // keys on (id, tenant_id = caller.tenant_id) from `RequireAdminUser`.
-    let ok = GrantInvitationsService::cancel(state.db.pool(), id, caller.tenant_id).await?;
+    let ok = GrantInvitationsService::cancel(
+        state.db.pool(),
+        id,
+        caller.tenant_id,
+        state.bunyip_directory.as_deref(),
+    )
+    .await?;
     // Idempotent shape: whether we moved a pending row or found
     // none to move, answer 204. The endpoint is enumeration-
     // resistant because the WHERE clause on the UPDATE names both

@@ -257,21 +257,55 @@ impl GrantInvitationsService {
     /// NOT distinguish "unknown id" from "wrong tenant" - both
     /// return `Ok(false)` so the endpoint stays enumeration-
     /// resistant against a leaked or stale id.
-    pub async fn cancel(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> AppResult<bool> {
-        let rows = sqlx::query(
+    ///
+    /// PMS-1486: a pending invitation may already have lost an
+    /// accept/cancel race to a concurrent `accept` that registered
+    /// the grant on Bunyip before this UPDATE committed (`accept`
+    /// registers before its own local UPDATE, by design - see that
+    /// method's doc comment). This always attempts the Bunyip revoke
+    /// in SaaS mode when the local cancel actually moved the row,
+    /// rather than trying to first determine whether a registration
+    /// happened: `unregister_grant` treats "nothing registered" (404)
+    /// and "revoked" as the same success, so the always-attempt shape
+    /// is also the simplest correct one. A revoke failure here is
+    /// logged, not propagated: the local cancel already committed,
+    /// and turning that into a 500 would not undo it.
+    pub async fn cancel(
+        pool: &PgPool,
+        id: Uuid,
+        tenant_id: Uuid,
+        bunyip_directory: Option<&super::bunyip_directory::BunyipUserDirectory>,
+    ) -> AppResult<bool> {
+        let canceled: Option<(Uuid,)> = sqlx::query_as(
             r#"
             UPDATE mokosh_grant_invitations
             SET status = 'canceled',
                 canceled_at = NOW(),
                 updated_at = NOW()
             WHERE id = $1 AND tenant_id = $2 AND status = 'pending'
+            RETURNING inviter_bunyip_user_id
             "#,
         )
         .bind(id)
         .bind(tenant_id)
-        .execute(pool)
+        .fetch_optional(pool)
         .await?;
-        Ok(rows.rows_affected() == 1)
+
+        let Some((inviter_bunyip_user_id,)) = canceled else {
+            return Ok(false);
+        };
+
+        if let Some(directory) = bunyip_directory {
+            if let Err(e) = directory.unregister_grant(id, inviter_bunyip_user_id).await {
+                tracing::error!(
+                    error = %e,
+                    invitation_id = %id,
+                    "failed to revoke the bunyip grant on cancel; the grant may be orphaned"
+                );
+            }
+        }
+
+        Ok(true)
     }
 
     /// Grantee accepts. Runs one transaction: verifies the token
@@ -395,6 +429,35 @@ impl GrantInvitationsService {
             let refreshed = Self::find_by_token(pool, token)
                 .await?
                 .ok_or(AppError::internal("Invitation vanished during accept"))?;
+
+            // PMS-1486: the `register_grant` call above already wrote
+            // an active row into Bunyip's `mokosh_account_grants`
+            // before we lost this race (most commonly to a concurrent
+            // `cancel`). Nothing else undoes that row - `cancel`
+            // itself never called Bunyip, and a retry from the
+            // grantee is refused at the top of this function before
+            // it ever reaches here - so this is the only place left
+            // that can heal the orphan. Skip the revoke when another
+            // accept won the race (`refreshed.status == "accepted"`):
+            // that caller's own `register_grant` call landed the same
+            // row this one did (idempotent `ON CONFLICT (id) DO
+            // UPDATE` on Bunyip's side), so the grant is legitimately
+            // active and must not be torn down.
+            if refreshed.status != "accepted" {
+                if let Some(directory) = bunyip_directory {
+                    if let Err(e) = directory
+                        .unregister_grant(invitation.id, owner_bunyip_user_id_fallback)
+                        .await
+                    {
+                        tracing::error!(
+                            error = %e,
+                            invitation_id = %invitation.id,
+                            "failed to revoke the bunyip grant after losing the accept race; the grant is orphaned"
+                        );
+                    }
+                }
+            }
+
             return Ok(Err(match refreshed.status.as_str() {
                 "canceled" => AcceptRefusal::Canceled,
                 "accepted" => AcceptRefusal::AlreadyAccepted,
