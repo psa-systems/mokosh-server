@@ -223,6 +223,18 @@ async fn create_invitation(
     if invitee_email.is_none() {
         return Err(AppError::validation_required("invitee_email"));
     }
+    // PMS-1487: the column is the mailer's recipient address, so a value
+    // that cannot even shape-check as an email (e.g. a stringified
+    // Bunyip id passed through this field by mistake) is refused here
+    // rather than persisted and handed to the dispatcher.
+    if let Some(em) = invitee_email {
+        if crate::utils::validation::validate_email(em).is_err() {
+            return Err(AppError::validation_field(
+                "invitee_email",
+                "must be a valid email address",
+            ));
+        }
+    }
     // Refuse a self-invite by verified address. The id-based CHECK
     // constraint covers the id path; this covers the email-only
     // path when the caller's own address matches.

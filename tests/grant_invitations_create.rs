@@ -54,6 +54,37 @@ async fn id_only_body_is_rejected(pool: PgPool) {
 }
 
 #[mokosh_test]
+async fn a_uuid_shaped_invitee_email_is_rejected(pool: PgPool) {
+    let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &admin_email, &admin_pw).await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/v1/grants/invitations"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "invitee_email": Uuid::new_v4().to_string(),
+            "role": "admin",
+        }))
+        .send()
+        .await
+        .expect("create invitation");
+
+    assert!(
+        resp.status().is_client_error(),
+        "a UUID-shaped invitee_email should be rejected; got {}",
+        resp.status()
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM mokosh_grant_invitations")
+        .fetch_one(&pool)
+        .await
+        .expect("count invitations");
+    assert_eq!(count, 0, "no row should have been persisted");
+}
+
+#[mokosh_test]
 async fn email_only_body_still_succeeds(pool: PgPool) {
     let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
