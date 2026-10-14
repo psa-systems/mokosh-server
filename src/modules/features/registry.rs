@@ -47,17 +47,25 @@ pub enum Feature {
     /// `tenant_hostnames`: it names real work, it is honest that it gates
     /// nothing today, and flipping it cannot break anything while that is true.
     IntegrationsOverview,
+    /// Asset catalog (PMS-1488). Hides the `/asset-models`, `/asset-templates`,
+    /// `/assets/bulk-create` and `/asset-models/signature-detector` routes
+    /// behind this switch while the SPA half (catalog picker + bulk-create
+    /// modal + signature banner, MAPPS-xxxx) is being built. Flipping it on
+    /// makes the routes serve; flipping it off makes them 404. The existing
+    /// `POST /api/v1/assets` single-asset create is unaffected either way.
+    AssetsCatalog,
 }
 
 impl Feature {
     /// Every registered feature, in admin-page order.
-    pub const ALL: &'static [Feature] = &[Feature::IntegrationsOverview];
+    pub const ALL: &'static [Feature] = &[Feature::IntegrationsOverview, Feature::AssetsCatalog];
 
     /// The stable key: the `feature_toggles.key` value and the wire name. Never
     /// rename one; see the module docs.
     pub const fn key(self) -> &'static str {
         match self {
             Feature::IntegrationsOverview => "integrations_overview",
+            Feature::AssetsCatalog => "assets_catalog",
         }
     }
 
@@ -65,6 +73,7 @@ impl Feature {
     pub const fn label(self) -> &'static str {
         match self {
             Feature::IntegrationsOverview => "Integrations overview",
+            Feature::AssetsCatalog => "Asset catalog + templates + bulk create",
         }
     }
 
@@ -76,6 +85,14 @@ impl Feature {
                 "The Settings page listing what this organization delegates to other systems. \
                  Nothing reads this switch yet, so flipping it changes nothing today."
             }
+            Feature::AssetsCatalog => {
+                "The per-tenant device-model catalog, asset templates, bulk create (fan N \
+                 assets out from one template + a list of serials), and the \"you have 7 \
+                 identical Dell Latitudes - save as a template?\" banner on the Assets list. \
+                 Off: all four routes answer 404 and the Create / Assets pages render the \
+                 pre-catalog shape. On: the SPA renders the catalog picker + bulk modal + \
+                 signature banner."
+            }
         }
     }
 
@@ -84,6 +101,7 @@ impl Feature {
     pub const fn issue(self) -> &'static str {
         match self {
             Feature::IntegrationsOverview => "MAPPS-971",
+            Feature::AssetsCatalog => "PMS-1488",
         }
     }
 

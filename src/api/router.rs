@@ -302,6 +302,9 @@ pub fn create_api_router(
         spa_base_url.clone(),
     );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
+    // PMS-1488: asset catalog + templates + bulk create + signature detector.
+    // Gated on the `assets_catalog` feature toggle inside the router.
+    let asset_catalog_service = crate::modules::assets::AssetCatalogService::new(db.clone());
     // PMS-1129: an @mention in a KB comment notifies through the queue.
     let kb_service = KbService::new(db.clone()).with_notifications(notifications_service.clone());
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
@@ -608,6 +611,12 @@ pub fn create_api_router(
         // `POST /assets/{id}/report-issue` endpoint can create the
         // linked ticket through the shared portal-ticket path.
         .merge(assets_routes(assets_service, ticket_service.clone()))
+        // PMS-1488: catalog + templates + bulk-create + signature detector.
+        // Four mounts, all gated on `assets_catalog` inside the handlers.
+        .merge(crate::modules::assets::asset_catalog_routes(
+            asset_catalog_service.clone(),
+            features.clone(),
+        ))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
         // PMS-923: images an article embeds. Upload / list / delete are

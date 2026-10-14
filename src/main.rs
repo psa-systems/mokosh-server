@@ -913,6 +913,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     scheduler.register(dispatcher, std::time::Duration::from_secs(5));
     scheduler.register(rmm_worker, std::time::Duration::from_secs(60));
 
+    // PMS-1488: refresh the asset-signature-detector MV every 60s so
+    // the Assets-list banner reflects "last 7 days of creates" within
+    // one tick of the final matching INSERT. Idempotent REFRESH; a
+    // failed tick logs + skips so the banner keeps its last snapshot.
+    scheduler.register(
+        mokosh_server::modules::assets::AssetCatalogSignatureRefresh::new(db.clone()),
+        std::time::Duration::from_secs(
+            mokosh_server::modules::assets::catalog_refresh_job::REFRESH_INTERVAL_SECS,
+        ),
+    );
+
     // PMS-1215: Google Contacts import runs. Every 60s the worker resumes runs
     // whose process died, queues connections past their interval, and drains
     // the queue; the request that starts an import only inserts a row, so a
