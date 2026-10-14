@@ -62,12 +62,14 @@ pub struct GrantInvitationsState {
     pub bunyip_directory: Option<Arc<BunyipUserDirectory>>,
 }
 
-/// POST body for `POST /api/v1/grants/invitations`. Either
-/// `invitee_bunyip_user_id` or `invitee_email` MUST be present;
-/// email is the friendlier admin path, id is the machine one. The
-/// service takes both because a SaaS-mode caller resolved the id
-/// through bunyip already, while a standalone-mode caller has only
-/// the address.
+/// POST body for `POST /api/v1/grants/invitations`. `invitee_email`
+/// MUST be present on every call (PMS-1487: it is the only field
+/// persisted into `mokosh_grant_invitations.invitee_email` and read
+/// back as the mailer's recipient, so an id with no address has
+/// nothing to resolve it server-side). `invitee_bunyip_user_id` is
+/// optional and additive: a SaaS-mode caller that already resolved
+/// the invitee's id through bunyip may pass it alongside the email
+/// to skip the directory lookup below.
 #[derive(Debug, Deserialize)]
 pub struct CreateInvitationRequest {
     #[serde(default)]
@@ -217,10 +219,8 @@ async fn create_invitation(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    if body.invitee_bunyip_user_id.is_none() && invitee_email.is_none() {
-        return Err(AppError::BadRequest(
-            "Provide either invitee_bunyip_user_id or invitee_email.".to_string(),
-        ));
+    if invitee_email.is_none() {
+        return Err(AppError::validation_required("invitee_email"));
     }
     // Refuse a self-invite by verified address. The id-based CHECK
     // constraint covers the id path; this covers the email-only
@@ -284,9 +284,7 @@ async fn create_invitation(
     // The service's create returns Conflict on the partial-UNIQUE
     // trip; the "already an active grant" pre-check runs here so
     // the two 409s are named separately.
-    let addr = invitee_email
-        .map(str::to_string)
-        .unwrap_or_else(|| body.invitee_bunyip_user_id.unwrap().to_string());
+    let addr = invitee_email.unwrap();
     let resolved_invitee_id = body.invitee_bunyip_user_id.or(invitee_id_from_directory);
     let CreatedInvitation {
         invitation,
