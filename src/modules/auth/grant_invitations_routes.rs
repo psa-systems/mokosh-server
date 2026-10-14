@@ -18,11 +18,12 @@
 //! when it is present or falling back to the token's stored
 //! invitee id.
 
+use crate::utils::json::Json;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     routing::{delete, get, post},
-    Json, Router,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
