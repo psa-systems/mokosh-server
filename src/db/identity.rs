@@ -238,7 +238,7 @@ impl MembershipRepo {
         // how it reads a revoked grant.
         let grant_rows: Vec<(Uuid, Option<Uuid>, Uuid, String, String, String, String)> =
             sqlx::query_as(
-            r#"
+                r#"
             SELECT g.id, g.bunyip_grant_id, t.id AS tenant_id, t.name, t.slug, t.kind, g.role
             FROM mokosh_bunyip_grants g
             JOIN tenants t ON t.slug = g.mokosh_account_id
@@ -264,11 +264,11 @@ impl MembershipRepo {
               )
             ORDER BY g.granted_at ASC
             "#,
-        )
-        .bind(identity_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+            )
+            .bind(identity_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
 
         let mut views: Vec<mokosh_types::auth::MembershipView> = grant_rows
             .into_iter()
