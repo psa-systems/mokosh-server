@@ -33,12 +33,23 @@ pub struct AssetsRouterState {
     /// keep call sites that only exercise the assets surface (unit
     /// tests, seed) trivially constructible.
     pub ticket_service: Option<Arc<TicketService>>,
+    /// PMS-1486: the feature-toggle snapshot gates the new search
+    /// routes. The handler reads `assets_search_v2`; off => 404
+    /// before any DB round trip. Optional so test-rig call sites that
+    /// do not exercise the search can leave it `None` (snapshot
+    /// defaults to all-features-off, which produces the same 404).
+    pub features: Option<crate::modules::features::FeatureSnapshot>,
 }
 
-pub fn assets_routes(service: AssetsService, ticket_service: TicketService) -> Router {
+pub fn assets_routes(
+    service: AssetsService,
+    ticket_service: TicketService,
+    features: crate::modules::features::FeatureSnapshot,
+) -> Router {
     let state = AssetsRouterState {
         service: Arc::new(service),
         ticket_service: Some(Arc::new(ticket_service)),
+        features: Some(features),
     };
     Router::new()
         // PMS-73 asset types
@@ -52,6 +63,18 @@ pub fn assets_routes(service: AssetsService, ticket_service: TicketService) -> R
         )
         // PMS-74 assets
         .route("/assets", get(list_assets).post(create_asset))
+        // PMS-1486: structured-filter search + the sidebar facet counts.
+        // Both gated on the `assets_search_v2` feature toggle; off => 404.
+        // The POST body carries the filter shape rather than the query
+        // string so the SPA's pill set can grow without a URL-length cap.
+        .route(
+            "/assets/search",
+            axum::routing::post(search_assets_structured),
+        )
+        .route(
+            "/assets/search/facets",
+            axum::routing::post(asset_facets_structured),
+        )
         .route(
             "/assets/{id}",
             get(get_asset).put(update_asset).delete(delete_asset),
@@ -641,4 +664,102 @@ async fn report_asset_issue(
             .await?;
         Ok(Json(refreshed))
     }
+}
+
+// -- PMS-1486 search handlers ---------------------------------------------
+
+/// Validate every (field, op, values) triple against the vocab in
+/// `models.rs`. The service trusts what it is handed and will emit SQL
+/// that misbinds on an illegal pair; the handler is where the pair is
+/// refused with a 422 naming the field.
+fn validate_search_request(req: &AssetSearchRequest) -> AppResult<()> {
+    for (i, f) in req.filters.iter().enumerate() {
+        let legal = match (f.field, f.op) {
+            // ContainsTag is Tags-only.
+            (AssetField::Tags, FacetOp::ContainsTag) => true,
+            (AssetField::Tags, _) => false,
+            (_, FacetOp::ContainsTag) => false,
+            // IsNull / IsNotNull take no values; anything with values is a bug.
+            (_, FacetOp::IsNull) | (_, FacetOp::IsNotNull) => f.values.is_empty(),
+            // Within is a {days: N} object on date fields only.
+            (
+                AssetField::WarrantyExpiry
+                | AssetField::EndOfLife
+                | AssetField::PurchaseDate
+                | AssetField::InstalledDate,
+                FacetOp::Within,
+            ) => f
+                .values
+                .first()
+                .and_then(|v| v.get("days"))
+                .and_then(|v| v.as_i64())
+                .is_some(),
+            (_, FacetOp::Within) => false,
+            // Before / After on dates only.
+            (
+                AssetField::WarrantyExpiry
+                | AssetField::EndOfLife
+                | AssetField::PurchaseDate
+                | AssetField::InstalledDate,
+                FacetOp::Before | FacetOp::After,
+            ) => f.values.len() == 1,
+            (_, FacetOp::Before | FacetOp::After) => false,
+            // Eq / In / NotIn: at least one value.
+            (_, FacetOp::Eq) => f.values.len() == 1,
+            (_, FacetOp::In | FacetOp::NotIn) => !f.values.is_empty(),
+        };
+        if !legal {
+            return Err(AppError::validation_field(
+                format!("filters[{i}]"),
+                "field + op combination is not supported for this facet",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_search_v2(state: &AssetsRouterState) -> AppResult<()> {
+    let on = state
+        .features
+        .as_ref()
+        .is_some_and(|s| s.is_enabled(crate::modules::features::registry::Feature::AssetsSearchV2));
+    if on {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(
+            "This endpoint is not enabled on this deployment".to_string(),
+        ))
+    }
+}
+
+async fn search_assets_structured(
+    State(s): State<AssetsRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    Query(pagination): Query<PaginationParams>,
+    Json(req): Json<AssetSearchRequest>,
+) -> AppResult<Json<PaginatedResponse<AssetResponse>>> {
+    require_search_v2(&s)?;
+    req.validate()?;
+    validate_search_request(&req)?;
+    pagination.reject_unsupported_sort()?;
+    let tenant = u.tenant();
+    let (items, total) = s.service.search_assets(tenant, &req, &pagination).await?;
+    Ok(Json(PaginatedResponse::from_params(
+        items,
+        &pagination,
+        total,
+    )))
+}
+
+async fn asset_facets_structured(
+    State(s): State<AssetsRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    Json(req): Json<AssetSearchRequest>,
+) -> AppResult<Json<AssetFacetsResponse>> {
+    require_search_v2(&s)?;
+    req.validate()?;
+    validate_search_request(&req)?;
+    let tenant = u.tenant();
+    let resp = s.service.asset_facets(tenant, &req).await?;
+    Ok(Json(resp))
 }
