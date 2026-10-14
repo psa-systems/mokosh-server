@@ -299,7 +299,7 @@ async fn create_invitation(
         caller.tenant_id,
         caller.id,
         resolved_invitee_id,
-        &addr,
+        addr,
         body.role.trim(),
         DEFAULT_TTL,
     )
