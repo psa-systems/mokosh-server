@@ -2321,7 +2321,14 @@ impl TenantService {
                                  -- Google Contacts import keeps failing.
                                  -- Seeded for the default tenant by migration
                                  -- 229, which also backfills older tenants.
-                                 'contact_sync.failing')
+                                 'contact_sync.failing',
+                                 -- PMS-1208: Cloudflare-style pending invite
+                                 -- for cross-account grants. Seeded for the
+                                 -- default tenant by migration 268; copied
+                                 -- here so a tenant created from now on can
+                                 -- send an invitation email when the owner
+                                 -- shares their account.
+                                 'auth.mokosh_grant_invite')
             "#,
         )
         .bind(new_tenant_id)
@@ -2379,7 +2386,11 @@ impl TenantService {
                                    -- above and not its rule, so a tenant
                                    -- created since never sent that mail.
                                    'portal.access_requested',
-                                   'contact_sync.failing')
+                                   'contact_sync.failing',
+                                   -- PMS-1208: pair the invitation template
+                                   -- above with its rule. A template with no
+                                   -- rule is a message that is never sent.
+                                   'auth.mokosh_grant_invite')
             "#,
         )
         .bind(new_tenant_id)
