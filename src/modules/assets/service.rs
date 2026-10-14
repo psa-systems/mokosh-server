@@ -392,6 +392,7 @@ impl AssetsService {
                       a.installed_date, a.department, a.in_transit_ticket_id,
                       a.itil_lifecycle_stage,
                       a.license_vendor, a.license_seat_count, a.license_expiry,
+                      a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
