@@ -88,6 +88,14 @@ pub struct AssetResponse {
     pub license_vendor: Option<String>,
     pub license_seat_count: Option<i32>,
     pub license_expiry: Option<NaiveDate>,
+    /// PMS-1487: free-text tags surfaced here so the inline-edit drawer
+    /// round-trips the chip editor. `#[serde(default)]` keeps the wire
+    /// shape backward-compatible for clients pinned to an older response.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// PMS-1487: free-text note surfaced for the inline markdown editor.
+    #[serde(default)]
+    pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -375,6 +383,101 @@ pub struct UpdateAssetRequest {
     #[validate(range(min = 0))]
     pub license_seat_count: Option<i32>,
     pub license_expiry: Option<NaiveDate>,
+}
+
+/// PMS-1487: partial-update body for `PATCH /api/v1/assets/{id}`.
+///
+/// Three states per nullable field, which is what the SPA drawer needs:
+/// 1. Key absent         → `None`                   → leave column untouched.
+/// 2. Key present + `null` → `Some(None)`           → write NULL.
+/// 3. Key present + value  → `Some(Some(value))`    → write value.
+///
+/// `#[serde(default)]` gives state 1. `deserialize_with = "double_option"`
+/// gives states 2 and 3: without it, a `null` on the wire would also
+/// deserialise to the outer `None` (a known serde pitfall; the ticket-
+/// templates module carries the same helper for the same reason).
+///
+/// Validation attributes mirror `CreateAssetRequest`'s so a value rejected
+/// at create time is also rejected on patch; the `check-create-update-validate-
+/// parity` guard refuses a mismatch between the two.
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct PatchAssetRequest {
+    #[serde(default, deserialize_with = "double_option")]
+    pub asset_tag: Option<Option<String>>,
+    #[validate(length(min = 1, max = 255))]
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub asset_type_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub site_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub contact_id: Option<Option<Uuid>>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub manufacturer: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub serial_number: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub purchase_date: Option<Option<NaiveDate>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub purchase_price: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub warranty_expiry: Option<Option<NaiveDate>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub end_of_life: Option<Option<NaiveDate>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub assigned_user_id: Option<Option<Uuid>>,
+    #[validate(length(max = 45))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub ip_address: Option<Option<String>>,
+    #[validate(length(max = 255))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub hostname: Option<Option<String>>,
+    #[validate(length(max = 50))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub mac_address: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub installed_date: Option<Option<NaiveDate>>,
+    #[validate(length(max = 100))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub department: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub in_transit_ticket_id: Option<Option<Uuid>>,
+    #[validate(length(max = 50))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub itil_lifecycle_stage: Option<Option<String>>,
+    #[validate(length(max = 150))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub license_vendor: Option<Option<String>>,
+    #[validate(range(min = 0))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub license_seat_count: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub license_expiry: Option<Option<NaiveDate>>,
+    /// Full replacement when present: the SPA chip editor sends the entire
+    /// new list on commit. `None` leaves tags untouched; `Some(vec![])`
+    /// clears them.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Free-text; `Some(None)` clears, `None` leaves untouched.
+    #[serde(default, deserialize_with = "double_option")]
+    pub notes: Option<Option<String>>,
+}
+
+/// `#[serde(deserialize_with = ...)]` helper that makes `Option<Option<T>>`
+/// actually distinguish absent from null: a `null` on the wire becomes
+/// `Some(None)`, a value becomes `Some(Some(v))`, and an absent key stays
+/// `None` via the `default`. Mirrors the shape in `ticket_templates/models.rs`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Clone, Serialize)]
