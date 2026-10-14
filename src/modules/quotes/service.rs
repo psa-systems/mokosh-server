@@ -783,13 +783,9 @@ impl QuotesService {
             None => (DeliveryMethod::Email, None),
         };
         if method == DeliveryMethod::Other && note.is_none() {
-            return Err(AppError::validation(
-                "describe how the quote was delivered",
-                vec![crate::utils::error::FieldError::new(
-                    "delivery.note",
-                    "A note describing the delivery is required when `method` is `other`.",
-                    "required",
-                )],
+            return Err(AppError::validation_field(
+                "delivery.note",
+                "a note describing the delivery is required when `method` is `other`",
             ));
         }
 
