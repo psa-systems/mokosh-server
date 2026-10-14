@@ -661,7 +661,11 @@ pub fn create_api_router(
         // PMS-936: also carries a `TicketService` clone so the
         // `POST /assets/{id}/report-issue` endpoint can create the
         // linked ticket through the shared portal-ticket path.
-        .merge(assets_routes(assets_service, ticket_service.clone()))
+        .merge(assets_routes(
+            assets_service,
+            ticket_service.clone(),
+            features.clone(),
+        ))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
         // PMS-923: images an article embeds. Upload / list / delete are

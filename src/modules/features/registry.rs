@@ -47,17 +47,24 @@ pub enum Feature {
     /// `tenant_hostnames`: it names real work, it is honest that it gates
     /// nothing today, and flipping it cannot break anything while that is true.
     IntegrationsOverview,
+    /// Asset search v2 (PMS-1486). Hides the `POST /api/v1/assets/search` +
+    /// `GET /api/v1/assets/search/facets` routes behind this switch while the
+    /// SPA half (MAPPS-xxxx pill-based filter builder) is being built. Flipping
+    /// it on makes the routes serve; flipping it off makes them 404. The
+    /// existing `GET /api/v1/assets?q=` is unaffected either way.
+    AssetsSearchV2,
 }
 
 impl Feature {
     /// Every registered feature, in admin-page order.
-    pub const ALL: &'static [Feature] = &[Feature::IntegrationsOverview];
+    pub const ALL: &'static [Feature] = &[Feature::IntegrationsOverview, Feature::AssetsSearchV2];
 
     /// The stable key: the `feature_toggles.key` value and the wire name. Never
     /// rename one; see the module docs.
     pub const fn key(self) -> &'static str {
         match self {
             Feature::IntegrationsOverview => "integrations_overview",
+            Feature::AssetsSearchV2 => "assets_search_v2",
         }
     }
 
@@ -65,6 +72,7 @@ impl Feature {
     pub const fn label(self) -> &'static str {
         match self {
             Feature::IntegrationsOverview => "Integrations overview",
+            Feature::AssetsSearchV2 => "Asset search v2",
         }
     }
 
@@ -76,6 +84,13 @@ impl Feature {
                 "The Settings page listing what this organization delegates to other systems. \
                  Nothing reads this switch yet, so flipping it changes nothing today."
             }
+            Feature::AssetsSearchV2 => {
+                "The structured-filter asset search (POST /api/v1/assets/search) and its \
+                 companion facets endpoint. Off: both routes answer 404 and the Assets list \
+                 keeps its single search box. On: the SPA renders the pill-based filter bar \
+                 and the routes serve. The existing GET /api/v1/assets?q= stays available in \
+                 both states."
+            }
         }
     }
 
@@ -84,6 +99,7 @@ impl Feature {
     pub const fn issue(self) -> &'static str {
         match self {
             Feature::IntegrationsOverview => "MAPPS-971",
+            Feature::AssetsSearchV2 => "PMS-1486",
         }
     }
 
