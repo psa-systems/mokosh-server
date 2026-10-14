@@ -20,6 +20,9 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 - [`ALLOW_UNINVITED_BUNYIP_SIGNUP`](#var-allow-uninvited-bunyip-signup) (Required: no) - Optional, off by default. Set `true` only where uninvited Bunyip sign-up is wanted (staging). (PMS-1457)
 - [`APP_SECRET_BACKEND`](#var-app-secret-backend) (Required: no) - Optional. Selects where application-tier secrets live; unset keeps the hosting profile's default. (PMS-1424)
+- [`BUNYIP_API_BASE_URL`](#var-bunyip-api-base-url) (Required: no) - Optional. Set all three to let mokosh-server look invitees up on Bunyip's `/v1/users/lookup` when creating a grant invitation; unset means standalone-mode shape (email-only invite). (PMS-1208)
+- [`BUNYIP_DIRECTORY_CLIENT_ID`](#var-bunyip-directory-client-id) (Required: no) - Optional. Set all three to let mokosh-server look invitees up on Bunyip's `/v1/users/lookup` when creating a grant invitation; unset means standalone-mode shape (email-only invite). (PMS-1208)
+- [`BUNYIP_DIRECTORY_CLIENT_SECRET`](#var-bunyip-directory-client-secret) (Required: no) - Optional. Set all three to let mokosh-server look invitees up on Bunyip's `/v1/users/lookup` when creating a grant invitation; unset means standalone-mode shape (email-only invite). (PMS-1208)
 
 #### Changed
 
@@ -274,6 +277,9 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-google-oauth-client-secret"></a>`GOOGLE_OAUTH_CLIENT_SECRET` | no | v0.2.0; removed in v0.14.0 | nowhere | Client secret of the retired Google sign-in routes (PMS-837). |
 | <a id="var-google-oauth-redirect-uri"></a>`GOOGLE_OAUTH_REDIRECT_URI` | no | v0.2.0; removed in v0.14.0 | nowhere | Redirect URI of the retired Google sign-in routes (PMS-837). |
 | <a id="var-oauth-super-admin-emails"></a>`OAUTH_SUPER_ADMIN_EMAILS` | no | v0.3.0; removed in v0.14.0 | nowhere | Super-admin allowlist only the retired Google sign-in read (PMS-837). |
+| <a id="var-bunyip-api-base-url"></a>`BUNYIP_API_BASE_URL` | no | v0.16.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-bunyip-directory-client-id"></a>`BUNYIP_DIRECTORY_CLIENT_ID` | no | v0.16.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-bunyip-directory-client-secret"></a>`BUNYIP_DIRECTORY_CLIENT_SECRET` | no | v0.16.0 | `.env` | Not described yet: say what it does. |
 
 ## Development stack variables
 

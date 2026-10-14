@@ -54,7 +54,19 @@ use sqlx::PgPool;
 ///   Decided in migration `154_tenant_membership_entitlements.sql`'s header
 ///   (MAPPS-459 / PMS-728) and restated at the call site; PMS-1040 moved it here
 ///   because a rule recorded only in prose is not a rule.
-const ALLOWED_WITHOUT_RLS: &[&str] = &["tenant_membership_entitlements"];
+/// * `mokosh_grant_invitations` - PMS-1208 pending-invite table. Carries a
+///   `tenant_id` on the owner side but three of its five route handlers read
+///   it cross-tenant: the grantee inbox at
+///   `GET /api/v1/my-grants/invitations` scopes by `invitee_bunyip_user_id`,
+///   and the by-token metadata + accept + decline paths at
+///   `/api/v1/grants/invitations/by-token/{token}` scope by the hashed
+///   accept token (the token IS the credential and no caller tenant is in
+///   scope). An RLS policy keyed on `app.current_tenant` would fail-close
+///   each of those to zero rows. The service pins scope in the WHERE
+///   clause instead; `grant_invitations_routes.rs` carries a
+///   `// SAFETY (PMS-285)` note above every bare `.pool()` call.
+const ALLOWED_WITHOUT_RLS: &[&str] =
+    &["mokosh_grant_invitations", "tenant_membership_entitlements"];
 
 /// Tables with NO `tenant_id` column that legitimately carry no
 /// `tenant_isolation` policy. Keep sorted; every entry states its reason.

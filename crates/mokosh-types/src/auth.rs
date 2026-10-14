@@ -189,6 +189,20 @@ pub struct MembershipView {
     /// pinned to an older `mokosh-types` still deserializes the payload.
     #[serde(default)]
     pub mokosh_bunyip_grant_id: Option<Uuid>,
+    /// PMS-1208 finding 4: `Some(bunyip_grant_id)` alongside the
+    /// mokosh mirror id above whenever the row came from a mirror.
+    /// This is the id bunyip's `mokosh_account_grants` table holds
+    /// (the source-of-truth primary key), NOT the mokosh-side mirror
+    /// `id`. The SPA sends this to bunyip's
+    /// `POST /v1/grants/{id}/access-token` to mint a grant-scoped
+    /// at+jwt when the operator switches into the granted account.
+    /// The two ids are separate columns on the mirror row (see
+    /// `mokosh_bunyip_grants.id` vs `mokosh_bunyip_grants.bunyip_grant_id`)
+    /// and cannot be reconciled to one because `DELETE
+    /// /api/v1/my-grants/{id}` keys on the mokosh mirror id while
+    /// bunyip's mint endpoint keys on its own.
+    #[serde(default)]
+    pub bunyip_grant_id: Option<Uuid>,
 }
 
 /// Current authenticated user state

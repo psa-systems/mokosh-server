@@ -529,7 +529,16 @@ mod tests {
                 .map(|l| l.split("--").next().unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join("\n");
-            for created in code.split("create table").skip(1) {
+            // Prepend a sentinel newline so a statement at the very start
+            // of the file still splits on the newline-anchored patterns
+            // below (PMS-1208 regression: a table name containing the
+            // substring `_grant_` ate the naive `.split("grant")` from
+            // both sides and left the real GRANT statement unmatched;
+            // the fix is to split on word-bounded "\ngrant" so the
+            // inner occurrence inside the identifier does not divide
+            // the real statement).
+            let padded = format!("\n{code}");
+            for created in padded.split("\ncreate table ").skip(1) {
                 let table = created
                     .trim_start()
                     .trim_start_matches("if not exists")
@@ -539,7 +548,13 @@ mod tests {
                     .unwrap_or_default()
                     .trim_start_matches("public.")
                     .to_string();
-                let granted = code.split("grant").skip(1).any(|g| {
+                // Word-bounded split: " grant " (ascii-lowercased), so
+                // the "grant" INSIDE a table identifier like
+                // `mokosh_grant_invitations` does not split. GRANTs
+                // always have a space after "grant" in valid SQL, and
+                // the padded leading newline above handles the file-
+                // start case.
+                let granted = padded.split("\ngrant ").skip(1).any(|g| {
                     let statement = g.split(';').next().unwrap_or_default();
                     statement.contains("to mokosh_app")
                         && (statement.contains(&format!(" {table} "))

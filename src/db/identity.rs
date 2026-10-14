@@ -106,24 +106,6 @@ pub struct MembershipRow {
 
 pub struct MembershipRepo;
 
-/// PMS-1393: the seven columns [`MembershipRepo::list_views_for_identity`] reads,
-/// named.
-///
-/// A struct rather than a tuple because six of the seven are `String` or `Uuid`:
-/// a reordered SELECT still compiles and binds the wrong value to the wrong
-/// name, which `FromRow`'s match on column NAME makes impossible rather than
-/// unlikely. It is also what clippy's `type_complexity` asks for at seven.
-#[derive(sqlx::FromRow)]
-struct MembershipViewRow {
-    tenant_id: Uuid,
-    name: String,
-    slug: String,
-    kind: String,
-    role: String,
-    status: String,
-    grant_id: Option<Uuid>,
-}
-
 impl MembershipRepo {
     /// Every active membership for an identity, ordered by joined_at so
     /// the picker in phase 3 renders "your longest-standing tenant first".
@@ -222,20 +204,108 @@ impl MembershipRepo {
         identity_id: Uuid,
         active_tenant_id: Option<Uuid>,
     ) -> Result<Vec<mokosh_types::auth::MembershipView>, sqlx::Error> {
-        let rows: Vec<MembershipViewRow> = sqlx::query_as(
+        // PMS-1208 finding 11: grant rows are collected FIRST, and
+        // tenant_memberships rows for the same tenant are skipped.
+        //
+        // Why the order matters. Migration 157's
+        // `users_sync_to_identity` trigger fires on every `users`
+        // INSERT/UPDATE and materialises a matching
+        // `tenant_memberships` row (identity_id, tenant_id, role) via
+        // an ON CONFLICT upsert. `AuthService::place_grantee_user`
+        // INSERTs a `users` row for the JIT-placed grantee, and that
+        // trigger writes a tenant_memberships row for the grantee's
+        // identity in the granted tenant. Without this reorder the
+        // memberships list carried the trigger-produced row from the
+        // owner arm, `mokosh_bunyip_grant_id` came back None, the SPA
+        // switcher rendered "Member" instead of "Shared with you",
+        // and its `switch_to` fell to `POST /auth/switch-tenant/{id}`
+        // (the own-tenant path) which minted a legacy HS256 session.
+        //
+        // Collecting grants first + skipping owner-arm dupes gives
+        // the grantee's tenant its authoritative designation (the
+        // grant's role, `mokosh_bunyip_grant_id: Some(...)`,
+        // `bunyip_grant_id: Some(...)`) and keeps the SPA on the
+        // bunyip mint path. An owner who happens to grant themselves
+        // their OWN tenant surfaces as "Shared with you" for that
+        // owner, which is unusual but not wrong (the grant IS what
+        // put a row here) and does not affect their real access,
+        // which the owner path resolves separately.
+        // `bunyip_grant_id` is nullable per migration 225: a row written
+        // by a pre-BUNYIP-674-webhook test seed, or any pre-PMS-1393
+        // record, has `NULL` there. Keep the type Option so sqlx can
+        // decode either case; the switcher's bunyip-mint path hides
+        // the "Switch" affordance when the id is None, consistent with
+        // how it reads a revoked grant.
+        let grant_rows: Vec<(Uuid, Option<Uuid>, Uuid, String, String, String, String)> =
+            sqlx::query_as(
             r#"
-            SELECT tm.tenant_id, t.name, t.slug, t.kind, tm.role, tm.status, g.id AS grant_id
+            SELECT g.id, g.bunyip_grant_id, t.id AS tenant_id, t.name, t.slug, t.kind, g.role
+            FROM mokosh_bunyip_grants g
+            JOIN tenants t ON t.slug = g.mokosh_account_id
+            WHERE g.revoked_at IS NULL
+              AND g.role IS NOT NULL
+              AND (
+                  g.grantee_bunyip_user_id IN (
+                      SELECT DISTINCT u.bunyip_user_id
+                      FROM users u
+                      JOIN identities i ON lower(i.email) = lower(u.email)
+                      WHERE i.id = $1
+                        AND u.bunyip_user_id IS NOT NULL
+                        AND u.deleted_at IS NULL
+                  )
+                  OR (
+                      g.grantee_email IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM identities i
+                          WHERE i.id = $1
+                            AND lower(i.email) = lower(g.grantee_email)
+                      )
+                  )
+              )
+            ORDER BY g.granted_at ASC
+            "#,
+        )
+        .bind(identity_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let mut views: Vec<mokosh_types::auth::MembershipView> = grant_rows
+            .into_iter()
+            .map(
+                |(grant_id, bunyip_grant_id, tenant_id, name, slug, kind, role)| {
+                    mokosh_types::auth::MembershipView {
+                        is_active: Some(tenant_id) == active_tenant_id,
+                        tenant_id,
+                        tenant_name: name,
+                        tenant_slug: slug,
+                        tenant_kind: kind,
+                        role,
+                        status: "active".to_string(),
+                        // PMS-1210: mokosh mirror id, used by
+                        // DELETE `/api/v1/my-grants/{id}` (mokosh's
+                        // own row).
+                        mokosh_bunyip_grant_id: Some(grant_id),
+                        // PMS-1208 finding 4: bunyip source-of-truth
+                        // id, used by the SPA's tenant switcher to
+                        // mint a grant-scoped at+jwt at bunyip's
+                        // `POST /v1/grants/{id}/access-token`. Already
+                        // `Option` on the SELECT because the mirror
+                        // column is nullable (see migration 225); a
+                        // pre-webhook or hand-seeded row forwards
+                        // `None` here, which the SPA reads as "no
+                        // bunyip mint path for this seat".
+                        bunyip_grant_id,
+                    }
+                },
+            )
+            .collect();
+
+        let owner_rows: Vec<(Uuid, String, String, String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT tm.tenant_id, t.name, t.slug, t.kind, tm.role, tm.status
             FROM tenant_memberships tm
             JOIN tenants t ON t.id = tm.tenant_id
-            JOIN identities i ON i.id = tm.identity_id
-            LEFT JOIN users u
-                   ON u.tenant_id = tm.tenant_id
-                  AND lower(u.email) = lower(i.email)
-                  AND u.deleted_at IS NULL
-            LEFT JOIN mokosh_bunyip_grants g
-                   ON g.grantee_bunyip_user_id = u.bunyip_user_id
-                  AND g.mokosh_account_id = t.slug
-                  AND g.revoked_at IS NULL
             WHERE tm.identity_id = $1 AND tm.status = 'active'
             ORDER BY tm.joined_at ASC
             "#,
@@ -244,19 +314,26 @@ impl MembershipRepo {
         .fetch_all(pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| mokosh_types::auth::MembershipView {
-                is_active: Some(row.tenant_id) == active_tenant_id,
-                tenant_id: row.tenant_id,
-                tenant_name: row.name,
-                tenant_slug: row.slug,
-                tenant_kind: row.kind,
-                role: row.role,
-                status: row.status,
-                mokosh_bunyip_grant_id: row.grant_id,
-            })
-            .collect())
+        for (tenant_id, name, slug, kind, role, status) in owner_rows {
+            // A tenant already claimed by the grants arm keeps its
+            // grant designation. See the head-of-function comment.
+            if views.iter().any(|v| v.tenant_id == tenant_id) {
+                continue;
+            }
+            views.push(mokosh_types::auth::MembershipView {
+                is_active: Some(tenant_id) == active_tenant_id,
+                tenant_id,
+                tenant_name: name,
+                tenant_slug: slug,
+                tenant_kind: kind,
+                role,
+                status,
+                mokosh_bunyip_grant_id: None,
+                bunyip_grant_id: None,
+            });
+        }
+
+        Ok(views)
     }
 }
 
