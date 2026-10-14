@@ -1,4 +1,12 @@
 //! Assets HTTP routes.
+//!
+//! parity record 2026-10-14: `/assets/search/facets` has no SPA caller
+//! yet. The pill-based filter bar (MAPPS-xxxx, phase 1 SPA) renders the
+//! facet counts in a sidebar beside the pill set; both the search POST
+//! and the facets POST ship together on that MR. The note comes off
+//! with the first client call. Both routes are gated on the
+//! `assets_search_v2` feature toggle so a deployment with the switch
+//! off answers 404 regardless of whether the SPA renders them yet.
 
 use std::sync::Arc;
 
