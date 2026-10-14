@@ -188,6 +188,76 @@ impl BunyipUserDirectory {
         Ok(())
     }
 
+    /// PMS-1486: undo a `register_grant` call that the local accept
+    /// or cancel lost the race on, so a canceled invitation (or an
+    /// accept that lost the race to a cancel) leaves no active,
+    /// mintable grant on Bunyip's side. Mirrors `register_grant`'s
+    /// transport shape: `DELETE {base_url}/v1/mokosh-grants/{id}`,
+    /// machine-authed, body `{ owner_bunyip_user_id }` (the revoke
+    /// endpoint binds the caller-as-owner into its WHERE clause, so
+    /// a machine client cannot revoke a grant it does not own).
+    ///
+    /// A 404 reads as success: `register_grant` may never have run
+    /// (a cancel on a still-pending, never-accepted invitation), so
+    /// "nothing to revoke" and "revoked" are the same outcome from
+    /// this call's point of view. Idempotent by design on Bunyip's
+    /// side (a second revoke of an already-revoked grant also
+    /// answers success), so a retry here is always safe.
+    #[tracing::instrument(skip(self), fields(grant_id = %grant_id))]
+    pub async fn unregister_grant(
+        &self,
+        grant_id: Uuid,
+        owner_bunyip_user_id: Uuid,
+    ) -> AppResult<()> {
+        let url = format!("{}/v1/mokosh-grants/{}", self.base_url, grant_id);
+        let body = serde_json::json!({
+            "owner_bunyip_user_id": owner_bunyip_user_id,
+        });
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", &self.basic_header)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::internal(format!("bunyip mokosh-grant revoke transport: {e}"))
+            })?;
+
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(());
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status,
+                body = %body.chars().take(200).collect::<String>(),
+                "bunyip mokosh-grant revoke returned a non-2xx"
+            );
+            return Err(AppError::internal(format!(
+                "bunyip mokosh-grant revoke returned status {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Build a client pointed at a stub Bunyip server for a test's
+    /// own loopback address. `from_config` reads real deployment
+    /// env vars; tests need a client that talks to the stub HTTP
+    /// server they spawned instead.
+    pub fn for_tests(base_url: &str) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("build test bunyip directory client");
+        Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            basic_header: "Basic dGVzdDp0ZXN0".to_string(),
+        }
+    }
+
     /// Look one email up. Returns:
     /// - `Ok(Some(DirectoryHit { user_id, email_verified }))` on a
     ///   Bunyip match. Both fields matter: an unverified identity
