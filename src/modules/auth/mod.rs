@@ -31,10 +31,23 @@ pub mod caller_context;
 // beside the webhooks, and authenticated by the token's own signature.
 #[cfg(feature = "server")]
 pub mod backchannel_logout;
+// PMS-1208: SaaS-mode Bunyip user-directory lookup for the grant-invite
+// invitee resolver. `BunyipMachineClient` + `BunyipDirectory` trait +
+// `NoBunyipDirectory` fallback so standalone mode compiles the same code
+// path.
+#[cfg(feature = "server")]
+pub mod bunyip_directory;
 // PMS-591: receiver for Bunyip's `account_deleted` webhook. Wired outside
 // the JWT auth chain in `create_api_router`.
 #[cfg(feature = "server")]
 pub mod bunyip_webhook;
+// PMS-1208: pending/accept/decline/expire lifecycle for Mokosh grants.
+#[cfg(feature = "server")]
+pub mod grant_invitations;
+#[cfg(feature = "server")]
+pub mod grant_invitations_routes;
+#[cfg(feature = "server")]
+pub mod grant_invitations_worker;
 #[cfg(feature = "server")]
 pub mod middleware;
 #[cfg(feature = "server")]
