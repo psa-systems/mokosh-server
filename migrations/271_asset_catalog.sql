@@ -26,12 +26,22 @@
 -- asset_models
 -- ============================================================================
 
+-- Every FK in this migration is `DEFERRABLE INITIALLY IMMEDIATE` so the
+-- tenant-data import path (`SET CONSTRAINTS ALL DEFERRED` inside the
+-- wipe-and-reload transaction, migration 088) can satisfy them in any
+-- insert order. Default per-statement checking is unchanged for every
+-- other write. See migration 088's note: "constraints added by FUTURE
+-- migrations default to NOT DEFERRABLE".
 CREATE TABLE asset_models (
     id                     UUID         PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id              UUID         NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    tenant_id              UUID         NOT NULL
+                                        REFERENCES tenants(id) ON DELETE CASCADE
+                                        DEFERRABLE INITIALLY IMMEDIATE,
     manufacturer           VARCHAR(100) NOT NULL,
     model                  VARCHAR(100) NOT NULL,
-    asset_type_id          UUID         NOT NULL REFERENCES asset_types(id) ON DELETE RESTRICT,
+    asset_type_id          UUID         NOT NULL
+                                        REFERENCES asset_types(id) ON DELETE RESTRICT
+                                        DEFERRABLE INITIALLY IMMEDIATE,
     -- Each default is OPTIONAL: a row may know only manufacturer + model
     -- and let the operator fill the rest at create time. `warranty_months`
     -- + `end_of_life_months` are per-order horizons the SPA adds to the
@@ -102,16 +112,23 @@ COMMENT ON TABLE asset_models IS
 
 CREATE TABLE asset_templates (
     id                       UUID         PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id                UUID         NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    tenant_id                UUID         NOT NULL
+                                          REFERENCES tenants(id) ON DELETE CASCADE
+                                          DEFERRABLE INITIALLY IMMEDIATE,
     name                     VARCHAR(150) NOT NULL,
-    asset_model_id           UUID         NOT NULL REFERENCES asset_models(id) ON DELETE CASCADE,
+    asset_model_id           UUID         NOT NULL
+                                          REFERENCES asset_models(id) ON DELETE CASCADE
+                                          DEFERRABLE INITIALLY IMMEDIATE,
     -- Per-order context the template fills in on top of the model's
     -- defaults. Each is optional; a template MAY be as thin as a model
     -- + a name ("Sales Latitude") when the operator wants the model
     -- preserved but no per-order fields.
-    company_id               UUID REFERENCES companies(id)   ON DELETE CASCADE,
-    site_id                  UUID REFERENCES sites(id)       ON DELETE SET NULL,
-    default_assigned_user_id UUID REFERENCES users(id)       ON DELETE SET NULL,
+    company_id               UUID REFERENCES companies(id)   ON DELETE CASCADE
+                                          DEFERRABLE INITIALLY IMMEDIATE,
+    site_id                  UUID REFERENCES sites(id)       ON DELETE SET NULL
+                                          DEFERRABLE INITIALLY IMMEDIATE,
+    default_assigned_user_id UUID REFERENCES users(id)       ON DELETE SET NULL
+                                          DEFERRABLE INITIALLY IMMEDIATE,
     department               VARCHAR(100),
     tags                     TEXT[],
     notes                    TEXT,
@@ -120,7 +137,8 @@ CREATE TABLE asset_templates (
     updated_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     -- `created_by` is informational; losing the user does not lose
     -- the template.
-    created_by               UUID REFERENCES users(id)       ON DELETE SET NULL,
+    created_by               UUID REFERENCES users(id)       ON DELETE SET NULL
+                                          DEFERRABLE INITIALLY IMMEDIATE,
     uses_count               INTEGER      NOT NULL DEFAULT 0
 );
 
@@ -155,7 +173,8 @@ COMMENT ON TABLE asset_templates IS
 -- 'auto_derived'` so the next asset of the same shape finds a hit.
 
 ALTER TABLE assets
-    ADD COLUMN asset_model_id UUID REFERENCES asset_models(id) ON DELETE SET NULL;
+    ADD COLUMN asset_model_id UUID REFERENCES asset_models(id) ON DELETE SET NULL
+    DEFERRABLE INITIALLY IMMEDIATE;
 
 CREATE INDEX idx_assets_asset_model_id
     ON assets(asset_model_id)
