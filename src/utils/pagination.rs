@@ -697,6 +697,10 @@ mod pms1194_sort_guard {
     /// file here too, or this scan silently stops covering it.
     const ROUTE_FILES: &[(&str, &str)] = &[
         ("approvals", include_str!("../modules/approvals/routes.rs")),
+        (
+            "asset_catalog",
+            include_str!("../modules/asset_catalog/routes.rs"),
+        ),
         ("assets", include_str!("../modules/assets/routes.rs")),
         ("audit", include_str!("../modules/audit/routes.rs")),
         ("auth", include_str!("../modules/auth/routes.rs")),
