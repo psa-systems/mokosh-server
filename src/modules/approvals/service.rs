@@ -140,6 +140,49 @@ const SELECT_JOINS: &str = "
            ON a.target = 'time_entry' AND te.id = a.entity_id AND te.tenant_id = a.tenant_id
 ";
 
+/// PMS-1491: each of these three logical fields is requested/approved/decided
+/// by either a user OR a contact (the XOR the DB enforces on the id columns),
+/// so one unresolved id per row comes from whichever side is populated, never
+/// both. Grouping the two columns into one surface per logical field keeps a
+/// full response to at most three log calls instead of six.
+fn unresolved_requested_by_ids(rows: &[ApprovalRow]) -> Vec<Uuid> {
+    rows.iter()
+        .flat_map(|r| {
+            let by_user = r.requested_by_id.filter(|_| r.requested_by_name.is_none());
+            let by_contact = r
+                .requested_by_contact_id
+                .filter(|_| r.requested_by_contact_name.is_none());
+            [by_user, by_contact].into_iter().flatten()
+        })
+        .collect()
+}
+
+fn unresolved_approver_ids(rows: &[ApprovalRow]) -> Vec<Uuid> {
+    rows.iter()
+        .flat_map(|r| {
+            let by_user = r
+                .approver_user_id
+                .filter(|_| r.approver_user_name.is_none());
+            let by_contact = r
+                .approver_contact_id
+                .filter(|_| r.approver_contact_name.is_none());
+            [by_user, by_contact].into_iter().flatten()
+        })
+        .collect()
+}
+
+fn unresolved_decided_by_ids(rows: &[ApprovalRow]) -> Vec<Uuid> {
+    rows.iter()
+        .flat_map(|r| {
+            let by_user = r.decided_by_id.filter(|_| r.decided_by_name.is_none());
+            let by_contact = r
+                .decided_by_contact_id
+                .filter(|_| r.decided_by_contact_name.is_none());
+            [by_user, by_contact].into_iter().flatten()
+        })
+        .collect()
+}
+
 /// PMS-683: every query runs inside `Database::begin_with_tenant`, which sets
 /// the `app.current_tenant` GUC transaction-locally, so `ticket_approvals` and
 /// `change_requests` are safe under the fail-closed `tenant_isolation` RLS
@@ -183,6 +226,18 @@ impl ApprovalsService {
             .bind(entity_id)
             .fetch_all(&mut *tx)
             .await?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.list_for_entity.requested_by",
+            &unresolved_requested_by_ids(&rows),
+        );
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.list_for_entity.approver",
+            &unresolved_approver_ids(&rows),
+        );
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.list_for_entity.decided_by",
+            &unresolved_decided_by_ids(&rows),
+        );
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -210,6 +265,18 @@ impl ApprovalsService {
             .bind(roles_held)
             .fetch_all(&mut *tx)
             .await?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.pending_for_user.requested_by",
+            &unresolved_requested_by_ids(&rows),
+        );
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.pending_for_user.approver",
+            &unresolved_approver_ids(&rows),
+        );
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.pending_for_user.decided_by",
+            &unresolved_decided_by_ids(&rows),
+        );
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -285,6 +352,18 @@ impl ApprovalsService {
             .bind(contact_id)
             .fetch_all(&mut *tx)
             .await?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.pending_for_contact.requested_by",
+            &unresolved_requested_by_ids(&rows),
+        );
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.pending_for_contact.approver",
+            &unresolved_approver_ids(&rows),
+        );
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.pending_for_contact.decided_by",
+            &unresolved_decided_by_ids(&rows),
+        );
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -447,6 +526,19 @@ impl ApprovalsService {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("Approval".into()))?;
+        let as_row = std::slice::from_ref(&row);
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.get.requested_by",
+            &unresolved_requested_by_ids(as_row),
+        );
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.get.approver",
+            &unresolved_approver_ids(as_row),
+        );
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "approvals.get.decided_by",
+            &unresolved_decided_by_ids(as_row),
+        );
         Ok(row.into())
     }
 

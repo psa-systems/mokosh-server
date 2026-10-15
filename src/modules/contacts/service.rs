@@ -569,6 +569,19 @@ impl ContactService {
                 resp.open_ticket_count = Some(row.open_ticket_count);
             }
         }
+        // PMS-1491: the CASE above resolves `account_manager_name` to NULL
+        // both when there is no account manager (`u.id IS NULL`, legitimate)
+        // and when `u.first_name`/`u.last_name` themselves are NULL (a failed
+        // lookup); `account_manager_id` distinguishes the two.
+        let unresolved: Vec<Uuid> = responses
+            .iter()
+            .filter(|r| r.account_manager_id.is_some() && r.account_manager_name.is_none())
+            .filter_map(|r| r.account_manager_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "contacts.companies.account_manager",
+            &unresolved,
+        );
         Ok(responses)
     }
 

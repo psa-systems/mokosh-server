@@ -432,6 +432,15 @@ impl ContactSyncService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Uploaded file".to_string()))?;
+        if let Some(id) = file
+            .uploaded_by_user_id
+            .filter(|_| file.uploaded_by_name.is_none())
+        {
+            crate::utils::unresolved_person::log_unresolved_person_names(
+                "contact_sync.vcard_file",
+                &[id],
+            );
+        }
         file.latest_run = sqlx::query_as(&format!(
             "SELECT {RUN_COLUMNS} FROM contact_sync_runs \
              WHERE tenant_id = $1 AND import_file_id = $2 ORDER BY created_at DESC LIMIT 1"
@@ -482,6 +491,17 @@ impl ContactSyncService {
         .into_iter()
         .map(|file: ImportFileView| (file.id, file))
         .collect();
+        let unresolved: Vec<Uuid> = files
+            .values()
+            .filter_map(|f| {
+                f.uploaded_by_user_id
+                    .filter(|_| f.uploaded_by_name.is_none())
+            })
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "contact_sync.vcard_files",
+            &unresolved,
+        );
         let mut runs: std::collections::HashMap<Uuid, RunStatus> = sqlx::query_as(&format!(
             "SELECT DISTINCT ON (import_file_id) import_file_id, {RUN_COLUMNS} \
              FROM contact_sync_runs \
