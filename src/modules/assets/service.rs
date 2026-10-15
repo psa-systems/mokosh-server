@@ -216,6 +216,65 @@ impl AssetsService {
         Ok(())
     }
 
+    // PMS-1490 assets exists pre-flight -------------------------------------
+    /// Returns the subset of `serials` that already belong to an asset at
+    /// the given company in this tenant. Case-insensitive match (the hardware
+    /// vendors vary); the returned strings preserve the request's casing by
+    /// mapping through a lowercase lookup set and keeping first-occurrence
+    /// order. The caller already enforced the 500-item cap at the validator.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn assets_exists(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        serials: &[String],
+    ) -> AppResult<Vec<String>> {
+        if serials.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Trim + lowercase the request's serials for the lookup; preserve
+        // the first-occurrence raw string so the response matches the
+        // operator's input.
+        let mut lower_to_display: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut order = Vec::<String>::new();
+        for s in serials {
+            let t = s.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let key = t.to_lowercase();
+            if lower_to_display
+                .insert(key.clone(), t.to_string())
+                .is_none()
+            {
+                order.push(key);
+            }
+        }
+        let lookup: Vec<String> = order.clone();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let present: Vec<String> = sqlx::query_scalar(
+            "SELECT lower(serial_number) \
+             FROM assets \
+             WHERE tenant_id = $1 \
+               AND company_id = $2 \
+               AND serial_number IS NOT NULL \
+               AND lower(serial_number) = ANY($3)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&lookup)
+        .fetch_all(&mut *tx)
+        .await?;
+        let present_set: std::collections::HashSet<String> = present.into_iter().collect();
+        let existing: Vec<String> = order
+            .into_iter()
+            .filter(|k| present_set.contains(k))
+            .filter_map(|k| lower_to_display.remove(&k))
+            .collect();
+        Ok(existing)
+    }
+
     // PMS-74 assets CRUD ------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_assets(

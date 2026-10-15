@@ -646,6 +646,31 @@ pub struct AssetAuditLogResponse {
     pub performed_at: DateTime<Utc>,
 }
 
+// -- PMS-1490 (bulk-create pre-flight) --------------------------------------
+
+/// `POST /api/v1/assets/exists` body. Given a company and a serial list,
+/// returns the subset already present on an asset at that company so the
+/// bulk-create modal can trim or warn before firing the fan-out whose
+/// unique constraint would otherwise reject the whole batch mid-transaction.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct AssetExistsRequest {
+    pub company_id: Uuid,
+    /// 1..=500 serial strings. The 500 cap mirrors `BulkCreateAssetsRequest`
+    /// so the two endpoints agree on batch size.
+    #[validate(length(min = 1, max = 500))]
+    pub serials: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetExistsResponse {
+    /// Subset of the request's serials that already belong to an asset at
+    /// the given company. Case preserved from the request so the UI can
+    /// render them verbatim; the match itself is case-insensitive.
+    /// Insertion order matches first-occurrence in the request; duplicates
+    /// in the request collapse to one entry.
+    pub existing: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
