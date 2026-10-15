@@ -1044,11 +1044,11 @@ impl AssetsService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Asset".to_string()))?;
-        if row.assigned_user_id.is_some() && row.assigned_user_name.is_none() {
-            crate::utils::unresolved_person::log_unresolved_person_names(
-                "assets.get",
-                &[row.assigned_user_id.expect("checked Some above")],
-            );
+        if let Some(id) = row
+            .assigned_user_id
+            .filter(|_| row.assigned_user_name.is_none())
+        {
+            crate::utils::unresolved_person::log_unresolved_person_names("assets.get", &[id]);
         }
         Ok(row.into())
     }

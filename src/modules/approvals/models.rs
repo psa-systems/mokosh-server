@@ -1,4 +1,5 @@
 //! PMS-451: ticket approval DTOs.
+#![allow(clippy::should_implement_trait)]
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -432,10 +432,13 @@ impl ContactSyncService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Uploaded file".to_string()))?;
-        if file.uploaded_by_user_id.is_some() && file.uploaded_by_name.is_none() {
+        if let Some(id) = file
+            .uploaded_by_user_id
+            .filter(|_| file.uploaded_by_name.is_none())
+        {
             crate::utils::unresolved_person::log_unresolved_person_names(
                 "contact_sync.vcard_file",
-                &[file.uploaded_by_user_id.unwrap()],
+                &[id],
             );
         }
         file.latest_run = sqlx::query_as(&format!(
