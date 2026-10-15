@@ -263,19 +263,23 @@ impl AssetsService {
             idx += 1;
         }
         if filter.tag.is_some() {
-            // Containment: the row's tags array contains the single filter
-            // tag. Matches the structured-search `op = contains_tag` arm so
-            // the two endpoints agree on which assets a given tag selects.
-            conditions.push(format!("a.tags @> ARRAY[${idx}]::text[]"));
+            // `$N = ANY(a.tags)` matches the structured-search ContainsTag
+            // arm so the two endpoints agree on which assets a given tag
+            // selects. Postgres resolves the bound `TEXT` scalar against
+            // the `tags TEXT[]` column directly.
+            conditions.push(format!("${idx} = ANY(a.tags)"));
             idx += 1;
         }
-        if filter.warranty_within_days.is_some() {
-            // `BETWEEN today AND today + N`. Rejects nulls (no warranty_expiry
-            // row never matches a "within N days" filter).
+        // `warranty_within_days`: the structured arm inlines the clamped
+        // integer as a SQL literal rather than binding + casting, which
+        // sidesteps the Postgres `int || text` resolution. Match that
+        // pattern here so the two endpoints produce identical plans and
+        // no extra bind slot is spent on a value we have already clamped.
+        if let Some(days) = filter.warranty_within_days {
+            let days = days.clamp(0, 36500);
             conditions.push(format!(
-                "a.warranty_expiry BETWEEN CURRENT_DATE AND (CURRENT_DATE + (${idx}::int || ' days')::interval)::date"
+                "a.warranty_expiry BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL '{days} days')::date"
             ));
-            idx += 1;
         }
         if filter.end_of_life_before.is_some() {
             conditions.push(format!("a.end_of_life < ${idx}"));
@@ -330,9 +334,7 @@ impl AssetsService {
         if let Some(v) = &filter.tag {
             cq = cq.bind(v);
         }
-        if let Some(v) = filter.warranty_within_days {
-            cq = cq.bind(v);
-        }
+        // `warranty_within_days` is inlined as a SQL literal above; no bind.
         if let Some(v) = filter.end_of_life_before {
             cq = cq.bind(v);
         }
@@ -392,9 +394,7 @@ impl AssetsService {
         if let Some(v) = &filter.tag {
             q = q.bind(v);
         }
-        if let Some(v) = filter.warranty_within_days {
-            q = q.bind(v);
-        }
+        // `warranty_within_days` is inlined as a SQL literal above; no bind.
         if let Some(v) = filter.end_of_life_before {
             q = q.bind(v);
         }

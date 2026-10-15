@@ -644,9 +644,12 @@ async fn asset_list_filters_cover_the_structured_search_vocab(pool: PgPool) {
 
     // Three assets that differ on each of the new filters so a single
     // request can prove each dimension narrows the set independently.
+    // `CreateAssetRequest` does not take a `tags` field (set via a
+    // separate PUT), so the create closure handles the fields it owns
+    // and we PUT tags after each one.
     let create = |name: &'static str, body: serde_json::Value| {
         let client = app.client.clone();
-        let url = app.url("/api/v1/assets");
+        let base = app.url("/api/v1/assets");
         let token = token.clone();
         let type_id = type_id.clone();
         async move {
@@ -660,13 +663,38 @@ async fn asset_list_filters_cover_the_structured_search_vocab(pool: PgPool) {
                 obj.insert(k, v);
             }
             let resp = client
-                .post(url)
-                .bearer_auth(token)
+                .post(&base)
+                .bearer_auth(&token)
                 .json(&payload)
                 .send()
                 .await
                 .expect("create asset");
             assert!(resp.status().is_success(), "create: {}", resp.status());
+            let v: serde_json::Value = resp.json().await.expect("asset JSON");
+            v["id"].as_str().expect("asset id").to_string()
+        }
+    };
+    // PATCH, not PUT: the PUT handler's dynamic UPDATE statement does
+    // not list `tags` among the 24 CMDB-expansion columns it accepts, so
+    // a PUT with `{"tags": [...]}` returns 200 but silently discards the
+    // field (the `UpdateAssetRequest.tags` slot is deserialised but
+    // never bound). PATCH `/assets/{id}` goes through `patch_asset`
+    // which uses a per-field QueryBuilder that DOES push the tags col.
+    let patch_tags = |id: &str, tags: Vec<&'static str>| {
+        let client = app.client.clone();
+        let url = app.url(&format!("/api/v1/assets/{id}"));
+        let token = token.clone();
+        async move {
+            let resp = client
+                .patch(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "tags": tags }))
+                .send()
+                .await
+                .expect("patch tags");
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            assert!(status.is_success(), "patch tags: {status}, body: {body}");
         }
     };
     let today = chrono::Utc::now().date_naive();
@@ -674,40 +702,40 @@ async fn asset_list_filters_cover_the_structured_search_vocab(pool: PgPool) {
     let in_100_days = today + chrono::Duration::days(100);
     let yesterday = today - chrono::Duration::days(1);
     let tomorrow = today + chrono::Duration::days(1);
-    create(
+    let sales_id = create(
         "sales-laptop",
         serde_json::json!({
             "department": "Sales",
             "manufacturer": "Dell",
             "model": "Latitude 5450",
-            "tags": ["kiosk", "loaner"],
             "warranty_expiry": in_15_days.to_string(),
             "end_of_life": yesterday.to_string(),
         }),
     )
     .await;
-    create(
+    patch_tags(&sales_id, vec!["kiosk", "loaner"]).await;
+    let ops_id = create(
         "ops-laptop",
         serde_json::json!({
             "department": "Ops",
             "manufacturer": "HP",
             "model": "EliteBook 850",
-            "tags": ["fleet"],
             "warranty_expiry": in_100_days.to_string(),
             "end_of_life": tomorrow.to_string(),
         }),
     )
     .await;
-    create(
+    patch_tags(&ops_id, vec!["fleet"]).await;
+    let eng_id = create(
         "eng-laptop",
         serde_json::json!({
             "department": "Engineering",
             "manufacturer": "Dell",
             "model": "XPS 15",
-            "tags": ["dev"],
         }),
     )
     .await;
+    patch_tags(&eng_id, vec!["dev"]).await;
 
     let names_for = |query: &str| {
         let client = app.client.clone();
