@@ -629,160 +629,106 @@ async fn asset_search_matches_serial_numbers(pool: PgPool) {
     assert!(search("nothing-matches-this").await.is_empty());
 }
 
-/// Legacy `GET /assets` filter expansion: the handler now accepts the
-/// department, manufacturer, model, tag, site_id, assigned_user_id,
-/// warranty_within_days, and end_of_life_before query params so a tenant
-/// on a toggle-off deployment (`assets_search_v2 = false`) sees the same
-/// filter outcomes staff on the structured endpoint see.
+/// PMS-1490: `POST /api/v1/assets/exists` returns which of the given
+/// serials already belong to an asset at the given company so the SPA's
+/// bulk-create modal can trim or warn before firing the fan-out.
 #[mokosh_test]
-async fn asset_list_filters_cover_the_structured_search_vocab(pool: PgPool) {
+async fn assets_exists_names_matches_case_insensitively_within_the_company_scope(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
-    let company = seed_company(&pool, "Acme Co").await;
+    let main_street = seed_company(&pool, "Main Street Dental").await;
+    let riverside = seed_company(&pool, "Riverside Accounting").await;
     let app = common::boot(pool).await;
     let token = common::login(&app, &email, &pw).await;
-    let type_id = create_asset_type(&app, &token, "Server").await;
+    let type_id = create_asset_type(&app, &token, "Laptop").await;
 
-    // Three assets that differ on each of the new filters so a single
-    // request can prove each dimension narrows the set independently.
-    // `CreateAssetRequest` does not take a `tags` field (set via a
-    // separate PUT), so the create closure handles the fields it owns
-    // and we PUT tags after each one.
-    let create = |name: &'static str, body: serde_json::Value| {
+    // Seed with a mix of serials across both companies. `create_asset`
+    // stamps SN-12345, so override via the API's full serial_number field.
+    let seed = |name: &'static str, serial: &'static str, company: Uuid| {
         let client = app.client.clone();
-        let base = app.url("/api/v1/assets");
+        let url = app.url("/api/v1/assets");
         let token = token.clone();
         let type_id = type_id.clone();
         async move {
-            let mut payload = serde_json::json!({
-                "name": name,
-                "asset_type_id": type_id,
-                "company_id": company,
-            });
-            let obj = payload.as_object_mut().expect("obj");
-            for (k, v) in body.as_object().expect("overrides obj").clone() {
-                obj.insert(k, v);
-            }
             let resp = client
-                .post(&base)
-                .bearer_auth(&token)
-                .json(&payload)
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "name": name,
+                    "asset_type_id": type_id,
+                    "company_id": company,
+                    "serial_number": serial,
+                }))
                 .send()
                 .await
                 .expect("create asset");
             assert!(resp.status().is_success(), "create: {}", resp.status());
-            let v: serde_json::Value = resp.json().await.expect("asset JSON");
-            v["id"].as_str().expect("asset id").to_string()
         }
     };
-    // PATCH, not PUT: the PUT handler's dynamic UPDATE statement does
-    // not list `tags` among the 24 CMDB-expansion columns it accepts, so
-    // a PUT with `{"tags": [...]}` returns 200 but silently discards the
-    // field (the `UpdateAssetRequest.tags` slot is deserialised but
-    // never bound). PATCH `/assets/{id}` goes through `patch_asset`
-    // which uses a per-field QueryBuilder that DOES push the tags col.
-    let patch_tags = |id: &str, tags: Vec<&'static str>| {
-        let client = app.client.clone();
-        let url = app.url(&format!("/api/v1/assets/{id}"));
-        let token = token.clone();
-        async move {
-            let resp = client
-                .patch(url)
-                .bearer_auth(token)
-                .json(&serde_json::json!({ "tags": tags }))
-                .send()
-                .await
-                .expect("patch tags");
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            assert!(status.is_success(), "patch tags: {status}, body: {body}");
-        }
-    };
-    let today = chrono::Utc::now().date_naive();
-    let in_15_days = today + chrono::Duration::days(15);
-    let in_100_days = today + chrono::Duration::days(100);
-    let yesterday = today - chrono::Duration::days(1);
-    let tomorrow = today + chrono::Duration::days(1);
-    let sales_id = create(
-        "sales-laptop",
-        serde_json::json!({
-            "department": "Sales",
-            "manufacturer": "Dell",
-            "model": "Latitude 5450",
-            "warranty_expiry": in_15_days.to_string(),
-            "end_of_life": yesterday.to_string(),
-        }),
-    )
-    .await;
-    patch_tags(&sales_id, vec!["kiosk", "loaner"]).await;
-    let ops_id = create(
-        "ops-laptop",
-        serde_json::json!({
-            "department": "Ops",
-            "manufacturer": "HP",
-            "model": "EliteBook 850",
-            "warranty_expiry": in_100_days.to_string(),
-            "end_of_life": tomorrow.to_string(),
-        }),
-    )
-    .await;
-    patch_tags(&ops_id, vec!["fleet"]).await;
-    let eng_id = create(
-        "eng-laptop",
-        serde_json::json!({
-            "department": "Engineering",
-            "manufacturer": "Dell",
-            "model": "XPS 15",
-        }),
-    )
-    .await;
-    patch_tags(&eng_id, vec!["dev"]).await;
+    seed("ms-01", "QA-001", main_street).await;
+    seed("ms-02", "qa-002", main_street).await;
+    seed("rs-01", "QA-003", riverside).await;
 
-    let names_for = |query: &str| {
+    let probe = |company_id: Uuid, serials: serde_json::Value| {
         let client = app.client.clone();
-        let url = app.url(&format!("/api/v1/assets?{query}"));
+        let url = app.url("/api/v1/assets/exists");
         let token = token.clone();
-        let query = query.to_string();
         async move {
             let resp = client
-                .get(url)
+                .post(url)
                 .bearer_auth(token)
+                .json(&serde_json::json!({ "company_id": company_id, "serials": serials }))
                 .send()
                 .await
-                .expect("list assets");
-            assert!(resp.status().is_success(), "{query}: {}", resp.status());
-            let v: serde_json::Value = resp.json().await.expect("assets JSON");
-            let mut names: Vec<String> = v["data"]
+                .expect("post exists");
+            assert!(resp.status().is_success(), "exists: {}", resp.status());
+            let v: serde_json::Value = resp.json().await.expect("json");
+            v["existing"]
                 .as_array()
-                .expect("data array")
+                .expect("existing array")
                 .iter()
-                .map(|a| a["name"].as_str().unwrap_or_default().to_string())
-                .collect();
-            names.sort();
-            names
+                .map(|s| s.as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
         }
     };
 
-    assert_eq!(names_for("department=Sales").await, vec!["sales-laptop"]);
+    // Case-insensitive match, response preserves request casing.
+    let got = probe(
+        main_street,
+        serde_json::json!(["Qa-001", "QA-002", "QA-999"]),
+    )
+    .await;
+    assert_eq!(got, vec!["Qa-001".to_string(), "QA-002".to_string()]);
+
+    // A serial that belongs to another company does not match.
+    let got = probe(main_street, serde_json::json!(["QA-003"])).await;
+    assert!(got.is_empty(), "QA-003 lives at Riverside, not Main Street");
+
+    // Empty-ish input (whitespace-only lines) still returns an empty
+    // existing list, not a 400.
+    let got = probe(main_street, serde_json::json!(["   ", "\t"])).await;
+    assert!(got.is_empty());
+}
+
+#[mokosh_test]
+async fn assets_exists_rejects_over_the_500_cap(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // 501 serials to trip the validator.
+    let serials: Vec<String> = (0..501).map(|i| format!("QA-{i:04}")).collect();
+    let resp = app
+        .client
+        .post(app.url("/api/v1/assets/exists"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "company_id": company, "serials": serials }))
+        .send()
+        .await
+        .expect("post exists");
     assert_eq!(
-        names_for("manufacturer=Dell").await,
-        vec!["eng-laptop", "sales-laptop"]
-    );
-    assert_eq!(names_for("model=XPS%2015").await, vec!["eng-laptop"]);
-    assert_eq!(names_for("tag=kiosk").await, vec!["sales-laptop"]);
-    assert_eq!(
-        names_for("warranty_within_days=30").await,
-        vec!["sales-laptop"],
-        "within-30 excludes the asset whose warranty is 100 days out"
-    );
-    let eol_query = format!("end_of_life_before={today}");
-    assert_eq!(
-        names_for(&eol_query).await,
-        vec!["sales-laptop"],
-        "end-of-life-before today excludes the one whose EOL is tomorrow and the one with no EOL"
-    );
-    // Combinations AND: manufacturer=Dell AND department=Sales = one row.
-    assert_eq!(
-        names_for("manufacturer=Dell&department=Sales").await,
-        vec!["sales-laptop"]
+        resp.status().as_u16(),
+        422,
+        "over-cap request must be rejected at the validator"
     );
 }

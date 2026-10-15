@@ -83,6 +83,12 @@ pub fn assets_routes(
             "/assets/search/facets",
             axum::routing::post(asset_facets_structured),
         )
+        // PMS-1490: pre-flight collision check for the bulk-create modal.
+        // Given a company and a list of serials, returns which already
+        // belong to an asset at that company so the SPA can trim or
+        // warn before firing a bulk-create whose unique constraint would
+        // otherwise reject the whole batch mid-transaction.
+        .route("/assets/exists", axum::routing::post(assets_exists_handler))
         .route(
             "/assets/{id}",
             get(get_asset)
@@ -792,4 +798,18 @@ async fn asset_facets_structured(
     let tenant = u.tenant();
     let resp = s.service.asset_facets(tenant, &req).await?;
     Ok(Json(resp))
+}
+
+async fn assets_exists_handler(
+    State(s): State<AssetsRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    Json(req): Json<AssetExistsRequest>,
+) -> AppResult<Json<AssetExistsResponse>> {
+    req.validate()?;
+    let tenant = u.tenant();
+    let existing = s
+        .service
+        .assets_exists(tenant, req.company_id, &req.serials)
+        .await?;
+    Ok(Json(AssetExistsResponse { existing }))
 }
