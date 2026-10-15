@@ -639,6 +639,146 @@ impl Mailer for SmtpMailer {
     }
 }
 
+/// PMS-1482: Bunyip's shared mailer relay (`POST /v1/mailer/send`,
+/// BUNYIP-602). The caller authenticates with a machine credential over HTTP
+/// Basic directly on the send call (no separate token exchange, unlike the
+/// Bunyip configuration provider's `client_credentials` grant): see
+/// `bunyip-api`'s `handlers::mailer::relay_send`.
+const MAILER_SEND_PATH: &str = "/v1/mailer/send";
+
+/// Bunyip mailer relay's per-request budget. The relay itself talks to an
+/// SMTP server, so this is sized like [`HTTP_TIMEOUT`] in `config/bunyip.rs`
+/// rather than a tight in-process call.
+const API_MAILER_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Construction inputs for [`ApiMailer`]. All three are env-sourced; see
+/// [`ApiMailerConfig::from_env`].
+#[derive(Clone, Debug)]
+pub struct ApiMailerConfig {
+    /// Base URL (no trailing slash) of the Bunyip API.
+    pub base_url: String,
+    pub client_id: String,
+    pub client_secret: SecretString,
+}
+
+impl ApiMailerConfig {
+    /// Read `BUNYIP_MAILER_URL` / `_CLIENT_ID` / `_CLIENT_SECRET`. Unlike
+    /// [`crate::config::bunyip::BunyipConfig::from_env`], this provider is
+    /// only ever reached after an operator explicitly selects
+    /// `MAIL_PROVIDER=bunyip`, so there is no "not enabled" case to return
+    /// `Ok(None)` for: any of the three missing is a named boot error.
+    pub fn from_env() -> AppResult<Self> {
+        let base = config::get(&keys::BUNYIP_MAILER_URL)
+            .map(|raw| raw.trim().to_string())
+            .filter(|raw| !raw.is_empty())
+            .ok_or_else(|| {
+                AppError::Configuration(
+                    "MAIL_PROVIDER=bunyip requires BUNYIP_MAILER_URL; the selected provider has \
+                     no relay to send through"
+                        .to_string(),
+                )
+            })?;
+        let client_id =
+            required_mailer_var(&keys::BUNYIP_MAILER_CLIENT_ID, "BUNYIP_MAILER_CLIENT_ID")?;
+        let client_secret = SecretString::from(required_mailer_var(
+            &keys::BUNYIP_MAILER_CLIENT_SECRET,
+            "BUNYIP_MAILER_CLIENT_SECRET",
+        )?);
+        Ok(Self {
+            base_url: base.trim_end_matches('/').to_string(),
+            client_id,
+            client_secret,
+        })
+    }
+}
+
+fn required_mailer_var(key: &config::ConfigKey, name: &str) -> AppResult<String> {
+    match config::get(key).map(|v| v.trim().to_string()) {
+        Some(v) if !v.is_empty() => Ok(v),
+        _ => Err(AppError::Configuration(format!(
+            "BUNYIP_MAILER_URL is set, so {name} must be set too; the Bunyip mailer relay needs \
+             both halves of its machine credential"
+        ))),
+    }
+}
+
+/// Mailer backed by Bunyip's shared mailer relay (PMS-1482). Bytes leave the
+/// server over HTTPS, not SMTP: Bunyip owns the SMTP infrastructure and the
+/// verified sending domain, so this mailer carries no transport configuration
+/// of its own beyond the relay's base URL and machine credential.
+pub struct ApiMailer {
+    http: reqwest::Client,
+    base_url: String,
+    client_id: String,
+    client_secret: SecretString,
+}
+
+impl ApiMailer {
+    pub fn new(config: ApiMailerConfig) -> AppResult<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(API_MAILER_HTTP_TIMEOUT)
+            .build()
+            .map_err(|e| {
+                AppError::external_service("bunyip-mailer", format!("http client build: {e}"))
+            })?;
+        Ok(Self {
+            http,
+            base_url: config.base_url,
+            client_id: config.client_id,
+            client_secret: config.client_secret,
+        })
+    }
+}
+
+/// Request body for `POST /v1/mailer/send`, matching `bunyip-api`'s
+/// `handlers::mailer::RelaySendRequest`.
+#[derive(serde::Serialize)]
+struct RelaySendRequest<'a> {
+    to: &'a str,
+    subject: &'a str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    html: Option<&'a str>,
+}
+
+#[async_trait]
+impl Mailer for ApiMailer {
+    async fn send_multipart(
+        &self,
+        to: &str,
+        subject: &str,
+        text: &str,
+        html: Option<&str>,
+    ) -> AppResult<()> {
+        let url = format!("{}{MAILER_SEND_PATH}", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .basic_auth(&self.client_id, Some(self.client_secret.expose_secret()))
+            .json(&RelaySendRequest {
+                to,
+                subject,
+                text,
+                html,
+            })
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::external_service("bunyip-mailer", format!("send request: {e}"))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(AppError::external_service(
+                "bunyip-mailer",
+                format!("send failed ({status}): {text}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// SMTP / mailer configuration sourced from env. `from_env` returns the
 /// `LogMailer` when `SMTP_HOST` is unset or empty so dev environments
 /// work without an SMTP server.
@@ -791,8 +931,13 @@ pub enum EmailProviderKind {
     /// fresh customer image.
     Log,
     /// SMTP relay via [`SmtpMailer`]. The hosting profile's default in `saas`,
-    /// because the deployed instance sets `SMTP_HOST` explicitly.
+    /// because the deployed instance sets `SMTP_HOST` explicitly (PMS-1018).
     Smtp,
+    /// Bunyip's shared mailer relay via [`ApiMailer`] (PMS-1482). Not a
+    /// hosting-profile default for any mode today: PMS-1018 confirmed the
+    /// deployed `saas` instance already sends through `smtp` directly, so this
+    /// is an explicit `MAIL_PROVIDER=bunyip` opt-in, not a profile row.
+    Api,
 }
 
 impl EmailProviderKind {
@@ -800,6 +945,7 @@ impl EmailProviderKind {
         match self {
             EmailProviderKind::Log => crate::utils::deployment::provider::LOG,
             EmailProviderKind::Smtp => crate::utils::deployment::provider::SMTP,
+            EmailProviderKind::Api => crate::utils::deployment::provider::BUNYIP,
         }
     }
 
@@ -812,8 +958,10 @@ impl EmailProviderKind {
         match raw.trim() {
             s if s == provider::LOG => Ok(EmailProviderKind::Log),
             s if s == provider::SMTP => Ok(EmailProviderKind::Smtp),
+            s if s == provider::BUNYIP => Ok(EmailProviderKind::Api),
             other => Err(AppError::Configuration(format!(
-                "MAIL_PROVIDER {other:?} is not a known provider; expected 'log' or 'smtp'"
+                "MAIL_PROVIDER {other:?} is not a known provider; expected 'log', 'smtp' or \
+                 'bunyip'"
             ))),
         }
     }
@@ -935,6 +1083,15 @@ pub fn build_mailer(
                 ));
             }
             mailer_config.build()
+        }
+        // PMS-1482: the Bunyip mailer relay carries its own base URL and
+        // machine credential, none of which `MailerConfig` holds, so this arm
+        // reads its own env-sourced config rather than the SMTP fields the
+        // caller passed in. Fails loud when any of the three is missing.
+        EmailProviderKind::Api => {
+            let api_config = ApiMailerConfig::from_env()?;
+            let mailer = ApiMailer::new(api_config)?;
+            Ok(Arc::new(mailer))
         }
     }
 }
@@ -1456,6 +1613,21 @@ mod tests {
         }
     }
 
+    /// PMS-1482: `bunyip` joins the known names, mapped through
+    /// [`EmailProviderKind::Api`], and round-trips back to the same
+    /// `deployment::provider::BUNYIP` string `as_str` reports.
+    #[test]
+    fn email_provider_kind_parses_bunyip_as_the_api_variant() {
+        assert_eq!(
+            EmailProviderKind::parse_name("bunyip").unwrap(),
+            EmailProviderKind::Api
+        );
+        assert_eq!(
+            EmailProviderKind::Api.as_str(),
+            crate::utils::deployment::provider::BUNYIP
+        );
+    }
+
     /// PMS-1013: unset MAIL_PROVIDER with SMTP_HOST set infers smtp
     /// (backward compat with the pre-PMS-1013 implicit rule) and marks the
     /// source Explicit; unset with no host takes the profile default and
@@ -1563,6 +1735,117 @@ mod tests {
             "MAIL_PROVIDER=log must build LogMailer regardless of SMTP_HOST; the warning \
              is the operator signal"
         );
+    }
+
+    /// RAII: clear `keys` on construction and again on drop, then refresh the
+    /// configuration generation, matching the pattern in
+    /// `config::flags::tests::EnvGuard`. Scoped here because `ApiMailerConfig`
+    /// is the only `email.rs` type that reads config, so no other test in
+    /// this module needs to serialise against env mutation.
+    struct MailerEnvGuard {
+        keys: Vec<&'static str>,
+    }
+
+    impl MailerEnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            let _ = crate::config::refresh();
+            Self {
+                keys: keys.to_vec(),
+            }
+        }
+    }
+
+    impl Drop for MailerEnvGuard {
+        fn drop(&mut self) {
+            for key in &self.keys {
+                std::env::remove_var(key);
+            }
+            let _ = crate::config::refresh();
+        }
+    }
+
+    const MAILER_ENV_KEYS: &[&str] = &[
+        "BUNYIP_MAILER_URL",
+        "BUNYIP_MAILER_CLIENT_ID",
+        "BUNYIP_MAILER_CLIENT_SECRET",
+    ];
+
+    /// PMS-1482: `MAIL_PROVIDER=bunyip` is explicit, so there is no
+    /// "not enabled" case: an unset `BUNYIP_MAILER_URL` is a named boot
+    /// error, not a silent no-op mailer.
+    #[test]
+    fn api_mailer_config_refuses_an_unset_url() {
+        let _serial = crate::config::refresh_test_lock();
+        let _cleanup = MailerEnvGuard::new(MAILER_ENV_KEYS);
+
+        let err = ApiMailerConfig::from_env().expect_err("unset URL must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("BUNYIP_MAILER_URL"), "{msg}");
+    }
+
+    /// An operator who sets the URL but leaves either credential half unset
+    /// gets a boot error naming exactly the half that is missing.
+    #[test]
+    fn api_mailer_config_refuses_a_partial_credential() {
+        let _serial = crate::config::refresh_test_lock();
+        let _cleanup = MailerEnvGuard::new(MAILER_ENV_KEYS);
+
+        std::env::set_var("BUNYIP_MAILER_URL", "https://bunyip.example");
+        let _ = crate::config::refresh();
+        let err = ApiMailerConfig::from_env().expect_err("client id is still required");
+        assert!(err.to_string().contains("BUNYIP_MAILER_CLIENT_ID"));
+
+        std::env::set_var("BUNYIP_MAILER_CLIENT_ID", "id");
+        let _ = crate::config::refresh();
+        let err = ApiMailerConfig::from_env().expect_err("client secret is still required");
+        assert!(err.to_string().contains("BUNYIP_MAILER_CLIENT_SECRET"));
+    }
+
+    /// All three set builds, and the trailing slash on the URL is trimmed
+    /// the same way `BunyipConfig::from_env` trims it, so the relay path is
+    /// appended without a double slash.
+    #[test]
+    fn api_mailer_config_trims_a_trailing_slash_when_all_three_are_set() {
+        let _serial = crate::config::refresh_test_lock();
+        let _cleanup = MailerEnvGuard::new(MAILER_ENV_KEYS);
+
+        std::env::set_var("BUNYIP_MAILER_URL", "https://bunyip.example/");
+        std::env::set_var("BUNYIP_MAILER_CLIENT_ID", "id");
+        std::env::set_var("BUNYIP_MAILER_CLIENT_SECRET", "secret");
+        let _ = crate::config::refresh();
+
+        let cfg = ApiMailerConfig::from_env().unwrap();
+        assert_eq!(cfg.base_url, "https://bunyip.example");
+        assert_eq!(cfg.client_id, "id");
+        assert_eq!(cfg.client_secret.expose_secret(), "secret");
+    }
+
+    /// PMS-1482: `build_mailer(Api, _)` is fail-loud on the same missing
+    /// config `ApiMailerConfig::from_env` refuses, through the one
+    /// construction path every `EmailProviderKind` goes through.
+    #[test]
+    fn build_mailer_refuses_api_without_relay_config() {
+        let _serial = crate::config::refresh_test_lock();
+        let _cleanup = MailerEnvGuard::new(MAILER_ENV_KEYS);
+
+        let cfg = MailerConfig {
+            host: None,
+            port: 587,
+            username: None,
+            password: None,
+            from: "Mokosh <noreply@example.com>".to_string(),
+            tls: SmtpTls::Starttls,
+        };
+        match build_mailer(EmailProviderKind::Api, cfg) {
+            Err(AppError::Configuration(msg)) => {
+                assert!(msg.contains("BUNYIP_MAILER_URL"), "{msg}");
+            }
+            Err(other) => panic!("expected Configuration error, got {other}"),
+            Ok(_) => panic!("bunyip without relay config must refuse"),
+        }
     }
 
     /// PMS-1013: LogMailer's default verify is trivially Ok. SmtpMailer's

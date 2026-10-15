@@ -207,9 +207,12 @@ three guesses:
 
 ## Mail transport
 
-Independent of everything above, and not yet implemented: PMS-903 will read the
-same flag to send through Bunyip's shared mailer API (BUNYIP-602) instead of
-direct SMTP in `saas`, with `MailerConfig::build` selecting an `ApiMailer`.
-Composition does not change; only the transport does. `DeploymentMode`
-deliberately carries no transport knowledge, so that work lands on top of it
-rather than revisiting it.
+Independent of everything above. `ApiMailer` (PMS-1482) now exists and sends
+through Bunyip's shared mailer relay (BUNYIP-602) instead of SMTP when an
+operator sets `MAIL_PROVIDER=bunyip` explicitly. It is not a hosting-profile
+default: PMS-1018 confirmed the deployed `saas` instance already sends through
+plain SMTP directly, so `SAAS_PROVIDER_DEFAULTS`'s Email row stays `smtp` and
+`DeploymentMode` continues to carry no transport knowledge of its own.
+Composition (what an email says) does not change either way; only the
+transport does. [`self-hosted-vs-saas-mail.md`](self-hosted-vs-saas-mail.md)
+documents the two-mode mail data flow in full.

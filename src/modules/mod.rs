@@ -4,6 +4,7 @@
 //! Each module is designed to be a discrete unit with its own API.
 
 pub mod approvals;
+pub mod asset_catalog;
 pub mod assets;
 pub mod audit;
 pub mod auth;

@@ -53,11 +53,24 @@ pub enum Feature {
     /// it on makes the routes serve; flipping it off makes them 404. The
     /// existing `GET /api/v1/assets?q=` is unaffected either way.
     AssetsSearchV2,
+    /// Asset catalog + bulk order (PMS-1492). Hides every `/api/v1/asset-models`,
+    /// `/api/v1/asset-templates` and `/api/v1/assets/bulk-create` route behind
+    /// this switch so the Phase 3 SPA (`AssetBulkCreateModal`, `SignatureBanner`,
+    /// `/settings/asset-catalog`) only writes against a server that has the
+    /// backing tables + CRUD + fan-out verb landed. Off: every new route
+    /// answers 404 and the SPA renders its "Asset catalog is not enabled"
+    /// banner. The existing single-asset `POST /api/v1/assets` is unaffected
+    /// either way.
+    AssetsCatalog,
 }
 
 impl Feature {
     /// Every registered feature, in admin-page order.
-    pub const ALL: &'static [Feature] = &[Feature::IntegrationsOverview, Feature::AssetsSearchV2];
+    pub const ALL: &'static [Feature] = &[
+        Feature::IntegrationsOverview,
+        Feature::AssetsSearchV2,
+        Feature::AssetsCatalog,
+    ];
 
     /// The stable key: the `feature_toggles.key` value and the wire name. Never
     /// rename one; see the module docs.
@@ -65,6 +78,7 @@ impl Feature {
         match self {
             Feature::IntegrationsOverview => "integrations_overview",
             Feature::AssetsSearchV2 => "assets_search_v2",
+            Feature::AssetsCatalog => "assets_catalog",
         }
     }
 
@@ -73,6 +87,7 @@ impl Feature {
         match self {
             Feature::IntegrationsOverview => "Integrations overview",
             Feature::AssetsSearchV2 => "Asset search v2",
+            Feature::AssetsCatalog => "Asset catalog + bulk order",
         }
     }
 
@@ -91,6 +106,15 @@ impl Feature {
                  and the routes serve. The existing GET /api/v1/assets?q= stays available in \
                  both states."
             }
+            Feature::AssetsCatalog => {
+                "The device-catalog + bulk-order flow (GET/POST/PUT/DELETE /api/v1/asset-models, \
+                 /api/v1/asset-templates, POST /api/v1/assets/bulk-create, \
+                 GET /api/v1/asset-models/signature-detector). Off: every new route answers \
+                 404 and the SPA's Bulk create modal renders a 'not enabled on this deployment' \
+                 banner. On: the typeahead returns catalog hits, the bulk-create verb fans out \
+                 up to 500 serials per call, and the signature detector surfaces hot patterns. \
+                 The single-asset POST /api/v1/assets is unaffected either way."
+            }
         }
     }
 
@@ -100,6 +124,7 @@ impl Feature {
         match self {
             Feature::IntegrationsOverview => "MAPPS-971",
             Feature::AssetsSearchV2 => "PMS-1486",
+            Feature::AssetsCatalog => "PMS-1492",
         }
     }
 

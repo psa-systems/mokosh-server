@@ -309,6 +309,11 @@ services:
       # at the env-var level.
       SMTP_FROM: ${SMTP_FROM:-Mokosh Dev <noreply@mokosh.localdev>}
       SMTP_TLS: ${SMTP_TLS:-none}
+      # PMS-1482: Bunyip mailer relay; empty by default, so dev stays on
+      # the mailpit SMTP path above unless an operator opts in.
+      BUNYIP_MAILER_URL: ${BUNYIP_MAILER_URL:-}
+      BUNYIP_MAILER_CLIENT_ID: ${BUNYIP_MAILER_CLIENT_ID:-}
+      BUNYIP_MAILER_CLIENT_SECRET: ${BUNYIP_MAILER_CLIENT_SECRET:-}
 
       # Infisical is an opt-in profile, so this stays EMPTY on a plain
       # `just dev` and the readiness probe reports "skipped" instead of

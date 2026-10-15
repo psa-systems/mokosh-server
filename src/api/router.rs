@@ -666,6 +666,13 @@ pub fn create_api_router(
             ticket_service.clone(),
             features.clone(),
         ))
+        // PMS-1492 phase 3 MR1: catalog typeahead + CRUD. Gated on
+        // `Feature::AssetsCatalog` inside the handlers; off => 404
+        // without touching the DB.
+        .merge(crate::modules::asset_catalog::asset_catalog_routes(
+            crate::modules::asset_catalog::AssetCatalogService::new(db.clone()),
+            features.clone(),
+        ))
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
         // PMS-923: images an article embeds. Upload / list / delete are
