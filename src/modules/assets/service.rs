@@ -755,13 +755,57 @@ impl AssetsService {
         performer: Uuid,
         request: &BulkCreateAssetsRequest,
     ) -> AppResult<Vec<AssetResponse>> {
-        let Some(asset_model_id) = request.asset_model_id else {
+        // Resolve template → model + per-order context overlay. When a
+        // template is set, its company_id / site_id / assigned_user_id /
+        // department overlay the request's values (per the plan doc:
+        // "template wins when both are present"). The request's own
+        // fields win only when the template is None for that field.
+        // bump templates.uses_count by the batch size for the typeahead's
+        // ordering.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[derive(sqlx::FromRow)]
+        struct TemplateOverlay {
+            asset_model_id: Uuid,
+            company_id: Option<Uuid>,
+            site_id: Option<Uuid>,
+            default_assigned_user_id: Option<Uuid>,
+            department: Option<String>,
+        }
+        let (asset_model_id, overlay) = if let Some(template_id) = request.template_id {
+            let tpl: TemplateOverlay = sqlx::query_as(
+                "SELECT asset_model_id, company_id, site_id, default_assigned_user_id, department \
+                 FROM asset_templates WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(*tenant_id)
+            .bind(template_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::validation_field("template_id", "template does not exist in this tenant")
+            })?;
+            (tpl.asset_model_id, Some(tpl))
+        } else if let Some(id) = request.asset_model_id {
+            (id, None)
+        } else {
             return Err(AppError::validation_field(
                 "asset_model_id",
-                "asset_model_id is required (templates land in a follow-up MR)",
+                "either template_id or asset_model_id must be set",
             ));
         };
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let effective_company_id = overlay
+            .as_ref()
+            .and_then(|t| t.company_id)
+            .unwrap_or(request.company_id);
+        let effective_site_id = overlay.as_ref().and_then(|t| t.site_id).or(request.site_id);
+        let effective_assigned_user_id = overlay
+            .as_ref()
+            .and_then(|t| t.default_assigned_user_id)
+            .or(request.assigned_user_id);
+        let effective_department = overlay
+            .as_ref()
+            .and_then(|t| t.department.clone())
+            .or(request.department.clone());
+
         // Resolve the catalog model to its defaults. Scoped by tenant so
         // a caller cannot reach another tenant's model.
         #[derive(sqlx::FromRow)]
@@ -791,11 +835,13 @@ impl AssetsService {
 
         // Verify the per-request references up-front so a wrong one 422s
         // before any insert fires rather than after N-1 succeed and the
-        // Nth raises an FK violation.
+        // Nth raises an FK violation. Uses the effective_* overlay so a
+        // template that overrides the company is checked against the
+        // template's value, not the request's.
         let company_ok: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM companies WHERE tenant_id = $1 AND id = $2")
                 .bind(*tenant_id)
-                .bind(request.company_id)
+                .bind(effective_company_id)
                 .fetch_optional(&mut *tx)
                 .await?;
         if company_ok.is_none() {
@@ -804,7 +850,7 @@ impl AssetsService {
                 "company does not exist in this tenant",
             ));
         }
-        if let Some(site_id) = request.site_id {
+        if let Some(site_id) = effective_site_id {
             let found: Option<Uuid> =
                 sqlx::query_scalar("SELECT id FROM sites WHERE tenant_id = $1 AND id = $2")
                     .bind(*tenant_id)
@@ -818,7 +864,7 @@ impl AssetsService {
                 ));
             }
         }
-        if let Some(assigned_user_id) = request.assigned_user_id {
+        if let Some(assigned_user_id) = effective_assigned_user_id {
             let found: Option<Uuid> =
                 sqlx::query_scalar("SELECT id FROM users WHERE tenant_id = $1 AND id = $2")
                     .bind(*tenant_id)
@@ -844,10 +890,7 @@ impl AssetsService {
             (Some(d), Some(m)) => Some(d + chrono::Months::new(m.max(0) as u32)),
             _ => None,
         };
-        let department = request
-            .department
-            .clone()
-            .or_else(|| defaults.default_department.clone());
+        let department = effective_department.or_else(|| defaults.default_department.clone());
 
         let mut created_ids = Vec::with_capacity(request.serials.len());
         for (idx, s) in request.serials.iter().enumerate() {
@@ -876,8 +919,8 @@ impl AssetsService {
             .bind(&s.asset_tag)
             .bind(&name)
             .bind(defaults.asset_type_id)
-            .bind(request.company_id)
-            .bind(request.site_id)
+            .bind(effective_company_id)
+            .bind(effective_site_id)
             .bind(&defaults.manufacturer)
             .bind(&defaults.model)
             .bind(&s.serial_number)
@@ -885,7 +928,7 @@ impl AssetsService {
             .bind(request.purchase_price)
             .bind(warranty_expiry)
             .bind(end_of_life)
-            .bind(request.assigned_user_id)
+            .bind(effective_assigned_user_id)
             .bind(s.ip_address.as_deref().unwrap_or(""))
             .bind(&s.hostname)
             .bind(&s.mac_address)
@@ -939,6 +982,19 @@ impl AssetsService {
         .bind(created_ids.len() as i64)
         .execute(&mut *tx)
         .await?;
+        // Same bump for the template when one was used, so the templates
+        // typeahead on the SPA's bulk modal ranks by actual popularity.
+        if let Some(template_id) = request.template_id {
+            sqlx::query(
+                "UPDATE asset_templates SET uses_count = uses_count + $3, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(*tenant_id)
+            .bind(template_id)
+            .bind(created_ids.len() as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
 

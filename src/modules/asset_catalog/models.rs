@@ -94,3 +94,64 @@ pub struct AssetModelsQuery {
     #[serde(default)]
     pub limit: Option<i64>,
 }
+
+/// A row from `asset_templates` with its model eagerly joined so the SPA
+/// typeahead can render "<Template name> - <manufacturer> <model>" inline.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct AssetTemplateResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub asset_model_id: Uuid,
+    pub manufacturer: String,
+    pub model: String,
+    pub asset_type_id: Uuid,
+    pub company_id: Option<Uuid>,
+    pub site_id: Option<Uuid>,
+    pub default_assigned_user_id: Option<Uuid>,
+    pub department: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub notes: Option<String>,
+    pub license_seat_count: Option<i32>,
+    pub created_by: Option<Uuid>,
+    pub uses_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// `POST /api/v1/asset-templates` body.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct CreateAssetTemplateRequest {
+    #[validate(length(min = 1, max = 150))]
+    pub name: String,
+    pub asset_model_id: Uuid,
+    pub company_id: Option<Uuid>,
+    pub site_id: Option<Uuid>,
+    pub default_assigned_user_id: Option<Uuid>,
+    #[validate(length(max = 100))]
+    pub department: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    pub notes: Option<String>,
+    #[validate(range(min = 0, max = 100_000))]
+    pub license_seat_count: Option<i32>,
+}
+
+/// `PUT /api/v1/asset-templates/{id}` body. Every field Option; absent
+/// fields leave the column untouched. (`company_id` and friends are
+/// Option<Option<T>> so the SPA can clear them explicitly; the service
+/// treats a bare `None` as "do not touch".)
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpdateAssetTemplateRequest {
+    #[validate(length(min = 1, max = 150))]
+    pub name: Option<String>,
+    pub asset_model_id: Option<Uuid>,
+    pub company_id: Option<Uuid>,
+    pub site_id: Option<Uuid>,
+    pub default_assigned_user_id: Option<Uuid>,
+    #[validate(length(max = 100))]
+    pub department: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub notes: Option<String>,
+    #[validate(range(min = 0, max = 100_000))]
+    pub license_seat_count: Option<i32>,
+}

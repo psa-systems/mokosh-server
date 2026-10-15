@@ -406,3 +406,211 @@ async fn bulk_create_rejects_over_500_serials(pool: PgPool) {
         "over-cap must be 422"
     );
 }
+
+#[mokosh_test]
+async fn template_crud_and_bulk_create_with_template_overlay(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company_a = seed_company(&pool, "Acme Co").await;
+    let company_b = seed_company(&pool, "Beta Co").await;
+    let type_id = seed_asset_type(&pool, "Laptop").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    turn_catalog_on(&app, &token).await;
+
+    // Model + template.
+    let model: Value = app
+        .client
+        .post(app.url(MODELS))
+        .bearer_auth(&token)
+        .json(&json!({
+            "manufacturer": "Dell",
+            "model": "Latitude 5450",
+            "asset_type_id": type_id,
+            "warranty_months": 36,
+        }))
+        .send()
+        .await
+        .expect("create model")
+        .json()
+        .await
+        .expect("model JSON");
+    let model_id = model["id"].as_str().unwrap().to_string();
+
+    let r = app
+        .client
+        .post(app.url("/api/v1/asset-templates"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "name": "Sales Latitude",
+            "asset_model_id": model_id,
+            "company_id": company_a,
+            "department": "Sales",
+        }))
+        .send()
+        .await
+        .expect("create template");
+    assert_eq!(
+        r.status(),
+        StatusCode::CREATED,
+        "body: {}",
+        r.text().await.unwrap_or_default()
+    );
+    let template: Value = app
+        .client
+        .get(app.url("/api/v1/asset-templates"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list templates")
+        .json()
+        .await
+        .expect("list json");
+    let tpl = &template.as_array().unwrap()[0];
+    assert_eq!(tpl["name"], "Sales Latitude");
+    // Eager join must surface the model's manufacturer + model.
+    assert_eq!(tpl["manufacturer"], "Dell");
+    assert_eq!(tpl["model"], "Latitude 5450");
+    let template_id = tpl["id"].as_str().unwrap().to_string();
+
+    // Bulk-create with template_id + a different company in the request:
+    // the template's company (Acme) wins per the plan ("template wins
+    // when both are present").
+    let r = app
+        .client
+        .post(app.url(BULK_CREATE))
+        .bearer_auth(&token)
+        .json(&json!({
+            "template_id": template_id,
+            "company_id": company_b,
+            "serials": [
+                { "serial_number": "T-001" },
+                { "serial_number": "T-002" },
+            ]
+        }))
+        .send()
+        .await
+        .expect("bulk create via template");
+    assert_eq!(
+        r.status(),
+        StatusCode::CREATED,
+        "body: {}",
+        r.text().await.unwrap_or_default()
+    );
+
+    // Both created assets live at company_a (Acme), not company_b, and
+    // carry the template's department.
+    let list: Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets?company_id={company_a}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list assets")
+        .json()
+        .await
+        .expect("list json");
+    let rows = list["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "template company overrides request");
+    for row in rows {
+        assert_eq!(row["department"], "Sales");
+        assert_eq!(row["manufacturer"], "Dell");
+    }
+
+    // Template's uses_count bumped by 2.
+    let after: Value = app
+        .client
+        .get(app.url(&format!("/api/v1/asset-templates/{template_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get template")
+        .json()
+        .await
+        .expect("tpl json");
+    assert_eq!(after["uses_count"].as_i64(), Some(2));
+
+    // Update template name.
+    let r = app
+        .client
+        .put(app.url(&format!("/api/v1/asset-templates/{template_id}")))
+        .bearer_auth(&token)
+        .json(&json!({ "name": "Sales Latitude v2" }))
+        .send()
+        .await
+        .expect("put template");
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // Delete the template.
+    let r = app
+        .client
+        .delete(app.url(&format!("/api/v1/asset-templates/{template_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete template");
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    let r = app
+        .client
+        .get(app.url("/api/v1/asset-templates"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list after delete");
+    let v: Value = r.json().await.expect("json");
+    assert_eq!(v.as_array().unwrap().len(), 0);
+}
+
+#[mokosh_test]
+async fn model_update_and_delete(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let type_id = seed_asset_type(&pool, "Laptop").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    turn_catalog_on(&app, &token).await;
+
+    let model: Value = app
+        .client
+        .post(app.url(MODELS))
+        .bearer_auth(&token)
+        .json(&json!({
+            "manufacturer": "Dell",
+            "model": "Latitude 5450",
+            "asset_type_id": type_id,
+        }))
+        .send()
+        .await
+        .expect("create")
+        .json()
+        .await
+        .expect("json");
+    let model_id = model["id"].as_str().unwrap();
+
+    let r = app
+        .client
+        .put(app.url(&format!("/api/v1/asset-models/{model_id}")))
+        .bearer_auth(&token)
+        .json(&json!({ "warranty_months": 48 }))
+        .send()
+        .await
+        .expect("put model");
+    assert_eq!(r.status(), StatusCode::OK);
+    let after: Value = r.json().await.expect("json");
+    assert_eq!(after["warranty_months"].as_i64(), Some(48));
+
+    let r = app
+        .client
+        .delete(app.url(&format!("/api/v1/asset-models/{model_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("delete model");
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    let r = app
+        .client
+        .get(app.url(&format!("/api/v1/asset-models/{model_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get after delete");
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}

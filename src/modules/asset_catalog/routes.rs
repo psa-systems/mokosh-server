@@ -17,7 +17,10 @@ use uuid::Uuid;
 use validator::Validate;
 
 use super::{
-    models::{AssetModelResponse, AssetModelsQuery, CreateAssetModelRequest},
+    models::{
+        AssetModelResponse, AssetModelsQuery, AssetTemplateResponse, CreateAssetModelRequest,
+        CreateAssetTemplateRequest, UpdateAssetModelRequest, UpdateAssetTemplateRequest,
+    },
     service::AssetCatalogService,
 };
 use crate::modules::auth::{RequireAdmin, RequireAssets, TenantScoped};
@@ -41,7 +44,22 @@ pub fn asset_catalog_routes(service: AssetCatalogService, features: FeatureSnaps
             "/asset-models",
             get(list_asset_models).post(create_asset_model),
         )
-        .route("/asset-models/{id}", get(get_asset_model))
+        .route(
+            "/asset-models/{id}",
+            get(get_asset_model)
+                .put(update_asset_model)
+                .delete(delete_asset_model),
+        )
+        .route(
+            "/asset-templates",
+            get(list_asset_templates).post(create_asset_template),
+        )
+        .route(
+            "/asset-templates/{id}",
+            get(get_asset_template)
+                .put(update_asset_template)
+                .delete(delete_asset_template),
+        )
         .with_state(state)
 }
 
@@ -90,4 +108,83 @@ async fn get_asset_model(
     require_catalog(&s)?;
     let row = s.service.get_model(u.tenant(), id).await?;
     Ok(Json(row))
+}
+
+async fn update_asset_model(
+    State(s): State<AssetCatalogRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    _admin: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateAssetModelRequest>,
+) -> AppResult<Json<AssetModelResponse>> {
+    require_catalog(&s)?;
+    req.validate()?;
+    let row = s.service.update_model(u.tenant(), id, &req).await?;
+    Ok(Json(row))
+}
+
+async fn delete_asset_model(
+    State(s): State<AssetCatalogRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    _admin: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<axum::http::StatusCode> {
+    require_catalog(&s)?;
+    s.service.delete_model(u.tenant(), id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn list_asset_templates(
+    State(s): State<AssetCatalogRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+) -> AppResult<Json<Vec<AssetTemplateResponse>>> {
+    require_catalog(&s)?;
+    let rows = s.service.list_templates(u.tenant()).await?;
+    Ok(Json(rows))
+}
+
+async fn get_asset_template(
+    State(s): State<AssetCatalogRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<AssetTemplateResponse>> {
+    require_catalog(&s)?;
+    let row = s.service.get_template(u.tenant(), id).await?;
+    Ok(Json(row))
+}
+
+async fn create_asset_template(
+    State(s): State<AssetCatalogRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    _admin: RequireAdmin,
+    Json(req): Json<CreateAssetTemplateRequest>,
+) -> AppResult<(axum::http::StatusCode, Json<AssetTemplateResponse>)> {
+    require_catalog(&s)?;
+    req.validate()?;
+    let row = s.service.create_template(u.tenant(), u.id, &req).await?;
+    Ok((axum::http::StatusCode::CREATED, Json(row)))
+}
+
+async fn update_asset_template(
+    State(s): State<AssetCatalogRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    _admin: RequireAdmin,
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateAssetTemplateRequest>,
+) -> AppResult<Json<AssetTemplateResponse>> {
+    require_catalog(&s)?;
+    req.validate()?;
+    let row = s.service.update_template(u.tenant(), id, &req).await?;
+    Ok(Json(row))
+}
+
+async fn delete_asset_template(
+    State(s): State<AssetCatalogRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    _admin: RequireAdmin,
+    Path(id): Path<Uuid>,
+) -> AppResult<axum::http::StatusCode> {
+    require_catalog(&s)?;
+    s.service.delete_template(u.tenant(), id).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }

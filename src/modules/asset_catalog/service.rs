@@ -2,7 +2,10 @@
 
 use uuid::Uuid;
 
-use super::models::{AssetModelResponse, AssetModelsQuery, CreateAssetModelRequest};
+use super::models::{
+    AssetModelResponse, AssetModelsQuery, AssetTemplateResponse, CreateAssetModelRequest,
+    CreateAssetTemplateRequest, UpdateAssetModelRequest, UpdateAssetTemplateRequest,
+};
 use crate::db::Database;
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
@@ -144,6 +147,278 @@ impl AssetCatalogService {
         .await?
         .ok_or_else(|| AppError::NotFound("Asset model".to_string()))?;
         Ok(row)
+    }
+
+    /// MR2: partial update. Each field is Option; absent fields leave
+    /// the column untouched via `COALESCE($N, col)`. The unique index on
+    /// `(tenant_id, lower(manufacturer), lower(model), asset_type_id)`
+    /// may raise 23505 when a rename moves two models into the same
+    /// shape; mapped to 409 at the HTTP layer the same way `create_model`
+    /// does.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_model(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpdateAssetModelRequest,
+    ) -> AppResult<AssetModelResponse> {
+        if let Some(type_id) = request.asset_type_id {
+            self.assert_asset_type_in_tenant(tenant_id, type_id).await?;
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query(
+            "UPDATE asset_models SET \
+                manufacturer = COALESCE($3, manufacturer), \
+                model = COALESCE($4, model), \
+                asset_type_id = COALESCE($5, asset_type_id), \
+                warranty_months = COALESCE($6, warranty_months), \
+                end_of_life_months = COALESCE($7, end_of_life_months), \
+                default_department = COALESCE($8, default_department), \
+                default_license_vendor = COALESCE($9, default_license_vendor), \
+                default_tags = COALESCE($10, default_tags), \
+                specs = COALESCE($11, specs), \
+                image_url = COALESCE($12, image_url), \
+                updated_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(*tenant_id)
+        .bind(id)
+        .bind(&request.manufacturer)
+        .bind(&request.model)
+        .bind(request.asset_type_id)
+        .bind(request.warranty_months)
+        .bind(request.end_of_life_months)
+        .bind(&request.default_department)
+        .bind(&request.default_license_vendor)
+        .bind(&request.default_tags)
+        .bind(&request.specs)
+        .bind(&request.image_url)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let Some(dbe) = e.as_database_error() {
+                if let Some(code) = dbe.code() {
+                    if code == "23505" {
+                        return AppError::Conflict(
+                            "Another catalog row already has this manufacturer / model / type."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            e.into()
+        })?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("Asset model".to_string()));
+        }
+        tx.commit().await?;
+        self.get_model(tenant_id, id).await
+    }
+
+    /// MR2: delete. Assets referencing the row keep their rows (the FK on
+    /// `assets.asset_model_id` is ON DELETE SET NULL per migration 271);
+    /// templates referencing the row are cascade-deleted by their own
+    /// FK (so the operator's intent "I don't want this model anymore"
+    /// implies the dependent templates go too).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_model(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query("DELETE FROM asset_models WHERE tenant_id = $1 AND id = $2")
+            .bind(*tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("Asset model".to_string()));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // -- Templates ------------------------------------------------
+
+    /// `GET /api/v1/asset-templates`: all templates for the tenant, each
+    /// eagerly joined to its asset_model so the typeahead can render
+    /// "<name> - <manufacturer> <model>" inline without a second round
+    /// trip. Ordered by `updated_at DESC` so recent edits float.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn list_templates(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<Vec<AssetTemplateResponse>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<AssetTemplateResponse> = sqlx::query_as::<_, AssetTemplateResponse>(
+            "SELECT t.id, t.name, t.asset_model_id, m.manufacturer, m.model, m.asset_type_id, \
+                    t.company_id, t.site_id, t.default_assigned_user_id, \
+                    t.department, t.tags, t.notes, t.license_seat_count, \
+                    t.created_by, t.uses_count, t.created_at, t.updated_at \
+             FROM asset_templates t \
+             INNER JOIN asset_models m ON m.id = t.asset_model_id AND m.tenant_id = t.tenant_id \
+             WHERE t.tenant_id = $1 \
+             ORDER BY t.updated_at DESC",
+        )
+        .bind(*tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows)
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn get_template(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+    ) -> AppResult<AssetTemplateResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as::<_, AssetTemplateResponse>(
+            "SELECT t.id, t.name, t.asset_model_id, m.manufacturer, m.model, m.asset_type_id, \
+                    t.company_id, t.site_id, t.default_assigned_user_id, \
+                    t.department, t.tags, t.notes, t.license_seat_count, \
+                    t.created_by, t.uses_count, t.created_at, t.updated_at \
+             FROM asset_templates t \
+             INNER JOIN asset_models m ON m.id = t.asset_model_id AND m.tenant_id = t.tenant_id \
+             WHERE t.tenant_id = $1 AND t.id = $2",
+        )
+        .bind(*tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Asset template".to_string()))?;
+        Ok(row)
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn create_template(
+        &self,
+        tenant_id: TenantId,
+        performer: Uuid,
+        request: &CreateAssetTemplateRequest,
+    ) -> AppResult<AssetTemplateResponse> {
+        // Model must be in-tenant. The INSERT's FK would catch it too but
+        // the message would read as a generic DB error.
+        self.get_model(tenant_id, request.asset_model_id).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: (Uuid,) = sqlx::query_as(
+            "INSERT INTO asset_templates (tenant_id, name, asset_model_id, company_id, site_id, \
+                default_assigned_user_id, department, tags, notes, license_seat_count, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             RETURNING id",
+        )
+        .bind(*tenant_id)
+        .bind(&request.name)
+        .bind(request.asset_model_id)
+        .bind(request.company_id)
+        .bind(request.site_id)
+        .bind(request.default_assigned_user_id)
+        .bind(&request.department)
+        .bind(&request.tags)
+        .bind(&request.notes)
+        .bind(request.license_seat_count)
+        .bind(performer)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let Some(dbe) = e.as_database_error() {
+                if let Some(code) = dbe.code() {
+                    if code == "23505" {
+                        return AppError::Conflict(
+                            "A template with this name already exists.".to_string(),
+                        );
+                    }
+                }
+            }
+            e.into()
+        })?;
+        tx.commit().await?;
+        self.get_template(tenant_id, row.0).await
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn update_template(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        request: &UpdateAssetTemplateRequest,
+    ) -> AppResult<AssetTemplateResponse> {
+        if let Some(model_id) = request.asset_model_id {
+            self.get_model(tenant_id, model_id).await?;
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query(
+            "UPDATE asset_templates SET \
+                name = COALESCE($3, name), \
+                asset_model_id = COALESCE($4, asset_model_id), \
+                company_id = COALESCE($5, company_id), \
+                site_id = COALESCE($6, site_id), \
+                default_assigned_user_id = COALESCE($7, default_assigned_user_id), \
+                department = COALESCE($8, department), \
+                tags = COALESCE($9, tags), \
+                notes = COALESCE($10, notes), \
+                license_seat_count = COALESCE($11, license_seat_count), \
+                updated_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(*tenant_id)
+        .bind(id)
+        .bind(&request.name)
+        .bind(request.asset_model_id)
+        .bind(request.company_id)
+        .bind(request.site_id)
+        .bind(request.default_assigned_user_id)
+        .bind(&request.department)
+        .bind(&request.tags)
+        .bind(&request.notes)
+        .bind(request.license_seat_count)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let Some(dbe) = e.as_database_error() {
+                if let Some(code) = dbe.code() {
+                    if code == "23505" {
+                        return AppError::Conflict(
+                            "Another template already uses this name.".to_string(),
+                        );
+                    }
+                }
+            }
+            e.into()
+        })?
+        .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("Asset template".to_string()));
+        }
+        tx.commit().await?;
+        self.get_template(tenant_id, id).await
+    }
+
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn delete_template(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let n = sqlx::query("DELETE FROM asset_templates WHERE tenant_id = $1 AND id = $2")
+            .bind(*tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("Asset template".to_string()));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Internal helper for `bulk_create_assets` to resolve a template id
+    /// into the model + per-order context it carries. Returns the row
+    /// shape as a tuple of (asset_model_id, context overlay).
+    #[allow(clippy::type_complexity)]
+    pub async fn resolve_template_for_bulk(
+        &self,
+        tenant_id: TenantId,
+        template_id: Uuid,
+    ) -> AppResult<AssetTemplateResponse> {
+        self.get_template(tenant_id, template_id).await
     }
 
     async fn assert_asset_type_in_tenant(
