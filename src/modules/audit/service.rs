@@ -183,6 +183,12 @@ impl AuditService {
             let total = cq.fetch_one(self.db.migrator_pool()).await?;
             (rows, total)
         };
+        let unresolved: Vec<Uuid> = rows
+            .iter()
+            .filter(|r| r.user_id.is_some() && r.user_name.is_none())
+            .filter_map(|r| r.user_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names("audit.list", &unresolved);
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -240,24 +246,18 @@ impl AuditService {
         .await?;
 
         let entries: Vec<EntityHistoryEntry> = rows.into_iter().map(Into::into).collect();
-        // PMS-1477's shared unresolved-person helper has not landed yet; log
-        // once per read rather than once per row so a long page does not
-        // spam the log. A `Some` user_id with no resolved name means the
-        // user row is gone (or cross-tenant, impossible given the join
-        // above), which an absent `user_id` (`None`, by contract) is not.
+        // A `Some` user_id with no resolved name means the user row is gone
+        // (or cross-tenant, impossible given the join above), which an absent
+        // `user_id` (`None`, by contract) is not.
         let unresolved: Vec<Uuid> = entries
             .iter()
             .filter(|e| e.user_id.is_some() && e.user_name.is_none())
             .filter_map(|e| e.user_id)
             .collect();
-        if !unresolved.is_empty() {
-            tracing::info!(
-                surface = "audit.list_entity_history",
-                count = unresolved.len(),
-                ids = ?unresolved,
-                "unresolved actor id in entity history"
-            );
-        }
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "audit.list_entity_history",
+            &unresolved,
+        );
 
         Ok((entries, total as u64))
     }

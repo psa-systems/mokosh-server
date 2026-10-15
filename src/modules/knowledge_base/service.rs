@@ -479,6 +479,10 @@ impl KbService {
             .fetch_all(&mut *tx)
             .await?;
         let total = cq.fetch_one(&mut *tx).await?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "knowledge_base.list_articles",
+            &unresolved_article_person_ids(&rows),
+        );
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -617,6 +621,10 @@ impl KbService {
                 .await;
         }
         tx.commit().await?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "knowledge_base.get_article",
+            &unresolved_article_person_ids(std::slice::from_ref(&row)),
+        );
         Ok(row.into())
     }
 
@@ -929,6 +937,12 @@ impl KbService {
         .bind(provenance.restored_from)
         .fetch_one(&mut *tx)
         .await?;
+        if row.edited_by_name.is_none() {
+            crate::utils::unresolved_person::log_unresolved_person_names(
+                "knowledge_base.snapshot_version",
+                &[row.edited_by_id],
+            );
+        }
         Ok(row.into())
     }
 
@@ -1276,6 +1290,15 @@ impl KbService {
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
         .await?;
+        let unresolved: Vec<Uuid> = rows
+            .iter()
+            .filter(|r| r.edited_by_name.is_none())
+            .map(|r| r.edited_by_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "knowledge_base.list_article_versions",
+            &unresolved,
+        );
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -1368,6 +1391,10 @@ impl KbService {
         .bind(article_id)
         .fetch_all(&mut *tx)
         .await?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "knowledge_base.list_comments",
+            &unresolved_comment_person_ids(&rows),
+        );
         let mut roots: Vec<KbCommentResponse> = Vec::new();
         let mut replies: Vec<KbCommentResponse> = Vec::new();
         for row in rows {
@@ -1811,15 +1838,19 @@ impl KbService {
         tenant_id: TenantId,
         comment_id: Uuid,
     ) -> AppResult<KbCommentResponse> {
-        sqlx::query_as::<_, CommentRow>(&format!(
+        let row = sqlx::query_as::<_, CommentRow>(&format!(
             "{COMMENT_SELECT} WHERE c.tenant_id = $1 AND c.id = $2"
         ))
         .bind(tenant_id)
         .bind(comment_id)
         .fetch_optional(&mut *tx)
         .await?
-        .map(Into::into)
-        .ok_or_else(|| AppError::NotFound("Comment".to_string()))
+        .ok_or_else(|| AppError::NotFound("Comment".to_string()))?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "knowledge_base.read_comment",
+            &unresolved_comment_person_ids(std::slice::from_ref(&row)),
+        );
+        Ok(row.into())
     }
 
     async fn comment_snapshot(
@@ -1873,6 +1904,10 @@ impl KbService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("KB article".to_string()))?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "knowledge_base.get_portal_article",
+            &unresolved_article_person_ids(std::slice::from_ref(&row)),
+        );
         Ok(row.into())
     }
 
@@ -2036,6 +2071,18 @@ struct ArticleRow {
     updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// PMS-1477: the author id and (when the article has one) the last-editor
+/// id, for every row in `rows` that came back with no resolvable name.
+fn unresolved_article_person_ids(rows: &[ArticleRow]) -> Vec<Uuid> {
+    rows.iter()
+        .flat_map(|r| {
+            let author = r.author_name.is_none().then_some(r.author_id);
+            let editor = r.updated_by_id.filter(|_| r.updated_by_name.is_none());
+            [author, editor].into_iter().flatten()
+        })
+        .collect()
+}
+
 impl From<ArticleRow> for KbArticleResponse {
     fn from(r: ArticleRow) -> Self {
         Self {
@@ -2150,6 +2197,18 @@ struct CommentRow {
     resolved_by_id: Option<Uuid>,
     resolved_by_name: Option<String>,
     deleted: bool,
+}
+
+/// PMS-1477: the author id, and (when the comment has one) the resolver id,
+/// for every row in `rows` that came back with no resolvable name.
+fn unresolved_comment_person_ids(rows: &[CommentRow]) -> Vec<Uuid> {
+    rows.iter()
+        .flat_map(|r| {
+            let author = r.author_name.is_none().then_some(r.author_id);
+            let resolver = r.resolved_by_id.filter(|_| r.resolved_by_name.is_none());
+            [author, resolver].into_iter().flatten()
+        })
+        .collect()
 }
 
 impl From<CommentRow> for KbCommentResponse {

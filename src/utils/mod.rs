@@ -48,6 +48,9 @@ pub mod recovery;
 // that applies it before any handler deserializes a request.
 pub mod text;
 pub mod totp;
+// PMS-1477: the one place a server response logs that it could not resolve a
+// person's name for an id it was asked to resolve.
+pub mod unresolved_person;
 // PMS-1204: the one size-limit refusal every upload site shares (one status
 // code, one wording), so a ticket attachment, a KB image, a tenant logo and a
 // branding asset stop disagreeing on how "too big" is reported.

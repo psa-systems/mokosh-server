@@ -88,6 +88,15 @@ impl TicketTemplatesService {
             .bind(active_only)
             .fetch_all(&mut *tx)
             .await?;
+        let unresolved: Vec<Uuid> = rows
+            .iter()
+            .filter(|r| r.created_by_name.is_none())
+            .map(|r| r.created_by_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "ticket_templates.list",
+            &unresolved,
+        );
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -105,6 +114,12 @@ impl TicketTemplatesService {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("Ticket template".into()))?;
+        if row.created_by_name.is_none() {
+            crate::utils::unresolved_person::log_unresolved_person_names(
+                "ticket_templates.get",
+                &[row.created_by_id],
+            );
+        }
         Ok(row.into())
     }
 
