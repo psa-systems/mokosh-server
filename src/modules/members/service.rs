@@ -18,7 +18,7 @@
 //! process." Future phases wire the SaaS fan-out when the bunyip-side
 //! directory lands.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -120,12 +120,15 @@ impl MembersService {
 
     /// Build the merged members page.
     ///
-    /// The merge is deterministic: all native users first, placed grantees
-    /// decorated with their grant id, remaining grants emitted as unplaced
-    /// guests, sort the whole set by (last_name, first_name, email) with a
-    /// stable id tie-break, then paginate the sorted set. `kind` /
-    /// `team_id` filters narrow the raw set before pagination so `total`
-    /// reflects the filtered set, not the pre-filter one.
+    /// The merge, sort and pagination all happen in one `UNION ALL` query
+    /// over native `users` rows (with `placed_by_grant_id` resolved via a
+    /// `LEFT JOIN` on `mokosh_bunyip_grants`) and unplaced-grant rows (a
+    /// grant with no matching `bunyip_user_id` in `users`), ordered by
+    /// `(last_name, first_name, email, id)` with `LIMIT`/`OFFSET` pushed
+    /// down. `total` is a second query over the same `UNION ALL` wrapped in
+    /// `COUNT(*)`, matching the count-then-page convention `list_assets`
+    /// uses. `kind` / `team_id` narrow which arms run and what they select
+    /// so `total` reflects the filtered set, not the pre-filter one.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list(
         &self,
@@ -134,6 +137,7 @@ impl MembersService {
         pagination: &PaginationParams,
     ) -> AppResult<MembersResponse> {
         let kind = filter.kind.as_deref().unwrap_or("everyone");
+        let team_filter_active = filter.team_id.is_some();
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
@@ -144,106 +148,71 @@ impl MembersService {
             .fetch_one(&mut *tx)
             .await?;
 
-        // --- native users -----------------------------------------------
-        // MAPPS-562: the auto-provisioned `system+<slug>@mokosh.local`
-        // attribution user exists only to satisfy FKs on tickets etc.;
-        // hide it here the same way `list_users` does.
-        let mut users_qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-            "SELECT id, email, first_name, last_name, role, status, \
-                    last_login_at, bunyip_user_id \
-             FROM users \
-             WHERE tenant_id = ",
-        );
-        users_qb.push_bind(*tenant_id);
-        users_qb.push(
-            " AND email NOT LIKE 'system+%@mokosh.local' \
-              AND deleted_at IS NULL",
-        );
-        if let Some(q) = filter.q.as_deref().filter(|q| !q.is_empty()) {
-            let pattern = format!("%{}%", q);
-            users_qb.push(" AND (email ILIKE ");
-            users_qb.push_bind(pattern.clone());
-            users_qb.push(" OR first_name ILIKE ");
-            users_qb.push_bind(pattern.clone());
-            users_qb.push(" OR last_name ILIKE ");
-            users_qb.push_bind(pattern);
-            users_qb.push(")");
-        }
-        if let Some(role) = filter.role.as_deref() {
-            users_qb.push(" AND role = ");
-            users_qb.push_bind(role.to_string());
-        }
-        let mut user_rows: Vec<UserScan> = users_qb
-            .build_query_as::<UserScan>()
-            .fetch_all(&mut *tx)
-            .await?;
-
-        // `team_id` filter: narrow users to those on the team. Unplaced
-        // guests cannot be on a team (no users row to join) so this also
-        // suppresses the grant branch.
-        let team_filter_active = filter.team_id.is_some();
-        if let Some(team_id) = filter.team_id {
-            let members: Vec<Uuid> = sqlx::query_scalar(
-                "SELECT user_id FROM team_members \
-                 WHERE tenant_id = $1 AND team_id = $2",
-            )
-            .bind(*tenant_id)
-            .bind(team_id)
-            .fetch_all(&mut *tx)
-            .await?;
-            let allowed: HashSet<Uuid> = members.into_iter().collect();
-            user_rows.retain(|u| allowed.contains(&u.id));
-        }
-
-        // --- active grants targeting this tenant -----------------------
-        // SAFETY (PMS-285): `mokosh_bunyip_grants` is an RLS-exempt
-        // cross-tenant table (see `mokosh_bunyip_grants.rs` module doc).
-        // Scoping by `mokosh_account_id = tenant.slug` reads only this
-        // tenant's grants; the slug is bound from the tenant we already
-        // resolved under this tenant_id, so no other tenant's grants can
-        // be returned. Reads on `self.db.migrator_pool()` because the RLS
-        // app pool would see zero rows (table has no `tenant_id`).
-        let mut grants: Vec<GrantScan> = if team_filter_active {
-            Vec::new()
-        } else {
-            let mut grants_qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-                "SELECT id, grantee_bunyip_user_id, role, granted_at \
-                 FROM mokosh_bunyip_grants \
-                 WHERE revoked_at IS NULL AND mokosh_account_id = ",
+        // SAFETY (PMS-285): the combined query below UNIONs native `users`
+        // rows with `mokosh_bunyip_grants` rows, a cross-tenant table with
+        // no `tenant_id` column (see its module doc), so the two arms
+        // cannot share one `app.current_tenant` GUC the way a single-table
+        // read would. It runs on `self.db.migrator_pool()`, the same
+        // BYPASSRLS accessor the pre-existing grants read already used,
+        // with tenant scoping enforced explicitly: the users arm filters
+        // `u.tenant_id = $1` and the grants arm filters
+        // `mokosh_account_id = <this tenant's slug>`, both bound from the
+        // `tenant_id` this handler was gated on, so no other tenant's rows
+        // can surface.
+        let total: i64 = {
+            let mut count_qb: QueryBuilder<sqlx::Postgres> =
+                QueryBuilder::new("SELECT COUNT(*) FROM (");
+            push_union(
+                &mut count_qb,
+                *tenant_id,
+                &tenant_slug,
+                filter,
+                kind,
+                team_filter_active,
             );
-            grants_qb.push_bind(tenant_slug.clone());
-            if let Some(role) = filter.role.as_deref() {
-                grants_qb.push(" AND role = ");
-                grants_qb.push_bind(role.to_string());
-            }
-            grants_qb
-                .build_query_as::<GrantScan>()
-                .fetch_all(self.db.migrator_pool())
+            count_qb.push(") members_union");
+            count_qb
+                .build_query_scalar()
+                .fetch_one(self.db.migrator_pool())
                 .await?
         };
 
-        // --- pair grants with users via bunyip_user_id -----------------
-        let mut users_by_bunyip: HashMap<Uuid, Uuid> = HashMap::new();
-        for u in &user_rows {
-            if let Some(bunyip_id) = u.bunyip_user_id {
-                users_by_bunyip.insert(bunyip_id, u.id);
-            }
-        }
-        let mut placed_grant_by_user: HashMap<Uuid, (String, String)> = HashMap::new();
-        grants.retain(|g| {
-            if let Some(user_id) = users_by_bunyip.get(&g.grantee_bunyip_user_id) {
-                placed_grant_by_user.insert(
-                    *user_id,
-                    (g.id.to_string(), g.role.clone().unwrap_or_default()),
-                );
-                false
-            } else {
-                true
-            }
-        });
+        let per_page = pagination.limit();
+        let page = pagination.page;
 
-        // --- team chips, batched for the users we are about to return --
-        let page_user_ids: Vec<Uuid> = user_rows.iter().map(|u| u.id).collect();
+        let mut page_qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+            "SELECT kind, user_id, email, first_name, last_name, role, status, \
+                    last_login_at, grant_id, grantee_email, grantee_name, granted_at \
+             FROM (",
+        );
+        push_union(
+            &mut page_qb,
+            *tenant_id,
+            &tenant_slug,
+            filter,
+            kind,
+            team_filter_active,
+        );
+        page_qb.push(
+            ") members_union \
+             ORDER BY sort_last, sort_first, sort_email, sort_id \
+             LIMIT ",
+        );
+        page_qb.push_bind(pagination.limit() as i64);
+        page_qb.push(" OFFSET ");
+        page_qb.push_bind(pagination.offset() as i64);
+
+        let merged_rows: Vec<MergedRow> = page_qb
+            .build_query_as::<MergedRow>()
+            .fetch_all(self.db.migrator_pool())
+            .await?;
+
+        // --- team chips, batched for exactly the returned page ----------
+        let page_user_ids: Vec<Uuid> = merged_rows
+            .iter()
+            .filter(|r| r.kind == "user")
+            .filter_map(|r| r.user_id)
+            .collect();
         let mut team_chips: HashMap<Uuid, Vec<TeamChip>> = HashMap::new();
         if !page_user_ids.is_empty() {
             let rows = sqlx::query(
@@ -271,68 +240,37 @@ impl MembersService {
 
         tx.commit().await?;
 
-        // --- compose the merged set ------------------------------------
-        let mut rows: Vec<MemberRow> = Vec::with_capacity(user_rows.len() + grants.len());
-        for u in user_rows {
-            let placed = placed_grant_by_user.get(&u.id).cloned();
-            rows.push(MemberRow::User {
-                user_id: u.id,
-                email: u.email,
-                first_name: u.first_name,
-                last_name: u.last_name,
-                role: placed.as_ref().map(|(_, r)| r.clone()).unwrap_or(u.role),
-                status: u.status,
-                last_login_at: u.last_login_at,
-                team_memberships: team_chips.remove(&u.id).unwrap_or_default(),
-                placed_by_grant_id: placed.map(|(id, _)| id),
-            });
-        }
-        for g in grants {
-            rows.push(MemberRow::UnplacedGuest {
-                grant_id: g.id.to_string(),
-                grantee_email: None,
-                grantee_name: None,
-                role: g.role.unwrap_or_default(),
-                granted_at: g.granted_at,
-            });
-        }
-
-        // --- kind filter ----------------------------------------------
-        match kind {
-            "user" => rows.retain(|r| {
-                matches!(
-                    r,
+        // --- compose the page -------------------------------------------
+        let page_rows: Vec<MemberRow> = merged_rows
+            .into_iter()
+            .map(|r| match r.kind.as_str() {
+                "user" => {
+                    let user_id = r.user_id.expect("user arm always carries user_id");
                     MemberRow::User {
-                        placed_by_grant_id: None,
-                        ..
+                        user_id,
+                        email: r.email.unwrap_or_default(),
+                        first_name: r.first_name.unwrap_or_default(),
+                        last_name: r.last_name.unwrap_or_default(),
+                        role: r.role.unwrap_or_default(),
+                        status: r.status.unwrap_or_default(),
+                        last_login_at: r.last_login_at,
+                        team_memberships: team_chips.remove(&user_id).unwrap_or_default(),
+                        placed_by_grant_id: r.grant_id.map(|id| id.to_string()),
                     }
-                )
-            }),
-            "guest" => rows.retain(|r| {
-                matches!(
-                    r,
-                    MemberRow::User {
-                        placed_by_grant_id: Some(_),
-                        ..
-                    } | MemberRow::UnplacedGuest { .. }
-                )
-            }),
-            _ => {}
-        }
-
-        // --- sort + paginate -------------------------------------------
-        rows.sort_by_key(sort_key);
-
-        let total = rows.len() as u64;
-        let per_page = pagination.limit();
-        let page = pagination.page;
-        let offset = pagination.offset() as usize;
-        let limit = pagination.limit() as usize;
-        let page_rows: Vec<MemberRow> = rows.into_iter().skip(offset).take(limit).collect();
+                }
+                _ => MemberRow::UnplacedGuest {
+                    grant_id: r.grant_id.map(|id| id.to_string()).unwrap_or_default(),
+                    grantee_email: r.grantee_email,
+                    grantee_name: r.grantee_name,
+                    role: r.role.unwrap_or_default(),
+                    granted_at: r.granted_at,
+                },
+            })
+            .collect();
 
         Ok(MembersResponse {
             rows: page_rows,
-            total,
+            total: total as u64,
             page,
             per_page,
             bunyip_reachable: true,
@@ -340,66 +278,131 @@ impl MembersService {
     }
 }
 
-/// (last_name, first_name, email, id) for a stable deterministic sort
-/// across kinds. `UnplacedGuest` uses the grantee_name (split on the first
-/// space) when present, else the email; falling back to the grant id when
-/// everything is absent so the order is still stable.
-fn sort_key(row: &MemberRow) -> (String, String, String, String) {
-    match row {
-        MemberRow::User {
-            last_name,
-            first_name,
-            email,
-            user_id,
-            ..
-        } => (
-            last_name.to_lowercase(),
-            first_name.to_lowercase(),
-            email.to_lowercase(),
-            user_id.to_string(),
-        ),
-        MemberRow::UnplacedGuest {
-            grantee_name,
-            grantee_email,
-            grant_id,
-            ..
-        } => {
-            let name = grantee_name.clone().unwrap_or_default();
-            let (first, last) = match name.split_once(' ') {
-                Some((f, l)) => (f.to_string(), l.to_string()),
-                None => (name.clone(), String::new()),
-            };
-            let email = grantee_email.clone().unwrap_or_default();
-            (
-                last.to_lowercase(),
-                first.to_lowercase(),
-                email.to_lowercase(),
-                grant_id.clone(),
-            )
+/// Push `(arm_a) UNION ALL (arm_b)` (or just `arm_a` when `kind`/`team_id`
+/// suppress the grants arm) onto `qb`. Shared by the count query and the
+/// page query so the two see the exact same filtered, unioned row set.
+///
+/// `arm_a` is every native `users` row (MAPPS-562's `system+...@mokosh.local`
+/// attribution user and soft-deleted rows excluded), `LEFT JOIN`ed to its
+/// active grant (if any) via `bunyip_user_id`; `grant_id IS NOT NULL` on
+/// that join is exactly `placed_by_grant_id = Some(_)`. `arm_b` is every
+/// active grant with no matching `users` row (`NOT EXISTS`), i.e. the
+/// `UnplacedGuest`s. `team_id` narrows `arm_a` to that team's members and
+/// drops `arm_b` entirely (an unplaced guest has no `users` row to join a
+/// team through, matching the pre-SQL-pushdown behaviour). `kind = "user"`
+/// drops `arm_b`; `kind = "guest"` restricts `arm_a` to placed rows only.
+/// Both arms expose `sort_last`/`sort_first`/`sort_email`/`sort_id` so the
+/// caller can `ORDER BY` the union without re-deriving the sort key in Rust.
+fn push_union(
+    qb: &mut QueryBuilder<'_, sqlx::Postgres>,
+    tenant_id: Uuid,
+    tenant_slug: &str,
+    filter: &MembersFilter,
+    kind: &str,
+    team_filter_active: bool,
+) {
+    qb.push(
+        "SELECT 'user' AS kind, u.id AS user_id, u.email, u.first_name, u.last_name, \
+                u.role AS role, u.status, u.last_login_at, g.id AS grant_id, \
+                NULL::text AS grantee_email, NULL::text AS grantee_name, \
+                NULL::timestamptz AS granted_at, \
+                lower(u.last_name) AS sort_last, lower(u.first_name) AS sort_first, \
+                lower(u.email) AS sort_email, u.id::text AS sort_id \
+         FROM users u \
+         LEFT JOIN mokosh_bunyip_grants g \
+           ON g.grantee_bunyip_user_id = u.bunyip_user_id \
+          AND g.revoked_at IS NULL \
+          AND g.mokosh_account_id = ",
+    );
+    qb.push_bind(tenant_slug.to_string());
+    qb.push(" WHERE u.tenant_id = ");
+    qb.push_bind(tenant_id);
+    qb.push(
+        " AND u.email NOT LIKE 'system+%@mokosh.local' \
+          AND u.deleted_at IS NULL",
+    );
+    if let Some(q) = filter.q.as_deref().filter(|q| !q.is_empty()) {
+        let pattern = format!("%{}%", q);
+        qb.push(" AND (u.email ILIKE ");
+        qb.push_bind(pattern.clone());
+        qb.push(" OR u.first_name ILIKE ");
+        qb.push_bind(pattern.clone());
+        qb.push(" OR u.last_name ILIKE ");
+        qb.push_bind(pattern);
+        qb.push(")");
+    }
+    if let Some(role) = filter.role.as_deref() {
+        qb.push(" AND u.role = ");
+        qb.push_bind(role.to_string());
+    }
+    if let Some(team_id) = filter.team_id {
+        qb.push(
+            " AND EXISTS (SELECT 1 FROM team_members tm \
+                           WHERE tm.tenant_id = u.tenant_id \
+                             AND tm.team_id = ",
+        );
+        qb.push_bind(team_id);
+        qb.push(" AND tm.user_id = u.id)");
+    }
+    match kind {
+        // A placed guest is a `User` row AND has a grant, so "user" (plain
+        // native users only) excludes it the same as the pre-pushdown
+        // `retain(|r| matches!(r, MemberRow::User { placed_by_grant_id:
+        // None, .. }))` did.
+        "user" => qb.push(" AND g.id IS NULL"),
+        "guest" => qb.push(" AND g.id IS NOT NULL"),
+        _ => qb,
+    };
+
+    // Unplaced guests have no `users` row to join a team through, so a
+    // `team_id` filter excludes them outright, the same as the pre-pushdown
+    // behaviour (grants branch skipped entirely when the filter is active).
+    // `kind = "user"` hides UnplacedGuest explicitly.
+    if !team_filter_active && kind != "user" {
+        qb.push(
+            " UNION ALL \
+              SELECT 'unplaced_guest' AS kind, NULL::uuid AS user_id, NULL::text AS email, \
+                     NULL::text AS first_name, NULL::text AS last_name, g.role AS role, \
+                     NULL::text AS status, NULL::timestamptz AS last_login_at, \
+                     g.id AS grant_id, g.grantee_email, NULL::text AS grantee_name, \
+                     g.granted_at, \
+                     '' AS sort_last, '' AS sort_first, \
+                     lower(coalesce(g.grantee_email, '')) AS sort_email, \
+                     g.id::text AS sort_id \
+              FROM mokosh_bunyip_grants g \
+              WHERE g.revoked_at IS NULL AND g.mokosh_account_id = ",
+        );
+        qb.push_bind(tenant_slug.to_string());
+        qb.push(
+            " AND NOT EXISTS ( \
+                   SELECT 1 FROM users u2 \
+                    WHERE u2.bunyip_user_id = g.grantee_bunyip_user_id \
+                      AND u2.tenant_id = ",
+        );
+        qb.push_bind(tenant_id);
+        qb.push(")");
+        if let Some(role) = filter.role.as_deref() {
+            qb.push(" AND g.role = ");
+            qb.push_bind(role.to_string());
         }
     }
 }
 
+/// One row of the `UNION ALL` built by [`push_union`]. `kind` is `"user"`
+/// or `"unplaced_guest"`; the `sort_*` columns exist only to be `ORDER BY`ed
+/// in SQL and are not decoded into [`MemberRow`].
 #[derive(sqlx::FromRow)]
-struct UserScan {
-    id: Uuid,
-    email: String,
-    first_name: String,
-    last_name: String,
-    role: String,
-    status: String,
-    last_login_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Nullable per migration 226: pre-BUNYIP-673 rows have no bunyip
-    /// mirror, and nothing in the schema forbids a manual insert from
-    /// omitting it. A row without a mirror cannot pair with a grant;
-    /// the pairing loop below treats `None` as "no grant match".
-    bunyip_user_id: Option<Uuid>,
-}
-
-#[derive(sqlx::FromRow)]
-struct GrantScan {
-    id: Uuid,
-    grantee_bunyip_user_id: Uuid,
+struct MergedRow {
+    kind: String,
+    user_id: Option<Uuid>,
+    email: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     role: Option<String>,
+    status: Option<String>,
+    last_login_at: Option<chrono::DateTime<chrono::Utc>>,
+    grant_id: Option<Uuid>,
+    grantee_email: Option<String>,
+    grantee_name: Option<String>,
     granted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
