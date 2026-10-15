@@ -733,6 +733,225 @@ impl AssetsService {
         self.get_asset(tenant_id, id).await
     }
 
+    /// PMS-1492 phase 3 MR1: fan-out create. Resolves a catalog model
+    /// into one "defaults" record, inserts N asset rows in one
+    /// transaction with per-row overrides applied, writes one audit row
+    /// per asset, bumps the model's `uses_count`, and returns the full
+    /// created set. Any single-row failure rolls the whole batch back
+    /// via `?` on the transaction.
+    ///
+    /// Validation happens in two places:
+    ///  - At the handler: `BulkCreateAssetsRequest::validate()` covers
+    ///    the 1..=500 serials cap, per-serial length rules, and the
+    ///    top-level company_id.
+    ///  - Here: `asset_model_id` must resolve to a catalog row in this
+    ///    tenant; `company_id` + `site_id` + `assigned_user_id` must
+    ///    exist in-tenant. A missing model is a 422, not a 404, because
+    ///    the SPA treats both as "fix your form".
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, count = request.serials.len()))]
+    pub async fn bulk_create_assets(
+        &self,
+        tenant_id: TenantId,
+        performer: Uuid,
+        request: &BulkCreateAssetsRequest,
+    ) -> AppResult<Vec<AssetResponse>> {
+        let Some(asset_model_id) = request.asset_model_id else {
+            return Err(AppError::validation_field(
+                "asset_model_id",
+                "asset_model_id is required (templates land in a follow-up MR)",
+            ));
+        };
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // Resolve the catalog model to its defaults. Scoped by tenant so
+        // a caller cannot reach another tenant's model.
+        #[derive(sqlx::FromRow)]
+        struct ModelDefaults {
+            manufacturer: String,
+            model: String,
+            asset_type_id: Uuid,
+            warranty_months: Option<i32>,
+            end_of_life_months: Option<i32>,
+            default_department: Option<String>,
+        }
+        let defaults: ModelDefaults = sqlx::query_as(
+            "SELECT manufacturer, model, asset_type_id, warranty_months, \
+                    end_of_life_months, default_department \
+             FROM asset_models WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(*tenant_id)
+        .bind(asset_model_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::validation_field(
+                "asset_model_id",
+                "asset model does not exist in this tenant",
+            )
+        })?;
+
+        // Verify the per-request references up-front so a wrong one 422s
+        // before any insert fires rather than after N-1 succeed and the
+        // Nth raises an FK violation.
+        let company_ok: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM companies WHERE tenant_id = $1 AND id = $2")
+                .bind(*tenant_id)
+                .bind(request.company_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if company_ok.is_none() {
+            return Err(AppError::validation_field(
+                "company_id",
+                "company does not exist in this tenant",
+            ));
+        }
+        if let Some(site_id) = request.site_id {
+            let found: Option<Uuid> =
+                sqlx::query_scalar("SELECT id FROM sites WHERE tenant_id = $1 AND id = $2")
+                    .bind(*tenant_id)
+                    .bind(site_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if found.is_none() {
+                return Err(AppError::validation_field(
+                    "site_id",
+                    "site does not exist in this tenant",
+                ));
+            }
+        }
+        if let Some(assigned_user_id) = request.assigned_user_id {
+            let found: Option<Uuid> =
+                sqlx::query_scalar("SELECT id FROM users WHERE tenant_id = $1 AND id = $2")
+                    .bind(*tenant_id)
+                    .bind(assigned_user_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if found.is_none() {
+                return Err(AppError::validation_field(
+                    "assigned_user_id",
+                    "user does not exist in this tenant",
+                ));
+            }
+        }
+
+        // Resolve warranty / EOL dates once from the purchase date so
+        // every row in the batch picks the same anchor. Omitted purchase
+        // date = NULL dates on the asset (the catalog is informational).
+        let warranty_expiry = match (request.purchase_date, defaults.warranty_months) {
+            (Some(d), Some(m)) => Some(d + chrono::Months::new(m.max(0) as u32)),
+            _ => None,
+        };
+        let end_of_life = match (request.purchase_date, defaults.end_of_life_months) {
+            (Some(d), Some(m)) => Some(d + chrono::Months::new(m.max(0) as u32)),
+            _ => None,
+        };
+        let department = request
+            .department
+            .clone()
+            .or_else(|| defaults.default_department.clone());
+
+        let mut created_ids = Vec::with_capacity(request.serials.len());
+        for (idx, s) in request.serials.iter().enumerate() {
+            // Per-row validation already ran via `#[validate(nested)]`
+            // at the handler; the handler returns 422 before reaching
+            // the service. Re-asserting here would be belt-and-braces
+            // at the cost of double-work.
+            let id = Uuid::new_v4();
+            let name = s.name.clone().unwrap_or_else(|| {
+                format!(
+                    "{} {} #{}",
+                    defaults.manufacturer, defaults.model, s.serial_number
+                )
+            });
+            let insert = sqlx::query(
+                r#"INSERT INTO assets (id, tenant_id, asset_tag, name, asset_type_id, company_id,
+                                        site_id, status, manufacturer, model, serial_number,
+                                        purchase_date, purchase_price, warranty_expiry, end_of_life,
+                                        assigned_user_id, ip_address, hostname, mac_address,
+                                        installed_date, department, asset_model_id)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,$9,$10,$11,$12,$13,$14,
+                           $15, NULLIF($16,'')::inet, $17, $18, $19, $20, $21)"#,
+            )
+            .bind(id)
+            .bind(*tenant_id)
+            .bind(&s.asset_tag)
+            .bind(&name)
+            .bind(defaults.asset_type_id)
+            .bind(request.company_id)
+            .bind(request.site_id)
+            .bind(&defaults.manufacturer)
+            .bind(&defaults.model)
+            .bind(&s.serial_number)
+            .bind(request.purchase_date)
+            .bind(request.purchase_price)
+            .bind(warranty_expiry)
+            .bind(end_of_life)
+            .bind(request.assigned_user_id)
+            .bind(s.ip_address.as_deref().unwrap_or(""))
+            .bind(&s.hostname)
+            .bind(&s.mac_address)
+            .bind(request.installed_date)
+            .bind(&department)
+            .bind(asset_model_id)
+            .execute(&mut *tx)
+            .await;
+            if let Err(e) = insert {
+                // Map the two most common failure modes to a field-
+                // scoped 422 naming the row that failed so the SPA
+                // can anchor the hint to the right line.
+                if let Some(dbe) = e.as_database_error() {
+                    if let Some(code) = dbe.code() {
+                        if code == "23505" {
+                            return Err(AppError::validation_field(
+                                format!("serials[{idx}].serial_number"),
+                                format!(
+                                    "serial `{}` is already assigned to an asset in this tenant",
+                                    s.serial_number
+                                ),
+                            ));
+                        }
+                    }
+                }
+                return Err(e.into());
+            }
+            // One audit row per asset so the per-asset timeline shows
+            // the bulk create as a `created` event, same as a
+            // single-asset POST.
+            sqlx::query(
+                r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id)
+                   VALUES ($1, $2, 'created', $3)"#,
+            )
+            .bind(*tenant_id)
+            .bind(id)
+            .bind(performer)
+            .execute(&mut *tx)
+            .await?;
+            created_ids.push(id);
+        }
+
+        // Bump the model's uses_count in one shot so the typeahead's
+        // ORDER BY reflects actual popularity.
+        sqlx::query(
+            "UPDATE asset_models SET uses_count = uses_count + $3, updated_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(*tenant_id)
+        .bind(asset_model_id)
+        .bind(created_ids.len() as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        // Fetch each row through the standard `get_asset` so the
+        // response shape matches the single-POST result (company_name
+        // + assigned_user_name resolved via join).
+        let mut created = Vec::with_capacity(created_ids.len());
+        for id in created_ids {
+            created.push(self.get_asset(tenant_id, id).await?);
+        }
+        Ok(created)
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<AssetResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
