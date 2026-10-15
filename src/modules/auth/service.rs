@@ -2614,6 +2614,12 @@ impl AuthService {
         .fetch_one(&mut *tx)
         .await?;
 
+        let unresolved: Vec<Uuid> = rows
+            .iter()
+            .filter(|(_, name, _)| name == "Unnamed User")
+            .map(|(id, _, _)| *id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names("auth.directory", &unresolved);
         Ok((
             rows.into_iter()
                 .map(|(id, name, handle)| mokosh_types::auth::DirectoryEntry { id, name, handle })

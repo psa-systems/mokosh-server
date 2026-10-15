@@ -121,6 +121,15 @@ impl SavedReportsService {
         }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let rows = q.fetch_all(&mut *tx).await?;
+        let unresolved: Vec<Uuid> = rows
+            .iter()
+            .filter(|r| r.created_by_name.is_none())
+            .map(|r| r.created_by_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "saved_reports.list",
+            &unresolved,
+        );
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -145,6 +154,12 @@ impl SavedReportsService {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(AppError::NotFound("Saved report".into()))?;
+        if row.created_by_name.is_none() {
+            crate::utils::unresolved_person::log_unresolved_person_names(
+                "saved_reports.get",
+                &[row.created_by_id],
+            );
+        }
         Ok(row.into())
     }
 
