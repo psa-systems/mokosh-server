@@ -299,6 +299,13 @@ declare_keys! {
     Application SMTP_PASSWORD = "SMTP_PASSWORD", since "v0.2.0", optional;
     Application SMTP_FROM = "SMTP_FROM", since "v0.2.0", optional;
     Application SMTP_TLS = "SMTP_TLS", since "v0.2.0", optional;
+    /// PMS-1482: base URL of Bunyip's mailer relay (`POST /v1/mailer/send`,
+    /// BUNYIP-602) that `MAIL_PROVIDER=bunyip` sends through instead of SMTP.
+    Application BUNYIP_MAILER_URL = "BUNYIP_MAILER_URL", since "v0.16.0", optional;
+    /// Machine-credential client id presented as HTTP Basic to the relay.
+    Application BUNYIP_MAILER_CLIENT_ID = "BUNYIP_MAILER_CLIENT_ID", since "v0.16.0", optional;
+    /// Machine-credential client secret presented as HTTP Basic to the relay.
+    Application BUNYIP_MAILER_CLIENT_SECRET = "BUNYIP_MAILER_CLIENT_SECRET", since "v0.16.0", optional;
 
     // -- Authentication ------------------------------------------------------
 

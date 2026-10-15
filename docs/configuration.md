@@ -23,6 +23,9 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 - [`BUNYIP_API_BASE_URL`](#var-bunyip-api-base-url) (Required: no) - Optional. Set all three to let mokosh-server look invitees up on Bunyip's `/v1/users/lookup` when creating a grant invitation; unset means standalone-mode shape (email-only invite). (PMS-1208)
 - [`BUNYIP_DIRECTORY_CLIENT_ID`](#var-bunyip-directory-client-id) (Required: no) - Optional. Set all three to let mokosh-server look invitees up on Bunyip's `/v1/users/lookup` when creating a grant invitation; unset means standalone-mode shape (email-only invite). (PMS-1208)
 - [`BUNYIP_DIRECTORY_CLIENT_SECRET`](#var-bunyip-directory-client-secret) (Required: no) - Optional. Set all three to let mokosh-server look invitees up on Bunyip's `/v1/users/lookup` when creating a grant invitation; unset means standalone-mode shape (email-only invite). (PMS-1208)
+- [`BUNYIP_MAILER_CLIENT_ID`](#var-bunyip-mailer-client-id) (Required: no) - Optional. Base URL and machine credential for Bunyip's mailer relay, read only when MAIL_PROVIDER=bunyip; unset keeps that provider unselectable. (PMS-1482)
+- [`BUNYIP_MAILER_CLIENT_SECRET`](#var-bunyip-mailer-client-secret) (Required: no) - Optional. Base URL and machine credential for Bunyip's mailer relay, read only when MAIL_PROVIDER=bunyip; unset keeps that provider unselectable. (PMS-1482)
+- [`BUNYIP_MAILER_URL`](#var-bunyip-mailer-url) (Required: no) - Optional. Base URL and machine credential for Bunyip's mailer relay, read only when MAIL_PROVIDER=bunyip; unset keeps that provider unselectable. (PMS-1482)
 
 #### Changed
 
@@ -280,6 +283,9 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-bunyip-api-base-url"></a>`BUNYIP_API_BASE_URL` | no | v0.16.0 | `.env` | Not described yet: say what it does. |
 | <a id="var-bunyip-directory-client-id"></a>`BUNYIP_DIRECTORY_CLIENT_ID` | no | v0.16.0 | `.env` | Not described yet: say what it does. |
 | <a id="var-bunyip-directory-client-secret"></a>`BUNYIP_DIRECTORY_CLIENT_SECRET` | no | v0.16.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-bunyip-mailer-url"></a>`BUNYIP_MAILER_URL` | no, unset makes `MAIL_PROVIDER=bunyip` refuse to boot | v0.16.0 | `.env` | Base URL of Bunyip's mailer relay that `MAIL_PROVIDER=bunyip` sends through (`POST /v1/mailer/send`, BUNYIP-602). |
+| <a id="var-bunyip-mailer-client-id"></a>`BUNYIP_MAILER_CLIENT_ID` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client id presented as HTTP Basic to the mailer relay. |
+| <a id="var-bunyip-mailer-client-secret"></a>`BUNYIP_MAILER_CLIENT_SECRET` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client secret presented as HTTP Basic to the mailer relay. |
 
 ## Development stack variables
 

@@ -298,7 +298,12 @@ impl ProviderKind {
             Self::Configuration => &[provider::ENVIRONMENT],
             Self::Secrets => &[provider::DATABASE, provider::INFISICAL],
             Self::Authentication => &[provider::LOCAL, provider::BUNYIP],
-            Self::Email => &[provider::LOG, provider::SMTP],
+            // PMS-1482: `bunyip` (ApiMailer) is a known selection for
+            // `MAIL_PROVIDER` even though it is nobody's profile default yet
+            // (PMS-1018 confirmed `saas` already sends through `smtp`
+            // directly); `known_providers` lists what MAY be named, not what
+            // a profile row defaults to.
+            Self::Email => &[provider::LOG, provider::SMTP, provider::BUNYIP],
             Self::Storage => &[provider::LOCAL, provider::S3],
         }
     }
