@@ -39,8 +39,13 @@ CREATE TABLE asset_models (
                                         DEFERRABLE INITIALLY IMMEDIATE,
     manufacturer           VARCHAR(100) NOT NULL,
     model                  VARCHAR(100) NOT NULL,
+    -- `ON DELETE NO ACTION` rather than `RESTRICT`: both block the
+    -- deletion of a referenced asset_types row, but only NO ACTION
+    -- respects the DEFERRABLE clause below. The tenant-data import
+    -- (`SET CONSTRAINTS ALL DEFERRED`) wipes every tenant table in any
+    -- order; RESTRICT would fire mid-transaction regardless.
     asset_type_id          UUID         NOT NULL
-                                        REFERENCES asset_types(id) ON DELETE RESTRICT
+                                        REFERENCES asset_types(id) ON DELETE NO ACTION
                                         DEFERRABLE INITIALLY IMMEDIATE,
     -- Each default is OPTIONAL: a row may know only manufacturer + model
     -- and let the operator fill the rest at create time. `warranty_months`
