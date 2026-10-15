@@ -344,9 +344,15 @@ fn push_union(
         qb.push_bind(team_id);
         qb.push(" AND tm.user_id = u.id)");
     }
-    if kind == "guest" {
-        qb.push(" AND g.id IS NOT NULL");
-    }
+    match kind {
+        // A placed guest is a `User` row AND has a grant, so "user" (plain
+        // native users only) excludes it the same as the pre-pushdown
+        // `retain(|r| matches!(r, MemberRow::User { placed_by_grant_id:
+        // None, .. }))` did.
+        "user" => qb.push(" AND g.id IS NULL"),
+        "guest" => qb.push(" AND g.id IS NOT NULL"),
+        _ => qb,
+    };
 
     // Unplaced guests have no `users` row to join a team through, so a
     // `team_id` filter excludes them outright, the same as the pre-pushdown
