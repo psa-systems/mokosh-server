@@ -628,3 +628,133 @@ async fn asset_search_matches_serial_numbers(pool: PgPool) {
     // filtering rather than passing everything through.
     assert!(search("nothing-matches-this").await.is_empty());
 }
+
+/// Legacy `GET /assets` filter expansion: the handler now accepts the
+/// department, manufacturer, model, tag, site_id, assigned_user_id,
+/// warranty_within_days, and end_of_life_before query params so a tenant
+/// on a toggle-off deployment (`assets_search_v2 = false`) sees the same
+/// filter outcomes staff on the structured endpoint see.
+#[mokosh_test]
+async fn asset_list_filters_cover_the_structured_search_vocab(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id = create_asset_type(&app, &token, "Server").await;
+
+    // Three assets that differ on each of the new filters so a single
+    // request can prove each dimension narrows the set independently.
+    let create = |name: &'static str, body: serde_json::Value| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/assets");
+        let token = token.clone();
+        let type_id = type_id.clone();
+        async move {
+            let mut payload = serde_json::json!({
+                "name": name,
+                "asset_type_id": type_id,
+                "company_id": company,
+            });
+            let obj = payload.as_object_mut().expect("obj");
+            for (k, v) in body.as_object().expect("overrides obj").clone() {
+                obj.insert(k, v);
+            }
+            let resp = client
+                .post(url)
+                .bearer_auth(token)
+                .json(&payload)
+                .send()
+                .await
+                .expect("create asset");
+            assert!(resp.status().is_success(), "create: {}", resp.status());
+        }
+    };
+    let today = chrono::Utc::now().date_naive();
+    let in_15_days = today + chrono::Duration::days(15);
+    let in_100_days = today + chrono::Duration::days(100);
+    let yesterday = today - chrono::Duration::days(1);
+    let tomorrow = today + chrono::Duration::days(1);
+    create(
+        "sales-laptop",
+        serde_json::json!({
+            "department": "Sales",
+            "manufacturer": "Dell",
+            "model": "Latitude 5450",
+            "tags": ["kiosk", "loaner"],
+            "warranty_expiry": in_15_days.to_string(),
+            "end_of_life": yesterday.to_string(),
+        }),
+    )
+    .await;
+    create(
+        "ops-laptop",
+        serde_json::json!({
+            "department": "Ops",
+            "manufacturer": "HP",
+            "model": "EliteBook 850",
+            "tags": ["fleet"],
+            "warranty_expiry": in_100_days.to_string(),
+            "end_of_life": tomorrow.to_string(),
+        }),
+    )
+    .await;
+    create(
+        "eng-laptop",
+        serde_json::json!({
+            "department": "Engineering",
+            "manufacturer": "Dell",
+            "model": "XPS 15",
+            "tags": ["dev"],
+        }),
+    )
+    .await;
+
+    let names_for = |query: &str| {
+        let client = app.client.clone();
+        let url = app.url(&format!("/api/v1/assets?{query}"));
+        let token = token.clone();
+        let query = query.to_string();
+        async move {
+            let resp = client
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("list assets");
+            assert!(resp.status().is_success(), "{query}: {}", resp.status());
+            let v: serde_json::Value = resp.json().await.expect("assets JSON");
+            let mut names: Vec<String> = v["data"]
+                .as_array()
+                .expect("data array")
+                .iter()
+                .map(|a| a["name"].as_str().unwrap_or_default().to_string())
+                .collect();
+            names.sort();
+            names
+        }
+    };
+
+    assert_eq!(names_for("department=Sales").await, vec!["sales-laptop"]);
+    assert_eq!(
+        names_for("manufacturer=Dell").await,
+        vec!["eng-laptop", "sales-laptop"]
+    );
+    assert_eq!(names_for("model=XPS%2015").await, vec!["eng-laptop"]);
+    assert_eq!(names_for("tag=kiosk").await, vec!["sales-laptop"]);
+    assert_eq!(
+        names_for("warranty_within_days=30").await,
+        vec!["sales-laptop"],
+        "within-30 excludes the asset whose warranty is 100 days out"
+    );
+    let eol_query = format!("end_of_life_before={today}");
+    assert_eq!(
+        names_for(&eol_query).await,
+        vec!["sales-laptop"],
+        "end-of-life-before today excludes the one whose EOL is tomorrow and the one with no EOL"
+    );
+    // Combinations AND: manufacturer=Dell AND department=Sales = one row.
+    assert_eq!(
+        names_for("manufacturer=Dell&department=Sales").await,
+        vec!["sales-laptop"]
+    );
+}

@@ -147,8 +147,29 @@ impl From<AssetResponse> for ContactAssetResponse {
 pub struct AssetFilter {
     pub company_id: Option<Uuid>,
     pub asset_type_id: Option<Uuid>,
+    pub site_id: Option<Uuid>,
+    pub assigned_user_id: Option<Uuid>,
     #[validate(length(max = 100))]
     pub status: Option<String>,
+    #[validate(length(max = 100))]
+    pub department: Option<String>,
+    #[validate(length(max = 100))]
+    pub manufacturer: Option<String>,
+    #[validate(length(max = 100))]
+    pub model: Option<String>,
+    /// Containment match against `assets.tags`. One tag per request;
+    /// the structured search (`POST /assets/search`) supports multiple
+    /// tags per request via `op = contains_tag` + repeated filters, and
+    /// is the right place to go when a caller needs that shape.
+    #[validate(length(max = 100))]
+    pub tag: Option<String>,
+    /// `warranty_expiry BETWEEN NOW()::date AND (NOW()::date + N)`.
+    #[validate(range(min = 0, max = 36500))]
+    pub warranty_within_days: Option<i64>,
+    /// `end_of_life < $date`. Caller passes today's date (or any
+    /// cutoff) directly; the client's `FilterPill` sentinel `"NOW"` is
+    /// not accepted here, callers resolve to a concrete date.
+    pub end_of_life_before: Option<chrono::NaiveDate>,
     /// PMS-344 follow-up: free-text search on the asset name, used by
     /// the AssetPicker on the ticket form / inline editor. ILIKE-matched
     /// in the service, mirroring CompanyFilter.q.

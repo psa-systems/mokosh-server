@@ -238,8 +238,47 @@ impl AssetsService {
             conditions.push(format!("a.asset_type_id = ${idx}"));
             idx += 1;
         }
+        if filter.site_id.is_some() {
+            conditions.push(format!("a.site_id = ${idx}"));
+            idx += 1;
+        }
+        if filter.assigned_user_id.is_some() {
+            conditions.push(format!("a.assigned_user_id = ${idx}"));
+            idx += 1;
+        }
         if filter.status.is_some() {
             conditions.push(format!("a.status = ${idx}"));
+            idx += 1;
+        }
+        if filter.department.is_some() {
+            conditions.push(format!("a.department = ${idx}"));
+            idx += 1;
+        }
+        if filter.manufacturer.is_some() {
+            conditions.push(format!("a.manufacturer = ${idx}"));
+            idx += 1;
+        }
+        if filter.model.is_some() {
+            conditions.push(format!("a.model = ${idx}"));
+            idx += 1;
+        }
+        if filter.tag.is_some() {
+            // Containment: the row's tags array contains the single filter
+            // tag. Matches the structured-search `op = contains_tag` arm so
+            // the two endpoints agree on which assets a given tag selects.
+            conditions.push(format!("a.tags @> ARRAY[${idx}]::text[]"));
+            idx += 1;
+        }
+        if filter.warranty_within_days.is_some() {
+            // `BETWEEN today AND today + N`. Rejects nulls (no warranty_expiry
+            // row never matches a "within N days" filter).
+            conditions.push(format!(
+                "a.warranty_expiry BETWEEN CURRENT_DATE AND (CURRENT_DATE + (${idx}::int || ' days')::interval)::date"
+            ));
+            idx += 1;
+        }
+        if filter.end_of_life_before.is_some() {
+            conditions.push(format!("a.end_of_life < ${idx}"));
             idx += 1;
         }
         // PMS-344 follow-up: free-text name match for the AssetPicker.
@@ -259,6 +298,8 @@ impl AssetsService {
         }
         let where_clause = conditions.join(" AND ");
 
+        let q_pattern = filter.q.as_ref().map(|s| format!("%{s}%"));
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let count_query = format!("SELECT COUNT(*) FROM assets a WHERE {where_clause}");
         let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
@@ -268,10 +309,33 @@ impl AssetsService {
         if let Some(v) = filter.asset_type_id {
             cq = cq.bind(v);
         }
+        if let Some(v) = filter.site_id {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = filter.assigned_user_id {
+            cq = cq.bind(v);
+        }
         if let Some(v) = &filter.status {
             cq = cq.bind(v);
         }
-        let q_pattern = filter.q.as_ref().map(|s| format!("%{s}%"));
+        if let Some(v) = &filter.department {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.manufacturer {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.model {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.tag {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = filter.warranty_within_days {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = filter.end_of_life_before {
+            cq = cq.bind(v);
+        }
         if let Some(p) = &q_pattern {
             cq = cq.bind(p);
         }
@@ -307,7 +371,31 @@ impl AssetsService {
         if let Some(v) = filter.asset_type_id {
             q = q.bind(v);
         }
+        if let Some(v) = filter.site_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.assigned_user_id {
+            q = q.bind(v);
+        }
         if let Some(v) = &filter.status {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.department {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.manufacturer {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.model {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.tag {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.warranty_within_days {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.end_of_life_before {
             q = q.bind(v);
         }
         if let Some(p) = &q_pattern {
