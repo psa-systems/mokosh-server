@@ -907,6 +907,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mokosh_server::modules::features::job::REFRESH_INTERVAL_SECS,
         ),
     );
+    // PMS-1492 phase 3 MR3: REFRESH MATERIALIZED VIEW CONCURRENTLY on
+    // `asset_signature_candidates_mv` on a 60s cadence so the SPA's
+    // signature banner surfaces hot patterns without a per-request COUNT
+    // on the full assets table.
+    scheduler.register(
+        mokosh_server::modules::asset_catalog::AssetSignatureDetectorRefresh::new(db.clone()),
+        std::time::Duration::from_secs(
+            mokosh_server::modules::asset_catalog::job::REFRESH_INTERVAL_SECS,
+        ),
+    );
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
     // now run on the Scheduler too; the intervals match their former raw
     // `tokio::spawn(run_forever(..))` cadences.

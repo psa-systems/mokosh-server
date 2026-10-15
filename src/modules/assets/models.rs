@@ -489,6 +489,67 @@ pub struct PatchAssetRequest {
     pub notes: Option<Option<String>>,
 }
 
+// -- PMS-1492 (asset catalog, phase 3, MR1) --------------------------------
+//
+// The fan-out body for `POST /api/v1/assets/bulk-create`. Resolves a
+// catalog model (and optionally an asset_templates row on top) into one
+// defaults record, then inserts N asset rows in one transaction. Per-row
+// overrides (serial_number, name, asset_tag, hostname, mac_address,
+// ip_address) take precedence; everything else comes from the defaults.
+//
+// Cap at 500 serials per call so the transaction stays bounded. The SPA
+// (`AssetBulkCreateModal`) blocks at the client side as well.
+
+/// One serial in a bulk-create request. Only `serial_number` is required;
+/// the other fields let the operator distinguish rows that share a model
+/// but differ on a hostname or network identifier.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct BulkSerial {
+    #[validate(length(min = 1, max = 100))]
+    pub serial_number: String,
+    /// Overrides the computed default `"{manufacturer} {model} #{serial}"`.
+    #[validate(length(min = 1, max = 255))]
+    pub name: Option<String>,
+    #[validate(length(max = 100))]
+    pub asset_tag: Option<String>,
+    #[validate(length(max = 255))]
+    pub hostname: Option<String>,
+    #[validate(length(max = 50))]
+    pub mac_address: Option<String>,
+    #[validate(length(max = 45))]
+    pub ip_address: Option<String>,
+}
+
+/// `POST /api/v1/assets/bulk-create` body.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct BulkCreateAssetsRequest {
+    /// Preferred when both set. The template resolves to its model so a
+    /// template row covers both. MR2 wires `asset_templates`; MR1 only
+    /// honours `asset_model_id`, but the shape is forward-compatible.
+    pub template_id: Option<Uuid>,
+    /// Required for MR1 (templates land in MR2). The handler returns 422
+    /// `template_id or asset_model_id must be set` when both are None.
+    pub asset_model_id: Option<Uuid>,
+    pub company_id: Uuid,
+    pub site_id: Option<Uuid>,
+    pub assigned_user_id: Option<Uuid>,
+    #[validate(length(max = 100))]
+    pub department: Option<String>,
+    pub purchase_date: Option<NaiveDate>,
+    pub purchase_price: Option<Decimal>,
+    pub installed_date: Option<NaiveDate>,
+    #[validate(length(min = 1, max = 500))]
+    #[validate(nested)]
+    pub serials: Vec<BulkSerial>,
+}
+
+/// Response body for `POST /assets/bulk-create`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkCreateAssetsResponse {
+    pub created: Vec<AssetResponse>,
+    pub count: usize,
+}
+
 /// `#[serde(deserialize_with = ...)]` helper that makes `Option<Option<T>>`
 /// actually distinguish absent from null: a `null` on the wire becomes
 /// `Some(None)`, a value becomes `Some(Some(v))`, and an absent key stays

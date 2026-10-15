@@ -83,6 +83,12 @@ pub fn assets_routes(
             "/assets/search/facets",
             axum::routing::post(asset_facets_structured),
         )
+        // PMS-1492 phase 3 MR1: fan-out create. Gated on
+        // `Feature::AssetsCatalog`; off => 404 without touching the DB.
+        .route(
+            "/assets/bulk-create",
+            axum::routing::post(bulk_create_assets_handler),
+        )
         // PMS-1490: pre-flight collision check for the bulk-create modal.
         // Given a company and a list of serials, returns which already
         // belong to an asset at that company so the SPA can trim or
@@ -812,4 +818,34 @@ async fn assets_exists_handler(
         .assets_exists(tenant, req.company_id, &req.serials)
         .await?;
     Ok(Json(AssetExistsResponse { existing }))
+}
+
+fn require_catalog(state: &AssetsRouterState) -> AppResult<()> {
+    let on = state
+        .features
+        .as_ref()
+        .is_some_and(|s| s.is_enabled(crate::modules::features::registry::Feature::AssetsCatalog));
+    if on {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(
+            "This endpoint is not enabled on this deployment".to_string(),
+        ))
+    }
+}
+
+async fn bulk_create_assets_handler(
+    State(s): State<AssetsRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+    Json(req): Json<BulkCreateAssetsRequest>,
+) -> AppResult<(axum::http::StatusCode, Json<BulkCreateAssetsResponse>)> {
+    require_catalog(&s)?;
+    req.validate()?;
+    let tenant = u.tenant();
+    let created = s.service.bulk_create_assets(tenant, u.id, &req).await?;
+    let count = created.len();
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(BulkCreateAssetsResponse { created, count }),
+    ))
 }
