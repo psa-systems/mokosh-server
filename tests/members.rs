@@ -372,9 +372,120 @@ async fn list_members_rejects_an_unknown_kind_at_validation(pool: PgPool) {
     assert!(dump.contains("kind"), "error names the field: {dump}");
 }
 
+/// T4: pagination boundaries. Five native users, `per_page=2` walks three
+/// pages in (last_name, first_name, email, id) order with the right
+/// `total` on every page, proving the `LIMIT`/`OFFSET` pushed into SQL
+/// (PMS-1495) still lands on page boundaries correctly.
+#[mokosh_test]
+async fn list_members_paginates_on_page_boundaries(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    seed_user(&pool, "c@acme.example", "C", "Carter", "technician").await;
+    seed_user(&pool, "d@acme.example", "D", "Davis", "technician").await;
+    seed_user(&pool, "e@acme.example", "E", "Evans", "technician").await;
+    seed_user(&pool, "f@acme.example", "F", "Ford", "technician").await;
+    // seed_admin's row sorts first (last_name "Admin"), then Carter, Davis,
+    // Evans, Ford: five total.
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let page1 = get_members(&app, &token, "per_page=2&page=1").await;
+    assert_eq!(page1["total"].as_u64(), Some(5));
+    let rows1 = page1["rows"].as_array().expect("rows");
+    assert_eq!(rows1.len(), 2);
+    assert_eq!(rows1[0]["email"].as_str(), Some(email.as_str()));
+    assert_eq!(rows1[1]["email"].as_str(), Some("c@acme.example"));
+
+    let page2 = get_members(&app, &token, "per_page=2&page=2").await;
+    let rows2 = page2["rows"].as_array().expect("rows");
+    assert_eq!(rows2.len(), 2);
+    assert_eq!(rows2[0]["email"].as_str(), Some("d@acme.example"));
+    assert_eq!(rows2[1]["email"].as_str(), Some("e@acme.example"));
+
+    let page3 = get_members(&app, &token, "per_page=2&page=3").await;
+    let rows3 = page3["rows"].as_array().expect("rows");
+    assert_eq!(rows3.len(), 1);
+    assert_eq!(rows3[0]["email"].as_str(), Some("f@acme.example"));
+}
+
+/// T6: `q` substring-matches email/first_name/last_name, scoped to the
+/// native-users arm only (unplaced guests have no name/email columns in
+/// the mirror), matching the pre-pushdown behaviour.
+#[mokosh_test]
+async fn list_members_filters_by_q(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    seed_user(&pool, "zoe@acme.example", "Zoe", "Zephyr", "technician").await;
+    seed_user(&pool, "nolan@acme.example", "Nolan", "North", "technician").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let body = get_members(&app, &token, "q=zoe").await;
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(body["total"].as_u64(), Some(1));
+    assert_eq!(rows[0]["email"].as_str(), Some("zoe@acme.example"));
+}
+
+/// T7: `role` filters the native-users arm on the user's own stored role
+/// (not the effective/grant role), matching the pre-pushdown
+/// `users_qb`/`grants_qb` filter, which was never resolved through the
+/// placement overlay either.
+#[mokosh_test]
+async fn list_members_filters_by_role(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    seed_user(&pool, "fin@acme.example", "Fin", "Ance", "finance").await;
+    seed_user(&pool, "tech@acme.example", "Tech", "Nician", "technician").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let body = get_members(&app, &token, "role=finance").await;
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(body["total"].as_u64(), Some(1));
+    assert_eq!(rows[0]["email"].as_str(), Some("fin@acme.example"));
+}
+
+/// T5: `team_id` narrows native users to that team's members and drops the
+/// grants arm entirely (an unplaced guest has no `users` row to join a
+/// team through), matching the pre-pushdown behaviour where the grants
+/// branch was skipped whenever `team_id` was set.
+#[mokosh_test]
+async fn list_members_filters_by_team_id_and_excludes_unplaced_guests(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let (on_team_id, _) = seed_user(&pool, "on@acme.example", "On", "Team", "technician").await;
+    seed_user(&pool, "off@acme.example", "Off", "Team", "technician").await;
+    seed_grant(&pool, Uuid::new_v4(), "finance").await; // unplaced
+    let team_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO teams (id, tenant_id, name, is_active) VALUES ($1, $2, 'Team A', TRUE)",
+    )
+    .bind(team_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("seed team");
+    for user in [admin_id, on_team_id] {
+        sqlx::query(
+            "INSERT INTO team_members (tenant_id, team_id, user_id, role) VALUES ($1, $2, $3, 'member')",
+        )
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(team_id)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .expect("seed team_member");
+    }
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let body = get_members(&app, &token, &format!("team_id={team_id}")).await;
+    let rows = body["rows"].as_array().expect("rows");
+    assert_eq!(body["total"].as_u64(), Some(2));
+    for r in rows {
+        assert_eq!(r["kind"].as_str(), Some("user"));
+        let e = r["email"].as_str().unwrap_or("");
+        assert_ne!(e, "off@acme.example");
+    }
+}
+
 // Deliberately deferred to later phases:
-// - T4 / T5 / T6 / T7 / T9 / T10: the sort / pagination / q / role /
-//   team_id / bunyip-unreachable paths; the standalone-mode build keeps
-//   `bunyip_reachable = true` so T10 does not apply, and the other
-//   filters are mechanical variations the SPA will exercise during
-//   phase 3 end-to-end.
+// - T9 / T10: the bunyip-unreachable path; the standalone-mode build
+//   keeps `bunyip_reachable = true` so T10 does not apply, and T9 is a
+//   mechanical variation the SPA will exercise during phase 3 end-to-end.
