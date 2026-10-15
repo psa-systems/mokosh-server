@@ -464,6 +464,12 @@ impl AssetsService {
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64);
         let rows = q.fetch_all(&mut *tx).await?;
+        let unresolved: Vec<Uuid> = rows
+            .iter()
+            .filter(|r| r.assigned_user_id.is_some() && r.assigned_user_name.is_none())
+            .filter_map(|r| r.assigned_user_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names("assets.list", &unresolved);
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -552,6 +558,12 @@ impl AssetsService {
             .bind(pagination.limit() as i64)
             .bind(pagination.offset() as i64);
         let rows = bound.fetch_all(&mut *tx).await?;
+        let unresolved: Vec<Uuid> = rows
+            .iter()
+            .filter(|r| r.assigned_user_id.is_some() && r.assigned_user_name.is_none())
+            .filter_map(|r| r.assigned_user_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names("assets.search", &unresolved);
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -1032,6 +1044,12 @@ impl AssetsService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Asset".to_string()))?;
+        if row.assigned_user_id.is_some() && row.assigned_user_name.is_none() {
+            crate::utils::unresolved_person::log_unresolved_person_names(
+                "assets.get",
+                &[row.assigned_user_id.expect("checked Some above")],
+            );
+        }
         Ok(row.into())
     }
 
@@ -2011,22 +2029,15 @@ impl AssetsService {
         .await?;
 
         let entries: Vec<AssetAuditLogResponse> = rows.into_iter().map(Into::into).collect();
-        // PMS-1477's shared unresolved-person helper has not landed yet; log
-        // once per read rather than once per row so a long page does not
-        // spam the log.
         let unresolved: Vec<Uuid> = entries
             .iter()
             .filter(|e| e.performed_by_id.is_some() && e.performed_by_name.is_none())
             .filter_map(|e| e.performed_by_id)
             .collect();
-        if !unresolved.is_empty() {
-            tracing::info!(
-                surface = "assets.list_asset_audit_log",
-                count = unresolved.len(),
-                ids = ?unresolved,
-                "unresolved actor id in asset audit log"
-            );
-        }
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "assets.list_asset_audit_log",
+            &unresolved,
+        );
 
         Ok((entries, total as u64))
     }

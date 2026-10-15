@@ -189,6 +189,25 @@ impl AuditService {
             .filter_map(|r| r.user_id)
             .collect();
         crate::utils::unresolved_person::log_unresolved_person_names("audit.list", &unresolved);
+        // PMS-1491: `entity_name`'s CASE expression resolves a person's name
+        // for the audited *entity* on the `auth` and `contacts` branches
+        // (see the query above); every other `entity_type` falls through to
+        // ELSE NULL by design, which is not a failed lookup, so this is
+        // gated on `entity_type` rather than treating any `entity_name.is_none()`
+        // row as unresolved.
+        let unresolved_entity: Vec<Uuid> = rows
+            .iter()
+            .filter(|r| {
+                matches!(r.entity_type.as_str(), "auth" | "contacts")
+                    && r.entity_id.is_some()
+                    && r.entity_name.is_none()
+            })
+            .filter_map(|r| r.entity_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "audit.list.entity_name",
+            &unresolved_entity,
+        );
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 

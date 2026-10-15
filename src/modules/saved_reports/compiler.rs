@@ -577,6 +577,57 @@ fn coerce_bind_array(field: &str, ty: ColumnType, arr: &[Value]) -> AppResult<Bi
     }
 }
 
+/// (id column key, name column key) pairs the tickets whitelist
+/// resolves a person through. `log_unresolved_person_names` below
+/// walks this list against a compiled query's selected output
+/// columns, so adding a fourth resolved-name column later is one
+/// line here rather than a new per-column check.
+const TICKET_PERSON_COLUMNS: &[(&str, &str)] = &[
+    ("contact_id", "contact_name"),
+    ("assigned_to_id", "assigned_to_name"),
+    ("created_by_id", "created_by_name"),
+];
+
+/// PMS-1491: once per call (never per row), logs the person ids a
+/// compiled report's `row_to_json` rows carried whose paired name
+/// column came back null, via the shared
+/// `crate::utils::unresolved_person` helper. `output_columns` is the
+/// same key list `CompiledQuery::columns` carries (the SQL output
+/// names, before the executor relabels to display headers); `rows`
+/// is the `row_to_json` output the executor fetched for those
+/// columns. A pair is only checked when the saved report selected
+/// BOTH its id and name column - a report that selected only the
+/// name has no id in the row to log, and that is not this helper's
+/// problem to solve. Only an id, never a name, reaches the log line.
+/// Called from `saved_reports::service::execute`.
+pub fn log_unresolved_person_names(surface: &str, output_columns: &[String], rows: &[Value]) {
+    let mut unresolved: Vec<Uuid> = Vec::new();
+    for (id_key, name_key) in TICKET_PERSON_COLUMNS {
+        let has_id = output_columns.iter().any(|c| c == id_key);
+        let has_name = output_columns.iter().any(|c| c == name_key);
+        if !has_id || !has_name {
+            continue;
+        }
+        for row in rows {
+            let Some(obj) = row.as_object() else {
+                continue;
+            };
+            let id = obj
+                .get(*id_key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok());
+            let Some(id) = id else {
+                continue;
+            };
+            let name_resolved = obj.get(*name_key).map(|v| v.is_string()).unwrap_or(false);
+            if !name_resolved {
+                unresolved.push(id);
+            }
+        }
+    }
+    crate::utils::unresolved_person::log_unresolved_person_names(surface, &unresolved);
+}
+
 /// Parse `sort` JSON into an ORDER BY clause. Accepts an array of
 /// `{field, dir}` objects. Empty / missing -> default to
 /// `ORDER BY t.updated_at DESC` to give pagination a stable order.
@@ -843,6 +894,21 @@ mod tests {
         .expect("ok");
         assert_eq!(q.columns, vec!["title", "title_2"]);
         assert!(q.sql.contains("t.title AS \"title_2\""), "sql: {}", q.sql);
+    }
+
+    #[test]
+    fn unresolved_person_names_found_only_when_id_and_name_both_selected() {
+        let id = Uuid::from_u128(0xabc);
+        let columns = vec!["contact_id".to_string(), "contact_name".to_string()];
+        let rows = vec![json!({"contact_id": id.to_string(), "contact_name": null})];
+        // Can't assert on tracing output here; just prove it does not
+        // panic and that a row missing the paired id column is a no-op.
+        log_unresolved_person_names("saved_reports.compiler.test", &columns, &rows);
+        log_unresolved_person_names(
+            "saved_reports.compiler.test",
+            &["contact_name".to_string()],
+            &rows,
+        );
     }
 
     #[test]

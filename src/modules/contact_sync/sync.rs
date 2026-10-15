@@ -989,6 +989,15 @@ impl ContactSyncEngine {
         .bind(connection_id)
         .fetch_all(&mut *tx)
         .await?;
+        let unresolved: Vec<Uuid> = locals
+            .iter()
+            .filter(|r| r.first_name.trim().is_empty() && r.last_name.trim().is_empty())
+            .map(|r| r.id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "contact_sync.snapshot",
+            &unresolved,
+        );
         let links: Vec<LinkRow> = sqlx::query_as(
             "SELECT id, external_id, contact_id, etag, deleted_in_source_at \
              FROM contact_sync_links \

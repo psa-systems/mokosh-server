@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use uuid::Uuid;
 
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult};
@@ -400,6 +401,22 @@ pub async fn run(
     selects.extend(dims.iter().map(|d| format!("({})::text", d.sql)));
     selects.extend(measures.iter().map(|m| format!("({})::text", m.sql)));
 
+    // PMS-1491: the "assignee" dimension on the "tickets" source masks an
+    // unresolved name behind the 'Unassigned' SQL placeholder (see TICKETS
+    // above), which is indistinguishable from a ticket that legitimately has
+    // no assignee unless the raw id is read too. When that dimension is
+    // selected, append the raw id as an extra, un-labelled column (not part
+    // of `columns`/`ncols`, so it never reaches the caller) purely to tell
+    // the two cases apart below.
+    let assignee_idx = if src.key == "tickets" {
+        dims.iter().position(|d| d.key == "assignee")
+    } else {
+        None
+    };
+    if assignee_idx.is_some() {
+        selects.push("(t.assigned_to_id)::text".to_string());
+    }
+
     let mut sql = format!(
         "SELECT {} {} WHERE {} = $1",
         selects.join(", "),
@@ -468,6 +485,7 @@ pub async fn run(
     let ncols = dims.len() + measures.len();
     let mut out_rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows.len());
     let mut totals_acc: Vec<f64> = vec![0.0; measures.len()];
+    let mut unresolved_assignees: Vec<Uuid> = Vec::new();
 
     for row in &rows {
         let mut r: Vec<Option<String>> = Vec::with_capacity(ncols);
@@ -481,8 +499,26 @@ pub async fn run(
                 }
             }
         }
+        if let Some(idx) = assignee_idx {
+            // Raw `t.assigned_to_id`, appended after `ncols` purely for this
+            // check; `Some(id)` alongside the 'Unassigned' placeholder means
+            // the id resolved to no name, not that there was no assignee.
+            let raw_id: Option<String> = row.try_get(ncols)?;
+            if let (Some(id_str), Some(Some(name))) = (raw_id, r.get(idx)) {
+                if name == "Unassigned" {
+                    if let Ok(id) = id_str.parse::<Uuid>() {
+                        unresolved_assignees.push(id);
+                    }
+                }
+            }
+        }
         out_rows.push(r);
     }
+
+    crate::utils::unresolved_person::log_unresolved_person_names(
+        "reports.custom.tickets.assignee",
+        &unresolved_assignees,
+    );
 
     let mut totals = BTreeMap::new();
     for (j, m) in measures.iter().enumerate() {

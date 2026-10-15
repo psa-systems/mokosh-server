@@ -298,6 +298,11 @@ pub struct ProvenanceLink {
     pub import_file_name: Option<String>,
     pub import_file_uploaded_by_name: Option<String>,
     pub import_file_uploaded_at: Option<chrono::DateTime<Utc>>,
+    /// Not shown; carries `f.uploaded_by_user_id` so a blank
+    /// `import_file_uploaded_by_name` can still be logged against the id that
+    /// failed to resolve (PMS-1491).
+    #[serde(skip)]
+    pub import_file_uploaded_by_user_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
@@ -1545,7 +1550,8 @@ impl ContactSyncService {
                     l.import_file_id, f.filename AS import_file_name, \
                     NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '') \
                         AS import_file_uploaded_by_name, \
-                    f.uploaded_at AS import_file_uploaded_at \
+                    f.uploaded_at AS import_file_uploaded_at, \
+                    f.uploaded_by_user_id AS import_file_uploaded_by_user_id \
              FROM contact_sync_links l \
              LEFT JOIN companies co ON co.id = l.suggested_company_id AND co.tenant_id = l.tenant_id \
              LEFT JOIN contact_import_files f ON f.id = l.import_file_id \
@@ -1571,6 +1577,22 @@ impl ContactSyncService {
         .bind(contact_id)
         .fetch_all(&mut *tx)
         .await?;
+        let unresolved: Vec<Uuid> = links
+            .iter()
+            .filter_map(|l| {
+                l.import_file_uploaded_by_user_id
+                    .filter(|_| l.import_file_uploaded_by_name.is_none())
+            })
+            .chain(
+                locks
+                    .iter()
+                    .filter_map(|k| k.locked_by_user_id.filter(|_| k.locked_by_name.is_none())),
+            )
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "contact_sync.provenance",
+            &unresolved,
+        );
         Ok(ContactProvenance {
             contact_id,
             links,

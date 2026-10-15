@@ -696,6 +696,15 @@ impl BillingService {
                 .billing_contact_id
                 .and_then(|id| contact_names.get(&id).cloned());
         }
+        let unresolved: Vec<Uuid> = resp
+            .iter()
+            .filter(|r| r.billing_contact_id.is_some() && r.billing_contact_name.is_none())
+            .filter_map(|r| r.billing_contact_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "billing.list_invoices",
+            &unresolved,
+        );
         Ok(())
     }
 
@@ -6111,6 +6120,7 @@ impl BillingService {
         // here too rather than only there, because this loader exists to be
         // the ONE assembly of what an invoice contains and a field it left
         // unfilled would differ between the list and the detail.
+        let mut unresolved_person_ids: Vec<Uuid> = Vec::new();
         if let Some(contact_id) = resp.billing_contact_id {
             resp.billing_contact_name = sqlx::query_scalar(
                 "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
@@ -6121,6 +6131,9 @@ impl BillingService {
             .fetch_optional(&mut **tx)
             .await?
             .flatten();
+            if resp.billing_contact_name.is_none() {
+                unresolved_person_ids.push(contact_id);
+            }
         }
         // MAPPS-727: name the finance user who wrote the invoice off, the
         // shape `decided_by_name` has on an approval; a deleted user reads
@@ -6135,6 +6148,9 @@ impl BillingService {
             .fetch_optional(&mut **tx)
             .await?
             .flatten();
+            if resp.written_off_by_name.is_none() {
+                unresolved_person_ids.push(user_id);
+            }
         }
         // PMS-1333: and the one who voided it, the same way, so the page can
         // say who without a users lookup it has no route for.
@@ -6148,6 +6164,9 @@ impl BillingService {
             .fetch_optional(&mut **tx)
             .await?
             .flatten();
+            if resp.voided_by_name.is_none() {
+                unresolved_person_ids.push(user_id);
+            }
         }
         // PMS-1462: the display name behind delivered_by_id, resolved the
         // same way as voided_by_name. The detail page says who delivered the
@@ -6162,7 +6181,14 @@ impl BillingService {
             .fetch_optional(&mut **tx)
             .await?
             .flatten();
+            if resp.delivered_by_name.is_none() {
+                unresolved_person_ids.push(user_id);
+            }
         }
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "billing.load_invoice",
+            &unresolved_person_ids,
+        );
         Ok(resp)
     }
 

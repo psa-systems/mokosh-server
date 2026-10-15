@@ -670,6 +670,19 @@ fn pdf_for_dashboard(r: &DashboardResponse, title: &str) -> pdf::Document {
 }
 
 fn pdf_for_tickets(r: &TicketsReportResponse, title: &str) -> pdf::Document {
+    // PMS-1491: `assignee_name` is `None` both for a legitimately unassigned
+    // ticket (`assignee_id` is also `None`) and for an id whose name failed
+    // to resolve; only the latter is logged.
+    let unresolved: Vec<Uuid> = r
+        .opened_by_assignee
+        .iter()
+        .filter(|a| a.assignee_id.is_some() && a.assignee_name.is_none())
+        .filter_map(|a| a.assignee_id)
+        .collect();
+    crate::utils::unresolved_person::log_unresolved_person_names(
+        "reports.tickets.pdf.assignee",
+        &unresolved,
+    );
     pdf::Document::new(title)
         .subtitle(format!("{} to {}", r.from, r.to))
         .table(

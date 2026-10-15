@@ -318,6 +318,12 @@ impl SavedReportsService {
         }
         let rows = row_q.fetch_all(&mut *tx).await?;
 
+        super::compiler::log_unresolved_person_names(
+            "saved_reports.execute",
+            &compiled.columns,
+            &rows,
+        );
+
         // PMS-690: the SELECT aliases are whitelist-derived column keys,
         // so re-key each row to the operator's display headers here. The
         // wire shape (rows keyed by header) is unchanged.

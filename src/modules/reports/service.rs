@@ -197,6 +197,17 @@ impl ReportsService {
         .bind(to)
         .fetch_all(&mut *tx)
         .await?;
+        // PMS-1491: a `Some` assignee id with no resolved name is a failed
+        // lookup; a `None` id (unassigned ticket) is not.
+        let unresolved: Vec<Uuid> = by_assignee
+            .iter()
+            .filter(|(uid, name, _)| uid.is_some() && name.is_none())
+            .filter_map(|(uid, _, _)| *uid)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "reports.tickets",
+            &unresolved,
+        );
         Ok(TicketsReportResponse {
             from,
             to,
@@ -267,6 +278,14 @@ impl ReportsService {
         .bind(to)
         .fetch_all(&mut *tx)
         .await?;
+        // PMS-1491: `te.user_id` is never null, so any row whose name failed
+        // to resolve is a failed lookup, not a legitimately absent user.
+        let unresolved: Vec<Uuid> = by_user
+            .iter()
+            .filter(|(_, name, _)| name.is_none())
+            .map(|(id, _, _)| *id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names("reports.time", &unresolved);
         Ok(TimeReportResponse {
             from,
             to,

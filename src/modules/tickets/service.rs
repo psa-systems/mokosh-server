@@ -1422,6 +1422,12 @@ impl TicketService {
         .await?
         .ok_or_else(|| AppError::NotFound("Note".to_string()))?;
 
+        if row.created_by_name.is_none() {
+            crate::utils::unresolved_person::log_unresolved_person_names(
+                "tickets.get_note",
+                &[row.created_by_id],
+            );
+        }
         Ok(row.into())
     }
 
@@ -1464,6 +1470,15 @@ impl TicketService {
         .fetch_all(&mut *tx)
         .await?;
 
+        let unresolved: Vec<Uuid> = rows
+            .iter()
+            .filter(|r| r.created_by_name.is_none())
+            .map(|r| r.created_by_id)
+            .collect();
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "tickets.get_ticket_notes",
+            &unresolved,
+        );
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -2535,6 +2550,10 @@ impl TicketService {
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
         .await?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "tickets.list_portal_ticket_notes",
+            &unresolved_ticket_note_person_ids(&rows),
+        );
         Ok((
             rows.into_iter().map(Into::into).collect(),
             total.try_into().unwrap_or(0),
@@ -2588,6 +2607,10 @@ impl TicketService {
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
         .await?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "tickets.list_notes_by_contact",
+            &unresolved_ticket_note_person_ids(&rows),
+        );
         Ok((
             rows.into_iter().map(Into::into).collect(),
             total.try_into().unwrap_or(0),
@@ -2688,6 +2711,12 @@ impl TicketService {
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
+        if let Some(row) = &row {
+            crate::utils::unresolved_person::log_unresolved_person_names(
+                "tickets.create_portal_ticket_note",
+                &unresolved_ticket_note_person_ids(std::slice::from_ref(row)),
+            );
+        }
         row.map(TicketNote::from)
             .ok_or(AppError::NotFound("Ticket note".to_string()))
     }
@@ -2917,6 +2946,10 @@ impl TicketService {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| AppError::NotFound("Ticket".to_string()))?;
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "tickets.get_ticket_response",
+            &unresolved_ticket_response_person_ids(std::slice::from_ref(&row)),
+        );
         Ok(row.into())
     }
 
@@ -2996,6 +3029,10 @@ impl TicketService {
         let rows = query_builder.fetch_all(&mut *tx).await?;
         let total = count_builder.fetch_one(&mut *tx).await?;
 
+        crate::utils::unresolved_person::log_unresolved_person_names(
+            "tickets.list_ticket_responses",
+            &unresolved_ticket_response_person_ids(&rows),
+        );
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
@@ -3373,6 +3410,7 @@ const TICKET_RESPONSE_SELECT: &str = r#"
 SELECT
     t.id, t.ticket_number, t.title, t.description,
     t.source, t.company_id, t.contact_id, t.assigned_to_id,
+    t.created_by_id,
     t.asset_id, t.procedure_kb_article_id, t.parent_ticket_id,
     t.sla_due_date, t.is_billable, t.billing_status,
     t.estimated_hours, t.actual_hours, t.tags,
@@ -3525,6 +3563,7 @@ struct TicketResponseRow {
     company_id: Uuid,
     contact_id: Option<Uuid>,
     assigned_to_id: Option<Uuid>,
+    created_by_id: Uuid,
     asset_id: Option<Uuid>,
     procedure_kb_article_id: Option<Uuid>,
     sla_due_date: Option<chrono::DateTime<Utc>>,
@@ -3574,6 +3613,22 @@ const TICKET_SORT_COLUMNS: &[(&str, &str)] = &[
     ("priority", "tp.sort_order"),
     ("assigned_to_name", "au.first_name"),
 ];
+
+/// `contact_name`, `assigned_to_name` and `created_by_name` each resolve
+/// independently (contact/assignee are optional, creator never is), so a row
+/// can contribute up to three unresolved ids. `created_by_name` is a plain
+/// `String` (the SQL falls back to `''`, never `NULL`), so it is unresolved
+/// on empty, not `None`.
+fn unresolved_ticket_response_person_ids(rows: &[TicketResponseRow]) -> Vec<Uuid> {
+    rows.iter()
+        .flat_map(|r| {
+            let contact = r.contact_id.filter(|_| r.contact_name.is_none());
+            let assigned = r.assigned_to_id.filter(|_| r.assigned_to_name.is_none());
+            let creator = r.created_by_name.is_empty().then_some(r.created_by_id);
+            [contact, assigned, creator].into_iter().flatten()
+        })
+        .collect()
+}
 
 impl From<TicketResponseRow> for TicketResponse {
     fn from(r: TicketResponseRow) -> Self {
@@ -3657,6 +3712,17 @@ struct TicketNoteRow {
     work_summary: Option<String>,
     parts_used: Option<Vec<String>>,
     follow_up: Option<serde_json::Value>,
+}
+
+/// For the portal-facing note queries, `created_by_name` resolves through the
+/// contact join when `created_by_contact_id` is set (portal-authored) and
+/// through the user join otherwise, so the unresolved id is whichever side
+/// the name was supposed to come from, not always `created_by_id`.
+fn unresolved_ticket_note_person_ids(rows: &[TicketNoteRow]) -> Vec<Uuid> {
+    rows.iter()
+        .filter(|r| r.created_by_name.is_none())
+        .map(|r| r.created_by_contact_id.unwrap_or(r.created_by_id))
+        .collect()
 }
 
 impl From<TicketNoteRow> for TicketNote {

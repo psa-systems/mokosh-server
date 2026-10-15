@@ -132,6 +132,14 @@ impl FormsService {
         .bind(created_by)
         .fetch_optional(&mut *tx)
         .await?;
+        if let Some((first, last, _)) = &sender {
+            if first.trim().is_empty() && last.trim().is_empty() {
+                crate::utils::unresolved_person::log_unresolved_person_names(
+                    "forms.issue_request_link",
+                    &[created_by],
+                );
+            }
+        }
         let sender_name = sender
             .map(|(first, last, email)| sender_display_name(&first, &last, &email))
             .unwrap_or_else(|| tenant_name.clone());

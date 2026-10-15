@@ -108,6 +108,15 @@ pub fn resolve(token: &str, people: &[Person]) -> Option<Uuid> {
 
 /// Every person `body` mentions, unique, in order of first mention.
 pub fn mentioned(body: &str, people: &[Person]) -> Vec<Uuid> {
+    let unresolved: Vec<Uuid> = people
+        .iter()
+        .filter(|p| p.first_name.trim().is_empty() && p.last_name.trim().is_empty())
+        .map(|p| p.id)
+        .collect();
+    crate::utils::unresolved_person::log_unresolved_person_names(
+        "knowledge_base.mentions.mentioned",
+        &unresolved,
+    );
     let mut out: Vec<Uuid> = Vec::new();
     for token in tokens(body) {
         if let Some(id) = resolve(&token, people) {
