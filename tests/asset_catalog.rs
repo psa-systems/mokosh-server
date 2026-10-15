@@ -105,12 +105,13 @@ async fn model_create_and_typeahead_ranks_by_uses_count(pool: PgPool) {
     let token = common::login(&app, &email, &pw).await;
     turn_catalog_on(&app, &token).await;
 
-    // Create three models under one asset type. All manufacturer "Dell"
-    // so the typeahead can rank them by uses_count.
+    // Create three models under one asset type. Distinctive manufacturer
+    // ("Testco") so the typeahead's `q=Testco` returns exactly these
+    // three without the seed catalog's rows muddying the result set.
     for (manufacturer, model) in [
-        ("Dell", "Latitude 5450"),
-        ("Dell", "XPS 15"),
-        ("Dell", "OptiPlex 7010"),
+        ("Testco", "Lat-A"),
+        ("Testco", "Xps-Z"),
+        ("Testco", "Opti-M"),
     ] {
         let r = app
             .client
@@ -134,31 +135,12 @@ async fn model_create_and_typeahead_ranks_by_uses_count(pool: PgPool) {
         );
     }
 
-    // Default typeahead (no q): all three come back ordered by uses_count
-    // DESC and then by (manufacturer, model). Each uses_count is 0 at
-    // seed; the model names decide the tie-break alphabetically on
-    // lowercase.
+    // Typeahead q=Testco: all three come back ordered by uses_count
+    // DESC then by (manufacturer, model) ascending. Each uses_count is 0
+    // at seed, so the tie-break is alphabetical on model.
     let r: Value = app
         .client
-        .get(app.url("/api/v1/asset-models"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("list models")
-        .json()
-        .await
-        .expect("models JSON");
-    let arr = r.as_array().expect("array");
-    let names: Vec<&str> = arr
-        .iter()
-        .map(|m| m["model"].as_str().unwrap_or_default())
-        .collect();
-    assert_eq!(names, vec!["Latitude 5450", "OptiPlex 7010", "XPS 15"]);
-
-    // Typeahead q=lat should narrow to Latitude only.
-    let r: Value = app
-        .client
-        .get(app.url("/api/v1/asset-models?q=lat"))
+        .get(app.url("/api/v1/asset-models?q=Testco"))
         .bearer_auth(&token)
         .send()
         .await
@@ -172,7 +154,26 @@ async fn model_create_and_typeahead_ranks_by_uses_count(pool: PgPool) {
         .iter()
         .map(|m| m["model"].as_str().unwrap_or_default())
         .collect();
-    assert_eq!(names, vec!["Latitude 5450"]);
+    assert_eq!(names, vec!["Lat-A", "Opti-M", "Xps-Z"]);
+
+    // Typeahead q=lat-a should narrow to one.
+    let r: Value = app
+        .client
+        .get(app.url("/api/v1/asset-models?q=lat-a"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("typeahead")
+        .json()
+        .await
+        .expect("models JSON");
+    let names: Vec<&str> = r
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["model"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(names, vec!["Lat-A"]);
 
     // Duplicate shape rejected: same tenant + manufacturer + model + type.
     let r = app
@@ -180,8 +181,8 @@ async fn model_create_and_typeahead_ranks_by_uses_count(pool: PgPool) {
         .post(app.url(MODELS))
         .bearer_auth(&token)
         .json(&json!({
-            "manufacturer": "dell",
-            "model": "LATITUDE 5450",
+            "manufacturer": "testco",
+            "model": "LAT-A",
             "asset_type_id": type_id,
         }))
         .send()
@@ -711,5 +712,41 @@ async fn signature_detector_surfaces_hot_pattern_then_suppresses_once_tenant_aut
     assert!(
         r["signature"].is_null(),
         "tenant_authored catalog row must suppress the candidate: {r}"
+    );
+}
+
+#[mokosh_test]
+async fn seed_migration_populates_default_tenant_catalog(pool: PgPool) {
+    // Migration 273 seeds a short mainstream catalog into the DEFAULT
+    // tenant. The test harness runs every migration, so this must land
+    // without touching the API. Verify a well-known row is present and
+    // its asset_type_id resolves to the matching asset_types row.
+    let (manufacturer, model, type_name): (String, String, String) = sqlx::query_as(
+        "SELECT am.manufacturer, am.model, at.name \
+         FROM asset_models am \
+         JOIN asset_types at ON at.id = am.asset_type_id \
+         WHERE am.tenant_id = $1 AND am.manufacturer = 'Dell' AND am.model = 'Latitude 5450'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("Dell Latitude 5450 seeded");
+    assert_eq!(manufacturer, "Dell");
+    assert_eq!(model, "Latitude 5450");
+    assert_eq!(type_name, "Laptop");
+
+    // Row count is a smoke check that the full set landed, not just the
+    // one we probed. Loose lower bound to tolerate catalog additions in
+    // future migrations.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM asset_models WHERE tenant_id = $1 AND source = 'seeded'",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count seeded");
+    assert!(
+        count >= 30,
+        "expected the seed migration to insert at least 30 rows, got {count}"
     );
 }
