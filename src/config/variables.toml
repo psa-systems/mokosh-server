@@ -341,6 +341,13 @@ issue = "PMS-1193"
 action = "Optional. Set both to let Bunyip read provider status with its machine credential."
 
 [[change]]
+release = "v0.16.0"
+group = "Added"
+variables = ["BUNYIP_API_BASE_URL", "BUNYIP_DIRECTORY_CLIENT_ID", "BUNYIP_DIRECTORY_CLIENT_SECRET"]
+issue = "PMS-1208"
+action = "Optional. Set all three to let mokosh-server look invitees up on Bunyip's `/v1/users/lookup` when creating a grant invitation; unset means standalone-mode shape (email-only invite)."
+
+[[change]]
 release = "v0.14.0"
 group = "Added"
 variables = ["ORGANIZATIONS_ENABLED"]

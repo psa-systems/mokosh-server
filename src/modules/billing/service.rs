@@ -4173,13 +4173,9 @@ impl BillingService {
         });
         if let Some((DeliveryMethod::Other, note)) = &delivery_choice {
             if note.is_none() {
-                return Err(AppError::validation(
-                    "describe how the invoice was delivered",
-                    vec![FieldError::new(
-                        "delivery.note",
-                        "A note describing the delivery is required when `method` is `other`.",
-                        "required",
-                    )],
+                return Err(AppError::validation_field(
+                    "delivery.note",
+                    "a note describing the delivery is required when `method` is `other`",
                 ));
             }
         }

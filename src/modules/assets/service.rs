@@ -24,6 +24,43 @@ use crate::utils::pagination::PaginationParams;
 
 use super::models::*;
 
+// Macro defined up here so the `search_assets` + `asset_facets` methods below
+// can reach it; a macro_rules! is visible from the point of definition
+// onward within its module. The implementation + doc continue below the
+// `SearchWhereBuilder` struct (bottom of this file).
+macro_rules! bind_all {
+    ($q:ident, $base:expr) => {{
+        let mut $q = $q;
+        for value in $base.binds() {
+            use serde_json::Value;
+            $q = match value {
+                Value::Null => $q.bind::<Option<String>>(None),
+                Value::Bool(b) => $q.bind(*b),
+                Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        $q.bind(i)
+                    } else if let Some(f) = n.as_f64() {
+                        $q.bind(f)
+                    } else {
+                        $q.bind(n.to_string())
+                    }
+                }
+                Value::String(s) => {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+                        $q.bind(uuid)
+                    } else if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                        $q.bind(date)
+                    } else {
+                        $q.bind(s.clone())
+                    }
+                }
+                other => $q.bind(other.to_string()),
+            };
+        }
+        $q
+    }};
+}
+
 #[derive(Clone)]
 pub struct AssetsService {
     db: Database,
@@ -179,6 +216,65 @@ impl AssetsService {
         Ok(())
     }
 
+    // PMS-1490 assets exists pre-flight -------------------------------------
+    /// Returns the subset of `serials` that already belong to an asset at
+    /// the given company in this tenant. Case-insensitive match (the hardware
+    /// vendors vary); the returned strings preserve the request's casing by
+    /// mapping through a lowercase lookup set and keeping first-occurrence
+    /// order. The caller already enforced the 500-item cap at the validator.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn assets_exists(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        serials: &[String],
+    ) -> AppResult<Vec<String>> {
+        if serials.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Trim + lowercase the request's serials for the lookup; preserve
+        // the first-occurrence raw string so the response matches the
+        // operator's input.
+        let mut lower_to_display: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        let mut order = Vec::<String>::new();
+        for s in serials {
+            let t = s.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let key = t.to_lowercase();
+            if lower_to_display
+                .insert(key.clone(), t.to_string())
+                .is_none()
+            {
+                order.push(key);
+            }
+        }
+        let lookup: Vec<String> = order.clone();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let present: Vec<String> = sqlx::query_scalar(
+            "SELECT lower(serial_number) \
+             FROM assets \
+             WHERE tenant_id = $1 \
+               AND company_id = $2 \
+               AND serial_number IS NOT NULL \
+               AND lower(serial_number) = ANY($3)",
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .bind(&lookup)
+        .fetch_all(&mut *tx)
+        .await?;
+        let present_set: std::collections::HashSet<String> = present.into_iter().collect();
+        let existing: Vec<String> = order
+            .into_iter()
+            .filter(|k| present_set.contains(k))
+            .filter_map(|k| lower_to_display.remove(&k))
+            .collect();
+        Ok(existing)
+    }
+
     // PMS-74 assets CRUD ------------------------------------------------------
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_assets(
@@ -201,8 +297,51 @@ impl AssetsService {
             conditions.push(format!("a.asset_type_id = ${idx}"));
             idx += 1;
         }
+        if filter.site_id.is_some() {
+            conditions.push(format!("a.site_id = ${idx}"));
+            idx += 1;
+        }
+        if filter.assigned_user_id.is_some() {
+            conditions.push(format!("a.assigned_user_id = ${idx}"));
+            idx += 1;
+        }
         if filter.status.is_some() {
             conditions.push(format!("a.status = ${idx}"));
+            idx += 1;
+        }
+        if filter.department.is_some() {
+            conditions.push(format!("a.department = ${idx}"));
+            idx += 1;
+        }
+        if filter.manufacturer.is_some() {
+            conditions.push(format!("a.manufacturer = ${idx}"));
+            idx += 1;
+        }
+        if filter.model.is_some() {
+            conditions.push(format!("a.model = ${idx}"));
+            idx += 1;
+        }
+        if filter.tag.is_some() {
+            // `$N = ANY(a.tags)` matches the structured-search ContainsTag
+            // arm so the two endpoints agree on which assets a given tag
+            // selects. Postgres resolves the bound `TEXT` scalar against
+            // the `tags TEXT[]` column directly.
+            conditions.push(format!("${idx} = ANY(a.tags)"));
+            idx += 1;
+        }
+        // `warranty_within_days`: the structured arm inlines the clamped
+        // integer as a SQL literal rather than binding + casting, which
+        // sidesteps the Postgres `int || text` resolution. Match that
+        // pattern here so the two endpoints produce identical plans and
+        // no extra bind slot is spent on a value we have already clamped.
+        if let Some(days) = filter.warranty_within_days {
+            let days = days.clamp(0, 36500);
+            conditions.push(format!(
+                "a.warranty_expiry BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL '{days} days')::date"
+            ));
+        }
+        if filter.end_of_life_before.is_some() {
+            conditions.push(format!("a.end_of_life < ${idx}"));
             idx += 1;
         }
         // PMS-344 follow-up: free-text name match for the AssetPicker.
@@ -222,6 +361,8 @@ impl AssetsService {
         }
         let where_clause = conditions.join(" AND ");
 
+        let q_pattern = filter.q.as_ref().map(|s| format!("%{s}%"));
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let count_query = format!("SELECT COUNT(*) FROM assets a WHERE {where_clause}");
         let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
@@ -231,10 +372,31 @@ impl AssetsService {
         if let Some(v) = filter.asset_type_id {
             cq = cq.bind(v);
         }
+        if let Some(v) = filter.site_id {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = filter.assigned_user_id {
+            cq = cq.bind(v);
+        }
         if let Some(v) = &filter.status {
             cq = cq.bind(v);
         }
-        let q_pattern = filter.q.as_ref().map(|s| format!("%{s}%"));
+        if let Some(v) = &filter.department {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.manufacturer {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.model {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.tag {
+            cq = cq.bind(v);
+        }
+        // `warranty_within_days` is inlined as a SQL literal above; no bind.
+        if let Some(v) = filter.end_of_life_before {
+            cq = cq.bind(v);
+        }
         if let Some(p) = &q_pattern {
             cq = cq.bind(p);
         }
@@ -253,6 +415,7 @@ impl AssetsService {
                       -- PMS-456: per-CI lifecycle stage. Free-text VARCHAR(50).
                       a.itil_lifecycle_stage,
                       a.license_vendor, a.license_seat_count, a.license_expiry,
+                      a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
@@ -269,7 +432,29 @@ impl AssetsService {
         if let Some(v) = filter.asset_type_id {
             q = q.bind(v);
         }
+        if let Some(v) = filter.site_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.assigned_user_id {
+            q = q.bind(v);
+        }
         if let Some(v) = &filter.status {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.department {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.manufacturer {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.model {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.tag {
+            q = q.bind(v);
+        }
+        // `warranty_within_days` is inlined as a SQL literal above; no bind.
+        if let Some(v) = filter.end_of_life_before {
             q = q.bind(v);
         }
         if let Some(p) = &q_pattern {
@@ -280,6 +465,187 @@ impl AssetsService {
             .bind(pagination.offset() as i64);
         let rows = q.fetch_all(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// PMS-1486 (asset search v2): the structured-filter sibling of
+    /// `list_assets`. `q` lowers to one ILIKE against `search_haystack`
+    /// (migration 267); every `filters` entry lowers to its own clause
+    /// via the private `WhereBuilder` helper below. Returns the same
+    /// `(rows, total)` shape as `list_assets` so the handler composes a
+    /// `PaginatedResponse` from either source.
+    ///
+    /// Validation of the (field, op, values) triples happens at the
+    /// handler boundary; this method trusts the shapes it is handed and
+    /// turns an unexpected pair into a 500 at the SQL layer rather than
+    /// a 422. The handler calls `AssetSearchRequest::validate_shape`
+    /// first.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn search_assets(
+        &self,
+        tenant_id: TenantId,
+        req: &AssetSearchRequest,
+        pagination: &PaginationParams,
+    ) -> AppResult<(Vec<AssetResponse>, u64)> {
+        let mut wb = SearchWhereBuilder::new();
+        wb.push_bind_tenant(tenant_id);
+        // Haystack. pg_trgm reaches the GIN at 3+ chars; shorter strings
+        // land a sequential scan the planner still answers in bounded
+        // time because the facets below usually pare the set first.
+        if let Some(q) = req.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            wb.push_clause("a.search_haystack ILIKE ");
+            wb.push_bind_json(serde_json::Value::String(format!("%{}%", q.to_lowercase())));
+        }
+        for filter in &req.filters {
+            wb.apply_filter(filter);
+        }
+        let where_clause = wb.where_clause();
+
+        // Count.
+        let count_sql = format!("SELECT COUNT(*) FROM assets a WHERE {where_clause}");
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        let total: i64 = bind_all!(count_q, &wb).fetch_one(&mut *tx).await?;
+
+        // Sort allowlist: lower each `AssetField` to a column reference.
+        // Any field the enum knows is safe; the enum IS the allowlist.
+        let mut order_by = String::from(" ORDER BY ");
+        if req.sort.is_empty() {
+            order_by.push_str("a.name ASC");
+        } else {
+            let parts: Vec<String> = req
+                .sort
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} {}",
+                        column_for(c.field),
+                        match c.direction {
+                            SortDirection::Asc => "ASC",
+                            SortDirection::Desc => "DESC",
+                        }
+                    )
+                })
+                .collect();
+            order_by.push_str(&parts.join(", "));
+        }
+
+        let (limit_idx, offset_idx) = wb.next_two_slots();
+        let query = format!(
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
+                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
+                      a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
+                      a.ip_address::text AS ip_address, a.hostname, a.mac_address,
+                      a.installed_date, a.department, a.in_transit_ticket_id,
+                      a.itil_lifecycle_stage,
+                      a.license_vendor, a.license_seat_count, a.license_expiry,
+                      a.tags, a.notes,
+                      a.created_at, a.updated_at
+               FROM assets a
+               LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
+               LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               WHERE {where_clause}{order_by}
+               LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
+        );
+        let list_q = sqlx::query_as::<_, AssetRow>(&query);
+        let bound = bind_all!(list_q, &wb)
+            .bind(pagination.limit() as i64)
+            .bind(pagination.offset() as i64);
+        let rows = bound.fetch_all(&mut *tx).await?;
+        Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// PMS-1486: companion to `search_assets`. Returns per-facet value
+    /// counts under the same filter set the search is applied to, so
+    /// the SPA's sidebar renders "next pill worth adding" without a
+    /// second round trip per facet. The named canned-view counts
+    /// (`warranty_expiring_in_30_days`, `end_of_life_passed`) ride on
+    /// the same request.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn asset_facets(
+        &self,
+        tenant_id: TenantId,
+        req: &AssetSearchRequest,
+    ) -> AppResult<AssetFacetsResponse> {
+        let base = {
+            let mut wb = SearchWhereBuilder::new();
+            wb.push_bind_tenant(tenant_id);
+            if let Some(q) = req.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                wb.push_clause("a.search_haystack ILIKE ");
+                wb.push_bind_json(serde_json::Value::String(format!("%{}%", q.to_lowercase())));
+            }
+            for filter in &req.filters {
+                wb.apply_filter(filter);
+            }
+            wb
+        };
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let where_clause = base.where_clause();
+
+        let status = facet_text_counts(&mut tx, &base, "a.status", &where_clause).await?;
+        let company = facet_uuid_counts(
+            &mut tx,
+            &base,
+            "a.company_id",
+            Some("co.name"),
+            Some("LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id"),
+            &where_clause,
+        )
+        .await?;
+        let asset_type = facet_uuid_counts(
+            &mut tx,
+            &base,
+            "a.asset_type_id",
+            Some("at.name"),
+            Some("LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id"),
+            &where_clause,
+        )
+        .await?;
+        let assigned_user = facet_uuid_counts(
+            &mut tx,
+            &base,
+            "a.assigned_user_id",
+            Some("NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '')"),
+            Some("LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id"),
+            &where_clause,
+        )
+        .await?;
+        let department = facet_text_counts(&mut tx, &base, "a.department", &where_clause).await?;
+        let manufacturer =
+            facet_text_counts(&mut tx, &base, "a.manufacturer", &where_clause).await?;
+        let itil_lifecycle_stage =
+            facet_text_counts(&mut tx, &base, "a.itil_lifecycle_stage", &where_clause).await?;
+
+        // Canned saved-view counts. BETWEEN current and current+30d for
+        // the warranty one; `< NOW()::date` for the end-of-life one.
+        let warranty_sql = format!(
+            "SELECT COUNT(*) FROM assets a WHERE {where_clause} \
+             AND a.warranty_expiry IS NOT NULL \
+             AND a.warranty_expiry BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL '30 days')::date"
+        );
+        let warranty_q = sqlx::query_scalar::<_, i64>(&warranty_sql);
+        let warranty_expiring_in_30_days: i64 =
+            bind_all!(warranty_q, &base).fetch_one(&mut *tx).await?;
+        let eol_sql = format!(
+            "SELECT COUNT(*) FROM assets a WHERE {where_clause} \
+             AND a.end_of_life IS NOT NULL \
+             AND a.end_of_life < CURRENT_DATE"
+        );
+        let eol_q = sqlx::query_scalar::<_, i64>(&eol_sql);
+        let end_of_life_passed: i64 = bind_all!(eol_q, &base).fetch_one(&mut *tx).await?;
+
+        Ok(AssetFacetsResponse {
+            status,
+            company,
+            asset_type,
+            assigned_user,
+            department,
+            manufacturer,
+            itil_lifecycle_stage,
+            warranty_expiring_in_30_days,
+            end_of_life_passed,
+        })
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -367,6 +733,281 @@ impl AssetsService {
         self.get_asset(tenant_id, id).await
     }
 
+    /// PMS-1492 phase 3 MR1: fan-out create. Resolves a catalog model
+    /// into one "defaults" record, inserts N asset rows in one
+    /// transaction with per-row overrides applied, writes one audit row
+    /// per asset, bumps the model's `uses_count`, and returns the full
+    /// created set. Any single-row failure rolls the whole batch back
+    /// via `?` on the transaction.
+    ///
+    /// Validation happens in two places:
+    ///  - At the handler: `BulkCreateAssetsRequest::validate()` covers
+    ///    the 1..=500 serials cap, per-serial length rules, and the
+    ///    top-level company_id.
+    ///  - Here: `asset_model_id` must resolve to a catalog row in this
+    ///    tenant; `company_id` + `site_id` + `assigned_user_id` must
+    ///    exist in-tenant. A missing model is a 422, not a 404, because
+    ///    the SPA treats both as "fix your form".
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, count = request.serials.len()))]
+    pub async fn bulk_create_assets(
+        &self,
+        tenant_id: TenantId,
+        performer: Uuid,
+        request: &BulkCreateAssetsRequest,
+    ) -> AppResult<Vec<AssetResponse>> {
+        // Resolve template → model + per-order context overlay. When a
+        // template is set, its company_id / site_id / assigned_user_id /
+        // department overlay the request's values (per the plan doc:
+        // "template wins when both are present"). The request's own
+        // fields win only when the template is None for that field.
+        // bump templates.uses_count by the batch size for the typeahead's
+        // ordering.
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        #[derive(sqlx::FromRow)]
+        struct TemplateOverlay {
+            asset_model_id: Uuid,
+            company_id: Option<Uuid>,
+            site_id: Option<Uuid>,
+            default_assigned_user_id: Option<Uuid>,
+            department: Option<String>,
+        }
+        let (asset_model_id, overlay) = if let Some(template_id) = request.template_id {
+            let tpl: TemplateOverlay = sqlx::query_as(
+                "SELECT asset_model_id, company_id, site_id, default_assigned_user_id, department \
+                 FROM asset_templates WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(*tenant_id)
+            .bind(template_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                AppError::validation_field("template_id", "template does not exist in this tenant")
+            })?;
+            (tpl.asset_model_id, Some(tpl))
+        } else if let Some(id) = request.asset_model_id {
+            (id, None)
+        } else {
+            return Err(AppError::validation_field(
+                "asset_model_id",
+                "either template_id or asset_model_id must be set",
+            ));
+        };
+        let effective_company_id = overlay
+            .as_ref()
+            .and_then(|t| t.company_id)
+            .unwrap_or(request.company_id);
+        let effective_site_id = overlay.as_ref().and_then(|t| t.site_id).or(request.site_id);
+        let effective_assigned_user_id = overlay
+            .as_ref()
+            .and_then(|t| t.default_assigned_user_id)
+            .or(request.assigned_user_id);
+        let effective_department = overlay
+            .as_ref()
+            .and_then(|t| t.department.clone())
+            .or(request.department.clone());
+
+        // Resolve the catalog model to its defaults. Scoped by tenant so
+        // a caller cannot reach another tenant's model.
+        #[derive(sqlx::FromRow)]
+        struct ModelDefaults {
+            manufacturer: String,
+            model: String,
+            asset_type_id: Uuid,
+            warranty_months: Option<i32>,
+            end_of_life_months: Option<i32>,
+            default_department: Option<String>,
+        }
+        let defaults: ModelDefaults = sqlx::query_as(
+            "SELECT manufacturer, model, asset_type_id, warranty_months, \
+                    end_of_life_months, default_department \
+             FROM asset_models WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(*tenant_id)
+        .bind(asset_model_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            AppError::validation_field(
+                "asset_model_id",
+                "asset model does not exist in this tenant",
+            )
+        })?;
+
+        // Verify the per-request references up-front so a wrong one 422s
+        // before any insert fires rather than after N-1 succeed and the
+        // Nth raises an FK violation. Uses the effective_* overlay so a
+        // template that overrides the company is checked against the
+        // template's value, not the request's.
+        let company_ok: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM companies WHERE tenant_id = $1 AND id = $2")
+                .bind(*tenant_id)
+                .bind(effective_company_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if company_ok.is_none() {
+            return Err(AppError::validation_field(
+                "company_id",
+                "company does not exist in this tenant",
+            ));
+        }
+        if let Some(site_id) = effective_site_id {
+            let found: Option<Uuid> =
+                sqlx::query_scalar("SELECT id FROM sites WHERE tenant_id = $1 AND id = $2")
+                    .bind(*tenant_id)
+                    .bind(site_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if found.is_none() {
+                return Err(AppError::validation_field(
+                    "site_id",
+                    "site does not exist in this tenant",
+                ));
+            }
+        }
+        if let Some(assigned_user_id) = effective_assigned_user_id {
+            let found: Option<Uuid> =
+                sqlx::query_scalar("SELECT id FROM users WHERE tenant_id = $1 AND id = $2")
+                    .bind(*tenant_id)
+                    .bind(assigned_user_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if found.is_none() {
+                return Err(AppError::validation_field(
+                    "assigned_user_id",
+                    "user does not exist in this tenant",
+                ));
+            }
+        }
+
+        // Resolve warranty / EOL dates once from the purchase date so
+        // every row in the batch picks the same anchor. Omitted purchase
+        // date = NULL dates on the asset (the catalog is informational).
+        let warranty_expiry = match (request.purchase_date, defaults.warranty_months) {
+            (Some(d), Some(m)) => Some(d + chrono::Months::new(m.max(0) as u32)),
+            _ => None,
+        };
+        let end_of_life = match (request.purchase_date, defaults.end_of_life_months) {
+            (Some(d), Some(m)) => Some(d + chrono::Months::new(m.max(0) as u32)),
+            _ => None,
+        };
+        let department = effective_department.or_else(|| defaults.default_department.clone());
+
+        let mut created_ids = Vec::with_capacity(request.serials.len());
+        for (idx, s) in request.serials.iter().enumerate() {
+            // Per-row validation already ran via `#[validate(nested)]`
+            // at the handler; the handler returns 422 before reaching
+            // the service. Re-asserting here would be belt-and-braces
+            // at the cost of double-work.
+            let id = Uuid::new_v4();
+            let name = s.name.clone().unwrap_or_else(|| {
+                format!(
+                    "{} {} #{}",
+                    defaults.manufacturer, defaults.model, s.serial_number
+                )
+            });
+            let insert = sqlx::query(
+                r#"INSERT INTO assets (id, tenant_id, asset_tag, name, asset_type_id, company_id,
+                                        site_id, status, manufacturer, model, serial_number,
+                                        purchase_date, purchase_price, warranty_expiry, end_of_life,
+                                        assigned_user_id, ip_address, hostname, mac_address,
+                                        installed_date, department, asset_model_id)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,$9,$10,$11,$12,$13,$14,
+                           $15, NULLIF($16,'')::inet, $17, $18, $19, $20, $21)"#,
+            )
+            .bind(id)
+            .bind(*tenant_id)
+            .bind(&s.asset_tag)
+            .bind(&name)
+            .bind(defaults.asset_type_id)
+            .bind(effective_company_id)
+            .bind(effective_site_id)
+            .bind(&defaults.manufacturer)
+            .bind(&defaults.model)
+            .bind(&s.serial_number)
+            .bind(request.purchase_date)
+            .bind(request.purchase_price)
+            .bind(warranty_expiry)
+            .bind(end_of_life)
+            .bind(effective_assigned_user_id)
+            .bind(s.ip_address.as_deref().unwrap_or(""))
+            .bind(&s.hostname)
+            .bind(&s.mac_address)
+            .bind(request.installed_date)
+            .bind(&department)
+            .bind(asset_model_id)
+            .execute(&mut *tx)
+            .await;
+            if let Err(e) = insert {
+                // Map the two most common failure modes to a field-
+                // scoped 422 naming the row that failed so the SPA
+                // can anchor the hint to the right line.
+                if let Some(dbe) = e.as_database_error() {
+                    if let Some(code) = dbe.code() {
+                        if code == "23505" {
+                            return Err(AppError::validation_field(
+                                format!("serials[{idx}].serial_number"),
+                                format!(
+                                    "serial `{}` is already assigned to an asset in this tenant",
+                                    s.serial_number
+                                ),
+                            ));
+                        }
+                    }
+                }
+                return Err(e.into());
+            }
+            // One audit row per asset so the per-asset timeline shows
+            // the bulk create as a `created` event, same as a
+            // single-asset POST.
+            sqlx::query(
+                r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id)
+                   VALUES ($1, $2, 'created', $3)"#,
+            )
+            .bind(*tenant_id)
+            .bind(id)
+            .bind(performer)
+            .execute(&mut *tx)
+            .await?;
+            created_ids.push(id);
+        }
+
+        // Bump the model's uses_count in one shot so the typeahead's
+        // ORDER BY reflects actual popularity.
+        sqlx::query(
+            "UPDATE asset_models SET uses_count = uses_count + $3, updated_at = NOW() \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(*tenant_id)
+        .bind(asset_model_id)
+        .bind(created_ids.len() as i64)
+        .execute(&mut *tx)
+        .await?;
+        // Same bump for the template when one was used, so the templates
+        // typeahead on the SPA's bulk modal ranks by actual popularity.
+        if let Some(template_id) = request.template_id {
+            sqlx::query(
+                "UPDATE asset_templates SET uses_count = uses_count + $3, updated_at = NOW() \
+                 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(*tenant_id)
+            .bind(template_id)
+            .bind(created_ids.len() as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        // Fetch each row through the standard `get_asset` so the
+        // response shape matches the single-POST result (company_name
+        // + assigned_user_name resolved via join).
+        let mut created = Vec::with_capacity(created_ids.len());
+        for id in created_ids {
+            created.push(self.get_asset(tenant_id, id).await?);
+        }
+        Ok(created)
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn get_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<AssetResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -379,6 +1020,7 @@ impl AssetsService {
                       a.installed_date, a.department, a.in_transit_ticket_id,
                       a.itil_lifecycle_stage,
                       a.license_vendor, a.license_seat_count, a.license_expiry,
+                      a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
@@ -490,6 +1132,214 @@ impl AssetsService {
         };
         // Persist the before -> after diff as a JSON array of {field, old, new}
         // so the asset detail page can show the actual content of the edit.
+        let changes = serde_json::to_value(crate::modules::audit::field_changes(&before, &after))
+            .unwrap_or(serde_json::Value::Null);
+        sqlx::query(
+            r#"INSERT INTO asset_audit_log (tenant_id, asset_id, action, performed_by_id, changes)
+               VALUES ($1, $2, $3, $4, $5)"#,
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(action)
+        .bind(performer)
+        .bind(changes)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_asset(tenant_id, id).await
+    }
+
+    /// PMS-1487: partial update with explicit null semantics. The SPA's
+    /// inline-edit drawer sends one PATCH per blurred field with ONLY
+    /// the keys it changed; `None` on an outer `Option<Option<T>>`
+    /// means "leave the column untouched", `Some(None)` means "write
+    /// NULL", `Some(Some(v))` means "write v".
+    ///
+    /// Returns the refreshed row + the list of changed field names so
+    /// the SPA can show a precise undo toast. Writes one audit-log
+    /// entry carrying the full before -> after diff, matching the
+    /// shape `update_asset` emits so the audit panel renders both
+    /// surfaces uniformly.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn patch_asset(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        performer: Uuid,
+        request: &PatchAssetRequest,
+    ) -> AppResult<AssetResponse> {
+        let prior = self.get_asset(tenant_id, id).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM assets a WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        // Build a dynamic UPDATE from the keys the request actually sent.
+        // Each present field appends `col = $N` and binds the value.
+        // Nothing-present is a 204-shaped no-op (we still refresh the row
+        // so the client sees the current state).
+        let mut qb: sqlx::QueryBuilder<'_, sqlx::Postgres> =
+            sqlx::QueryBuilder::new("UPDATE assets SET ");
+        let mut first = true;
+        let mut touched = false;
+        let push = |qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>,
+                    first: &mut bool,
+                    touched: &mut bool,
+                    col: &str| {
+            if !*first {
+                qb.push(", ");
+            }
+            qb.push(col);
+            qb.push(" = ");
+            *first = false;
+            *touched = true;
+        };
+
+        if let Some(ref v) = request.name {
+            push(&mut qb, &mut first, &mut touched, "name");
+            qb.push_bind(v);
+        }
+        if let Some(v) = request.asset_type_id {
+            push(&mut qb, &mut first, &mut touched, "asset_type_id");
+            qb.push_bind(v);
+        }
+        if let Some(ref v) = request.status {
+            push(&mut qb, &mut first, &mut touched, "status");
+            qb.push_bind(v);
+        }
+        if let Some(ref opt) = request.asset_tag {
+            push(&mut qb, &mut first, &mut touched, "asset_tag");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.site_id {
+            push(&mut qb, &mut first, &mut touched, "site_id");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.contact_id {
+            push(&mut qb, &mut first, &mut touched, "contact_id");
+            qb.push_bind(opt);
+        }
+        if let Some(ref opt) = request.manufacturer {
+            push(&mut qb, &mut first, &mut touched, "manufacturer");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(ref opt) = request.model {
+            push(&mut qb, &mut first, &mut touched, "model");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(ref opt) = request.serial_number {
+            push(&mut qb, &mut first, &mut touched, "serial_number");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.purchase_date {
+            push(&mut qb, &mut first, &mut touched, "purchase_date");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.purchase_price {
+            push(&mut qb, &mut first, &mut touched, "purchase_price");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.warranty_expiry {
+            push(&mut qb, &mut first, &mut touched, "warranty_expiry");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.end_of_life {
+            push(&mut qb, &mut first, &mut touched, "end_of_life");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.assigned_user_id {
+            push(&mut qb, &mut first, &mut touched, "assigned_user_id");
+            qb.push_bind(opt);
+        }
+        if let Some(ref opt) = request.ip_address {
+            // `::inet` cast at write time so a malformed IP surfaces as
+            // 400 at the DB rather than silently writing garbage.
+            push(&mut qb, &mut first, &mut touched, "ip_address");
+            match opt.as_ref() {
+                None => {
+                    qb.push("NULL");
+                }
+                Some(s) => {
+                    qb.push_bind(s.clone());
+                    qb.push("::inet");
+                }
+            }
+        }
+        if let Some(ref opt) = request.hostname {
+            push(&mut qb, &mut first, &mut touched, "hostname");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(ref opt) = request.mac_address {
+            push(&mut qb, &mut first, &mut touched, "mac_address");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.installed_date {
+            push(&mut qb, &mut first, &mut touched, "installed_date");
+            qb.push_bind(opt);
+        }
+        if let Some(ref opt) = request.department {
+            push(&mut qb, &mut first, &mut touched, "department");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.in_transit_ticket_id {
+            push(&mut qb, &mut first, &mut touched, "in_transit_ticket_id");
+            qb.push_bind(opt);
+        }
+        if let Some(ref opt) = request.itil_lifecycle_stage {
+            push(&mut qb, &mut first, &mut touched, "itil_lifecycle_stage");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(ref opt) = request.license_vendor {
+            push(&mut qb, &mut first, &mut touched, "license_vendor");
+            qb.push_bind(opt.as_ref());
+        }
+        if let Some(opt) = request.license_seat_count {
+            push(&mut qb, &mut first, &mut touched, "license_seat_count");
+            qb.push_bind(opt);
+        }
+        if let Some(opt) = request.license_expiry {
+            push(&mut qb, &mut first, &mut touched, "license_expiry");
+            qb.push_bind(opt);
+        }
+        if let Some(ref tags) = request.tags {
+            push(&mut qb, &mut first, &mut touched, "tags");
+            qb.push_bind(tags);
+        }
+        if let Some(ref opt) = request.notes {
+            push(&mut qb, &mut first, &mut touched, "notes");
+            qb.push_bind(opt.as_ref());
+        }
+
+        if !touched {
+            // Empty body: return the current row without touching anything.
+            // Not an error - a GET-shaped idempotent probe is a legitimate
+            // SPA shape (e.g. "re-fetch after Esc").
+            return self.get_asset(tenant_id, id).await;
+        }
+
+        qb.push(", updated_at = NOW() WHERE tenant_id = ");
+        qb.push_bind(tenant_id);
+        qb.push(" AND id = ");
+        qb.push_bind(id);
+        let n = qb.build().execute(&mut *tx).await?.rows_affected();
+        if n == 0 {
+            return Err(AppError::NotFound("Asset".to_string()));
+        }
+
+        let after: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT to_jsonb(a) FROM assets a WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let action = if request.status.is_some() && request.status.as_ref() != Some(&prior.status) {
+            "status_changed"
+        } else {
+            "updated"
+        };
         let changes = serde_json::to_value(crate::modules::audit::field_changes(&before, &after))
             .unwrap_or(serde_json::Value::Null);
         sqlx::query(
@@ -1242,6 +2092,9 @@ struct AssetRow {
     license_vendor: Option<String>,
     license_seat_count: Option<i32>,
     license_expiry: Option<chrono::NaiveDate>,
+    // PMS-1487: surfaced on the wire for the inline-edit drawer.
+    tags: Option<Vec<String>>,
+    notes: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1277,6 +2130,8 @@ impl From<AssetRow> for AssetResponse {
             license_vendor: r.license_vendor,
             license_seat_count: r.license_seat_count,
             license_expiry: r.license_expiry,
+            tags: r.tags.unwrap_or_default(),
+            notes: r.notes,
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
@@ -1440,4 +2295,250 @@ impl From<AuditRow> for AssetAuditLogResponse {
             performed_at: r.performed_at,
         }
     }
+}
+
+// -- PMS-1486 asset-search helpers ------------------------------------------
+//
+// A query-builder-ish helper that threads one Vec of serde_json::Value
+// bindings through the count + list + facet queries, so every scope-
+// defining filter is applied once and re-bound in each SQL round trip.
+//
+// Why not sqlx::QueryBuilder: the facet method runs seven count queries
+// over the same WHERE, and QueryBuilder's bindings are consumed when the
+// query is built; a per-query build would re-walk the filters each time.
+// Collecting the (sql, Vec<Value>) once and re-binding is cheaper and
+// keeps the WHERE text in sync across the seven calls.
+
+struct SearchWhereBuilder {
+    clauses: Vec<String>,
+    binds: Vec<serde_json::Value>,
+    tenant_id: Option<Uuid>,
+}
+
+impl SearchWhereBuilder {
+    fn new() -> Self {
+        Self {
+            clauses: Vec::new(),
+            binds: Vec::new(),
+            tenant_id: None,
+        }
+    }
+
+    fn push_bind_tenant(&mut self, tenant_id: TenantId) {
+        self.tenant_id = Some(*tenant_id);
+        let idx = self.binds.len() + 1;
+        self.clauses.push(format!("a.tenant_id = ${idx}"));
+        self.binds
+            .push(serde_json::Value::String((*tenant_id).to_string()));
+    }
+
+    fn push_clause(&mut self, prefix: &str) {
+        let idx = self.binds.len() + 1;
+        if let Some(last) = self.clauses.last_mut() {
+            // The prefix already carries the field + operator (e.g.
+            // "a.status = "), so we append its $N anchor to the previous
+            // clause only when the caller is extending a composite.
+            // Simpler: just push a new clause string with the slot.
+            let _ = last;
+        }
+        self.clauses.push(format!("{prefix}${idx}"));
+    }
+
+    fn push_bind_json(&mut self, value: serde_json::Value) {
+        self.binds.push(value);
+    }
+
+    fn apply_filter(&mut self, filter: &FacetFilter) {
+        let column = column_for(filter.field);
+        match filter.op {
+            FacetOp::Eq => {
+                if let Some(v) = filter.values.first() {
+                    let idx = self.binds.len() + 1;
+                    self.clauses.push(format!("{column} = ${idx}"));
+                    self.binds.push(v.clone());
+                }
+            }
+            FacetOp::In => {
+                if !filter.values.is_empty() {
+                    let start = self.binds.len() + 1;
+                    let placeholders: Vec<String> = (0..filter.values.len())
+                        .map(|i| format!("${}", start + i))
+                        .collect();
+                    self.clauses
+                        .push(format!("{column} IN ({})", placeholders.join(", ")));
+                    for v in &filter.values {
+                        self.binds.push(v.clone());
+                    }
+                }
+            }
+            FacetOp::NotIn => {
+                if !filter.values.is_empty() {
+                    let start = self.binds.len() + 1;
+                    let placeholders: Vec<String> = (0..filter.values.len())
+                        .map(|i| format!("${}", start + i))
+                        .collect();
+                    self.clauses
+                        .push(format!("{column} NOT IN ({})", placeholders.join(", ")));
+                    for v in &filter.values {
+                        self.binds.push(v.clone());
+                    }
+                }
+            }
+            FacetOp::IsNull => {
+                self.clauses.push(format!("{column} IS NULL"));
+            }
+            FacetOp::IsNotNull => {
+                self.clauses.push(format!("{column} IS NOT NULL"));
+            }
+            FacetOp::Before => {
+                if let Some(v) = filter.values.first() {
+                    let idx = self.binds.len() + 1;
+                    self.clauses.push(format!("{column} < ${idx}"));
+                    self.binds.push(v.clone());
+                }
+            }
+            FacetOp::After => {
+                if let Some(v) = filter.values.first() {
+                    let idx = self.binds.len() + 1;
+                    self.clauses.push(format!("{column} > ${idx}"));
+                    self.binds.push(v.clone());
+                }
+            }
+            FacetOp::Within => {
+                if let Some(days) = filter
+                    .values
+                    .first()
+                    .and_then(|v| v.get("days"))
+                    .and_then(|v| v.as_i64())
+                {
+                    let days = days.clamp(0, 3650);
+                    self.clauses.push(format!(
+                        "{column} BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL '{days} days')::date"
+                    ));
+                }
+            }
+            FacetOp::ContainsTag => {
+                if let Some(tag) = filter.values.first().and_then(|v| v.as_str()) {
+                    let idx = self.binds.len() + 1;
+                    // tags is TEXT[]; `?` is `contains`.
+                    self.clauses.push(format!("${idx} = ANY(a.tags)"));
+                    self.binds.push(serde_json::Value::String(tag.to_string()));
+                }
+            }
+        }
+    }
+
+    fn where_clause(&self) -> String {
+        if self.clauses.is_empty() {
+            "TRUE".to_string()
+        } else {
+            self.clauses.join(" AND ")
+        }
+    }
+
+    fn next_two_slots(&self) -> (usize, usize) {
+        let start = self.binds.len() + 1;
+        (start, start + 1)
+    }
+
+    /// The ordered bindings this builder has collected. The call-site macro
+    /// `bind_all!` walks it and applies every value to the live query via
+    /// repeated `.bind(...)` chain. A function-based helper would need a
+    /// trait exposing `bind` across `Query` / `QueryAs` / `QueryScalar`;
+    /// sqlx does not ship one, so the macro is the lightest shape here.
+    fn binds(&self) -> &[serde_json::Value] {
+        &self.binds
+    }
+}
+
+/// Map an `AssetField` to the aliased column reference the WHERE clause
+/// uses. Every variant has to appear here; a missing arm is a compile
+/// error, which is what makes the enum the allowlist.
+fn column_for(field: AssetField) -> &'static str {
+    match field {
+        AssetField::AssetType => "a.asset_type_id",
+        AssetField::Status => "a.status",
+        AssetField::Company => "a.company_id",
+        AssetField::Site => "a.site_id",
+        AssetField::AssignedUser => "a.assigned_user_id",
+        AssetField::Department => "a.department",
+        AssetField::ItilLifecycleStage => "a.itil_lifecycle_stage",
+        AssetField::WarrantyExpiry => "a.warranty_expiry",
+        AssetField::EndOfLife => "a.end_of_life",
+        AssetField::PurchaseDate => "a.purchase_date",
+        AssetField::InstalledDate => "a.installed_date",
+        AssetField::Tags => "a.tags",
+        AssetField::Manufacturer => "a.manufacturer",
+        AssetField::Model => "a.model",
+        AssetField::LicenseVendor => "a.license_vendor",
+    }
+}
+
+/// Facet counts for a text column. Returns the top 10 non-null values by
+/// count. The IS NOT NULL filter keeps the facet focused on values an
+/// operator can meaningfully pick; absence lives in a separate `IsNull`
+/// pill the SPA offers from the sidebar.
+async fn facet_text_counts(
+    conn: &mut sqlx::PgConnection,
+    base: &SearchWhereBuilder,
+    column: &str,
+    where_clause: &str,
+) -> AppResult<Vec<FacetValueCount>> {
+    let sql = format!(
+        "SELECT {column} AS value, COUNT(*) AS cnt \
+         FROM assets a \
+         WHERE {where_clause} AND {column} IS NOT NULL \
+         GROUP BY {column} \
+         ORDER BY cnt DESC, {column} ASC \
+         LIMIT 10"
+    );
+    let q = sqlx::query_as::<_, (Option<String>, i64)>(&sql);
+    let rows = bind_all!(q, base).fetch_all(&mut *conn).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(v, c)| {
+            v.map(|s| FacetValueCount {
+                value: serde_json::Value::String(s.clone()),
+                label: Some(s),
+                count: c,
+            })
+        })
+        .collect())
+}
+
+/// Facet counts for a UUID column with an optional display label.
+/// `label_expr` is a SELECT fragment that resolves to the human label
+/// (company name, user full name, asset type name) under the LEFT JOIN
+/// `join_clause` adds.
+async fn facet_uuid_counts(
+    conn: &mut sqlx::PgConnection,
+    base: &SearchWhereBuilder,
+    column: &str,
+    label_expr: Option<&str>,
+    join_clause: Option<&str>,
+    where_clause: &str,
+) -> AppResult<Vec<FacetValueCount>> {
+    let select_label = label_expr.unwrap_or("NULL::text");
+    let joins = join_clause.unwrap_or("");
+    let sql = format!(
+        "SELECT {column} AS value, {select_label} AS label, COUNT(*) AS cnt \
+         FROM assets a \
+         {joins} \
+         WHERE {where_clause} AND {column} IS NOT NULL \
+         GROUP BY {column}, {select_label} \
+         ORDER BY cnt DESC \
+         LIMIT 10"
+    );
+    let q = sqlx::query_as::<_, (Option<Uuid>, Option<String>, i64)>(&sql);
+    let rows = bind_all!(q, base).fetch_all(&mut *conn).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, label, c)| {
+            id.map(|u| FacetValueCount {
+                value: serde_json::Value::String(u.to_string()),
+                label,
+                count: c,
+            })
+        })
+        .collect())
 }

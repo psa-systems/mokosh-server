@@ -88,6 +88,14 @@ pub struct AssetResponse {
     pub license_vendor: Option<String>,
     pub license_seat_count: Option<i32>,
     pub license_expiry: Option<NaiveDate>,
+    /// PMS-1487: free-text tags surfaced here so the inline-edit drawer
+    /// round-trips the chip editor. `#[serde(default)]` keeps the wire
+    /// shape backward-compatible for clients pinned to an older response.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// PMS-1487: free-text note surfaced for the inline markdown editor.
+    #[serde(default)]
+    pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -139,13 +147,168 @@ impl From<AssetResponse> for ContactAssetResponse {
 pub struct AssetFilter {
     pub company_id: Option<Uuid>,
     pub asset_type_id: Option<Uuid>,
+    pub site_id: Option<Uuid>,
+    pub assigned_user_id: Option<Uuid>,
     #[validate(length(max = 100))]
     pub status: Option<String>,
+    #[validate(length(max = 100))]
+    pub department: Option<String>,
+    #[validate(length(max = 100))]
+    pub manufacturer: Option<String>,
+    #[validate(length(max = 100))]
+    pub model: Option<String>,
+    /// Containment match against `assets.tags`. One tag per request;
+    /// the structured search (`POST /assets/search`) supports multiple
+    /// tags per request via `op = contains_tag` + repeated filters, and
+    /// is the right place to go when a caller needs that shape.
+    #[validate(length(max = 100))]
+    pub tag: Option<String>,
+    /// `warranty_expiry BETWEEN NOW()::date AND (NOW()::date + N)`.
+    #[validate(range(min = 0, max = 36500))]
+    pub warranty_within_days: Option<i64>,
+    /// `end_of_life < $date`. Caller passes today's date (or any
+    /// cutoff) directly; the client's `FilterPill` sentinel `"NOW"` is
+    /// not accepted here, callers resolve to a concrete date.
+    pub end_of_life_before: Option<chrono::NaiveDate>,
     /// PMS-344 follow-up: free-text search on the asset name, used by
     /// the AssetPicker on the ticket form / inline editor. ILIKE-matched
     /// in the service, mirroring CompanyFilter.q.
     #[validate(length(max = 200))]
     pub q: Option<String>,
+}
+
+// -- PMS-1486 (asset search v2) ---------------------------------------------
+//
+// The structured-filter body `POST /api/v1/assets/search` accepts. The
+// `AssetField` + `FacetOp` enums are the ONLY vocab the server honours; a
+// pill the SPA composes against anything else is a 422 at the validate
+// boundary rather than an empty list. `q` lowers to one ILIKE scan against
+// the `search_haystack` column migration 267 adds. See
+// docs/mokosh-assets/02-search-redesign.md for the design.
+
+/// A single filter pill. One field, one operator, one or more values.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FacetFilter {
+    pub field: AssetField,
+    pub op: FacetOp,
+    /// Zero or more values, interpreted per `op`:
+    /// - `Eq` / `In` / `NotIn`: one or more scalars; `In` and `NotIn`
+    ///   compile to `IN (...)` / `NOT IN (...)`.
+    /// - `IsNull` / `IsNotNull`: must be empty; a non-empty values list
+    ///   is a 422 at the handler.
+    /// - `Before` / `After`: exactly one scalar, parsed as a date (or
+    ///   a timestamp lowered to a date).
+    /// - `Within`: exactly one object `{"days": N}`; lowered to
+    ///   `field BETWEEN NOW()::date AND (NOW()::date + N)`.
+    /// - `ContainsTag`: exactly one string; valid only for `AssetField::Tags`.
+    #[serde(default)]
+    pub values: Vec<serde_json::Value>,
+}
+
+/// Every field the server knows how to filter by. Snake-case over the
+/// wire so the SPA sends `assigned_user` rather than `AssignedUser`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetField {
+    AssetType,
+    Status,
+    Company,
+    Site,
+    AssignedUser,
+    Department,
+    ItilLifecycleStage,
+    WarrantyExpiry,
+    EndOfLife,
+    PurchaseDate,
+    InstalledDate,
+    Tags,
+    Manufacturer,
+    Model,
+    LicenseVendor,
+}
+
+/// The operator vocab. The handler and the service enforce every (field, op)
+/// pair that is legal; a pair that is not is a 422 at the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FacetOp {
+    Eq,
+    In,
+    NotIn,
+    IsNull,
+    IsNotNull,
+    Before,
+    After,
+    /// `{"days": N}` convenience for "the next N days from today".
+    Within,
+    /// `AssetField::Tags` only.
+    ContainsTag,
+}
+
+/// One sort clause. The default sort when `sort` is empty is `name ASC`,
+/// which matches today's list.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SortClause {
+    pub field: AssetField,
+    #[serde(default)]
+    pub direction: SortDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+/// The POST body for `/api/v1/assets/search`.
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct AssetSearchRequest {
+    /// Trimmed, lowercased, ILIKE'd with surrounding wildcards against
+    /// the `search_haystack` column. Empty / absent => no haystack
+    /// filter. pg_trgm needs 3+ chars to reach the GIN, so a shorter
+    /// string falls back to a sequential scan the service accepts; the
+    /// facet filters alone keep the plan bounded in practice.
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
+    /// Facet filters, AND-combined. Validated per (field, op) pair.
+    #[serde(default)]
+    pub filters: Vec<FacetFilter>,
+    /// Overrides the default `name ASC`.
+    #[serde(default)]
+    pub sort: Vec<SortClause>,
+}
+
+/// One row of the `/api/v1/assets/search/facets` response. The SPA's
+/// sidebar renders a row per value with its count under the currently-
+/// applied filter set.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetValueCount {
+    /// JSON scalar (string / uuid / i64). `null` for `IsNull` buckets.
+    pub value: serde_json::Value,
+    /// Human label; same string as `value` for a text facet, the
+    /// resolved tenant/company/user name for a Uuid facet.
+    pub label: Option<String>,
+    pub count: i64,
+}
+
+/// The facets endpoint's response. One key per facet the SPA renders in
+/// its sidebar. Keys the current filter has already pinned (e.g. a
+/// `status` pill is applied) return the top values AMONG THE REMAINING
+/// rows so the sidebar leads with "next pill worth adding".
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AssetFacetsResponse {
+    pub status: Vec<FacetValueCount>,
+    pub company: Vec<FacetValueCount>,
+    pub asset_type: Vec<FacetValueCount>,
+    pub assigned_user: Vec<FacetValueCount>,
+    pub department: Vec<FacetValueCount>,
+    pub manufacturer: Vec<FacetValueCount>,
+    pub itil_lifecycle_stage: Vec<FacetValueCount>,
+    /// Canned saved-view counts; one entry each when non-zero.
+    pub warranty_expiring_in_30_days: i64,
+    pub end_of_life_passed: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]
@@ -241,6 +404,162 @@ pub struct UpdateAssetRequest {
     #[validate(range(min = 0))]
     pub license_seat_count: Option<i32>,
     pub license_expiry: Option<NaiveDate>,
+}
+
+/// PMS-1487: partial-update body for `PATCH /api/v1/assets/{id}`.
+///
+/// Three states per nullable field, which is what the SPA drawer needs:
+/// 1. Key absent         → `None`                   → leave column untouched.
+/// 2. Key present + `null` → `Some(None)`           → write NULL.
+/// 3. Key present + value  → `Some(Some(value))`    → write value.
+///
+/// `#[serde(default)]` gives state 1. `deserialize_with = "double_option"`
+/// gives states 2 and 3: without it, a `null` on the wire would also
+/// deserialise to the outer `None` (a known serde pitfall; the ticket-
+/// templates module carries the same helper for the same reason).
+///
+/// Validation attributes mirror `CreateAssetRequest`'s so a value rejected
+/// at create time is also rejected on patch; the `check-create-update-validate-
+/// parity` guard refuses a mismatch between the two.
+#[derive(Debug, Clone, Deserialize, Default, Validate)]
+pub struct PatchAssetRequest {
+    #[serde(default, deserialize_with = "double_option")]
+    pub asset_tag: Option<Option<String>>,
+    #[validate(length(min = 1, max = 255))]
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub asset_type_id: Option<Uuid>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub site_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub contact_id: Option<Option<Uuid>>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub manufacturer: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub serial_number: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub purchase_date: Option<Option<NaiveDate>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub purchase_price: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub warranty_expiry: Option<Option<NaiveDate>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub end_of_life: Option<Option<NaiveDate>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub assigned_user_id: Option<Option<Uuid>>,
+    #[validate(length(max = 45))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub ip_address: Option<Option<String>>,
+    #[validate(length(max = 255))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub hostname: Option<Option<String>>,
+    #[validate(length(max = 50))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub mac_address: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub installed_date: Option<Option<NaiveDate>>,
+    #[validate(length(max = 100))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub department: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub in_transit_ticket_id: Option<Option<Uuid>>,
+    #[validate(length(max = 50))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub itil_lifecycle_stage: Option<Option<String>>,
+    #[validate(length(max = 150))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub license_vendor: Option<Option<String>>,
+    #[validate(range(min = 0))]
+    #[serde(default, deserialize_with = "double_option")]
+    pub license_seat_count: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub license_expiry: Option<Option<NaiveDate>>,
+    /// Full replacement when present: the SPA chip editor sends the entire
+    /// new list on commit. `None` leaves tags untouched; `Some(vec![])`
+    /// clears them.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Free-text; `Some(None)` clears, `None` leaves untouched.
+    #[serde(default, deserialize_with = "double_option")]
+    pub notes: Option<Option<String>>,
+}
+
+// -- PMS-1492 (asset catalog, phase 3, MR1) --------------------------------
+//
+// The fan-out body for `POST /api/v1/assets/bulk-create`. Resolves a
+// catalog model (and optionally an asset_templates row on top) into one
+// defaults record, then inserts N asset rows in one transaction. Per-row
+// overrides (serial_number, name, asset_tag, hostname, mac_address,
+// ip_address) take precedence; everything else comes from the defaults.
+//
+// Cap at 500 serials per call so the transaction stays bounded. The SPA
+// (`AssetBulkCreateModal`) blocks at the client side as well.
+
+/// One serial in a bulk-create request. Only `serial_number` is required;
+/// the other fields let the operator distinguish rows that share a model
+/// but differ on a hostname or network identifier.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct BulkSerial {
+    #[validate(length(min = 1, max = 100))]
+    pub serial_number: String,
+    /// Overrides the computed default `"{manufacturer} {model} #{serial}"`.
+    #[validate(length(min = 1, max = 255))]
+    pub name: Option<String>,
+    #[validate(length(max = 100))]
+    pub asset_tag: Option<String>,
+    #[validate(length(max = 255))]
+    pub hostname: Option<String>,
+    #[validate(length(max = 50))]
+    pub mac_address: Option<String>,
+    #[validate(length(max = 45))]
+    pub ip_address: Option<String>,
+}
+
+/// `POST /api/v1/assets/bulk-create` body.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct BulkCreateAssetsRequest {
+    /// Preferred when both set. The template resolves to its model so a
+    /// template row covers both. MR2 wires `asset_templates`; MR1 only
+    /// honours `asset_model_id`, but the shape is forward-compatible.
+    pub template_id: Option<Uuid>,
+    /// Required for MR1 (templates land in MR2). The handler returns 422
+    /// `template_id or asset_model_id must be set` when both are None.
+    pub asset_model_id: Option<Uuid>,
+    pub company_id: Uuid,
+    pub site_id: Option<Uuid>,
+    pub assigned_user_id: Option<Uuid>,
+    #[validate(length(max = 100))]
+    pub department: Option<String>,
+    pub purchase_date: Option<NaiveDate>,
+    pub purchase_price: Option<Decimal>,
+    pub installed_date: Option<NaiveDate>,
+    #[validate(length(min = 1, max = 500))]
+    #[validate(nested)]
+    pub serials: Vec<BulkSerial>,
+}
+
+/// Response body for `POST /assets/bulk-create`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkCreateAssetsResponse {
+    pub created: Vec<AssetResponse>,
+    pub count: usize,
+}
+
+/// `#[serde(deserialize_with = ...)]` helper that makes `Option<Option<T>>`
+/// actually distinguish absent from null: a `null` on the wire becomes
+/// `Some(None)`, a value becomes `Some(Some(v))`, and an absent key stays
+/// `None` via the `default`. Mirrors the shape in `ticket_templates/models.rs`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -386,6 +705,31 @@ pub struct AssetAuditLogResponse {
     /// only when `performed_by_id` is `NULL` or the user row is gone.
     pub performed_by_name: Option<String>,
     pub performed_at: DateTime<Utc>,
+}
+
+// -- PMS-1490 (bulk-create pre-flight) --------------------------------------
+
+/// `POST /api/v1/assets/exists` body. Given a company and a serial list,
+/// returns the subset already present on an asset at that company so the
+/// bulk-create modal can trim or warn before firing the fan-out whose
+/// unique constraint would otherwise reject the whole batch mid-transaction.
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct AssetExistsRequest {
+    pub company_id: Uuid,
+    /// 1..=500 serial strings. The 500 cap mirrors `BulkCreateAssetsRequest`
+    /// so the two endpoints agree on batch size.
+    #[validate(length(min = 1, max = 500))]
+    pub serials: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetExistsResponse {
+    /// Subset of the request's serials that already belong to an asset at
+    /// the given company. Case preserved from the request so the UI can
+    /// render them verbatim; the match itself is case-insensitive.
+    /// Insertion order matches first-occurrence in the request; duplicates
+    /// in the request collapse to one entry.
+    pub existing: Vec<String>,
 }
 
 #[cfg(test)]

@@ -2065,6 +2065,40 @@ impl TenantService {
         .execute(&mut *tx)
         .await?;
 
+        // PMS-1492 phase 3 MR4: catalog models. Re-link `asset_type_id`
+        // through the just-inserted asset_types rows by name because the
+        // UUIDs differ per tenant. The source join filters to the DEFAULT
+        // tenant's `seeded` rows so a copy-from-default pass does not
+        // propagate a different tenant's `tenant_authored` or
+        // `auto_derived` rows (which can only happen if a prior pass
+        // copied them in; current code never does, but the filter keeps
+        // the invariant honest). Idempotent via the unique shape index.
+        sqlx::query(
+            r#"
+            INSERT INTO asset_models (tenant_id, manufacturer, model, asset_type_id,
+                                       warranty_months, end_of_life_months,
+                                       default_department, default_license_vendor,
+                                       default_tags, specs, image_url, source)
+            SELECT $1,
+                   am.manufacturer, am.model, nt.id,
+                   am.warranty_months, am.end_of_life_months,
+                   am.default_department, am.default_license_vendor,
+                   am.default_tags, am.specs, am.image_url,
+                   'seeded'
+            FROM asset_models am
+            JOIN asset_types dt
+                 ON dt.id = am.asset_type_id AND dt.tenant_id = $2
+            JOIN asset_types nt
+                 ON nt.tenant_id = $1 AND nt.name = dt.name AND nt.parent_type_id IS NULL
+            WHERE am.tenant_id = $2 AND am.source = 'seeded'
+            ON CONFLICT (tenant_id, lower(manufacturer), lower(model), asset_type_id) DO NOTHING
+            "#,
+        )
+        .bind(new_tenant_id)
+        .bind(default_tenant)
+        .execute(&mut *tx)
+        .await?;
+
         // Company industries (PMS-601): the suggestion vocabulary for the
         // company Industry combobox.
         sqlx::query(
@@ -2321,7 +2355,14 @@ impl TenantService {
                                  -- Google Contacts import keeps failing.
                                  -- Seeded for the default tenant by migration
                                  -- 229, which also backfills older tenants.
-                                 'contact_sync.failing')
+                                 'contact_sync.failing',
+                                 -- PMS-1208: Cloudflare-style pending invite
+                                 -- for cross-account grants. Seeded for the
+                                 -- default tenant by migration 268; copied
+                                 -- here so a tenant created from now on can
+                                 -- send an invitation email when the owner
+                                 -- shares their account.
+                                 'auth.mokosh_grant_invite')
             "#,
         )
         .bind(new_tenant_id)
@@ -2379,7 +2420,11 @@ impl TenantService {
                                    -- above and not its rule, so a tenant
                                    -- created since never sent that mail.
                                    'portal.access_requested',
-                                   'contact_sync.failing')
+                                   'contact_sync.failing',
+                                   -- PMS-1208: pair the invitation template
+                                   -- above with its rule. A template with no
+                                   -- rule is a message that is never sent.
+                                   'auth.mokosh_grant_invite')
             "#,
         )
         .bind(new_tenant_id)

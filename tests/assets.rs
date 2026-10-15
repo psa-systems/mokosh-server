@@ -628,3 +628,107 @@ async fn asset_search_matches_serial_numbers(pool: PgPool) {
     // filtering rather than passing everything through.
     assert!(search("nothing-matches-this").await.is_empty());
 }
+
+/// PMS-1490: `POST /api/v1/assets/exists` returns which of the given
+/// serials already belong to an asset at the given company so the SPA's
+/// bulk-create modal can trim or warn before firing the fan-out.
+#[mokosh_test]
+async fn assets_exists_names_matches_case_insensitively_within_the_company_scope(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let main_street = seed_company(&pool, "Main Street Dental").await;
+    let riverside = seed_company(&pool, "Riverside Accounting").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id = create_asset_type(&app, &token, "Laptop").await;
+
+    // Seed with a mix of serials across both companies. `create_asset`
+    // stamps SN-12345, so override via the API's full serial_number field.
+    let seed = |name: &'static str, serial: &'static str, company: Uuid| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/assets");
+        let token = token.clone();
+        let type_id = type_id.clone();
+        async move {
+            let resp = client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "name": name,
+                    "asset_type_id": type_id,
+                    "company_id": company,
+                    "serial_number": serial,
+                }))
+                .send()
+                .await
+                .expect("create asset");
+            assert!(resp.status().is_success(), "create: {}", resp.status());
+        }
+    };
+    seed("ms-01", "QA-001", main_street).await;
+    seed("ms-02", "qa-002", main_street).await;
+    seed("rs-01", "QA-003", riverside).await;
+
+    let probe = |company_id: Uuid, serials: serde_json::Value| {
+        let client = app.client.clone();
+        let url = app.url("/api/v1/assets/exists");
+        let token = token.clone();
+        async move {
+            let resp = client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "company_id": company_id, "serials": serials }))
+                .send()
+                .await
+                .expect("post exists");
+            assert!(resp.status().is_success(), "exists: {}", resp.status());
+            let v: serde_json::Value = resp.json().await.expect("json");
+            v["existing"]
+                .as_array()
+                .expect("existing array")
+                .iter()
+                .map(|s| s.as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Case-insensitive match, response preserves request casing.
+    let got = probe(
+        main_street,
+        serde_json::json!(["Qa-001", "QA-002", "QA-999"]),
+    )
+    .await;
+    assert_eq!(got, vec!["Qa-001".to_string(), "QA-002".to_string()]);
+
+    // A serial that belongs to another company does not match.
+    let got = probe(main_street, serde_json::json!(["QA-003"])).await;
+    assert!(got.is_empty(), "QA-003 lives at Riverside, not Main Street");
+
+    // Empty-ish input (whitespace-only lines) still returns an empty
+    // existing list, not a 400.
+    let got = probe(main_street, serde_json::json!(["   ", "\t"])).await;
+    assert!(got.is_empty());
+}
+
+#[mokosh_test]
+async fn assets_exists_rejects_over_the_500_cap(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    // 501 serials to trip the validator.
+    let serials: Vec<String> = (0..501).map(|i| format!("QA-{i:04}")).collect();
+    let resp = app
+        .client
+        .post(app.url("/api/v1/assets/exists"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "company_id": company, "serials": serials }))
+        .send()
+        .await
+        .expect("post exists");
+    assert_eq!(
+        resp.status().as_u16(),
+        422,
+        "over-cap request must be rejected at the validator"
+    );
+}

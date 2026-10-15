@@ -907,6 +907,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mokosh_server::modules::features::job::REFRESH_INTERVAL_SECS,
         ),
     );
+    // PMS-1492 phase 3 MR3: REFRESH MATERIALIZED VIEW CONCURRENTLY on
+    // `asset_signature_candidates_mv` on a 60s cadence so the SPA's
+    // signature banner surfaces hot patterns without a per-request COUNT
+    // on the full assets table.
+    scheduler.register(
+        mokosh_server::modules::asset_catalog::AssetSignatureDetectorRefresh::new(db.clone()),
+        std::time::Duration::from_secs(
+            mokosh_server::modules::asset_catalog::job::REFRESH_INTERVAL_SECS,
+        ),
+    );
     // PMS-198: the notifications dispatcher (5s) and RMM sync (60s) workers
     // now run on the Scheduler too; the intervals match their former raw
     // `tokio::spawn(run_forever(..))` cadences.
@@ -987,6 +997,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     );
     scheduler.register(calendar_reminder_worker, std::time::Duration::from_secs(60));
+
+    // PMS-1208: hourly expiry sweep for pending grant invitations. The
+    // service also lazy-checks expiry at read + accept + decline time, so
+    // a late request never sees a stale row; this job is what removes
+    // expired rows from the owner outbox and grantee inbox.
+    let grant_invitations_sweep =
+        mokosh_server::modules::auth::grant_invitations_worker::GrantInvitationsExpirySweep::new(
+            // SAFETY (PMS-285): no RLS on `mokosh_grant_invitations` (see
+            // migration 267 header). The sweep is a cross-tenant job: it
+            // UPDATEs every tenant's pending rows past expiry on a single
+            // pass, so the bare pool is the correct one.
+            std::sync::Arc::new(db.pool().clone()),
+        );
+    scheduler.register(
+        grant_invitations_sweep,
+        mokosh_server::modules::auth::grant_invitations_worker::GRANT_INVITATIONS_SWEEP_INTERVAL,
+    );
 
     // PMS-478: scheduled-report worker. Ticks every 60s; the cadence
     // matches the cron-expression granularity (cron crate parses

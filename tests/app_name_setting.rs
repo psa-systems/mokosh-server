@@ -524,9 +524,15 @@ async fn no_seeded_template_still_names_the_product_literally(pool: PgPool) {
     // entry for the team-invite mail (seeded by migration 265). The invitee
     // is an MSP-side identity being onboarded onto the product, same
     // audience as `auth.welcome`, so it carries `{{app_name}}` too.
+    //
+    // PMS-1208 makes it six: `auth.mokosh_grant_invite` is the pending-
+    // invitation email for cross-account grants (seeded by migration 268).
+    // The invitee is a Bunyip user being invited to another user's Mokosh
+    // account; the subject + body carry `{{app_name}}` so the product name
+    // in the email is still product-driven rather than hardcoded.
     assert_eq!(
-        templated, 5,
-        "expected the five MSP-side transactional templates to carry the placeholder"
+        templated, 6,
+        "expected the six MSP-side transactional templates to carry the placeholder"
     );
 }
 
