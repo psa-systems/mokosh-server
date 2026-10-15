@@ -238,8 +238,51 @@ impl AssetsService {
             conditions.push(format!("a.asset_type_id = ${idx}"));
             idx += 1;
         }
+        if filter.site_id.is_some() {
+            conditions.push(format!("a.site_id = ${idx}"));
+            idx += 1;
+        }
+        if filter.assigned_user_id.is_some() {
+            conditions.push(format!("a.assigned_user_id = ${idx}"));
+            idx += 1;
+        }
         if filter.status.is_some() {
             conditions.push(format!("a.status = ${idx}"));
+            idx += 1;
+        }
+        if filter.department.is_some() {
+            conditions.push(format!("a.department = ${idx}"));
+            idx += 1;
+        }
+        if filter.manufacturer.is_some() {
+            conditions.push(format!("a.manufacturer = ${idx}"));
+            idx += 1;
+        }
+        if filter.model.is_some() {
+            conditions.push(format!("a.model = ${idx}"));
+            idx += 1;
+        }
+        if filter.tag.is_some() {
+            // `$N = ANY(a.tags)` matches the structured-search ContainsTag
+            // arm so the two endpoints agree on which assets a given tag
+            // selects. Postgres resolves the bound `TEXT` scalar against
+            // the `tags TEXT[]` column directly.
+            conditions.push(format!("${idx} = ANY(a.tags)"));
+            idx += 1;
+        }
+        // `warranty_within_days`: the structured arm inlines the clamped
+        // integer as a SQL literal rather than binding + casting, which
+        // sidesteps the Postgres `int || text` resolution. Match that
+        // pattern here so the two endpoints produce identical plans and
+        // no extra bind slot is spent on a value we have already clamped.
+        if let Some(days) = filter.warranty_within_days {
+            let days = days.clamp(0, 36500);
+            conditions.push(format!(
+                "a.warranty_expiry BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL '{days} days')::date"
+            ));
+        }
+        if filter.end_of_life_before.is_some() {
+            conditions.push(format!("a.end_of_life < ${idx}"));
             idx += 1;
         }
         // PMS-344 follow-up: free-text name match for the AssetPicker.
@@ -259,6 +302,8 @@ impl AssetsService {
         }
         let where_clause = conditions.join(" AND ");
 
+        let q_pattern = filter.q.as_ref().map(|s| format!("%{s}%"));
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let count_query = format!("SELECT COUNT(*) FROM assets a WHERE {where_clause}");
         let mut cq = sqlx::query_scalar::<_, i64>(&count_query).bind(tenant_id);
@@ -268,10 +313,31 @@ impl AssetsService {
         if let Some(v) = filter.asset_type_id {
             cq = cq.bind(v);
         }
+        if let Some(v) = filter.site_id {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = filter.assigned_user_id {
+            cq = cq.bind(v);
+        }
         if let Some(v) = &filter.status {
             cq = cq.bind(v);
         }
-        let q_pattern = filter.q.as_ref().map(|s| format!("%{s}%"));
+        if let Some(v) = &filter.department {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.manufacturer {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.model {
+            cq = cq.bind(v);
+        }
+        if let Some(v) = &filter.tag {
+            cq = cq.bind(v);
+        }
+        // `warranty_within_days` is inlined as a SQL literal above; no bind.
+        if let Some(v) = filter.end_of_life_before {
+            cq = cq.bind(v);
+        }
         if let Some(p) = &q_pattern {
             cq = cq.bind(p);
         }
@@ -307,7 +373,29 @@ impl AssetsService {
         if let Some(v) = filter.asset_type_id {
             q = q.bind(v);
         }
+        if let Some(v) = filter.site_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.assigned_user_id {
+            q = q.bind(v);
+        }
         if let Some(v) = &filter.status {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.department {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.manufacturer {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.model {
+            q = q.bind(v);
+        }
+        if let Some(v) = &filter.tag {
+            q = q.bind(v);
+        }
+        // `warranty_within_days` is inlined as a SQL literal above; no bind.
+        if let Some(v) = filter.end_of_life_before {
             q = q.bind(v);
         }
         if let Some(p) = &q_pattern {
