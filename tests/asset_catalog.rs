@@ -614,3 +614,102 @@ async fn model_update_and_delete(pool: PgPool) {
         .expect("get after delete");
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
 }
+
+#[mokosh_test]
+async fn signature_detector_surfaces_hot_pattern_then_suppresses_once_tenant_authored(
+    pool: PgPool,
+) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let type_id = seed_asset_type(&pool, "Laptop").await;
+
+    // Seed 6 identical-signature assets so the matview's HAVING COUNT(*)
+    // >= 5 picks them up on refresh. Direct INSERT so we can set
+    // created_at explicitly inside the 7-day window; the API's POST sets
+    // created_at to NOW() which would also work but makes the test
+    // dependent on wall-clock timing.
+    for i in 0..6 {
+        sqlx::query(
+            "INSERT INTO assets (id, tenant_id, name, asset_type_id, company_id, status, \
+                                  manufacturer, model, serial_number, created_at) \
+             VALUES ($1, $2, $3, $4, $5, 'active', 'Dell', 'Latitude 5450', $6, NOW() - INTERVAL '1 hour')"
+        )
+        .bind(Uuid::new_v4())
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(format!("hot-{i}"))
+        .bind(type_id)
+        .bind(company)
+        .bind(format!("HOT-{i:03}"))
+        .execute(&pool)
+        .await
+        .expect("seed hot asset");
+    }
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+    turn_catalog_on(&app, &token).await;
+
+    // Refresh the matview so the SELECT below has data to find. The
+    // scheduler runs this every 60s in production; in a test we trigger
+    // it directly to avoid a sleep.
+    sqlx::query("REFRESH MATERIALIZED VIEW asset_signature_candidates_mv")
+        .execute(&pool)
+        .await
+        .expect("refresh mv");
+
+    let r: Value = app
+        .client
+        .get(app.url("/api/v1/asset-models/signature-detector"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get signature-detector")
+        .json()
+        .await
+        .expect("sig JSON");
+    let sig = &r["signature"];
+    assert!(
+        !sig.is_null(),
+        "6 identical assets must surface a candidate: {r}"
+    );
+    assert_eq!(sig["manufacturer"], "Dell");
+    assert_eq!(sig["model"], "Latitude 5450");
+    assert_eq!(sig["recent_count"].as_i64(), Some(6));
+    assert_eq!(sig["window_days"].as_i64(), Some(7));
+    assert_eq!(sig["existing_model_id"].as_null(), Some(()));
+    assert_eq!(
+        sig["template_suggestion"]["name_hint"],
+        "Dell Latitude 5450"
+    );
+
+    // Author a catalog row for the pattern - the detector must stop
+    // returning the candidate because the operator has now "owned" it.
+    let r = app
+        .client
+        .post(app.url(MODELS))
+        .bearer_auth(&token)
+        .json(&json!({
+            "manufacturer": "Dell",
+            "model": "Latitude 5450",
+            "asset_type_id": type_id,
+        }))
+        .send()
+        .await
+        .expect("author catalog row");
+    assert_eq!(r.status(), StatusCode::CREATED);
+
+    let r: Value = app
+        .client
+        .get(app.url("/api/v1/asset-models/signature-detector"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("post-author sig")
+        .json()
+        .await
+        .expect("sig JSON");
+    assert!(
+        r["signature"].is_null(),
+        "tenant_authored catalog row must suppress the candidate: {r}"
+    );
+}

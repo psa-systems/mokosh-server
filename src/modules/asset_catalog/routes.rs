@@ -29,7 +29,8 @@ use validator::Validate;
 use super::{
     models::{
         AssetModelResponse, AssetModelsQuery, AssetTemplateResponse, CreateAssetModelRequest,
-        CreateAssetTemplateRequest, UpdateAssetModelRequest, UpdateAssetTemplateRequest,
+        CreateAssetTemplateRequest, SignatureDetectorResponse, UpdateAssetModelRequest,
+        UpdateAssetTemplateRequest,
     },
     service::AssetCatalogService,
 };
@@ -54,6 +55,11 @@ pub fn asset_catalog_routes(service: AssetCatalogService, features: FeatureSnaps
             "/asset-models",
             get(list_asset_models).post(create_asset_model),
         )
+        // PMS-1492 MR3: signature-detector read. Must be registered
+        // BEFORE the `/asset-models/{id}` route or Axum's path matcher
+        // would treat "signature-detector" as a UUID candidate and
+        // return 400.
+        .route("/asset-models/signature-detector", get(signature_detector))
         .route(
             "/asset-models/{id}",
             get(get_asset_model)
@@ -118,6 +124,15 @@ async fn get_asset_model(
     require_catalog(&s)?;
     let row = s.service.get_model(u.tenant(), id).await?;
     Ok(Json(row))
+}
+
+async fn signature_detector(
+    State(s): State<AssetCatalogRouterState>,
+    RequireAssets { user: u, .. }: RequireAssets,
+) -> AppResult<Json<SignatureDetectorResponse>> {
+    require_catalog(&s)?;
+    let resp = s.service.signature_detector(u.tenant()).await?;
+    Ok(Json(resp))
 }
 
 async fn update_asset_model(

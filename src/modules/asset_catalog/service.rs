@@ -4,7 +4,8 @@ use uuid::Uuid;
 
 use super::models::{
     AssetModelResponse, AssetModelsQuery, AssetTemplateResponse, CreateAssetModelRequest,
-    CreateAssetTemplateRequest, UpdateAssetModelRequest, UpdateAssetTemplateRequest,
+    CreateAssetTemplateRequest, SignatureCandidate, SignatureDetectorResponse, TemplateSuggestion,
+    UpdateAssetModelRequest, UpdateAssetTemplateRequest,
 };
 use crate::db::Database;
 use crate::modules::auth::TenantId;
@@ -419,6 +420,57 @@ impl AssetCatalogService {
         template_id: Uuid,
     ) -> AppResult<AssetTemplateResponse> {
         self.get_template(tenant_id, template_id).await
+    }
+
+    /// MR3: signature detector read. Returns zero or one row: the top
+    /// `(tenant, manufacturer, model, asset_type)` group from the last
+    /// 7 days of asset creates, filtered to groups the operator has not
+    /// yet "owned" by writing a `tenant_authored` catalog row. An
+    /// `auto_derived` row still returns (the detector is the write path
+    /// for those, so the banner can still prompt).
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn signature_detector(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<SignatureDetectorResponse> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // LEFT JOIN against asset_models filtered by `source =
+        // 'tenant_authored'` so the WHERE condition can suppress the
+        // candidate when a catalog row the operator wrote already
+        // covers the pattern. `auto_derived` rows do not suppress -
+        // the detector is where they come from in the first place.
+        let row: Option<(String, String, uuid::Uuid, i64, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT mv.manufacturer, mv.model, mv.asset_type_id, mv.group_count, am.id \
+             FROM asset_signature_candidates_mv mv \
+             LEFT JOIN asset_models am \
+               ON am.tenant_id = mv.tenant_id \
+              AND lower(am.manufacturer) = mv.manufacturer_lower \
+              AND lower(am.model) = mv.model_lower \
+              AND am.asset_type_id = mv.asset_type_id \
+             WHERE mv.tenant_id = $1 \
+               AND (am.id IS NULL OR am.source = 'auto_derived') \
+             ORDER BY mv.group_count DESC \
+             LIMIT 1",
+        )
+        .bind(*tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(SignatureDetectorResponse {
+            signature: row.map(
+                |(manufacturer, model, asset_type_id, recent_count, existing_model_id)| {
+                    let name_hint = format!("{manufacturer} {model}");
+                    SignatureCandidate {
+                        manufacturer,
+                        model,
+                        asset_type_id,
+                        recent_count,
+                        window_days: 7,
+                        existing_model_id,
+                        template_suggestion: TemplateSuggestion { name_hint },
+                    }
+                },
+            ),
+        })
     }
 
     async fn assert_asset_type_in_tenant(

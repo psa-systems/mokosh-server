@@ -25,12 +25,16 @@
 //! shipped before this module.
 
 #[cfg(feature = "server")]
+pub mod job;
+#[cfg(feature = "server")]
 pub mod models;
 #[cfg(feature = "server")]
 pub mod routes;
 #[cfg(feature = "server")]
 pub mod service;
 
+#[cfg(feature = "server")]
+pub use job::AssetSignatureDetectorRefresh;
 #[cfg(feature = "server")]
 pub use models::*;
 #[cfg(feature = "server")]

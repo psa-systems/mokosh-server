@@ -118,6 +118,37 @@ pub struct AssetTemplateResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+/// `GET /api/v1/asset-models/signature-detector` response.
+///
+/// Zero or one row: the top signature candidate for the caller's
+/// tenant that has no `tenant_authored` catalog row yet (so the SPA's
+/// "save as template" prompt is useful rather than a reminder that the
+/// operator already wrote the catalog row).
+#[derive(Debug, Clone, Serialize)]
+pub struct SignatureDetectorResponse {
+    pub signature: Option<SignatureCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct SignatureCandidate {
+    pub manufacturer: String,
+    pub model: String,
+    pub asset_type_id: Uuid,
+    pub recent_count: i64,
+    pub window_days: i32,
+    /// `Some(uuid)` when a catalog row of this shape already exists
+    /// (which the handler only ever returns when that row is
+    /// `auto_derived`; a `tenant_authored` row suppresses the
+    /// candidate entirely).
+    pub existing_model_id: Option<Uuid>,
+    pub template_suggestion: TemplateSuggestion,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateSuggestion {
+    pub name_hint: String,
+}
+
 /// `POST /api/v1/asset-templates` body.
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateAssetTemplateRequest {
