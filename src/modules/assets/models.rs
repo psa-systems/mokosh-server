@@ -55,6 +55,11 @@ pub struct AssetResponse {
     pub company_name: Option<String>,
     pub site_id: Option<Uuid>,
     pub contact_id: Option<Uuid>,
+    /// MAPPS-1071: resolved full name for `contact_id`, from a tenant-scoped
+    /// LEFT JOIN on `contacts`. `None` when the asset is not issued to a
+    /// contact (the client-hardware case), or when the contact row is gone.
+    /// The SPA renders "Issued to <contact>" without a secondary fetch.
+    pub contact_name: Option<String>,
     pub status: String,
     pub manufacturer: Option<String>,
     pub model: Option<String>,
