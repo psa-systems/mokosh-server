@@ -521,41 +521,35 @@ async fn one_tenants_integration_is_invisible_to_another(pool: PgPool) {
     assert_eq!(entry(&ours, MANAGED_HERE)["status"], "connected");
 }
 
-/// The catalog a client renders has to agree with what the server will accept,
-/// because the client does not hold its own copy of what a provider supports.
+/// Per-row `supported_capabilities` has to agree with what the server will
+/// accept on connect, because the client reads the row's own subset and does
+/// not hold a separate catalog. MAPPS-986: the standalone catalog route was
+/// removed - what each row reports is now the only client-facing source.
 #[mokosh_test]
-async fn every_capability_the_catalog_offers_is_one_the_server_accepts(pool: PgPool) {
+async fn every_capability_a_row_supports_is_one_the_server_accepts(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    let catalog: Vec<Value> = app
-        .client
-        .get(app.url("/api/v1/integrations/capabilities"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("capability catalog")
-        .json()
-        .await
-        .expect("catalog json");
-    assert_eq!(catalog.len(), 5, "every capability in the vocabulary");
-    for descriptor in &catalog {
-        assert!(
-            !descriptor["label"].as_str().unwrap_or_default().is_empty(),
-            "a capability with no label cannot be rendered: {descriptor}"
-        );
-    }
-
-    // And for the one provider this subsystem manages, everything its row says
-    // it supports is accepted on a connect.
     let entries = list(&app, &token).await;
-    let supported: Vec<String> = entry(&entries, MANAGED_HERE)["supported_capabilities"]
+    let row = entry(&entries, MANAGED_HERE);
+    let supported: Vec<String> = row["supported_capabilities"]
         .as_array()
         .expect("array")
         .iter()
-        .map(|c| c["key"].as_str().expect("key").to_string())
+        .map(|c| {
+            let label = c["label"].as_str().unwrap_or_default();
+            assert!(
+                !label.is_empty(),
+                "a capability with no label cannot be rendered: {c}",
+            );
+            c["key"].as_str().expect("key").to_string()
+        })
         .collect();
+    assert!(
+        !supported.is_empty(),
+        "the row's capability list cannot be empty, nothing could be connected",
+    );
     let response = connect(
         &app,
         &token,
@@ -566,6 +560,6 @@ async fn every_capability_the_catalog_offers_is_one_the_server_accepts(pool: PgP
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "the catalog offered a capability the server refused"
+        "the row offered a capability the server refused on connect",
     );
 }
