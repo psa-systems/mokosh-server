@@ -929,3 +929,70 @@ async fn assert_rate_limited(resp: reqwest::Response) {
     );
     assert_eq!(body["retry_after_seconds"], retry_after);
 }
+
+/// PMS-838: a form retired after its link went out answers 410 on both GET
+/// and POST, and the message is a complete sentence. The two handlers used
+/// to disagree (`submit_via_request_link` returned 409 with a mid-clause
+/// message, `public_form_for_token` served the form as if nothing had
+/// changed), so a client filled every field in before the save failed.
+#[mokosh_test]
+async fn a_retired_form_is_refused_on_open_and_on_submit_with_410(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let agent_token = common::login(&app, &email, &password).await;
+    let (form_id, _) = seed_form_with_article(&app, &agent_token, &pool, admin_id).await;
+    let (token, _link_id) = issue_link(&app, &agent_token, &pool, &form_id, company_id).await;
+
+    // Retire the form after the link went out.
+    sqlx::query("UPDATE form_definitions SET is_active = FALSE WHERE id = $1::uuid")
+        .bind(&form_id)
+        .execute(&pool)
+        .await
+        .expect("retire the form");
+
+    // GET must 410, not 200.
+    let get_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/public/request-forms/{token}")))
+        .send()
+        .await
+        .expect("send public get");
+    assert_eq!(
+        get_resp.status(),
+        reqwest::StatusCode::GONE,
+        "a retired form is refused at open"
+    );
+    let get_body: serde_json::Value = get_resp.json().await.expect("gone body");
+    let get_msg = get_body["message"].as_str().unwrap_or_default();
+    assert!(
+        get_msg.contains("form has been retired") && get_msg.ends_with("new link."),
+        "the message is a complete sentence: {get_msg}"
+    );
+
+    // POST must also 410, not 409, and share the completed wording.
+    let post_resp = app
+        .client
+        .post(app.url(&format!("/api/v1/public/request-forms/{token}")))
+        .json(&serde_json::json!({
+            "payload": {
+                "first_name": "Pat",
+                "last_name": "Doe",
+                "department": "Sales",
+            }
+        }))
+        .send()
+        .await
+        .expect("send public post");
+    assert_eq!(
+        post_resp.status(),
+        reqwest::StatusCode::GONE,
+        "a retired form is refused on submit too"
+    );
+    let post_body: serde_json::Value = post_resp.json().await.expect("gone body");
+    let post_msg = post_body["message"].as_str().unwrap_or_default();
+    assert!(
+        post_msg.contains("form has been retired") && post_msg.ends_with("new link."),
+        "the submit message is a complete sentence: {post_msg}"
+    );
+}
