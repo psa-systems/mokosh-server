@@ -198,6 +198,13 @@ async fn project_phase_task_dependency_flow(pool: PgPool) {
         0.0,
         "no time -> 0 actual hours"
     );
+    // PMS-1481: the status label and its is_completed flag ride along, so the
+    // SPA no longer pairs status_id against a separate `/task-statuses` fetch.
+    assert!(
+        parent["status_name"].as_str().is_some(),
+        "status_name resolved: {parent}",
+    );
+    assert!(parent["status_is_completed"].is_boolean());
 
     let sub = post(
         &app,
@@ -384,6 +391,89 @@ async fn create_accepts_status_dates_and_manager(pool: PgPool) {
 // everything. With approval confined to timesheets, a tenant with the flag off
 // never reaches 'approved', so the old rule would have shown every project on
 // such a tenant running at zero actuals for ever.
+/// PMS-1481 - a task carries both status display name and assignee name on
+/// list + get so the SPA renders a row without secondary lookups.
+#[mokosh_test]
+async fn task_response_resolves_status_and_assignee_names(pool: PgPool) {
+    let (admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let project: serde_json::Value = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Delivery", "company_id": company, "status": "active" }),
+    )
+    .await
+    .json()
+    .await
+    .expect("project JSON");
+    let project_id = project["id"].as_str().unwrap().to_string();
+
+    // Resolve the first seeded task status so the test knows its name.
+    let statuses = get_json(&app, &token, "/api/v1/task-statuses").await;
+    let status_row = &statuses["data"][0];
+    let status_id = status_row["id"].as_str().unwrap().to_string();
+    let status_name = status_row["name"].as_str().unwrap().to_string();
+    let status_is_completed = status_row["is_completed"].as_bool().unwrap_or(false);
+
+    let created: serde_json::Value = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        serde_json::json!({
+            "title": "Build",
+            "status_id": status_id,
+            "assigned_to_id": admin_id,
+        }),
+    )
+    .await
+    .json()
+    .await
+    .expect("task JSON");
+    assert_eq!(created["status_name"].as_str(), Some(status_name.as_str()));
+    assert_eq!(
+        created["status_is_completed"].as_bool(),
+        Some(status_is_completed),
+    );
+    assert_eq!(created["assigned_to_name"].as_str(), Some("Test Admin"));
+
+    let task_id = created["id"].as_str().unwrap();
+    let list = get_json(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+    )
+    .await;
+    let row = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"].as_str() == Some(task_id))
+        .expect("task in list");
+    assert_eq!(row["status_name"].as_str(), Some(status_name.as_str()));
+    assert_eq!(row["assigned_to_name"].as_str(), Some("Test Admin"));
+
+    // Unassigned task: status still resolves, assignee stays null.
+    let unassigned: serde_json::Value = post(
+        &app,
+        &token,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        serde_json::json!({ "title": "Lonely", "status_id": status_id }),
+    )
+    .await
+    .json()
+    .await
+    .expect("task JSON");
+    assert_eq!(
+        unassigned["status_name"].as_str(),
+        Some(status_name.as_str())
+    );
+    assert!(unassigned["assigned_to_name"].is_null());
+}
+
 #[mokosh_test]
 async fn logged_time_rolls_into_actuals(pool: PgPool) {
     let (admin_id, email, pw) = common::seed_admin(&pool).await;
