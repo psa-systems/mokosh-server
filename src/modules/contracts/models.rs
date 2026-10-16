@@ -315,6 +315,10 @@ pub struct RateCardItemResponse {
     pub id: Uuid,
     pub rate_card_id: Uuid,
     pub work_type_id: Uuid,
+    /// PMS-1481: work type display name, resolved via a tenant-scoped LEFT
+    /// JOIN on `work_types`. `None` when the join misses; the SPA renders
+    /// the row without a second `/work-types/{id}` fetch.
+    pub work_type_name: Option<String>,
     pub hourly_rate: Decimal,
     pub after_hours_rate: Option<Decimal>,
     pub emergency_rate: Option<Decimal>,

@@ -46,6 +46,10 @@ pub struct AssetResponse {
     pub asset_tag: Option<String>,
     pub name: String,
     pub asset_type_id: Uuid,
+    /// PMS-1481: asset type display name, resolved via LEFT JOIN on
+    /// asset_types. `None` only if the row is missing; the SPA renders
+    /// `None` as "Unknown" and skips a per-row `/asset-types/{id}` fetch.
+    pub asset_type_name: Option<String>,
     pub company_id: Uuid,
     /// PMS-336: owning company display name, resolved via LEFT JOIN on
     /// companies (mirrors how TicketResponse surfaces company_name). The
@@ -334,10 +338,12 @@ pub struct CreateAssetRequest {
     // column defaults when omitted.
     pub assigned_user_id: Option<Uuid>,
     #[validate(length(max = 45))]
+    #[validate(custom(function = crate::utils::validation::validate_ip_address))]
     pub ip_address: Option<String>,
     #[validate(length(max = 255))]
     pub hostname: Option<String>,
     #[validate(length(max = 50))]
+    #[validate(custom(function = crate::utils::validation::validate_mac_address))]
     pub mac_address: Option<String>,
     pub installed_date: Option<NaiveDate>,
     #[validate(length(max = 100))]
@@ -382,10 +388,12 @@ pub struct UpdateAssetRequest {
     // only touches the fields the SPA actually sends.
     pub assigned_user_id: Option<Uuid>,
     #[validate(length(max = 45))]
+    #[validate(custom(function = crate::utils::validation::validate_ip_address))]
     pub ip_address: Option<String>,
     #[validate(length(max = 255))]
     pub hostname: Option<String>,
     #[validate(length(max = 50))]
+    #[validate(custom(function = crate::utils::validation::validate_mac_address))]
     pub mac_address: Option<String>,
     pub installed_date: Option<NaiveDate>,
     #[validate(length(max = 100))]
@@ -453,12 +461,14 @@ pub struct PatchAssetRequest {
     #[serde(default, deserialize_with = "double_option")]
     pub assigned_user_id: Option<Option<Uuid>>,
     #[validate(length(max = 45))]
+    #[validate(custom(function = crate::utils::validation::validate_ip_address))]
     #[serde(default, deserialize_with = "double_option")]
     pub ip_address: Option<Option<String>>,
     #[validate(length(max = 255))]
     #[serde(default, deserialize_with = "double_option")]
     pub hostname: Option<Option<String>>,
     #[validate(length(max = 50))]
+    #[validate(custom(function = crate::utils::validation::validate_mac_address))]
     #[serde(default, deserialize_with = "double_option")]
     pub mac_address: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
@@ -515,8 +525,10 @@ pub struct BulkSerial {
     #[validate(length(max = 255))]
     pub hostname: Option<String>,
     #[validate(length(max = 50))]
+    #[validate(custom(function = crate::utils::validation::validate_mac_address))]
     pub mac_address: Option<String>,
     #[validate(length(max = 45))]
+    #[validate(custom(function = crate::utils::validation::validate_ip_address))]
     pub ip_address: Option<String>,
 }
 

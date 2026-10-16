@@ -340,6 +340,10 @@ impl CalendarService {
         let query = format!(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
+                      (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                         FROM users u
+                        WHERE u.id = appointments.assigned_to_id
+                          AND u.tenant_id = appointments.tenant_id) AS assigned_to_name,
                       start_time, end_time, all_day, timezone, status, location,
                       recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
@@ -409,6 +413,10 @@ impl CalendarService {
         let plain_query = format!(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
+                      (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                         FROM users u
+                        WHERE u.id = appointments.assigned_to_id
+                          AND u.tenant_id = appointments.tenant_id) AS assigned_to_name,
                       start_time, end_time, all_day, timezone, status, location,
                       recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
@@ -436,6 +444,10 @@ impl CalendarService {
         let recurring_query = format!(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
+                      (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                         FROM users u
+                        WHERE u.id = appointments.assigned_to_id
+                          AND u.tenant_id = appointments.tenant_id) AS assigned_to_name,
                       start_time, end_time, all_day, timezone, status, location,
                       recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
@@ -676,6 +688,10 @@ impl CalendarService {
         let row = sqlx::query_as::<_, AppointmentRow>(
             r#"SELECT id, title, description, appointment_type, ticket_id, project_id,
                       task_id, company_id, contact_id, site_id, assigned_to_id,
+                      (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                         FROM users u
+                        WHERE u.id = appointments.assigned_to_id
+                          AND u.tenant_id = appointments.tenant_id) AS assigned_to_name,
                       start_time, end_time, all_day, timezone, status, location,
                       recurrence_rule, recurrence_parent_id, team_id,
                       created_at, updated_at
@@ -1716,6 +1732,7 @@ impl ReminderRow {
             contact_id: None,
             site_id: None,
             assigned_to_id: self.assigned_to_id,
+            assigned_to_name: None,
             start_time: self.start_time,
             end_time: self.end_time,
             all_day: false,
@@ -1747,6 +1764,7 @@ struct AppointmentRow {
     contact_id: Option<Uuid>,
     site_id: Option<Uuid>,
     assigned_to_id: Uuid,
+    assigned_to_name: Option<String>,
     start_time: chrono::DateTime<Utc>,
     end_time: chrono::DateTime<Utc>,
     all_day: Option<bool>,
@@ -1776,6 +1794,7 @@ impl From<AppointmentRow> for AppointmentResponse {
             contact_id: r.contact_id,
             site_id: r.site_id,
             assigned_to_id: r.assigned_to_id,
+            assigned_to_name: r.assigned_to_name,
             start_time: r.start_time,
             end_time: r.end_time,
             all_day: r.all_day.unwrap_or(false),
