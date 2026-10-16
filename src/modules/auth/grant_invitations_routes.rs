@@ -17,6 +17,12 @@
 //! bunyip identity by reading the current request's `AuthState`
 //! when it is present or falling back to the token's stored
 //! invitee id.
+//!
+//! PMS-840 parity record 2026-10-16: none of the seven routes in this
+//! file has a real SPA caller yet. MAPPS-1084 (in progress) is the
+//! accept/decline UI that will call the by-token surface; the owner and
+//! grantee list/revoke surfaces have no tracked SPA work yet either. The
+//! note comes off once a real caller lands.
 
 use crate::utils::json::Json;
 use axum::{
