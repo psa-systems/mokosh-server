@@ -334,10 +334,12 @@ pub struct CreateAssetRequest {
     // column defaults when omitted.
     pub assigned_user_id: Option<Uuid>,
     #[validate(length(max = 45))]
+    #[validate(custom(function = crate::utils::validation::validate_ip_address))]
     pub ip_address: Option<String>,
     #[validate(length(max = 255))]
     pub hostname: Option<String>,
     #[validate(length(max = 50))]
+    #[validate(custom(function = crate::utils::validation::validate_mac_address))]
     pub mac_address: Option<String>,
     pub installed_date: Option<NaiveDate>,
     #[validate(length(max = 100))]
@@ -382,10 +384,12 @@ pub struct UpdateAssetRequest {
     // only touches the fields the SPA actually sends.
     pub assigned_user_id: Option<Uuid>,
     #[validate(length(max = 45))]
+    #[validate(custom(function = crate::utils::validation::validate_ip_address))]
     pub ip_address: Option<String>,
     #[validate(length(max = 255))]
     pub hostname: Option<String>,
     #[validate(length(max = 50))]
+    #[validate(custom(function = crate::utils::validation::validate_mac_address))]
     pub mac_address: Option<String>,
     pub installed_date: Option<NaiveDate>,
     #[validate(length(max = 100))]
@@ -453,12 +457,14 @@ pub struct PatchAssetRequest {
     #[serde(default, deserialize_with = "double_option")]
     pub assigned_user_id: Option<Option<Uuid>>,
     #[validate(length(max = 45))]
+    #[validate(custom(function = crate::utils::validation::validate_ip_address))]
     #[serde(default, deserialize_with = "double_option")]
     pub ip_address: Option<Option<String>>,
     #[validate(length(max = 255))]
     #[serde(default, deserialize_with = "double_option")]
     pub hostname: Option<Option<String>>,
     #[validate(length(max = 50))]
+    #[validate(custom(function = crate::utils::validation::validate_mac_address))]
     #[serde(default, deserialize_with = "double_option")]
     pub mac_address: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
@@ -515,8 +521,10 @@ pub struct BulkSerial {
     #[validate(length(max = 255))]
     pub hostname: Option<String>,
     #[validate(length(max = 50))]
+    #[validate(custom(function = crate::utils::validation::validate_mac_address))]
     pub mac_address: Option<String>,
     #[validate(length(max = 45))]
+    #[validate(custom(function = crate::utils::validation::validate_ip_address))]
     pub ip_address: Option<String>,
 }
 
