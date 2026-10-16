@@ -405,7 +405,9 @@ impl AssetsService {
         let query = format!(
             r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
                       a.company_id, co.name AS company_name,
-                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
                       -- PMS-454: CMDB expansion columns. INET cast to text so the
                       -- sqlx FromRow target stays String. Assigned-user name is
@@ -422,6 +424,7 @@ impl AssetsService {
                LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
                WHERE {where_clause} ORDER BY a.name
                LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
             limit_idx = idx,
@@ -541,7 +544,9 @@ impl AssetsService {
         let query = format!(
             r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
                       a.company_id, co.name AS company_name,
-                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
                       a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
                       a.ip_address::text AS ip_address, a.hostname, a.mac_address,
@@ -554,6 +559,7 @@ impl AssetsService {
                LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
                WHERE {where_clause}{order_by}
                LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
         );
@@ -1062,7 +1068,9 @@ impl AssetsService {
         let row = sqlx::query_as::<_, AssetRow>(
             r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
                       a.company_id, co.name AS company_name,
-                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
                       a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
                       a.ip_address::text AS ip_address, a.hostname, a.mac_address,
@@ -1075,6 +1083,7 @@ impl AssetsService {
                LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
                WHERE a.tenant_id = $1 AND a.id = $2"#,
         )
         .bind(tenant_id)
@@ -2167,6 +2176,8 @@ struct AssetRow {
     company_name: Option<String>,
     site_id: Option<Uuid>,
     contact_id: Option<Uuid>,
+    // MAPPS-1071: resolved from the LEFT JOIN on contacts.
+    contact_name: Option<String>,
     status: Option<String>,
     manufacturer: Option<String>,
     model: Option<String>,
@@ -2211,6 +2222,7 @@ impl From<AssetRow> for AssetResponse {
             company_name: r.company_name,
             site_id: r.site_id,
             contact_id: r.contact_id,
+            contact_name: r.contact_name,
             status: r.status.unwrap_or_else(|| "active".into()),
             manufacturer: r.manufacturer,
             model: r.model,
