@@ -805,3 +805,131 @@ async fn assets_exists_rejects_over_the_500_cap(pool: PgPool) {
         "over-cap request must be rejected at the validator"
     );
 }
+
+/// PMS-1476: when an asset update flips `itil_lifecycle_stage` to `retired`
+/// and the request does not also set `status`, the server flips the status
+/// to `retired` so the Status badge, list facets and saved reports stop
+/// counting the device as Active. Status explicitly sent wins over the
+/// implied flip. Covers both PUT /assets/{id} and PATCH /assets/{id}.
+#[mokosh_test]
+async fn retiring_lifecycle_stage_flips_status_to_retired_on_put_and_patch(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id = create_asset_type(&app, &token, "Workstation").await;
+
+    // -- PUT path --
+    let put_id = create_asset(&app, &token, "put-asset", &type_id, company).await;
+    let r = app
+        .client
+        .put(app.url(&format!("/api/v1/assets/{put_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "itil_lifecycle_stage": "retired" }))
+        .send()
+        .await
+        .expect("put lifecycle");
+    assert!(r.status().is_success(), "PUT: {}", r.status());
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{put_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get after put")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(after["itil_lifecycle_stage"].as_str(), Some("retired"));
+    assert_eq!(
+        after["status"].as_str(),
+        Some("retired"),
+        "PUT: lifecycle=retired must flip status to retired"
+    );
+
+    // -- PUT path, explicit status wins --
+    let put2_id = create_asset(&app, &token, "put-explicit", &type_id, company).await;
+    let r = app
+        .client
+        .put(app.url(&format!("/api/v1/assets/{put2_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "itil_lifecycle_stage": "retired",
+            "status": "in_stock"
+        }))
+        .send()
+        .await
+        .expect("put both");
+    assert!(r.status().is_success());
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{put2_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get after put2")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        after["status"].as_str(),
+        Some("in_stock"),
+        "PUT: explicit status wins over the implied retired flip"
+    );
+
+    // -- PATCH path --
+    let patch_id = create_asset(&app, &token, "patch-asset", &type_id, company).await;
+    let r = app
+        .client
+        .patch(app.url(&format!("/api/v1/assets/{patch_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "itil_lifecycle_stage": "retired" }))
+        .send()
+        .await
+        .expect("patch lifecycle");
+    assert!(r.status().is_success(), "PATCH: {}", r.status());
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{patch_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get after patch")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(after["itil_lifecycle_stage"].as_str(), Some("retired"));
+    assert_eq!(
+        after["status"].as_str(),
+        Some("retired"),
+        "PATCH: lifecycle=retired must flip status to retired"
+    );
+
+    // -- PATCH path, non-retired lifecycle does not touch status --
+    let patch2_id = create_asset(&app, &token, "patch-in-service", &type_id, company).await;
+    let r = app
+        .client
+        .patch(app.url(&format!("/api/v1/assets/{patch2_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "itil_lifecycle_stage": "in_service" }))
+        .send()
+        .await
+        .expect("patch in_service");
+    assert!(r.status().is_success());
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{patch2_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(after["itil_lifecycle_stage"].as_str(), Some("in_service"));
+    assert_eq!(
+        after["status"].as_str(),
+        Some("active"),
+        "PATCH: non-retired lifecycle must leave status untouched (default 'active')"
+    );
+}

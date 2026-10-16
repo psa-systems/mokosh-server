@@ -1082,6 +1082,16 @@ impl AssetsService {
         // SPA omits the field in a partial PUT. The IP arrives as text
         // and is `::inet` cast at write time so a bad value raises a
         // 400 rather than silently corrupting the column.
+        //
+        // PMS-1476: when the request sets `itil_lifecycle_stage` to
+        // `retired` and does NOT also set `status`, flip status to
+        // `retired`. The CASE below resolves the three combinations:
+        //   - status explicitly sent -> use it ($8 wins via outer COALESCE)
+        //   - status omitted, lifecycle -> retired -> write 'retired'
+        //   - status omitted, lifecycle -> anything else (or NULL) -> leave status unchanged
+        // That keeps the lifecycle picker consistent with the Status badge,
+        // the list facet counts and the saved reports (filters that read
+        // `status` would otherwise still count a retired asset as active).
         let n = sqlx::query(
             r#"UPDATE assets SET
                 asset_tag = COALESCE($3, asset_tag),
@@ -1089,7 +1099,10 @@ impl AssetsService {
                 asset_type_id = COALESCE($5, asset_type_id),
                 site_id = COALESCE($6, site_id),
                 contact_id = COALESCE($7, contact_id),
-                status = COALESCE($8, status),
+                status = COALESCE(
+                    $8,
+                    CASE WHEN $23 = 'retired' THEN 'retired' ELSE status END
+                ),
                 manufacturer = COALESCE($9, manufacturer),
                 model = COALESCE($10, model),
                 serial_number = COALESCE($11, serial_number),
@@ -1230,9 +1243,24 @@ impl AssetsService {
             push(&mut qb, &mut first, &mut touched, "asset_type_id");
             qb.push_bind(v);
         }
+        // PMS-1476: a lifecycle_stage=retired flip implies status=retired
+        // unless the caller explicitly sent its own status. The SPA's
+        // inline-edit drawer PATCHes one field per blur, so the common
+        // path is "set lifecycle_stage, send nothing else"; without this
+        // the Status badge, list facets and saved reports still count
+        // the asset as Active. Status explicitly sent wins (same rule
+        // as the full-PUT path).
+        let implied_retired_status = request.status.is_none()
+            && matches!(
+                &request.itil_lifecycle_stage,
+                Some(Some(stage)) if stage.eq_ignore_ascii_case("retired"),
+            );
         if let Some(ref v) = request.status {
             push(&mut qb, &mut first, &mut touched, "status");
             qb.push_bind(v);
+        } else if implied_retired_status {
+            push(&mut qb, &mut first, &mut touched, "status");
+            qb.push_bind("retired".to_string());
         }
         if let Some(ref opt) = request.asset_tag {
             push(&mut qb, &mut first, &mut touched, "asset_tag");
