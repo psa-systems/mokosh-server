@@ -142,6 +142,15 @@ pub struct TimeEntryFilter {
     pub date_to: Option<NaiveDate>,
 }
 
+/// MAPPS-984: server-side aggregate for the dashboard "time this week"
+/// widget. One number per request so the SPA stops paging the full
+/// `/time-entries` list and summing in the browser.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimeEntrySummaryResponse {
+    /// Total non-rejected minutes across every entry matching the filter.
+    pub minutes: i64,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateTimeEntryRequest {
     /// Only super_admin / admin / manager can attribute time to a
