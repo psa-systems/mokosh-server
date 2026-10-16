@@ -47,6 +47,9 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
             "/time-entries",
             get(list_time_entries).post(create_time_entry),
         )
+        // MAPPS-984: aggregate for dashboard widgets that want one number
+        // (minutes summed over the same `TimeEntryFilter` the list uses).
+        .route("/time-entries/summary", get(summarize_time_entries))
         .route(
             "/time-entries/{id}",
             get(get_time_entry)
@@ -182,6 +185,20 @@ async fn list_time_entries(
         &pagination,
         total,
     )))
+}
+
+async fn summarize_time_entries(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    Query(filter): Query<TimeEntryFilter>,
+) -> AppResult<Json<mokosh_types::time_tracking::TimeEntrySummaryResponse>> {
+    filter.validate()?;
+    Ok(Json(
+        state
+            .service
+            .summarize_time_entries(user.tenant(), &filter)
+            .await?,
+    ))
 }
 
 async fn create_time_entry(

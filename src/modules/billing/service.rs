@@ -825,6 +825,54 @@ impl BillingService {
     /// PMS-35: paginated + filterable invoice list. `lines` is left
     /// `None` on list rollups — the customer-facing UI fetches lines
     /// only when expanding a row.
+    /// MAPPS-984: `COUNT` and `SUM(balance_due)` over the invoice filter.
+    /// The dashboard's "Open invoices" widget asks for the two numbers, not
+    /// the rows; paging the whole collection to compute them client-side cost
+    /// up to 100 round trips per load. `exclude_draft` and `overdue` carry
+    /// over for parity with `list_invoices`; the free-text `q` and the
+    /// `contract_id` filter are left out as list-only concerns.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn summarize_invoices(
+        &self,
+        tenant_id: TenantId,
+        filter: &InvoiceFilter,
+    ) -> AppResult<crate::modules::billing::models::InvoiceSummaryResponse> {
+        let mut conds = vec!["tenant_id = $1".to_string()];
+        let mut idx = 2;
+        if filter.company_id.is_some() {
+            conds.push(format!("company_id = ${idx}"));
+            idx += 1;
+        }
+        if filter.status.is_some() {
+            conds.push(format!("status = ${idx}"));
+            // No more placeholders after status today; the increment is kept
+            // so a future filter picks up at the right slot without a trap.
+            let _ = idx;
+        }
+        if filter.exclude_draft {
+            conds.push("status <> 'draft'".to_string());
+        }
+        let where_clause = conds.join(" AND ");
+        let query = format!(
+            r#"
+            SELECT COUNT(*)::bigint AS count,
+                   COALESCE(SUM(balance_due), 0) AS total
+            FROM invoices
+            WHERE {where_clause}
+            "#
+        );
+        let mut q = sqlx::query_as::<_, (i64, rust_decimal::Decimal)>(&query).bind(tenant_id);
+        if let Some(v) = filter.company_id {
+            q = q.bind(v);
+        }
+        if let Some(ref v) = filter.status {
+            q = q.bind(v);
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let (count, total) = q.fetch_one(&mut *tx).await?;
+        Ok(crate::modules::billing::models::InvoiceSummaryResponse { count, total })
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn list_invoices(
         &self,

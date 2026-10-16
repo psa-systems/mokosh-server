@@ -1652,3 +1652,72 @@ async fn a_generated_line_describes_the_work_not_the_row(pool: PgPool) {
         assert!(!line.contains("Time entry"), "{line}");
     }
 }
+
+/// MAPPS-984: `GET /invoices/summary` returns one count + one summed balance
+/// over the filter so the dashboard widget stops paging the whole collection
+/// to compute them client-side.
+#[mokosh_test]
+async fn invoice_summary_counts_and_sums_balance_due(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let other_company = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO companies (id, tenant_id, name, slug) VALUES ($1, $2, 'Other', $3)",
+    )
+    .bind(other_company)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(format!("other-{}", other_company.simple()))
+    .execute(&pool)
+    .await
+    .expect("seed other company");
+    seed_sent_invoice(&pool, company_id, "100").await;
+    seed_sent_invoice(&pool, company_id, "250").await;
+    seed_sent_invoice(&pool, other_company, "50").await;
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+
+    // All sent: 3 invoices, 400 total balance.
+    let all: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/invoices/summary?status=sent"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary all")
+        .json()
+        .await
+        .expect("summary all JSON");
+    assert_eq!(all["count"].as_i64(), Some(3));
+    assert_eq!(all["total"].as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| all["total"].as_f64()).unwrap(), 400.0);
+
+    // Company-scoped: 2 invoices for `company_id`, 350 balance.
+    let scoped: serde_json::Value = app
+        .client
+        .get(app.url(&format!(
+            "/api/v1/invoices/summary?status=sent&company_id={company_id}"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary scoped")
+        .json()
+        .await
+        .expect("summary scoped JSON");
+    assert_eq!(scoped["count"].as_i64(), Some(2));
+    assert_eq!(scoped["total"].as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| scoped["total"].as_f64()).unwrap(), 350.0);
+
+    // Empty: no draft invoices seeded.
+    let draft: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/invoices/summary?status=draft"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary draft")
+        .json()
+        .await
+        .expect("summary draft JSON");
+    assert_eq!(draft["count"].as_i64(), Some(0));
+    assert_eq!(draft["total"].as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| draft["total"].as_f64()).unwrap(), 0.0);
+}

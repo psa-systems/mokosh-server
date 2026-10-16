@@ -67,6 +67,10 @@ pub fn billing_routes(service: BillingService, public_api_base: Option<String>) 
     };
     Router::new()
         .route("/invoices", get(list_invoices).post(create_invoice))
+        // MAPPS-984: COUNT + SUM(balance_due) over the invoice filter so the
+        // dashboard widget stops paging the whole collection to derive two
+        // numbers.
+        .route("/invoices/summary", get(summarize_invoices))
         .route(
             "/invoices/from-time-entries",
             axum::routing::post(create_invoice_from_time_entries),
@@ -632,6 +636,21 @@ async fn get_invoice(
         }
     }
     Ok(Json(inv))
+}
+
+async fn summarize_invoices(
+    State(state): State<BillingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    Query(filter): Query<InvoiceFilter>,
+) -> AppResult<Json<crate::modules::billing::models::InvoiceSummaryResponse>> {
+    filter.validate()?;
+    Ok(Json(
+        state
+            .service
+            .summarize_invoices(user.tenant(), &filter)
+            .await?,
+    ))
 }
 
 async fn list_invoices(

@@ -1190,3 +1190,82 @@ async fn general_time_entry_against_own_company(pool: PgPool) {
         "entry classifies as general"
     );
 }
+
+/// MAPPS-984: the aggregate endpoint sums `duration_minutes` over the same
+/// filter the list endpoint takes, so a dashboard widget asks for one number
+/// instead of paging the whole collection.
+#[mokosh_test]
+async fn summary_sums_duration_minutes_over_the_filter(pool: PgPool) {
+    let (admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &admin_email, &admin_pw).await;
+
+    let work_types: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/work-types"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list work types")
+        .json()
+        .await
+        .expect("work types JSON");
+    let work_type_id = work_types["data"][0]["id"].as_str().unwrap().to_string();
+
+    for (date, minutes) in [("2026-06-16", 30), ("2026-06-17", 45), ("2026-06-18", 15)] {
+        let r = app
+            .client
+            .post(app.url("/api/v1/time-entries"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "user_id": admin_id,
+                "date": date,
+                "duration_minutes": minutes,
+                "work_type_id": work_type_id,
+                "notes": "seed",
+            }))
+            .send()
+            .await
+            .expect("create entry");
+        assert!(r.status().is_success(), "entry create {date} should 2xx");
+    }
+
+    // Full span: all three entries are summed.
+    let total: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/time-entries/summary"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary")
+        .json()
+        .await
+        .expect("summary JSON");
+    assert_eq!(total["minutes"].as_i64(), Some(90));
+
+    // Date-filtered: only the middle entry.
+    let window: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/time-entries/summary?date_from=2026-06-17&date_to=2026-06-17"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary filtered")
+        .json()
+        .await
+        .expect("summary filtered JSON");
+    assert_eq!(window["minutes"].as_i64(), Some(45));
+
+    // Empty match set collapses to zero, not null.
+    let empty: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/time-entries/summary?date_from=2030-01-01"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary empty")
+        .json()
+        .await
+        .expect("summary empty JSON");
+    assert_eq!(empty["minutes"].as_i64(), Some(0));
+}

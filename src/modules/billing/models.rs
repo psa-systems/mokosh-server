@@ -183,6 +183,17 @@ pub struct InvoiceResponse {
     pub lines: Option<Vec<InvoiceLineResponse>>,
 }
 
+/// Aggregate over the invoice filter (MAPPS-984). The dashboard's "Open
+/// invoices" widget asks for one count and one summed balance, not the rows.
+/// Returned by `GET /invoices/summary`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct InvoiceSummaryResponse {
+    /// How many invoices matched the filter.
+    pub count: i64,
+    /// Sum of `balance_due` over the matching rows (zero when nothing matched).
+    pub total: rust_decimal::Decimal,
+}
+
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct InvoiceFilter {
     pub company_id: Option<Uuid>,

@@ -311,6 +311,68 @@ impl TimeTrackingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// MAPPS-984: single-row SUM over the same `TimeEntryFilter` the list
+    /// endpoint takes. The dashboard's "Time this week" widget asks for one
+    /// number, so paging the whole collection to sum client-side wastes up to
+    /// 100 round trips per load; this query is one `SUM(duration_minutes)`
+    /// bounded by the tenant and the filter. `NULL` from an empty match set
+    /// collapses to `0`.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn summarize_time_entries(
+        &self,
+        tenant_id: TenantId,
+        filter: &TimeEntryFilter,
+    ) -> AppResult<mokosh_types::time_tracking::TimeEntrySummaryResponse> {
+        let mut conds = vec!["tenant_id = $1".to_string()];
+        let mut idx = 2;
+        let mut push = |col: &str, op: &str| {
+            conds.push(format!("{col} {op} ${idx}"));
+            idx += 1;
+        };
+        if filter.user_id.is_some() {
+            push("user_id", "=");
+        }
+        if filter.ticket_id.is_some() {
+            push("ticket_id", "=");
+        }
+        if filter.project_id.is_some() {
+            push("project_id", "=");
+        }
+        if filter.date_from.is_some() {
+            push("date", ">=");
+        }
+        if filter.date_to.is_some() {
+            push("date", "<=");
+        }
+        let where_clause = conds.join(" AND ");
+        let query = format!(
+            r#"
+            SELECT COALESCE(SUM(duration_minutes), 0)::bigint AS minutes
+            FROM time_entries
+            WHERE {where_clause}
+            "#
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&query).bind(tenant_id);
+        if let Some(v) = filter.user_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.ticket_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.project_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.date_from {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.date_to {
+            q = q.bind(v);
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let minutes = q.fetch_one(&mut *tx).await?;
+        Ok(mokosh_types::time_tracking::TimeEntrySummaryResponse { minutes })
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_time_entry(
         &self,

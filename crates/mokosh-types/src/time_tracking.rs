@@ -149,6 +149,16 @@ pub struct TimeEntryFilter {
     pub date_to: Option<NaiveDate>,
 }
 
+/// Aggregate over the same filter the list endpoint takes (MAPPS-984). The
+/// dashboard's "Time this week" widget asks for one number, not the rows.
+/// Returned by `GET /time-entries/summary`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimeEntrySummaryResponse {
+    /// Sum of `duration_minutes` over the matching rows. `0` when the filter
+    /// matches no rows.
+    pub minutes: i64,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateTimeEntryRequest {
     /// Only super_admin / admin / manager can attribute time to a
