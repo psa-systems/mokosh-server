@@ -1096,6 +1096,12 @@ pub struct Contact {
     /// imported. Filled by the same batched hydration as `phones`.
     #[serde(default)]
     pub imported_from: Option<ContactOrigin>,
+    /// PMS-1481: portal roles granted to this contact, by display name.
+    /// Filled by the same batched hydration pass as `phones`, so the SPA
+    /// renders the Portal Roles column from the list response alone
+    /// instead of a per-row `GET /contacts/{id}/portal-roles`.
+    #[serde(default)]
+    pub portal_role_names: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1279,6 +1285,9 @@ pub struct ContactResponse {
     /// PMS-1260 (PSA-70 C): where this contact was imported from, `null` for
     /// one entered by hand. The list's provenance badge reads it.
     pub imported_from: Option<ContactOrigin>,
+    /// PMS-1481: portal roles granted to this contact, by display name.
+    #[serde(default)]
+    pub portal_role_names: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1307,6 +1316,7 @@ impl From<Contact> for ContactResponse {
             phones: c.phones,
             companies: c.companies,
             imported_from: c.imported_from,
+            portal_role_names: c.portal_role_names,
             created_at: c.created_at,
         }
     }
