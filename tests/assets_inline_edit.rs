@@ -238,3 +238,135 @@ async fn patch_tags_replace_semantics(pool: PgPool) {
         .collect();
     assert!(tags.is_empty(), "empty vec clears tags: {body}");
 }
+
+fn field_messages<'a>(body: &'a Value, field: &str) -> Vec<&'a str> {
+    body["error"]["errors"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|e| e["field"].as_str() == Some(field))
+                .filter_map(|e| e["message"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// PMS-1488 - a malformed IP is a 422 with `fields[].field = "ip_address"`,
+/// not a raw `Database operation failed` from the Postgres `::inet` cast.
+#[mokosh_test]
+async fn patch_rejects_malformed_ip_before_sql(pool: PgPool) {
+    let (_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let co = seed_company(&pool, "Acme").await;
+    let at = seed_asset_type(&pool, "Laptop").await;
+    let a = seed_asset(&pool, co, at, "Netbox", "active", None).await;
+
+    for bad in ["999.999.999.999", "10.0.0", "not-an-ip"] {
+        let (st, body) = patch(&app, &token, a, json!({ "ip_address": bad })).await;
+        assert_eq!(
+            st,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bad ip {bad} should 422: {body}"
+        );
+        let msgs = field_messages(&body, "ip_address");
+        assert!(
+            !msgs.is_empty(),
+            "ip_address field envelope missing for {bad}: {body}"
+        );
+        let flat = body.to_string();
+        assert!(
+            !flat.contains("Database operation failed"),
+            "raw DB error leaked for {bad}: {flat}",
+        );
+    }
+
+    for ok in ["10.0.0.5", "::1", "2001:db8::1"] {
+        let (st, _) = patch(&app, &token, a, json!({ "ip_address": ok })).await;
+        assert_eq!(st, StatusCode::OK, "good ip {ok} should 200");
+    }
+}
+
+/// PMS-1488 - malformed MAC rejected the same way (`macaddr` cast would
+/// otherwise raise `invalid input syntax for type macaddr`).
+#[mokosh_test]
+async fn patch_rejects_malformed_mac_before_sql(pool: PgPool) {
+    let (_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let co = seed_company(&pool, "Acme").await;
+    let at = seed_asset_type(&pool, "Laptop").await;
+    let a = seed_asset(&pool, co, at, "Netbox", "active", None).await;
+
+    for bad in ["ZZ:ZZ:ZZ:ZZ:ZZ:ZZ", "aa:bb:cc:dd:ee", "aabbccddeeff"] {
+        let (st, body) = patch(&app, &token, a, json!({ "mac_address": bad })).await;
+        assert_eq!(
+            st,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bad mac {bad} should 422: {body}"
+        );
+        let msgs = field_messages(&body, "mac_address");
+        assert!(
+            !msgs.is_empty(),
+            "mac_address field envelope missing for {bad}: {body}"
+        );
+        let flat = body.to_string();
+        assert!(
+            !flat.contains("Database operation failed"),
+            "raw DB error leaked for {bad}: {flat}",
+        );
+    }
+
+    for ok in ["aa:bb:cc:dd:ee:ff", "AA-BB-CC-DD-EE-FF"] {
+        let (st, _) = patch(&app, &token, a, json!({ "mac_address": ok })).await;
+        assert_eq!(st, StatusCode::OK, "good mac {ok} should 200");
+    }
+}
+
+/// PMS-1488 - `POST /assets` also runs the DTO validators (an import or
+/// future-CLI create path cannot sneak past them).
+#[mokosh_test]
+async fn create_rejects_malformed_ip_and_mac(pool: PgPool) {
+    let (_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let co = seed_company(&pool, "Acme").await;
+    let at = seed_asset_type(&pool, "Laptop").await;
+
+    let base = json!({
+        "name": "New",
+        "asset_type_id": at,
+        "company_id": co,
+    });
+
+    for (field, bad) in [
+        ("ip_address", "999.999.999.999"),
+        ("mac_address", "ZZ:ZZ:ZZ:ZZ:ZZ:ZZ"),
+    ] {
+        let mut body = base.clone();
+        body[field] = json!(bad);
+        let r = app
+            .client
+            .post(app.url("/api/v1/assets"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .expect("post");
+        let st = r.status();
+        let resp = r.json::<Value>().await.unwrap_or(Value::Null);
+        assert_eq!(
+            st,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{field} bad create: {resp}"
+        );
+        let msgs = field_messages(&resp, field);
+        assert!(
+            !msgs.is_empty(),
+            "{field} envelope missing on create: {resp}"
+        );
+    }
+}

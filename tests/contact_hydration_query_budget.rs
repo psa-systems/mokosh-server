@@ -146,6 +146,18 @@ async fn a_contact_page_reads_each_child_table_once(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("seed contact link");
+        // PMS-1481: give every contact two of the seeded portal roles so the
+        // batched hydration has rows to pick up.
+        sqlx::query(
+            "INSERT INTO contact_role_assignments (contact_id, role_id, tenant_id) \
+             SELECT $1, pr.id, $2 FROM portal_roles pr \
+             WHERE pr.tenant_id = $2 AND pr.name IN ('Billing Contact', 'Support Contact')",
+        )
+        .bind(contact)
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .expect("seed contact role assignments");
     }
 
     let svc = ContactService::new(Database::from_pool(pool.clone()));
@@ -169,6 +181,12 @@ async fn a_contact_page_reads_each_child_table_once(pool: PgPool) {
             .all(|c| c.phones.len() == 2 && c.companies.len() == 1),
         "every contact on the page is hydrated"
     );
+    assert!(
+        contacts.iter().all(|c| c.portal_role_names.len() == 2
+            && c.portal_role_names.contains(&"Billing Contact".to_string())
+            && c.portal_role_names.contains(&"Support Contact".to_string())),
+        "PMS-1481: portal_role_names resolved on every contact",
+    );
 
     let statements = recorder.take();
     for (table, label) in [
@@ -176,6 +194,9 @@ async fn a_contact_page_reads_each_child_table_once(pool: PgPool) {
         ("contact_companies", "company links"),
         // PMS-1260: provenance for the list's badge.
         ("contact_sync_links", "import provenance"),
+        // PMS-1481: portal roles batched into the same hydration pass so
+        // the SPA renders the Portal Roles column without a per-row GET.
+        ("contact_role_assignments", "portal role names"),
     ] {
         let reads: Vec<&String> = statements
             .iter()
