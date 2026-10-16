@@ -48,6 +48,8 @@ async fn book_appointment_then_range_query_returns_it(pool: PgPool) {
         .expect("create appointment JSON");
     let appt_id = created["id"].as_str().expect("created appointment id");
     assert_eq!(created["title"].as_str(), Some("Onsite visit"));
+    // PMS-1481: the owning user's name rides on the response.
+    assert_eq!(created["assigned_to_name"].as_str(), Some("Test Admin"));
 
     let list: serde_json::Value = app
         .client
@@ -69,6 +71,7 @@ async fn book_appointment_then_range_query_returns_it(pool: PgPool) {
         found.get("recurrence_parent_id").is_none() || found["recurrence_parent_id"].is_null(),
         "non-recurring appointment must not have recurrence_parent_id, got {found}"
     );
+    assert_eq!(found["assigned_to_name"].as_str(), Some("Test Admin"));
 }
 
 /// Reject a one-off appointment whose end is not strictly after its

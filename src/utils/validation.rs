@@ -396,6 +396,43 @@ pub fn validate_tax_rate(value: &Decimal) -> Result<(), ValidationError> {
     Ok(())
 }
 
+static MAC_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$|^(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}$")
+        .unwrap()
+});
+
+/// Parse an IP address (v4 or v6) ahead of the Postgres `::inet` cast so a
+/// malformed value becomes a 422 field envelope instead of surfacing as a
+/// generic `Database operation failed` from `invalid input syntax for type
+/// inet`.
+pub fn validate_ip_address(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_ip_address");
+        error.message = Some("Not a valid IP address".into());
+        Err(error)
+    }
+}
+
+/// Parse a MAC address (colon or hyphen separated) ahead of the Postgres
+/// `::macaddr` cast; same rationale as `validate_ip_address` (PMS-1488).
+pub fn validate_mac_address(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if MAC_REGEX.is_match(value) {
+        Ok(())
+    } else {
+        let mut error = ValidationError::new("invalid_mac_address");
+        error.message = Some("Not a valid MAC address".into());
+        Err(error)
+    }
+}
+
 /// Generate a slug from a string
 pub fn slugify(s: &str) -> String {
     s.to_lowercase()
@@ -632,6 +669,34 @@ mod tests {
         assert!(validate_tax_rate(&Decimal::from_str("100.01").unwrap()).is_err());
         // More than 4 decimal places would be silently rounded by the column.
         assert!(validate_tax_rate(&Decimal::from_str("1.23456").unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_validate_ip_address() {
+        assert!(validate_ip_address("10.0.0.5").is_ok());
+        assert!(validate_ip_address("0.0.0.0").is_ok());
+        assert!(validate_ip_address("255.255.255.255").is_ok());
+        assert!(validate_ip_address("::1").is_ok());
+        assert!(validate_ip_address("2001:db8::1").is_ok());
+        assert!(validate_ip_address("::ffff:192.0.2.1").is_ok());
+        assert!(validate_ip_address("").is_ok());
+        assert!(validate_ip_address("999.999.999.999").is_err());
+        assert!(validate_ip_address("10.0.0").is_err());
+        assert!(validate_ip_address("fe80::zz").is_err());
+        assert!(validate_ip_address("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn test_validate_mac_address() {
+        assert!(validate_mac_address("aa:bb:cc:dd:ee:ff").is_ok());
+        assert!(validate_mac_address("AA:BB:CC:DD:EE:FF").is_ok());
+        assert!(validate_mac_address("AA-BB-CC-DD-EE-FF").is_ok());
+        assert!(validate_mac_address("01:23:45:67:89:ab").is_ok());
+        assert!(validate_mac_address("").is_ok());
+        assert!(validate_mac_address("ZZ:ZZ:ZZ:ZZ:ZZ:ZZ").is_err());
+        assert!(validate_mac_address("aa:bb:cc:dd:ee").is_err());
+        assert!(validate_mac_address("aabbccddeeff").is_err());
+        assert!(validate_mac_address("aa:bb-cc:dd:ee:ff").is_err());
     }
 
     #[test]
