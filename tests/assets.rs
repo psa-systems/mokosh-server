@@ -709,6 +709,79 @@ async fn assets_exists_names_matches_case_insensitively_within_the_company_scope
     assert!(got.is_empty());
 }
 
+/// PMS-1481 - `asset_type_name` rides along on list + get via a tenant-scoped
+/// LEFT JOIN on `asset_types`, so the SPA stops fetching the full type list
+/// to resolve each row's label.
+#[mokosh_test]
+async fn asset_response_carries_resolved_asset_type_name(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let type_id = create_asset_type(&app, &token, "Rack Server").await;
+    let asset_id = create_asset(&app, &token, "srv-01", &type_id, company).await;
+
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(got["asset_type_name"].as_str(), Some("Rack Server"));
+
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/assets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list assets")
+        .json()
+        .await
+        .expect("list json");
+    let row = list["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .find(|r| r["id"].as_str() == Some(asset_id.as_str()))
+        .expect("asset in list");
+    assert_eq!(row["asset_type_name"].as_str(), Some("Rack Server"));
+
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name, slug, kind) VALUES ($1, $2, $3, 'org')")
+        .bind(foreign_tenant)
+        .bind("Foreign")
+        .bind(format!("foreign-{}", foreign_tenant.simple()))
+        .execute(&pool)
+        .await
+        .expect("seed tenant");
+    sqlx::query("UPDATE asset_types SET tenant_id = $1 WHERE id = $2::uuid")
+        .bind(foreign_tenant)
+        .bind(&type_id)
+        .execute(&pool)
+        .await
+        .expect("retag asset_type to another tenant");
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert!(
+        got["asset_type_name"].is_null(),
+        "a type whose tenant does not match the asset's resolves to null: {got}",
+    );
+}
+
 #[mokosh_test]
 async fn assets_exists_rejects_over_the_500_cap(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
