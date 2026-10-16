@@ -86,11 +86,14 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
             );
         }
         RolesProbe::AppPasswordMismatch => {
-            // Falls through to the same full provision path, which already
-            // ends with `ALTER ROLE mokosh_app ... PASSWORD`, so the
-            // reconciliation is the existing statement rather than a new one.
-            // Named separately only because the operator-facing message for a
-            // wrong password is not the message for a missing role.
+            // Falls through to the provision path for its `ALTER ROLE
+            // mokosh_app ... PASSWORD`, so the reconciliation is an existing
+            // statement rather than a new one. PMS-1469: only the app half of
+            // the statement list runs, because this probe answer is itself
+            // proof that the credential in `DATABASE_URL` works, and rewriting
+            // `mokosh_migrator`'s password from a drifted
+            // MOKOSH_MIGRATOR_PASSWORD would turn a one-role incident into a
+            // two-role outage on the NEXT boot.
             tracing::warn!(
                 "mokosh_app exists but {APP_DATABASE_URL_VAR} cannot authenticate as it; \
                  reconciling its password from {APP_PASSWORD_VAR} via {ADMIN_DATABASE_URL_VAR}"
@@ -111,12 +114,27 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
         }
     };
 
-    let migrator_password = require_env(MIGRATOR_PASSWORD_VAR)?;
     let app_password = require_env(APP_PASSWORD_VAR)?;
+    // PMS-1469: required only when the migrator's statements are going to run,
+    // through the same predicate that decides whether to emit them, so the two
+    // cannot drift apart. Reconciling mokosh_app's password must not fail a
+    // boot over a variable it has no use for.
+    let migrator_password = if needs_migrator_statements(&probe) {
+        Some(require_env(MIGRATOR_PASSWORD_VAR)?)
+    } else {
+        None
+    };
 
-    tracing::info!(
-        "mokosh_migrator cannot connect; provisioning DB roles via {ADMIN_DATABASE_URL_VAR}"
-    );
+    // PMS-1153 applies to this line as much as to the error messages below:
+    // the old wording claimed the migrator could not connect, which is false
+    // in two of the three states that reach here.
+    match probe {
+        RolesProbe::AppPasswordMismatch => tracing::info!(
+            "reconciling mokosh_app from {APP_PASSWORD_VAR} via {ADMIN_DATABASE_URL_VAR}; \
+             mokosh_migrator is left alone"
+        ),
+        _ => tracing::info!("provisioning DB roles via {ADMIN_DATABASE_URL_VAR}"),
+    }
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -134,47 +152,23 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
         .await
         .map_err(|e| AppError::Database(format!("failed to read current_database(): {e}")))?;
 
-    let migrator_pw = sql_quote(&migrator_password);
-    let app_pw = sql_quote(&app_password);
-    let db = quote_ident(&db_name);
-
-    // CREATE ROLE is not idempotent, so guard each with a DO block; the ALTER
-    // ROLE afterwards reconciles the password + attributes on an existing role.
-    let stmts: Vec<String> = vec![
-        format!(
-            "DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mokosh_migrator') \
-             THEN CREATE ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD {migrator_pw}; END IF; END $do$"
-        ),
-        format!("ALTER ROLE mokosh_migrator LOGIN BYPASSRLS PASSWORD {migrator_pw}"),
-        format!(
-            "DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mokosh_app') \
-             THEN CREATE ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD {app_pw}; END IF; END $do$"
-        ),
-        format!("ALTER ROLE mokosh_app LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD {app_pw}"),
-        // The migrator owns/creates schema objects.
-        "GRANT ALL ON SCHEMA public TO mokosh_migrator".to_string(),
-        // CREATE on the database lets the migrator self-install the trusted
-        // extensions (CREATE EXTENSION). The old provision-roles step omitted
-        // this, so the migrator could not.
-        format!("GRANT CREATE ON DATABASE {db} TO mokosh_migrator"),
-        // The app role: connect + use the schema, read/write existing objects.
-        format!("GRANT CONNECT ON DATABASE {db} TO mokosh_app"),
-        "GRANT USAGE ON SCHEMA public TO mokosh_app".to_string(),
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mokosh_app"
-            .to_string(),
-        "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mokosh_app".to_string(),
-        "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO mokosh_app".to_string(),
-        // Future objects created by the migrator are auto-granted to the app.
-        "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public \
-         GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mokosh_app"
-            .to_string(),
-        "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public \
-         GRANT USAGE, SELECT ON SEQUENCES TO mokosh_app"
-            .to_string(),
-        "ALTER DEFAULT PRIVILEGES FOR ROLE mokosh_migrator IN SCHEMA public \
-         GRANT EXECUTE ON FUNCTIONS TO mokosh_app"
-            .to_string(),
-    ];
+    let stmts = match provision_statements(
+        &probe,
+        RoleNames::FIXED,
+        migrator_password.as_deref(),
+        &app_password,
+        &db_name,
+    ) {
+        Ok(stmts) => stmts,
+        Err(e) => {
+            // Unreachable from here: the `require_env` above already refused
+            // the only combination this rejects. Handled rather than `?`d
+            // because the admin pool is open by now, and the one rule about it
+            // is that a privileged connection does not linger.
+            pool.close().await;
+            return Err(e);
+        }
+    };
 
     for stmt in &stmts {
         sqlx::query(stmt).execute(&pool).await.map_err(|e| {
@@ -186,11 +180,182 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     // one-time step and must not linger as an open superuser connection.
     pool.close().await;
 
-    tracing::info!(
-        database = %db_name,
-        "DB roles provisioned (mokosh_migrator BYPASSRLS / mokosh_app NOSUPERUSER NOBYPASSRLS)"
-    );
+    match probe {
+        // PMS-1469: say what ran. A line claiming both roles were provisioned
+        // is how a reader concludes the migrator's password was rewritten and
+        // goes looking for the wrong cause when the next boot fails.
+        RolesProbe::AppPasswordMismatch => tracing::info!(
+            database = %db_name,
+            "mokosh_app reconciled (NOSUPERUSER NOBYPASSRLS); mokosh_migrator untouched"
+        ),
+        _ => tracing::info!(
+            database = %db_name,
+            "DB roles provisioned (mokosh_migrator BYPASSRLS / mokosh_app NOSUPERUSER NOBYPASSRLS)"
+        ),
+    }
     Ok(())
+}
+
+/// The two role names the provisioning statements target.
+///
+/// [`RoleNames::FIXED`] is what every boot uses, and the module header's "the
+/// role names are fixed identifiers (no injection surface)" still describes
+/// production. They are parameterised only so PMS-1469's regression test can
+/// run the REAL statement list against throwaway roles: Postgres roles are
+/// cluster-wide while a test database is not, so a test that ran
+/// `ALTER ROLE mokosh_app ... PASSWORD` would change the password under every
+/// other test in the suite. Both names still reach SQL through `quote_ident`
+/// as an identifier and `sql_quote` as the `pg_roles` literal.
+#[derive(Clone, Copy)]
+pub struct RoleNames<'a> {
+    migrator: &'a str,
+    app: &'a str,
+}
+
+impl RoleNames<'static> {
+    /// The names the server provisions.
+    pub const FIXED: Self = Self {
+        migrator: "mokosh_migrator",
+        app: "mokosh_app",
+    };
+}
+
+impl<'a> RoleNames<'a> {
+    /// Throwaway names, for a test that must not touch the real roles.
+    pub fn new(migrator: &'a str, app: &'a str) -> Self {
+        Self { migrator, app }
+    }
+}
+
+/// Does this probe outcome call for the migrator half of the statement list?
+///
+/// The one place the PMS-1469 decision is made: `provision_roles` reads
+/// `MOKOSH_MIGRATOR_PASSWORD` only when this says yes, and
+/// [`provision_statements`] emits those statements only when it says yes. Two
+/// copies of this test would be two things to keep in step.
+fn needs_migrator_statements(probe: &RolesProbe) -> bool {
+    !matches!(probe, RolesProbe::AppPasswordMismatch)
+}
+
+/// The migrator's own role and privileges.
+///
+/// PMS-1469 is about the second statement here. `ALTER ROLE ... PASSWORD`
+/// overwrites whatever password the role holds with the configured one, and
+/// `MOKOSH_MIGRATOR_PASSWORD` is a separately settable production secret that
+/// can drift from the password actually embedded in `DATABASE_URL`. Running it
+/// while healing `mokosh_app` takes out the role the probe just proved was
+/// working, and the boot that does it SUCCEEDS: the breakage lands on the next
+/// one, which makes it an outage with no obvious cause.
+fn migrator_statements(names: RoleNames<'_>, migrator_password: &str, db: &str) -> Vec<String> {
+    let role = quote_ident(names.migrator);
+    let role_literal = sql_quote(names.migrator);
+    let pw = sql_quote(migrator_password);
+    vec![
+        format!(
+            "DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {role_literal}) \
+             THEN CREATE ROLE {role} LOGIN BYPASSRLS PASSWORD {pw}; END IF; END $do$"
+        ),
+        format!("ALTER ROLE {role} LOGIN BYPASSRLS PASSWORD {pw}"),
+        // The migrator owns/creates schema objects.
+        format!("GRANT ALL ON SCHEMA public TO {role}"),
+        // CREATE on the database lets the migrator self-install the trusted
+        // extensions (CREATE EXTENSION). The old provision-roles step omitted
+        // this, so the migrator could not.
+        format!("GRANT CREATE ON DATABASE {db} TO {role}"),
+    ]
+}
+
+/// Future objects the migrator creates are auto-granted to the app role.
+///
+/// Its own slice because it is the one group that needs BOTH roles to already
+/// exist: `FOR ROLE <migrator>` is 42704 without the migrator, and the grantee
+/// is 42704 without the app role, so it runs after both halves above. Getting
+/// that order wrong is not theoretical, it is what the first cut of the
+/// PMS-1469 split did: with these statements still inside
+/// `migrator_statements`, a first boot ran them before `CREATE ROLE
+/// mokosh_app` and failed on a database that provisions cleanly today.
+///
+/// Skipped with the migrator half, because the statement names the migrator. A
+/// deployment in the mismatch state has already provisioned once, so these are
+/// in place; and since PMS-1265 a migration grants each new table to
+/// `mokosh_app` in the same file, so skipping them strands nothing.
+fn default_privilege_statements(names: RoleNames<'_>) -> Vec<String> {
+    let role = quote_ident(names.migrator);
+    let app = quote_ident(names.app);
+    vec![
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public \
+             GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {app}"
+        ),
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public \
+             GRANT USAGE, SELECT ON SEQUENCES TO {app}"
+        ),
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {role} IN SCHEMA public \
+             GRANT EXECUTE ON FUNCTIONS TO {app}"
+        ),
+    ]
+}
+
+/// Every statement that names only the app role: its role, its password, and
+/// the privileges it serves requests with.
+///
+/// This is the whole list a `RolesProbe::AppPasswordMismatch` boot runs.
+fn app_statements(names: RoleNames<'_>, app_password: &str, db: &str) -> Vec<String> {
+    let app = quote_ident(names.app);
+    let app_literal = sql_quote(names.app);
+    let pw = sql_quote(app_password);
+    vec![
+        format!(
+            "DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {app_literal}) \
+             THEN CREATE ROLE {app} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD {pw}; END IF; END $do$"
+        ),
+        format!("ALTER ROLE {app} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD {pw}"),
+        format!("GRANT CONNECT ON DATABASE {db} TO {app}"),
+        format!("GRANT USAGE ON SCHEMA public TO {app}"),
+        format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {app}"),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {app}"),
+        format!("GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {app}"),
+    ]
+}
+
+/// The statements one provisioning pass runs, chosen by the probe outcome.
+///
+/// `CREATE ROLE` is not idempotent, so each role is guarded by a `DO` block;
+/// the `ALTER ROLE` afterwards reconciles the password and attributes on an
+/// existing one. `migrator_password` is `None` when the caller did not need to
+/// read it; passing `None` for a probe that DOES need it is refused here rather
+/// than silently dropping half the list, because a provisioning pass that
+/// quietly skips the migrator on a first boot is the PMS-1469 defect with the
+/// roles reversed.
+///
+/// `pub` for the reason `app_login_with` is: the test that matters drives real
+/// Postgres roles, so it is an integration test, and an integration test links
+/// the library compiled without `cfg(test)`.
+pub fn provision_statements(
+    probe: &RolesProbe,
+    names: RoleNames<'_>,
+    migrator_password: Option<&str>,
+    app_password: &str,
+    db_name: &str,
+) -> AppResult<Vec<String>> {
+    let db = quote_ident(db_name);
+    let mut stmts = Vec::new();
+    let with_migrator = needs_migrator_statements(probe);
+    if with_migrator {
+        let pw = migrator_password.ok_or_else(|| {
+            AppError::Database(format!(
+                "{MIGRATOR_PASSWORD_VAR} is required to provision DB roles but is unset"
+            ))
+        })?;
+        stmts.extend(migrator_statements(names, pw, &db));
+    }
+    stmts.extend(app_statements(names, app_password, &db));
+    if with_migrator {
+        stmts.extend(default_privilege_statements(names));
+    }
+    Ok(stmts)
 }
 
 /// The result of the boot-time role probe: does the migrator role log in,
@@ -211,7 +376,8 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
 /// leaving the app pool unable to authenticate on the very next boot step.
 /// Falling through when `rolcanlogin` is false routes to the full provision
 /// path, whose ALTER heals the LOGIN + password state in one pass.
-enum RolesProbe {
+#[derive(Debug, PartialEq, Eq)]
+pub enum RolesProbe {
     BothExist,
     MigratorConnectsAppMissing,
     /// PMS-1423: `mokosh_app` exists and can log in, but not with the password
@@ -577,5 +743,153 @@ mod tests {
             "these migrations create a table without `GRANT SELECT, INSERT, UPDATE, DELETE ON <table> TO mokosh_app;` in the same file, so a deployment whose migrations run as another owner cannot read it (PMS-1265):\n{}",
             offenders.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod pms_1469_tests {
+    use super::*;
+
+    const DB: &str = "mokosh";
+    const MIGRATOR_PW: &str = "pms1469-the-drifted-one";
+    const APP_PW: &str = "pms1469-the-configured-app-one";
+
+    /// The fix. Healing `mokosh_app`'s password emits nothing that names the
+    /// migrator.
+    ///
+    /// A substring test over the whole list rather than an index-by-index
+    /// comparison, because what matters is not which statements are there but
+    /// that NONE of them can reach the other role: `ALTER ROLE
+    /// mokosh_migrator ... PASSWORD <env>` overwrote a working password with a
+    /// drifted one, the boot that did it succeeded, and the next boot could not
+    /// connect at all.
+    #[test]
+    fn healing_the_app_password_never_names_the_migrator() {
+        let stmts = provision_statements(
+            &RolesProbe::AppPasswordMismatch,
+            RoleNames::FIXED,
+            // Set, and wrong, which is the scenario: an operator rotated only
+            // the app password and nobody noticed this one had drifted.
+            Some(MIGRATOR_PW),
+            APP_PW,
+            DB,
+        )
+        .expect("the app half needs no migrator password");
+
+        for stmt in &stmts {
+            assert!(
+                !stmt.contains("mokosh_migrator"),
+                "reached the role the probe already proved was fine: {stmt}"
+            );
+            assert!(
+                !stmt.contains(MIGRATOR_PW),
+                "a migrator credential reached a statement: {stmt}"
+            );
+        }
+        assert!(
+            stmts.iter().any(
+                |s| s.starts_with("ALTER ROLE \"mokosh_app\" LOGIN NOSUPERUSER")
+                    && s.contains(APP_PW)
+            ),
+            "the reconciliation itself still runs: {stmts:?}"
+        );
+    }
+
+    /// A first boot still provisions both roles, and in an order Postgres
+    /// accepts.
+    ///
+    /// The ordering assertion is not decoration. The first cut of this split
+    /// left the three `ALTER DEFAULT PRIVILEGES` statements in the migrator
+    /// group, which put them ahead of `CREATE ROLE mokosh_app`, and
+    /// `FOR ROLE ... GRANT ... TO <absent role>` is 42704: a clean first boot
+    /// would have failed on a database that provisions fine today.
+    #[test]
+    fn a_first_boot_provisions_both_roles_with_the_app_role_before_its_default_privileges() {
+        let stmts = provision_statements(
+            &RolesProbe::MigratorCannotConnect,
+            RoleNames::FIXED,
+            Some(MIGRATOR_PW),
+            APP_PW,
+            DB,
+        )
+        .expect("a first boot has both passwords");
+
+        assert_eq!(stmts.len(), 14, "the whole list: {stmts:?}");
+        let create_app = stmts
+            .iter()
+            .position(|s| s.contains("CREATE ROLE \"mokosh_app\""))
+            .expect("the app role is created");
+        let first_default = stmts
+            .iter()
+            .position(|s| s.contains("ALTER DEFAULT PRIVILEGES"))
+            .expect("default privileges are set");
+        assert!(
+            create_app < first_default,
+            "the grantee has to exist first: {stmts:?}"
+        );
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.contains("ALTER ROLE \"mokosh_migrator\"")),
+            "the state this path exists for still gets the migrator's ALTER: {stmts:?}"
+        );
+    }
+
+    /// `MOKOSH_MIGRATOR_PASSWORD` is required exactly when it is used.
+    ///
+    /// Both directions matter. Requiring it on the app-password path is the
+    /// defect PMS-1469 is about, one layer up: a deployment that has dropped
+    /// the variable would fail the boot that was going to heal it. And NOT
+    /// requiring it on a first boot would silently provision half the roles,
+    /// which is the same defect with the roles swapped.
+    #[test]
+    fn the_migrator_password_is_required_exactly_when_its_statements_run() {
+        assert!(
+            provision_statements(
+                &RolesProbe::AppPasswordMismatch,
+                RoleNames::FIXED,
+                None,
+                APP_PW,
+                DB,
+            )
+            .is_ok(),
+            "healing the app password must not depend on the migrator's"
+        );
+
+        for probe in [
+            RolesProbe::MigratorCannotConnect,
+            RolesProbe::MigratorConnectsAppMissing,
+            RolesProbe::BothExist,
+        ] {
+            let err = provision_statements(&probe, RoleNames::FIXED, None, APP_PW, DB)
+                .expect_err("these need the migrator's password");
+            assert!(
+                format!("{err}").contains(MIGRATOR_PASSWORD_VAR),
+                "the error names the variable to set: {err}"
+            );
+        }
+    }
+
+    /// Throwaway role names are quoted, in both the identifier and the
+    /// `pg_roles` literal position.
+    ///
+    /// The names are parameterised for the integration test, so the quoting is
+    /// what keeps that from being an injection surface.
+    #[test]
+    fn parameterised_role_names_are_quoted_in_both_positions() {
+        let stmts = provision_statements(
+            &RolesProbe::AppPasswordMismatch,
+            RoleNames::new("mig\"rator", "ap'p"),
+            None,
+            APP_PW,
+            DB,
+        )
+        .expect("builds");
+        let guard = stmts
+            .iter()
+            .find(|s| s.starts_with("DO $do$"))
+            .expect("the CREATE guard");
+        assert!(guard.contains("rolname = 'ap''p'"), "{guard}");
+        assert!(guard.contains("CREATE ROLE \"ap'p\""), "{guard}");
     }
 }
