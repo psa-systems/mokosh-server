@@ -2026,7 +2026,15 @@ const USER_NAME_SQL: &str = "NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''
 /// unambiguous.
 const ARTICLE_SELECT: &str = r#"SELECT kb_articles.id, title, slug, content, summary, category_id, visibility, status,
               author_id, view_count, helpful_count, not_helpful_count,
-              published_at, tags, company_ids, parent_article_id, created_at, updated_at,
+              published_at, tags, company_ids,
+              -- PMS-1481: resolved company labels for the Access column.
+              -- Tenant-scoped join; a stale id is skipped so the array
+              -- never carries a NULL that would surprise the SPA.
+              COALESCE((SELECT array_agg(c.name ORDER BY c.name)
+                        FROM companies c
+                        WHERE c.id = ANY(kb_articles.company_ids)
+                          AND c.tenant_id = kb_articles.tenant_id), ARRAY[]::text[]) AS company_names,
+              parent_article_id, created_at, updated_at,
               prov.author_name, prov.editor_id AS updated_by_id,
               prov.editor_name AS updated_by_name, prov.current_version
        FROM kb_articles
@@ -2066,6 +2074,7 @@ struct ArticleRow {
     published_at: Option<chrono::DateTime<chrono::Utc>>,
     tags: Option<Vec<String>>,
     company_ids: Option<Vec<Uuid>>,
+    company_names: Option<Vec<String>>,
     parent_article_id: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -2107,6 +2116,7 @@ impl From<ArticleRow> for KbArticleResponse {
             published_at: r.published_at,
             tags: r.tags.unwrap_or_default(),
             company_ids: r.company_ids.unwrap_or_default(),
+            company_names: r.company_names.unwrap_or_default(),
             parent_article_id: r.parent_article_id,
             created_at: r.created_at,
             updated_at: r.updated_at,
