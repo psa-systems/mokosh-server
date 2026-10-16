@@ -847,10 +847,12 @@ impl ContractsService {
         .await?;
 
         let rows = sqlx::query_as::<_, RateCardItemRow>(
-            r#"SELECT rci.id, rci.rate_card_id, rci.work_type_id, rci.hourly_rate,
-                      rci.after_hours_rate, rci.emergency_rate
+            r#"SELECT rci.id, rci.rate_card_id, rci.work_type_id,
+                      wt.name AS work_type_name,
+                      rci.hourly_rate, rci.after_hours_rate, rci.emergency_rate
                FROM rate_card_items rci
                INNER JOIN rate_cards rc ON rci.rate_card_id = rc.id
+               LEFT JOIN work_types wt ON wt.id = rci.work_type_id AND wt.tenant_id = rc.tenant_id
                WHERE rc.tenant_id = $1 AND rci.rate_card_id = $2
                LIMIT $3 OFFSET $4"#,
         )
@@ -941,11 +943,18 @@ impl ContractsService {
             after,
         )
         .await?;
+        let work_type_name: Option<String> =
+            sqlx::query_scalar("SELECT name FROM work_types WHERE id = $1 AND tenant_id = $2")
+                .bind(request.work_type_id)
+                .bind(tenant_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         tx.commit().await?;
         Ok(RateCardItemResponse {
             id,
             rate_card_id,
             work_type_id: request.work_type_id,
+            work_type_name,
             hourly_rate: request.hourly_rate,
             after_hours_rate: request.after_hours_rate,
             emergency_rate: request.emergency_rate,
@@ -1808,6 +1817,7 @@ struct RateCardItemRow {
     id: Uuid,
     rate_card_id: Uuid,
     work_type_id: Uuid,
+    work_type_name: Option<String>,
     hourly_rate: Decimal,
     after_hours_rate: Option<Decimal>,
     emergency_rate: Option<Decimal>,
@@ -1819,6 +1829,7 @@ impl From<RateCardItemRow> for RateCardItemResponse {
             id: r.id,
             rate_card_id: r.rate_card_id,
             work_type_id: r.work_type_id,
+            work_type_name: r.work_type_name,
             hourly_rate: r.hourly_rate,
             after_hours_rate: r.after_hours_rate,
             emergency_rate: r.emergency_rate,
