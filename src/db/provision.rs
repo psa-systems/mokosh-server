@@ -115,13 +115,15 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     };
 
     let app_password = require_env(APP_PASSWORD_VAR)?;
-    // PMS-1469: read only when the migrator's statements are going to run.
-    // `provision_statements` refuses with the same message `require_env` would
-    // if the probe needs it and it is absent, so the decision lives in one
-    // place rather than being made again here.
-    let migrator_password = std::env::var(MIGRATOR_PASSWORD_VAR)
-        .ok()
-        .filter(|v| !v.is_empty());
+    // PMS-1469: required only when the migrator's statements are going to run,
+    // through the same predicate that decides whether to emit them, so the two
+    // cannot drift apart. Reconciling mokosh_app's password must not fail a
+    // boot over a variable it has no use for.
+    let migrator_password = if needs_migrator_statements(&probe) {
+        Some(require_env(MIGRATOR_PASSWORD_VAR)?)
+    } else {
+        None
+    };
 
     // PMS-1153 applies to this line as much as to the error messages below:
     // the old wording claimed the migrator could not connect, which is false
@@ -159,9 +161,10 @@ pub async fn provision_roles(migrator_url: &str) -> AppResult<()> {
     ) {
         Ok(stmts) => stmts,
         Err(e) => {
-            // The admin pool is open by now, and the one rule about it is that
-            // a privileged connection does not linger. Closing it on the way
-            // out matters more here than the one line it costs.
+            // Unreachable from here: the `require_env` above already refused
+            // the only combination this rejects. Handled rather than `?`d
+            // because the admin pool is open by now, and the one rule about it
+            // is that a privileged connection does not linger.
             pool.close().await;
             return Err(e);
         }
