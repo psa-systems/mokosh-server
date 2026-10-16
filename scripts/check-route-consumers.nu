@@ -33,9 +33,21 @@ def routes_in [text: string] {
 def consumed [path: string, client: string] {
     let segs = (static_segments $path)
     if ($segs | is-empty) { return true }
+    # MAPPS-986: match each static segment on an identifier boundary rather
+    # than as a plain substring, so a route segment that happens to be a
+    # substring of an unrelated client struct field (`capabilities` inside
+    # `supported_capabilities`) cannot pass silently. The first segment
+    # anchors on its leading slash; later segments must appear flanked by a
+    # non-identifier character (or line edge).
     ($segs | enumerate | all {|s|
-        let needle = if $s.index == 0 { $"/($s.item)" } else { $s.item }
-        $client | str contains $needle
+        if $s.index == 0 {
+            $client | str contains $"/($s.item)"
+        } else {
+            let left = '(?:^|[^A-Za-z0-9_])'
+            let right = '(?:[^A-Za-z0-9_]|$)'
+            let bounded = $left + $s.item + $right
+            ($client | parse --regex $bounded | is-not-empty)
+        }
     })
 }
 
@@ -54,13 +66,24 @@ def read_client [dir: string] {
 
 def self_test [] {
     let d = (mktemp -d)
-    mkdir $"($d)/a" $"($d)/b"
+    mkdir $"($d)/a" $"($d)/b" $"($d)/c"
     'Router::new().route("/things/{id}/frob", get(x)).route("/used", get(y))' | save $"($d)/a/routes.rs"
     '// parity record 2026-09-18: unbuilt\nRouter::new().route("/nope", get(x))' | save $"($d)/b/routes.rs"
-    let client = 'get("/used"); format!("/things/{}", id)'
-    let got = (unconsumed_in [$"($d)/a/routes.rs" $"($d)/b/routes.rs"] $client)
+    # MAPPS-986: a route whose later static segment is a substring of an
+    # unrelated client identifier (`capabilities` inside
+    # `supported_capabilities`) must still be reported as unconsumed. The
+    # old `str contains` match passed this silently.
+    'Router::new().route("/integrations/capabilities", get(x))' | save $"($d)/c/routes.rs"
+    let client = (
+        'get("/used"); format!("/things/{}", id);' +
+        ' pub supported_capabilities: Vec<X>; pub enabled_capabilities: Vec<X>;' +
+        ' let _ = "/integrations";'
+    )
+    let got = (unconsumed_in [$"($d)/a/routes.rs" $"($d)/b/routes.rs" $"($d)/c/routes.rs"] $client)
     rm -r $d
-    if ($got | length) != 1 or $got.0.route != '/things/{id}/frob' {
+    let routes = ($got | get route | sort)
+    let expected = (['/integrations/capabilities' '/things/{id}/frob'] | sort)
+    if $routes != $expected {
         error make {msg: $"self-test failed: ($got | to nuon)"}
     }
     print "route-consumers self-test ok"
