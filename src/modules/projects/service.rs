@@ -859,7 +859,18 @@ impl ProjectsService {
 
         let rows = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
-                      priority, assigned_to_id, estimated_hours,
+                      (SELECT ts.name FROM task_statuses ts
+                        WHERE ts.id = tasks.status_id
+                          AND ts.tenant_id = tasks.tenant_id) AS status_name,
+                      (SELECT ts.is_completed FROM task_statuses ts
+                        WHERE ts.id = tasks.status_id
+                          AND ts.tenant_id = tasks.tenant_id) AS status_is_completed,
+                      priority, assigned_to_id,
+                      (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                         FROM users u
+                        WHERE u.id = tasks.assigned_to_id
+                          AND u.tenant_id = tasks.tenant_id) AS assigned_to_name,
+                      estimated_hours,
                       -- PMS-944: actual hours are the hours worked. They used
                       -- to count only `approved` time, which reads zero on a
                       -- tenant with timesheets off, because nothing there ever
@@ -994,7 +1005,18 @@ impl ProjectsService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
-                      priority, assigned_to_id, estimated_hours,
+                      (SELECT ts.name FROM task_statuses ts
+                        WHERE ts.id = tasks.status_id
+                          AND ts.tenant_id = tasks.tenant_id) AS status_name,
+                      (SELECT ts.is_completed FROM task_statuses ts
+                        WHERE ts.id = tasks.status_id
+                          AND ts.tenant_id = tasks.tenant_id) AS status_is_completed,
+                      priority, assigned_to_id,
+                      (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                         FROM users u
+                        WHERE u.id = tasks.assigned_to_id
+                          AND u.tenant_id = tasks.tenant_id) AS assigned_to_name,
+                      estimated_hours,
                       -- PMS-944: actual hours are the hours worked. They used
                       -- to count only `approved` time, which reads zero on a
                       -- tenant with timesheets off, because nothing there ever
@@ -1383,8 +1405,11 @@ struct TaskRow {
     title: String,
     description: Option<String>,
     status_id: Uuid,
+    status_name: Option<String>,
+    status_is_completed: Option<bool>,
     priority: Option<String>,
     assigned_to_id: Option<Uuid>,
+    assigned_to_name: Option<String>,
     estimated_hours: Option<Decimal>,
     actual_hours: Option<Decimal>,
     logged_hours: Option<Decimal>,
@@ -1404,8 +1429,11 @@ impl From<TaskRow> for TaskResponse {
             title: r.title,
             description: r.description,
             status_id: r.status_id,
+            status_name: r.status_name,
+            status_is_completed: r.status_is_completed,
             priority: r.priority.unwrap_or_else(|| "medium".into()),
             assigned_to_id: r.assigned_to_id,
+            assigned_to_name: r.assigned_to_name,
             estimated_hours: r.estimated_hours,
             actual_hours: r.actual_hours,
             logged_hours: r.logged_hours,
