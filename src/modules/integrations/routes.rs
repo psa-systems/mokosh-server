@@ -8,10 +8,9 @@
 //! to a real caller.
 //!
 //! Mounted at `/api/v1/integrations` by `create_api_router`, so the paths here
-//! are relative to that prefix. `/capabilities` is registered BEFORE
-//! `/{provider}` so the literal segment wins the path match, the
-//! `portal_role_routes` ordering: a bare `/{provider}` would swallow it and 400
-//! on the parse.
+//! are relative to that prefix. The literal `/{provider}` segment is parsed
+//! against the integration enum; a bare string that is not a provider gets a
+//! 404 at [`parse_provider`].
 //!
 //! Every handler takes `RequireAdmin`. Deciding that Xero issues this MSP's
 //! invoices is not a technician's call, and `connect` accepts a credential, so
@@ -48,7 +47,6 @@ pub fn integration_routes(service: IntegrationsService) -> Router {
     };
     Router::new()
         .route("/integrations", get(list_integrations))
-        .route("/integrations/capabilities", get(list_capabilities))
         .route("/integrations/{provider}", get(get_integration))
         .route("/integrations/{provider}", put(update_integration))
         .route(
@@ -88,26 +86,6 @@ async fn list_integrations(
     RequireAuth(user): RequireAuth,
 ) -> AppResult<Json<Vec<IntegrationResponse>>> {
     Ok(Json(state.service.list(user.tenant()).await?))
-}
-
-/// The whole capability vocabulary, with labels.
-///
-/// Served rather than compiled into the client for the reason the
-/// `mokosh_types::integrations` module doc gives: what a provider supports is a
-/// property of this build, and a client holding its own copy would offer a
-/// delegation the server would refuse. A provider's supported subset rides on
-/// each row in the list; this endpoint is the full catalog behind it.
-async fn list_capabilities(
-    _admin: RequireAdmin,
-    RequireAuth(_user): RequireAuth,
-) -> AppResult<Json<Vec<CapabilityDescriptorResponse>>> {
-    Ok(Json(
-        Capability::ALL
-            .iter()
-            .copied()
-            .map(CapabilityDescriptorResponse::from)
-            .collect(),
-    ))
 }
 
 async fn get_integration(

@@ -46,6 +46,10 @@ pub struct AssetResponse {
     pub asset_tag: Option<String>,
     pub name: String,
     pub asset_type_id: Uuid,
+    /// PMS-1481: asset type display name, resolved via LEFT JOIN on
+    /// asset_types. `None` only if the row is missing; the SPA renders
+    /// `None` as "Unknown" and skips a per-row `/asset-types/{id}` fetch.
+    pub asset_type_name: Option<String>,
     pub company_id: Uuid,
     /// PMS-336: owning company display name, resolved via LEFT JOIN on
     /// companies (mirrors how TicketResponse surfaces company_name). The
@@ -55,6 +59,11 @@ pub struct AssetResponse {
     pub company_name: Option<String>,
     pub site_id: Option<Uuid>,
     pub contact_id: Option<Uuid>,
+    /// MAPPS-1071: resolved full name for `contact_id`, from a tenant-scoped
+    /// LEFT JOIN on `contacts`. `None` when the asset is not issued to a
+    /// contact (the client-hardware case), or when the contact row is gone.
+    /// The SPA renders "Issued to <contact>" without a secondary fetch.
+    pub contact_name: Option<String>,
     pub status: String,
     pub manufacturer: Option<String>,
     pub model: Option<String>,

@@ -1315,7 +1315,7 @@ fn qa_asset_type() -> UpsertAssetTypeRequest {
 fn qa_asset_specs(asset_type_id: Uuid, company_ids: &[Uuid]) -> Vec<CreateAssetRequest> {
     (0..6)
         .map(|i| CreateAssetRequest {
-            asset_tag: Some(format!("{QA_PREFIX}AST-{:03}", i + 1)),
+            asset_tag: None,
             name: format!("{QA_PREFIX}Laptop {:02}", i + 1),
             asset_type_id,
             company_id: company_ids[i % company_ids.len()],

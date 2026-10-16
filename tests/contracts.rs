@@ -548,6 +548,69 @@ async fn resolve_rate_honours_tier_precedence(pool: PgPool) {
     );
 }
 
+/// PMS-1481: list + upsert resolve `work_type_name` so the SPA stops
+/// pairing ids against a separate `/work-types` fetch.
+#[mokosh_test]
+async fn rate_card_item_response_carries_work_type_name(pool: PgPool) {
+    use mokosh_server::modules::audit::AuditCtx;
+    use mokosh_server::modules::contracts::UpsertRateCardItemRequest;
+    use mokosh_server::utils::pagination::PaginationParams;
+
+    let tenant = common::DEFAULT_TENANT_ID;
+    let svc = ContractsService::new(Database::from_pool(pool.clone()));
+
+    let rate_card_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM rate_cards WHERE tenant_id = $1 AND is_default = TRUE")
+            .bind(tenant)
+            .fetch_one(&pool)
+            .await
+            .expect("default rate card");
+    let work_type_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM work_types WHERE tenant_id = $1 AND name = 'Remote Support'",
+    )
+    .bind(tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("work type");
+
+    let ctx = AuditCtx::system(tenant);
+    let upserted = svc
+        .upsert_rate_card_item(
+            TenantId::from_trusted(tenant),
+            rate_card_id,
+            &UpsertRateCardItemRequest {
+                work_type_id,
+                hourly_rate: common::dec("175.00"),
+                after_hours_rate: None,
+                emergency_rate: None,
+            },
+            &ctx,
+        )
+        .await
+        .expect("upsert");
+    assert_eq!(upserted.work_type_id, work_type_id);
+    assert_eq!(upserted.work_type_name.as_deref(), Some("Remote Support"));
+
+    let (items, _) = svc
+        .list_rate_card_items(
+            TenantId::from_trusted(tenant),
+            rate_card_id,
+            &PaginationParams {
+                page: 1,
+                per_page: 50,
+                sort: None,
+                sort_dir: "asc".into(),
+            },
+        )
+        .await
+        .expect("list rate card items");
+    let found = items
+        .iter()
+        .find(|i| i.work_type_id == work_type_id)
+        .expect("work type in list");
+    assert_eq!(found.work_type_name.as_deref(), Some("Remote Support"));
+}
+
 #[mokosh_test]
 async fn expire_due_renews_auto_renew_and_expires_others(pool: PgPool) {
     let tenant = common::DEFAULT_TENANT_ID;
