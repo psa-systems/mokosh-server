@@ -668,8 +668,20 @@ impl AssetsService {
         request: &CreateAssetRequest,
         ctx: &AuditCtx,
     ) -> AppResult<AssetResponse> {
+        // PMS-1496: a caller-supplied tag is a defect, not data. The server
+        // owns every tag it issues so a technician who wrote one down can
+        // still find the asset tomorrow. The SPA already hides the field,
+        // but refuse here too so the import path stays the only entry that
+        // may carry a provided tag.
+        if request.asset_tag.is_some() {
+            return Err(AppError::validation_field(
+                "asset_tag",
+                "asset_tag is auto-generated and cannot be supplied on create",
+            ));
+        }
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let asset_tag = reserve_asset_tags(&mut tx, tenant_id, 1).await?.remove(0);
         // PMS-454: INSERT now carries the eight CMDB-expansion columns.
         // `ip_address` is text on the wire; Postgres ::inet cast at write
         // time validates the format and rejects garbage. NULL on any
@@ -688,7 +700,7 @@ impl AssetsService {
         )
         .bind(id)
         .bind(tenant_id)
-        .bind(&request.asset_tag)
+        .bind(&asset_tag)
         .bind(&request.name)
         .bind(request.asset_type_id)
         .bind(request.company_id)
@@ -767,6 +779,20 @@ impl AssetsService {
         performer: Uuid,
         request: &BulkCreateAssetsRequest,
     ) -> AppResult<Vec<AssetResponse>> {
+        // PMS-1496: per-serial `asset_tag` is a caller-supplied value and
+        // the create plane does not accept them. The server issues one
+        // tag per asset below.
+        if let Some(bad) = request
+            .serials
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| s.asset_tag.is_some().then_some(i))
+        {
+            return Err(AppError::validation_field(
+                format!("serials[{bad}].asset_tag"),
+                "asset_tag is auto-generated and cannot be supplied on create",
+            ));
+        }
         // Resolve template → model + per-order context overlay. When a
         // template is set, its company_id / site_id / assigned_user_id /
         // department overlay the request's values (per the plan doc:
@@ -904,6 +930,12 @@ impl AssetsService {
         };
         let department = effective_department.or_else(|| defaults.default_department.clone());
 
+        // PMS-1496: one tag per serial, reserved in one counter bump so
+        // the batch is numbered contiguously and no later `create_asset`
+        // can slip a tag in between.
+        let asset_tags =
+            reserve_asset_tags(&mut tx, tenant_id, request.serials.len() as u32).await?;
+
         let mut created_ids = Vec::with_capacity(request.serials.len());
         for (idx, s) in request.serials.iter().enumerate() {
             // Per-row validation already ran via `#[validate(nested)]`
@@ -928,7 +960,7 @@ impl AssetsService {
             )
             .bind(id)
             .bind(*tenant_id)
-            .bind(&s.asset_tag)
+            .bind(&asset_tags[idx])
             .bind(&name)
             .bind(defaults.asset_type_id)
             .bind(effective_company_id)
@@ -1062,6 +1094,15 @@ impl AssetsService {
         request: &UpdateAssetRequest,
     ) -> AppResult<AssetResponse> {
         let prior = self.get_asset(tenant_id, id).await?;
+        // PMS-1496: tags are read-only once assigned. Reject any attempt
+        // to change the tag through the regular update path; delete and
+        // recreate is the documented remediation for a wrong tag.
+        if request.asset_tag.is_some() {
+            return Err(AppError::validation_field(
+                "asset_tag",
+                "asset_tag is read-only; delete and recreate the asset to issue a new one",
+            ));
+        }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Snapshot before/after so the audit row records the field-level
         // before -> after diff, not just the action (PMS-204).
@@ -1076,6 +1117,10 @@ impl AssetsService {
         // SPA omits the field in a partial PUT. The IP arrives as text
         // and is `::inet` cast at write time so a bad value raises a
         // 400 rather than silently corrupting the column.
+        //
+        // PMS-1496: `$3` is kept as a NULL slot (bound `request.asset_tag`,
+        // guaranteed None by the guard above) so the parameter numbering
+        // stays legible against the bind list below.
         let n = sqlx::query(
             r#"UPDATE assets SET
                 asset_tag = COALESCE($3, asset_tag),
@@ -1186,6 +1231,14 @@ impl AssetsService {
         performer: Uuid,
         request: &PatchAssetRequest,
     ) -> AppResult<AssetResponse> {
+        // PMS-1496: a patch cannot touch asset_tag either. The create path
+        // owns issuance; a wrong tag is remediated by delete + recreate.
+        if request.asset_tag.is_some() {
+            return Err(AppError::validation_field(
+                "asset_tag",
+                "asset_tag is read-only; delete and recreate the asset to issue a new one",
+            ));
+        }
         let prior = self.get_asset(tenant_id, id).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> =
@@ -2550,6 +2603,61 @@ async fn facet_uuid_counts(
                 label,
                 count: c,
             })
+        })
+        .collect())
+}
+
+/// Default `AST-NNN` prefix. Hard-coded for now; a tenant-level override
+/// (per PMS-1496's "configurable prefix" note) can land as a follow-up
+/// once a tenant setting is wired - the single call site here contains it.
+const ASSET_TAG_PREFIX: &str = "AST-";
+
+/// Minimum numeric width in the formatted tag ("AST-001"); larger values
+/// grow naturally.
+const ASSET_TAG_WIDTH: usize = 3;
+
+/// PMS-1496: reserve `count` consecutive asset tags for `tenant_id` and
+/// return them formatted. Atomic on the counter row via `INSERT ... ON
+/// CONFLICT DO UPDATE RETURNING`; the first call per tenant seeds the
+/// counter from the maximum numeric suffix already present in the
+/// tenant's `assets.asset_tag` so an export/import round-trip keeps
+/// issuing non-colliding tags.
+async fn reserve_asset_tags(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    count: u32,
+) -> AppResult<Vec<String>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let count_i64 = count as i64;
+    let start: i64 = sqlx::query_scalar(
+        r#"INSERT INTO asset_tag_counters (tenant_id, next_number)
+           VALUES (
+             $1,
+             COALESCE((SELECT MAX(
+                 CAST(SUBSTRING(asset_tag FROM '^AST-([0-9]+)$') AS BIGINT)
+             ) FROM assets
+                WHERE tenant_id = $1
+                  AND asset_tag ~ '^AST-[0-9]+$'), 0) + 1 + $2
+           )
+           ON CONFLICT (tenant_id) DO UPDATE SET
+             next_number = asset_tag_counters.next_number + $2,
+             updated_at = NOW()
+           RETURNING next_number - $2"#,
+    )
+    .bind(tenant_id)
+    .bind(count_i64)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok((0..count_i64)
+        .map(|offset| {
+            format!(
+                "{prefix}{number:0>width$}",
+                prefix = ASSET_TAG_PREFIX,
+                number = start + offset,
+                width = ASSET_TAG_WIDTH,
+            )
         })
         .collect())
 }

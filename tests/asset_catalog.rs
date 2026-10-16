@@ -309,6 +309,72 @@ async fn bulk_create_fans_out_and_bumps_uses_count(pool: PgPool) {
     assert_eq!(qa_001["end_of_life"], "2031-01-15");
     // Auto-named "{manufacturer} {model} #{serial}" when no per-row name.
     assert_eq!(qa_001["name"], "Dell Latitude 5450 #QA-001");
+    // PMS-1496: every row gets a unique auto-generated tag; the batch of
+    // three plus the single reserved a contiguous AST-001..AST-004 range.
+    let mut tags: Vec<&str> = rows
+        .iter()
+        .filter_map(|a| a["asset_tag"].as_str())
+        .collect();
+    tags.sort();
+    assert_eq!(tags, vec!["AST-001", "AST-002", "AST-003", "AST-004"]);
+}
+
+/// PMS-1496 - per-serial `asset_tag` is rejected at the DTO; the server
+/// owns issuance for the bulk-create fan-out too.
+#[mokosh_test]
+async fn bulk_create_rejects_caller_supplied_asset_tag(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let type_id = seed_asset_type(&pool, "Laptop").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    turn_catalog_on(&app, &token).await;
+
+    let model: Value = app
+        .client
+        .post(app.url(MODELS))
+        .bearer_auth(&token)
+        .json(&json!({
+            "manufacturer": "Dell",
+            "model": "Latitude 5450",
+            "asset_type_id": type_id,
+        }))
+        .send()
+        .await
+        .expect("create model")
+        .json()
+        .await
+        .expect("model JSON");
+    let model_id = model["id"].as_str().unwrap();
+
+    let r = app
+        .client
+        .post(app.url(BULK_CREATE))
+        .bearer_auth(&token)
+        .json(&json!({
+            "asset_model_id": model_id,
+            "company_id": company,
+            "serials": [
+                { "serial_number": "QA-001" },
+                { "serial_number": "QA-002", "asset_tag": "PICK-ME" },
+            ]
+        }))
+        .send()
+        .await
+        .expect("bulk create with asset_tag");
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = r.json().await.unwrap_or(Value::Null);
+    let found = body["error"]["errors"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .any(|e| e["field"].as_str() == Some("serials[1].asset_tag"))
+        })
+        .unwrap_or(false);
+    assert!(
+        found,
+        "serials[1].asset_tag field envelope expected: {body}"
+    );
 }
 
 #[mokosh_test]

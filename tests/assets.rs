@@ -709,6 +709,134 @@ async fn assets_exists_names_matches_case_insensitively_within_the_company_scope
     assert!(got.is_empty());
 }
 
+/// PMS-1496 - the server owns asset_tag issuance. A caller-supplied
+/// `asset_tag` on create or update is a 422 at the DTO; the create
+/// path auto-generates `AST-001`, `AST-002`, ... per tenant.
+#[mokosh_test]
+async fn asset_tag_is_auto_generated_and_read_only(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id = create_asset_type(&app, &token, "Laptop").await;
+
+    // create_asset: tag is generated, not accepted on the wire.
+    let first_id = create_asset(&app, &token, "srv-01", &type_id, company).await;
+    let first: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{first_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(first["asset_tag"].as_str(), Some("AST-001"));
+    let second_id = create_asset(&app, &token, "srv-02", &type_id, company).await;
+    let second: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{second_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(second["asset_tag"].as_str(), Some("AST-002"));
+
+    // Supplying asset_tag on create = 422 with field envelope.
+    let create_bad = app
+        .client
+        .post(app.url("/api/v1/assets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "sneaky",
+            "asset_type_id": type_id,
+            "company_id": company,
+            "asset_tag": "PICK-ME",
+        }))
+        .send()
+        .await
+        .expect("create with asset_tag");
+    assert_eq!(create_bad.status().as_u16(), 422);
+    let body: serde_json::Value = create_bad.json().await.unwrap_or(serde_json::Value::Null);
+    assert!(
+        body["error"]["errors"]
+            .as_array()
+            .map(|arr| arr.iter().any(|e| e["field"].as_str() == Some("asset_tag")))
+            .unwrap_or(false),
+        "asset_tag field envelope: {body}"
+    );
+
+    // PUT /assets/{id} with asset_tag = 422.
+    let put_bad = app
+        .client
+        .put(app.url(&format!("/api/v1/assets/{first_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "asset_tag": "WRONG" }))
+        .send()
+        .await
+        .expect("put with asset_tag");
+    assert_eq!(put_bad.status().as_u16(), 422, "PUT asset_tag must 422");
+
+    // PATCH /assets/{id} with asset_tag = 422.
+    let patch_bad = app
+        .client
+        .patch(app.url(&format!("/api/v1/assets/{first_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "asset_tag": "WRONG" }))
+        .send()
+        .await
+        .expect("patch with asset_tag");
+    assert_eq!(patch_bad.status().as_u16(), 422, "PATCH asset_tag must 422");
+}
+
+/// PMS-1496 - the import path (schema-driven `jsonb_populate_recordset`)
+/// leaves provided asset_tags alone, and the next create picks up where
+/// the imported sequence left off.
+#[mokosh_test]
+async fn asset_tag_counter_catches_up_after_imported_rows(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id_str = create_asset_type(&app, &token, "Laptop").await;
+    let type_id = Uuid::parse_str(&type_id_str).expect("type uuid");
+
+    // Simulate an import by inserting a row with a chosen asset_tag.
+    let imported_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, company_id, asset_type_id, asset_tag, name, status) \
+         VALUES ($1, $2, $3, $4, 'AST-042', 'Imported', 'active')",
+    )
+    .bind(imported_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .bind(type_id)
+    .execute(&pool)
+    .await
+    .expect("seed imported asset");
+
+    let next_id = create_asset(&app, &token, "next-asset", &type_id_str, company).await;
+    let next: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{next_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(
+        next["asset_tag"].as_str(),
+        Some("AST-043"),
+        "the generator seeds the counter from max existing tag",
+    );
+}
+
 #[mokosh_test]
 async fn assets_exists_rejects_over_the_500_cap(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
