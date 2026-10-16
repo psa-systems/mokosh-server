@@ -86,6 +86,10 @@ pub struct ProjectResponse {
     pub project_type_id: Option<Uuid>,
     pub status: String,
     pub project_manager_id: Option<Uuid>,
+    /// PMS-1481: project manager display name, resolved via a tenant-scoped
+    /// LEFT join on `users`. `None` when the row is unassigned or the user
+    /// is gone; the SPA uses it to render the owner without a per-row fetch.
+    pub project_manager_name: Option<String>,
     pub start_date: Option<NaiveDate>,
     pub target_end_date: Option<NaiveDate>,
     pub actual_end_date: Option<NaiveDate>,
@@ -327,8 +331,19 @@ pub struct TaskResponse {
     pub title: String,
     pub description: Option<String>,
     pub status_id: Uuid,
+    /// PMS-1481: display name for `status_id`, resolved via a tenant-scoped
+    /// LEFT JOIN on `task_statuses`. `None` only if the join misses.
+    pub status_name: Option<String>,
+    /// PMS-1481: whether the resolved status is a terminal / completed one.
+    /// Lets the SPA strike-through completed rows without a second
+    /// `/task-statuses` lookup. `None` if the join misses.
+    pub status_is_completed: Option<bool>,
     pub priority: String,
     pub assigned_to_id: Option<Uuid>,
+    /// PMS-1481: display name for `assigned_to_id`, resolved via a tenant-
+    /// scoped correlated subquery on `users`. `None` when unassigned or the
+    /// user row is gone / has no name.
+    pub assigned_to_name: Option<String>,
     pub estimated_hours: Option<Decimal>,
     /// Actual hours rolled up from approved time entries linked to this
     /// task (PMS-51 AC5). Derived on read, not settable directly.

@@ -2951,10 +2951,37 @@ impl ContactService {
                 });
         }
 
+        // PMS-1481: portal role display names, batched, so the list stops
+        // the SPA from firing one `/contacts/{id}/portal-roles` per row.
+        let role_rows: Vec<(Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT cra.contact_id, pr.name
+            FROM contact_role_assignments cra
+            INNER JOIN portal_roles pr ON pr.id = cra.role_id AND pr.tenant_id = cra.tenant_id
+            WHERE cra.tenant_id = $1 AND cra.contact_id = ANY($2)
+            ORDER BY cra.contact_id, pr.name
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut role_names_by_contact: std::collections::HashMap<Uuid, Vec<String>> =
+            std::collections::HashMap::new();
+        for (contact_id, name) in role_rows {
+            role_names_by_contact
+                .entry(contact_id)
+                .or_default()
+                .push(name);
+        }
+
         for contact in contacts.iter_mut() {
             contact.phones = phones_by_contact.remove(&contact.id).unwrap_or_default();
             contact.companies = links_by_contact.remove(&contact.id).unwrap_or_default();
             contact.imported_from = origin_by_contact.remove(&contact.id);
+            contact.portal_role_names = role_names_by_contact
+                .remove(&contact.id)
+                .unwrap_or_default();
         }
         Ok(contacts)
     }
@@ -4747,6 +4774,7 @@ impl From<ContactRow> for Contact {
             phones: Vec::new(),
             companies: Vec::new(),
             imported_from: None,
+            portal_role_names: Vec::new(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }

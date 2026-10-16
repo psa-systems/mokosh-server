@@ -741,6 +741,15 @@ async fn client_specific_company_ids_write_path(pool: PgPool) {
         Some(1),
         "GET must round-trip company_ids"
     );
+    // PMS-1481: GET also resolves the label beside the id so the SPA
+    // stops fetching the full /companies list to render the Access column.
+    let names: Vec<&str> = got["company_names"]
+        .as_array()
+        .expect("company_names array")
+        .iter()
+        .map(|v| v.as_str().expect("company name string"))
+        .collect();
+    assert_eq!(names, vec!["Company A"]);
 
     // 4) Switching away from client_specific clears the scope.
     let updated: serde_json::Value = app
@@ -758,6 +767,11 @@ async fn client_specific_company_ids_write_path(pool: PgPool) {
         updated["company_ids"].as_array().map(|a| a.len()),
         Some(0),
         "switching away from client_specific must clear company_ids"
+    );
+    assert_eq!(
+        updated["company_names"].as_array().map(|a| a.len()),
+        Some(0),
+        "clearing the scope also empties the resolved names",
     );
 }
 

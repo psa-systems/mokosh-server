@@ -175,17 +175,34 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
     let filtered: serde_json::Value =
         serde_json::from_str(&filtered_text).expect("filtered list JSON");
     let entry_id = entry["id"].as_str().expect("entry id");
-    assert!(
-        filtered["data"]
-            .as_array()
-            .expect("filtered list has data")
-            .iter()
-            .any(|e| e["id"].as_str() == Some(entry_id)),
-        "the ticket's time entry should appear in the ticket_id-filtered list"
-    );
+    let filtered_entry = filtered["data"]
+        .as_array()
+        .expect("filtered list has data")
+        .iter()
+        .find(|e| e["id"].as_str() == Some(entry_id))
+        .expect("the ticket's time entry should appear in the ticket_id-filtered list");
     assert!(
         filtered["meta"]["total"].as_i64().unwrap_or(0) >= 1,
         "filtered list total should count the entry"
+    );
+    // PMS-1481: user and work type names ride on every read, so a timesheet
+    // row renders without pairing ids against separate /users and /work-types
+    // fetches.
+    assert!(
+        filtered_entry["user_name"].as_str().is_some(),
+        "user_name resolved on list: {filtered_entry}",
+    );
+    assert!(
+        filtered_entry["work_type_name"].as_str().is_some(),
+        "work_type_name resolved on list: {filtered_entry}",
+    );
+    assert!(
+        entry["work_type_name"].as_str().is_some(),
+        "work_type_name resolved on the stop response: {entry}",
+    );
+    assert!(
+        entry["user_name"].as_str().is_some(),
+        "user_name resolved on the stop response: {entry}",
     );
 
     // SUBMIT the technician's week (any date in the week anchors to Monday).
