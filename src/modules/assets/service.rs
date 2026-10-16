@@ -403,10 +403,9 @@ impl AssetsService {
         let total: i64 = cq.fetch_one(&mut *tx).await?;
 
         let query = format!(
-            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
+                      a.company_id, co.name AS company_name,
                       a.site_id, a.contact_id,
-                      -- MAPPS-1071: resolved contact display name alongside
-                      -- the assigned-user name, same shape and tenant guard.
                       NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
                       a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
@@ -422,6 +421,7 @@ impl AssetsService {
                       a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
+               LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
                LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
@@ -542,7 +542,8 @@ impl AssetsService {
 
         let (limit_idx, offset_idx) = wb.next_two_slots();
         let query = format!(
-            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
+                      a.company_id, co.name AS company_name,
                       a.site_id, a.contact_id,
                       NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
                       a.status, a.manufacturer, a.model, a.serial_number,
@@ -555,6 +556,7 @@ impl AssetsService {
                       a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
+               LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
                LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
@@ -1032,7 +1034,8 @@ impl AssetsService {
     pub async fn get_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<AssetResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, AssetRow>(
-            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
+                      a.company_id, co.name AS company_name,
                       a.site_id, a.contact_id,
                       NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
                       a.status, a.manufacturer, a.model, a.serial_number,
@@ -1045,6 +1048,7 @@ impl AssetsService {
                       a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
+               LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
                LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
@@ -2111,6 +2115,8 @@ struct AssetRow {
     asset_tag: Option<String>,
     name: String,
     asset_type_id: Uuid,
+    // PMS-1481: resolved from the LEFT JOIN on asset_types.
+    asset_type_name: Option<String>,
     company_id: Uuid,
     // PMS-336: resolved from the LEFT JOIN on companies. NULL only if the
     // company row is missing; populated for every real asset.
@@ -2158,6 +2164,7 @@ impl From<AssetRow> for AssetResponse {
             asset_tag: r.asset_tag,
             name: r.name,
             asset_type_id: r.asset_type_id,
+            asset_type_name: r.asset_type_name,
             company_id: r.company_id,
             company_name: r.company_name,
             site_id: r.site_id,

@@ -116,7 +116,12 @@ impl ProjectsService {
                      WHERE co.id = projects.company_id
                        AND co.tenant_id = projects.tenant_id) AS company_name,
                    contract_id,
-                   project_type, project_type_id, status, project_manager_id, start_date,
+                   project_type, project_type_id, status, project_manager_id,
+                   (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                      FROM users u
+                     WHERE u.id = projects.project_manager_id
+                       AND u.tenant_id = projects.tenant_id) AS project_manager_name,
+                   start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    -- PMS-944: see the note on the task query. Approval is no
                    -- longer the gate on anything, so a project's actuals count
@@ -132,7 +137,7 @@ impl ProjectsService {
                    created_at, updated_at
             FROM projects WHERE {where_clause}
             ORDER BY {order_by} LIMIT $2 OFFSET $3
-            "#
+"#
         );
         let count_query = format!("SELECT COUNT(*) FROM projects WHERE {count_where}");
         let mut q = sqlx::query_as::<_, ProjectRow>(&query)
@@ -242,7 +247,12 @@ impl ProjectsService {
                      WHERE co.id = projects.company_id
                        AND co.tenant_id = projects.tenant_id) AS company_name,
                    contract_id,
-                   project_type, project_type_id, status, project_manager_id, start_date,
+                   project_type, project_type_id, status, project_manager_id,
+                   (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                      FROM users u
+                     WHERE u.id = projects.project_manager_id
+                       AND u.tenant_id = projects.tenant_id) AS project_manager_name,
+                   start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    -- PMS-944: see the note on the task query. Approval is no
                    -- longer the gate on anything, so a project's actuals count
@@ -257,7 +267,7 @@ impl ProjectsService {
                    billing_method, hourly_rate, is_billable, default_due_business_days,
                    created_at, updated_at
             FROM projects WHERE tenant_id = $1 AND id = $2
-            "#,
+"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -859,7 +869,18 @@ impl ProjectsService {
 
         let rows = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
-                      priority, assigned_to_id, estimated_hours,
+                      (SELECT ts.name FROM task_statuses ts
+                        WHERE ts.id = tasks.status_id
+                          AND ts.tenant_id = tasks.tenant_id) AS status_name,
+                      (SELECT ts.is_completed FROM task_statuses ts
+                        WHERE ts.id = tasks.status_id
+                          AND ts.tenant_id = tasks.tenant_id) AS status_is_completed,
+                      priority, assigned_to_id,
+                      (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                         FROM users u
+                        WHERE u.id = tasks.assigned_to_id
+                          AND u.tenant_id = tasks.tenant_id) AS assigned_to_name,
+                      estimated_hours,
                       -- PMS-944: actual hours are the hours worked. They used
                       -- to count only `approved` time, which reads zero on a
                       -- tenant with timesheets off, because nothing there ever
@@ -994,7 +1015,18 @@ impl ProjectsService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TaskRow>(
             r#"SELECT id, project_id, phase_id, parent_task_id, title, description, status_id,
-                      priority, assigned_to_id, estimated_hours,
+                      (SELECT ts.name FROM task_statuses ts
+                        WHERE ts.id = tasks.status_id
+                          AND ts.tenant_id = tasks.tenant_id) AS status_name,
+                      (SELECT ts.is_completed FROM task_statuses ts
+                        WHERE ts.id = tasks.status_id
+                          AND ts.tenant_id = tasks.tenant_id) AS status_is_completed,
+                      priority, assigned_to_id,
+                      (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                         FROM users u
+                        WHERE u.id = tasks.assigned_to_id
+                          AND u.tenant_id = tasks.tenant_id) AS assigned_to_name,
+                      estimated_hours,
                       -- PMS-944: actual hours are the hours worked. They used
                       -- to count only `approved` time, which reads zero on a
                       -- tenant with timesheets off, because nothing there ever
@@ -1255,6 +1287,7 @@ struct ProjectRow {
     project_type_id: Option<Uuid>,
     status: String,
     project_manager_id: Option<Uuid>,
+    project_manager_name: Option<String>,
     start_date: Option<chrono::NaiveDate>,
     target_end_date: Option<chrono::NaiveDate>,
     actual_end_date: Option<chrono::NaiveDate>,
@@ -1284,6 +1317,7 @@ impl From<ProjectRow> for ProjectResponse {
             project_type_id: r.project_type_id,
             status: r.status,
             project_manager_id: r.project_manager_id,
+            project_manager_name: r.project_manager_name,
             start_date: r.start_date,
             target_end_date: r.target_end_date,
             actual_end_date: r.actual_end_date,
@@ -1383,8 +1417,11 @@ struct TaskRow {
     title: String,
     description: Option<String>,
     status_id: Uuid,
+    status_name: Option<String>,
+    status_is_completed: Option<bool>,
     priority: Option<String>,
     assigned_to_id: Option<Uuid>,
+    assigned_to_name: Option<String>,
     estimated_hours: Option<Decimal>,
     actual_hours: Option<Decimal>,
     logged_hours: Option<Decimal>,
@@ -1404,8 +1441,11 @@ impl From<TaskRow> for TaskResponse {
             title: r.title,
             description: r.description,
             status_id: r.status_id,
+            status_name: r.status_name,
+            status_is_completed: r.status_is_completed,
             priority: r.priority.unwrap_or_else(|| "medium".into()),
             assigned_to_id: r.assigned_to_id,
+            assigned_to_name: r.assigned_to_name,
             estimated_hours: r.estimated_hours,
             actual_hours: r.actual_hours,
             logged_hours: r.logged_hours,
