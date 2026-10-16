@@ -354,6 +354,8 @@ async fn create_accepts_status_dates_and_manager(pool: PgPool) {
         created["project_manager_id"].as_str(),
         Some(admin_id.to_string().as_str())
     );
+    // PMS-1481: manager name rides along on every read.
+    assert_eq!(created["project_manager_name"].as_str(), Some("Test Admin"));
     assert_eq!(created["start_date"].as_str(), Some("2026-01-05"));
     assert_eq!(created["target_end_date"].as_str(), Some("2026-06-30"));
     assert_eq!(created["actual_end_date"].as_str(), Some("2026-06-28"));
@@ -365,9 +367,22 @@ async fn create_accepts_status_dates_and_manager(pool: PgPool) {
         fetched["project_manager_id"].as_str(),
         Some(admin_id.to_string().as_str())
     );
+    assert_eq!(fetched["project_manager_name"].as_str(), Some("Test Admin"));
     assert_eq!(fetched["start_date"].as_str(), Some("2026-01-05"));
     assert_eq!(fetched["target_end_date"].as_str(), Some("2026-06-30"));
     assert_eq!(fetched["actual_end_date"].as_str(), Some("2026-06-28"));
+
+    // Unassigned manager => the subquery resolves to NULL, not a crash.
+    let unassigned = post(
+        &app,
+        &token,
+        "/api/v1/projects",
+        serde_json::json!({ "name": "Nobody owns me", "company_id": company }),
+    )
+    .await;
+    let unassigned: serde_json::Value = unassigned.json().await.expect("project JSON");
+    assert!(unassigned["project_manager_id"].is_null());
+    assert!(unassigned["project_manager_name"].is_null());
 }
 
 // AC5, as rewritten by PMS-944: a time entry linked to a task or project rolls

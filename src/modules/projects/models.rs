@@ -86,6 +86,10 @@ pub struct ProjectResponse {
     pub project_type_id: Option<Uuid>,
     pub status: String,
     pub project_manager_id: Option<Uuid>,
+    /// PMS-1481: project manager display name, resolved via a tenant-scoped
+    /// LEFT join on `users`. `None` when the row is unassigned or the user
+    /// is gone; the SPA uses it to render the owner without a per-row fetch.
+    pub project_manager_name: Option<String>,
     pub start_date: Option<NaiveDate>,
     pub target_end_date: Option<NaiveDate>,
     pub actual_end_date: Option<NaiveDate>,

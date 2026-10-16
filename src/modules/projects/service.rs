@@ -116,7 +116,12 @@ impl ProjectsService {
                      WHERE co.id = projects.company_id
                        AND co.tenant_id = projects.tenant_id) AS company_name,
                    contract_id,
-                   project_type, project_type_id, status, project_manager_id, start_date,
+                   project_type, project_type_id, status, project_manager_id,
+                   (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                      FROM users u
+                     WHERE u.id = projects.project_manager_id
+                       AND u.tenant_id = projects.tenant_id) AS project_manager_name,
+                   start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    -- PMS-944: see the note on the task query. Approval is no
                    -- longer the gate on anything, so a project's actuals count
@@ -132,7 +137,7 @@ impl ProjectsService {
                    created_at, updated_at
             FROM projects WHERE {where_clause}
             ORDER BY {order_by} LIMIT $2 OFFSET $3
-            "#
+"#
         );
         let count_query = format!("SELECT COUNT(*) FROM projects WHERE {count_where}");
         let mut q = sqlx::query_as::<_, ProjectRow>(&query)
@@ -242,7 +247,12 @@ impl ProjectsService {
                      WHERE co.id = projects.company_id
                        AND co.tenant_id = projects.tenant_id) AS company_name,
                    contract_id,
-                   project_type, project_type_id, status, project_manager_id, start_date,
+                   project_type, project_type_id, status, project_manager_id,
+                   (SELECT NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '')
+                      FROM users u
+                     WHERE u.id = projects.project_manager_id
+                       AND u.tenant_id = projects.tenant_id) AS project_manager_name,
+                   start_date,
                    target_end_date, actual_end_date, budget_hours, budget_amount,
                    -- PMS-944: see the note on the task query. Approval is no
                    -- longer the gate on anything, so a project's actuals count
@@ -257,7 +267,7 @@ impl ProjectsService {
                    billing_method, hourly_rate, is_billable, default_due_business_days,
                    created_at, updated_at
             FROM projects WHERE tenant_id = $1 AND id = $2
-            "#,
+"#,
         )
         .bind(tenant_id)
         .bind(id)
@@ -1277,6 +1287,7 @@ struct ProjectRow {
     project_type_id: Option<Uuid>,
     status: String,
     project_manager_id: Option<Uuid>,
+    project_manager_name: Option<String>,
     start_date: Option<chrono::NaiveDate>,
     target_end_date: Option<chrono::NaiveDate>,
     actual_end_date: Option<chrono::NaiveDate>,
@@ -1306,6 +1317,7 @@ impl From<ProjectRow> for ProjectResponse {
             project_type_id: r.project_type_id,
             status: r.status,
             project_manager_id: r.project_manager_id,
+            project_manager_name: r.project_manager_name,
             start_date: r.start_date,
             target_end_date: r.target_end_date,
             actual_end_date: r.actual_end_date,
