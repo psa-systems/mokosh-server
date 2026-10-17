@@ -186,6 +186,7 @@ One line per rule, linking its full text. A new convention adds its text under `
 - `LOGIN_APPROVAL_ENABLED` gates suspicious logins ([PMS-658](docs/invariants/identity-auth.md#login-approval-pms-658))
 - `users` mirrors to `identities` one way ([PMS-1120](docs/invariants/identity-auth.md#identity-mirror-pms-1120))
 - A TOTP secret is sealed on both planes ([PMS-1055](docs/invariants/identity-auth.md#totp-secret-pms-1055))
+- A grant invitation mirrors into Bunyip only on accept, and cancel never orphans it ([PMS-1208](docs/invariants/identity-auth.md#grant-invitations-pms-1208))
 
 ### Configuration and providers
 
