@@ -1,6 +1,6 @@
 //! PMS-1208: pending-invite service for the Mokosh grant lifecycle.
 //!
-//! `mokosh_grant_invitations` (migration 222) is the pre-mirror
+//! `mokosh_grant_invitations` (migration 267) is the pre-mirror
 //! state: an owner invites a bunyip user to see their account, the
 //! invite sits `pending` for up to 7 days, and only when the
 //! invitee accepts does the row propagate into
