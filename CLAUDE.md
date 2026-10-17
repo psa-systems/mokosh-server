@@ -205,6 +205,11 @@ One line per rule, linking its full text. A new convention adds its text under `
 - Every stored object puts its tenant first ([PMS-1318](docs/invariants/config-providers.md#tenant-first-pms-1318))
 - Storage settings are `STORAGE_`-prefixed ([PMS-1317](docs/invariants/config-providers.md#storage-names-pms-1317))
 
+### Error handling
+
+- A lookup that found nothing is not a failed attempt ([PMS-1477](docs/invariants/error-visibility.md#2-a-lookup-that-found-nothing-is-not-a-failed-attempt-pms-1477))
+- A client-stated conflict is not a server fault ([details](docs/invariants/error-visibility.md#4-a-client-stated-conflict-is-not-a-server-fault))
+
 ### CI, release and repo hygiene
 
 - Branches are `fix/`, `feat/`, `chore/`; no `gh` ([details](docs/invariants/ci-release.md#branches))
