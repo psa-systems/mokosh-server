@@ -567,11 +567,12 @@ impl TeamsService {
 
         let joined_at = match insert {
             Ok(created_at) => created_at,
-            // Deliberate suppression (error-visibility rule §4): 23505 here is
-            // only ever the `UNIQUE(team_id, user_id)` duplicate, and the 409
-            // states that cause in full, so the sqlx error carries nothing the
-            // caller does not already get. Every other code falls through to
-            // the shared mapping, which logs the Postgres message at `error`.
+            // Deliberate suppression (`docs/invariants/error-visibility.md`
+            // section 4): 23505 here is only ever the `UNIQUE(team_id,
+            // user_id)` duplicate, and the 409 states that cause in full, so
+            // the sqlx error carries nothing the caller does not already
+            // get. Every other code falls through to the shared mapping,
+            // which logs the Postgres message at `error`.
             Err(sqlx::Error::Database(dbe)) if dbe.code().as_deref() == Some("23505") => {
                 return Err(AppError::conflict("User is already a member of this team"));
             }
