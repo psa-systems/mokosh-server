@@ -10,15 +10,31 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-async fn seed_asset(pool: &PgPool, company_id: Uuid, name: &str) -> Uuid {
+async fn seed_asset_type(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO assets (id, tenant_id, company_id, name, status) \
-         VALUES ($1, $2, $3, $4, 'active')",
+        "INSERT INTO asset_types (id, tenant_id, name, is_active) VALUES ($1, $2, $3, TRUE)",
+    )
+    .bind(id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(format!("type-{}", id.simple()))
+    .execute(pool)
+    .await
+    .expect("seed asset_type");
+    id
+}
+
+async fn seed_asset(pool: &PgPool, company_id: Uuid, name: &str) -> Uuid {
+    let type_id = seed_asset_type(pool).await;
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, company_id, asset_type_id, name, status) \
+         VALUES ($1, $2, $3, $4, $5, 'active')",
     )
     .bind(id)
     .bind(common::DEFAULT_TENANT_ID)
     .bind(company_id)
+    .bind(type_id)
     .bind(name)
     .execute(pool)
     .await
@@ -37,7 +53,7 @@ async fn seed_credential(
         "INSERT INTO credential_vault \
              (id, tenant_id, company_id, asset_id, name, credential_type, \
               username_encrypted, password_encrypted) \
-         VALUES ($1, $2, $3, $4, $5, 'login', ''::bytea, ''::bytea)",
+         VALUES ($1, $2, $3, $4, $5, 'other', ''::bytea, ''::bytea)",
     )
     .bind(id)
     .bind(common::DEFAULT_TENANT_ID)

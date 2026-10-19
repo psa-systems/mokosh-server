@@ -722,6 +722,10 @@ mod pms1194_sort_guard {
             include_str!("../modules/dashboards/routes.rs"),
         ),
         (
+            "documentation",
+            include_str!("../modules/documentation/routes.rs"),
+        ),
+        (
             "email_intake",
             include_str!("../modules/email_intake/routes.rs"),
         ),
