@@ -25,6 +25,10 @@ pub mod contracts;
 pub mod credential_move;
 pub mod dashboards;
 pub mod data_transfer;
+/// PMS-800: per-client documentation aggregate (assets with typed fields +
+/// credential references + company-scoped KB articles). Composition over
+/// the three owning modules; no new store, no secrets on the wire.
+pub mod documentation;
 pub mod email_intake;
 pub mod features;
 pub mod forms;
