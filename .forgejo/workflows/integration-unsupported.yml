@@ -26,10 +26,9 @@
 # how you run it on demand, which is what to do on a PR that touches
 # `src/storage/` before merging it.
 #
-# DEV-612 / scripts/check-single-build.nu: this workflow compiles and declares
-# neither `push: main` nor `pull_request: main`, so it gates nothing and
-# repeats nothing. It is a scheduled check, not a merge gate; the gate is
-# `integration.yml`.
+# DEV-612: this workflow compiles and declares neither `push: main` nor
+# `pull_request: main`, so it gates nothing and repeats nothing. It is a
+# scheduled check, not a merge gate; the gate is `integration.yml`.
 name: Integration (unsupported)
 
 on:
