@@ -236,15 +236,28 @@ pub fn grant_invitations_owner_routes(
 }
 
 /// Grantee-facing mount. Sits under `/api/v1/my-grants/invitations`.
-pub fn grant_invitations_grantee_routes(db: Arc<Database>) -> Router {
+///
+/// PMS-1500: id-scoped accept/decline routes alongside the inbox GET so the
+/// SPA's `TenantSwitcher` can wire Accept/Decline on inbox rows that never
+/// held the plaintext accept token (by mokosh-server's own design, the
+/// plaintext is handed back exactly once on `POST /api/v1/grants/invitations`
+/// and only reaches the grantee via the invitation email). The by-token
+/// routes stay mounted because the email link reaches a grantee who may
+/// have no account yet, where the id-scoped path cannot authenticate them.
+pub fn grant_invitations_grantee_routes(
+    db: Arc<Database>,
+    bunyip_directory: Option<Arc<BunyipUserDirectory>>,
+) -> Router {
     let state = GrantInvitationsState {
         db,
         spa_base_url: Arc::new(String::new()),
         notifications: None,
-        bunyip_directory: None,
+        bunyip_directory,
     };
     Router::new()
         .route("/", get(list_grantee_inbox))
+        .route("/{id}/accept", post(accept_invitation_by_id))
+        .route("/{id}/decline", post(decline_invitation_by_id))
         .with_state(state)
 }
 
@@ -716,6 +729,80 @@ async fn decline_invitation(
         Err(AcceptRefusal::WrongCaller) => Err(AppError::Forbidden(
             "This invitation was sent to a different account.".to_string(),
         )),
+    }
+}
+
+/// PMS-1500: id-scoped accept for an authenticated grantee acting on an
+/// inbox row. The service's `find_by_id_for_grantee` scopes to the
+/// caller, so a foreign id answers 404 (same shape the by-token path
+/// uses for an unknown token — the invitation's existence is not
+/// information the caller is entitled to).
+async fn accept_invitation_by_id(
+    State(state): State<GrantInvitationsState>,
+    RequireAuth(caller): RequireAuth,
+    Path(invitation_id): Path<Uuid>,
+) -> AppResult<Json<InvitationResponse>> {
+    let outcome = GrantInvitationsService::accept_by_id(
+        state.db.pool(),
+        invitation_id,
+        caller.id,
+        state.bunyip_directory.as_deref(),
+    )
+    .await?;
+    match outcome {
+        Ok(invitation) => {
+            let response: InvitationResponse = invitation.into();
+            Ok(Json(response.with_tenant_slug(&state.db).await))
+        }
+        Err(AcceptRefusal::NotFound) => Err(AppError::NotFound("invitation".to_string())),
+        Err(AcceptRefusal::Expired) => Err(AppError::Gone(
+            "This invitation has expired. Ask the owner to send a new one.".to_string(),
+        )),
+        Err(AcceptRefusal::Canceled) => Err(AppError::Gone(
+            "This invitation has been canceled by the owner.".to_string(),
+        )),
+        Err(AcceptRefusal::AlreadyAccepted) => Err(AppError::conflict(
+            "This invitation has already been accepted.".to_string(),
+        )),
+        Err(AcceptRefusal::Declined) => Err(AppError::conflict(
+            "This invitation was declined.".to_string(),
+        )),
+        Err(AcceptRefusal::WrongCaller) => {
+            // The find_by_id_for_grantee lookup already scopes by caller,
+            // so WrongCaller here means the row's invitee changed between
+            // find and update (vanishingly unlikely); 404 it rather than
+            // leak the row's existence.
+            Err(AppError::NotFound("invitation".to_string()))
+        }
+    }
+}
+
+async fn decline_invitation_by_id(
+    State(state): State<GrantInvitationsState>,
+    RequireAuth(caller): RequireAuth,
+    Path(invitation_id): Path<Uuid>,
+) -> AppResult<Json<InvitationResponse>> {
+    let outcome =
+        GrantInvitationsService::decline_by_id(state.db.pool(), invitation_id, caller.id).await?;
+    match outcome {
+        Ok(invitation) => {
+            let response: InvitationResponse = invitation.into();
+            Ok(Json(response.with_tenant_slug(&state.db).await))
+        }
+        Err(AcceptRefusal::NotFound) => Err(AppError::NotFound("invitation".to_string())),
+        Err(AcceptRefusal::Expired) => {
+            Err(AppError::Gone("This invitation has expired.".to_string()))
+        }
+        Err(AcceptRefusal::Canceled) => Err(AppError::Gone(
+            "This invitation has been canceled by the owner.".to_string(),
+        )),
+        Err(AcceptRefusal::AlreadyAccepted) => Err(AppError::conflict(
+            "This invitation has already been accepted.".to_string(),
+        )),
+        Err(AcceptRefusal::Declined) => Err(AppError::conflict(
+            "This invitation was already declined.".to_string(),
+        )),
+        Err(AcceptRefusal::WrongCaller) => Err(AppError::NotFound("invitation".to_string())),
     }
 }
 
