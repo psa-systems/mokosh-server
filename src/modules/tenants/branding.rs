@@ -139,10 +139,11 @@ pub fn validate_branding_value_as(key: &str, label: &str, value: &Value) -> Resu
         return Ok(());
     }
     match key {
-        // `accent_color` is the deprecated alias for `secondary_color`, kept
-        // accepted per PMS-703 F18 because the settings endpoint has written it
-        // since PMS-113.
-        "primary_color" | "secondary_color" | "accent_color" | "background_color" => {
+        // PMS-1443: `accent_color` was the deprecated alias for
+        // `secondary_color`, removed with the storage alias sweep. A
+        // client that still sends it reaches the unknown-key arm and is
+        // rejected with the handler's standard "unknown field" message.
+        "primary_color" | "secondary_color" | "background_color" => {
             let s = text(label, value, 7)?;
             if is_hex_color(s) {
                 Ok(())
@@ -345,7 +346,8 @@ fn cross_tenant_message(key: &str) -> String {
 /// `crate::modules::branding::effective`), so a third branding surface
 /// cannot introduce a key this table has never validated.
 pub(crate) const KNOWN_KEYS: &[&str] = &[
-    "accent_color",
+    // PMS-1443: `accent_color` (deprecated alias for `secondary_color`)
+    // was removed. A client sending it now reaches the unknown-key arm.
     "background_color",
     "background_mime",
     "background_url",
@@ -549,9 +551,14 @@ mod tests {
     fn the_colour_keys_take_a_hex_colour() {
         assert!(patch(json!({ "primary_color": "#0066cc" })).is_ok());
         assert!(patch(json!({ "secondary_color": "#00AA55" })).is_ok());
+        // PMS-1443: `accent_color` was the deprecated alias for
+        // `secondary_color`; after this ticket it reaches the unknown-key
+        // arm and is rejected with the handler's standard "unknown field"
+        // message. A client that still sends it must be migrated to
+        // `secondary_color`.
         assert!(
-            patch(json!({ "accent_color": "#0066cc" })).is_ok(),
-            "the deprecated alias stays writable (PMS-703 F18)"
+            patch(json!({ "accent_color": "#0066cc" })).is_err(),
+            "the deprecated alias is rejected (PMS-1443)"
         );
         assert!(patch(json!({ "primary_color": "red" })).is_err());
         assert!(patch(json!({ "primary_color": "#0066cz" })).is_err());

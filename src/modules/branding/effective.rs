@@ -230,6 +230,11 @@ mod tests {
     /// has never validated is a key a third branding surface could write
     /// unchecked and have it show up in what a client is shown, which is
     /// exactly the regression this issue closes.
+    ///
+    /// PMS-1443: `accent_color` is deliberately omitted. The alias is no
+    /// longer a writable key - the patch validator rejects it - but legacy
+    /// rows that still carry one are read as a `secondary_color` fallback
+    /// so the colour does not vanish on upgrade.
     #[test]
     fn every_field_effective_branding_reads_is_a_known_branding_key() {
         use crate::modules::tenants::branding::KNOWN_KEYS;
@@ -240,7 +245,6 @@ mod tests {
             "favicon_mime",
             "primary_color",
             "secondary_color",
-            "accent_color",
             "background_color",
             "background_url",
             "background_mime",

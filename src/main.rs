@@ -549,6 +549,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // first. `config.deployment_mode` keeps the lenient reading for mail.
     let hosting_profile = DeploymentMode::from_env_for_providers()?;
 
+    // PMS-1443: the alias grace period for storage names is over. If a
+    // deployment is still forwarding `ATTACHMENT_DIR` or any of the bare
+    // `S3_*` names, refuse to boot and name the replacement so an operator
+    // can edit the compose file. This runs before any config read so a
+    // half-migrated deployment fails loud at startup instead of silently
+    // using a stale default.
+    if let Err(msg) = mokosh_server::storage::env::check_boot_env_from_process() {
+        eprintln!("{msg}");
+        return Err(msg.into());
+    }
+
     // PMS-982: pick the configuration provider and resolve the first
     // generation, before `AppConfig` or any feature asks for a value. An
     // unrecognised CONFIG_BACKEND ends startup here naming the legal values,
