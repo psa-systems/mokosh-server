@@ -355,16 +355,11 @@ impl GrantInvitationsService {
         caller_bunyip_user_id: Uuid,
         bunyip_directory: Option<&super::bunyip_directory::BunyipUserDirectory>,
     ) -> AppResult<Result<GrantInvitation, AcceptRefusal>> {
-        let invitation = match Self::find_by_id_for_grantee(
-            pool,
-            invitation_id,
-            caller_bunyip_user_id,
-        )
-        .await?
-        {
-            Some(inv) => inv,
-            None => return Ok(Err(AcceptRefusal::NotFound)),
-        };
+        let invitation =
+            match Self::find_by_id_for_grantee(pool, invitation_id, caller_bunyip_user_id).await? {
+                Some(inv) => inv,
+                None => return Ok(Err(AcceptRefusal::NotFound)),
+            };
         let owner = invitation.inviter_bunyip_user_id;
         Self::accept_resolved(
             pool,
@@ -382,16 +377,11 @@ impl GrantInvitationsService {
         invitation_id: Uuid,
         caller_bunyip_user_id: Uuid,
     ) -> AppResult<Result<GrantInvitation, AcceptRefusal>> {
-        let invitation = match Self::find_by_id_for_grantee(
-            pool,
-            invitation_id,
-            caller_bunyip_user_id,
-        )
-        .await?
-        {
-            Some(inv) => inv,
-            None => return Ok(Err(AcceptRefusal::NotFound)),
-        };
+        let invitation =
+            match Self::find_by_id_for_grantee(pool, invitation_id, caller_bunyip_user_id).await? {
+                Some(inv) => inv,
+                None => return Ok(Err(AcceptRefusal::NotFound)),
+            };
         Self::decline_resolved(pool, invitation, caller_bunyip_user_id).await
     }
 

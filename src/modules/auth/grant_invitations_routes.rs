@@ -150,13 +150,12 @@ impl InvitationResponse {
     /// tenants). A missing row (deleted/soft-deleted tenant) leaves the slug
     /// `None`; the caller falls back to its own lookup.
     pub async fn with_tenant_slug(mut self, db: &Database) -> Self {
-        let slug: Option<String> =
-            sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
-                .bind(self.tenant_id)
-                .fetch_optional(db.migrator_pool())
-                .await
-                .ok()
-                .flatten();
+        let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
+            .bind(self.tenant_id)
+            .fetch_optional(db.migrator_pool())
+            .await
+            .ok()
+            .flatten();
         self.tenant_slug = slug;
         self
     }
@@ -167,7 +166,10 @@ impl InvitationResponse {
 /// design, so a per-row slug lookup would be an N+1 against `tenants`. A row
 /// whose tenant has no slug entry is left `None` to match
 /// `with_tenant_slug`'s single-row behaviour.
-async fn fill_tenant_slugs(db: &Database, mut rows: Vec<InvitationResponse>) -> Vec<InvitationResponse> {
+async fn fill_tenant_slugs(
+    db: &Database,
+    mut rows: Vec<InvitationResponse>,
+) -> Vec<InvitationResponse> {
     if rows.is_empty() {
         return rows;
     }
@@ -468,8 +470,9 @@ async fn create_invitation(
 
     // PMS-1499: fill `tenant_slug` on the create response too so the owner's
     // UI uses the same decode path as the inbox / accept / decline paths.
-    let invitation_response: InvitationResponse =
-        InvitationResponse::from(invitation).with_tenant_slug(&state.db).await;
+    let invitation_response: InvitationResponse = InvitationResponse::from(invitation)
+        .with_tenant_slug(&state.db)
+        .await;
     Ok((
         StatusCode::CREATED,
         Json(CreatedInvitationResponse {
@@ -624,17 +627,16 @@ async fn get_invitation_by_token(
     // bunyip_user_id the invitation row carries. An unresolved lookup
     // leaves the SPA's existing "unresolved person" helper to render a
     // placeholder; the page does not refuse to load.
-    let inviter_name: Option<String> =
-        sqlx::query_scalar(
-            "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
+    let inviter_name: Option<String> = sqlx::query_scalar(
+        "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
              FROM users WHERE bunyip_user_id = $1",
-        )
-        .bind(invitation.inviter_bunyip_user_id)
-        .fetch_optional(state.db.migrator_pool())
-        .await
-        .ok()
-        .flatten()
-        .flatten();
+    )
+    .bind(invitation.inviter_bunyip_user_id)
+    .fetch_optional(state.db.migrator_pool())
+    .await
+    .ok()
+    .flatten()
+    .flatten();
 
     Ok(Json(InvitationMetadata {
         mokosh_account_name: name,
@@ -750,15 +752,39 @@ async fn decline_invitation(
 /// caller, so a foreign id answers 404 (same shape the by-token path
 /// uses for an unknown token — the invitation's existence is not
 /// information the caller is entitled to).
+/// Resolve the caller's Bunyip sub from their `users` row. The id-scoped
+/// grantee endpoints address an invitation by its `invitee_bunyip_user_id`,
+/// but `RequireAuth` hands back a mokosh `users.id`; `my_grants::leave_grant`
+/// uses the same shape. Returns `None` for a legacy local user who has no
+/// Bunyip sub yet so the caller falls through to a 404 rather than a 500.
+async fn resolve_caller_bunyip_sub(db: &Database, user_id: Uuid) -> AppResult<Option<Uuid>> {
+    // SAFETY (PMS-285): identity-plane read of the caller's own row; the
+    // grantee surface is cross-tenant by design and holds no scoped tenant
+    // GUC. Matches the shape `my_grants::leave_grant` uses.
+    let sub: Option<Uuid> =
+        sqlx::query_scalar("SELECT bunyip_user_id FROM users WHERE id = $1 LIMIT 1")
+            .bind(user_id)
+            .fetch_optional(db.pool())
+            .await?;
+    Ok(sub)
+}
+
 async fn accept_invitation_by_id(
     State(state): State<GrantInvitationsState>,
     RequireAuth(caller): RequireAuth,
     Path(invitation_id): Path<Uuid>,
 ) -> AppResult<Json<InvitationResponse>> {
+    let Some(caller_bunyip_user_id) = resolve_caller_bunyip_sub(&state.db, caller.id).await? else {
+        return Err(AppError::NotFound("invitation".to_string()));
+    };
+    // SAFETY (PMS-285): no RLS on `mokosh_grant_invitations`; the service's
+    // `accept_by_id` scopes the lookup to the caller's bunyip sub so a foreign
+    // row 404s (same shape the by-token accept uses), and the UPDATE in the
+    // same transaction scopes by id + invitee again as the race guard.
     let outcome = GrantInvitationsService::accept_by_id(
         state.db.pool(),
         invitation_id,
-        caller.id,
+        caller_bunyip_user_id,
         state.bunyip_directory.as_deref(),
     )
     .await?;
@@ -795,8 +821,18 @@ async fn decline_invitation_by_id(
     RequireAuth(caller): RequireAuth,
     Path(invitation_id): Path<Uuid>,
 ) -> AppResult<Json<InvitationResponse>> {
-    let outcome =
-        GrantInvitationsService::decline_by_id(state.db.pool(), invitation_id, caller.id).await?;
+    let Some(caller_bunyip_user_id) = resolve_caller_bunyip_sub(&state.db, caller.id).await? else {
+        return Err(AppError::NotFound("invitation".to_string()));
+    };
+    // SAFETY (PMS-285): no RLS on `mokosh_grant_invitations`; the service's
+    // `decline_by_id` scopes to the caller's bunyip sub so a foreign row 404s,
+    // same shape as the accept-by-id path right above.
+    let outcome = GrantInvitationsService::decline_by_id(
+        state.db.pool(),
+        invitation_id,
+        caller_bunyip_user_id,
+    )
+    .await?;
     match outcome {
         Ok(invitation) => {
             let response: InvitationResponse = invitation.into();

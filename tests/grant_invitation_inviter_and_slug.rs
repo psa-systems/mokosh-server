@@ -132,12 +132,11 @@ async fn by_token_response_omits_inviter_name_when_lookup_misses(pool: PgPool) {
 async fn owner_outbox_rows_carry_tenant_slug(pool: PgPool) {
     let (admin_bunyip, admin_email, admin_pw) = common::seed_admin(&pool).await;
     // The admin's own tenant: look its slug up for the assertion.
-    let admin_tenant: Uuid =
-        sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
-            .bind(admin_bunyip)
-            .fetch_one(&pool)
-            .await
-            .expect("admin tenant_id");
+    let admin_tenant: Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = $1")
+        .bind(admin_bunyip)
+        .fetch_one(&pool)
+        .await
+        .expect("admin tenant_id");
     let slug: String = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
         .bind(admin_tenant)
         .fetch_one(&pool)
@@ -157,7 +156,11 @@ async fn owner_outbox_rows_carry_tenant_slug(pool: PgPool) {
         .expect("list outbox");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let rows: Vec<Value> = resp.json().await.expect("rows");
-    assert_eq!(rows.len(), 1, "exactly one invitation seeded for this tenant");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one invitation seeded for this tenant"
+    );
     assert_eq!(
         rows[0]["tenant_slug"].as_str(),
         Some(slug.as_str()),

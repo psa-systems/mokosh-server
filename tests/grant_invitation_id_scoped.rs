@@ -92,11 +92,23 @@ async fn authenticated_grantee_accepts_their_own_invitation_by_id(pool: PgPool) 
         "pw-pms1500-01",
     )
     .await;
-    let invitation_id =
-        create_invitation(&pool, owner_tenant, inviter, Some(grantee_bunyip), "grantee-id@example.com").await;
+    let invitation_id = create_invitation(
+        &pool,
+        owner_tenant,
+        inviter,
+        Some(grantee_bunyip),
+        "grantee-id@example.com",
+    )
+    .await;
 
     let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, "grantee-id@example.com", "pw-pms1500-01").await;
+    let token = common::login_with_tenant(
+        &app,
+        "grantee-id@example.com",
+        "pw-pms1500-01",
+        "pms1500-grantee",
+    )
+    .await;
 
     let resp = app
         .client
@@ -138,7 +150,13 @@ async fn a_different_user_cannot_accept_someone_elses_invitation(pool: PgPool) {
     .await;
 
     let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, "foreign@example.com", "pw-pms1500-02").await;
+    let token = common::login_with_tenant(
+        &app,
+        "foreign@example.com",
+        "pw-pms1500-02",
+        "pms1500-foreign-user",
+    )
+    .await;
 
     let resp = app
         .client
@@ -179,14 +197,22 @@ async fn an_expired_invitation_410s_on_the_id_path(pool: PgPool) {
     )
     .await;
     // Backdate `expires_at` so the next accept is past it.
-    sqlx::query("UPDATE mokosh_grant_invitations SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
-        .bind(invitation_id)
-        .execute(&pool)
-        .await
-        .expect("backdate expiry");
+    sqlx::query(
+        "UPDATE mokosh_grant_invitations SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+    )
+    .bind(invitation_id)
+    .execute(&pool)
+    .await
+    .expect("backdate expiry");
 
     let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, "expired-grantee@example.com", "pw-pms1500-03").await;
+    let token = common::login_with_tenant(
+        &app,
+        "expired-grantee@example.com",
+        "pw-pms1500-03",
+        "pms1500-expired-grantee",
+    )
+    .await;
 
     let resp = app
         .client
@@ -228,7 +254,13 @@ async fn a_declined_invitation_cannot_be_re_accepted(pool: PgPool) {
     .await;
 
     let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, "double-grantee@example.com", "pw-pms1500-04").await;
+    let token = common::login_with_tenant(
+        &app,
+        "double-grantee@example.com",
+        "pw-pms1500-04",
+        "pms1500-double-grantee",
+    )
+    .await;
 
     let decline = app
         .client
