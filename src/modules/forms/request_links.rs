@@ -479,6 +479,21 @@ impl FormsService {
         let definition = self
             .get(resolved.tenant_id, resolved.form_definition_id)
             .await?;
+        // PMS-838: refuse a retired definition at open time, same shape as the
+        // already-submitted terminal state. Submitting also checks `is_active`
+        // (below) as the race guard, but a GET-first refusal spares the client
+        // the fill-in-everything-then-fail path. 410 (`Gone`) rather than 409
+        // because the client's existing terminal handler maps `Gone`; a form
+        // retired after the link was issued and the already-submitted state
+        // are the same shape of "stop trying" and read better with the same
+        // treatment.
+        if !definition.is_active {
+            return Err(AppError::Gone(
+                "This form has been retired and is no longer accepting submissions. \
+                 Ask your account team for a new link."
+                    .to_string(),
+            ));
+        }
         // PMS-748: who is asking. The page is reached from an email by someone
         // with no account here, so it has to carry its own attribution rather
         // than relying on the message that linked to it still being open.
@@ -549,8 +564,13 @@ impl FormsService {
         let tenant_id = resolved.tenant_id;
         let definition = self.get(tenant_id, resolved.form_definition_id).await?;
         if !definition.is_active {
-            return Err(AppError::Conflict(
-                "This form has been retired and is no longer accepting submissions.".to_string(),
+            // PMS-838: match the GET's shape and status. 410 instead of 409 so
+            // the client treats the two paths the same (terminal, stop trying);
+            // complete the message so it does not stop mid-clause.
+            return Err(AppError::Gone(
+                "This form has been retired and is no longer accepting submissions. \
+                 Ask your account team for a new link."
+                    .to_string(),
             ));
         }
 
