@@ -28,6 +28,7 @@ use crate::utils::json::Json;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    middleware,
     routing::{delete, get, post},
     Router,
 };
@@ -40,6 +41,9 @@ use super::grant_invitations::{
     AcceptRefusal, CreatedInvitation, GrantInvitation, GrantInvitationsService, DEFAULT_TTL,
 };
 use super::middleware::{RequireAdminUser, RequireAuth};
+use super::rate_limit::{
+    grant_invitation_token_limit, GrantInvitationTokenLimiter, GRANT_INVITATION_TOKEN_PER_MIN,
+};
 use super::tenant::TenantId;
 use crate::db::Database;
 use crate::modules::notifications::NotificationsService;
@@ -293,6 +297,15 @@ pub fn grant_invitations_by_token_routes(
         .route("/{token}/accept", post(accept_invitation))
         .route("/{token}/decline", post(decline_invitation))
         .with_state(state)
+        // PMS-1506: `find_by_token` runs an Argon2 verify once an id matches,
+        // so this unauthenticated, token-driven mount needs the same per-IP
+        // backstop every other one in this module has. Layered on the whole
+        // router rather than checked per-handler so all three routes share
+        // one budget and a future route added here cannot forget it.
+        .layer(middleware::from_fn_with_state(
+            GrantInvitationTokenLimiter::new(GRANT_INVITATION_TOKEN_PER_MIN),
+            grant_invitation_token_limit,
+        ))
 }
 
 async fn create_invitation(

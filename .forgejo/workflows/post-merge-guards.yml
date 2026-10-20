@@ -1,0 +1,77 @@
+---
+
+# Post-merge guards (PMS-1402).
+#
+# Two guards whose entire subject is the interaction between branches, so
+# the per-pull-request check cannot catch them: each branch passes on its
+# own, and the collision is created by the merge itself.
+#
+# - Migration prefix uniqueness (PMS-198). Branch A adds 250_a.sql,
+#   branch B adds 250_b.sql; the per-PR check on each branch sees exactly
+#   one row for prefix 250 and passes, then both merge in sequence and
+#   `_sqlx_migrations`'s ledger goes ambiguous for prefix 250. Suspected
+#   cause of the earlier staging failure where migrations either failed
+#   or were not run.
+# - Migration immutability (DEV-395). A branch could pass its own PR
+#   check and still land next to a prior-main edit of the same file, so
+#   the merge-result diff against `origin/main`'s history is what proves
+#   the invariant. sqlx verifies applied-migration checksums on startup,
+#   so editing an applied migration makes every deployed database refuse
+#   to boot (this broke nc-01 on the v0.4.0 deploy).
+#
+# DEV-612 removed the `push: main` trigger from check.yml because its
+# compile-and-test gated nothing (the merge had already landed) and
+# recompiled a tree byte-identical to the one the pull-request run had
+# just built: 189s per merge for a known answer. This workflow runs the
+# two shell guards ONLY: no cargo, no docker, so single-build's
+# compile-pattern scan classifies it as "n/a (compiles nothing)" and
+# both triggers are legal. The pull-request gate in check.yml is
+# untouched.
+
+name: Post-merge guards
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  guards:
+    name: migration prefix + immutability
+    # Base label: no compile step runs here, so the dev image's cc / gcc /
+    # ld / OpenSSL headers (PMS-705) are not needed. A nu-only shell check
+    # fits the base runner.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Clone the repository
+        # fetch-depth: 0 so check-migration-immutability can diff the
+        # merge commit against `origin/main`'s history. DEV-395.
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # The root justfile imports `common/common.just` from the
+          # `common` submodule, so without this NOTHING here can parse
+          # the justfile - `just --list` included (PMS-786).
+          submodules: true
+
+      - name: Migration prefix uniqueness
+        # PMS-198: fail loud when two migrations share a numeric prefix.
+        # sqlx keys its `_sqlx_migrations` ledger on that prefix, so a
+        # cross-branch collision (e.g. two branches both picking 027)
+        # makes the applied version ambiguous. The per-PR check in
+        # check.yml runs the same recipe but only sees the branch tip;
+        # this run sees the merge result.
+        shell: nu {0}
+        run: |
+          just check-migration-versions
+
+      - name: Migration immutability
+        # DEV-395: fail loud when a migration already committed on main
+        # is modified, renamed, or deleted. The per-PR check gates one
+        # branch at a time; this run gates the merge result against the
+        # updated main.
+        shell: nu {0}
+        run: |
+          just check-migration-immutability
