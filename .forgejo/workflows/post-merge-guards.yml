@@ -41,7 +41,7 @@ jobs:
     # Base label: no compile step runs here, so the dev image's cc / gcc /
     # ld / OpenSSL headers (PMS-705) are not needed. A nu-only shell check
     # fits the base runner.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
     timeout-minutes: 5
 
     steps:

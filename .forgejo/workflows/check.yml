@@ -40,7 +40,7 @@ jobs:
     # Dev label: this job compiles Rust natively on the runner, and only the
     # dev image carries `cc` / `gcc` / `ld` plus the OpenSSL headers openssl-sys
     # probes. Base fails at `linker cc not found` (PMS-705, CLAUDE-203).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Backstop, not a target (PMS-829): 38 green runs between 2026-08-22 and
     # 2026-08-24 took 1.9-9.0 minutes, median 3.5. The headroom is for a cold
@@ -365,3 +365,65 @@ jobs:
         # pins "a raw Uuid cannot be passed where a TenantId is required".
         # `--lib` above does not execute doctests.
         run: cargo test --workspace --doc
+
+  secrets:
+    name: secrets scan
+    # Base label: this job only invokes a composite action; nothing on the
+    # runner compiles Rust, so the dev image's cc / glibc headers are not
+    # needed. The per-job compile-check in scripts/check-runner-labels.nu
+    # scopes the dev-label rule to the enclosing job, so this base-label
+    # runs-on sits beside the cargo job above without tripping the guard.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Rename .gitconfig
+        # The runner's ~/.gitconfig prevents actions/checkout from working.
+        shell: nu {0}
+        run: |
+          let gitconfig = ([$env.HOME .gitconfig] | path join)
+          if ($gitconfig | path expand | path exists) {
+            mv $gitconfig ([$gitconfig 'disabled'] | str join '-')
+          }
+
+      - name: Clone the repository
+        # fetch-depth: 0 so the git-history scanners see every commit the
+        # branch adds; persist-credentials: false so the composite action
+        # does not inherit a push-capable token.
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Secrets scan
+        # PMS-1286: kingfisher excludes point at paths whose finding is
+        # provably a dev default, test fixture or env-var NAME string.
+        # kingfisher_skip_regex catches the same patterns in git history
+        # (the ignore file is path-only; `--exclude` does not reach a
+        # blob reachable only through `.git/objects/`). The one-line
+        # reason per path lives in `.noseyparker-ignore.txt` alongside
+        # the broader noseyparker path-glob exclusions.
+        uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-secrets@main
+        with:
+          kingfisher_excludes: >-
+            justfile
+            .forgejo/workflows/integration.yml
+            .forgejo/workflows/integration-unsupported.yml
+            .noseyparker-ignore.txt
+            src/main.rs
+            src/infisical/dev.rs
+            src/modules/auth/routes.rs
+            src/modules/forms/routes.rs
+            src/storage/s3.rs
+            src/utils/crypto.rs
+            src/modules/assets/models.rs
+            src/infisical/bootstrap.rs
+            src/providers/status/auth.rs
+          # Dev-default and lazy-pool test URLs appear in older commits
+          # of `.forgejo/workflows/check.yml` and `justfile` under their
+          # pre-move paths, so `--exclude` cannot reach them; this regex
+          # suppresses the specific URL shapes everywhere they appear in
+          # git history. The regex is deliberately narrow: each
+          # alternative names a specific throwaway credential pair.
+          kingfisher_skip_regex: "postgres://(postgres:postgres|unused:unused|user:(pass|p=ssw=rd)|infisical:\\(\\$infisical_pg_password\\)|[^@:]+:\\(\\$[a-z_]+\\))@"
+          noseyparker_ignore_file: .noseyparker-ignore.txt
