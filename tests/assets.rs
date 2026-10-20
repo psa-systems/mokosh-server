@@ -905,6 +905,90 @@ async fn asset_tag_counter_catches_up_after_imported_rows(pool: PgPool) {
     );
 }
 
+/// An asset issued to a contact now carries that contact's name on list and
+/// get, resolved via a tenant-scoped LEFT JOIN on `contacts`. Lets the asset
+/// "Issued to" column render a contact name without a secondary
+/// `/contacts/{id}` fetch per row.
+#[mokosh_test]
+async fn asset_response_resolves_contact_name(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id = create_asset_type(&app, &token, "Laptop").await;
+
+    let contact_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contacts (id, tenant_id, company_id, first_name, last_name) \
+         VALUES ($1, $2, $3, 'Alice', 'Carter')",
+    )
+    .bind(contact_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .execute(&pool)
+    .await
+    .expect("seed contact");
+
+    let asset_id = create_asset(&app, &token, "customer-laptop", &type_id, company).await;
+    let patch = app
+        .client
+        .patch(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "contact_id": contact_id }))
+        .send()
+        .await
+        .expect("patch contact_id");
+    assert!(patch.status().is_success(), "patch contact_id should 2xx");
+
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(
+        got["contact_id"].as_str(),
+        Some(contact_id.to_string().as_str()),
+    );
+    assert_eq!(got["contact_name"].as_str(), Some("Alice Carter"));
+
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/assets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list assets")
+        .json()
+        .await
+        .expect("list json");
+    let row = list["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .find(|r| r["id"].as_str() == Some(asset_id.as_str()))
+        .expect("asset in list");
+    assert_eq!(row["contact_name"].as_str(), Some("Alice Carter"));
+
+    let unassigned_id = create_asset(&app, &token, "unassigned", &type_id, company).await;
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{unassigned_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert!(got["contact_id"].is_null());
+    assert!(got["contact_name"].is_null());
+}
+
 #[mokosh_test]
 async fn assets_exists_rejects_over_the_500_cap(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
