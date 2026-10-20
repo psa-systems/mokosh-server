@@ -23,7 +23,7 @@ const TOOLCHAIN_PKGS = [
 
 const PKG_MANAGERS = ["zypper" "apt-get" "dnf " "apk "]
 
-const DEV_LABEL = "RUNS_ON_OPENSUSE_DEV_LATEST"
+const DEV_LABEL = "RUNS_ON_OPENSUSE_BASE_HEAVY"
 
 # Strip a leading `run:` so a one-line step and a block-scalar line look alike.
 def command-body [line: string] {
