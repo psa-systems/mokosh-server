@@ -557,9 +557,14 @@ async fn a_retired_form_refuses_submissions_and_refuses_new_links(pool: PgPool) 
     assert!(patched.status().is_success());
 
     let (status, _) = submit(&app, &in_flight, valid).await;
+    // PMS-838: the public submit now returns 410 (Gone) rather than 409
+    // (Conflict) so the client's terminal handler reads a retired form the
+    // same way it reads an already-submitted one; the issue-link endpoint
+    // below is still 409 because that is about disallowing a new link, not
+    // about an existing link falling off a cliff.
     assert_eq!(
         status,
-        reqwest::StatusCode::CONFLICT,
+        reqwest::StatusCode::GONE,
         "a retired form must stop collecting, or the flag is decorative"
     );
 

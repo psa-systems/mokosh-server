@@ -502,7 +502,14 @@ pub fn create_api_router(
         )
         .nest(
             "/my-grants/invitations",
-            grant_invitations_grantee_routes(Arc::new(db.clone())),
+            grant_invitations_grantee_routes(
+                Arc::new(db.clone()),
+                // PMS-1500: id-scoped accept delegates to the shared
+                // `accept_resolved`, which registers the bunyip grant in
+                // SaaS mode. The grantee mount needs the directory handle
+                // for the same reason the by-token mount does.
+                bunyip_directory.clone(),
+            ),
         )
         // PMS-1210: the grantee-side "Leave account" endpoint. Placed at
         // the top of `/api/v1` rather than under `/auth` because the
