@@ -1652,3 +1652,69 @@ async fn a_generated_line_describes_the_work_not_the_row(pool: PgPool) {
         assert!(!line.contains("Time entry"), "{line}");
     }
 }
+
+/// MAPPS-984 - `GET /invoices/summary` collapses the full list to a
+/// count + total so the dashboard "open invoices" widget stops paging.
+/// Same filter shape as `GET /invoices`; sent/partially_paid rows sum.
+#[mokosh_test]
+async fn invoices_summary_returns_count_and_total(pool: PgPool) {
+    let (admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+
+    // Three invoices: one draft (excluded by status filter), two sent.
+    for (status, total) in [("draft", "100.00"), ("sent", "250.00"), ("sent", "750.00")] {
+        sqlx::query(
+            r#"
+            INSERT INTO invoices (
+                id, tenant_id, invoice_number, company_id, status,
+                invoice_date, due_date, subtotal, tax_amount, total, balance_due
+            )
+            VALUES (
+                gen_random_uuid(), $1,
+                'INV-' || substr(md5(random()::text), 1, 8),
+                $2, $3,
+                CURRENT_DATE, CURRENT_DATE + INTERVAL '30 days',
+                $4::numeric, 0, $4::numeric, $4::numeric
+            )
+            "#,
+        )
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(company_id)
+        .bind(status)
+        .bind(total)
+        .execute(&pool)
+        .await
+        .expect("seed invoice");
+    }
+
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &password).await;
+    let _ = admin_id;
+
+    let summary: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/invoices/summary?status=sent"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary")
+        .json()
+        .await
+        .expect("summary json");
+    assert_eq!(summary["count"].as_i64(), Some(2));
+    assert_eq!(summary["total"].as_str(), Some("1000.00"));
+
+    // No filter: all three rows roll in.
+    let all: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/invoices/summary"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("summary all")
+        .json()
+        .await
+        .expect("summary all json");
+    assert_eq!(all["count"].as_i64(), Some(3));
+    assert_eq!(all["total"].as_str(), Some("1100.00"));
+}

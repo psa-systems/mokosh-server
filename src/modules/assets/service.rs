@@ -405,7 +405,9 @@ impl AssetsService {
         let query = format!(
             r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
                       a.company_id, co.name AS company_name,
-                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
                       -- PMS-454: CMDB expansion columns. INET cast to text so the
                       -- sqlx FromRow target stays String. Assigned-user name is
@@ -422,6 +424,7 @@ impl AssetsService {
                LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
                WHERE {where_clause} ORDER BY a.name
                LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
             limit_idx = idx,
@@ -541,7 +544,9 @@ impl AssetsService {
         let query = format!(
             r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
                       a.company_id, co.name AS company_name,
-                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
                       a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
                       a.ip_address::text AS ip_address, a.hostname, a.mac_address,
@@ -554,6 +559,7 @@ impl AssetsService {
                LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
                WHERE {where_clause}{order_by}
                LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
         );
@@ -1062,7 +1068,9 @@ impl AssetsService {
         let row = sqlx::query_as::<_, AssetRow>(
             r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
                       a.company_id, co.name AS company_name,
-                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
                       a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
                       a.ip_address::text AS ip_address, a.hostname, a.mac_address,
@@ -1075,6 +1083,7 @@ impl AssetsService {
                LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
                WHERE a.tenant_id = $1 AND a.id = $2"#,
         )
         .bind(tenant_id)
@@ -1874,6 +1883,45 @@ impl AssetsService {
         Ok((items, total as u64))
     }
 
+    /// PMS-800: list every credential a company owns, across its assets
+    /// AND the company-scoped ones (`asset_id IS NULL`). Returns the same
+    /// `CredentialSummary` shape as `list_credentials` with no secret
+    /// material; reveals still go through the audited single-credential
+    /// endpoint.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn list_credentials_for_company(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<Vec<CredentialSummary>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = sqlx::query_as::<_, CredRow>(
+            r#"SELECT id, name, company_id, asset_id, credential_type,
+                      username_encrypted, password_encrypted, url, notes_encrypted,
+                      last_rotated, created_at
+               FROM credential_vault
+               WHERE tenant_id = $1 AND company_id = $2
+               ORDER BY name"#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| CredentialSummary {
+                id: r.id,
+                name: r.name,
+                company_id: r.company_id,
+                asset_id: r.asset_id,
+                credential_type: r.credential_type,
+                url: r.url,
+                last_rotated: r.last_rotated,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
     /// Reveal a single credential's decrypted secrets. Authz is enforced
     /// at the route (`RequireAssets`); the reveal is recorded in
     /// `asset_audit_log` so every decryption is traceable.
@@ -2167,6 +2215,8 @@ struct AssetRow {
     company_name: Option<String>,
     site_id: Option<Uuid>,
     contact_id: Option<Uuid>,
+    // MAPPS-1071: resolved from the LEFT JOIN on contacts.
+    contact_name: Option<String>,
     status: Option<String>,
     manufacturer: Option<String>,
     model: Option<String>,
@@ -2211,6 +2261,7 @@ impl From<AssetRow> for AssetResponse {
             company_name: r.company_name,
             site_id: r.site_id,
             contact_id: r.contact_id,
+            contact_name: r.contact_name,
             status: r.status.unwrap_or_else(|| "active".into()),
             manufacturer: r.manufacturer,
             model: r.model,

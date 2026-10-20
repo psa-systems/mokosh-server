@@ -280,9 +280,9 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-google-oauth-client-secret"></a>`GOOGLE_OAUTH_CLIENT_SECRET` | no | v0.2.0; removed in v0.14.0 | nowhere | Client secret of the retired Google sign-in routes (PMS-837). |
 | <a id="var-google-oauth-redirect-uri"></a>`GOOGLE_OAUTH_REDIRECT_URI` | no | v0.2.0; removed in v0.14.0 | nowhere | Redirect URI of the retired Google sign-in routes (PMS-837). |
 | <a id="var-oauth-super-admin-emails"></a>`OAUTH_SUPER_ADMIN_EMAILS` | no | v0.3.0; removed in v0.14.0 | nowhere | Super-admin allowlist only the retired Google sign-in read (PMS-837). |
-| <a id="var-bunyip-api-base-url"></a>`BUNYIP_API_BASE_URL` | no | v0.16.0 | `.env` | Not described yet: say what it does. |
-| <a id="var-bunyip-directory-client-id"></a>`BUNYIP_DIRECTORY_CLIENT_ID` | no | v0.16.0 | `.env` | Not described yet: say what it does. |
-| <a id="var-bunyip-directory-client-secret"></a>`BUNYIP_DIRECTORY_CLIENT_SECRET` | no | v0.16.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-bunyip-api-base-url"></a>`BUNYIP_API_BASE_URL` | no | v0.16.0 | `.env` | Base URL of the Bunyip API this deployment federates with in SaaS mode; used to call `GET /v1/users/lookup?email=` before creating a pending grant invitation. Unset in standalone mode. |
+| <a id="var-bunyip-directory-client-id"></a>`BUNYIP_DIRECTORY_CLIENT_ID` | no | v0.16.0 | `.env` | Machine-credential client id this deployment presents to Bunyip's `/v1/users/lookup` endpoint, as HTTP Basic. All three (`BUNYIP_API_BASE_URL` + this pair) must be set together or left unset. |
+| <a id="var-bunyip-directory-client-secret"></a>`BUNYIP_DIRECTORY_CLIENT_SECRET` | no | v0.16.0 | `.env` | Machine-credential client secret this deployment presents to Bunyip's `/v1/users/lookup` endpoint, as HTTP Basic. All three (`BUNYIP_API_BASE_URL` + this pair) must be set together or left unset. |
 | <a id="var-bunyip-mailer-url"></a>`BUNYIP_MAILER_URL` | no, unset makes `MAIL_PROVIDER=bunyip` refuse to boot | v0.16.0 | `.env` | Base URL of Bunyip's mailer relay that `MAIL_PROVIDER=bunyip` sends through (`POST /v1/mailer/send`, BUNYIP-602). |
 | <a id="var-bunyip-mailer-client-id"></a>`BUNYIP_MAILER_CLIENT_ID` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client id presented as HTTP Basic to the mailer relay. |
 | <a id="var-bunyip-mailer-client-secret"></a>`BUNYIP_MAILER_CLIENT_SECRET` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client secret presented as HTTP Basic to the mailer relay. |
@@ -324,20 +324,8 @@ Every stored object lives under one root: `STORAGE_ROOT` when `STORAGE_PROVIDER`
 
 ### Paths that do not yet begin with their tenant
 
-Two kinds of path are exceptions, and an operator reading a volume will see both.
+**Old locations, read-only.** A knowledge base image written before the layout change is at `kb-articles/{id}`, a tenant logo written before it is at `tenant-logos/{tenant}.{ext}`, and the five pre-PMS-1397 branding directories (`tenant-favicons/`, `tenant-backgrounds/`, `company-logos/`, `company-favicons/`, `company-backgrounds/`) still carry files not yet moved. All are still served; a one-shot pass at each server start (`BrandingAssetMover` and friends) walks them to the paths above and nothing writes back.
 
-**Old locations, read-only.** A knowledge base image written before the layout change is at `kb-articles/{id}`, and a tenant logo written before it is at `tenant-logos/{tenant}.{ext}`. Both are still served, and a one-shot pass at each server start walks them to the paths above; once it has, neither directory refills. Nothing writes to them.
+Every current write goes under its tenant. The five branding pairs now land at `{tenant}/branding/favicon.{ext}`, `{tenant}/branding/background.{ext}` and `{tenant}/branding/company-{kind}/{company}.{ext}` through `src/modules/branding/assets.rs`.
 
-**Branding assets other than the tenant logo**, which are still on a shared directory per kind and are the subject of PMS-1397:
-
-| Path | What it is |
-|---|---|
-| `tenant-favicons/{tenant}.{ext}` | the tenant's favicon |
-| `tenant-backgrounds/{tenant}.{ext}` | the tenant's sign-in background |
-| `company-logos/{company}.{ext}` | a client company's logo |
-| `company-favicons/{company}.{ext}` | a client company's favicon |
-| `company-backgrounds/{company}.{ext}` | a client company's sign-in background |
-
-These are listed rather than left to be discovered, because the point of documenting a layout is that it is the real one. The three `company-*` directories carry no tenant at all. That is not a way for one tenant to read another's file through the API - the routes that serve these are deliberately public, with the id as the credential, so no tenant-scoped key is presented in the first place - but it does mean those five cannot be moved, quota-limited or exported per tenant until PMS-1397 lands.
-
-`crate::storage` is the only place any of this is decided, with `src/modules/branding/assets.rs` holding the five above. A caller is handed a tenant and an object identity and never a path, so a new kind of stored object cannot invent its own layout, and `storage::tests::every_object_kind_puts_its_tenant_first` fails the build if one is added without its tenant in front.
+`crate::storage` is the only place any of this is decided. A caller is handed a tenant and an object identity and never a path, so a new kind of stored object cannot invent its own layout, and `storage::tests::every_object_kind_puts_its_tenant_first` fails the build if one is added without its tenant in front.

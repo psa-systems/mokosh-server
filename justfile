@@ -78,7 +78,7 @@ default:
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-migration-versions-against-base check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md
 
 # Keep docs/configuration.md's Required / Added in facts and changelog true to
 # the registry and src/config/variables.toml (PMS-1442).
@@ -165,7 +165,19 @@ check-env-example:
 # common's shared recipe (PC-79).
 [doc("Fail if two migrations share a numeric prefix (PMS-198).")]
 [group: 'check']
-check-migrations: check-migration-versions
+check-migrations: check-migration-versions check-migration-versions-against-base
+
+# PMS-1402: catch a prefix collision that only appears after the merge. The
+# per-branch check-migration-versions scan passes because each branch holds
+# only its own migration; two branches both picking 300_ each pass alone and
+# only collide when the second one lands. DEV-612 removed the push-to-main
+# re-check (which rolled the compile+test cost on every merge); this cheap
+# unions the base ref's migrations with HEAD's and re-asserts prefix
+# uniqueness WITHOUT the compile cost.
+[doc("Fail if a PR's migrations would collide with origin/main after the merge (PMS-1402).")]
+[group: 'check']
+check-migration-versions-against-base base_ref="origin/main":
+    nu scripts/check-migration-versions-against-base.nu migrations {{base_ref}}
 
 # Keep a guarded content UPDATE from matching zero rows in silence (PMS-1117).
 # A migration after prefix 209 that guards a WHERE clause on a content-column
