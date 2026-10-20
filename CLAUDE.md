@@ -186,6 +186,7 @@ One line per rule, linking its full text. A new convention adds its text under `
 - `LOGIN_APPROVAL_ENABLED` gates suspicious logins ([PMS-658](docs/invariants/identity-auth.md#login-approval-pms-658))
 - `users` mirrors to `identities` one way ([PMS-1120](docs/invariants/identity-auth.md#identity-mirror-pms-1120))
 - A TOTP secret is sealed on both planes ([PMS-1055](docs/invariants/identity-auth.md#totp-secret-pms-1055))
+- A grant invitation mirrors into Bunyip only on accept, and cancel never orphans it ([PMS-1208](docs/invariants/identity-auth.md#grant-invitations-pms-1208))
 
 ### Configuration and providers
 
@@ -200,9 +201,15 @@ One line per rule, linking its full text. A new convention adds its text under `
 - `integrations.status` has one writer ([PMS-1312](docs/invariants/config-providers.md#payment-status-pms-1312))
 - The Google OAuth client is the host's ([PMS-1430](docs/invariants/config-providers.md#google-client-pms-1340))
 - A one-time correction runs once per boot ([PMS-1320](docs/invariants/config-providers.md#one-shots-pms-1320))
+- Healing one DB role's password never rewrites the other's ([PMS-1469](docs/architecture.md#migration-rules))
 - A feature toggle is a registry entry, off unless a row says otherwise ([PMS-1414](docs/feature-toggles.md))
 - Every stored object puts its tenant first ([PMS-1318](docs/invariants/config-providers.md#tenant-first-pms-1318))
 - Storage settings are `STORAGE_`-prefixed ([PMS-1317](docs/invariants/config-providers.md#storage-names-pms-1317))
+
+### Error handling
+
+- A lookup that found nothing is not a failed attempt ([PMS-1477](docs/invariants/error-visibility.md#2-a-lookup-that-found-nothing-is-not-a-failed-attempt-pms-1477))
+- A client-stated conflict is not a server fault ([details](docs/invariants/error-visibility.md#4-a-client-stated-conflict-is-not-a-server-fault))
 
 ### CI, release and repo hygiene
 

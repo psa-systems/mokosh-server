@@ -175,17 +175,34 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
     let filtered: serde_json::Value =
         serde_json::from_str(&filtered_text).expect("filtered list JSON");
     let entry_id = entry["id"].as_str().expect("entry id");
-    assert!(
-        filtered["data"]
-            .as_array()
-            .expect("filtered list has data")
-            .iter()
-            .any(|e| e["id"].as_str() == Some(entry_id)),
-        "the ticket's time entry should appear in the ticket_id-filtered list"
-    );
+    let filtered_entry = filtered["data"]
+        .as_array()
+        .expect("filtered list has data")
+        .iter()
+        .find(|e| e["id"].as_str() == Some(entry_id))
+        .expect("the ticket's time entry should appear in the ticket_id-filtered list");
     assert!(
         filtered["meta"]["total"].as_i64().unwrap_or(0) >= 1,
         "filtered list total should count the entry"
+    );
+    // PMS-1481: user and work type names ride on every read, so a timesheet
+    // row renders without pairing ids against separate /users and /work-types
+    // fetches.
+    assert!(
+        filtered_entry["user_name"].as_str().is_some(),
+        "user_name resolved on list: {filtered_entry}",
+    );
+    assert!(
+        filtered_entry["work_type_name"].as_str().is_some(),
+        "work_type_name resolved on list: {filtered_entry}",
+    );
+    assert!(
+        entry["work_type_name"].as_str().is_some(),
+        "work_type_name resolved on the stop response: {entry}",
+    );
+    assert!(
+        entry["user_name"].as_str().is_some(),
+        "user_name resolved on the stop response: {entry}",
     );
 
     // SUBMIT the technician's week (any date in the week anchors to Monday).
@@ -1171,5 +1188,92 @@ async fn general_time_entry_against_own_company(pool: PgPool) {
         entry["work_category"].as_str(),
         Some("general"),
         "entry classifies as general"
+    );
+}
+
+/// MAPPS-984 - `GET /time-entries/summary` returns the sum of
+/// non-rejected `duration_minutes` matching the filter. Lets the
+/// dashboard "time this week" widget replace a paged list fetch with one
+/// aggregate request.
+#[mokosh_test]
+async fn time_entries_summary_sums_non_rejected_minutes(pool: PgPool) {
+    use mokosh_server::modules::time_tracking::TimeEntryFilter;
+
+    let (admin_id, _email, _pw) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let work_type_id = seeded_work_type(&pool).await;
+    let svc = TimeTrackingService::new(Database::from_pool(pool.clone()));
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let ctx = AuditCtx::system(common::DEFAULT_TENANT_ID);
+
+    // Three entries on different dates summing 60 + 90 + 30 = 180.
+    for minutes in [60, 90, 30] {
+        let req = CreateTimeEntryRequest {
+            user_id: admin_id,
+            date: chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+            start_time: None,
+            end_time: None,
+            duration_minutes: Some(minutes),
+            worked_minutes: None,
+            billable_minutes: None,
+            work_type_id,
+            ticket_id: None,
+            project_id: None,
+            task_id: None,
+            entry_kind: None,
+            company_id: Some(company_id),
+            notes: Some("sum".into()),
+            work_category: None,
+            is_billable: true,
+            hourly_rate: None,
+        };
+        svc.create_time_entry(tenant, &req, &ctx)
+            .await
+            .expect("create entry");
+    }
+
+    // A fourth entry gets rejected and must NOT be summed.
+    let rejected_req = CreateTimeEntryRequest {
+        user_id: admin_id,
+        date: chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+        start_time: None,
+        end_time: None,
+        duration_minutes: Some(500),
+        worked_minutes: None,
+        billable_minutes: None,
+        work_type_id,
+        ticket_id: None,
+        project_id: None,
+        task_id: None,
+        entry_kind: None,
+        company_id: Some(company_id),
+        notes: Some("reject me".into()),
+        work_category: None,
+        is_billable: true,
+        hourly_rate: None,
+    };
+    let rejected = svc
+        .create_time_entry(tenant, &rejected_req, &ctx)
+        .await
+        .expect("create rejected entry");
+    sqlx::query("UPDATE time_entries SET approval_status = 'rejected' WHERE id = $1")
+        .bind(rejected.id)
+        .execute(&pool)
+        .await
+        .expect("mark rejected");
+
+    let filter = TimeEntryFilter {
+        user_id: Some(admin_id),
+        date_from: Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap()),
+        date_to: Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap()),
+        ..Default::default()
+    };
+    let minutes = svc
+        .sum_time_entry_minutes(tenant, &filter)
+        .await
+        .expect("summary");
+    assert_eq!(
+        minutes, 180,
+        "rejected entries are excluded, same as roll-ups"
     );
 }

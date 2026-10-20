@@ -258,17 +258,22 @@ impl TimeTrackingService {
         let order_by = format!("te.{order_by}");
         let query = format!(
             r#"
-            SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
+            SELECT te.id, te.user_id,
+                   NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '') AS user_name,
+                   te.date, te.start_time, te.end_time, te.duration_minutes,
                    te.worked_minutes, te.billable_minutes,
-                   te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.entry_kind, te.notes,
+                   te.work_type_id, wt.name AS work_type_name,
+                   te.ticket_id, te.project_id, te.task_id, te.company_id, te.entry_kind, te.notes,
                    te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
                    te.approval_status, te.work_category, te.created_at, te.updated_at,
                    tk.ticket_number, tk.title AS ticket_title,
                    pr.name AS project_name, ta.title AS task_title
             FROM time_entries te
-            LEFT JOIN tickets  tk ON tk.id = te.ticket_id
-            LEFT JOIN projects pr ON pr.id = te.project_id
-            LEFT JOIN tasks    ta ON ta.id = te.task_id
+            LEFT JOIN users     u  ON u.id  = te.user_id      AND u.tenant_id  = te.tenant_id
+            LEFT JOIN work_types wt ON wt.id = te.work_type_id AND wt.tenant_id = te.tenant_id
+            LEFT JOIN tickets   tk ON tk.id = te.ticket_id
+            LEFT JOIN projects  pr ON pr.id = te.project_id
+            LEFT JOIN tasks     ta ON ta.id = te.task_id
             WHERE {data_where}
             ORDER BY {order_by}
             LIMIT $2 OFFSET $3
@@ -304,6 +309,68 @@ impl TimeTrackingService {
         let rows = q.fetch_all(&mut *tx).await?;
         let total = cq.fetch_one(&mut *tx).await?;
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
+    }
+
+    /// MAPPS-984: sum `duration_minutes` across non-rejected entries matching
+    /// the filter, in one aggregate query. Lets the dashboard "time this
+    /// week" widget replace a paged `/time-entries` fetch with one request.
+    /// Rejected entries are excluded for the same reason the project/task
+    /// `actual_hours` roll-ups exclude them (PMS-944): a rejected entry is
+    /// not time worked.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn sum_time_entry_minutes(
+        &self,
+        tenant_id: TenantId,
+        filter: &TimeEntryFilter,
+    ) -> AppResult<i64> {
+        let mut conds = vec![
+            "tenant_id = $1".to_string(),
+            "approval_status <> 'rejected'".to_string(),
+        ];
+        let mut idx = 2u32;
+        let mut push_filter = |col: &str, op: &str| {
+            conds.push(format!("{col} {op} ${idx}"));
+            idx += 1;
+        };
+        if filter.user_id.is_some() {
+            push_filter("user_id", "=");
+        }
+        if filter.ticket_id.is_some() {
+            push_filter("ticket_id", "=");
+        }
+        if filter.project_id.is_some() {
+            push_filter("project_id", "=");
+        }
+        if filter.date_from.is_some() {
+            push_filter("date", ">=");
+        }
+        if filter.date_to.is_some() {
+            push_filter("date", "<=");
+        }
+        let where_clause = conds.join(" AND ");
+        let sql = format!(
+            "SELECT COALESCE(SUM(duration_minutes), 0)::bigint
+             FROM time_entries WHERE {where_clause}"
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(tenant_id);
+        if let Some(v) = filter.user_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.ticket_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.project_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.date_from {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.date_to {
+            q = q.bind(v);
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let minutes = q.fetch_one(&mut *tx).await?;
+        Ok(minutes)
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -467,17 +534,22 @@ impl TimeTrackingService {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, TimeEntryRow>(
             r#"
-            SELECT te.id, te.user_id, te.date, te.start_time, te.end_time, te.duration_minutes,
+            SELECT te.id, te.user_id,
+                   NULLIF(TRIM(CONCAT(u.first_name, ' ', u.last_name)), '') AS user_name,
+                   te.date, te.start_time, te.end_time, te.duration_minutes,
                    te.worked_minutes, te.billable_minutes,
-                   te.work_type_id, te.ticket_id, te.project_id, te.task_id, te.company_id, te.entry_kind, te.notes,
+                   te.work_type_id, wt.name AS work_type_name,
+                   te.ticket_id, te.project_id, te.task_id, te.company_id, te.entry_kind, te.notes,
                    te.is_billable, te.billing_status, te.hourly_rate, te.total_amount,
                    te.approval_status, te.work_category, te.created_at, te.updated_at,
                    tk.ticket_number, tk.title AS ticket_title,
                    pr.name AS project_name, ta.title AS task_title
             FROM time_entries te
-            LEFT JOIN tickets  tk ON tk.id = te.ticket_id
-            LEFT JOIN projects pr ON pr.id = te.project_id
-            LEFT JOIN tasks    ta ON ta.id = te.task_id
+            LEFT JOIN users     u  ON u.id  = te.user_id      AND u.tenant_id  = te.tenant_id
+            LEFT JOIN work_types wt ON wt.id = te.work_type_id AND wt.tenant_id = te.tenant_id
+            LEFT JOIN tickets   tk ON tk.id = te.ticket_id
+            LEFT JOIN projects  pr ON pr.id = te.project_id
+            LEFT JOIN tasks     ta ON ta.id = te.task_id
             WHERE te.tenant_id = $1 AND te.id = $2
             "#,
         )
@@ -2264,6 +2336,7 @@ impl From<WorkTypeRow> for WorkTypeResponse {
 struct TimeEntryRow {
     id: Uuid,
     user_id: Uuid,
+    user_name: Option<String>,
     date: chrono::NaiveDate,
     start_time: Option<chrono::NaiveTime>,
     end_time: Option<chrono::NaiveTime>,
@@ -2271,6 +2344,7 @@ struct TimeEntryRow {
     worked_minutes: Option<i32>,
     billable_minutes: Option<i32>,
     work_type_id: Uuid,
+    work_type_name: Option<String>,
     ticket_id: Option<Uuid>,
     project_id: Option<Uuid>,
     task_id: Option<Uuid>,
@@ -2296,6 +2370,7 @@ impl From<TimeEntryRow> for TimeEntryResponse {
         Self {
             id: r.id,
             user_id: r.user_id,
+            user_name: r.user_name,
             date: r.date,
             start_time: r.start_time,
             end_time: r.end_time,
@@ -2306,6 +2381,7 @@ impl From<TimeEntryRow> for TimeEntryResponse {
             worked_minutes: r.worked_minutes.unwrap_or(r.duration_minutes),
             billable_minutes: r.billable_minutes,
             work_type_id: r.work_type_id,
+            work_type_name: r.work_type_name,
             ticket_id: r.ticket_id,
             project_id: r.project_id,
             task_id: r.task_id,

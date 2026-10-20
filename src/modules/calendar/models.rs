@@ -22,6 +22,11 @@ pub struct AppointmentResponse {
     pub contact_id: Option<Uuid>,
     pub site_id: Option<Uuid>,
     pub assigned_to_id: Uuid,
+    /// PMS-1481: resolved display name for `assigned_to_id`, from a tenant-
+    /// scoped correlated subquery against `users`. `None` only if the user
+    /// row is gone or has no name; the calendar renders it without a per-row
+    /// `/users/{id}` fetch.
+    pub assigned_to_name: Option<String>,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     pub all_day: bool,

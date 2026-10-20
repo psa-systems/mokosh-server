@@ -700,10 +700,10 @@ mod tests {
     }
 
     const FULL: &[(&str, &str)] = &[
-        ("S3_ENDPOINT", "http://minio:9000"),
-        ("S3_BUCKET", "mokosh"),
-        ("S3_ACCESS_KEY_ID", "key"),
-        ("S3_SECRET_ACCESS_KEY", "secret"),
+        ("STORAGE_S3_ENDPOINT", "http://minio:9000"),
+        ("STORAGE_S3_BUCKET", "mokosh"),
+        ("STORAGE_S3_ACCESS_KEY_ID", "key"),
+        ("STORAGE_S3_SECRET_ACCESS_KEY", "secret"),
     ];
 
     fn provider(pairs: &[(&str, &str)]) -> S3Provider {
@@ -796,8 +796,8 @@ mod tests {
     #[test]
     fn virtual_hosted_puts_the_bucket_in_the_host() {
         let mut pairs = FULL.to_vec();
-        pairs.push(("S3_PATH_STYLE", "false"));
-        pairs[0] = ("S3_ENDPOINT", "https://s3.us-west-2.amazonaws.com");
+        pairs.push(("STORAGE_S3_PATH_STYLE", "false"));
+        pairs[0] = ("STORAGE_S3_ENDPOINT", "https://s3.us-west-2.amazonaws.com");
         let s = provider(&pairs);
         let (url, host) = s.url_for(Some("a/b")).unwrap();
         assert_eq!(
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn an_endpoint_with_a_path_prefix_keeps_it() {
         let mut pairs = FULL.to_vec();
-        pairs[0] = ("S3_ENDPOINT", "https://storage.example/s3/");
+        pairs[0] = ("STORAGE_S3_ENDPOINT", "https://storage.example/s3/");
         let s = provider(&pairs);
         let (url, _) = s.url_for(Some("a/b")).unwrap();
         assert_eq!(url.as_str(), "https://storage.example/s3/mokosh/a/b");
@@ -824,10 +824,10 @@ mod tests {
     #[test]
     fn every_required_variable_is_named_when_missing() {
         for missing in [
-            "S3_ENDPOINT",
-            "S3_BUCKET",
-            "S3_ACCESS_KEY_ID",
-            "S3_SECRET_ACCESS_KEY",
+            "STORAGE_S3_ENDPOINT",
+            "STORAGE_S3_BUCKET",
+            "STORAGE_S3_ACCESS_KEY_ID",
+            "STORAGE_S3_SECRET_ACCESS_KEY",
         ] {
             let pairs: Vec<(&str, &str)> = FULL
                 .iter()
@@ -839,9 +839,9 @@ mod tests {
         }
         // Blank is unset (PMS-836): a forwarded-but-empty variable arrives as "".
         let mut pairs = FULL.to_vec();
-        pairs[1] = ("S3_BUCKET", "   ");
+        pairs[1] = ("STORAGE_S3_BUCKET", "   ");
         let err = S3Config::parse(vars(&pairs)).expect_err("blank is unset");
-        assert!(err.to_string().contains("S3_BUCKET"));
+        assert!(err.to_string().contains("STORAGE_S3_BUCKET"));
     }
 
     #[test]
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn a_path_style_value_that_is_not_a_boolean_is_refused() {
         let mut pairs = FULL.to_vec();
-        pairs.push(("S3_PATH_STYLE", "maybe"));
+        pairs.push(("STORAGE_S3_PATH_STYLE", "maybe"));
         assert!(S3Config::parse(vars(&pairs)).is_err());
     }
 
@@ -868,7 +868,7 @@ mod tests {
             "http://minio/#f",
         ] {
             let mut pairs = FULL.to_vec();
-            pairs[0] = ("S3_ENDPOINT", bad);
+            pairs[0] = ("STORAGE_S3_ENDPOINT", bad);
             assert!(
                 S3Config::parse(vars(&pairs)).is_err(),
                 "{bad:?} must be refused"
@@ -880,7 +880,7 @@ mod tests {
     fn a_bucket_name_outside_the_s3_rules_is_refused() {
         for bad in ["ab", "Mokosh", "my_bucket", "-x-", "a..b", &"a".repeat(64)] {
             let mut pairs = FULL.to_vec();
-            pairs[1] = ("S3_BUCKET", bad);
+            pairs[1] = ("STORAGE_S3_BUCKET", bad);
             assert!(
                 S3Config::parse(vars(&pairs)).is_err(),
                 "{bad:?} must be refused"

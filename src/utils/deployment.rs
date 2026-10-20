@@ -20,10 +20,13 @@
 //!   `/auth/login`'s password branch and `/auth/forgot-password` still exist
 //!   in `saas`; restricting them is PMS-905.
 //!
-//! PMS-903 will read the same flag to pick mail TRANSPORT (Bunyip's shared
-//! mailer API instead of direct SMTP). This module deliberately carries no
-//! transport knowledge: the two questions are independent, and PMS-903 landing
-//! must not need to revisit anything here.
+//! Mail TRANSPORT (direct SMTP vs. Bunyip's shared mailer API) is a separate,
+//! already-answered question: `MAIL_PROVIDER` selects it independently, and
+//! `bunyip` (`ApiMailer`, PMS-1482) is a known selection alongside `log` and
+//! `smtp` (see [`ProviderKind::known_providers`] below). This module
+//! deliberately carries no transport knowledge of its own; see
+//! `docs/dev-docs/self-hosted-vs-saas-mail.md`, which documents the two-mode
+//! mail data flow in full.
 //!
 //! # The mode is also the hosting profile (PMS-1011)
 //!

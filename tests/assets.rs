@@ -709,6 +709,286 @@ async fn assets_exists_names_matches_case_insensitively_within_the_company_scope
     assert!(got.is_empty());
 }
 
+/// `asset_type_name` rides along on list + get via a tenant-scoped
+/// LEFT JOIN on `asset_types`, so the SPA stops fetching the full type list
+/// to resolve each row's label.
+#[mokosh_test]
+async fn asset_response_carries_resolved_asset_type_name(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+
+    let type_id = create_asset_type(&app, &token, "Rack Server").await;
+    let asset_id = create_asset(&app, &token, "srv-01", &type_id, company).await;
+
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(got["asset_type_name"].as_str(), Some("Rack Server"));
+
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/assets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list assets")
+        .json()
+        .await
+        .expect("list json");
+    let row = list["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .find(|r| r["id"].as_str() == Some(asset_id.as_str()))
+        .expect("asset in list");
+    assert_eq!(row["asset_type_name"].as_str(), Some("Rack Server"));
+
+    let foreign_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name, slug, kind) VALUES ($1, $2, $3, 'org')")
+        .bind(foreign_tenant)
+        .bind("Foreign")
+        .bind(format!("foreign-{}", foreign_tenant.simple()))
+        .execute(&pool)
+        .await
+        .expect("seed tenant");
+    sqlx::query("UPDATE asset_types SET tenant_id = $1 WHERE id = $2::uuid")
+        .bind(foreign_tenant)
+        .bind(&type_id)
+        .execute(&pool)
+        .await
+        .expect("retag asset_type to another tenant");
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert!(
+        got["asset_type_name"].is_null(),
+        "a type whose tenant does not match the asset's resolves to null: {got}",
+    );
+}
+
+/// The server owns asset_tag issuance. A caller-supplied `asset_tag` on
+/// create or update is a 422 at the DTO; the create path auto-generates
+/// `AST-001`, `AST-002`, ... per tenant.
+#[mokosh_test]
+async fn asset_tag_is_auto_generated_and_read_only(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id = create_asset_type(&app, &token, "Laptop").await;
+
+    let first_id = create_asset(&app, &token, "srv-01", &type_id, company).await;
+    let first: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{first_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(first["asset_tag"].as_str(), Some("AST-001"));
+    let second_id = create_asset(&app, &token, "srv-02", &type_id, company).await;
+    let second: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{second_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(second["asset_tag"].as_str(), Some("AST-002"));
+
+    let create_bad = app
+        .client
+        .post(app.url("/api/v1/assets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "sneaky",
+            "asset_type_id": type_id,
+            "company_id": company,
+            "asset_tag": "PICK-ME",
+        }))
+        .send()
+        .await
+        .expect("create with asset_tag");
+    assert_eq!(create_bad.status().as_u16(), 422);
+    let body: serde_json::Value = create_bad.json().await.unwrap_or(serde_json::Value::Null);
+    assert!(
+        body["error"]["errors"]
+            .as_array()
+            .map(|arr| arr.iter().any(|e| e["field"].as_str() == Some("asset_tag")))
+            .unwrap_or(false),
+        "asset_tag field envelope: {body}"
+    );
+
+    let put_bad = app
+        .client
+        .put(app.url(&format!("/api/v1/assets/{first_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "asset_tag": "WRONG" }))
+        .send()
+        .await
+        .expect("put with asset_tag");
+    assert_eq!(put_bad.status().as_u16(), 422, "PUT asset_tag must 422");
+
+    let patch_bad = app
+        .client
+        .patch(app.url(&format!("/api/v1/assets/{first_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "asset_tag": "WRONG" }))
+        .send()
+        .await
+        .expect("patch with asset_tag");
+    assert_eq!(patch_bad.status().as_u16(), 422, "PATCH asset_tag must 422");
+}
+
+/// The import path (schema-driven `jsonb_populate_recordset`) leaves
+/// provided asset_tags alone, and the next create picks up where the
+/// imported sequence left off.
+#[mokosh_test]
+async fn asset_tag_counter_catches_up_after_imported_rows(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id_str = create_asset_type(&app, &token, "Laptop").await;
+    let type_id = Uuid::parse_str(&type_id_str).expect("type uuid");
+
+    let imported_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO assets (id, tenant_id, company_id, asset_type_id, asset_tag, name, status) \
+         VALUES ($1, $2, $3, $4, 'AST-042', 'Imported', 'active')",
+    )
+    .bind(imported_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .bind(type_id)
+    .execute(&pool)
+    .await
+    .expect("seed imported asset");
+
+    let next_id = create_asset(&app, &token, "next-asset", &type_id_str, company).await;
+    let next: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{next_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(
+        next["asset_tag"].as_str(),
+        Some("AST-043"),
+        "the generator seeds the counter from max existing tag",
+    );
+}
+
+/// An asset issued to a contact now carries that contact's name on list and
+/// get, resolved via a tenant-scoped LEFT JOIN on `contacts`. Lets the asset
+/// "Issued to" column render a contact name without a secondary
+/// `/contacts/{id}` fetch per row.
+#[mokosh_test]
+async fn asset_response_resolves_contact_name(pool: PgPool) {
+    let (_aid, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id = create_asset_type(&app, &token, "Laptop").await;
+
+    let contact_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contacts (id, tenant_id, company_id, first_name, last_name) \
+         VALUES ($1, $2, $3, 'Alice', 'Carter')",
+    )
+    .bind(contact_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company)
+    .execute(&pool)
+    .await
+    .expect("seed contact");
+
+    let asset_id = create_asset(&app, &token, "customer-laptop", &type_id, company).await;
+    let patch = app
+        .client
+        .patch(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "contact_id": contact_id }))
+        .send()
+        .await
+        .expect("patch contact_id");
+    assert!(patch.status().is_success(), "patch contact_id should 2xx");
+
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{asset_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert_eq!(
+        got["contact_id"].as_str(),
+        Some(contact_id.to_string().as_str()),
+    );
+    assert_eq!(got["contact_name"].as_str(), Some("Alice Carter"));
+
+    let list: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/assets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list assets")
+        .json()
+        .await
+        .expect("list json");
+    let row = list["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .find(|r| r["id"].as_str() == Some(asset_id.as_str()))
+        .expect("asset in list");
+    assert_eq!(row["contact_name"].as_str(), Some("Alice Carter"));
+
+    let unassigned_id = create_asset(&app, &token, "unassigned", &type_id, company).await;
+    let got: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{unassigned_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get asset")
+        .json()
+        .await
+        .expect("asset json");
+    assert!(got["contact_id"].is_null());
+    assert!(got["contact_name"].is_null());
+}
+
 #[mokosh_test]
 async fn assets_exists_rejects_over_the_500_cap(pool: PgPool) {
     let (_admin_id, email, pw) = common::seed_admin(&pool).await;
@@ -730,5 +1010,133 @@ async fn assets_exists_rejects_over_the_500_cap(pool: PgPool) {
         resp.status().as_u16(),
         422,
         "over-cap request must be rejected at the validator"
+    );
+}
+
+/// PMS-1476: when an asset update flips `itil_lifecycle_stage` to `retired`
+/// and the request does not also set `status`, the server flips the status
+/// to `retired` so the Status badge, list facets and saved reports stop
+/// counting the device as Active. Status explicitly sent wins over the
+/// implied flip. Covers both PUT /assets/{id} and PATCH /assets/{id}.
+#[mokosh_test]
+async fn retiring_lifecycle_stage_flips_status_to_retired_on_put_and_patch(pool: PgPool) {
+    let (_admin_id, email, pw) = common::seed_admin(&pool).await;
+    let company = seed_company(&pool, "Acme Co").await;
+    let app = common::boot(pool).await;
+    let token = common::login(&app, &email, &pw).await;
+    let type_id = create_asset_type(&app, &token, "Workstation").await;
+
+    // -- PUT path --
+    let put_id = create_asset(&app, &token, "put-asset", &type_id, company).await;
+    let r = app
+        .client
+        .put(app.url(&format!("/api/v1/assets/{put_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "itil_lifecycle_stage": "retired" }))
+        .send()
+        .await
+        .expect("put lifecycle");
+    assert!(r.status().is_success(), "PUT: {}", r.status());
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{put_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get after put")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(after["itil_lifecycle_stage"].as_str(), Some("retired"));
+    assert_eq!(
+        after["status"].as_str(),
+        Some("retired"),
+        "PUT: lifecycle=retired must flip status to retired"
+    );
+
+    // -- PUT path, explicit status wins --
+    let put2_id = create_asset(&app, &token, "put-explicit", &type_id, company).await;
+    let r = app
+        .client
+        .put(app.url(&format!("/api/v1/assets/{put2_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "itil_lifecycle_stage": "retired",
+            "status": "in_stock"
+        }))
+        .send()
+        .await
+        .expect("put both");
+    assert!(r.status().is_success());
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{put2_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get after put2")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        after["status"].as_str(),
+        Some("in_stock"),
+        "PUT: explicit status wins over the implied retired flip"
+    );
+
+    // -- PATCH path --
+    let patch_id = create_asset(&app, &token, "patch-asset", &type_id, company).await;
+    let r = app
+        .client
+        .patch(app.url(&format!("/api/v1/assets/{patch_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "itil_lifecycle_stage": "retired" }))
+        .send()
+        .await
+        .expect("patch lifecycle");
+    assert!(r.status().is_success(), "PATCH: {}", r.status());
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{patch_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get after patch")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(after["itil_lifecycle_stage"].as_str(), Some("retired"));
+    assert_eq!(
+        after["status"].as_str(),
+        Some("retired"),
+        "PATCH: lifecycle=retired must flip status to retired"
+    );
+
+    // -- PATCH path, non-retired lifecycle does not touch status --
+    let patch2_id = create_asset(&app, &token, "patch-in-service", &type_id, company).await;
+    let r = app
+        .client
+        .patch(app.url(&format!("/api/v1/assets/{patch2_id}")))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "itil_lifecycle_stage": "in_service" }))
+        .send()
+        .await
+        .expect("patch in_service");
+    assert!(r.status().is_success());
+    let after: serde_json::Value = app
+        .client
+        .get(app.url(&format!("/api/v1/assets/{patch2_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(after["itil_lifecycle_stage"].as_str(), Some("in_service"));
+    assert_eq!(
+        after["status"].as_str(),
+        Some("active"),
+        "PATCH: non-retired lifecycle must leave status untouched (default 'active')"
     );
 }

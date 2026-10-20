@@ -7,4 +7,5 @@
 
 pub mod assets;
 pub mod effective;
+pub mod mover;
 pub mod routes;

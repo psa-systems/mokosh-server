@@ -529,10 +529,11 @@ mod server_impl {
                 sqlx::Error::RowNotFound => Self::NotFound("Record".to_string()),
                 sqlx::Error::Database(db_err) => {
                     // Check for unique constraint violations. Deliberate
-                    // suppression (error-visibility rule §4): a 23505 is the
-                    // caller re-sending a row that already exists, which the
-                    // 409 states in full, so it is logged at `debug` and not
-                    // `error`. Every other code is a real fault.
+                    // suppression (`docs/invariants/error-visibility.md`
+                    // section 4): a 23505 is the caller re-sending a row
+                    // that already exists, which the 409 states in full, so
+                    // it is logged at `debug` and not `error`. Every other
+                    // code is a real fault.
                     if let Some(code) = db_err.code() {
                         if code == "23505" {
                             tracing::debug!("Unique violation: {:?}", db_err);

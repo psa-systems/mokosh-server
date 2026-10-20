@@ -83,6 +83,10 @@ pub struct UpsertWorkTypeRequest {
 pub struct TimeEntryResponse {
     pub id: Uuid,
     pub user_id: Uuid,
+    /// PMS-1481: resolved display name for `user_id`, via a tenant-scoped
+    /// LEFT JOIN on `users`. `None` when the user row is gone or has no
+    /// first/last name.
+    pub user_name: Option<String>,
     pub date: NaiveDate,
     pub start_time: Option<NaiveTime>,
     pub end_time: Option<NaiveTime>,
@@ -99,6 +103,9 @@ pub struct TimeEntryResponse {
     /// backfill, in which case clients fall back to the rounded worked time.
     pub billable_minutes: Option<i32>,
     pub work_type_id: Uuid,
+    /// PMS-1481: resolved display name for `work_type_id`, via a tenant-
+    /// scoped LEFT JOIN on `work_types`. `None` when the join misses.
+    pub work_type_name: Option<String>,
     pub ticket_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
     /// Classifier for the kind of work (PMS-394): `ticketed` | `project` |
@@ -140,6 +147,15 @@ pub struct TimeEntryFilter {
     pub project_id: Option<Uuid>,
     pub date_from: Option<NaiveDate>,
     pub date_to: Option<NaiveDate>,
+}
+
+/// MAPPS-984: server-side aggregate for the dashboard "time this week"
+/// widget. One number per request so the SPA stops paging the full
+/// `/time-entries` list and summing in the browser.
+#[derive(Debug, Clone, Serialize)]
+pub struct TimeEntrySummaryResponse {
+    /// Total non-rejected minutes across every entry matching the filter.
+    pub minutes: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]

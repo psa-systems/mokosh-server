@@ -68,6 +68,13 @@ pub struct KbArticleResponse {
     /// `public` / `internal` articles. Returned so the editor can
     /// round-trip the multi-select selection (PMS-341).
     pub company_ids: Vec<Uuid>,
+    /// PMS-1481: company display names resolved via a tenant-scoped join
+    /// on `companies`, ordered alphabetically. Lets the SPA label the
+    /// Access column without a separate full `/companies` fetch. A company
+    /// whose row no longer resolves is omitted, so `company_names.len()`
+    /// may be shorter than `company_ids.len()` for a stale link.
+    #[serde(default)]
+    pub company_names: Vec<String>,
     /// The generic article this row is a client-specific version of.
     /// `None` for a top-level article. The parent is scoped to the same
     /// tenant; a cross-tenant link cannot be written through the API.

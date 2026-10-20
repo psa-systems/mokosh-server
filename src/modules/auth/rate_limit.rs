@@ -501,6 +501,92 @@ pub async fn public_ip_limit(
     }
 }
 
+/// PMS-1506: requests per minute per client IP across the grant-invitation
+/// by-token routes (`/grants/invitations/by-token/{token}` and its
+/// `/accept` and `/decline` siblings). Matches `RequestFormLimiter`'s
+/// default: loose enough that a real caller resolving a link and then
+/// accepting or declining it is never throttled, tight enough to make
+/// grinding the token's secret half (behind a per-request Argon2 verify)
+/// impractical.
+pub const GRANT_INVITATION_TOKEN_PER_MIN: u32 = 30;
+
+/// Per-IP limiter for the grant-invitation by-token routes. `find_by_token`
+/// runs an Argon2 verify once an id matches, so without this an attacker who
+/// already knows one pending invitation's id could grind the secret half of
+/// the token at unbounded, Argon2-costed concurrency.
+pub struct GrantInvitationTokenLimiter {
+    by_ip: IpLimiter,
+    clock: DefaultClock,
+}
+
+impl GrantInvitationTokenLimiter {
+    pub fn new(per_min: u32) -> Arc<Self> {
+        let quota = Quota::per_minute(NonZeroU32::new(per_min).expect("quota must be non-zero"));
+        Arc::new(Self {
+            by_ip: RateLimiter::keyed(quota),
+            clock: DefaultClock::default(),
+        })
+    }
+
+    pub fn check(&self, ip: IpAddr) -> Result<(), u64> {
+        self.by_ip
+            .check_key(&ip)
+            .map_err(|neg| seconds_until(&neg, &self.clock))
+    }
+}
+
+/// Middleware: 429 with `Retry-After` past the per-IP budget. Layered on the
+/// whole router `grant_invitations_by_token_routes` returns, so it covers
+/// all three of its routes without a per-handler check.
+pub async fn grant_invitation_token_limit(
+    axum::extract::State(limiter): axum::extract::State<Arc<GrantInvitationTokenLimiter>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let ip = crate::utils::client_ip::extract_client_ip(
+        addr.ip(),
+        request.headers(),
+        crate::utils::client_ip::trusted_proxies(),
+    );
+    match limiter.check(ip) {
+        Ok(()) => next.run(request).await,
+        Err(retry_after) => crate::utils::error::rate_limited_response(
+            retry_after,
+            "Too many requests, please try again shortly",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod pms_1506_tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn grant_invitation_router_answers_429_with_retry_after_past_budget() {
+        let app = Router::new().route("/x", get(|| async { "ok" })).layer(
+            axum::middleware::from_fn_with_state(
+                GrantInvitationTokenLimiter::new(2),
+                grant_invitation_token_limit,
+            ),
+        );
+        let send = || {
+            let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(axum::extract::ConnectInfo(
+                "203.0.113.9:1".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            app.clone().oneshot(req)
+        };
+        assert_eq!(send().await.unwrap().status(), 200);
+        assert_eq!(send().await.unwrap().status(), 200);
+        let third = send().await.unwrap();
+        assert_eq!(third.status(), 429);
+        assert!(third.headers().contains_key("retry-after"));
+    }
+}
+
 #[cfg(test)]
 mod pms_1299_tests {
     use super::*;

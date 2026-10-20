@@ -403,8 +403,11 @@ impl AssetsService {
         let total: i64 = cq.fetch_one(&mut *tx).await?;
 
         let query = format!(
-            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
-                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
+                      a.company_id, co.name AS company_name,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
                       -- PMS-454: CMDB expansion columns. INET cast to text so the
                       -- sqlx FromRow target stays String. Assigned-user name is
@@ -418,8 +421,10 @@ impl AssetsService {
                       a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
+               LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
                WHERE {where_clause} ORDER BY a.name
                LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
             limit_idx = idx,
@@ -537,8 +542,11 @@ impl AssetsService {
 
         let (limit_idx, offset_idx) = wb.next_two_slots();
         let query = format!(
-            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
-                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
+                      a.company_id, co.name AS company_name,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
                       a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
                       a.ip_address::text AS ip_address, a.hostname, a.mac_address,
@@ -548,8 +556,10 @@ impl AssetsService {
                       a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
+               LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
                WHERE {where_clause}{order_by}
                LIMIT ${limit_idx} OFFSET ${offset_idx}"#,
         );
@@ -668,8 +678,20 @@ impl AssetsService {
         request: &CreateAssetRequest,
         ctx: &AuditCtx,
     ) -> AppResult<AssetResponse> {
+        // PMS-1496: a caller-supplied tag is a defect, not data. The server
+        // owns every tag it issues so a technician who wrote one down can
+        // still find the asset tomorrow. The SPA already hides the field,
+        // but refuse here too so the import path stays the only entry that
+        // may carry a provided tag.
+        if request.asset_tag.is_some() {
+            return Err(AppError::validation_field(
+                "asset_tag",
+                "asset_tag is auto-generated and cannot be supplied on create",
+            ));
+        }
         let id = Uuid::new_v4();
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let asset_tag = reserve_asset_tags(&mut tx, tenant_id, 1).await?.remove(0);
         // PMS-454: INSERT now carries the eight CMDB-expansion columns.
         // `ip_address` is text on the wire; Postgres ::inet cast at write
         // time validates the format and rejects garbage. NULL on any
@@ -688,7 +710,7 @@ impl AssetsService {
         )
         .bind(id)
         .bind(tenant_id)
-        .bind(&request.asset_tag)
+        .bind(&asset_tag)
         .bind(&request.name)
         .bind(request.asset_type_id)
         .bind(request.company_id)
@@ -767,6 +789,20 @@ impl AssetsService {
         performer: Uuid,
         request: &BulkCreateAssetsRequest,
     ) -> AppResult<Vec<AssetResponse>> {
+        // PMS-1496: per-serial `asset_tag` is a caller-supplied value and
+        // the create plane does not accept them. The server issues one
+        // tag per asset below.
+        if let Some(bad) = request
+            .serials
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| s.asset_tag.is_some().then_some(i))
+        {
+            return Err(AppError::validation_field(
+                format!("serials[{bad}].asset_tag"),
+                "asset_tag is auto-generated and cannot be supplied on create",
+            ));
+        }
         // Resolve template → model + per-order context overlay. When a
         // template is set, its company_id / site_id / assigned_user_id /
         // department overlay the request's values (per the plan doc:
@@ -904,6 +940,12 @@ impl AssetsService {
         };
         let department = effective_department.or_else(|| defaults.default_department.clone());
 
+        // PMS-1496: one tag per serial, reserved in one counter bump so
+        // the batch is numbered contiguously and no later `create_asset`
+        // can slip a tag in between.
+        let asset_tags =
+            reserve_asset_tags(&mut tx, tenant_id, request.serials.len() as u32).await?;
+
         let mut created_ids = Vec::with_capacity(request.serials.len());
         for (idx, s) in request.serials.iter().enumerate() {
             // Per-row validation already ran via `#[validate(nested)]`
@@ -928,7 +970,7 @@ impl AssetsService {
             )
             .bind(id)
             .bind(*tenant_id)
-            .bind(&s.asset_tag)
+            .bind(&asset_tags[idx])
             .bind(&name)
             .bind(defaults.asset_type_id)
             .bind(effective_company_id)
@@ -1024,8 +1066,11 @@ impl AssetsService {
     pub async fn get_asset(&self, tenant_id: TenantId, id: Uuid) -> AppResult<AssetResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row = sqlx::query_as::<_, AssetRow>(
-            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, a.company_id, co.name AS company_name,
-                      a.site_id, a.contact_id, a.status, a.manufacturer, a.model, a.serial_number,
+            r#"SELECT a.id, a.asset_tag, a.name, a.asset_type_id, at.name AS asset_type_name,
+                      a.company_id, co.name AS company_name,
+                      a.site_id, a.contact_id,
+                      NULLIF(TRIM(CONCAT(ac.first_name, ' ', ac.last_name)), '') AS contact_name,
+                      a.status, a.manufacturer, a.model, a.serial_number,
                       a.purchase_date, a.purchase_price, a.warranty_expiry, a.end_of_life,
                       a.assigned_user_id, NULLIF(TRIM(CONCAT(au.first_name, ' ', au.last_name)), '') AS assigned_user_name,
                       a.ip_address::text AS ip_address, a.hostname, a.mac_address,
@@ -1035,8 +1080,10 @@ impl AssetsService {
                       a.tags, a.notes,
                       a.created_at, a.updated_at
                FROM assets a
+               LEFT JOIN asset_types at ON at.id = a.asset_type_id AND at.tenant_id = a.tenant_id
                LEFT JOIN companies co ON co.id = a.company_id AND co.tenant_id = a.tenant_id
                LEFT JOIN users au ON au.id = a.assigned_user_id AND au.tenant_id = a.tenant_id
+               LEFT JOIN contacts ac ON ac.id = a.contact_id AND ac.tenant_id = a.tenant_id
                WHERE a.tenant_id = $1 AND a.id = $2"#,
         )
         .bind(tenant_id)
@@ -1062,6 +1109,15 @@ impl AssetsService {
         request: &UpdateAssetRequest,
     ) -> AppResult<AssetResponse> {
         let prior = self.get_asset(tenant_id, id).await?;
+        // PMS-1496: tags are read-only once assigned. Reject any attempt
+        // to change the tag through the regular update path; delete and
+        // recreate is the documented remediation for a wrong tag.
+        if request.asset_tag.is_some() {
+            return Err(AppError::validation_field(
+                "asset_tag",
+                "asset_tag is read-only; delete and recreate the asset to issue a new one",
+            ));
+        }
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         // Snapshot before/after so the audit row records the field-level
         // before -> after diff, not just the action (PMS-204).
@@ -1076,6 +1132,20 @@ impl AssetsService {
         // SPA omits the field in a partial PUT. The IP arrives as text
         // and is `::inet` cast at write time so a bad value raises a
         // 400 rather than silently corrupting the column.
+        //
+        // `$3` is kept as a NULL slot (bound `request.asset_tag`,
+        // guaranteed None by the guard above) so the parameter numbering
+        // stays legible against the bind list below.
+        //
+        // When the request sets `itil_lifecycle_stage` to `retired` and does
+        // NOT also set `status`, flip status to `retired`. The CASE below
+        // resolves the three combinations:
+        //   - status explicitly sent -> use it ($8 wins via outer COALESCE)
+        //   - status omitted, lifecycle -> retired -> write 'retired'
+        //   - status omitted, lifecycle -> anything else (or NULL) -> leave status unchanged
+        // That keeps the lifecycle picker consistent with the Status badge,
+        // the list facet counts and the saved reports (filters that read
+        // `status` would otherwise still count a retired asset as active).
         let n = sqlx::query(
             r#"UPDATE assets SET
                 asset_tag = COALESCE($3, asset_tag),
@@ -1083,7 +1153,10 @@ impl AssetsService {
                 asset_type_id = COALESCE($5, asset_type_id),
                 site_id = COALESCE($6, site_id),
                 contact_id = COALESCE($7, contact_id),
-                status = COALESCE($8, status),
+                status = COALESCE(
+                    $8,
+                    CASE WHEN $23 = 'retired' THEN 'retired' ELSE status END
+                ),
                 manufacturer = COALESCE($9, manufacturer),
                 model = COALESCE($10, model),
                 serial_number = COALESCE($11, serial_number),
@@ -1186,6 +1259,14 @@ impl AssetsService {
         performer: Uuid,
         request: &PatchAssetRequest,
     ) -> AppResult<AssetResponse> {
+        // PMS-1496: a patch cannot touch asset_tag either. The create path
+        // owns issuance; a wrong tag is remediated by delete + recreate.
+        if request.asset_tag.is_some() {
+            return Err(AppError::validation_field(
+                "asset_tag",
+                "asset_tag is read-only; delete and recreate the asset to issue a new one",
+            ));
+        }
         let prior = self.get_asset(tenant_id, id).await?;
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Option<serde_json::Value> =
@@ -1224,9 +1305,24 @@ impl AssetsService {
             push(&mut qb, &mut first, &mut touched, "asset_type_id");
             qb.push_bind(v);
         }
+        // PMS-1476: a lifecycle_stage=retired flip implies status=retired
+        // unless the caller explicitly sent its own status. The SPA's
+        // inline-edit drawer PATCHes one field per blur, so the common
+        // path is "set lifecycle_stage, send nothing else"; without this
+        // the Status badge, list facets and saved reports still count
+        // the asset as Active. Status explicitly sent wins (same rule
+        // as the full-PUT path).
+        let implied_retired_status = request.status.is_none()
+            && matches!(
+                &request.itil_lifecycle_stage,
+                Some(Some(stage)) if stage.eq_ignore_ascii_case("retired"),
+            );
         if let Some(ref v) = request.status {
             push(&mut qb, &mut first, &mut touched, "status");
             qb.push_bind(v);
+        } else if implied_retired_status {
+            push(&mut qb, &mut first, &mut touched, "status");
+            qb.push_bind("retired".to_string());
         }
         if let Some(ref opt) = request.asset_tag {
             push(&mut qb, &mut first, &mut touched, "asset_tag");
@@ -1787,6 +1883,45 @@ impl AssetsService {
         Ok((items, total as u64))
     }
 
+    /// PMS-800: list every credential a company owns, across its assets
+    /// AND the company-scoped ones (`asset_id IS NULL`). Returns the same
+    /// `CredentialSummary` shape as `list_credentials` with no secret
+    /// material; reveals still go through the audited single-credential
+    /// endpoint.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn list_credentials_for_company(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<Vec<CredentialSummary>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = sqlx::query_as::<_, CredRow>(
+            r#"SELECT id, name, company_id, asset_id, credential_type,
+                      username_encrypted, password_encrypted, url, notes_encrypted,
+                      last_rotated, created_at
+               FROM credential_vault
+               WHERE tenant_id = $1 AND company_id = $2
+               ORDER BY name"#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| CredentialSummary {
+                id: r.id,
+                name: r.name,
+                company_id: r.company_id,
+                asset_id: r.asset_id,
+                credential_type: r.credential_type,
+                url: r.url,
+                last_rotated: r.last_rotated,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
     /// Reveal a single credential's decrypted secrets. Authz is enforced
     /// at the route (`RequireAssets`); the reveal is recorded in
     /// `asset_audit_log` so every decryption is traceable.
@@ -2072,12 +2207,16 @@ struct AssetRow {
     asset_tag: Option<String>,
     name: String,
     asset_type_id: Uuid,
+    // PMS-1481: resolved from the LEFT JOIN on asset_types.
+    asset_type_name: Option<String>,
     company_id: Uuid,
     // PMS-336: resolved from the LEFT JOIN on companies. NULL only if the
     // company row is missing; populated for every real asset.
     company_name: Option<String>,
     site_id: Option<Uuid>,
     contact_id: Option<Uuid>,
+    // MAPPS-1071: resolved from the LEFT JOIN on contacts.
+    contact_name: Option<String>,
     status: Option<String>,
     manufacturer: Option<String>,
     model: Option<String>,
@@ -2117,10 +2256,12 @@ impl From<AssetRow> for AssetResponse {
             asset_tag: r.asset_tag,
             name: r.name,
             asset_type_id: r.asset_type_id,
+            asset_type_name: r.asset_type_name,
             company_id: r.company_id,
             company_name: r.company_name,
             site_id: r.site_id,
             contact_id: r.contact_id,
+            contact_name: r.contact_name,
             status: r.status.unwrap_or_else(|| "active".into()),
             manufacturer: r.manufacturer,
             model: r.model,
@@ -2550,6 +2691,61 @@ async fn facet_uuid_counts(
                 label,
                 count: c,
             })
+        })
+        .collect())
+}
+
+/// Default `AST-NNN` prefix. Hard-coded for now; a tenant-level override
+/// (per PMS-1496's "configurable prefix" note) can land as a follow-up
+/// once a tenant setting is wired - the single call site here contains it.
+const ASSET_TAG_PREFIX: &str = "AST-";
+
+/// Minimum numeric width in the formatted tag ("AST-001"); larger values
+/// grow naturally.
+const ASSET_TAG_WIDTH: usize = 3;
+
+/// PMS-1496: reserve `count` consecutive asset tags for `tenant_id` and
+/// return them formatted. Atomic on the counter row via `INSERT ... ON
+/// CONFLICT DO UPDATE RETURNING`; the first call per tenant seeds the
+/// counter from the maximum numeric suffix already present in the
+/// tenant's `assets.asset_tag` so an export/import round-trip keeps
+/// issuing non-colliding tags.
+async fn reserve_asset_tags(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    count: u32,
+) -> AppResult<Vec<String>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let count_i64 = count as i64;
+    let start: i64 = sqlx::query_scalar(
+        r#"INSERT INTO asset_tag_counters (tenant_id, next_number)
+           VALUES (
+             $1,
+             COALESCE((SELECT MAX(
+                 CAST(SUBSTRING(asset_tag FROM '^AST-([0-9]+)$') AS BIGINT)
+             ) FROM assets
+                WHERE tenant_id = $1
+                  AND asset_tag ~ '^AST-[0-9]+$'), 0) + 1 + $2
+           )
+           ON CONFLICT (tenant_id) DO UPDATE SET
+             next_number = asset_tag_counters.next_number + $2,
+             updated_at = NOW()
+           RETURNING next_number - $2"#,
+    )
+    .bind(tenant_id)
+    .bind(count_i64)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok((0..count_i64)
+        .map(|offset| {
+            format!(
+                "{prefix}{number:0>width$}",
+                prefix = ASSET_TAG_PREFIX,
+                number = start + offset,
+                width = ASSET_TAG_WIDTH,
+            )
         })
         .collect())
 }
