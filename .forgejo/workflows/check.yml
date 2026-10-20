@@ -383,4 +383,20 @@ jobs:
           persist-credentials: false
 
       - name: Secrets scan
+        # PMS-1286: kingfisher excludes point at paths whose finding is
+        # provably a dev default, test fixture or env-var NAME string. The
+        # one-line reason per path lives in `.noseyparker-ignore.txt`
+        # alongside the broader noseyparker path-glob exclusions, so a
+        # future reader sees both scanner's exclusions in one place.
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-secrets@main
+        with:
+          kingfisher_excludes: >-
+            justfile
+            .forgejo/workflows/integration.yml
+            .forgejo/workflows/integration-unsupported.yml
+            src/main.rs
+            src/infisical/dev.rs
+            src/modules/auth/routes.rs
+            src/modules/forms/routes.rs
+            src/storage/s3.rs
+          noseyparker_ignore_file: .noseyparker-ignore.txt
