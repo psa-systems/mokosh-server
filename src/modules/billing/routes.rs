@@ -1499,6 +1499,13 @@ mod finance_gate {
     /// once and the compiler cannot see the omission.
     const INLINE_STAFF_GATE: &[&str] = &[
         "get_invoice",
+        // MAPPS-984: the aggregate `/invoices/summary` the dashboard Open
+        // Invoices tile reads. Dual-plane like `list_invoices` below (staff
+        // gets any status, a contact is scoped to their own company), so it
+        // takes the same inline staff gate rather than `RequireBilling` /
+        // `RequireFinance` as extractors. Position follows source order
+        // (right after `get_invoice`) so the equality check reads cleanly.
+        "invoices_summary",
         "list_invoices",
         "get_invoice_pdf",
         "pay_invoice",
