@@ -98,6 +98,14 @@ pub struct CreateInvitationRequest {
 pub struct InvitationResponse {
     pub id: Uuid,
     pub tenant_id: Uuid,
+    /// PMS-1499: tenant slug alongside the id so the SPA can auto-switch
+    /// into the granted tenant immediately after accept without a second
+    /// `/tenants/{id}` fetch. `None` on a server that predates the field,
+    /// which keeps the shape backwards compatible for a client that
+    /// re-decodes an older response and falls back to its own slug
+    /// lookup by `tenant_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_slug: Option<String>,
     pub inviter_bunyip_user_id: Uuid,
     pub invitee_bunyip_user_id: Option<Uuid>,
     pub invitee_email: String,
@@ -115,6 +123,11 @@ impl From<GrantInvitation> for InvitationResponse {
         Self {
             id: row.id,
             tenant_id: row.tenant_id,
+            // `From<GrantInvitation>` does not have a DB handle; a slug
+            // lookup needs one, so the `From` path leaves `tenant_slug`
+            // empty and the handlers that have a `state.db` populate it
+            // explicitly via `with_tenant_slug` below.
+            tenant_slug: None,
             inviter_bunyip_user_id: row.inviter_bunyip_user_id,
             invitee_bunyip_user_id: row.invitee_bunyip_user_id,
             invitee_email: row.invitee_email,
@@ -127,6 +140,53 @@ impl From<GrantInvitation> for InvitationResponse {
             canceled_at: row.canceled_at,
         }
     }
+}
+
+impl InvitationResponse {
+    /// PMS-1499: fill `tenant_slug` from `tenants.slug` by `tenant_id`. Runs
+    /// on the migrator pool because the grant-invitation handlers either are
+    /// pre-auth (by-token) or carry an auth context whose tenant may NOT be
+    /// the invitation's tenant (the grantee inbox lists invitations across
+    /// tenants). A missing row (deleted/soft-deleted tenant) leaves the slug
+    /// `None`; the caller falls back to its own lookup.
+    pub async fn with_tenant_slug(mut self, db: &Database) -> Self {
+        let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
+            .bind(self.tenant_id)
+            .fetch_optional(db.migrator_pool())
+            .await
+            .ok()
+            .flatten();
+        self.tenant_slug = slug;
+        self
+    }
+}
+
+/// PMS-1499: batch-resolve `tenant_slug` for a list of invitations with one
+/// `WHERE id = ANY($1)` round trip. The grantee inbox is cross-tenant by
+/// design, so a per-row slug lookup would be an N+1 against `tenants`. A row
+/// whose tenant has no slug entry is left `None` to match
+/// `with_tenant_slug`'s single-row behaviour.
+async fn fill_tenant_slugs(
+    db: &Database,
+    mut rows: Vec<InvitationResponse>,
+) -> Vec<InvitationResponse> {
+    if rows.is_empty() {
+        return rows;
+    }
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.tenant_id).collect();
+    let slug_rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, slug FROM tenants WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(db.migrator_pool())
+            .await
+            .unwrap_or_default();
+    let by_id: std::collections::HashMap<Uuid, String> = slug_rows.into_iter().collect();
+    for r in rows.iter_mut() {
+        if let Some(slug) = by_id.get(&r.tenant_id) {
+            r.tenant_slug = Some(slug.clone());
+        }
+    }
+    rows
 }
 
 /// Response for `POST /api/v1/grants/invitations`. Carries the
@@ -147,6 +207,14 @@ pub struct CreatedInvitationResponse {
 pub struct InvitationMetadata {
     pub mokosh_account_name: String,
     pub mokosh_account_slug: String,
+    /// PMS-1499: inviter display name, resolved from `users` by
+    /// `bunyip_user_id = inviter_bunyip_user_id` on the invitation row.
+    /// `None` when the inviter cannot be resolved (standalone-mode
+    /// invitation where the inviter has no `bunyip_user_id`, or a
+    /// `users` row whose first/last are both blank); the SPA already
+    /// renders unresolved people via the shared helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter_name: Option<String>,
     pub role: String,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub status: String,
@@ -387,10 +455,15 @@ async fn create_invitation(
         ),
     }
 
+    // PMS-1499: fill `tenant_slug` on the create response too so the owner's
+    // UI uses the same decode path as the inbox / accept / decline paths.
+    let invitation_response: InvitationResponse = InvitationResponse::from(invitation)
+        .with_tenant_slug(&state.db)
+        .await;
     Ok((
         StatusCode::CREATED,
         Json(CreatedInvitationResponse {
-            invitation: invitation.into(),
+            invitation: invitation_response,
             accept_token,
         }),
     ))
@@ -471,7 +544,8 @@ async fn list_owner_outbox(
     // caller.tenant_id`, which comes from `RequireAdminUser`.
     let rows =
         GrantInvitationsService::find_pending_by_tenant(state.db.pool(), caller.tenant_id).await?;
-    Ok(Json(rows.into_iter().map(Into::into).collect()))
+    let out: Vec<InvitationResponse> = rows.into_iter().map(Into::into).collect();
+    Ok(Json(fill_tenant_slugs(&state.db, out).await))
 }
 
 async fn list_grantee_inbox(
@@ -488,7 +562,8 @@ async fn list_grantee_inbox(
     // comes from the bearer and cannot be forged.
     let rows =
         GrantInvitationsService::find_pending_for_invitee(state.db.pool(), caller.id).await?;
-    Ok(Json(rows.into_iter().map(Into::into).collect()))
+    let out: Vec<InvitationResponse> = rows.into_iter().map(Into::into).collect();
+    Ok(Json(fill_tenant_slugs(&state.db, out).await))
 }
 
 async fn cancel_invitation(
@@ -535,9 +610,25 @@ async fn get_invitation_by_token(
             .await?;
     let (name, slug) = row.ok_or_else(|| AppError::NotFound("invitation".to_string()))?;
 
+    // PMS-1499: inviter display name. Resolves against `users` by the
+    // bunyip_user_id the invitation row carries. An unresolved lookup
+    // leaves the SPA's existing "unresolved person" helper to render a
+    // placeholder; the page does not refuse to load.
+    let inviter_name: Option<String> = sqlx::query_scalar(
+        "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
+             FROM users WHERE bunyip_user_id = $1",
+    )
+    .bind(invitation.inviter_bunyip_user_id)
+    .fetch_optional(state.db.migrator_pool())
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+
     Ok(Json(InvitationMetadata {
         mokosh_account_name: name,
         mokosh_account_slug: slug,
+        inviter_name,
         role: invitation.role,
         expires_at: invitation.expires_at,
         status: invitation.status,
@@ -582,7 +673,13 @@ async fn accept_invitation(
     )
     .await?;
     match outcome {
-        Ok(invitation) => Ok(Json(invitation.into())),
+        // PMS-1499: carry the tenant_slug on accept so the SPA can
+        // auto-switch into the granted tenant immediately without a
+        // second `/tenants/{id}` fetch.
+        Ok(invitation) => {
+            let response: InvitationResponse = invitation.into();
+            Ok(Json(response.with_tenant_slug(&state.db).await))
+        }
         Err(AcceptRefusal::NotFound) => Err(AppError::NotFound("invitation".to_string())),
         Err(AcceptRefusal::Expired) => Err(AppError::Gone(
             "This invitation has expired. Ask the owner to send a new one.".to_string(),
@@ -612,7 +709,12 @@ async fn decline_invitation(
     // named one at create time. No RLS on `mokosh_grant_invitations`.
     let outcome = GrantInvitationsService::decline(state.db.pool(), &token, caller.id).await?;
     match outcome {
-        Ok(invitation) => Ok(Json(invitation.into())),
+        // PMS-1499: a declined invitation also carries the tenant_slug
+        // so the SPA renders the toast consistently with accept.
+        Ok(invitation) => {
+            let response: InvitationResponse = invitation.into();
+            Ok(Json(response.with_tenant_slug(&state.db).await))
+        }
         Err(AcceptRefusal::NotFound) => Err(AppError::NotFound("invitation".to_string())),
         Err(AcceptRefusal::Expired) => {
             Err(AppError::Gone("This invitation has expired.".to_string()))
