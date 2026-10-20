@@ -502,7 +502,14 @@ pub fn create_api_router(
         )
         .nest(
             "/my-grants/invitations",
-            grant_invitations_grantee_routes(Arc::new(db.clone())),
+            grant_invitations_grantee_routes(
+                Arc::new(db.clone()),
+                // PMS-1500: id-scoped accept delegates to the shared
+                // `accept_resolved`, which registers the bunyip grant in
+                // SaaS mode. The grantee mount needs the directory handle
+                // for the same reason the by-token mount does.
+                bunyip_directory.clone(),
+            ),
         )
         // PMS-1210: the grantee-side "Leave account" endpoint. Placed at
         // the top of `/api/v1` rather than under `/auth` because the
@@ -662,7 +669,7 @@ pub fn create_api_router(
         // `POST /assets/{id}/report-issue` endpoint can create the
         // linked ticket through the shared portal-ticket path.
         .merge(assets_routes(
-            assets_service,
+            assets_service.clone(),
             ticket_service.clone(),
             features.clone(),
         ))
@@ -673,6 +680,21 @@ pub fn create_api_router(
             crate::modules::asset_catalog::AssetCatalogService::new(db.clone()),
             features.clone(),
         ))
+        // PMS-800: `/companies/{id}/documentation` composes assets +
+        // credential refs + company-scoped KB. No new store; the three
+        // owning services enforce tenant + company scope on each read.
+        // Both input services are cloned (each wraps an Arc internally,
+        // so the clone is cheap and lets the owning routes above and
+        // below consume their copies unchanged).
+        .nest(
+            "/companies",
+            crate::modules::documentation::documentation_routes(
+                crate::modules::documentation::service::DocumentationService::new(
+                    assets_service,
+                    kb_service.clone(),
+                ),
+            ),
+        )
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
         // PMS-923: images an article embeds. Upload / list / delete are

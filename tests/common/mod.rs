@@ -811,6 +811,39 @@ pub async fn login(app: &TestApp, email: &str, password: &str) -> String {
         .to_string()
 }
 
+/// Same as `login`, but the caller picks the tenant slug. Used by tests
+/// that seed users in a tenant other than the migration-002 `default`.
+#[allow(dead_code)]
+pub async fn login_with_tenant(
+    app: &TestApp,
+    email: &str,
+    password: &str,
+    tenant_slug: &str,
+) -> String {
+    init_tracing();
+    let resp = app
+        .client
+        .post(app.url("/api/v1/auth/login"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "tenant_slug": tenant_slug,
+        }))
+        .send()
+        .await
+        .expect("send /login request");
+    assert!(
+        resp.status().is_success(),
+        "login expected 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("/login JSON body");
+    body["access_token"]
+        .as_str()
+        .expect("login response has access_token")
+        .to_string()
+}
+
 /// MAPPS-518 (MAPPS-513 stage B): drive `POST /api/v1/platform/login`
 /// and return the platform bearer. `seed_admin` seeds a matching
 /// `platform_admins` row so this works with the same email/password

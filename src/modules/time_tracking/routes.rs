@@ -4,6 +4,11 @@
 //! `/timers/start`, `/timers/{id}/stop`) have no SPA caller. `WorkDayPage`
 //! uses the segment routes; the item-timer UI is deferred. Note covers
 //! ONLY the three timer routes; every other route in this file is consumed.
+//!
+//! parity record 2026-10-16: `/time-entries/summary` has no SPA caller
+//! yet; MAPPS-983 wires the dashboard "time this week" widget to it (and
+//! MAPPS-984 is the server half this adds). Note covers ONLY the summary
+//! route; every other `/time-entries*` route is consumed today.
 
 use std::sync::Arc;
 
@@ -47,6 +52,7 @@ pub fn time_tracking_routes(service: TimeTrackingService) -> Router {
             "/time-entries",
             get(list_time_entries).post(create_time_entry),
         )
+        .route("/time-entries/summary", get(time_entries_summary))
         .route(
             "/time-entries/{id}",
             get(get_time_entry)
@@ -165,6 +171,25 @@ async fn delete_work_type(
 // ============================================================================
 // Time entries
 // ============================================================================
+
+/// MAPPS-984: `GET /time-entries/summary?user_id=&date_from=&date_to=` -
+/// server-side aggregate so the dashboard "time this week" widget stops
+/// paging the full `/time-entries` list to compute a single sum. Returns
+/// `{ minutes: i64 }` across every non-rejected entry matching the filter.
+/// The gate matches `list_time_entries`; a user without the time-tracking
+/// module gets a 404 just like the list route.
+async fn time_entries_summary(
+    State(state): State<TimeTrackingRouterState>,
+    RequireTimeTracking { user, .. }: RequireTimeTracking,
+    Query(filter): Query<TimeEntryFilter>,
+) -> AppResult<Json<TimeEntrySummaryResponse>> {
+    filter.validate()?;
+    let minutes = state
+        .service
+        .sum_time_entry_minutes(user.tenant(), &filter)
+        .await?;
+    Ok(Json(TimeEntrySummaryResponse { minutes }))
+}
 
 async fn list_time_entries(
     State(state): State<TimeTrackingRouterState>,
