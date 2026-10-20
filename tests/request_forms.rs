@@ -964,7 +964,11 @@ async fn a_retired_form_is_refused_on_open_and_on_submit_with_410(pool: PgPool) 
         "a retired form is refused at open"
     );
     let get_body: serde_json::Value = get_resp.json().await.expect("gone body");
-    let get_msg = get_body["message"].as_str().unwrap_or_default();
+    // The server's error envelope is `{error: {code, message}}`, not a
+    // bare `message` top-level, so read the message out of its nested
+    // path; `body["message"]` would silently be `None` and the sentence
+    // check below would pass against the empty string.
+    let get_msg = get_body["error"]["message"].as_str().unwrap_or_default();
     assert!(
         get_msg.contains("form has been retired") && get_msg.ends_with("new link."),
         "the message is a complete sentence: {get_msg}"
@@ -990,7 +994,7 @@ async fn a_retired_form_is_refused_on_open_and_on_submit_with_410(pool: PgPool) 
         "a retired form is refused on submit too"
     );
     let post_body: serde_json::Value = post_resp.json().await.expect("gone body");
-    let post_msg = post_body["message"].as_str().unwrap_or_default();
+    let post_msg = post_body["error"]["message"].as_str().unwrap_or_default();
     assert!(
         post_msg.contains("form has been retired") && post_msg.ends_with("new link."),
         "the submit message is a complete sentence: {post_msg}"
