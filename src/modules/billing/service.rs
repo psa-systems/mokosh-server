@@ -822,6 +822,75 @@ impl BillingService {
         }
     }
 
+    /// MAPPS-984: `GET /invoices/summary` service half. One request
+    /// collapses the full list down to a count and a total, so the
+    /// dashboard "open invoices" widget stops paging rows just to add
+    /// their totals in the browser. Uses the same filter as `list_invoices`
+    /// (including the overdue-in-tenant-day predicate) so a widget asking
+    /// for "sent + overdue" gets the number the list would show.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn summarize_invoices(
+        &self,
+        tenant_id: TenantId,
+        filter: &InvoiceFilter,
+    ) -> AppResult<InvoiceSummaryResponse> {
+        let mut conds = vec!["tenant_id = $1".to_string()];
+        let mut idx = 2u32;
+        if filter.company_id.is_some() {
+            conds.push(format!("company_id = ${idx}"));
+            idx += 1;
+        }
+        if filter.status.is_some() {
+            conds.push(format!("status = ${idx}"));
+            idx += 1;
+        }
+        if filter.contract_id.is_some() {
+            conds.push(format!("contract_id = ${idx}"));
+            idx += 1;
+        }
+        if filter.q.is_some() {
+            conds.push(format!(
+                "(invoice_number ILIKE ${idx} OR po_number ILIKE ${idx})"
+            ));
+            idx += 1;
+        }
+        if filter.exclude_draft {
+            conds.push("status <> 'draft'".to_string());
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let zone = read_tenant_zone(&mut tx, tenant_id).await?;
+        let today = mokosh_types::datetime::user_local_date(Utc::now(), &zone);
+        if let Some(overdue) = filter.overdue {
+            let core = format!(
+                "(status IN ('sent', 'partially_paid') AND balance_due > 0 AND due_date < ${idx})"
+            );
+            conds.push(if overdue { core } else { format!("NOT {core}") });
+        }
+        let where_clause = conds.join(" AND ");
+        let sql = format!(
+            "SELECT COUNT(*)::bigint, COALESCE(SUM(total), 0)::numeric
+             FROM invoices WHERE {where_clause}"
+        );
+        let mut q = sqlx::query_as::<_, (i64, Decimal)>(&sql).bind(tenant_id);
+        if let Some(cid) = filter.company_id {
+            q = q.bind(cid);
+        }
+        if let Some(st) = &filter.status {
+            q = q.bind(st);
+        }
+        if let Some(cid) = filter.contract_id {
+            q = q.bind(cid);
+        }
+        if let Some(qstr) = &filter.q {
+            q = q.bind(format!("%{qstr}%"));
+        }
+        if filter.overdue.is_some() {
+            q = q.bind(today);
+        }
+        let (count, total) = q.fetch_one(&mut *tx).await?;
+        Ok(InvoiceSummaryResponse { count, total })
+    }
+
     /// PMS-35: paginated + filterable invoice list. `lines` is left
     /// `None` on list rollups — the customer-facing UI fetches lines
     /// only when expanding a row.

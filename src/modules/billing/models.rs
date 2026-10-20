@@ -183,6 +183,17 @@ pub struct InvoiceResponse {
     pub lines: Option<Vec<InvoiceLineResponse>>,
 }
 
+/// MAPPS-984: server-side aggregate for the dashboard "open invoices"
+/// widget. One request replaces the full `/invoices` list fetch.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvoiceSummaryResponse {
+    /// Number of invoices matching the filter.
+    pub count: i64,
+    /// Sum of `total` across the matched rows, as the money string the
+    /// list already returns.
+    pub total: Decimal,
+}
+
 #[derive(Debug, Clone, Deserialize, Default, validator::Validate)]
 pub struct InvoiceFilter {
     pub company_id: Option<Uuid>,
