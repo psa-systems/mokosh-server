@@ -10,7 +10,7 @@ Branches: `fix/...`, `feat/...`, `chore/...`. Forgejo PRs via `fj pr create` (ho
 
 ## Runner labels (PMS-719, GOV-43)
 
-CI runner labels (PMS-719, GOV-43): a job that compiles on the runner requests `RUNS_ON_OPENSUSE_DEV_LATEST` (only that image ships `cc` / `gcc` / `ld` plus glibc and OpenSSL headers); everything else stays on `RUNS_ON_OPENSUSE_BASE_LATEST`. Base plus a compile fails at `linker cc not found` on a cold cache (PMS-705, PMS-706); the fix is the label, never a run-time `zypper install gcc`. `scripts/check-runner-labels.nu` (in `just check` and `check.yml`) enforces this and requires every `runs-on:` to carry a comment justifying its label.
+CI runner labels (PMS-719, GOV-43): a job that compiles on the runner requests `RUNS_ON_OPENSUSE_BASE_HEAVY` (only that image ships `cc` / `gcc` / `ld` plus glibc and OpenSSL headers); everything else stays on `RUNS_ON_OPENSUSE_BASE_MEDIUM`. Base plus a compile fails at `linker cc not found` on a cold cache (PMS-705, PMS-706); the fix is the label, never a run-time `zypper install gcc`. `scripts/check-runner-labels.nu` (in `just check` and `check.yml`) enforces this and requires every `runs-on:` to carry a comment justifying its label.
 
 ## OCI cache (PMS-720, GOV-20)
 

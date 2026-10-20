@@ -311,6 +311,68 @@ impl TimeTrackingService {
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
     }
 
+    /// MAPPS-984: sum `duration_minutes` across non-rejected entries matching
+    /// the filter, in one aggregate query. Lets the dashboard "time this
+    /// week" widget replace a paged `/time-entries` fetch with one request.
+    /// Rejected entries are excluded for the same reason the project/task
+    /// `actual_hours` roll-ups exclude them (PMS-944): a rejected entry is
+    /// not time worked.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
+    pub async fn sum_time_entry_minutes(
+        &self,
+        tenant_id: TenantId,
+        filter: &TimeEntryFilter,
+    ) -> AppResult<i64> {
+        let mut conds = vec![
+            "tenant_id = $1".to_string(),
+            "approval_status <> 'rejected'".to_string(),
+        ];
+        let mut idx = 2u32;
+        let mut push_filter = |col: &str, op: &str| {
+            conds.push(format!("{col} {op} ${idx}"));
+            idx += 1;
+        };
+        if filter.user_id.is_some() {
+            push_filter("user_id", "=");
+        }
+        if filter.ticket_id.is_some() {
+            push_filter("ticket_id", "=");
+        }
+        if filter.project_id.is_some() {
+            push_filter("project_id", "=");
+        }
+        if filter.date_from.is_some() {
+            push_filter("date", ">=");
+        }
+        if filter.date_to.is_some() {
+            push_filter("date", "<=");
+        }
+        let where_clause = conds.join(" AND ");
+        let sql = format!(
+            "SELECT COALESCE(SUM(duration_minutes), 0)::bigint
+             FROM time_entries WHERE {where_clause}"
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(tenant_id);
+        if let Some(v) = filter.user_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.ticket_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.project_id {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.date_from {
+            q = q.bind(v);
+        }
+        if let Some(v) = filter.date_to {
+            q = q.bind(v);
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let minutes = q.fetch_one(&mut *tx).await?;
+        Ok(minutes)
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_time_entry(
         &self,

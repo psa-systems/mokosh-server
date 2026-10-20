@@ -44,7 +44,7 @@ jobs:
     # the dev image ships the C toolchain + OpenSSL headers that needs. Base
     # fails at `linker cc not found` (PMS-706), the same reason integration.yml
     # carries this label.
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # The same outer backstop integration.yml carries, and for the same reason:
     # nextest's own slow-timeout reports a stuck case, this only stops a wedge

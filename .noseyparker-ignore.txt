@@ -1,0 +1,76 @@
+# PMS-1286: paths whose scanner findings are provably false positives.
+# One sentence per entry naming WHY the exclusion is safe. A real secret
+# in any of these paths is the same incident class a scan on a clean path
+# would catch; files are listed individually rather than widening a parent
+# glob so a future contributor cannot land a real secret under cover of a
+# module-wide exemption. Comments do NOT quote the fixture strings
+# themselves, or the ignore file re-triggers the scanner on itself.
+
+# This file. The scanner has no way to tell its own ignore list apart from
+# a committed secret-shaped string in another plain-text file.
+.noseyparker-ignore.txt
+
+# Integration test fixtures. Every password in `tests/` is seeded by
+# `tests/common/mod.rs` against the per-test disposable Postgres and
+# redeemed inside the same test run.
+tests/
+
+# Documentation examples. The strings are what the operator is told to
+# type, not credentials in use.
+docs/
+
+# Dev-stack entrypoint. `.env` is generated per clone via `openssl rand`
+# in the `ensure-env` recipe; the DB-URL strings here are Nushell
+# variable templates that resolve to the generated values at run time,
+# never shipped as literals.
+justfile
+
+# Env-var NAME string literals. The text matches the key an operator
+# sets; the value lives in `.env`, Infisical or the application-secret
+# provider and never in these files.
+src/config/registry.rs
+src/app_secrets/mod.rs
+
+# Dev-only default. `AppConfig::from_env` falls back to a hardcoded
+# localhost URL so a fresh clone can boot; production refuses an unset
+# DATABASE_URL and the probe at `provision.rs` fails before this
+# fallback is reached.
+src/main.rs
+
+# Lazy-pool test fixtures. The URL builds a `PgPool::connect_lazy` that
+# NEVER connects, used to assert the router produces 404 for an unmounted
+# path without touching the database.
+src/modules/auth/routes.rs
+src/modules/forms/routes.rs
+
+# Dotenv-upsert round-trip fixture. The URL exercises an `=` char in a
+# stored password through the upsert logic, not a credential in use.
+src/infisical/dev.rs
+
+# AWS SigV4 reference test vectors. The access-key and secret-key literals
+# are the AWS documented example credentials from their SigV4 signing
+# guide; they do not authenticate against any real AWS account.
+src/storage/s3.rs
+
+# Argon2 password-hashing round-trip test fixture.
+src/utils/crypto.rs
+
+# Credential-DTO deserialization fixture. The literal is the sample value
+# fed to `serde_json::from_value` to assert the struct parses.
+src/modules/assets/models.rs
+
+# Infisical bootstrap request-shape fixtures. The password + client-secret
+# literals are inputs to `BootstrapInput::sample_input` and a parse test
+# over a documented sample JSON payload.
+src/infisical/bootstrap.rs
+
+# Doc comment mentioning HTTP Basic Authentication's base64 wire format
+# as the shape the auth gate accepts; no secret is embedded.
+src/providers/status/auth.rs
+
+# Doc comment in a header showing the command an operator types.
+scripts/audit-portal-no-credential.nu
+
+# CI service postgres uses the default superuser login against a
+# container-scoped database that lives only for the duration of the job.
+.forgejo/workflows/

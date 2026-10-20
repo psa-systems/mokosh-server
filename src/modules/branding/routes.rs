@@ -57,7 +57,11 @@ pub fn staff_routes(db: Database) -> Router {
     // `{asset}` segment, and `store` only picks the per-kind cap once the
     // body is already buffered, so the route's `DefaultBodyLimit` has to
     // cover the largest of the three for its scope.
-    let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company(Uuid::nil()));
+    // Dummy ids: max_bytes_for_scope only matches on the variant.
+    let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company {
+        tenant: Uuid::nil(),
+        company: Uuid::nil(),
+    });
     let tenant_max_bytes = store.max_bytes_for_scope(AssetScope::Tenant(Uuid::nil()));
     let state = StaffBrandingState {
         // PMS-1234: gives the tenant-logo write path (only) a ledger, the
@@ -94,13 +98,17 @@ async fn staff_upload_company_asset(
     }
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
-    verify_company_in_tenant(&state.db, user.tenant().get(), company_id).await?;
+    let tenant_id = user.tenant().get();
+    verify_company_in_tenant(&state.db, tenant_id, company_id).await?;
     upload_asset(
         &state.store,
         &state.db,
-        AssetScope::Company(company_id),
+        AssetScope::Company {
+            tenant: tenant_id,
+            company: company_id,
+        },
         kind,
-        user.tenant().get(),
+        tenant_id,
         multipart,
     )
     .await
@@ -114,13 +122,17 @@ async fn staff_delete_company_asset(
 ) -> AppResult<Response> {
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
-    verify_company_in_tenant(&state.db, user.tenant().get(), company_id).await?;
+    let tenant_id = user.tenant().get();
+    verify_company_in_tenant(&state.db, tenant_id, company_id).await?;
     delete_asset(
         &state.store,
         &state.db,
-        AssetScope::Company(company_id),
+        AssetScope::Company {
+            tenant: tenant_id,
+            company: company_id,
+        },
         kind,
-        user.tenant().get(),
+        tenant_id,
     )
     .await
 }
@@ -193,7 +205,10 @@ pub fn contact_routes(
 ) -> Router {
     let store = BrandingAssetStore::from_env();
     // PMS-1233: see the matching comment in `staff_routes`.
-    let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company(Uuid::nil()));
+    let company_max_bytes = store.max_bytes_for_scope(AssetScope::Company {
+        tenant: Uuid::nil(),
+        company: Uuid::nil(),
+    });
     let state = ContactBrandingState {
         store: Arc::new(store.with_ledger(db.clone())),
         db,
@@ -221,7 +236,10 @@ async fn contact_upload_asset(
     upload_asset(
         &state.store,
         &state.db,
-        AssetScope::Company(session.company_id),
+        AssetScope::Company {
+            tenant: session.tenant_id,
+            company: session.company_id,
+        },
         kind,
         session.tenant_id,
         multipart,
@@ -240,7 +258,10 @@ async fn contact_delete_asset(
     delete_asset(
         &state.store,
         &state.db,
-        AssetScope::Company(session.company_id),
+        AssetScope::Company {
+            tenant: session.tenant_id,
+            company: session.company_id,
+        },
         kind,
         session.tenant_id,
     )
@@ -288,16 +309,22 @@ async fn serve_company_asset(
 ) -> AppResult<Response> {
     let kind =
         BrandAssetKind::from_segment(&asset).ok_or_else(|| AppError::not_found("asset kind"))?;
-    let mime: Option<String> = sqlx::query_scalar(&format!(
-        "SELECT branding->>'{}' FROM companies WHERE id = $1",
+    // PMS-1397: resolve the owning tenant alongside the stored mime so
+    // the storage layer can address the asset under its tenant.
+    let row: Option<(Uuid, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT tenant_id, branding->>'{}' FROM companies WHERE id = $1",
         kind.mime_field()
     ))
     .bind(company_id)
     .fetch_optional(state.db.migrator_pool())
-    .await?
-    .flatten();
-    let mime = mime.ok_or_else(|| AppError::NotFound("Asset".to_string()))?;
-    let scope = AssetScope::Company(company_id);
+    .await?;
+    let (tenant_id, mime) = row
+        .and_then(|(t, m)| m.map(|mime| (t, mime)))
+        .ok_or_else(|| AppError::NotFound("Asset".to_string()))?;
+    let scope = AssetScope::Company {
+        tenant: tenant_id,
+        company: company_id,
+    };
     serve_asset(&state.store, scope, kind, &mime, &headers).await
 }
 
@@ -480,13 +507,13 @@ async fn write_branding_asset(
         kind.mime_field(): mime,
     });
     let affected = match scope {
-        AssetScope::Company(company_id) => sqlx::query(
+        AssetScope::Company { company, .. } => sqlx::query(
             "UPDATE companies \
              SET branding = branding || $3::jsonb, updated_at = NOW() \
              WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
-        .bind(company_id)
+        .bind(company)
         .bind(&patch)
         .execute(db.migrator_pool())
         .await?
@@ -504,7 +531,7 @@ async fn write_branding_asset(
     };
     if affected == 0 {
         return Err(AppError::NotFound(match scope {
-            AssetScope::Company(_) => "Company".to_string(),
+            AssetScope::Company { .. } => "Company".to_string(),
             AssetScope::Tenant(_) => "Tenant".to_string(),
         }));
     }

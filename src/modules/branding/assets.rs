@@ -3,24 +3,30 @@
 //! the three asset kinds (logo, favicon, background) uniformly per
 //! scope.
 //!
-//! Storage layout under `$ATTACHMENT_DIR`:
+//! Storage layout under `$ATTACHMENT_DIR` (PMS-1397 moves all five
+//! non-logo pairs under their tenant; PMS-1234 did the logo first):
 //!
 //! ```text
 //! attachments/
-//!   tenant-favicons/{tenant_id}.{ext}
-//!   tenant-backgrounds/{tenant_id}.{ext}
-//!   company-logos/{company_id}.{ext}
-//!   company-favicons/{company_id}.{ext}
-//!   company-backgrounds/{company_id}.{ext}
+//!   {tenant_id}/branding/favicon.{ext}
+//!   {tenant_id}/branding/background.{ext}
+//!   {tenant_id}/branding/company-logos/{company_id}.{ext}
+//!   {tenant_id}/branding/company-favicons/{company_id}.{ext}
+//!   {tenant_id}/branding/company-backgrounds/{company_id}.{ext}
 //! ```
 //!
 //! The tenant logo write (`AssetScope::Tenant` + `BrandAssetKind::Logo`)
 //! converges on the same object key `src/modules/tenants/logo.rs` writes
 //! (PMS-1234): both entry points call through `ObjectKey::tenant_logo` and
 //! record the same `FileLedger` row, so a logo uploaded from either route is
-//! the same object. This module owns the on-disk layout for the two new
-//! tenant kinds (favicon + background) plus every Company kind, none of
-//! which have an `ObjectKind` of their own yet.
+//! the same object.
+//!
+//! Legacy paths from before PMS-1397 (`tenant-favicons/{tenant}.{ext}`,
+//! `company-logos/{company}.{ext}`, etc.) remain readable through the
+//! `legacy_path_for` fallback below until `BrandingAssetMover` (PMS-1320
+//! one-shot) walks the ledger-less files over to the tenant-first paths.
+//! A write never falls back to legacy: an upload lands on the new path
+//! and the legacy copy is cleared.
 //!
 //! Same MIME allowlist as the tenant logo (`image/png|jpeg|webp|gif`);
 //! SVG stays refused. Per-kind size caps default to sensible values
@@ -64,23 +70,38 @@ pub type CompanyAssetKind = BrandAssetKind;
 /// Which scope an asset belongs to. Tenant scope maps to the MSP-
 /// level defaults every Company inherits; Company scope maps to the
 /// per-Company override.
+///
+/// PMS-1397: `Company` carries its tenant alongside its id so the
+/// storage layer can put the tenant first in the path without a second
+/// DB lookup at the write site. Public read routes resolve the tenant
+/// from `companies` before constructing the scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssetScope {
     Tenant(Uuid),
-    Company(Uuid),
+    Company { tenant: Uuid, company: Uuid },
 }
 
 impl AssetScope {
     fn subdir_prefix(self) -> &'static str {
         match self {
             Self::Tenant(_) => "tenant",
-            Self::Company(_) => "company",
+            Self::Company { .. } => "company",
         }
     }
 
     fn id(self) -> Uuid {
         match self {
-            Self::Tenant(id) | Self::Company(id) => id,
+            Self::Tenant(id) => id,
+            Self::Company { company, .. } => company,
+        }
+    }
+
+    /// The owning tenant for this scope. Used by the storage layer to
+    /// put the tenant first in every path (PMS-1318, PMS-1397).
+    fn tenant_id(self) -> Uuid {
+        match self {
+            Self::Tenant(id) => id,
+            Self::Company { tenant, .. } => tenant,
         }
     }
 }
@@ -91,6 +112,17 @@ impl BrandAssetKind {
             Self::Logo => "logos",
             Self::Favicon => "favicons",
             Self::Background => "backgrounds",
+        }
+    }
+
+    /// PMS-1397: filename stem for a Tenant-scoped (non-logo) asset
+    /// under the tenant-first layout. One file per kind per tenant, so
+    /// the kind IS the filename: `{tenant}/branding/favicon.{ext}`.
+    fn filename_stem(self) -> &'static str {
+        match self {
+            Self::Logo => "logo",
+            Self::Favicon => "favicon",
+            Self::Background => "background",
         }
     }
 
@@ -106,9 +138,11 @@ impl BrandAssetKind {
             (AssetScope::Tenant(_), Self::Background) => {
                 &keys::BRANDING_TENANT_BACKGROUND_MAX_BYTES
             }
-            (AssetScope::Company(_), Self::Logo) => &keys::BRANDING_COMPANY_LOGO_MAX_BYTES,
-            (AssetScope::Company(_), Self::Favicon) => &keys::BRANDING_COMPANY_FAVICON_MAX_BYTES,
-            (AssetScope::Company(_), Self::Background) => {
+            (AssetScope::Company { .. }, Self::Logo) => &keys::BRANDING_COMPANY_LOGO_MAX_BYTES,
+            (AssetScope::Company { .. }, Self::Favicon) => {
+                &keys::BRANDING_COMPANY_FAVICON_MAX_BYTES
+            }
+            (AssetScope::Company { .. }, Self::Background) => {
                 &keys::BRANDING_COMPANY_BACKGROUND_MAX_BYTES
             }
         }
@@ -268,13 +302,42 @@ impl BrandingAssetStore {
         .unwrap_or(0)
     }
 
+    /// PMS-1397: tenant-first layout.
+    ///
+    /// - Tenant/{favicon,background}: `{tenant}/branding/`
+    /// - Company/*                  : `{tenant}/branding/company-{kind}/`
     fn dir_for(&self, scope: AssetScope, kind: BrandAssetKind) -> PathBuf {
-        self.root
-            .join(format!("{}-{}", scope.subdir_prefix(), kind.kind_dir()))
+        let branding = self
+            .root
+            .join(scope.tenant_id().to_string())
+            .join("branding");
+        match scope {
+            AssetScope::Tenant(_) => branding,
+            AssetScope::Company { .. } => branding.join(format!("company-{}", kind.kind_dir())),
+        }
     }
 
+    /// PMS-1397: tenant-first path. The filename is the kind for a
+    /// Tenant-scoped asset (one asset per tenant) and the company id for
+    /// a Company-scoped asset.
     fn path_for(&self, scope: AssetScope, kind: BrandAssetKind, mime: &str) -> PathBuf {
+        let filename = match scope {
+            AssetScope::Tenant(_) => kind.filename_stem().to_string(),
+            AssetScope::Company { company, .. } => company.to_string(),
+        };
         self.dir_for(scope, kind)
+            .join(format!("{filename}.{}", extension_for(mime)))
+    }
+
+    /// PMS-1397 legacy fallback: the pre-move layout `{scope-prefix}-
+    /// {kind}/{id}.{ext}` shared one directory across tenants. Reads
+    /// fall through to this when the new tenant-first path misses, so
+    /// an asset uploaded before this ticket landed and not yet moved by
+    /// the one-shot mover still serves. Writes never touch legacy: the
+    /// new path is written and the legacy copy is cleared.
+    fn legacy_path_for(&self, scope: AssetScope, kind: BrandAssetKind, mime: &str) -> PathBuf {
+        self.root
+            .join(format!("{}-{}", scope.subdir_prefix(), kind.kind_dir()))
             .join(format!("{}.{}", scope.id(), extension_for(mime)))
     }
 
@@ -362,9 +425,15 @@ impl BrandingAssetStore {
                 .map_err(|_| AppError::NotFound("Asset".to_string()));
         }
 
-        tokio::fs::read(self.path_for(scope, kind, mime))
-            .await
-            .map_err(|_| AppError::NotFound("Asset".to_string()))
+        // PMS-1397: prefer the tenant-first path, fall through to the
+        // legacy shared-directory path until the one-shot mover reaches
+        // it. Both reads use the same mime+ext.
+        match tokio::fs::read(self.path_for(scope, kind, mime)).await {
+            Ok(bytes) => Ok(bytes),
+            Err(_) => tokio::fs::read(self.legacy_path_for(scope, kind, mime))
+                .await
+                .map_err(|_| AppError::NotFound("Asset".to_string())),
+        }
     }
 
     /// Size and an ETag for the currently-stored asset, without reading its
@@ -403,10 +472,13 @@ impl BrandingAssetStore {
             });
         }
 
-        let path = self.path_for(scope, kind, mime);
-        let meta = tokio::fs::metadata(&path)
-            .await
-            .map_err(|_| AppError::NotFound("Asset".to_string()))?;
+        // PMS-1397: prefer the tenant-first path, fall through to legacy.
+        let meta = match tokio::fs::metadata(self.path_for(scope, kind, mime)).await {
+            Ok(m) => m,
+            Err(_) => tokio::fs::metadata(self.legacy_path_for(scope, kind, mime))
+                .await
+                .map_err(|_| AppError::NotFound("Asset".to_string()))?,
+        };
         let size = meta.len();
         Ok(AssetMeta {
             size,
@@ -439,9 +511,13 @@ impl BrandingAssetStore {
                 .map_err(|_| AppError::NotFound("Asset".to_string()));
         }
 
-        let file = tokio::fs::File::open(self.path_for(scope, kind, mime))
-            .await
-            .map_err(|_| AppError::NotFound("Asset".to_string()))?;
+        // PMS-1397: prefer the tenant-first path, fall through to legacy.
+        let file = match tokio::fs::File::open(self.path_for(scope, kind, mime)).await {
+            Ok(f) => f,
+            Err(_) => tokio::fs::File::open(self.legacy_path_for(scope, kind, mime))
+                .await
+                .map_err(|_| AppError::NotFound("Asset".to_string()))?,
+        };
         Ok(Box::pin(file))
     }
 
@@ -484,9 +560,17 @@ impl BrandingAssetStore {
                 continue;
             }
             // Best-effort: same reasoning as above, for the local-path asset.
-            let path = self.path_for(scope, kind, mime);
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                tracing::warn!(path = %path.display(), error = %e, "failed to delete superseded brand asset");
+            // PMS-1397: clear both the tenant-first path and the legacy
+            // shared-directory path, so a re-upload that lands on the new
+            // path alone cannot leave a stale legacy copy that a later
+            // read falls back to.
+            for path in [
+                self.path_for(scope, kind, mime),
+                self.legacy_path_for(scope, kind, mime),
+            ] {
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to delete superseded brand asset");
+                }
             }
         }
     }
@@ -503,7 +587,9 @@ pub fn asset_path(scope: AssetScope, kind: BrandAssetKind) -> String {
     };
     match scope {
         AssetScope::Tenant(id) => format!("/api/v1/public/tenants/{id}/{segment}"),
-        AssetScope::Company(id) => format!("/api/v1/public/companies/{id}/{segment}"),
+        AssetScope::Company { company, .. } => {
+            format!("/api/v1/public/companies/{company}/{segment}")
+        }
     }
 }
 
@@ -536,8 +622,12 @@ mod tests {
 
     #[test]
     fn asset_path_stays_relative() {
-        let id = Uuid::nil();
-        let p = asset_path(AssetScope::Company(id), BrandAssetKind::Logo);
+        let tenant = Uuid::from_u128(1);
+        let company = Uuid::from_u128(2);
+        let p = asset_path(
+            AssetScope::Company { tenant, company },
+            BrandAssetKind::Logo,
+        );
         assert!(p.starts_with("/api/v1/public/companies/"));
         assert!(p.ends_with("/logo"));
     }
@@ -550,53 +640,11 @@ mod tests {
         assert!(p.ends_with("/favicon"));
     }
 
-    /// PMS-1318: the (scope, kind) pairs whose stored path does NOT begin with
-    /// the tenant, and the directory each one shares across tenants.
-    ///
-    /// Only `(Tenant, Logo)` goes through `ObjectKey`, so only it gets the
-    /// `{tenant}/...` prefix every other kind of stored object has
-    /// (`crate::storage::tests::every_object_kind_puts_its_tenant_first`). The
-    /// other five are built from a local path in this module and sit in one
-    /// shared directory per kind, which is the same shape PMS-960 removed for
-    /// KB attachments and PMS-1234 removed for the logo itself.
-    ///
-    /// This is NOT live cross-tenant exposure: the serving routes are
-    /// deliberately public with the id as the credential, so no key is
-    /// presented that could name another tenant's object. What is missing is
-    /// the property - a per-tenant bucket, quota, export or provider migration
-    /// has no prefix to be built on, which is the reason the logo moved.
-    ///
-    /// PMS-1397 moves them. The list is here rather than in a comment so that
-    /// closing it is a code change with a test behind it, and so a SIXTH pair
-    /// added on the local-path layout fails below instead of joining them
-    /// quietly.
-    const NOT_TENANT_SCOPED: &[(AssetScope, BrandAssetKind, &str)] = &[
-        (
-            AssetScope::Tenant(Uuid::nil()),
-            BrandAssetKind::Favicon,
-            "tenant-favicons",
-        ),
-        (
-            AssetScope::Tenant(Uuid::nil()),
-            BrandAssetKind::Background,
-            "tenant-backgrounds",
-        ),
-        (
-            AssetScope::Company(Uuid::nil()),
-            BrandAssetKind::Logo,
-            "company-logos",
-        ),
-        (
-            AssetScope::Company(Uuid::nil()),
-            BrandAssetKind::Favicon,
-            "company-favicons",
-        ),
-        (
-            AssetScope::Company(Uuid::nil()),
-            BrandAssetKind::Background,
-            "company-backgrounds",
-        ),
-    ];
+    /// PMS-1397 closed PMS-1318's gap: every (scope, kind) pair is
+    /// tenant-first now, so this list is empty. Kept as a `const` + a
+    /// dedicated test so a SIXTH pair re-introducing a tenant-less
+    /// path cannot land quietly.
+    const NOT_TENANT_SCOPED: &[(AssetScope, BrandAssetKind, &str)] = &[];
 
     fn store() -> BrandingAssetStore {
         BrandingAssetStore {
@@ -606,46 +654,47 @@ mod tests {
         }
     }
 
-    /// Exactly one pair is tenant-scoped, and it is the logo.
-    ///
-    /// `tenant_logo_id` is the classifier the store itself branches on, so
-    /// asserting over it is asserting over the real behaviour rather than a
-    /// restatement of the list. A sixth pair, or a pair moved onto `ObjectKey`
-    /// without updating the list, fails here.
+    /// PMS-1397: no (scope, kind) pair stores under a tenant-less path
+    /// any more. Also pins that every pair's new path begins with the
+    /// tenant id, so a future regression (returning to a shared root
+    /// directory per kind) fails here.
     #[test]
     fn the_unscoped_pairs_are_the_ones_pms_1318_found() {
+        assert!(
+            NOT_TENANT_SCOPED.is_empty(),
+            "PMS-1397 moved every pair under its tenant; a new entry here \
+             re-introduces the pre-move shared-directory layout. Add an \
+             ObjectKind or thread the tenant into the path instead."
+        );
+
+        let tenant = Uuid::from_u128(1);
+        let company = Uuid::from_u128(2);
         let every_pair = [
-            (AssetScope::Tenant(Uuid::nil()), BrandAssetKind::Logo),
-            (AssetScope::Tenant(Uuid::nil()), BrandAssetKind::Favicon),
-            (AssetScope::Tenant(Uuid::nil()), BrandAssetKind::Background),
-            (AssetScope::Company(Uuid::nil()), BrandAssetKind::Logo),
-            (AssetScope::Company(Uuid::nil()), BrandAssetKind::Favicon),
-            (AssetScope::Company(Uuid::nil()), BrandAssetKind::Background),
+            (AssetScope::Tenant(tenant), BrandAssetKind::Logo),
+            (AssetScope::Tenant(tenant), BrandAssetKind::Favicon),
+            (AssetScope::Tenant(tenant), BrandAssetKind::Background),
+            (
+                AssetScope::Company { tenant, company },
+                BrandAssetKind::Logo,
+            ),
+            (
+                AssetScope::Company { tenant, company },
+                BrandAssetKind::Favicon,
+            ),
+            (
+                AssetScope::Company { tenant, company },
+                BrandAssetKind::Background,
+            ),
         ];
-
-        for (scope, kind) in every_pair {
-            let through_object_key = BrandingAssetStore::tenant_logo_id(scope, kind).is_some();
-            let listed = NOT_TENANT_SCOPED
-                .iter()
-                .any(|(s, k, _)| s.subdir_prefix() == scope.subdir_prefix() && *k == kind);
-            assert_ne!(
-                through_object_key, listed,
-                "{}/{:?} is both tenant-scoped and listed as not, or neither;                  PMS-1397 closes this list and the entry comes off then",
-                scope.subdir_prefix(),
-                kind
-            );
-        }
-    }
-
-    /// Each listed pair really does land in a directory shared across tenants.
-    ///
-    /// Asserted against the path the store builds, so the list cannot go stale
-    /// by describing a layout the code stopped producing.
-    #[test]
-    fn an_unscoped_pair_shares_one_directory_across_tenants() {
         let s = store();
-        for (scope, kind, directory) in NOT_TENANT_SCOPED {
-            let path = s.path_for(*scope, *kind, "image/png");
+        for (scope, kind) in every_pair {
+            if BrandingAssetStore::tenant_logo_id(scope, kind).is_some() {
+                // Tenant logo goes through ObjectKey, which `crate::storage`
+                // already pins as tenant-first; this test covers the local-
+                // path branch.
+                continue;
+            }
+            let path = s.path_for(scope, kind, "image/png");
             let relative = path
                 .strip_prefix("/data/attachments")
                 .expect("the store builds under its root");
@@ -657,11 +706,39 @@ mod tests {
                 .to_string_lossy()
                 .to_string();
             assert_eq!(
-                &first,
-                directory,
-                "the list says {directory} but the store writes {}",
+                first,
+                scope.tenant_id().to_string(),
+                "{scope:?}/{kind:?} must store under its tenant; got {}",
                 relative.display()
             );
         }
+    }
+
+    /// PMS-1397: the legacy fallback keeps pre-move files readable
+    /// until `BrandingAssetMover` reaches them. Pins both path shapes
+    /// so a change to either stays visible here.
+    #[test]
+    fn legacy_path_matches_the_pre_pms_1397_layout() {
+        let tenant = Uuid::from_u128(1);
+        let company = Uuid::from_u128(2);
+        let s = store();
+        let legacy = s.legacy_path_for(
+            AssetScope::Company { tenant, company },
+            BrandAssetKind::Logo,
+            "image/png",
+        );
+        assert_eq!(
+            legacy,
+            PathBuf::from(format!("/data/attachments/company-logos/{company}.png"))
+        );
+        let legacy_tenant = s.legacy_path_for(
+            AssetScope::Tenant(tenant),
+            BrandAssetKind::Favicon,
+            "image/png",
+        );
+        assert_eq!(
+            legacy_tenant,
+            PathBuf::from(format!("/data/attachments/tenant-favicons/{tenant}.png"))
+        );
     }
 }

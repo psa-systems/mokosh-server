@@ -1485,15 +1485,12 @@ mod tests {
         assert!(StorageProviderKind::parse("").is_err());
     }
 
-    /// PMS-1317: the root comes from `STORAGE_ROOT`, or from `ATTACHMENT_DIR`
-    /// while that alias lives, or from the compiled-in default.
-    ///
-    /// The middle case is the one that matters on the day this ships: a
-    /// deployment whose compose file still says `ATTACHMENT_DIR` keeps its
-    /// root, rather than silently falling back to `./attachments` and serving
-    /// 404s for every file already on its volume.
+    /// PMS-1317 / PMS-1443: the root comes from `STORAGE_ROOT` or from the
+    /// compiled-in default. The deprecated-alias branch was removed with
+    /// PMS-1443; `check_boot_env` catches a compose file still forwarding
+    /// one before this resolver runs.
     #[test]
-    fn the_root_falls_back_to_the_deprecated_name_before_the_default() {
+    fn the_root_comes_from_storage_root_or_the_default() {
         let lookup = |pairs: Vec<(&'static str, &'static str)>| {
             move |name: &str| {
                 pairs
@@ -1507,19 +1504,13 @@ mod tests {
             StorageConfig::resolve(lookup(vec![("STORAGE_ROOT", "/new")])).root,
             PathBuf::from("/new")
         );
+        // PMS-1443: the deprecated name no longer supplies the root; the
+        // boot check refuses the compose file at startup instead. The
+        // resolver here sees nothing.
         assert_eq!(
             StorageConfig::resolve(lookup(vec![("ATTACHMENT_DIR", "/old")])).root,
-            PathBuf::from("/old"),
-            "a deployment that has not moved its compose file keeps its root"
-        );
-        assert_eq!(
-            StorageConfig::resolve(lookup(vec![
-                ("STORAGE_ROOT", "/new"),
-                ("ATTACHMENT_DIR", "/old"),
-            ]))
-            .root,
-            PathBuf::from("/new"),
-            "the current name wins, or the new one looks broken mid-migration"
+            PathBuf::from(DEFAULT_ROOT),
+            "the deprecated alias is dead: the resolver reads the default"
         );
         assert_eq!(
             StorageConfig::resolve(lookup(vec![])).root,
@@ -1527,10 +1518,11 @@ mod tests {
         );
     }
 
-    /// The provider selection takes the alias too, and an unset pair still
-    /// resolves to the hosting profile's default rather than erroring.
+    /// PMS-1443: the deprecated provider alias is gone. Setting
+    /// `STORAGE_BACKEND` reads as unset here; the boot check in
+    /// `env::check_boot_env` refuses the compose file at startup instead.
     #[test]
-    fn the_provider_selection_takes_the_deprecated_name_too() {
+    fn the_deprecated_provider_name_no_longer_supplies_a_value() {
         let (kind, source) = StorageProviderKind::resolve(provider::LOCAL, "s3")
             .expect("an explicit provider parses");
         assert_eq!(kind, StorageProviderKind::S3);
@@ -1539,12 +1531,8 @@ mod tests {
         let (value, by) = env::resolve(env::PROVIDER, |name| {
             (name == "STORAGE_BACKEND").then(|| "s3".to_string())
         });
-        assert_eq!(value.as_deref(), Some("s3"));
-        assert_eq!(by, env::SuppliedBy::Deprecated);
-        let (kind, source) = StorageProviderKind::resolve(provider::LOCAL, &value.unwrap())
-            .expect("the alias names a provider");
-        assert_eq!(kind, StorageProviderKind::S3);
-        assert_eq!(source, EnablementSource::Explicit);
+        assert_eq!(value, None);
+        assert_eq!(by, env::SuppliedBy::Unset);
     }
 
     /// No storage variable is read by NAME outside `storage::env` (PMS-1317).
