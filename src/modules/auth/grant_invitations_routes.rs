@@ -150,13 +150,12 @@ impl InvitationResponse {
     /// tenants). A missing row (deleted/soft-deleted tenant) leaves the slug
     /// `None`; the caller falls back to its own lookup.
     pub async fn with_tenant_slug(mut self, db: &Database) -> Self {
-        let slug: Option<String> =
-            sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
-                .bind(self.tenant_id)
-                .fetch_optional(db.migrator_pool())
-                .await
-                .ok()
-                .flatten();
+        let slug: Option<String> = sqlx::query_scalar("SELECT slug FROM tenants WHERE id = $1")
+            .bind(self.tenant_id)
+            .fetch_optional(db.migrator_pool())
+            .await
+            .ok()
+            .flatten();
         self.tenant_slug = slug;
         self
     }
@@ -167,7 +166,10 @@ impl InvitationResponse {
 /// design, so a per-row slug lookup would be an N+1 against `tenants`. A row
 /// whose tenant has no slug entry is left `None` to match
 /// `with_tenant_slug`'s single-row behaviour.
-async fn fill_tenant_slugs(db: &Database, mut rows: Vec<InvitationResponse>) -> Vec<InvitationResponse> {
+async fn fill_tenant_slugs(
+    db: &Database,
+    mut rows: Vec<InvitationResponse>,
+) -> Vec<InvitationResponse> {
     if rows.is_empty() {
         return rows;
     }
@@ -455,8 +457,9 @@ async fn create_invitation(
 
     // PMS-1499: fill `tenant_slug` on the create response too so the owner's
     // UI uses the same decode path as the inbox / accept / decline paths.
-    let invitation_response: InvitationResponse =
-        InvitationResponse::from(invitation).with_tenant_slug(&state.db).await;
+    let invitation_response: InvitationResponse = InvitationResponse::from(invitation)
+        .with_tenant_slug(&state.db)
+        .await;
     Ok((
         StatusCode::CREATED,
         Json(CreatedInvitationResponse {
@@ -611,17 +614,16 @@ async fn get_invitation_by_token(
     // bunyip_user_id the invitation row carries. An unresolved lookup
     // leaves the SPA's existing "unresolved person" helper to render a
     // placeholder; the page does not refuse to load.
-    let inviter_name: Option<String> =
-        sqlx::query_scalar(
-            "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
+    let inviter_name: Option<String> = sqlx::query_scalar(
+        "SELECT NULLIF(TRIM(CONCAT(first_name, ' ', last_name)), '') \
              FROM users WHERE bunyip_user_id = $1",
-        )
-        .bind(invitation.inviter_bunyip_user_id)
-        .fetch_optional(state.db.migrator_pool())
-        .await
-        .ok()
-        .flatten()
-        .flatten();
+    )
+    .bind(invitation.inviter_bunyip_user_id)
+    .fetch_optional(state.db.migrator_pool())
+    .await
+    .ok()
+    .flatten()
+    .flatten();
 
     Ok(Json(InvitationMetadata {
         mokosh_account_name: name,
