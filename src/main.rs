@@ -1103,6 +1103,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         async move { tenant_logo_mover.run_tick().await.map(|_| ()) },
     );
 
+    // PMS-1397: the five non-logo (scope, kind) pairs that still lived
+    // in a directory shared across tenants (`tenant-favicons/`,
+    // `tenant-backgrounds/`, `company-logos/`, `company-favicons/`,
+    // `company-backgrounds/`) now serve under `{tenant}/branding/...`.
+    // `BrandingAssetStore` reads fall back to the legacy layout until
+    // this pass reaches them, so a live asset keeps rendering.
+    mokosh_server::modules::branding::mover::arm(
+        mokosh_server::storage::StorageConfig::from_env().root,
+        db.clone(),
+    );
+
     // PMS-968: pre-existing gateway credentials out of their column and into
     // the configured secret provider.
     let gateway_credential_mover = mokosh_server::modules::billing::GatewayCredentialMover::new(

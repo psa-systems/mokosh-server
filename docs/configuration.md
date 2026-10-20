@@ -324,20 +324,8 @@ Every stored object lives under one root: `STORAGE_ROOT` when `STORAGE_PROVIDER`
 
 ### Paths that do not yet begin with their tenant
 
-Two kinds of path are exceptions, and an operator reading a volume will see both.
+**Old locations, read-only.** A knowledge base image written before the layout change is at `kb-articles/{id}`, a tenant logo written before it is at `tenant-logos/{tenant}.{ext}`, and the five pre-PMS-1397 branding directories (`tenant-favicons/`, `tenant-backgrounds/`, `company-logos/`, `company-favicons/`, `company-backgrounds/`) still carry files not yet moved. All are still served; a one-shot pass at each server start (`BrandingAssetMover` and friends) walks them to the paths above and nothing writes back.
 
-**Old locations, read-only.** A knowledge base image written before the layout change is at `kb-articles/{id}`, and a tenant logo written before it is at `tenant-logos/{tenant}.{ext}`. Both are still served, and a one-shot pass at each server start walks them to the paths above; once it has, neither directory refills. Nothing writes to them.
+Every current write goes under its tenant. The five branding pairs now land at `{tenant}/branding/favicon.{ext}`, `{tenant}/branding/background.{ext}` and `{tenant}/branding/company-{kind}/{company}.{ext}` through `src/modules/branding/assets.rs`.
 
-**Branding assets other than the tenant logo**, which are still on a shared directory per kind and are the subject of PMS-1397:
-
-| Path | What it is |
-|---|---|
-| `tenant-favicons/{tenant}.{ext}` | the tenant's favicon |
-| `tenant-backgrounds/{tenant}.{ext}` | the tenant's sign-in background |
-| `company-logos/{company}.{ext}` | a client company's logo |
-| `company-favicons/{company}.{ext}` | a client company's favicon |
-| `company-backgrounds/{company}.{ext}` | a client company's sign-in background |
-
-These are listed rather than left to be discovered, because the point of documenting a layout is that it is the real one. The three `company-*` directories carry no tenant at all. That is not a way for one tenant to read another's file through the API - the routes that serve these are deliberately public, with the id as the credential, so no tenant-scoped key is presented in the first place - but it does mean those five cannot be moved, quota-limited or exported per tenant until PMS-1397 lands.
-
-`crate::storage` is the only place any of this is decided, with `src/modules/branding/assets.rs` holding the five above. A caller is handed a tenant and an object identity and never a path, so a new kind of stored object cannot invent its own layout, and `storage::tests::every_object_kind_puts_its_tenant_first` fails the build if one is added without its tenant in front.
+`crate::storage` is the only place any of this is decided. A caller is handed a tenant and an object identity and never a path, so a new kind of stored object cannot invent its own layout, and `storage::tests::every_object_kind_puts_its_tenant_first` fails the build if one is added without its tenant in front.

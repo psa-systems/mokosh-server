@@ -39,7 +39,7 @@ jobs:
     # Dev label: `cargo test --tests` compiles natively on the runner, and only
     # the dev image ships the C toolchain + OpenSSL headers that needs. Base
     # fails at `linker cc not found` (PMS-706, same cause as check.yml).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Outer backstop. nextest's own `slow-timeout`/`terminate-after`
     # (`.config/nextest.toml`) is what produces a diagnostic for a stuck

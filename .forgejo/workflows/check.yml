@@ -40,7 +40,7 @@ jobs:
     # Dev label: this job compiles Rust natively on the runner, and only the
     # dev image carries `cc` / `gcc` / `ld` plus the OpenSSL headers openssl-sys
     # probes. Base fails at `linker cc not found` (PMS-705, CLAUDE-203).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
 
     # Backstop, not a target (PMS-829): 38 green runs between 2026-08-22 and
     # 2026-08-24 took 1.9-9.0 minutes, median 3.5. The headroom is for a cold
