@@ -384,19 +384,33 @@ jobs:
 
       - name: Secrets scan
         # PMS-1286: kingfisher excludes point at paths whose finding is
-        # provably a dev default, test fixture or env-var NAME string. The
-        # one-line reason per path lives in `.noseyparker-ignore.txt`
-        # alongside the broader noseyparker path-glob exclusions, so a
-        # future reader sees both scanner's exclusions in one place.
+        # provably a dev default, test fixture or env-var NAME string.
+        # kingfisher_skip_regex catches the same patterns in git history
+        # (the ignore file is path-only; `--exclude` does not reach a
+        # blob reachable only through `.git/objects/`). The one-line
+        # reason per path lives in `.noseyparker-ignore.txt` alongside
+        # the broader noseyparker path-glob exclusions.
         uses: https://dev.a8n.run/psa-systems/common/.forgejo/actions/check-secrets@main
         with:
           kingfisher_excludes: >-
             justfile
             .forgejo/workflows/integration.yml
             .forgejo/workflows/integration-unsupported.yml
+            .noseyparker-ignore.txt
             src/main.rs
             src/infisical/dev.rs
             src/modules/auth/routes.rs
             src/modules/forms/routes.rs
             src/storage/s3.rs
+            src/utils/crypto.rs
+            src/modules/assets/models.rs
+            src/infisical/bootstrap.rs
+            src/providers/status/auth.rs
+          # Dev-default and lazy-pool test URLs appear in older commits
+          # of `.forgejo/workflows/check.yml` and `justfile` under their
+          # pre-move paths, so `--exclude` cannot reach them; this regex
+          # suppresses the specific URL shapes everywhere they appear in
+          # git history. The regex is deliberately narrow: each
+          # alternative names a specific throwaway credential pair.
+          kingfisher_skip_regex: "postgres://(postgres:postgres|unused:unused|user:(pass|p=ssw=rd)|infisical:\\(\\$infisical_pg_password\\)|[^@:]+:\\(\\$[a-z_]+\\))@"
           noseyparker_ignore_file: .noseyparker-ignore.txt
