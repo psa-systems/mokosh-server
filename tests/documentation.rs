@@ -66,15 +66,16 @@ async fn seed_credential(
     id
 }
 
-async fn seed_article(pool: &PgPool, company_ids: &[Uuid], title: &str) -> Uuid {
+async fn seed_article(pool: &PgPool, author_id: Uuid, company_ids: &[Uuid], title: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO kb_articles \
-             (id, tenant_id, title, slug, content, visibility, status, company_ids) \
-         VALUES ($1, $2, $3, $4, '', 'client_specific', 'published', $5)",
+             (id, tenant_id, author_id, title, slug, content, visibility, status, company_ids) \
+         VALUES ($1, $2, $3, $4, $5, '', 'client_specific', 'published', $6)",
     )
     .bind(id)
     .bind(common::DEFAULT_TENANT_ID)
+    .bind(author_id)
     .bind(title)
     .bind(format!("slug-{}", id.simple()))
     .bind(company_ids)
@@ -86,13 +87,13 @@ async fn seed_article(pool: &PgPool, company_ids: &[Uuid], title: &str) -> Uuid 
 
 #[mokosh_test]
 async fn the_aggregate_returns_assets_credentials_and_articles_for_one_company(pool: PgPool) {
-    let (_admin, email, pw) = common::seed_admin(&pool).await;
+    let (admin, email, pw) = common::seed_admin(&pool).await;
     let company_id = common::seed_company(&pool).await;
 
     let asset = seed_asset(&pool, company_id, "QB-SRV-01").await;
     seed_credential(&pool, company_id, Some(asset), "QB admin login").await;
     seed_credential(&pool, company_id, None, "Office WiFi").await;
-    seed_article(&pool, &[company_id], "How to upgrade QuickBooks").await;
+    seed_article(&pool, admin, &[company_id], "How to upgrade QuickBooks").await;
 
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &pw).await;
@@ -120,7 +121,10 @@ async fn the_aggregate_returns_assets_credentials_and_articles_for_one_company(p
 
     let articles = body["articles"].as_array().expect("articles[]");
     assert_eq!(articles.len(), 1);
-    assert_eq!(articles[0]["title"].as_str(), Some("How to upgrade QuickBooks"));
+    assert_eq!(
+        articles[0]["title"].as_str(),
+        Some("How to upgrade QuickBooks")
+    );
 }
 
 #[mokosh_test]
@@ -151,7 +155,7 @@ async fn the_aggregate_omits_secret_material(pool: PgPool) {
 
 #[mokosh_test]
 async fn the_aggregate_scopes_to_one_company(pool: PgPool) {
-    let (_admin, email, pw) = common::seed_admin(&pool).await;
+    let (admin, email, pw) = common::seed_admin(&pool).await;
     let company_one = common::seed_company_named(&pool, "Acme One").await;
     let company_two = common::seed_company_named(&pool, "Acme Two").await;
 
@@ -159,8 +163,8 @@ async fn the_aggregate_scopes_to_one_company(pool: PgPool) {
     seed_asset(&pool, company_two, "two-01").await;
     seed_credential(&pool, company_one, None, "one-cred").await;
     seed_credential(&pool, company_two, None, "two-cred").await;
-    seed_article(&pool, &[company_one], "One article").await;
-    seed_article(&pool, &[company_two], "Two article").await;
+    seed_article(&pool, admin, &[company_one], "One article").await;
+    seed_article(&pool, admin, &[company_two], "Two article").await;
 
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &pw).await;
