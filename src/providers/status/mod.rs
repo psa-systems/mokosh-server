@@ -369,13 +369,11 @@ fn collect_storage_kind(
                 // "has staging moved" stops being a guess.
                 recorded_served_by: match supplied_by {
                     storage_env::SuppliedBy::Current => Some(var.name.to_string()),
-                    storage_env::SuppliedBy::Deprecated => var.deprecated.map(str::to_string),
                     storage_env::SuppliedBy::Unset => None,
                 },
                 live_holds: supplied_by != storage_env::SuppliedBy::Unset,
                 state: match supplied_by {
                     storage_env::SuppliedBy::Current => "unchanged".to_string(),
-                    storage_env::SuppliedBy::Deprecated => "deprecated_alias".to_string(),
                     storage_env::SuppliedBy::Unset => "unset".to_string(),
                 },
             }
