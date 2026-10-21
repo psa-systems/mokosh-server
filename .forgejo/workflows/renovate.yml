@@ -20,7 +20,7 @@ on:
 
 jobs:
   renovate:
-    uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@main  # secret-scope-ok: same-org shared workflow repo
+    uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@main
     with:
       target_repository: ${{ github.repository }}
-    secrets: inherit
+    secrets: inherit  # secret-scope-ok: reusable workflow needs RENOVATE_TOKEN (write:repository + write:issue) to open dependency-update PRs; this caller job runs no step and reads no secret itself
