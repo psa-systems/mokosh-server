@@ -5,6 +5,19 @@
 //! page. None has a SPA caller today; the Settings > Notifications screens
 //! that would wire them are deferred, not dead. Remove a route from this
 //! note when it ships a SPA caller.
+//!
+//! Exempted paths (named per MAPPS-1083):
+//!   - `/notification-channels`
+//!   - `/notification-channels/{id}`
+//!   - `/notification-templates`
+//!   - `/notification-templates/{id}`
+//!   - `/notification-rules`
+//!   - `/notification-rules/{id}`
+//!   - `/notifications`
+//!   - `/notifications/{id}/read`
+//!   - `/notifications/dispatch`
+//!   - `/notifications/preview`
+//!   - `/me/notification-preferences`
 
 use std::sync::Arc;
 

@@ -4,6 +4,10 @@
 //! The SPA that lets an admin pick a template when opening a ticket is
 //! deferred; the routes stay mounted so an admin can manage templates
 //! through the API meanwhile.
+//!
+//! Exempted paths (named per MAPPS-1083):
+//!   - `/ticket-templates`
+//!   - `/ticket-templates/{id}`
 
 use std::sync::Arc;
 
