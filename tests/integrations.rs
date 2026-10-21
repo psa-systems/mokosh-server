@@ -107,15 +107,9 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
         .collect();
     assert_eq!(
         providers,
-        vec![
-            "stripe",
-            "paypal",
-            "quickbooks",
-            "xero",
-            "google",
-            "microsoft"
-        ],
-        "the list is the registry, in its order"
+        vec!["quickbooks", "xero", "google", "microsoft"],
+        "the list is the registry filtered to providers exposed on the integrations page \
+         (MAPPS-1098: payment providers moved to Settings > Payment Gateways end-to-end)"
     );
 
     let xero = entry(&entries, MANAGED_HERE);
@@ -160,14 +154,57 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
         xero.get("managed_elsewhere").is_none(),
         "a provider managed here says nothing about being managed elsewhere: {xero}"
     );
-    // PMS-1312: Stripe is no longer one of them. Its connection came over, so
-    // the page must stop pointing at the payments settings for the connected
-    // fact even though the credential is still entered there.
-    let stripe = entry(&entries, "stripe");
-    assert!(
-        stripe.get("managed_elsewhere").is_none(),
-        "Stripe's connection home moved to integrations under PMS-1312: {stripe}"
-    );
+    // MAPPS-1098: payment providers (Stripe, PayPal) are not offered on
+    // the integrations surface at all. Their lifecycle lives entirely on
+    // Settings > Payment Gateways. The per-provider routes 404 for them.
+    for provider in ["stripe", "paypal"] {
+        let get = app
+            .client
+            .get(app.url(&format!("/api/v1/integrations/{provider}")))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("get payment provider");
+        assert_eq!(
+            get.status(),
+            StatusCode::NOT_FOUND,
+            "GET /integrations/{provider} must 404 after MAPPS-1098"
+        );
+
+        let put = app
+            .client
+            .put(app.url(&format!("/api/v1/integrations/{provider}")))
+            .bearer_auth(&token)
+            .json(&json!({ "capabilities": ["payments"] }))
+            .send()
+            .await
+            .expect("put payment provider");
+        assert_eq!(
+            put.status(),
+            StatusCode::NOT_FOUND,
+            "PUT /integrations/{provider} must 404 after MAPPS-1098"
+        );
+
+        let connect = connect(&app, &token, provider, json!({})).await;
+        assert_eq!(
+            connect.status(),
+            StatusCode::NOT_FOUND,
+            "POST /integrations/{provider}/connect must 404 after MAPPS-1098"
+        );
+
+        let disconnect = app
+            .client
+            .post(app.url(&format!("/api/v1/integrations/{provider}/disconnect")))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("disconnect payment provider");
+        assert_eq!(
+            disconnect.status(),
+            StatusCode::NOT_FOUND,
+            "POST /integrations/{provider}/disconnect must 404 after MAPPS-1098"
+        );
+    }
 }
 
 /// Connecting stores the credential through the secrets provider and marks the

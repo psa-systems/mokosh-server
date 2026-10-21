@@ -1544,9 +1544,8 @@ mod tests {
     /// what is asserted here is that this file names none of them.
     #[test]
     fn no_storage_variable_is_read_by_name_outside_the_env_module() {
-        // Comment lines are excluded: the doc comment above names the very
-        // pattern this looks for, which is the same reason
-        // `check-single-build.nu` strips them before it classifies a workflow.
+        // Comment lines are excluded: the doc comment above names the
+        // very pattern this looks for.
         let src: String = include_str!("mod.rs")
             .lines()
             .filter(|line| {

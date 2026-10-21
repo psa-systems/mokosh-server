@@ -184,6 +184,18 @@ impl ProviderDescriptor {
     pub fn supports(&self, capability: Capability) -> bool {
         self.supported_capabilities.contains(&capability)
     }
+
+    /// Whether this provider is offered on `Settings > Integrations`.
+    ///
+    /// A payment provider is not: its credential, test/live mode and active
+    /// toggle live entirely on `Settings > Payment Gateways`, and offering
+    /// a connect/disconnect button here on top of that is the redundancy
+    /// MAPPS-1098 removed. The provider stays in the registry (billing
+    /// still calls `set_payment_connection` for it) but is not exposed on
+    /// the integrations HTTP surface.
+    pub fn is_exposed_on_integrations_page(&self) -> bool {
+        !matches!(self.credential_home, CredentialHome::PaymentGateway)
+    }
 }
 
 /// Every provider, in the order the integrations page lists them.
@@ -365,6 +377,59 @@ mod tests {
                 REGISTRY.iter().any(|entry| entry.supports(*capability)),
                 "no provider supports {}",
                 capability.as_str()
+            );
+        }
+    }
+
+    /// MAPPS-1098: payment providers are not offered on the integrations
+    /// page; every other provider is. Pin this per-variant so a new payment
+    /// provider added without the `CredentialHome::PaymentGateway` tag
+    /// (or a non-payment provider accidentally tagged with it) does not
+    /// quietly cross between the two surfaces.
+    #[test]
+    fn is_exposed_on_integrations_page_matches_credential_home() {
+        for entry in REGISTRY {
+            let want = !matches!(entry.credential_home, CredentialHome::PaymentGateway);
+            assert_eq!(
+                entry.is_exposed_on_integrations_page(),
+                want,
+                "{} exposure disagrees with its credential home",
+                entry.provider.as_str()
+            );
+        }
+    }
+
+    /// MAPPS-1098: the two current payment providers (Stripe, PayPal) must
+    /// NOT be exposed on the integrations page. A regression here means a
+    /// duplicate connect button rematerialises on `Settings > Integrations`.
+    #[test]
+    fn stripe_and_paypal_are_not_exposed_on_integrations_page() {
+        for provider in [IntegrationProvider::Stripe, IntegrationProvider::Paypal] {
+            let d = descriptor(provider);
+            assert!(
+                !d.is_exposed_on_integrations_page(),
+                "{} must not appear on Settings > Integrations",
+                provider.as_str()
+            );
+        }
+    }
+
+    /// MAPPS-1098: the non-payment providers in the current registry stay
+    /// on the integrations page. A regression here means a legitimate
+    /// provider disappears from the only screen it has.
+    #[test]
+    fn non_payment_providers_are_exposed_on_integrations_page() {
+        for provider in [
+            IntegrationProvider::Quickbooks,
+            IntegrationProvider::Xero,
+            IntegrationProvider::Google,
+            IntegrationProvider::Microsoft,
+        ] {
+            let d = descriptor(provider);
+            assert!(
+                d.is_exposed_on_integrations_page(),
+                "{} must appear on Settings > Integrations",
+                provider.as_str()
             );
         }
     }
