@@ -667,6 +667,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let google_client = std::sync::Arc::new(
         mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
     );
+    // MAPPS-1101: same posture as the Google client above. One Entra app
+    // registration held by the deployment; a half-configured pair raises a
+    // boot error naming the missing half. One shared handle swapped at
+    // runtime so a Settings write takes effect in both the router and the
+    // worker without a restart.
+    let microsoft_client = match mokosh_server::app_secrets::current() {
+        Some(secrets) => {
+            mokosh_server::modules::contact_sync::microsoft_oauth::OauthClient::from_app_secrets(
+                secrets.as_ref(),
+            )?
+        }
+        None => None,
+    };
+    let microsoft_client = std::sync::Arc::new(
+        mokosh_server::modules::contact_sync::microsoft_oauth::SharedMicrosoftClient::new(
+            microsoft_client,
+        ),
+    );
     // PMS-1444: the router's deployment-wide Google client handler writes
     // through these. `init_from_env` above installed them, so `current()` is
     // Some; the error path exists because an `expect` in `main` would be a
@@ -950,7 +968,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The worker refreshes each run's access token, which is an exchange
         // with the same client the connection was made under, so it needs the
         // host client as much as the request path does.
-        .with_host_client(google_client.clone()),
+        .with_host_client(google_client.clone())
+        // MAPPS-1101: the worker also refreshes Microsoft 365 access tokens.
+        .with_microsoft_client(microsoft_client.clone()),
     );
     let contact_sync_notifications =
         mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
@@ -1231,6 +1251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secrets.clone(),
         Some(contact_sync_wake),
         google_client,
+        microsoft_client,
         app_secrets,
         features,
     );

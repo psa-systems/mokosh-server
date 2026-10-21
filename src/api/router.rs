@@ -141,6 +141,11 @@ pub fn create_api_router(
     // a deployment that cannot connect Google Contacts, which the Settings card
     // reports; it is never a per-tenant state.
     google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    // MAPPS-1101: the deployment-wide Microsoft 365 Entra OAuth client, same
+    // posture as `google_client`. Held even when `.current()` is `None`
+    // (deployment holds no pair), so the Settings card can read it and
+    // report "not available on this deployment" rather than guess.
+    microsoft_client: Arc<crate::modules::contact_sync::microsoft_oauth::SharedMicrosoftClient>,
     // PMS-1444: the application-tier secrets this process serves, for the
     // deployment-wide handler that writes the Google client into them. Passed
     // rather than read from `app_secrets::current()` inside the handler: a
@@ -302,6 +307,9 @@ pub fn create_api_router(
         contact_sync = contact_sync.with_run_wake(wake);
     }
     contact_sync = contact_sync.with_host_client(google_client.clone());
+    // MAPPS-1101: the router service refreshes Microsoft 365 access tokens
+    // on the Sync-now path, same reasoning as `with_host_client` above.
+    contact_sync = contact_sync.with_microsoft_client(microsoft_client.clone());
     let contact_sync_service = std::sync::Arc::new(contact_sync);
     let time_tracking_service = TimeTrackingService::new(db.clone());
     let mileage_tracking_service = MileageTrackingService::new(db.clone());
