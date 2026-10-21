@@ -14,9 +14,17 @@
 -- `src/modules/expenses/models.rs`; the routes + service + worker are
 -- deferred to later phases of MAPPS-1100 (see the module doc comment).
 --
--- Six tables. All tenant-scoped with `tenant_isolation` RLS policy, and
--- all granted to `mokosh_app` (PMS-1265) so the serving role can read
--- them once the service lands.
+-- Six tables. All tenant-scoped with the fail-closed `tenant_isolation`
+-- RLS policy mirroring 038_rls_fail_closed.sql / 094 / 095 (an unset or
+-- empty `app.current_tenant` GUC collapses to NULL, so USING matches no
+-- rows and WITH CHECK rejects writes; FORCE binds the owner too), and
+-- all granted to `mokosh_app` (PMS-1265) so the serving role can touch
+-- them once Phase A's service lands.
+--
+-- Serving code path: there is NO service code in Phase 0, so no serving
+-- query reaches these tables yet. Phase A's `expenses::service` must run
+-- every query through `Database::begin_with_tenant` (PMS-285 posture),
+-- same as every other RLS-protected table.
 
 -- Vendors the MSP buys from. Separate from `companies` (the MSP's own
 -- customers): a vendor can be a customer too, but the roles are different
@@ -34,8 +42,10 @@ CREATE TABLE IF NOT EXISTS vendors (
 CREATE INDEX IF NOT EXISTS vendors_tenant_id_idx ON vendors (tenant_id);
 CREATE INDEX IF NOT EXISTS vendors_tenant_name_idx ON vendors (tenant_id, lower(name));
 ALTER TABLE vendors ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vendors FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vendors
-    USING (tenant_id = current_setting('app.tenant_id', TRUE)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
 GRANT SELECT, INSERT, UPDATE, DELETE ON vendors TO mokosh_app;
 
 -- Categories to classify what a bill or an expense was for. One shared
@@ -52,8 +62,10 @@ CREATE INDEX IF NOT EXISTS expense_categories_tenant_id_idx ON expense_categorie
 CREATE UNIQUE INDEX IF NOT EXISTS expense_categories_tenant_name_uq
     ON expense_categories (tenant_id, lower(name));
 ALTER TABLE expense_categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expense_categories FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON expense_categories
-    USING (tenant_id = current_setting('app.tenant_id', TRUE)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
 GRANT SELECT, INSERT, UPDATE, DELETE ON expense_categories TO mokosh_app;
 
 -- A bill from a vendor: what the MSP owes, with a due date and a status
@@ -86,8 +98,10 @@ CREATE INDEX IF NOT EXISTS bills_tenant_id_idx ON bills (tenant_id);
 CREATE INDEX IF NOT EXISTS bills_tenant_vendor_idx ON bills (tenant_id, vendor_id);
 CREATE INDEX IF NOT EXISTS bills_tenant_status_due_idx ON bills (tenant_id, status, due_date);
 ALTER TABLE bills ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bills FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON bills
-    USING (tenant_id = current_setting('app.tenant_id', TRUE)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
 GRANT SELECT, INSERT, UPDATE, DELETE ON bills TO mokosh_app;
 
 CREATE TABLE IF NOT EXISTS bill_lines (
@@ -106,8 +120,10 @@ CREATE TABLE IF NOT EXISTS bill_lines (
 CREATE INDEX IF NOT EXISTS bill_lines_tenant_id_idx ON bill_lines (tenant_id);
 CREATE INDEX IF NOT EXISTS bill_lines_bill_id_idx ON bill_lines (bill_id);
 ALTER TABLE bill_lines ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bill_lines FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON bill_lines
-    USING (tenant_id = current_setting('app.tenant_id', TRUE)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
 GRANT SELECT, INSERT, UPDATE, DELETE ON bill_lines TO mokosh_app;
 
 -- An expense: what one of the MSP's own people spent, pending approval
@@ -136,8 +152,10 @@ CREATE INDEX IF NOT EXISTS expenses_tenant_id_idx ON expenses (tenant_id);
 CREATE INDEX IF NOT EXISTS expenses_tenant_user_idx ON expenses (tenant_id, user_id);
 CREATE INDEX IF NOT EXISTS expenses_tenant_status_idx ON expenses (tenant_id, status);
 ALTER TABLE expenses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expenses FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON expenses
-    USING (tenant_id = current_setting('app.tenant_id', TRUE)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
 GRANT SELECT, INSERT, UPDATE, DELETE ON expenses TO mokosh_app;
 
 CREATE TABLE IF NOT EXISTS expense_lines (
@@ -154,6 +172,8 @@ CREATE TABLE IF NOT EXISTS expense_lines (
 CREATE INDEX IF NOT EXISTS expense_lines_tenant_id_idx ON expense_lines (tenant_id);
 CREATE INDEX IF NOT EXISTS expense_lines_expense_id_idx ON expense_lines (expense_id);
 ALTER TABLE expense_lines ENABLE ROW LEVEL SECURITY;
+ALTER TABLE expense_lines FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON expense_lines
-    USING (tenant_id = current_setting('app.tenant_id', TRUE)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
 GRANT SELECT, INSERT, UPDATE, DELETE ON expense_lines TO mokosh_app;
