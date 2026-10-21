@@ -647,6 +647,55 @@ impl ContactSyncService {
         ))
     }
 
+    /// MAPPS-1101: refuse a Microsoft 365 sync when the tenant has not
+    /// delegated the `Contacts` capability on the integrations row.
+    ///
+    /// This is the capability-gate half of the MAPPS-1101 wiring: the
+    /// connection and the delegation are two different facts (one on
+    /// `contact_sync_connections`, one on `integrations.enabled_capabilities`),
+    /// and sync should only fire when BOTH are present. A tenant that
+    /// connected Microsoft but then unticked Contacts under
+    /// `Settings > Integrations` wants the connection kept (the credential,
+    /// the folder selection, the review state) but the sync off until they
+    /// tick it again. Refusing here produces a `Conflict` that renders on
+    /// the connection's `last_error`, naming where to toggle the capability
+    /// back on.
+    ///
+    /// Google's symmetric gate stays implicit for now: contact_sync has one
+    /// Google provider that is always on when a connection exists, and
+    /// retrofitting the gate symmetrically would stop every existing Google
+    /// deployment's sync overnight. The gate is Microsoft-specific until
+    /// `integrations.enabled_capabilities` is populated for Google rows
+    /// across every deployment (follow-up).
+    pub async fn assert_microsoft_contacts_capability_delegated(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let has_delegation: Option<bool> = sqlx::query_scalar(
+            "SELECT 'contacts' = ANY(enabled_capabilities) \
+             FROM integrations WHERE tenant_id = $1 AND provider = 'microsoft'",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        match has_delegation {
+            Some(true) => Ok(()),
+            Some(false) => Err(AppError::Conflict(
+                "Microsoft 365 Contacts is connected but the Contacts capability is not \
+                 delegated to it. Tick Contacts for Microsoft 365 under Settings, \
+                 Integrations to let the sync run."
+                    .to_string(),
+            )),
+            None => Err(AppError::Conflict(
+                "Microsoft 365 has no integration row for this tenant yet. Delegate the \
+                 Contacts capability under Settings, Integrations and reconnect."
+                    .to_string(),
+            )),
+        }
+    }
+
     /// MAPPS-1101: Microsoft 365 counterpart to [`Self::begin_connect`].
     ///
     /// Writes a `contact_sync_oauth_states` row with provider = microsoft

@@ -15,6 +15,7 @@ pub use service::read_tenant_zone;
 pub use service::{
     read_ci_impact_max_depth, read_default_currency, read_default_due_business_days,
     read_email_intake_default_company, read_google_contacts_enabled, read_icloud_contacts_enabled,
+    read_microsoft_contacts_enabled,
     read_max_minutes_per_day, read_note_editing, read_segment_editing, read_track_breaks,
     read_workflow_rule_max_depth, SettingsService,
 };

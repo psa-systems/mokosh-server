@@ -152,6 +152,16 @@ impl SourceFactory for GoogleSourceFactory {
         // SecretKey address Google's does. The HTTP shape of the provider
         // itself (Graph) is Phase 1's `super::microsoft::MicrosoftContactsProvider`.
         if provider == "microsoft" {
+            // MAPPS-1101 Phase 5: capability-gate check. Refuses when the
+            // tenant has not delegated the Contacts capability on the
+            // integrations row, so a user who connected Microsoft but then
+            // unticked Contacts under Settings > Integrations stops the
+            // sync without losing the credential / folder selection /
+            // review state the connection owns. Google has no symmetric
+            // gate yet (see the method's docstring).
+            self.service
+                .assert_microsoft_contacts_capability_delegated(tenant_id)
+                .await?;
             let token = self
                 .service
                 .microsoft_access_token(tenant_id, connection_id)
@@ -434,8 +444,15 @@ impl ContactSyncRunner {
             // Google's flag for an iCloud run would have made one integration
             // turn the other off, which is the shape of bug that is only ever
             // found by the tenant it surprises.
+            // MAPPS-1101: Microsoft has its own flag too, plus a capability
+            // check against `integrations.enabled_capabilities` so a tenant
+            // can keep the connection but turn the sync off from the
+            // Integrations surface.
             let allowed = if provider == super::icloud::ICLOUD {
                 crate::modules::settings::read_icloud_contacts_enabled(&self.db, tenant_id).await?
+            } else if provider == "microsoft" {
+                crate::modules::settings::read_microsoft_contacts_enabled(&self.db, tenant_id)
+                    .await?
             } else {
                 crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
             };
