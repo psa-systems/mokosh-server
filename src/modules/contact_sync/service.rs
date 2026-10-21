@@ -34,6 +34,9 @@ const STATE_TTL_MINUTES: i64 = 10;
 
 /// The provider this phase implements.
 const GOOGLE: &str = "google";
+/// MAPPS-1101: the Microsoft 365 provider discriminator used throughout the
+/// state table, the connections table, and the dispatch factory.
+const MICROSOFT: &str = "microsoft";
 
 #[derive(Clone)]
 pub struct ContactSyncService {
@@ -448,6 +451,28 @@ impl ContactSyncService {
         ))
     }
 
+    /// Where Microsoft Entra sends the browser back to. Same posture as
+    /// [`Self::redirect_uri`]: byte-identical in the authorization URL and
+    /// the token exchange, and also what the Entra app registration lists
+    /// as a permitted redirect URI.
+    pub fn microsoft_redirect_uri(&self) -> AppResult<String> {
+        let base = self
+            .public_api_base
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                AppError::Configuration(
+                    "PUBLIC_API_BASE_URL is not set, so Microsoft has no address to return to."
+                        .to_string(),
+                )
+            })?;
+        Ok(format!(
+            "{}/api/v1/public/contact-sync/microsoft/callback",
+            base.trim_end_matches('/')
+        ))
+    }
+
     /// The consent URL for an admin to visit.
     ///
     /// Refuses when the integration is unconfigured rather than producing a
@@ -618,6 +643,171 @@ impl ContactSyncService {
         };
         Ok(format!(
             "{}/settings/integrations/google-contacts?contact_sync={flag}",
+            self.spa_base_url.trim_end_matches('/')
+        ))
+    }
+
+    /// MAPPS-1101: Microsoft 365 counterpart to [`Self::begin_connect`].
+    ///
+    /// Writes a `contact_sync_oauth_states` row with provider = microsoft
+    /// and returns the Entra authorization URL. A tenant without the
+    /// `contact_sync` module enabled is refused, same as the Google path.
+    pub async fn begin_microsoft_connect(
+        &self,
+        tenant_id: TenantId,
+        user_id: Uuid,
+    ) -> AppResult<String> {
+        self.assert_enabled(tenant_id, MICROSOFT).await?;
+        let client = self.require_microsoft_oauth_client()?;
+        let redirect_uri = self.microsoft_redirect_uri()?;
+        let pkce = Pkce::generate();
+        let secret = generate_token(48);
+        let state_hash = hash_password(&secret).await?;
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let state_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO contact_sync_oauth_states \
+             (tenant_id, provider, started_by_user_id, state_hash, code_verifier, redirect_uri, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+        )
+        .bind(tenant_id)
+        .bind(MICROSOFT)
+        .bind(user_id)
+        .bind(&state_hash)
+        .bind(&pkce.verifier)
+        .bind(&redirect_uri)
+        .bind(Utc::now() + Duration::minutes(STATE_TTL_MINUTES))
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let state = format!("{state_id}.{secret}");
+        Ok(super::microsoft_oauth::authorization_url(
+            &client,
+            &redirect_uri,
+            &state,
+            &pkce,
+        ))
+    }
+
+    /// MAPPS-1101: Microsoft 365 counterpart to [`Self::complete_connect`].
+    ///
+    /// SAFETY (PMS-285): runs with no session, so the tenant comes from the
+    /// state row the caller proved possession of. Every write is scoped to
+    /// that tenant. Mirrors Google's shape: load state, verify, consume,
+    /// exchange code, verify scope grant, record connection, redirect.
+    pub async fn complete_microsoft_connect(
+        &self,
+        state: &str,
+        code: &str,
+    ) -> AppResult<String> {
+        let (state_id, secret) = state
+            .split_once('.')
+            .ok_or_else(|| AppError::BadRequest("That sign-in link is not valid.".to_string()))?;
+        let state_id = Uuid::parse_str(state_id)
+            .map_err(|_| AppError::BadRequest("That sign-in link is not valid.".to_string()))?;
+
+        let row: Option<OauthStateRow> = sqlx::query_as(
+            "SELECT tenant_id, started_by_user_id, state_hash, code_verifier, redirect_uri, \
+                    consumed_at, expires_at \
+             FROM contact_sync_oauth_states WHERE id = $1 AND provider = $2",
+        )
+        .bind(state_id)
+        .bind(MICROSOFT)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some(OauthStateRow {
+            tenant_id: tenant_uuid,
+            started_by_user_id: started_by,
+            state_hash,
+            code_verifier,
+            redirect_uri,
+            consumed_at,
+            expires_at,
+        }) = row
+        else {
+            return Err(AppError::BadRequest(
+                "That connection attempt is no longer valid. Start again from Settings."
+                    .to_string(),
+            ));
+        };
+        let usable = consumed_at.is_none()
+            && expires_at > Utc::now()
+            && verify_password(secret, &state_hash).await.unwrap_or(false);
+        if !usable {
+            return Err(AppError::BadRequest(
+                "That connection attempt is no longer valid. Start again from Settings."
+                    .to_string(),
+            ));
+        }
+        let tenant_id = TenantId::from_trusted(tenant_uuid);
+        let client = self.require_microsoft_oauth_client()?;
+
+        // Consume BEFORE the exchange so a slow or failing exchange cannot
+        // be retried with the same state.
+        let consumed: u64 = sqlx::query(
+            "UPDATE contact_sync_oauth_states SET consumed_at = NOW() \
+             WHERE id = $1 AND consumed_at IS NULL",
+        )
+        .bind(state_id)
+        .execute(self.db.migrator_pool())
+        .await?
+        .rows_affected();
+        if consumed == 0 {
+            return Err(AppError::BadRequest(
+                "That connection attempt is no longer valid. Start again from Settings."
+                    .to_string(),
+            ));
+        }
+
+        let tokens = super::microsoft_oauth::exchange_code(
+            &self.http,
+            &client,
+            &redirect_uri,
+            code,
+            &code_verifier,
+        )
+        .await
+        .map_err(AppError::from)?;
+        let Some(refresh_token) = tokens.refresh_token.clone() else {
+            // Microsoft returns a refresh token when `offline_access` is in
+            // the granted scope; the SCOPES constant always includes it, so
+            // its absence means consent was changed on the Entra side and
+            // the Settings card has to say what to do rather than storing a
+            // connection that dies in an hour.
+            return Err(AppError::BadRequest(
+                "Microsoft did not return a refresh token. Revoke this app in the Microsoft account's privacy settings and connect again."
+                    .to_string(),
+            ));
+        };
+        if tokens
+            .scope
+            .as_deref()
+            .is_some_and(|granted| !super::microsoft_oauth::grants_contacts_read(granted))
+        {
+            return Err(AppError::BadRequest(
+                "This Microsoft account was connected without permission to read its contacts. Connect again and leave the Contacts permission ticked."
+                    .to_string(),
+            ));
+        }
+        let account_email =
+            super::microsoft_oauth::account_email(&self.http, &tokens.access_token).await?;
+
+        let outcome = self
+            .record_connection(
+                tenant_id,
+                started_by,
+                MICROSOFT,
+                &account_email,
+                &refresh_token,
+            )
+            .await?;
+        let flag = match outcome {
+            ConnectOutcome::Connected(_) => "connected",
+            ConnectOutcome::Reconnected(_) => "reconnected",
+        };
+        Ok(format!(
+            "{}/settings/integrations/microsoft-contacts?contact_sync={flag}",
             self.spa_base_url.trim_end_matches('/')
         ))
     }
