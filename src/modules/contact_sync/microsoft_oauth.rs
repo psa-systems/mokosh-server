@@ -120,7 +120,9 @@ impl OauthClient {
                 client_secret,
             })),
             (None, None) => Ok(None),
-            (Some(_), None) => Err(half_configured(GovernedSecret::MicrosoftContactsClientSecret)),
+            (Some(_), None) => Err(half_configured(
+                GovernedSecret::MicrosoftContactsClientSecret,
+            )),
             (None, Some(_)) => Err(half_configured(GovernedSecret::MicrosoftContactsClientId)),
         }
     }
@@ -352,12 +354,13 @@ pub async fn account_email(http: &reqwest::Client, access_token: &str) -> AppRes
             format!("userinfo refused ({})", response.status()),
         ));
     }
-    let info: UserInfo = response.json().await.map_err(|e| {
-        AppError::external_service("microsoft", format!("userinfo not JSON: {e}"))
-    })?;
-    info.email.filter(|e| !e.trim().is_empty()).ok_or_else(|| {
-        AppError::external_service("microsoft", "userinfo carried no email address")
-    })
+    let info: UserInfo = response
+        .json()
+        .await
+        .map_err(|e| AppError::external_service("microsoft", format!("userinfo not JSON: {e}")))?;
+    info.email
+        .filter(|e| !e.trim().is_empty())
+        .ok_or_else(|| AppError::external_service("microsoft", "userinfo carried no email address"))
 }
 
 #[cfg(test)]
@@ -391,7 +394,10 @@ mod tests {
     /// someone's address book.
     #[test]
     fn the_scopes_are_read_only() {
-        assert_eq!(SCOPES, &["Contacts.Read", "offline_access", "openid", "email"]);
+        assert_eq!(
+            SCOPES,
+            &["Contacts.Read", "offline_access", "openid", "email"]
+        );
         for scope in SCOPES {
             assert!(
                 !scope.contains("ReadWrite") && !scope.contains("Write"),
@@ -413,12 +419,7 @@ mod tests {
             client_secret: "the-secret".into(),
         };
         let pkce = Pkce::generate();
-        let url = authorization_url(
-            &client,
-            "https://example/callback",
-            "state-123",
-            &pkce,
-        );
+        let url = authorization_url(&client, "https://example/callback", "state-123", &pkce);
         assert!(url.starts_with(AUTH_ENDPOINT));
         assert!(url.contains("client_id=the-client"));
         assert!(url.contains("code_challenge="));

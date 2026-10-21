@@ -247,7 +247,9 @@ impl MicrosoftContactsProvider {
             let Some(page) = self.get::<DeltaPage>(&url).await? else {
                 return Ok(None);
             };
-            changes.contacts.extend(page.value.into_iter().map(Contact::into_source));
+            changes
+                .contacts
+                .extend(page.value.into_iter().map(Contact::into_source));
             match (page.next_link, page.delta_link) {
                 (Some(next), _) if !next.is_empty() => {
                     url = next;
@@ -322,9 +324,7 @@ impl ContactSyncProvider for MicrosoftContactsProvider {
                 "Microsoft Graph refused a full read as a stale delta token.".to_string(),
             ));
         }
-        tracing::info!(
-            "Microsoft Graph delta token expired; reading the whole address book"
-        );
+        tracing::info!("Microsoft Graph delta token expired; reading the whole address book");
         let mut changes = self.read_all(DELTA_PATH).await?.ok_or_else(|| {
             SourceError::Failed(
                 "Microsoft Graph refused a full read as a stale delta token.".to_string(),
@@ -457,7 +457,11 @@ impl Contact {
                 is_primary: true,
             });
         }
-        for business in self.business_phones.into_iter().filter_map(|p| non_empty(Some(p))) {
+        for business in self
+            .business_phones
+            .into_iter()
+            .filter_map(|p| non_empty(Some(p)))
+        {
             phones.push(SourcePhone {
                 number: business,
                 canonical: None,
@@ -465,7 +469,11 @@ impl Contact {
                 is_primary: false,
             });
         }
-        for home in self.home_phones.into_iter().filter_map(|p| non_empty(Some(p))) {
+        for home in self
+            .home_phones
+            .into_iter()
+            .filter_map(|p| non_empty(Some(p)))
+        {
             phones.push(SourcePhone {
                 number: home,
                 canonical: None,
@@ -582,30 +590,34 @@ mod tests {
         // Scripted bodies carry absolute URLs the client follows verbatim,
         // so they must point at the stub's own listener.
         let (stub, provider) = serve(vec![]).await;
-        let next_link = format!(
-            "{}/v1.0/me/contacts/delta?$skiptoken=p2",
-            provider.base_url
-        );
+        let next_link = format!("{}/v1.0/me/contacts/delta?$skiptoken=p2", provider.base_url);
         let delta_link = format!(
             "{}/v1.0/me/contacts/delta?$deltatoken=sync-1",
             provider.base_url
         );
-        let page1 = format!(
-            r#"{{"value": [{ADA}], "@odata.nextLink": "{next_link}"}}"#
-        );
+        let page1 = format!(r#"{{"value": [{ADA}], "@odata.nextLink": "{next_link}"}}"#);
         let page2 = format!(
             r#"{{"value": [{{"id": "contact-2", "@odata.etag": "W/\"e2\""}}], "@odata.deltaLink": "{delta_link}"}}"#
         );
-        stub.script.lock().unwrap().extend([(200, page1), (200, page2)]);
+        stub.script
+            .lock()
+            .unwrap()
+            .extend([(200, page1), (200, page2)]);
 
         let changes = provider.changes_since(None).await.expect("read");
         assert_eq!(changes.contacts.len(), 2);
-        assert_eq!(changes.next_sync_token.as_deref(), Some(delta_link.as_str()));
+        assert_eq!(
+            changes.next_sync_token.as_deref(),
+            Some(delta_link.as_str())
+        );
         assert!(!changes.was_full_resync);
 
         let seen = stub.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "two GETs: initial + nextLink");
-        assert!(seen[0].0.contains("$select="), "first call asks the field mask");
+        assert!(
+            seen[0].0.contains("$select="),
+            "first call asks the field mask"
+        );
         assert!(
             seen[1].0.contains("$skiptoken=p2"),
             "second call followed the nextLink verbatim: {}",
@@ -635,9 +647,7 @@ mod tests {
             "{}/v1.0/me/contacts/delta?$deltatoken=sync-2",
             provider.base_url
         );
-        let resync_body = format!(
-            r#"{{"value": [], "@odata.deltaLink": "{fresh_delta}"}}"#
-        );
+        let resync_body = format!(r#"{{"value": [], "@odata.deltaLink": "{fresh_delta}"}}"#);
         stub.script.lock().unwrap().clear();
         stub.script.lock().unwrap().extend([
             (410, r#"{"error":{"code":"syncStateNotFound"}}"#.to_string()),
@@ -654,7 +664,10 @@ mod tests {
             .expect("resync");
         assert!(changes.was_full_resync, "flagged for the mapping layer");
         assert_eq!(changes.contacts.len(), 0);
-        assert_eq!(changes.next_sync_token.as_deref(), Some(fresh_delta.as_str()));
+        assert_eq!(
+            changes.next_sync_token.as_deref(),
+            Some(fresh_delta.as_str())
+        );
     }
 
     #[tokio::test]
@@ -679,8 +692,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_read_with_no_cursor_terminates_cleanly() {
         // The server did not mint a deltaLink (one page, no next, no delta).
-        let (_stub, provider) =
-            serve(vec![(200, r#"{"value": [{"id": "x"}]}"#)]).await;
+        let (_stub, provider) = serve(vec![(200, r#"{"value": [{"id": "x"}]}"#)]).await;
         let changes = provider.changes_since(None).await.expect("read");
         assert_eq!(changes.contacts.len(), 1);
         assert_eq!(changes.next_sync_token, None, "next sync is a full read");
@@ -688,8 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_contact_maps_mobile_before_business_before_home() {
-        let (_stub, provider) =
-            serve(vec![(200, &format!(r#"{{"value": [{ADA}]}}"#))]).await;
+        let (_stub, provider) = serve(vec![(200, &format!(r#"{{"value": [{ADA}]}}"#))]).await;
         let changes = provider.changes_since(None).await.expect("read");
         let ada = &changes.contacts[0];
         assert_eq!(ada.display_name.as_deref(), Some("Ada Lovelace"));
@@ -729,7 +740,10 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].id, "folder-a");
         assert_eq!(groups[0].name, "Clients");
-        assert!(groups[0].member_count.is_none(), "Graph does not report counts here");
+        assert!(
+            groups[0].member_count.is_none(),
+            "Graph does not report counts here"
+        );
     }
 
     #[tokio::test]

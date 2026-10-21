@@ -65,6 +65,12 @@ pub struct ContactSyncService {
     /// default handle holds `None`, which is the honest answer for a process
     /// that never resolved one.
     host_client: Arc<SharedGoogleClient>,
+    /// MAPPS-1101: the handle to the host's Microsoft 365 Entra OAuth client,
+    /// swappable at runtime for the same reason the Google one is. Held even
+    /// on a deployment with no Microsoft client (then `.current()` is `None`
+    /// and connect attempts are refused with the "not available on this
+    /// deployment" shape).
+    microsoft_client: Arc<super::microsoft_oauth::SharedMicrosoftClient>,
     /// PMS-1429: run the import worker as soon as a run is queued, instead of
     /// leaving it to sleep out its interval.
     ///
@@ -343,6 +349,7 @@ impl ContactSyncService {
             public_api_base,
             spa_base_url,
             host_client: Arc::new(SharedGoogleClient::default()),
+            microsoft_client: Arc::new(super::microsoft_oauth::SharedMicrosoftClient::default()),
             run_wake: None,
             payment_methods: None,
             carddav_base_url: carddav::ICLOUD_BASE_URL.to_string(),
@@ -367,6 +374,24 @@ impl ContactSyncService {
     /// path) rather than read it.
     pub fn host_client_handle(&self) -> Arc<SharedGoogleClient> {
         self.host_client.clone()
+    }
+
+    /// Hand the service the shared handle holding the host's Microsoft 365
+    /// Entra OAuth client (MAPPS-1101). Same posture as [`Self::with_host_client`]:
+    /// one handle, shared by the router's service, the worker's service, and
+    /// the Settings write path.
+    pub fn with_microsoft_client(
+        mut self,
+        client: Arc<super::microsoft_oauth::SharedMicrosoftClient>,
+    ) -> Self {
+        self.microsoft_client = client;
+        self
+    }
+
+    /// The Microsoft client handle, for a caller that has to swap it rather
+    /// than read it.
+    pub fn microsoft_client_handle(&self) -> Arc<super::microsoft_oauth::SharedMicrosoftClient> {
+        self.microsoft_client.clone()
     }
 
     /// Hand the service the handle that wakes the import worker (PMS-1429).
@@ -842,6 +867,60 @@ impl ContactSyncService {
                     .to_string(),
             )
         })
+    }
+
+    /// MAPPS-1101: the deployment's Microsoft 365 Entra client, as of now.
+    /// `None` when the deployment holds no Microsoft pair; the Settings card
+    /// reads that as "not available on this deployment".
+    pub fn microsoft_oauth_client(&self) -> Option<super::microsoft_oauth::OauthClient> {
+        self.microsoft_client.current()
+    }
+
+    fn require_microsoft_oauth_client(&self) -> AppResult<super::microsoft_oauth::OauthClient> {
+        self.microsoft_oauth_client().ok_or_else(|| {
+            AppError::Configuration(
+                "Microsoft 365 Contacts is not available on this deployment. Its Entra ID sign-in \
+                 client is configured by whoever runs it."
+                    .to_string(),
+            )
+        })
+    }
+
+    /// MAPPS-1101: fresh access token for a Microsoft 365 contact-sync
+    /// connection. Parallel to [`Self::access_token`] (Google), with the two
+    /// providers' refresh paths kept separate because the OAuth clients and
+    /// endpoints differ. `GrantRevoked` is handled identically: the
+    /// connection is marked `reconnect_required` and the error is propagated
+    /// unchanged.
+    pub async fn microsoft_access_token(
+        &self,
+        tenant_id: TenantId,
+        connection_id: Uuid,
+    ) -> AppResult<String> {
+        let client = self.require_microsoft_oauth_client()?;
+        let refresh_token = self
+            .secrets
+            .get(&SecretKey::contact_sync(
+                tenant_id.get(),
+                "microsoft",
+                connection_id,
+            ))
+            .await?
+            .ok_or_else(|| {
+                AppError::Configuration(
+                    "This connection's credential is missing from the secret store.".to_string(),
+                )
+            })?;
+        match super::microsoft_oauth::refresh_access_token(&self.http, &client, &refresh_token)
+            .await
+        {
+            Ok(tokens) => Ok(tokens.access_token),
+            Err(TokenError::GrantRevoked) => {
+                self.mark_reconnect_required(tenant_id, connection_id).await;
+                Err(AppError::from(TokenError::GrantRevoked))
+            }
+            Err(other) => Err(AppError::from(other)),
+        }
     }
 
     /// Refuse while `integrations/google_contacts_enabled` is off (PSA-70 K).
