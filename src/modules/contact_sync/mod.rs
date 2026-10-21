@@ -29,6 +29,8 @@ pub mod icloud;
 pub mod locks;
 pub mod mapping;
 pub mod matching;
+pub mod microsoft;
+pub mod microsoft_oauth;
 pub mod normalize;
 pub mod oauth;
 pub mod provider;

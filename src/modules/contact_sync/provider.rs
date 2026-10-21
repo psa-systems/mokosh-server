@@ -62,7 +62,7 @@ use crate::utils::error::AppError;
 /// `vcard` is an uploaded file (PMS-1290): one tenant-level source row whose
 /// reads are the file a run imports, so it is never scheduled and has no
 /// credential.
-pub const SUPPORTED: &[&str] = &["google", "vcard", "icloud"];
+pub const SUPPORTED: &[&str] = &["google", "vcard", "icloud", "microsoft"];
 
 /// A group a source may offer for the records that carry no group at all, so
 /// they can be selected like any other (PMS-1290: a `.vcf` card with no
@@ -126,6 +126,13 @@ pub fn words(provider: &str) -> Words {
             credential_gone: "Apple no longer accepts this app-specific password. Enter a new one in Settings, Integrations",
             account: "Apple ID",
             vendor: "Apple",
+        },
+        "microsoft" => Words {
+            name: "Microsoft 365 Contacts",
+            group: "Microsoft 365 folder",
+            credential_gone: "Microsoft has revoked this connection. Connect the account again",
+            account: "Microsoft account",
+            vendor: "Microsoft",
         },
         _ => Words {
             name: "Contact import",
@@ -371,10 +378,11 @@ mod tests {
     #[test]
     fn the_supported_list_matches_the_migration_check() {
         // The latest statement of the CHECK: migration 220 created it, 238
-        // widened it for `vcard`, and 254 for `icloud` (PMS-1341). This
-        // constant moves with the newest one, which is the whole point of the
-        // guard reading a file rather than a list somebody keeps.
-        const MIGRATION: &str = include_str!("../../../migrations/254_icloud_contact_sync.sql");
+        // widened it for `vcard`, 254 for `icloud` (PMS-1341), and 276 for
+        // `microsoft` (MAPPS-1101). This constant moves with the newest one,
+        // which is the whole point of the guard reading a file rather than a
+        // list somebody keeps.
+        const MIGRATION: &str = include_str!("../../../migrations/276_microsoft_contact_sync.sql");
         let check = MIGRATION
             .split("CHECK (provider IN (")
             .nth(1)
@@ -398,11 +406,12 @@ mod tests {
     /// Nothing outside the list is servable, so a stored row naming one cannot
     /// be silently skipped.
     ///
-    /// `icloud` left this list under PMS-1341, which is the point: it was here as
-    /// an example of a provider the build does not serve, and it now does.
+    /// `icloud` left this list under PMS-1341, `microsoft` left under
+    /// MAPPS-1101: each was an example of a provider the build did not yet
+    /// serve, and each now does.
     #[test]
     fn an_unknown_provider_is_not_supported() {
-        for unknown in ["microsoft", "carddav", "exchange", "", "Google"] {
+        for unknown in ["carddav", "exchange", "", "Google"] {
             assert!(!is_supported(unknown), "{unknown:?} must not be supported");
         }
     }

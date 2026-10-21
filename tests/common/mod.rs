@@ -521,6 +521,12 @@ async fn boot_with_db(
         std::sync::Arc::new(
             mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
         ),
+        // MAPPS-1101: the host's Microsoft 365 Entra client, same posture as
+        // the Google handle above. `None` for every suite that does not care,
+        // which reads as a deployment that cannot connect Microsoft 365.
+        std::sync::Arc::new(
+            mokosh_server::modules::contact_sync::microsoft_oauth::SharedMicrosoftClient::default(),
+        ),
         // PMS-1444: application-tier secrets over THIS suite's database, which
         // is what lets the deployment-wide Google client handler be exercised
         // per test. `app_secrets::current()` would be the wrong answer here: it

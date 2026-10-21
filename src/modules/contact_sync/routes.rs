@@ -83,6 +83,17 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
             "/integrations/contact-sync/icloud/disconnect",
             post(disconnect_icloud),
         )
+        // MAPPS-1101: Microsoft 365 Connect flow. `authorize` writes the
+        // state row and returns the Entra consent URL; `disconnect` reuses
+        // the shared disconnect path (same shape as the Google pair above).
+        .route(
+            "/integrations/contact-sync/microsoft/authorize",
+            post(begin_microsoft_connect),
+        )
+        .route(
+            "/integrations/contact-sync/microsoft/disconnect",
+            post(disconnect_microsoft),
+        )
         .route("/integrations/contact-sync/selection", put(set_selection))
         .route("/integrations/contact-sync/preview", post(preview))
         .route(
@@ -131,6 +142,11 @@ pub fn contact_sync_public_routes(service: Arc<ContactSyncService>) -> Router {
     let state = ContactSyncRouterState { service };
     Router::new()
         .route("/contact-sync/google/callback", get(callback))
+        // MAPPS-1101: the Microsoft 365 Entra redirect lands here. Thin
+        // wrapper around `complete_microsoft_connect`, always a redirect
+        // back to the SPA, never a JSON body, same reasoning as the Google
+        // callback.
+        .route("/contact-sync/microsoft/callback", get(microsoft_callback))
         .with_state(state)
 }
 
@@ -202,10 +218,10 @@ impl ProviderQuery {
             .filter(|p| !p.is_empty())
         {
             None => Ok("google"),
-            Some(provider @ ("google" | "icloud")) => Ok(provider),
+            Some(provider @ ("google" | "icloud" | "microsoft")) => Ok(provider),
             Some(_) => Err(AppError::validation_field(
                 "provider",
-                "must be google or icloud",
+                "must be google, icloud, or microsoft",
             )),
         }
     }
@@ -573,6 +589,67 @@ async fn callback(
             // Logged with its shape, on the server, where an operator can see
             // it. The browser is told only that it failed.
             tracing::warn!("Google Contacts connect failed: {e}");
+            Redirect::to(&state.service.failure_redirect())
+        }
+    }
+}
+
+/// MAPPS-1101: POST, not GET, same reasoning as `begin_connect` (writes a
+/// state row; a GET that mutates is a GET a browser can be made to
+/// perform). Admin-gated.
+async fn begin_microsoft_connect(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+) -> AppResult<Json<AuthorizeResponse>> {
+    let authorize_url = state
+        .service
+        .begin_microsoft_connect(user.tenant(), user.id)
+        .await?;
+    Ok(Json(AuthorizeResponse { authorize_url }))
+}
+
+/// MAPPS-1101: thin wrapper around the shared disconnect path with
+/// provider = "microsoft". Admin-gated.
+async fn disconnect_microsoft(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    ctx: AuditCtx,
+) -> AppResult<StatusCode> {
+    state
+        .service
+        .disconnect(user.tenant(), "microsoft", &ctx)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// MAPPS-1101: Microsoft Entra lands here after the consent screen. Same
+/// shape as `callback` for Google: always a redirect back to the SPA, the
+/// reason is a flag in the query (never Microsoft's text, because the URL
+/// ends up in a browser history).
+async fn microsoft_callback(
+    State(state): State<ContactSyncRouterState>,
+    Query(query): Query<CallbackQuery>,
+) -> impl IntoResponse {
+    if let Some(reason) = query.error.as_deref() {
+        tracing::info!(
+            reason,
+            "the Microsoft consent screen returned without a code"
+        );
+        return Redirect::to(&state.service.failure_redirect());
+    }
+    let (Some(code), Some(state_param)) = (query.code.as_deref(), query.state.as_deref()) else {
+        return Redirect::to(&state.service.failure_redirect());
+    };
+    match state
+        .service
+        .complete_microsoft_connect(state_param, code)
+        .await
+    {
+        Ok(destination) => Redirect::to(&destination),
+        Err(e) => {
+            tracing::warn!("Microsoft 365 Contacts connect failed: {e}");
             Redirect::to(&state.service.failure_redirect())
         }
     }
