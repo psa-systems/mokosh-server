@@ -1115,9 +1115,12 @@ impl ContactSyncService {
     pub async fn assert_enabled(&self, tenant_id: TenantId, provider: &str) -> AppResult<()> {
         // PMS-1409: each integration has its own switch (PMS-1341), so this asks
         // the one the caller is actually using. Reading Google's flag for an
-        // iCloud request would have made one integration turn the other off.
+        // iCloud request would have made one integration turn the other off;
+        // PMS-1512 gives Microsoft the same treatment.
         let on = if provider == ICLOUD {
             crate::modules::settings::read_icloud_contacts_enabled(&self.db, tenant_id).await?
+        } else if provider == MICROSOFT {
+            crate::modules::settings::read_microsoft_contacts_enabled(&self.db, tenant_id).await?
         } else {
             crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
         };
@@ -1307,6 +1310,20 @@ impl ContactSyncService {
                 app_password,
             );
             return Ok((connection, Box::new(ICloudProvider::new(client))));
+        }
+        // PMS-1512: Microsoft's access token is minted against the Entra
+        // OAuth client, not Google's, matching `runs.rs::GoogleSourceFactory::source`.
+        if provider == MICROSOFT {
+            let token = self
+                .microsoft_access_token(tenant_id, connection.id)
+                .await?;
+            return Ok((
+                connection,
+                Box::new(super::microsoft::MicrosoftContactsProvider::new(
+                    self.http.clone(),
+                    token,
+                )),
+            ));
         }
         let token = self
             .access_token(tenant_id, connection.id, &connection.provider)
@@ -2125,6 +2142,12 @@ impl ContactSyncService {
         connection_id: Uuid,
         provider: &str,
     ) -> AppResult<String> {
+        // PMS-1512: Microsoft's refresh token is never sent to Google's token
+        // endpoint, even if a future caller reaches this function directly
+        // with `provider == MICROSOFT` instead of going through `source`.
+        if provider == MICROSOFT {
+            return self.microsoft_access_token(tenant_id, connection_id).await;
+        }
         let client = self.require_oauth_client()?;
         let refresh_token = self
             .secrets
