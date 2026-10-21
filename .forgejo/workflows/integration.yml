@@ -3,7 +3,8 @@
 # Postgres-backed integration gate: runs the full `tests/*.rs` suite against a
 # real database. Split out of check.yml (PMS-267) so the fast fmt/clippy/compile
 # gate is not blocked on a Postgres spin-up. Mirrored locally by
-# `just test-integration`.
+# `just test-integration`, which runs the unsharded profile (sharding is a CI
+# scheduling concern).
 #
 # DEV-612: pull_request only. The `push: main` run landed after the merge, so it
 # gated nothing, and re-ran a 440s suite against a tree the pull-request run had
@@ -15,23 +16,29 @@
 # the "same tree twice" trap DEV-612's deleted `check-single-build.nu` existed
 # to catch does not fire for the warm run.
 #
-# PMS-1394: this job runs the SUPPORTED suites. The tests for functionality
+# PMS-1253: this file now has three jobs. `build` compiles the nextest archive
+# ONCE under the full disk-headroom + cache + sampler shape; `test` is a
+# fail-fast=false matrix of N shards that download the archive and run
+# `--partition hash:k/N` under their own Postgres service; `summary` fails the
+# workflow if any shard failed, which is the one job name branch protection
+# needs to require. `hash:` keeps a test in the same shard across runs so a
+# slow case stays attributable (`count:k/N` would reassign on every added test
+# file, which makes per-shard timings incomparable across runs).
+#
+# PMS-1394: this file runs the SUPPORTED suites. The tests for functionality
 # nothing currently uses run weekly in `integration-unsupported.yml` instead,
 # because standing their dependencies up costs this job time on every pull
-# request for coverage of a path no deployment takes. Today that is
-# `tests/s3_storage.rs` and the MinIO the S3 backend needs, which also broke
-# every branch at once when its third-party image source retracted anonymous
-# pulls (PMS-1390).
-#
-# Which suites those are is NOT decided here. `.config/nextest.toml` carries
-# the split as a `default-filter` on the `ci` profile, so this job names a
-# profile and never a suite, and `just test-integration` selects the identical
-# set without either of them repeating the expression.
+# request for coverage of a path no deployment takes. Which suites those are
+# is NOT decided here. `.config/nextest.toml` carries the split as a
+# `default-filter` on the `ci` profile, so this job names a profile and never
+# a suite, and `just test-integration` selects the identical set without
+# either of them repeating the expression.
 #
 # The binaries are still BUILT here. `cargo nextest archive` compiles every
 # `tests/*.rs` target whatever the filter says, so a change that stops an
 # unsupported suite compiling still fails the pull request; only its
 # assertions moved.
+
 name: Integration
 
 on:
@@ -40,51 +47,24 @@ on:
       - main
 
 jobs:
-  integration:
-    name: integration tests
-    # Dev label: `cargo test --tests` compiles natively on the runner, and only
-    # the dev image ships the C toolchain + OpenSSL headers that needs. Base
-    # fails at `linker cc not found` (PMS-706, same cause as check.yml).
-    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_HEAVY }}
+  build:
+    name: build nextest archive
+    # Dev label: `cargo nextest archive` compiles natively on the runner, and
+    # only the dev image ships the C toolchain + OpenSSL headers that needs
+    # (PMS-705).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
 
-    # Outer backstop. nextest's own `slow-timeout`/`terminate-after`
-    # (`.config/nextest.toml`) is what produces a diagnostic for a stuck
-    # case now (PMS-1177); this only stops a wedge elsewhere in the job (a
-    # cold-cache compile included) from running until the runner's own
-    # limit. 30m clears the worst measured cold build (1017s) plus the
-    # 10-minute run target plus checkout and cache upload with headroom.
-    timeout-minutes: 30
-
-    # Postgres service for `cargo test --tests`. `#[mokosh_test]` migrates one
-    # template database against the URL in DATABASE_URL and clones a fresh
-    # database per invocation from it, so this single instance fans out to all
-    # integration tests.
-    #
-    # The Forgejo Actions runner puts the job container and its service
-    # containers on a shared bridge network; services are reachable from
-    # the job container by their service name on the container-internal
-    # port. localhost would resolve to the job container itself, where
-    # nothing is listening on 5432.
-    services:
-      postgres:
-        image: postgres:18.2-alpine3.23
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+    # Placeholder (PMS-1253): the first three green sharded runs after this
+    # lands will supply the measured wall times for `build`, each shard, and
+    # the summary; replace each `timeout-minutes` with 1.5x the longest
+    # observed value rounded up to 5 minutes, and record the measurements in
+    # the per-job comment. The historical unsharded build step took 111-731s
+    # (`7959c0e1`'s own data), so this bound covers the cold case with
+    # headroom until the measured value lands.
+    timeout-minutes: 25
 
     env:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
-      # Job-level rather than step-level (PMS-1177): the build step and the
-      # test step used to see different environments (only the test step set
-      # this), which was the leading suspect for the dirty cargo fingerprint
-      # that made the test step recompile the binaries the build step had
-      # just built. Both steps now build/run under the identical environment.
+      SQLX_OFFLINE: "true"
       RUST_BACKTRACE: 1
 
     steps:
@@ -92,29 +72,15 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
 
       - name: Require disk headroom for the link step
-        # Runs BEFORE the cache restore on purpose: a runner too full to link
-        # is also too full to usefully restore a multi-GB cargo cache, so
-        # failing first saves that download and leaves less on disk for
-        # whatever runs next.
-        # PMS-740. `cargo test --tests` links one debug binary per `tests/*.rs`
-        # suite, each several hundred MB, several concurrently under
-        # CARGO_BUILD_JOBS.
-        # When the runner filesystem fills mid-write, `rust-lld` writes its
-        # output through an mmap and takes SIGBUS, which surfaces as:
-        #
-        #   collect2: fatal error: ld terminated with signal 7 [Bus error]
-        #
-        # That reads as a toolchain crash and has twice been triaged as a
-        # code defect it never was (runs #3666 and #3719). Failing here
-        # instead names the real problem in one line, before 20 minutes of
-        # compilation is spent to reach a confusing crash.
-        #
-        # 25G is chosen as roughly twice the peak this suite's link stage has
-        # been observed to need. Raise it if the suite grows rather than
-        # lowering it after a near miss. How much the suite has grown is
-        # counted at run time and printed below rather than written into this
-        # comment: the hand-maintained literal that used to sit here read 22
-        # while the tree held 81 (PMS-858).
+        # PMS-740: the archive step links one debug binary per `tests/*.rs`
+        # suite. When the runner filesystem fills mid-write, `rust-lld`
+        # writes its output through an mmap and takes SIGBUS
+        # (`collect2: fatal error: ld terminated with signal 7 [Bus
+        # error]`), which has twice been triaged as a code defect it never
+        # was (runs #3666, #3719). Failing here instead names the real
+        # problem in one line, before 20 minutes of compilation reach a
+        # confusing crash. 25G = roughly twice the peak this suite's link
+        # stage has been observed to need.
         run: |
           suites=$(ls tests/*.rs | wc -l)
           avail_gb=$(df -P -BG . | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
@@ -139,25 +105,15 @@ jobs:
       - name: Install cargo-nextest
         # PMS-1177: nextest schedules test CASES from every archived binary
         # concurrently instead of running one `tests/*.rs` binary to
-        # completion before starting the next, which is where most of the
-        # previous wall clock went.
+        # completion before the next, which is where most of the previous
+        # wall clock went.
         #
-        # PMS-1251: `cargo install --locked cargo-nextest` compiled nextest
-        # and its dependency tree from source on every cache-miss run (717
-        # `Compiling` lines total, 333 of them nextest's own tree; every run
-        # logged `No cache found` on 2026-09-17, per DEV-758). A pinned
-        # release archive replaces it. get.nexte.st publishes no checksum
-        # file, so the archive's SHA-256 is pinned here and verified with
-        # `sha256sum --check --strict`, the same pattern the MinIO step in
-        # `integration-unsupported.yml` uses for the same reason.
-        #
-        # `ghcr.io/niceguyit/rust-builder-glibc` sets CARGO_HOME=/usr/local/cargo
-        # and puts only that on PATH, not `~/.cargo/bin` (`~` is `/root` in
-        # this image but `/root/.cargo/bin` is never added to PATH). Installing
-        # there left the binary on disk but invisible to `cargo`, which reports
-        # a plain "no such command: `nextest`" with no hint that the install
-        # step ran at all. `${CARGO_HOME:-$HOME/.cargo}/bin` is where `cargo`
-        # actually looks.
+        # PMS-1251: a pinned release archive replaces `cargo install --locked
+        # cargo-nextest`, which used to compile 717 `Compiling` lines on
+        # every cache-miss run (333 of them nextest's own tree). The pair
+        # here matches `cache-warm.yml`'s install step; bump both together
+        # when upgrading nextest, otherwise the warm cache the pull-request
+        # job restores was built against a different binary.
         env:
           NEXTEST_VERSION: "0.9.145"
           NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
@@ -171,72 +127,29 @@ jobs:
           tar --extract --gzip --file /tmp/nextest.tar.gz --directory "${cargo_bin}"
 
       - name: Cap build parallelism
-        # nproc/2 cap: never claim more than half the host (see "Concurrency
-        # cap" in CI.md of dev.a8n.run/niceguyit/governance; not a file in
-        # this repository).
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
-
-      - name: Disable Postgres durability
-        # PMS-1251: this `postgres` service is thrown away with the job, so
-        # fsync/synchronous_commit/full_page_writes buy crash safety this
-        # database never needs to survive into. Measured locally against
-        # postgres:18.2-alpine3.23 on 2026-09-17: the 229-migration run drops
-        # from 1.12-1.32s to 0.60-0.71s and `CREATE DATABASE ... TEMPLATE`
-        # from 104-146ms to 35-39ms. PMS-1254 moved the migration run to once
-        # per job, so what is paid about 1,300 times per run is now the clone.
-        # Kept out of
-        # scripts/test-db-roles.sql, which also runs against the dev cluster,
-        # whose data a developer keeps. All three settings are reloadable, so
-        # no restart is needed. ON_ERROR_STOP is not optional, for the same
-        # reason the DB-roles step below sets it.
-        run: |
-          psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 <<'SQL'
-          ALTER SYSTEM SET fsync = off;
-          ALTER SYSTEM SET synchronous_commit = off;
-          ALTER SYSTEM SET full_page_writes = off;
-          SELECT pg_reload_conf();
-          SQL
-          psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --command 'SHOW fsync'
-
-      - name: Create the DB roles the migrations grant to
-        # PMS-988: migration 207 (`app_secrets`) ends with `GRANT ... TO
-        # mokosh_app`, and Postgres rejects a GRANT to a role that does not
-        # exist (42704), so every test in the suite failed at migration 207
-        # before its body ran. A real deployment never reaches
-        # that: `provision_roles` creates the split roles at startup, before
-        # the migrations run. This job has no server startup, so the step that
-        # prepares the cluster creates the role instead. The statement lives in
-        # a file because `just ensure-test-db-roles` runs the same one against
-        # the dev cluster; scripts/test-db-roles.sql says why only the name is
-        # reproduced.
-        #
-        # ON_ERROR_STOP is not optional: psql exits 0 on a failed statement
-        # without it, which would put the failure back where it was, in the
-        # test output rather than here.
-        run: psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --file scripts/test-db-roles.sql
-
-      - name: Build the integration test binaries
+      - name: Build the integration test archive
         # PMS-1177: `cargo nextest archive` compiles every `tests/*.rs`
-        # binary plus the lib unit tests BEFORE the timed step, under only
-        # the job's outer budget, the same reason PMS-1100 split the compile
-        # out of the timed step in the first place. The archive is what the
-        # next step runs from with `--archive-file`, which cannot recompile,
-        # so a dirty fingerprint (this step and the next used to see
-        # different environments) can no longer make the timed step start
-        # with a `Compiling mokosh-server` line.
+        # binary plus the lib unit tests BEFORE the timed step, the same
+        # reason PMS-1100 split the compile out of the timed step in the
+        # first place. The archive is what each shard runs from with
+        # `--archive-file`, which cannot recompile, so a dirty fingerprint
+        # cannot make the test step start with a `Compiling mokosh-server`
+        # line (PMS-1253 AC: "No shard log contains a `Compiling
+        # mokosh-server` line").
         #
-        # The sampler records free space every 5s for the life of the build so
-        # a failure has evidence from DURING the link rather than from after
-        # it, when the space has already been released and the filesystem
-        # looks healthy. That gap is why the first two occurrences could not
-        # be pinned down (PMS-740). It lives here because the link is here.
+        # The sampler records free space every 5s for the life of the build
+        # so a failure has evidence from DURING the link rather than from
+        # after it, when the space has already been released and the
+        # filesystem looks healthy. That gap is why the first two
+        # occurrences could not be pinned down (PMS-740).
         run: |
           ( while :; do df -P -BM . | awk 'NR==2 {gsub(/M/, "", $4); print $4}'; sleep 5; done ) > /tmp/disk-samples-build.txt 2>/dev/null &
           sampler=$!
           started=$(date +%s)
           set +e
-          cargo nextest archive --archive-file /tmp/nextest-archive.tar.zst
+          cargo nextest archive --archive-file nextest-archive.tar.zst
           status=$?
           set -e
           kill "${sampler}" 2>/dev/null || true
@@ -250,52 +163,186 @@ jobs:
           fi
           exit "${status}"
 
-      - name: Build the template every test clones
-        # PMS-1254: the 243 migrations are applied ONCE per run, into a
-        # template database named after a digest of the migration set compiled
-        # into the test binary (PMS-1398: the same set that fills it), and
-        # each case is then a `CREATE DATABASE ... TEMPLATE` clone of it. The
-        # suite builds the template by itself when it finds none, under an
-        # advisory lock, so this step is not what makes the run correct; it is
-        # what makes the run legible. Done here, the build happens in a step of
-        # the job rather than inside whichever case arrived first with every
-        # other case waiting on the lock, and the line naming the template is
-        # printed where a reader can see it instead of into one case's captured
-        # output. That line, printed only by the process that did the build, is
-        # the evidence that the migrations ran once rather than 1,300 times.
-        #
-        # Run out of the archive the previous step built, so it compiles
-        # nothing: `--no-capture` is what lets the line through, and it forces
-        # a single thread, which is why it is a filtered run of its own rather
-        # than a flag on the suite.
+      - name: Upload the nextest archive
+        # Each shard downloads this with `forgejo/download-artifact@v4` and
+        # runs it with `--archive-file`, so no shard recompiles the test
+        # binaries. `retention-days: 1` is enough: the artifact is useful
+        # only to the matrix shards that `needs: build` on this job.
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
+  test:
+    name: integration tests (shard ${{ matrix.shard }}/3)
+    needs: build
+    # Dev label: the shard runs `cargo nextest run` against the archive, so
+    # the dev image's C toolchain and OpenSSL headers are available even
+    # though no compile happens here (PMS-705). A fallback compile from a
+    # dirty fingerprint would otherwise hit `linker cc not found` on the
+    # base image.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+
+    # Placeholder (PMS-1253): see the `build` job's comment. Historical
+    # unsharded test step took 508-938s on the fast runner, 701s on the slow
+    # one; the 8-CPU runner timed out at 30m before the archive step split
+    # (`#6274`). At N=3 each shard runs ~1/3 of the cases on an independent
+    # Postgres, so this bound is a cautious cold-start cover until the first
+    # three sharded runs supply the real number.
+    timeout-minutes: 20
+
+    strategy:
+      # Every shard still runs after one fails, so a slow case does not hide
+      # a different one in a different shard. The summary job folds the
+      # outcomes.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+
+    services:
+      postgres:
+        # Each shard runs on its own runner, so each gets its own `postgres`
+        # service. The template every case clones (PMS-1254) is built once
+        # per shard inside the suite's own advisory lock, idempotent across
+        # the three shards and across runs.
+        image: postgres:18.2-alpine3.23
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+      # Job-level rather than step-level (PMS-1177): the template-build step
+      # and the test step must see the identical environment, otherwise a
+      # dirty cargo fingerprint makes the test step recompile the binaries
+      # the archive built - which the archive flow forbids.
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Clone the repository
+        # scripts/test-db-roles.sql and nextest's own config files are read
+        # from the workspace, so each shard still clones the repo even
+        # though the test binaries come from the archive artifact.
+        uses: https://code.forgejo.org/actions/checkout@v5
+
+      - name: Download the nextest archive
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: nextest-archive
+          path: .
+
+      - name: Install cargo-nextest
+        # The archive contents are version-pinned; the harness that runs
+        # them is pinned to the matching nextest release the `build` job
+        # was linked against, same pair as `cache-warm.yml`.
+        env:
+          NEXTEST_VERSION: "0.9.145"
+          NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
         run: |
-          cargo nextest run --archive-file /tmp/nextest-archive.tar.zst --profile ci \
+          set -euo pipefail
+          curl --silent --fail --location --output /tmp/nextest.tar.gz \
+            "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          mkdir -p "${cargo_bin}"
+          tar --extract --gzip --file /tmp/nextest.tar.gz --directory "${cargo_bin}"
+
+      - name: Disable Postgres durability
+        # PMS-1251: this `postgres` service is thrown away with the job, so
+        # fsync/synchronous_commit/full_page_writes buy crash safety this
+        # database never needs to survive into. Measured locally against
+        # postgres:18.2-alpine3.23 on 2026-09-17: the 229-migration run drops
+        # from 1.12-1.32s to 0.60-0.71s and `CREATE DATABASE ... TEMPLATE`
+        # from 104-146ms to 35-39ms. Each shard pays this once and recovers
+        # it on every clone.
+        run: |
+          psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 <<'SQL'
+          ALTER SYSTEM SET fsync = off;
+          ALTER SYSTEM SET synchronous_commit = off;
+          ALTER SYSTEM SET full_page_writes = off;
+          SELECT pg_reload_conf();
+          SQL
+          psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --command 'SHOW fsync'
+
+      - name: Create the DB roles the migrations grant to
+        # PMS-988: migration 207 ends with `GRANT ... TO mokosh_app`.
+        # Postgres rejects a GRANT to a role that does not exist (42704),
+        # so every test fails at migration 207 before its body runs. A real
+        # deployment never reaches that: `provision_roles` creates the
+        # split roles at startup; this job has no server startup, so the
+        # step preparing the cluster creates the role. Each shard's own
+        # Postgres service repeats this.
+        run: psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --file scripts/test-db-roles.sql
+
+      - name: Build the template every test clones
+        # PMS-1254: the 243 migrations are applied ONCE per Postgres
+        # service, into a template database named after a digest of the
+        # migration set, and each case is a `CREATE DATABASE ... TEMPLATE`
+        # clone of it. Done here in a step of the shard rather than inside
+        # whichever case arrived first with every other case waiting on the
+        # lock, so the "built the template" line is printed where a reader
+        # can see it. Run out of the archive so this compiles nothing.
+        run: |
+          cargo nextest run --archive-file nextest-archive.tar.zst --profile ci \
             --no-capture -E 'binary(template_database)'
 
-      - name: Integration tests
-        # PMS-1177: `cargo nextest run --archive-file` runs every case from
-        # every archived binary (all `tests/*.rs` suites plus the lib unit
-        # tests) at once, scheduled across `test-threads` from the `ci`
-        # profile in `.config/nextest.toml`, instead of one binary running
-        # to completion before the next starts. That cross-suite parallelism
-        # is where the wall clock the old `cargo test --tests` invocation
-        # spent waiting is recovered; new suites are still picked up
-        # automatically because the archive holds every binary cargo built.
-        #
-        # `fail-fast = false` in the profile is the `--no-fail-fast`
-        # replacement (PMS-1031): every case runs and the summary names each
-        # red one; the step still fails on any failure.
+      - name: Integration tests (shard ${{ matrix.shard }}/3)
+        # PMS-1253: `--partition hash:k/N` keeps every test in the same
+        # shard across runs so a slow case stays attributable; `count:k/N`
+        # would reassign on every added test file. nextest's `fail-fast =
+        # false` (`.config/nextest.toml`, PMS-1031) is why every case still
+        # runs here even after one fails. The archive, downloaded above,
+        # cannot recompile; a `Compiling mokosh-server` line in this step's
+        # log would mean a dirty fingerprint and would fail the PMS-1253
+        # AC that forbids it.
         #
         # There is no shell `timeout` wrapper here (PMS-823, PMS-1177):
-        # nextest's own `slow-timeout`/`terminate-after` in the `ci` profile
+        # nextest's `slow-timeout`/`terminate-after` in the `ci` profile
         # reports and terminates a stuck case BY NAME, so there is no
-        # grep-based diagnostic to get wrong and no separate hang message to
-        # keep in sync with the harness's own report.
+        # grep-based diagnostic to get wrong and no separate hang message
+        # to keep in sync with the harness's own report.
         run: |
           started=$(date +%s)
           set +e
-          cargo nextest run --archive-file /tmp/nextest-archive.tar.zst --profile ci
+          cargo nextest run --archive-file nextest-archive.tar.zst --profile ci \
+            --partition hash:${{ matrix.shard }}/3
           status=$?
           set -e
-          echo "Test run took $(( $(date +%s) - started ))s"
+          echo "Shard ${{ matrix.shard }}/3 test run took $(( $(date +%s) - started ))s"
           exit "${status}"
+
+  summary:
+    name: integration tests
+    # Always runs so a cancelled or failed shard still produces the one
+    # name branch protection reads. `needs: test` makes it wait on every
+    # shard; `if: always()` makes it fire whether they passed or not.
+    needs: test
+    if: always()
+    # Dev label: this job only reads shard outcomes and never compiles,
+    # so the dev image's C toolchain is strictly unneeded. The runner
+    # label stays uniform across this file for the file-wide
+    # `check-runner-labels` guard that reads any `cargo ` line anywhere
+    # as a requirement for every job's label (PMS-705).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Fail if any shard failed
+        # Reads the matrix job's aggregate result; `success` is the only
+        # value that lets the summary pass. A cancelled or skipped shard
+        # fails the workflow, same as the single-job gate did.
+        run: |
+          result="${{ needs.test.result }}"
+          echo "test matrix result: ${result}"
+          if [ "${result}" != "success" ]; then
+            echo "::error::integration test matrix did not succeed (result=${result})"
+            exit 1
+          fi
