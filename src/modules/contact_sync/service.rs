@@ -696,11 +696,7 @@ impl ContactSyncService {
     /// state row the caller proved possession of. Every write is scoped to
     /// that tenant. Mirrors Google's shape: load state, verify, consume,
     /// exchange code, verify scope grant, record connection, redirect.
-    pub async fn complete_microsoft_connect(
-        &self,
-        state: &str,
-        code: &str,
-    ) -> AppResult<String> {
+    pub async fn complete_microsoft_connect(&self, state: &str, code: &str) -> AppResult<String> {
         let (state_id, secret) = state
             .split_once('.')
             .ok_or_else(|| AppError::BadRequest("That sign-in link is not valid.".to_string()))?;
