@@ -81,14 +81,22 @@ pub enum GovernedSecret {
     GoogleContactsClientId,
     /// The host's Google OAuth client secret (PMS-1430).
     GoogleContactsClientSecret,
+    /// The host's Microsoft 365 OAuth client id (MAPPS-1101). Same posture as
+    /// the Google pair: one deployment-wide Entra ID app registration that
+    /// customers consent to, not a per-tenant Azure app.
+    MicrosoftContactsClientId,
+    /// The host's Microsoft 365 OAuth client secret (MAPPS-1101).
+    MicrosoftContactsClientSecret,
 }
 
 impl GovernedSecret {
     /// Every governed secret, in report order.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 5] = [
         Self::SmtpPassword,
         Self::GoogleContactsClientId,
         Self::GoogleContactsClientSecret,
+        Self::MicrosoftContactsClientId,
+        Self::MicrosoftContactsClientSecret,
     ];
 
     /// The env-style key: the plain variable name the operator writes, and
@@ -98,6 +106,8 @@ impl GovernedSecret {
             Self::SmtpPassword => "SMTP_PASSWORD",
             Self::GoogleContactsClientId => "GOOGLE_CONTACTS_CLIENT_ID",
             Self::GoogleContactsClientSecret => "GOOGLE_CONTACTS_CLIENT_SECRET",
+            Self::MicrosoftContactsClientId => "MICROSOFT_CONTACTS_CLIENT_ID",
+            Self::MicrosoftContactsClientSecret => "MICROSOFT_CONTACTS_CLIENT_SECRET",
         }
     }
 
@@ -141,6 +151,9 @@ impl GovernedSecret {
             Self::GoogleContactsClientId | Self::GoogleContactsClientSecret => {
                 "Google Contacts import is off, so no tenant on this deployment can connect a Google account"
             }
+            Self::MicrosoftContactsClientId | Self::MicrosoftContactsClientSecret => {
+                "Microsoft 365 Contacts import is off, so no tenant on this deployment can connect a Microsoft account"
+            }
         }
     }
 
@@ -153,6 +166,8 @@ impl GovernedSecret {
             Self::SmtpPassword => "smtp_password",
             Self::GoogleContactsClientId => "google_contacts_client_id",
             Self::GoogleContactsClientSecret => "google_contacts_client_secret",
+            Self::MicrosoftContactsClientId => "microsoft_contacts_client_id",
+            Self::MicrosoftContactsClientSecret => "microsoft_contacts_client_secret",
         }
     }
 }

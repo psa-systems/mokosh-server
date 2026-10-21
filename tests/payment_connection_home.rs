@@ -50,44 +50,45 @@ async fn put_gateway(
         .expect("put gateway")
 }
 
-async fn connect(
-    app: &common::TestApp,
-    token: &str,
-    provider: &str,
-    body: Value,
-) -> reqwest::Response {
-    app.client
-        .post(app.url(&format!("/api/v1/integrations/{provider}/connect")))
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await
-        .expect("connect")
-}
+// MAPPS-1098: the `connect` / `disconnect` helpers that drove the removed
+// tests above went with them. The two surviving tests here drive the
+// payment lifecycle through `/payment-gateways` only.
 
-async fn disconnect(app: &common::TestApp, token: &str, provider: &str) -> reqwest::Response {
-    app.client
-        .post(app.url(&format!("/api/v1/integrations/{provider}/disconnect")))
-        .bearer_auth(token)
-        .send()
-        .await
-        .expect("disconnect")
-}
-
+/// The three-state connection status for a payment provider, derived from
+/// the payments list the same way the integrations table's status would
+/// read for one.
+///
+/// Rewritten under MAPPS-1098 (payment providers moved off the
+/// `/integrations` HTTP surface) to read from `/payment-gateways` instead.
+/// The semantics are identical: `payment_gateway_configs.configured`
+/// mirrors whether a credential is stored, and `is_active` is the
+/// one-writer flag `CONNECTED_GATEWAY_FLAG` reads to decide whether the
+/// provider serves. A row absent from the list means the tenant has not
+/// touched the provider, which is `not_connected`.
 async fn integration_status(app: &common::TestApp, token: &str, provider: &str) -> String {
     let response = app
         .client
-        .get(app.url(&format!("/api/v1/integrations/{provider}")))
+        .get(app.url("/api/v1/payment-gateways"))
         .bearer_auth(token)
         .send()
         .await
-        .expect("get integration");
+        .expect("list gateways");
     assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("integration json");
-    body["status"]
-        .as_str()
-        .expect("status is a string")
-        .to_string()
+    let body: Value = response.json().await.expect("gateway list json");
+    let items = body["data"].as_array().expect("a list of gateways");
+    let row = items.iter().find(|r| r["provider"] == provider);
+    match row {
+        None => "not_connected".to_string(),
+        Some(r) => {
+            let is_active = r["is_active"].as_bool().unwrap_or(false);
+            let configured = r["configured"].as_bool().unwrap_or(false);
+            match (configured, is_active) {
+                (_, true) => "connected".to_string(),
+                (true, false) => "disconnected".to_string(),
+                (false, false) => "not_connected".to_string(),
+            }
+        }
+    }
 }
 
 /// What the payments settings page shows for this provider's switch.
@@ -123,24 +124,10 @@ async fn mirror(pool: &PgPool, provider: &str) -> Option<bool> {
     .flatten()
 }
 
-/// `gateway_ready` is the field the SPA renders the Pay Now button from, so it is
-/// the end of the chain this issue changed: the readiness read resolves the
-/// tenant's connected providers and builds each one.
-async fn readiness_has_gateway(app: &common::TestApp, token: &str, invoice_id: Uuid) -> bool {
-    let response = app
-        .client
-        .get(app.url(&format!("/api/v1/invoices/{invoice_id}/payment-readiness")))
-        .bearer_auth(token)
-        .send()
-        .await
-        .expect("readiness");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("readiness json");
-    body["gateway_ready"]
-        .as_bool()
-        .unwrap_or_else(|| panic!("readiness says nothing about a gateway: {body}"))
-}
-
+// MAPPS-1098: `readiness_has_gateway` and `seed_sent_invoice` serviced
+// the removed `connecting_on_the_integrations_page_is_what_the_payment_path_serves`
+// test. The surviving tests do not exercise invoice readiness directly.
+#[allow(dead_code)]
 async fn seed_sent_invoice(pool: &PgPool, company_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -199,134 +186,17 @@ async fn saving_an_active_gateway_connects_it_on_the_integrations_page(pool: PgP
     assert_eq!(mirror(&pool, "stripe").await, Some(false));
 }
 
-/// The other direction, which is the one the move exists for: connecting on the
-/// integrations page is what decides whether a customer can pay.
-#[mokosh_test]
-async fn connecting_on_the_integrations_page_is_what_the_payment_path_serves(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let company_id = common::seed_company(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-
-    // Credentials saved, switch left off: the state an admin is in halfway
-    // through setting Stripe up.
-    let response = put_gateway(&app, &token, "stripe", false, Some(stripe_config())).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        !listed_is_active(&app, &token, "stripe").await,
-        "a saved-but-inactive gateway is still listed, and not as active"
-    );
-
-    let invoice_id = seed_sent_invoice(&pool, company_id).await;
-    assert!(
-        !readiness_has_gateway(&app, &token, invoice_id).await,
-        "nothing is connected yet, so there is no Pay Now"
-    );
-
-    let response = connect(&app, &token, "stripe", json!({})).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "connecting a configured gateway here is allowed now: {:?}",
-        response.text().await
-    );
-
-    assert!(
-        readiness_has_gateway(&app, &token, invoice_id).await,
-        "the payment path reads the integrations row, so connecting there is enough"
-    );
-    assert!(
-        listed_is_active(&app, &token, "stripe").await,
-        "and the payments page shows the same fact rather than its own copy"
-    );
-    assert_eq!(mirror(&pool, "stripe").await, Some(true));
-
-    // Disconnecting here stops the customer being asked to pay, and leaves the
-    // credential so reconnecting does not mean finding the keys again.
-    let response = disconnect(&app, &token, "stripe").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(!readiness_has_gateway(&app, &token, invoice_id).await);
-    assert_eq!(mirror(&pool, "stripe").await, Some(false));
-
-    let response = connect(&app, &token, "stripe", json!({})).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the credential survived the disconnect, so a reconnect needs nothing"
-    );
-    assert!(readiness_has_gateway(&app, &token, invoice_id).await);
-}
-
-/// The three refusals, each for a state that would otherwise read as working.
-#[mokosh_test]
-async fn connecting_a_payment_gateway_refuses_the_states_that_would_lie(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-
-    // 1. No gateway at all. The message has to name where one is created, or an
-    //    operator is told no and not what to do.
-    let response = connect(&app, &token, "stripe", json!({})).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value = response.json().await.expect("refusal json");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("Payment gateways"),
-        "the refusal must say where to enter the credential: {message}"
-    );
-
-    // 2. A credential sent here would go to an address the payment path never
-    //    reads, so it is refused rather than quietly stored.
-    let response = put_gateway(&app, &token, "stripe", false, Some(stripe_config())).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let response = connect(
-        &app,
-        &token,
-        "stripe",
-        json!({ "credential": "sk_test_wrong" }),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value = response.json().await.expect("refusal json");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("Payment gateways"),
-        "the refusal must point at the surface that takes it: {message}"
-    );
-    assert_eq!(
-        integration_status(&app, &token, "stripe").await,
-        "not_connected",
-        "a refused connect changes nothing"
-    );
-
-    // 3. A gateway row whose credential is in neither place: `config_encrypted`
-    //    NULL says it moved to the secret provider, and nothing ever put it
-    //    there. Seeded raw, because no route produces this state; a half-finished
-    //    credential move does, which is what PMS-968 left behind. Connecting it
-    //    would record a gateway that cannot charge.
-    sqlx::query(
-        "INSERT INTO payment_gateway_configs \
-             (tenant_id, provider, is_test_mode, config_encrypted) \
-         VALUES ($1, 'paypal', TRUE, NULL)",
-    )
-    .bind(common::DEFAULT_TENANT_ID)
-    .execute(&pool)
-    .await
-    .expect("seed a gateway with no credential");
-
-    let response = connect(&app, &token, "paypal", json!({})).await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value = response.json().await.expect("refusal json");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("no credential"),
-        "the refusal must say what is missing: {message}"
-    );
-    assert_eq!(
-        integration_status(&app, &token, "paypal").await,
-        "not_connected"
-    );
-}
+// MAPPS-1098: `connecting_on_the_integrations_page_is_what_the_payment_path_serves`
+// and `connecting_a_payment_gateway_refuses_the_states_that_would_lie` were
+// removed with this ticket. Both exercised the integrations
+// `/connect` and `/disconnect` endpoints for Stripe + PayPal, which 1098
+// turned into 404s: the payment-provider lifecycle lives entirely on
+// `/payment-gateways` now, and the credential-refusal path from
+// PMS-1312 is no longer reachable because there is no HTTP surface here
+// to send a credential to. The write-through to `integrations.status`
+// stays covered by `saving_an_active_gateway_connects_it_on_the_integrations_page`
+// above, which runs through `/payment-gateways` and asserts the row
+// still carries the connected state.
 
 /// `authorize_net` is in the gateway table's CHECK and in no registry entry, so
 /// saving one must not try to write an `integrations` row for it. Before the skip

@@ -12,6 +12,15 @@ In development, `.env` is generated once per clone from the committed `.env.exam
 
 Configuration changes in the last 5 releases, newest first, rendered by `just config-docs` from `src/config/registry.rs` and `src/config/variables.toml` (edit those, not this section). **Breaking: won't start** marks a change after which the restart fails until the operator acts; apply it before restarting. **Breaking: feature off** marks a change after which the server runs but the named feature stops working or changes until the operator acts; review it before restarting. Both name the operator action and the issue that introduced them. An unmarked entry needs no action unless you relied on the old behavior. Upgrading across more releases than this? Run `just config-since <running version>`.
 
+<a id="release-v0-17-0"></a>
+
+### v0.17.0
+
+#### Added
+
+- [`MICROSOFT_CONTACTS_CLIENT_ID`](#var-microsoft-contacts-client-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MICROSOFT_CONTACTS_CLIENT_SECRET`](#var-microsoft-contacts-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
+
 <a id="release-v0-16-0"></a>
 
 ### v0.16.0
@@ -118,18 +127,6 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 ### v0.13.0
 
 No configuration changes.
-
-<a id="release-v0-12-0"></a>
-
-### v0.12.0
-
-#### Added
-
-- [`ABUSE_CONTACT_EMAIL`](#var-abuse-contact-email) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
-- [`INFISICAL_ADDRESS`](#var-infisical-address) (Required: no) - Optional. Blank reports Infisical as skipped in the readiness probe. (GOV-50)
-- [`PUBLIC_API_BASE_URL`](#var-public-api-base-url) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
-- [`SPA_BASE_URL`](#var-spa-base-url) (Required: no) - Optional at the time (required since v0.14.0). Set it to the mokosh-apps origin so SPA-only email links land there. (MAPPS-425)
-- [`TENANT_LOGO_MAX_BYTES`](#var-tenant-logo-max-bytes) (Required: no) - Optional. Leave it unset to keep the default.
 
 <!-- END GENERATED: recently-added -->
 
@@ -286,6 +283,8 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-bunyip-mailer-url"></a>`BUNYIP_MAILER_URL` | no, unset makes `MAIL_PROVIDER=bunyip` refuse to boot | v0.16.0 | `.env` | Base URL of Bunyip's mailer relay that `MAIL_PROVIDER=bunyip` sends through (`POST /v1/mailer/send`, BUNYIP-602). |
 | <a id="var-bunyip-mailer-client-id"></a>`BUNYIP_MAILER_CLIENT_ID` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client id presented as HTTP Basic to the mailer relay. |
 | <a id="var-bunyip-mailer-client-secret"></a>`BUNYIP_MAILER_CLIENT_SECRET` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client secret presented as HTTP Basic to the mailer relay. |
+| <a id="var-microsoft-contacts-client-id"></a>`MICROSOFT_CONTACTS_CLIENT_ID` | no | v0.17.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-microsoft-contacts-client-secret"></a>`MICROSOFT_CONTACTS_CLIENT_SECRET` | no | v0.17.0 | `.env` | Not described yet: say what it does. |
 
 ## Development stack variables
 

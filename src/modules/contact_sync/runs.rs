@@ -147,6 +147,20 @@ impl SourceFactory for GoogleSourceFactory {
                 ),
             )));
         }
+        // MAPPS-1101: Microsoft 365's access token is minted against the
+        // Entra OAuth client; the per-tenant refresh token lives at the same
+        // SecretKey address Google's does. The HTTP shape of the provider
+        // itself (Graph) is Phase 1's `super::microsoft::MicrosoftContactsProvider`.
+        if provider == "microsoft" {
+            let token = self
+                .service
+                .microsoft_access_token(tenant_id, connection_id)
+                .await?;
+            return Ok(Box::new(super::microsoft::MicrosoftContactsProvider::new(
+                self.http.clone(),
+                token,
+            )));
+        }
         let token = self
             .service
             .access_token(tenant_id, connection_id, provider)
