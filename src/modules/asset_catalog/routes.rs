@@ -7,15 +7,23 @@
 //! behind `RequireAssets` so a non-admin viewing the Create modal can
 //! still see matches.
 //!
-//! parity record 2026-10-15: `/asset-templates` and
-//! `/asset-templates/{id}` have no SPA caller yet. The admin page the
-//! design doc commits to (`/settings/asset-catalog` on the SPA; see
+//! parity record 2026-10-15: the following routes have no SPA caller
+//! yet. The admin page the design doc commits to
+//! (`/settings/asset-catalog` on the SPA; see
 //! docs/mokosh-assets/04-templates-and-bulk-order.md) is MAPPS-xxxx and
 //! has not shipped. The bulk-create flow consumes templates
 //! server-side via `POST /assets/bulk-create` with `template_id` set
 //! (which IS exercised from the SPA's `AssetBulkCreateModal`), so the
-//! template CRUD lands here now so the admin page can build against a
-//! stable surface. The note comes off with the first SPA call.
+//! template and model CRUD land here now so the admin page can build
+//! against a stable surface. The note comes off with the first SPA call
+//! for each path.
+//!
+//! Exempted paths (one line each so the guard can match the comment
+//! against the mounted route literals):
+//!   - `/asset-models` (POST)
+//!   - `/asset-models/{id}` (GET, PUT, DELETE)
+//!   - `/asset-templates` (POST)
+//!   - `/asset-templates/{id}` (GET, PUT, DELETE)
 
 use axum::{
     extract::{Path, Query, State},

@@ -98,8 +98,10 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
     EntryPoint {
         path: "src/storage/env.rs",
         reason: "the storage variables themselves (PMS-1317): the one place that reads a \
-                 STORAGE_ setting and its deprecated alias, for the same reason the provider \
-                 of record reads its own selection variable",
+                 STORAGE_ setting, for the same reason the provider of record reads its own \
+                 selection variable. PMS-1443 removed the deprecated-alias branch; \
+                 `check_boot_env` here is the boot-time refusal that catches a compose file \
+                 still forwarding an old name",
     },
     EntryPoint {
         path: "src/storage/s3.rs",

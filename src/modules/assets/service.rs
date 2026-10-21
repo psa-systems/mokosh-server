@@ -1883,6 +1883,45 @@ impl AssetsService {
         Ok((items, total as u64))
     }
 
+    /// PMS-800: list every credential a company owns, across its assets
+    /// AND the company-scoped ones (`asset_id IS NULL`). Returns the same
+    /// `CredentialSummary` shape as `list_credentials` with no secret
+    /// material; reveals still go through the audited single-credential
+    /// endpoint.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id))]
+    pub async fn list_credentials_for_company(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+    ) -> AppResult<Vec<CredentialSummary>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows = sqlx::query_as::<_, CredRow>(
+            r#"SELECT id, name, company_id, asset_id, credential_type,
+                      username_encrypted, password_encrypted, url, notes_encrypted,
+                      last_rotated, created_at
+               FROM credential_vault
+               WHERE tenant_id = $1 AND company_id = $2
+               ORDER BY name"#,
+        )
+        .bind(tenant_id)
+        .bind(company_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| CredentialSummary {
+                id: r.id,
+                name: r.name,
+                company_id: r.company_id,
+                asset_id: r.asset_id,
+                credential_type: r.credential_type,
+                url: r.url,
+                last_rotated: r.last_rotated,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
     /// Reveal a single credential's decrypted secrets. Authz is enforced
     /// at the route (`RequireAssets`); the reveal is recorded in
     /// `asset_audit_log` so every decryption is traceable.

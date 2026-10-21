@@ -5,6 +5,10 @@
 //! PayPal webhook attempts and their outcomes) that the admin reaches
 //! through the API; the delivery-log screen is deferred. Every other route
 //! in this file is consumed.
+//!
+//! parity record 2026-10-16: `/invoices/summary` has no SPA caller yet;
+//! MAPPS-983 wires the dashboard "open invoices" widget to it (MAPPS-984
+//! is the server half this adds). Note covers ONLY the summary route.
 
 use std::sync::Arc;
 
@@ -67,6 +71,7 @@ pub fn billing_routes(service: BillingService, public_api_base: Option<String>) 
     };
     Router::new()
         .route("/invoices", get(list_invoices).post(create_invoice))
+        .route("/invoices/summary", get(invoices_summary))
         .route(
             "/invoices/from-time-entries",
             axum::routing::post(create_invoice_from_time_entries),
@@ -632,6 +637,34 @@ async fn get_invoice(
         }
     }
     Ok(Json(inv))
+}
+
+/// MAPPS-984: `GET /invoices/summary?status=sent&overdue=true&company_id=...` -
+/// server-side aggregate so the dashboard "open invoices" widget stops
+/// paging the full `/invoices` list to compute a count + total. Returns
+/// `{ count, total }` using the same filter shape and gating as
+/// `list_invoices`.
+async fn invoices_summary(
+    State(state): State<BillingRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
+    Query(mut filter): Query<InvoiceFilter>,
+) -> AppResult<Json<InvoiceSummaryResponse>> {
+    filter.validate()?;
+    let tenant = caller.tenant();
+    match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_billing_finance(auth, &settings).await?;
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::INVOICES_READ, &db).await?;
+            filter.company_id = Some(session.company_id);
+            filter.exclude_draft = true;
+        }
+    }
+    let summary = state.service.summarize_invoices(tenant, &filter).await?;
+    Ok(Json(summary))
 }
 
 async fn list_invoices(
@@ -1466,6 +1499,13 @@ mod finance_gate {
     /// once and the compiler cannot see the omission.
     const INLINE_STAFF_GATE: &[&str] = &[
         "get_invoice",
+        // MAPPS-984: the aggregate `/invoices/summary` the dashboard Open
+        // Invoices tile reads. Dual-plane like `list_invoices` below (staff
+        // gets any status, a contact is scoped to their own company), so it
+        // takes the same inline staff gate rather than `RequireBilling` /
+        // `RequireFinance` as extractors. Position follows source order
+        // (right after `get_invoice`) so the equality check reads cleanly.
+        "invoices_summary",
         "list_invoices",
         "get_invoice_pdf",
         "pay_invoice",
