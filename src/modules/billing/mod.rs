@@ -30,6 +30,7 @@ pub mod credential_move;
 pub mod descriptions;
 pub mod documents;
 pub mod issuer;
+pub mod issuer_delegation;
 pub mod models;
 // PMS-979: what an invoice number is and who it belongs to.
 pub mod numbering;
