@@ -30,7 +30,6 @@ just check-config-doc-paths # every docs/ path named in .env.example / compose.d
 just check-config-docs     # docs/configuration.md matches the registry's since/required facts; `just config-docs` regenerates it
 just check-doc-links       # every relative Markdown link resolves to a path that exists
 just check-claude-md       # CLAUDE.md stays under 20,000 bytes and its docs/ links resolve (PMS-1437)
-just check-single-build    # fail if a compiling workflow builds the same tree twice (DEV-612)
 just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
 just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
@@ -217,7 +216,7 @@ One line per rule, linking its full text. A new convention adds its text under `
 - A compiling CI job uses the dev runner label ([PMS-719, GOV-43](docs/invariants/ci-release.md#runner-labels-pms-719-gov-43))
 - OCI builds cache through `type=gha` only ([PMS-720, GOV-20](docs/invariants/ci-release.md#oci-cache-pms-720-gov-20))
 - The trigger alone picks the image tag ([PMS-733](docs/invariants/ci-release.md#publish-tags-pms-733))
-- Compile on `pull_request`, never again on `push: main` ([DEV-612](docs/invariants/ci-release.md#single-build-dev-612))
+- Pull requests gate the merge; `cache-warm.yml` fills the shared build cache on `push: main` without re-running tests ([DEV-612, PMS-1252](docs/invariants/ci-release.md#single-build-dev-612-pms-1252))
 - `[workspace.dependencies]` lists only inherited crates ([PMS-785](docs/invariants/ci-release.md#workspace-deps-pms-785))
 - `cargo machete` fails an unused dependency ([PMS-780](docs/invariants/ci-release.md#unused-deps-pms-780))
 - Release image caches dependencies in their own layer ([PMS-781](docs/invariants/ci-release.md#image-layers-pms-781))
