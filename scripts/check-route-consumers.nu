@@ -8,11 +8,13 @@
 # this looks for the path in the SPA source (`mokosh-apps/src/`, a sibling
 # checkout, or $MOKOSH_APPS_DIR). A route the SPA never names fails unless its
 # file carries a "parity record" comment (the PMS-840 convention) that
-# includes an ISO date. The match is deliberately loose: the first static
-# segment of the path plus every later static segment must each appear in the
-# client source, because the client builds URLs with format! and the `{id}`
-# holes differ. A trailing `#[cfg(test)]` module is stripped before scanning,
-# so a router built inside a test fixture (e.g. a 404-after-unmount regression
+# includes an ISO date AND names the route's path literal (MAPPS-1083: the
+# dated-parity-record precondition alone no longer covers routes the record
+# did not name). The match is deliberately loose: the first static segment of
+# the path plus every later static segment must each appear in the client
+# source, because the client builds URLs with format! and the `{id}` holes
+# differ. A trailing `#[cfg(test)]` module is stripped before scanning, so a
+# router built inside a test fixture (e.g. a 404-after-unmount regression
 # test) is never mistaken for a mounted route.
 #
 # No client checkout means nothing to compare against: it says so and exits 0.
@@ -50,6 +52,20 @@ def routes_in [text: string] {
     $text | parse --regex '\.route\(\s*"(?P<path>[^"]*)"' | get path
 }
 
+# MAPPS-1083: a parity record exempts ONLY the route paths its comment
+# names, not every route the file mounts. A route is "recorded" iff a
+# `//`-prefixed line in the same file names its path literal verbatim. The
+# dated-parity-record precondition (`has_record`) still applies, so a file
+# with no record exempts nothing; a file with a record exempts only the
+# paths explicitly listed in its comment block. This stops an unrelated
+# route added later to a parity-record file from riding along silently.
+def recorded_in [text: string, path: string] {
+    if not (has_record $text) { return false }
+    $text | lines | any {|l|
+        ($l | str trim | str starts-with '//') and ($l | str contains $path)
+    }
+}
+
 def consumed [path: string, client: string] {
     let segs = (static_segments $path)
     if ($segs | is-empty) { return true }
@@ -73,10 +89,17 @@ def consumed [path: string, client: string] {
 
 def unconsumed_in [files: list<string>, client: string] {
     $files | each {|f|
+        # PMS-1498: strip `#[cfg(test)]` tail so an in-test fixture route is
+        # not mistaken for a mounted one.
+        # MAPPS-1083: scope the exemption. A route is unconsumed iff the
+        # client never names it AND its path literal is not called out in a
+        # `//` line of this file; a dated parity record alone no longer
+        # covers routes the record did not name.
         let text = (strip_test_code (open --raw $f | decode utf-8))
-        if (has_record $text) { [] } else {
-            routes_in $text | where {|p| not (consumed $p $client) } | each {|p| {file: $f, route: $p} }
-        }
+        routes_in $text
+            | where {|p| not (consumed $p $client) }
+            | where {|p| not (recorded_in $text $p) }
+            | each {|p| {file: $f, route: $p} }
     } | flatten
 }
 
@@ -86,9 +109,9 @@ def read_client [dir: string] {
 
 def self_test [] {
     let d = (mktemp -d)
-    mkdir $"($d)/a" $"($d)/b" $"($d)/c" $"($d)/d"
+    mkdir $"($d)/a" $"($d)/b" $"($d)/c" $"($d)/d" $"($d)/e"
     'Router::new().route("/things/{id}/frob", get(x)).route("/used", get(y))' | save $"($d)/a/routes.rs"
-    '// parity record 2026-09-18: unbuilt\nRouter::new().route("/nope", get(x))' | save $"($d)/b/routes.rs"
+    "// parity record 2026-09-18: /nope is unbuilt\nRouter::new().route(\"/nope\", get(x))" | save $"($d)/b/routes.rs"
     # MAPPS-986: a route whose later static segment is a substring of an
     # unrelated client identifier (`capabilities` inside
     # `supported_capabilities`) must still be reported as unconsumed. The
@@ -104,18 +127,33 @@ def self_test [] {
         '    fn t() { Router::new().route("/not-a-real-route", get(x)); }' +
         "\n}\n"
     ) | save $"($d)/d/grant_invitations_routes.rs"
+    # MAPPS-1083: a file with a parity record naming one route must still
+    # fail an unrelated route in the same file that the record does not
+    # name. The old file-wide exemption passed this silently.
+    (
+        "// parity record 2026-10-15: /named-exempt has no caller yet.\n" +
+        "Router::new()\n" +
+        '    .route("/named-exempt", get(x))' + "\n" +
+        '    .route("/other-unexempted", get(y))'
+    ) | save $"($d)/e/routes.rs"
     let client = (
         'get("/used"); format!("/things/{}", id);' +
         ' pub supported_capabilities: Vec<X>; pub enabled_capabilities: Vec<X>;' +
         ' let _ = "/integrations";'
     )
     let files = [
-        $"($d)/a/routes.rs" $"($d)/b/routes.rs" $"($d)/c/routes.rs" $"($d)/d/grant_invitations_routes.rs"
+        $"($d)/a/routes.rs"
+        $"($d)/b/routes.rs"
+        $"($d)/c/routes.rs"
+        $"($d)/d/grant_invitations_routes.rs"
+        $"($d)/e/routes.rs"
     ]
     let got = (unconsumed_in $files $client)
     rm -r $d
     let routes = ($got | get route | sort)
-    let expected = (['/integrations/capabilities' '/things/{id}/frob' '/grants/{id}'] | sort)
+    let expected = (
+        ['/grants/{id}' '/integrations/capabilities' '/other-unexempted' '/things/{id}/frob'] | sort
+    )
     if $routes != $expected {
         error make {msg: $"self-test failed: ($got | to nuon)"}
     }

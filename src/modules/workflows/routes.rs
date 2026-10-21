@@ -4,6 +4,10 @@
 //! serve a Settings > Automation admin surface with no SPA yet. Deferred,
 //! not dead: the rule engine drives ticket automation and the routes let an
 //! admin edit its config out-of-band. Remove this note when the SPA lands.
+//!
+//! Exempted paths (named per MAPPS-1083):
+//!   - `/workflow-rules`
+//!   - `/workflow-rules/{id}`
 
 use std::sync::Arc;
 
