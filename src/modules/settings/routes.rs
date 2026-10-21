@@ -32,6 +32,9 @@ pub struct SettingsRouterState {
     // PMS-1444: the live Google client handle, swapped after a write so the
     // setting takes effect without a restart, exactly as `shared_mailer` is.
     pub google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    // MAPPS-1101: the live Microsoft 365 Entra client handle, same posture
+    // as `google_client`.
+    pub microsoft_client: Arc<crate::modules::contact_sync::microsoft_oauth::SharedMicrosoftClient>,
     // PMS-1444: the providers the Google client is read from and written to.
     pub app_secrets: Arc<crate::app_secrets::AppSecrets>,
 }
@@ -42,6 +45,7 @@ pub fn settings_routes(
     enc_key: [u8; 32],
     shared_mailer: Arc<SharedMailer>,
     google_client: Arc<crate::modules::contact_sync::SharedGoogleClient>,
+    microsoft_client: Arc<crate::modules::contact_sync::microsoft_oauth::SharedMicrosoftClient>,
     app_secrets: Arc<crate::app_secrets::AppSecrets>,
 ) -> Router {
     let state = SettingsRouterState {
@@ -50,6 +54,7 @@ pub fn settings_routes(
         enc_key,
         shared_mailer,
         google_client,
+        microsoft_client,
         app_secrets,
     };
     Router::new()
@@ -99,6 +104,15 @@ pub fn settings_routes(
         .route(
             "/settings/google-contacts-client",
             get(get_google_client).put(put_google_client),
+        )
+        // MAPPS-1101: the host's Microsoft 365 Entra OAuth client. Same
+        // posture as the Google route above - deployment-wide, operator-
+        // only, stored in the declared app-secret provider, hot-swapped on
+        // write - and parallel SPA page lives at
+        // `/settings/integrations/microsoft-contacts/client` (follow-up).
+        .route(
+            "/settings/microsoft-contacts-client",
+            get(get_microsoft_client).put(put_microsoft_client),
         )
         // PMS-789: the deployment-wide product name. Literal, so it is matched
         // before the generic `/settings/{category}` below - which writes the
@@ -165,6 +179,37 @@ async fn put_google_client(
         &s.db,
         &s.app_secrets,
         s.google_client.as_ref(),
+        input,
+        &ctx,
+    )
+    .await?;
+    Ok(Json(view))
+}
+
+/// MAPPS-1101: whether this deployment's Microsoft 365 client is set and
+/// where it lives. Never either half of it, same posture as the Google
+/// GET.
+async fn get_microsoft_client(
+    State(s): State<SettingsRouterState>,
+    _operator: DeploymentOperator,
+) -> AppResult<Json<super::microsoft_client::MicrosoftClientView>> {
+    Ok(Json(super::microsoft_client::get_microsoft_client(
+        s.app_secrets.as_ref(),
+    )))
+}
+
+/// MAPPS-1101: set the host's Microsoft Entra client, then swap the one
+/// the process is using so a Connect that happens a second later uses it.
+async fn put_microsoft_client(
+    State(s): State<SettingsRouterState>,
+    _operator: DeploymentOperator,
+    ctx: crate::modules::audit::AuditCtx,
+    Json(input): Json<super::microsoft_client::MicrosoftClientInput>,
+) -> AppResult<Json<super::microsoft_client::MicrosoftClientView>> {
+    let view = super::microsoft_client::put_microsoft_client(
+        &s.db,
+        &s.app_secrets,
+        s.microsoft_client.as_ref(),
         input,
         &ctx,
     )

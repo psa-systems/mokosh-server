@@ -777,6 +777,7 @@ pub fn create_api_router(
             encryption_key,
             shared_mailer.clone(),
             google_client.clone(),
+            microsoft_client.clone(),
             app_secrets,
         ))
         // PMS-1414: feature toggles, deployment-wide and operator-gated, in the

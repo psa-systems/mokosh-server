@@ -5,6 +5,7 @@
 pub mod app_name;
 pub mod email;
 pub mod google_client;
+pub mod microsoft_client;
 pub mod models;
 pub mod routes;
 pub mod service;
