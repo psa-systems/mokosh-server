@@ -3,9 +3,14 @@
 //!
 //! parity record 2026-10-02: no route in this file has an SPA caller yet. The
 //! admin page is MAPPS-955 and the client half of the public probe is the same
-//! issue; this module is what they read. The note covers every route here and
-//! comes off with the first one the client calls, the way PMS-1310's did when
-//! MAPPS-971 shipped.
+//! issue; this module is what they read. The note comes off with the first
+//! route the client calls, the way PMS-1310's did when MAPPS-971 shipped.
+//!
+//! Exempted paths (named per MAPPS-1083, so the guard scopes this record to
+//! only the routes the comment lists):
+//!   - `/settings/feature-toggles`
+//!   - `/settings/feature-toggles/{key}`
+//!   - `/config`
 //!
 //! ## Why `/settings/feature-toggles` and not `/admin/feature-toggles`
 //!
