@@ -269,7 +269,10 @@ mod tests {
         match err {
             AppError::Conflict(message) => {
                 assert!(message.contains("xero"), "names Xero: {message}");
-                assert!(message.contains("quickbooks"), "names QuickBooks: {message}");
+                assert!(
+                    message.contains("quickbooks"),
+                    "names QuickBooks: {message}"
+                );
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
