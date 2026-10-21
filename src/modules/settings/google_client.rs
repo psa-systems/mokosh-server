@@ -409,6 +409,11 @@ mod tests {
                         "GOCSPX-pms1444-secret".to_string()
                     }
                     GovernedSecret::SmtpPassword => "smtp".to_string(),
+                    // MAPPS-1101: this fake only exercises the Google
+                    // pair; Microsoft's writable surface is a separate
+                    // follow-up and this test does not drive it.
+                    GovernedSecret::MicrosoftContactsClientId
+                    | GovernedSecret::MicrosoftContactsClientSecret => return None,
                 })
             }
         }
@@ -503,7 +508,9 @@ mod tests {
                     GovernedSecret::GoogleContactsClientSecret => {
                         self.secret.lock().unwrap().clone()
                     }
-                    GovernedSecret::SmtpPassword => None,
+                    GovernedSecret::SmtpPassword
+                    | GovernedSecret::MicrosoftContactsClientId
+                    | GovernedSecret::MicrosoftContactsClientSecret => None,
                 }
             }
             async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
@@ -518,7 +525,9 @@ mod tests {
                     GovernedSecret::GoogleContactsClientSecret => {
                         *self.secret.lock().unwrap() = Some(value.to_string());
                     }
-                    GovernedSecret::SmtpPassword => {}
+                    GovernedSecret::SmtpPassword
+                    | GovernedSecret::MicrosoftContactsClientId
+                    | GovernedSecret::MicrosoftContactsClientSecret => {}
                 }
                 Ok(())
             }

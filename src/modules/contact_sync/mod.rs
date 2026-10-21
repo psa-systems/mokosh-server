@@ -27,6 +27,7 @@ pub mod file_import;
 pub mod google;
 pub mod icloud;
 pub mod microsoft;
+pub mod microsoft_oauth;
 pub mod locks;
 pub mod mapping;
 pub mod matching;
