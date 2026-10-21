@@ -65,7 +65,8 @@ def check-workflow [] {
 # against it. Containment, not equality: check.yml running on an extra branch
 # costs a CI minute, while a publishing branch missing from it ships unchecked.
 # main is covered by the pull_request trigger rather than the push filter
-# (DEV-612); scripts/check-single-build.nu is what keeps it out of the latter.
+# (DEV-612); the shared cache for the next pull-request run is filled by
+# `.forgejo/workflows/cache-warm.yml` on push to main (PMS-1252).
 def check-gate [] {
     let on = (open $CHECK_WORKFLOW | get on)
     let branches = (($on | get --optional push.branches) | default [])

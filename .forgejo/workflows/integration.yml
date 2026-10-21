@@ -7,7 +7,13 @@
 #
 # DEV-612: pull_request only. The `push: main` run landed after the merge, so it
 # gated nothing, and re-ran a 440s suite against a tree the pull-request run had
-# usually already tested. scripts/check-single-build.nu fails if it comes back.
+# usually already tested.
+#
+# PMS-1252: `cache-warm.yml` archives the same `cargo nextest archive` on push
+# to main so the shared build cache is populated for a later pull-request run
+# to restore. The warm job archives and discards; it does not run tests, so
+# the "same tree twice" trap DEV-612's deleted `check-single-build.nu` existed
+# to catch does not fire for the warm run.
 #
 # PMS-1394: this job runs the SUPPORTED suites. The tests for functionality
 # nothing currently uses run weekly in `integration-unsupported.yml` instead,
@@ -121,8 +127,13 @@ jobs:
           fi
 
       - name: Cache Rust build
+        # PMS-1252: `shared-key` MUST match `cache-warm.yml`'s
+        # warm-integration job so a pull-request run restores what the
+        # post-merge warm saved. The key lands in rust-cache's key
+        # material as the `-integration-` segment.
         uses: https://github.com/Swatinem/rust-cache@v2
         with:
+          shared-key: integration
           cache-on-failure: true
 
       - name: Install cargo-nextest

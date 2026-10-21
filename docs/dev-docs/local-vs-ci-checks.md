@@ -31,7 +31,6 @@ PMS-786 only CI runs (see the note below).
 | Runner labels | `nu scripts/check-runner-labels.nu` | `check-runner-labels` | no | no |
 | OCI build cache | `nu scripts/check-oci-build-cache.nu` | `check-oci-cache` | no | no |
 | OCI publish tags | `nu scripts/check-oci-publish-tags.nu` | `check-oci-publish-tags` | no | no |
-| Single build per commit | `nu scripts/check-single-build.nu` | `check-single-build` | no | no |
 | Workspace dependency table | `nu scripts/check-workspace-deps.nu` | `check-workspace-deps` | no | no |
 | Environment-variable parity | `nu scripts/check-env-example.nu` | `check-env-example` | no | no |
 | Build target storage | `nu scripts/check-build-target-storage.nu` | `check-build-target-storage` | no | no |
