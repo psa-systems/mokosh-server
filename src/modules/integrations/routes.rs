@@ -34,6 +34,7 @@ use crate::utils::error::{AppError, AppResult};
 use crate::utils::json::Json;
 
 use super::models::*;
+use super::registry;
 use super::service::IntegrationsService;
 
 #[derive(Clone)]
@@ -67,8 +68,13 @@ pub fn integration_routes(service: IntegrationsService) -> Router {
 /// exist. Parsing here rather than in the service means the service only ever
 /// sees a provider the registry has an entry for, which is what lets
 /// `registry::descriptor` be infallible.
+///
+/// MAPPS-1098: also 404 for a provider whose integrations surface is hidden
+/// (payment providers). The row still exists and billing still writes to it
+/// via `set_payment_connection`; the HTTP surface here does not expose it so
+/// `Settings > Payment Gateways` is the single surface for the lifecycle.
 fn parse_provider(raw: &str) -> AppResult<IntegrationProvider> {
-    IntegrationProvider::from_str(raw).ok_or_else(|| {
+    let provider = IntegrationProvider::from_str(raw).ok_or_else(|| {
         AppError::NotFound(format!(
             "{raw} is not an integration provider. The providers are: {}",
             IntegrationProvider::ALL
@@ -77,7 +83,14 @@ fn parse_provider(raw: &str) -> AppResult<IntegrationProvider> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
-    })
+    })?;
+    if !registry::descriptor(provider).is_exposed_on_integrations_page() {
+        return Err(AppError::NotFound(format!(
+            "{} is configured under Settings > Payment Gateways",
+            provider.as_str()
+        )));
+    }
+    Ok(provider)
 }
 
 async fn list_integrations(

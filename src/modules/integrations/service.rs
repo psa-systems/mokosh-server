@@ -88,8 +88,14 @@ impl IntegrationsService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         tx.commit().await?;
 
+        // MAPPS-1098: payment providers are configured on
+        // `Settings > Payment Gateways` end to end, so they are not offered
+        // on this list. The row they persist still exists (billing writes
+        // it via `set_payment_connection`); this surface just does not
+        // expose them.
         Ok(registry::REGISTRY
             .iter()
+            .filter(|descriptor| descriptor.is_exposed_on_integrations_page())
             .map(|descriptor| {
                 let row = rows
                     .iter()
