@@ -20,7 +20,7 @@ on:
 
 jobs:
   renovate:
-    uses: psa-systems/common/.forgejo/workflows/renovate.yml@main  # secret-scope-ok: same-org shared workflow repo
+    uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@main  # secret-scope-ok: same-org shared workflow repo
     with:
       target_repository: ${{ github.repository }}
     secrets: inherit
