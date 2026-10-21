@@ -1,0 +1,49 @@
+//! MAPPS-1100 scaffold: the Bills and Expenses subsystem.
+//!
+//! An MSP tracks what IT is billed for (vendor bills) and what its own
+//! people spend (employee expenses), with the same tenant-isolation
+//! posture and audit shape as the rest of the server. The customer-
+//! facing invoicing plane (`billing/`) exists end-to-end today; this
+//! module is the inbound plane the `Capability::BillsAndExpenses`
+//! registry entry promises but could not deliver until MAPPS-1100.
+//!
+//! # What ships in Phase 0 (this PR)
+//!
+//! - Migration 279 creating `vendors`, `expense_categories`, `bills`,
+//!   `bill_lines`, `expenses`, `expense_lines` with tenant isolation and
+//!   `mokosh_app` grants.
+//! - [`models`]: the Rust types that mirror the schema, derivable to and
+//!   from a sqlx row. Service / routes / worker types ride on these.
+//!
+//! # What does NOT ship in Phase 0
+//!
+//! - **routes.rs**: no HTTP surface mounted. Mounting a `/api/v1/bills`
+//!   route that returns NotImplemented is the "advertises what the build
+//!   cannot deliver" anti-pattern MAPPS-1098 and MAPPS-1102 explicitly
+//!   enforced against. The routes land with the first write path that
+//!   actually serves (Phase A).
+//! - **service.rs**: no CRUD methods yet. The repository shape is a
+//!   Phase A decision made against the first endpoint the SPA calls.
+//! - **worker**: due-date reminders and reimbursement batching are
+//!   Phase B.
+//! - **delegation to Xero / QuickBooks**: Phase C, blocked on MAPPS-1099
+//!   shipping OAuth + webhook infrastructure.
+//!
+//! The scaffolding here is clearly marked as pre-wiring: no code
+//! constructs these types, no route is mounted, and this module is not
+//! yet referenced from `src/api/router.rs`. The migration + models give
+//! the next phase a schema and a Rust surface to build against without
+//! re-litigating field shapes in the same PR as the first service
+//! method.
+//!
+//! # Why six tables and not fewer
+//!
+//! `bills` and `expenses` are different ledgers in two directions: a
+//! bill is an obligation to a vendor (needs vendor + bill number + due
+//! date), an expense is a claim from an employee (needs user + approval
+//! flow + reimbursement). Folding them into one `payable` table would
+//! leave half the columns NULL per row and force the service to carry a
+//! discriminator for every read. The two "lines" tables mirror the two
+//! headers; `vendors` and `expense_categories` are shared lookup rows.
+
+pub mod models;
