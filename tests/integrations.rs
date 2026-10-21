@@ -194,9 +194,7 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
 
         let disconnect = app
             .client
-            .post(app.url(&format!(
-                "/api/v1/integrations/{provider}/disconnect"
-            )))
+            .post(app.url(&format!("/api/v1/integrations/{provider}/disconnect")))
             .bearer_auth(&token)
             .send()
             .await
