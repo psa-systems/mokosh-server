@@ -199,11 +199,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         description: "Collect card payments on a hosted page, with a pay-now link on every \
                       invoice. Stripe can also issue invoices of its own; take `payments` \
                       alone to keep Mokosh as the system of record for the document.",
-        supported_capabilities: &[
-            Capability::Payments,
-            Capability::Invoicing,
-            Capability::PointOfSale,
-        ],
+        supported_capabilities: &[Capability::Payments, Capability::Invoicing],
         polling: None,
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::PaymentGateway,
@@ -370,6 +366,24 @@ mod tests {
                 "no provider supports {}",
                 capability.as_str()
             );
+        }
+    }
+
+    /// MAPPS-1102: the `point_of_sale` capability was dropped. Pin that no
+    /// descriptor advertises it, so re-adding the string without re-adding
+    /// the subsystem it would delegate to fails the build. The enum
+    /// variant is gone; a string-level check is what survives.
+    #[test]
+    fn point_of_sale_is_not_supported_by_any_provider() {
+        for entry in REGISTRY {
+            for capability in entry.supported_capabilities {
+                assert_ne!(
+                    capability.as_str(),
+                    "point_of_sale",
+                    "{} still advertises `point_of_sale` after MAPPS-1102",
+                    entry.provider.as_str()
+                );
+            }
         }
     }
 }
