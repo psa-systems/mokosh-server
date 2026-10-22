@@ -1064,7 +1064,7 @@ pub enum LocalPlacement {
 ///
 /// Public because it is the branch production takes for an already-provisioned
 /// caller, and the query-budget regression test
-/// (`tests/bunyip_query_budget.rs`) asserts its cost directly.
+/// (`tests/suites/bunyip_query_budget.rs`) asserts its cost directly.
 pub async fn place_bunyip_user_from_local_state(
     auth_service: &Arc<AuthService>,
     tenants: Option<&Arc<crate::modules::tenants::TenantService>>,
@@ -1718,7 +1718,7 @@ async fn place_bunyip_caller(
     // Bunyip-backed login"). They bootstrap the first tenant, so they
     // must be able to sign in on a fresh instance without a
     // pre-existing invitation - matches the `bootstrap_admin_*`
-    // regression pins in `tests/bunyip_login.rs`.
+    // regression pins in `tests/suites/bunyip_login.rs`.
     let is_platform_admin = claims.bunyip_role.as_deref() == Some("admin");
     // The flag opens the door for a first-sight bunyip identity; the
     // verified-email conjunction stays here so an unverified address can

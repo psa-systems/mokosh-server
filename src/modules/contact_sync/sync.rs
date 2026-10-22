@@ -38,7 +38,7 @@
 //! computed as a difference, so an unchanged record writes nothing - no
 //! `updated_at`, no audit row. A queued question is keyed on its pair and
 //! found again rather than asked twice, and a pair a human already answered is
-//! never asked again. `tests/contact_sync_engine.rs` runs the same sync twice
+//! never asked again. `tests/suites/contact_sync_engine.rs` runs the same sync twice
 //! and compares.
 //!
 //! # A person's "stop" wins (PMS-1214)

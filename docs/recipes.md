@@ -53,7 +53,7 @@ just ci-stalls-self-test    # prove the stall report still reports, on fixtures,
 just fmt                    # cargo fmt --all
 just test                   # cargo test
 just ensure-test-db-roles   # create the DB roles the migrations grant to, before the Postgres-backed suite
-just test-integration       # Postgres-backed tests/*.rs suite in the dev `server` container (mirrors CI integration.yml)
+just test-integration       # Postgres-backed tests/suites/*.rs suite in the dev `server` container (mirrors CI integration.yml)
 just test-integration-unsupported # the suites integration.yml skips: functionality nothing currently uses (mirrors CI integration-unsupported.yml)
 just verify-demo            # the demo-critical subset of the integration suite (seed_demo + data_transfer)
 just verify-providers       # boot every provider seam against the running dev stack, report pass/fail per capability

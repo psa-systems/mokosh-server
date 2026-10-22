@@ -1,4 +1,4 @@
-# cargo-nextest configuration for the Postgres-backed `tests/*.rs` suite.
+# cargo-nextest configuration for the Postgres-backed `tests/suites/*.rs` suite.
 # Read by both `integration.yml` (`cargo nextest run --profile ci`) and
 # `just test-integration`, so CI and the local recipe run the identical
 # profile (PMS-1177).
@@ -16,11 +16,16 @@
 # and broke this job on every branch at once (PMS-1390).
 #
 # What is deliberately NOT given up: the code stays, the tests stay, and they
-# are still COMPILED by the pull-request job, because `cargo nextest archive`
-# builds every `tests/*.rs` binary whatever the filter says. A change that
-# stops `tests/s3_storage.rs` compiling still fails the PR. What moves is only
+# are still COMPILED by the pull-request job, because the one test binary
+# carries every suite whatever the filter says. A change that stops
+# `tests/suites/s3_storage.rs` compiling still fails the PR. What moves is only
 # how often the assertions are executed, to weekly in
 # `integration-unsupported.yml`.
+#
+# PMS-1520: the filters select by MODULE PATH rather than by binary name.
+# Every suite is a module of one binary now, so `binary(s3_storage)` matches
+# nothing; `test(/^suites::s3_storage::/)` is the same selection, anchored so a
+# suite whose name contains another's cannot be dragged in with it.
 #
 # The two filters are complements over the same list, so a suite is in exactly
 # one of them and adding a second unsupported suite is one edit in each. Do not
@@ -38,7 +43,7 @@
 # the two strings rather than parsing nextest's filter language. Keep the
 # parentheses even when the list is one entry long, and add a new suite to the
 # `unsupported` list only, never here.
-default-filter = 'not (binary(s3_storage) or binary(google_client_from_infisical))'
+default-filter = 'not (test(/^suites::s3_storage::/) or test(/^suites::google_client_from_infisical::/))'
 
 # nextest schedules test CASES across every archived binary at once instead
 # of running one binary to completion before starting the next (what
@@ -115,7 +120,7 @@ retries = 2
 # was split out of. Only the filter differs.
 [profile.unsupported]
 inherits = "ci"
-default-filter = '(binary(s3_storage) or binary(google_client_from_infisical))'
+default-filter = '(test(/^suites::s3_storage::/) or test(/^suites::google_client_from_infisical::/))'
 
 # The whole point of this profile is a suite that needs external setup, so a
 # failure has to say what it was. Printing the output of a failing case

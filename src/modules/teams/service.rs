@@ -6,7 +6,7 @@
 //! index and the `updated_at` column + trigger.
 //!
 //! Security-critical checks — every one has a named test in
-//! `tests/teams.rs`:
+//! `tests/suites/teams.rs`:
 //!
 //! - Cross-tenant `user_id` in `add_member` rejected (F1).
 //! - Cross-tenant `manager_id` in create / update rejected (F2).

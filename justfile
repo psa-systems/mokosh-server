@@ -75,7 +75,7 @@ default:
 #   build-oci-image.yml owns that. Run it by hand before touching
 #   oci-build/Dockerfile.
 # - `test-integration` needs a Postgres container, which is why PMS-267 split it
-#   into integration.yml. Run it by hand before touching the tests/*.rs suite.
+#   into integration.yml. Run it by hand before touching the tests/suites/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
 check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-migration-versions-against-base check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md
@@ -362,7 +362,7 @@ ensure-test-db-roles: ensure-env
 # override is expanded inside the container so the credential stays in the
 # compose environment rather than reaching the host shell.
 #
-# PMS-1254: `tests/template_database.rs` runs first and builds the template the
+# PMS-1254: `tests/suites/template_database.rs` runs first and builds the template the
 # suite clones, so the migrations are applied by a step rather than by
 # whichever test process arrives first, and the line naming the template is
 # printed where it can be read rather than inside one case's captured output.
@@ -381,11 +381,11 @@ ensure-test-db-roles: ensure-env
 # exercise the same nextest release; update both in the same change.
 [group: 'test']
 test-integration: ensure-env ensure-test-db-roles
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci --no-capture -E '"'"'binary(template_database)'"'"' && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci --no-capture -E '"'"'test(/^suites::template_database::/)'"'"' && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
 
 # Mirrors .forgejo/workflows/integration-unsupported.yml (PMS-1394): the suites
 # `test-integration` skips, for functionality nothing currently uses. Today that
-# is `tests/s3_storage.rs` alone, and it needs a MinIO, which is what
+# is `tests/suites/s3_storage.rs` alone, and it needs a MinIO, which is what
 # `dev-s3` starts and what fills the blank STORAGE_S3_* keys in `.env`. Without those
 # keys the suite skips loudly rather than failing, so running this recipe on a
 # stack that never ran `just dev-s3` reports nothing and passes.
