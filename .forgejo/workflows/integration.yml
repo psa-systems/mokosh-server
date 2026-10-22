@@ -282,6 +282,20 @@ jobs:
         # Postgres service repeats this.
         run: psql "${DATABASE_URL}" --set=ON_ERROR_STOP=1 --file scripts/test-db-roles.sql
 
+      - name: Report disk space before extracting
+        # Diagnostic for PMS-1515's recurrence: TMPDIR has moved twice already
+        # (`/tmp` -> `runner.temp/nextest` -> `github.workspace/.nextest-tmp`)
+        # and each candidate still ran out. Print `df -h` for the plausible
+        # extract targets so the next failure arrives with the data needed to
+        # pick one that has room.
+        run: |
+          echo "--- df -h ---"
+          df -h
+          echo "--- candidate dir sizes ---"
+          echo "HOME=$HOME"
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          du -sh /tmp "$HOME" "$GITHUB_WORKSPACE" 2>/dev/null || true
+
       - name: Build the template every test clones
         # PMS-1254: the 243 migrations are applied ONCE per Postgres
         # service, into a template database named after a digest of the
@@ -292,17 +306,15 @@ jobs:
         # can see it. Run out of the archive so this compiles nothing.
         #
         # TMPDIR override: nextest extracts the archive into TMPDIR before
-        # running any case. The runner's /tmp is on a small tmpfs, and the
-        # extracted debug `target/` (ring + aws-lc + 252 test binaries) does
-        # not fit, failing with ENOSPC midway through extraction. The first
-        # pass set TMPDIR to `${{ runner.temp }}/nextest`, but on this
-        # runner image `runner.temp` resolves to `/tmp/_temp` on the same
-        # tmpfs, so the extract still filled. Point TMPDIR at a directory
-        # under `github.workspace`, which lives on the volume the clone is
-        # already on and has gigabytes of room.
-        env:
-          TMPDIR: ${{ github.workspace }}/.nextest-tmp
+        # running any case. Both `/tmp` and `github.workspace/.nextest-tmp`
+        # proved too small on this runner image (ENOSPC midway through
+        # extraction, PMS-1515 attempts 1 and 2). Try `$HOME/.nextest-tmp`,
+        # which on a Forgejo-actions runner usually lives on the container's
+        # overlayfs rootfs (a separate, typically larger allocation than the
+        # bind-mounted workspace or the shared tmpfs). The disk-space report
+        # above makes the choice checkable rather than guessed at.
         run: |
+          export TMPDIR="$HOME/.nextest-tmp"
           mkdir -p "${TMPDIR}"
           cargo nextest run --archive-file nextest-archive.tar.zst --profile ci \
             --no-capture -E 'binary(template_database)'
@@ -324,9 +336,8 @@ jobs:
         # to keep in sync with the harness's own report.
         #
         # TMPDIR override: same reason as the template-build step above.
-        env:
-          TMPDIR: ${{ github.workspace }}/.nextest-tmp
         run: |
+          export TMPDIR="$HOME/.nextest-tmp"
           mkdir -p "${TMPDIR}"
           started=$(date +%s)
           set +e
