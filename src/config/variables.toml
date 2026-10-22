@@ -38,6 +38,18 @@ required = false
 reader = "src/app_secrets/mod.rs"
 
 [[variable]]
+name = "MICROSOFT_CONTACTS_CLIENT_ID"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "MICROSOFT_CONTACTS_CLIENT_SECRET"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
 name = "MOKOSH_ADMIN_DATABASE_URL"
 since = "v0.4.0"
 required = false

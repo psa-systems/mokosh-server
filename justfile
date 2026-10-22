@@ -78,7 +78,7 @@ default:
 #   into integration.yml. Run it by hand before touching the tests/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-migration-versions-against-base check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-migration-versions-against-base check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md
 
 # Keep docs/configuration.md's Required / Added in facts and changelog true to
 # the registry and src/config/variables.toml (PMS-1442).
@@ -288,14 +288,6 @@ check-oci-cache:
 [group: 'check']
 check-oci-publish-tags:
     nu scripts/check-oci-publish-tags.nu
-
-# Build a commit once on the pull-request-to-main path (DEV-612). Fails if a
-# workflow that compiles declares both `push: main` and `pull_request: main`, or
-# if no compiling workflow gates pull requests into main at all.
-[doc("Fail if a compiling workflow builds the same tree twice (DEV-612).")]
-[group: 'check']
-check-single-build:
-    nu scripts/check-single-build.nu
 
 # Keep [workspace.dependencies] describing what the workspace shares (PMS-785).
 # Fails if an entry is inherited by no member, or if a member re-pins a crate

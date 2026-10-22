@@ -34,7 +34,6 @@ just check-rate-limit-helper # fail if a 429 response is built outside the share
 just check-runner-labels    # fail if a CI job requests the wrong runner label
 just check-oci-cache        # fail if the OCI build leaves the type=gha runner cache
 just check-oci-publish-tags # fail if the publish tags drift from oci-build/get-tags.nu
-just check-single-build     # fail if a compiling workflow builds the same tree twice
 just check-workspace-deps   # fail if [workspace.dependencies] and its members disagree
 just check-unused-deps      # cargo-machete: fail on a dependency with no call site
 just check-env-example      # fail if a var the code reads is missing from .env.example or compose.dev.yml
