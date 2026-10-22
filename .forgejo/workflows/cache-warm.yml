@@ -68,14 +68,19 @@ jobs:
           cache-on-failure: true
 
       - name: Compile what check.yml compiles
-        # Build the three profile fingerprints check.yml's job builds
-        # (clippy's lint-flagged dev, plain check, test-no-run). No
-        # assertions run here; this workflow is for cache priming only.
+        # Build the profile fingerprints check.yml's job builds (clippy's
+        # lint-flagged dev, plain check, lib test-no-run) plus actually run
+        # the doc tests. The lib tests stay compile-only; the doc tests
+        # cannot — Cargo rejects `--no-run` for doc tests outright
+        # (`error: can't skip running doc tests with --no-run`), because
+        # rustdoc builds and runs them in one step. The run itself still
+        # primes the fingerprint check.yml's doc-test step reuses on a PR,
+        # which is the point of this workflow.
         run: |
           cargo clippy --all-targets -- -D warnings
           cargo check --all-targets
           cargo test --no-run --workspace --lib
-          cargo test --no-run --workspace --doc
+          cargo test --workspace --doc
 
   warm-integration:
     name: warm integration.yml cache
