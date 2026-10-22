@@ -125,14 +125,7 @@ impl IntegrationsService {
         tenant_id: TenantId,
     ) -> AppResult<std::collections::HashMap<String, ContactSyncState>> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let rows: Vec<(
-            String,
-            bool,
-            String,
-            Option<String>,
-            chrono::DateTime<chrono::Utc>,
-            Option<chrono::DateTime<chrono::Utc>>,
-        )> = sqlx::query_as(
+        let rows: Vec<ContactSyncRow> = sqlx::query_as(
             "SELECT provider, is_active, sync_status, last_error, created_at, disconnected_at \
                  FROM contact_sync_connections WHERE tenant_id = $1",
         )
@@ -144,26 +137,25 @@ impl IntegrationsService {
 
         Ok(rows
             .into_iter()
-            .map(
-                |(provider, is_active, sync_status, last_error, created_at, disconnected_at)| {
-                    let status = contact_sync_status(is_active, &sync_status, disconnected_at);
-                    (
-                        provider,
-                        ContactSyncState {
-                            status,
-                            // Only when the state IS the error: a stale message
-                            // from a sync that later succeeded would read as a
-                            // live failure.
-                            last_error: match status {
-                                IntegrationStatus::Error => last_error,
-                                _ => None,
-                            },
-                            connected_at: Some(created_at),
-                            disconnected_at,
+            .map(|row| {
+                let status =
+                    contact_sync_status(row.is_active, &row.sync_status, row.disconnected_at);
+                (
+                    row.provider,
+                    ContactSyncState {
+                        status,
+                        // Only when the state IS the error: a stale message
+                        // from a sync that later succeeded would read as a
+                        // live failure.
+                        last_error: match status {
+                            IntegrationStatus::Error => row.last_error,
+                            _ => None,
                         },
-                    )
-                },
-            )
+                        connected_at: Some(row.created_at),
+                        disconnected_at: row.disconnected_at,
+                    },
+                )
+            })
             .collect())
     }
 
@@ -740,6 +732,22 @@ fn contact_sync_status(
         "failed" | "reconnect_required" => IntegrationStatus::Error,
         _ => IntegrationStatus::Connected,
     }
+}
+
+/// The columns [`IntegrationsService::contact_sync_states`] reads.
+///
+/// A named row type rather than the tuple this was: six columns is past where
+/// a tuple reads (clippy's `type_complexity` says so, and CI is `-D warnings`),
+/// and the positional destructuring was one swapped pair away from reporting
+/// `is_active` as the status.
+#[derive(sqlx::FromRow)]
+struct ContactSyncRow {
+    provider: String,
+    is_active: bool,
+    sync_status: String,
+    last_error: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One contact-sync connection, reduced to what the panel renders
