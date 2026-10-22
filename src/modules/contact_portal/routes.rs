@@ -740,19 +740,50 @@ fn with_refresh_cookie(resp: &ContactLoginResponse, mut into: Response) -> Respo
 }
 
 fn build_refresh_cookie(refresh_token: &str) -> String {
-    format!(
+    build_refresh_cookie_with_domain(refresh_token, portal_cookie_domain().as_deref())
+}
+
+fn clear_refresh_cookie() -> String {
+    build_clear_cookie_with_domain(portal_cookie_domain().as_deref())
+}
+
+/// Reads `PORTAL_COOKIE_DOMAIN` from the config stack. `None` or whitespace
+/// means the cookie stays host-scoped (dev, or any deployment where the SPA
+/// shares the API's origin).
+fn portal_cookie_domain() -> Option<String> {
+    crate::config::get(&crate::config::registry::PORTAL_COOKIE_DOMAIN)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Pure cookie-builder; `domain` is the `Domain=` attribute to append (or
+/// `None` to omit it). Split out of `build_refresh_cookie` so unit tests can
+/// pin the attribute shape without initialising the config stack.
+fn build_refresh_cookie_with_domain(refresh_token: &str, domain: Option<&str>) -> String {
+    let base = format!(
         "{name}={value}; HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age={max_age}",
         name = REFRESH_COOKIE_NAME,
         value = refresh_token,
         max_age = REFRESH_COOKIE_MAX_AGE_SECS,
-    )
+    );
+    match domain {
+        Some(d) if !d.is_empty() => format!("{base}; Domain={d}"),
+        _ => base,
+    }
 }
 
-fn clear_refresh_cookie() -> String {
-    format!(
+/// Pure clear-cookie builder; shape mirrors `build_refresh_cookie_with_domain`
+/// so the browser matches the Set-Cookie against the earlier value and
+/// actually evicts it.
+fn build_clear_cookie_with_domain(domain: Option<&str>) -> String {
+    let base = format!(
         "{name}=; HttpOnly; Secure; SameSite=Lax; Path=/api/v1/contact/auth; Max-Age=0",
         name = REFRESH_COOKIE_NAME,
-    )
+    );
+    match domain {
+        Some(d) if !d.is_empty() => format!("{base}; Domain={d}"),
+        _ => base,
+    }
 }
 
 fn add_cookie(headers: &mut HeaderMap, cookie: &str) {
@@ -873,4 +904,61 @@ async fn set_default_payment_method(
         .set_default(tenant, session.id, id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_clear_cookie_with_domain, build_refresh_cookie_with_domain};
+
+    /// Without a Domain the cookie stays host-scoped (dev / same-origin
+    /// deployments). The attribute set stays HttpOnly;Secure;SameSite=Lax so
+    /// a dependency compromise on the SPA cannot read the token out, and the
+    /// Max-Age matches the refresh-token lifetime (30 days).
+    #[test]
+    fn refresh_cookie_has_no_domain_when_config_unset() {
+        let cookie = build_refresh_cookie_with_domain("tok-abc", None);
+        assert!(cookie.starts_with("mokosh:contact_token=tok-abc; "));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Path=/api/v1/contact/auth"));
+        assert!(cookie.contains("Max-Age=2592000"));
+        assert!(
+            !cookie.contains("Domain="),
+            "no Domain attribute when PORTAL_COOKIE_DOMAIN unset: {cookie}"
+        );
+    }
+
+    /// With `PORTAL_COOKIE_DOMAIN=.a8n.run` the cookie carries `Domain=.a8n.run`
+    /// so the SPA on `tenant-*.a8n.run` sends it to the API host on the same
+    /// apex. Browsers require this attribute to cross a subdomain boundary.
+    #[test]
+    fn refresh_cookie_appends_domain_when_set() {
+        let cookie = build_refresh_cookie_with_domain("tok-abc", Some(".a8n.run"));
+        assert!(
+            cookie.contains("; Domain=.a8n.run"),
+            "Domain=.a8n.run appended: {cookie}"
+        );
+    }
+
+    /// The clear-cookie shape must match the set-cookie's attributes
+    /// (Path and Domain in particular), or the browser treats the clear as a
+    /// different cookie and the stored one lingers until Max-Age expires.
+    #[test]
+    fn clear_cookie_mirrors_the_set_shape() {
+        let cleared = build_clear_cookie_with_domain(Some(".a8n.run"));
+        assert!(cleared.contains("mokosh:contact_token=;"));
+        assert!(cleared.contains("Path=/api/v1/contact/auth"));
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.contains("Domain=.a8n.run"));
+    }
+
+    /// An empty Domain string reads the same as unset: a bare `Domain=` would
+    /// render as a syntactic cookie attribute with no value, which some
+    /// browsers reject and others treat as host-scoped. Fall back cleanly.
+    #[test]
+    fn empty_domain_is_treated_as_unset() {
+        let cookie = build_refresh_cookie_with_domain("tok", Some(""));
+        assert!(!cookie.contains("Domain="));
+    }
 }
