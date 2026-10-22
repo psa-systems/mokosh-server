@@ -250,9 +250,12 @@ impl fmt::Display for SecretKey {
 /// (PMS-966). It is defence against the next caller, who will pass something
 /// else.
 fn validate_discriminator(value: &str) -> AppResult<()> {
-    if value.is_empty() || value.len() > 40 {
+    // PMS-1512: a `ContactSync` discriminator is `{provider}_{connection_id.simple()}`,
+    // and the uuid alone is 32 of those characters, so the cap has to clear the
+    // longest provider name plus the underscore: "microsoft_" + 32 hex = 42.
+    if value.is_empty() || value.len() > 48 {
         return Err(AppError::Configuration(format!(
-            "secret discriminator {value:?} must be 1 to 40 characters"
+            "secret discriminator {value:?} must be 1 to 48 characters"
         )));
     }
     if !value
