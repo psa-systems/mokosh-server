@@ -177,6 +177,16 @@ pub struct ContactSyncOverview {
     /// existing client reads `connection` and a tenant holding both is the point:
     /// two cards, two credentials, two selections, one response.
     pub icloud_connection: Option<ConnectionStatus>,
+    /// `integrations/microsoft_contacts_enabled` (PMS-1512), the Microsoft 365
+    /// half of `enabled`.
+    ///
+    /// MAPPS-1124: MAPPS-1101 shipped the Graph client, the Entra OAuth routes
+    /// and the sync dispatch, and this response never grew the pair that lets a
+    /// Settings page draw any of it. A provider the server can sync and the
+    /// client cannot see is a provider nobody can turn on.
+    pub microsoft_enabled: bool,
+    /// The Microsoft 365 connection, `null` when there is none.
+    pub microsoft_connection: Option<ConnectionStatus>,
 }
 
 /// What one connection looks like to the Settings card.
@@ -1025,6 +1035,11 @@ impl ContactSyncService {
             )
             .await?,
             icloud_connection: self.connection(tenant_id, ICLOUD).await?,
+            microsoft_enabled: crate::modules::settings::read_microsoft_contacts_enabled(
+                &self.db, tenant_id,
+            )
+            .await?,
+            microsoft_connection: self.connection(tenant_id, MICROSOFT).await?,
         })
     }
 
