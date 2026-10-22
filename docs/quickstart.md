@@ -203,7 +203,7 @@ just check                   # every check.yml step except its cargo test steps 
 just pre-commit              # fmt-only check plus check-tree-ownership, runs on every commit
 just pre-push                 # the unit tests `just check` leaves out, plus fmt/clippy/compile; runs on every push (doc tests are CI-only, PMS-786)
 just test                    # cargo test workspace-wide
-just test-integration        # the Postgres-backed tests/*.rs suite
+just test-integration        # the Postgres-backed tests/suites/*.rs suite
 just fmt                     # cargo fmt --all
 just migrate-run             # sqlx migrate run against $DATABASE_URL (host)
 just migrate-create <name>   # new migration file

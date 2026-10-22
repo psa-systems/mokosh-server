@@ -42,7 +42,7 @@ source comments and YouTrack issues cite by number.
 > entries, timesheets, timers, rounding rules) with rounding actually
 > applied, work-type rate derivation, a manager approve/reject state
 > machine, write-side tenant validation, and integration coverage in
-> `tests/time_tracking.rs`. Treat the `time_tracking` row in the
+> `tests/suites/time_tracking.rs`. Treat the `time_tracking` row in the
 > placeholder table and the F3/F8 entries under "Proposed fixes" as
 > closed. A broader re-audit of the other formerly-placeholder
 > modules (many are now `merge`d in `api/router.rs`) is still
@@ -96,7 +96,7 @@ cannot carry live counts, so derive them:
 
 ```nu
 ls migrations/*.sql | length                    # migrations
-ls tests/*.rs | length                          # integration test files
+ls tests/suites/*.rs | length                   # integration test files
 ls src/modules/ | where type == dir | length    # feature modules
 rg --count-matches '\.nest\(|\.merge\(' src/api/router.rs   # mounts
 ```
@@ -153,7 +153,7 @@ Notable layer details:
   parked there is backfilled into their own personal tenant on next
   Bunyip login (`place_bunyip_user` / `is_stuck_in_default`,
   `src/modules/auth/middleware.rs`), so no normal user shares data in
-  it. Enforced end-to-end by the `tests/bunyip_login.rs` placement
+  it. Enforced end-to-end by the `tests/suites/bunyip_login.rs` placement
   tests (PMS-262, PMS-245).
 
 ## Per-module status
@@ -356,7 +356,7 @@ company list's `contact_count`) go through `contact_companies`, so a
 contact is found through ANY of its links and counted once per company.
 `phones` and `companies` are hydrated with one batched query each per
 page, pinned by
-[`contact_hydration_query_budget.rs`](../../tests/contact_hydration_query_budget.rs).
+[`contact_hydration_query_budget.rs`](../../tests/suites/contact_hydration_query_budget.rs).
 
 Portal scoping is deliberately NOT broadened: a portal session still
 resolves the contact's primary company only (PMS-807).
@@ -749,7 +749,7 @@ Service Desk slice added on top:
   verify work-type/ticket/company belong to the tenant (FKs check
   existence, not ownership); `stop_timer`'s company-inference query is
   tenant-scoped; the single-active-timer race maps to `Conflict`.
-- **Tests.** `tests/time_tracking.rs` drives the two-actor happy path
+- **Tests.** `tests/suites/time_tracking.rs` drives the two-actor happy path
   (technician times + submits, manager approves) plus a technician
   cannot-approve guard; `apply_rounding` / `resolve_billing` have
   pure-fn unit tests.

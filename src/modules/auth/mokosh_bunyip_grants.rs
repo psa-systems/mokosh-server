@@ -19,7 +19,7 @@
 //! One read path: [`MokoshBunyipGrantService::is_grant_active`]. Reads
 //! the migrator pool (BYPASSRLS) because the table is deliberately
 //! cross-tenant - a grantee's row names an owner's tenant they do not
-//! otherwise belong to (see `tests/rls_coverage.rs`'s
+//! otherwise belong to (see `tests/suites/rls_coverage.rs`'s
 //! `ALLOWED_WITHOUT_RLS` note). Cached process-wide with a 30-second
 //! TTL: the parent BUNYIP-674 ticket names 30s as the stale window, so
 //! a miss triggers a single query, populates the cache, and the next
@@ -141,7 +141,7 @@ impl MokoshBunyipGrantService {
         }
 
         // SAFETY (PMS-285 / PMS-692 shape): the table is cross-tenant
-        // and RLS-exempt (see `tests/rls_coverage.rs`'s
+        // and RLS-exempt (see `tests/suites/rls_coverage.rs`'s
         // `ALLOWED_WITHOUT_RLS`), so this read runs on the raw
         // NOBYPASSRLS pool without a GUC. `mokosh_app` holds SELECT on
         // it.
@@ -362,7 +362,7 @@ fn invalidate_cache(key: &GrantKey) {
 
 /// Testing hook: drop every cached entry so a test's setup does not
 /// see stale state from an earlier test in the same process. Callable
-/// from the integration-test suite (`tests/mokosh_bunyip_grants.rs`),
+/// from the integration-test suite (`tests/suites/mokosh_bunyip_grants.rs`),
 /// which compiles against this crate's public API. A live process
 /// should never need this - the webhook is the invalidation contract.
 pub fn clear_cache_for_tests() {

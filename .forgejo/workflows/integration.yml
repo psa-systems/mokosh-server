@@ -1,6 +1,6 @@
 ---
 
-# Postgres-backed integration gate: runs the full `tests/*.rs` suite against a
+# Postgres-backed integration gate: runs the full `tests/suites/*.rs` suite against a
 # real database. Split out of check.yml (PMS-267) so the fast fmt/clippy/compile
 # gate is not blocked on a Postgres spin-up. Mirrored locally by
 # `just test-integration`, which runs the unsharded profile (sharding is a CI
@@ -35,7 +35,7 @@
 # either of them repeating the expression.
 #
 # The binaries are still BUILT here. `cargo nextest archive` compiles every
-# `tests/*.rs` target whatever the filter says, so a change that stops an
+# suite whatever the filter says, so a change that stops an
 # unsupported suite compiling still fails the pull request; only its
 # assertions moved.
 
@@ -72,19 +72,23 @@ jobs:
         uses: https://code.forgejo.org/actions/checkout@v5
 
       - name: Require disk headroom for the link step
-        # PMS-740: the archive step links one debug binary per `tests/*.rs`
-        # suite. When the runner filesystem fills mid-write, `rust-lld`
-        # writes its output through an mmap and takes SIGBUS
+        # PMS-740: the archive step used to link one debug binary per
+        # `tests/*.rs` suite. When the runner filesystem fills mid-write,
+        # `rust-lld` writes its output through an mmap and takes SIGBUS
         # (`collect2: fatal error: ld terminated with signal 7 [Bus
         # error]`), which has twice been triaged as a code defect it never
         # was (runs #3666, #3719). Failing here instead names the real
         # problem in one line, before 20 minutes of compilation reach a
-        # confusing crash. 25G = roughly twice the peak this suite's link
-        # stage has been observed to need.
+        # confusing crash.
+        #
+        # PMS-1520 made it one binary for every suite, so the headroom this
+        # needs is a fraction of what it was; the check stays because the
+        # failure it names is still the one a full disk produces, and 25G
+        # still costs nothing to require.
         run: |
-          suites=$(ls tests/*.rs | wc -l)
+          suites=$(ls tests/suites/*.rs | grep -vc '/mod\.rs$')
           avail_gb=$(df -P -BG . | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
-          echo "Integration suites to link: ${suites} debug test binaries"
+          echo "Integration suites: ${suites}, linked into one test binary"
           echo "Free space on the workspace filesystem: ${avail_gb}G"
           df -h .
           if [ "${avail_gb}" -lt 25 ]; then
@@ -104,9 +108,10 @@ jobs:
 
       - name: Install cargo-nextest
         # PMS-1177: nextest schedules test CASES from every archived binary
-        # concurrently instead of running one `tests/*.rs` binary to
-        # completion before the next, which is where most of the previous
-        # wall clock went.
+        # concurrently rather than one suite to completion before the next,
+        # which is where most of the previous wall clock went. PMS-1520
+        # made them modules of one binary; nextest still runs each CASE in
+        # its own process, so the scheduling and the isolation are the same.
         #
         # PMS-1251: a pinned release archive replaces `cargo install --locked
         # cargo-nextest`, which used to compile 717 `Compiling` lines on
@@ -317,7 +322,7 @@ jobs:
           export TMPDIR="$HOME/.nextest-tmp"
           mkdir -p "${TMPDIR}"
           cargo nextest run --archive-file nextest-archive.tar.zst --profile ci \
-            --no-capture -E 'binary(template_database)'
+            --no-capture -E 'test(/^suites::template_database::/)'
 
       - name: Integration tests (shard ${{ matrix.shard }}/3)
         # PMS-1253: `--partition hash:k/N` keeps every test in the same
