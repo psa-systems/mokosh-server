@@ -53,7 +53,7 @@ There is no `RequireVerified` extractor and no `email_verified_at`-based 403 any
 
 ## Tests
 
-`tests/bunyip_login.rs`:
+`tests/suites/bunyip_login.rs`:
 
 - `bootstrap_admin_unverified_email_still_gets_super_admin` - `email_verified = false` (SMTP unconfigured) plus the platform-admin claim still yields `super_admin` and an authenticated session.
 - `bootstrap_admin_verified_email_still_gets_super_admin` - `email_verified = true` (SMTP configured) yields the same `super_admin`, proving enabling email does not downgrade the bootstrap admin.

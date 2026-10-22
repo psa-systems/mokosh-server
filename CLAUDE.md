@@ -32,7 +32,7 @@ just check-doc-links       # every relative Markdown link resolves to a path tha
 just check-claude-md       # CLAUDE.md stays under 20,000 bytes and its docs/ links resolve (PMS-1437)
 just fmt                   # cargo fmt --all
 just test                  # cargo test (workspace-wide)
-just test-integration      # Postgres-backed tests/*.rs suite (mirrors CI integration.yml)
+just test-integration      # Postgres-backed tests/suites/*.rs suite (mirrors CI integration.yml)
 just install-hooks         # install the git pre-commit and pre-push hooks -> run `just pre-commit` and `just pre-push` (from common)
 just pre-commit            # fmt check plus check-tree-ownership only; the full suite moved to `just pre-push`
 just pre-push              # check.yml's cargo steps except doc tests: fmt/clippy/compile/unit, in the dev container

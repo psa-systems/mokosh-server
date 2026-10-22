@@ -1445,8 +1445,8 @@ mod tests {
     // `a_quote_without_an_expiry_omits_the_deadline`); the quote send now
     // routes through `NotificationsService::dispatch("quote.sent", ..)` and
     // the subject / body wording lives on the seeded `notification_templates`
-    // row (migration 265). `tests/notifications_branding.rs` and the
-    // integration tests under `tests/quote_signoff.rs` cover the rendered
+    // row (migration 265). `tests/suites/notifications_branding.rs` and the
+    // integration tests under `tests/suites/quote_signoff.rs` cover the rendered
     // shape end-to-end against the actual template.
 
     /// PMS-761: same for the invoice. An unattributed request for payment is
