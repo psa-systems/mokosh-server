@@ -12,6 +12,14 @@ In development, `.env` is generated once per clone from the committed `.env.exam
 
 Configuration changes in the last 5 releases, newest first, rendered by `just config-docs` from `src/config/registry.rs` and `src/config/variables.toml` (edit those, not this section). **Breaking: won't start** marks a change after which the restart fails until the operator acts; apply it before restarting. **Breaking: feature off** marks a change after which the server runs but the named feature stops working or changes until the operator acts; review it before restarting. Both name the operator action and the issue that introduced them. An unmarked entry needs no action unless you relied on the old behavior. Upgrading across more releases than this? Run `just config-since <running version>`.
 
+<a id="release-v0-19-0"></a>
+
+### Unreleased (v0.19.0)
+
+#### Added
+
+- [`PORTAL_COOKIE_DOMAIN`](#var-portal-cookie-domain) (Required: no) - Optional. Leave it unset to keep the default.
+
 <a id="release-v0-17-0"></a>
 
 ### v0.17.0
@@ -285,6 +293,7 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-bunyip-mailer-client-secret"></a>`BUNYIP_MAILER_CLIENT_SECRET` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client secret presented as HTTP Basic to the mailer relay. |
 | <a id="var-microsoft-contacts-client-id"></a>`MICROSOFT_CONTACTS_CLIENT_ID` | no | v0.17.0 | `.env` | Not described yet: say what it does. |
 | <a id="var-microsoft-contacts-client-secret"></a>`MICROSOFT_CONTACTS_CLIENT_SECRET` | no | v0.17.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-portal-cookie-domain"></a>`PORTAL_COOKIE_DOMAIN` | no | v0.19.0 | `.env` | Optional `Domain=` attribute for the contact-portal refresh cookie (`mokosh:contact_token`). Set to the shared apex (e.g. `.a8n.run`) when the SPA runs on `tenant-*.<apex>` and the API host is a different subdomain of the same apex, so the cookie reaches `/api/v1/contact/auth/refresh` across subdomains. Unset leaves the cookie host-scoped. |
 
 ## Development stack variables
 

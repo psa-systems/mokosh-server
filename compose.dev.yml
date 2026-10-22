@@ -448,6 +448,10 @@ services:
       # for the predicate.
       CORS_ORIGIN: ${CORS_ORIGIN:-}
 
+      # MAPPS-920: Domain= attribute for the contact-portal refresh cookie,
+      # set when the SPA runs on a different subdomain of the API's apex.
+      PORTAL_COOKIE_DOMAIN: ${PORTAL_COOKIE_DOMAIN:-}
+
       # MAPPS-425 / PMS-748 / MAPPS-429: the emailed-link and email-branding
       # trio. SPA_BASE_URL falls back to CLIENT_ORIGIN, so it only needs setting
       # on a stack where the SPA is not the login origin; PUBLIC_API_BASE_URL is

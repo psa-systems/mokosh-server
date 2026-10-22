@@ -25,4 +25,4 @@ jobs:
       target_repository: ${{ github.repository }}
     secrets:
       # secret-scope-ok: reusable workflow needs RENOVATE_TOKEN (write:repository + write:issue) to open dependency-update PRs; this caller job runs no step and reads no secret itself. Explicit pass-through: Forgejo `secrets: inherit` does not propagate reliably to cross-repo reusable workflows that declare a `secrets:` block.
-      RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
+      RENOVATE_TOKEN: ${{ secrets.RENOVATE_CI_TOKEN }}
