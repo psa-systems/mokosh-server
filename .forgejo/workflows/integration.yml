@@ -294,10 +294,14 @@ jobs:
         # TMPDIR override: nextest extracts the archive into TMPDIR before
         # running any case. The runner's /tmp is on a small tmpfs, and the
         # extracted debug `target/` (ring + aws-lc + 252 test binaries) does
-        # not fit, failing with ENOSPC midway through extraction. runner.temp
-        # lives on the workspace volume, which has room.
+        # not fit, failing with ENOSPC midway through extraction. The first
+        # pass set TMPDIR to `${{ runner.temp }}/nextest`, but on this
+        # runner image `runner.temp` resolves to `/tmp/_temp` on the same
+        # tmpfs, so the extract still filled. Point TMPDIR at a directory
+        # under `github.workspace`, which lives on the volume the clone is
+        # already on and has gigabytes of room.
         env:
-          TMPDIR: ${{ runner.temp }}/nextest
+          TMPDIR: ${{ github.workspace }}/.nextest-tmp
         run: |
           mkdir -p "${TMPDIR}"
           cargo nextest run --archive-file nextest-archive.tar.zst --profile ci \
@@ -321,7 +325,7 @@ jobs:
         #
         # TMPDIR override: same reason as the template-build step above.
         env:
-          TMPDIR: ${{ runner.temp }}/nextest
+          TMPDIR: ${{ github.workspace }}/.nextest-tmp
         run: |
           mkdir -p "${TMPDIR}"
           started=$(date +%s)
