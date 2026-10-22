@@ -124,10 +124,48 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
         .collect();
     assert_eq!(
         providers,
-        vec!["quickbooks", "xero", "google", "microsoft"],
-        "the list is the registry filtered to providers exposed on the integrations page \
-         (MAPPS-1098: payment providers moved to Settings > Payment Gateways end-to-end)"
+        vec![
+            "stripe",
+            "paypal",
+            "quickbooks",
+            "xero",
+            "google",
+            "microsoft",
+            "icloud"
+        ],
+        "MAPPS-1122: the panel lists the whole registry. MAPPS-1098 filtered the payment \
+         providers out of this list as well as out of the write routes, which left the page \
+         unable to answer what an organization is connected to; the write routes still \
+         refuse them, asserted below"
     );
+
+    // MAPPS-1122: every listed provider says where it is set up, or says
+    // nothing when there is nowhere to send an operator yet. Asserted as a
+    // table, because the failure worth catching is one provider pointing at
+    // another's page: `CredentialHome::ContactSync` names one surface for
+    // three providers, which is why the kind is served per provider.
+    for (provider, kind) in [
+        ("stripe", Some("payment_gateway")),
+        ("paypal", Some("payment_gateway")),
+        ("google", Some("contact_sync_google")),
+        ("icloud", Some("contact_sync_icloud")),
+        ("microsoft", Some("contact_sync_microsoft")),
+        ("quickbooks", None),
+        ("xero", None),
+    ] {
+        let row = entry(&entries, provider);
+        match kind {
+            Some(expected) => assert_eq!(
+                row["setup"]["kind"].as_str(),
+                Some(expected),
+                "{provider} points at the wrong setup surface: {row}"
+            ),
+            None => assert!(
+                row.get("setup").is_none(),
+                "{provider} has no setup surface until its client exists: {row}"
+            ),
+        }
+    }
 
     let xero = entry(&entries, MANAGED_HERE);
     assert_eq!(xero["status"], "not_connected");
@@ -559,5 +597,122 @@ async fn every_capability_a_row_reports_is_renderable(pool: PgPool) {
     assert!(
         !supported.is_empty(),
         "the row's capability list cannot be empty: it is what the card draws",
+    );
+}
+
+/// MAPPS-1122: a provider whose connection lives in contact sync reports the
+/// state contact sync is actually in.
+///
+/// This is the defect the panel existed around rather than solved. `compose`
+/// built every row from the `integrations` table, and Google never has one:
+/// its connection is a `contact_sync_connections` row. So a tenant whose
+/// Google Contacts was connected and syncing read "Not connected" on the page
+/// whose entire job is to say what is connected, and an admin had no way to
+/// tell that from a tenant that had never set it up.
+///
+/// The four states are asserted together because what matters is that they
+/// DIFFER: one case per state would each pass against a server that answered
+/// `connected` for any row at all.
+#[mokosh_test]
+async fn a_contact_sync_provider_reports_the_state_contact_sync_is_in(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded admin's tenant");
+
+    // google: connected and syncing. icloud: the provider asked us to wait,
+    // which is not a broken integration (PSA-70 J). microsoft: the grant was
+    // revoked, which is the one state with something for a human to do.
+    for (provider, is_active, sync_status, disconnected) in [
+        ("google", true, "success", false),
+        ("icloud", true, "throttled", false),
+        ("microsoft", true, "reconnect_required", false),
+    ] {
+        sqlx::query(
+            "INSERT INTO contact_sync_connections \
+             (tenant_id, provider, account_email, is_active, sync_status, last_error, disconnected_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(tenant_id)
+        .bind(provider)
+        .bind(format!("admin@{provider}.example"))
+        .bind(is_active)
+        .bind(sync_status)
+        .bind(Some("the grant was revoked"))
+        .bind(disconnected.then(chrono::Utc::now))
+        .execute(&pool)
+        .await
+        .expect("seed a contact-sync connection");
+    }
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let entries = list(&app, &token).await;
+
+    assert_eq!(
+        entry(&entries, "google")["status"],
+        "connected",
+        "a syncing connection has to read as connected, which is the whole ticket"
+    );
+    assert_eq!(
+        entry(&entries, "icloud")["status"],
+        "connected",
+        "throttled is the provider asking us to wait, not a broken integration"
+    );
+    let microsoft = entry(&entries, "microsoft");
+    assert_eq!(
+        microsoft["status"], "error",
+        "a revoked grant is the one state with something for a human to do"
+    );
+    assert_eq!(
+        microsoft["last_error"], "the grant was revoked",
+        "and the reason is shown: {microsoft}"
+    );
+    assert_eq!(
+        entry(&entries, "xero")["status"],
+        "not_connected",
+        "a provider with no connection anywhere is untouched by this"
+    );
+    assert!(
+        entry(&entries, "google").get("last_error").is_none(),
+        "a stale message from a sync that later succeeded would read as a live failure"
+    );
+}
+
+/// A disconnected contact-sync row reads as disconnected, not as never set up.
+///
+/// Contact sync KEEPS the row when an admin disconnects (PSA-70 J), because the
+/// contacts it imported stay and their provenance has to keep naming where they
+/// came from. The panel has to tell that apart from a tenant that never
+/// connected, which is the same distinction `integrations.status` draws for the
+/// providers it owns.
+#[mokosh_test]
+async fn a_disconnected_contact_sync_row_is_not_a_tenant_that_never_connected(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded admin's tenant");
+    sqlx::query(
+        "INSERT INTO contact_sync_connections \
+         (tenant_id, provider, account_email, is_active, sync_status, disconnected_at) \
+         VALUES ($1, 'google', 'admin@example.com', FALSE, 'success', NOW())",
+    )
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("seed a disconnected connection");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let entries = list(&app, &token).await;
+    assert_eq!(entry(&entries, "google")["status"], "disconnected");
+    assert_eq!(
+        entry(&entries, "icloud")["status"],
+        "not_connected",
+        "and the one that was never connected still says so"
     );
 }

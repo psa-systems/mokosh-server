@@ -92,6 +92,11 @@ pub struct IntegrationResponse {
     /// What this tenant has handed over. Empty for a provider with no row.
     pub enabled_capabilities: Vec<String>,
     pub status: IntegrationStatus,
+    /// The settings surface that owns this provider's setup, and the one
+    /// action the panel offers (MAPPS-1122). `None` for a provider with
+    /// nowhere to send an operator yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupSurfaceResponse>,
     /// Whether this build has anything behind the provider (MAPPS-1121).
     /// `false` means the entry exists so its capabilities can be named, and
     /// connect and capability changes are refused: a client renders it as not
@@ -124,6 +129,27 @@ pub struct IntegrationResponse {
     pub disconnected_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+/// Where a provider is set up, as the panel renders it (MAPPS-1122).
+///
+/// `kind` is what the client routes on and `label` is what a reader sees. Two
+/// fields because the prose has already changed once ("Settings > Contact
+/// sync" named one page for three providers), and a client routing on prose
+/// would have broken when it did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupSurfaceResponse {
+    pub kind: String,
+    pub label: String,
+}
+
+impl From<crate::modules::integrations::registry::SetupSurface> for SetupSurfaceResponse {
+    fn from(surface: crate::modules::integrations::registry::SetupSurface) -> Self {
+        Self {
+            kind: surface.kind.to_string(),
+            label: surface.label.to_string(),
+        }
+    }
 }
 
 /// The descriptor's credential home as the response carries it.
@@ -160,6 +186,7 @@ impl IntegrationResponse {
                 .collect(),
             enabled_capabilities: Vec::new(),
             status: IntegrationStatus::NotConnected,
+            setup: descriptor.setup_surface().map(SetupSurfaceResponse::from),
             available: descriptor.build.is_built(),
             managed_elsewhere: match descriptor.connection_home {
                 ConnectionHome::Integrations => None,

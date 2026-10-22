@@ -84,7 +84,11 @@ fn parse_provider(raw: &str) -> AppResult<IntegrationProvider> {
                 .join(", ")
         ))
     })?;
-    if !registry::descriptor(provider).is_exposed_on_integrations_page() {
+    // MAPPS-1098: a payment provider's lifecycle belongs to Settings > Payment
+    // Gateways, so the four per-provider routes refuse it. MAPPS-1122 kept this
+    // and stopped the LIST sharing the predicate: the panel lists every
+    // provider, and only changing one is confined to its own surface.
+    if !registry::descriptor(provider).is_writable_on_integrations_page() {
         return Err(AppError::NotFound(format!(
             "{} is configured under Settings > Payment Gateways",
             provider.as_str()
