@@ -501,6 +501,27 @@ pub async fn read_icloud_contacts_enabled(db: &Database, tenant_id: TenantId) ->
     Ok(value.and_then(|v| v.as_bool()).unwrap_or(true))
 }
 
+/// PMS-1512: whether this tenant allows the Microsoft 365 contact sync.
+///
+/// Its own key rather than sharing Google's, for the same reason the iCloud
+/// key (`read_icloud_contacts_enabled`) has its own: an MSP that disables one
+/// integration should not silently disable another. Defaults to allowed, the
+/// same "unset is enabled" convention as the other two.
+pub async fn read_microsoft_contacts_enabled(
+    db: &Database,
+    tenant_id: TenantId,
+) -> AppResult<bool> {
+    let mut tx = db.begin_with_tenant(tenant_id).await?;
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"SELECT value FROM tenant_settings
+           WHERE tenant_id = $1 AND category = 'integrations' AND key = 'microsoft_contacts_enabled'"#,
+    )
+    .bind(tenant_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(value.and_then(|v| v.as_bool()).unwrap_or(true))
+}
+
 /// PMS-1145: who may correct a work-day segment (`timesheets/segment_editing`),
 /// as the stored string; `SegmentEditPolicy::parse` gives it a meaning. Unset
 /// means `owner_or_admin`. A stored value the parser refuses is treated the
