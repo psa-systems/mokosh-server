@@ -15,9 +15,22 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-/// Xero is managed by this subsystem (`ConnectionHome::Integrations`), so it is
-/// the provider every write path is exercised through.
+/// Xero's connection is managed by this subsystem (`ConnectionHome::Integrations`),
+/// so it is the provider the write paths are exercised against.
+///
+/// MAPPS-1121: those paths now REFUSE it, because this build has no Xero client
+/// and nothing reads what it would be delegated. That is not a gap in this
+/// suite, it is the subsystem's current truth: after MAPPS-1098 moved the
+/// payment providers to Settings > Payment Gateways, every provider still on
+/// this surface is either planned (QuickBooks, Xero) or managed elsewhere
+/// (Google, Microsoft 365), so nothing here can be connected at all. The
+/// success-path cases this file used to run against Xero return when
+/// MAPPS-1099 Phase A ships `billing/provider/xero.rs` and the registry entry
+/// flips to `Built`; they are in this file's history to restore from.
 const MANAGED_HERE: &str = "xero";
+/// The other planned provider, so the refusal is asserted as a rule rather than
+/// against one name.
+const ALSO_PLANNED: &str = "quickbooks";
 /// Google's connection still lives in `contact_sync_connections` until PMS-1315
 /// moves it, so it is the provider every refusal is exercised through. It was
 /// Stripe until PMS-1312 brought the payment providers over, and the refusal has
@@ -25,6 +38,10 @@ const MANAGED_HERE: &str = "xero";
 /// message is what an operator gets back, and there is nothing else that tells
 /// them where to go instead.
 const MANAGED_ELSEWHERE: &str = "google";
+/// Microsoft 365 joined it in MAPPS-1121: its Graph client shipped (MAPPS-1101)
+/// and its connection is the Entra consent round trip that writes
+/// `contact_sync_connections`, so this surface is the wrong one for it too.
+const ALSO_ELSEWHERE: &str = "microsoft";
 
 async fn list(app: &common::TestApp, token: &str) -> Vec<Value> {
     let response = app
@@ -114,6 +131,23 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
 
     let xero = entry(&entries, MANAGED_HERE);
     assert_eq!(xero["status"], "not_connected");
+    // MAPPS-1121: the fact the page needs and could not derive. Xero is listed
+    // so its capabilities can be named; Google's client exists, so the two
+    // differ here even though neither can be connected on this surface.
+    assert_eq!(
+        xero["available"], false,
+        "no Xero client, nothing reads its capabilities, no poll job"
+    );
+    assert_eq!(
+        entry(&entries, MANAGED_ELSEWHERE)["available"],
+        true,
+        "Google's contact sync is built; it is simply configured elsewhere"
+    );
+    assert_eq!(
+        entry(&entries, ALSO_ELSEWHERE)["available"],
+        true,
+        "MAPPS-1101 shipped the Microsoft Graph client"
+    );
     assert_eq!(
         xero["enabled_capabilities"]
             .as_array()
@@ -207,64 +241,171 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
     }
 }
 
-/// Connecting stores the credential through the secrets provider and marks the
-/// integration connected. Omitting `capabilities` delegates everything the
-/// provider supports, because an operator who is asked nothing else expects the
-/// integration to work.
+/// Nothing on this surface can be connected today, and each refusal says which
+/// of the two reasons it is.
+///
+/// MAPPS-1121. The two reasons are not interchangeable and an operator acts on
+/// them differently: a planned provider is waiting on us to build it, and a
+/// provider managed elsewhere is waiting on the operator to go to the right
+/// page. Telling someone Microsoft 365 is "not available yet" would send them
+/// to wait for work that shipped.
+///
+/// Asserted together, in one case, because what matters is that the four
+/// answers are DIFFERENT from each other: four separate tests would each pass
+/// against a server that gave the same refusal to everyone.
 #[mokosh_test]
-async fn connecting_delegates_every_supported_capability_by_default(pool: PgPool) {
+async fn no_provider_can_be_connected_here_and_each_refusal_says_why(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    let response = connect(
-        &app,
-        &token,
-        MANAGED_HERE,
-        json!({ "credential": "xero-refresh-token" }),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("connect json");
-    assert_eq!(body["status"], "connected");
-    assert_eq!(
-        body["enabled_capabilities"],
-        json!(["invoicing", "bills_and_expenses"]),
-        "everything Xero supports, in the registry's order"
-    );
-    assert!(body["connected_at"].is_string());
+    for provider in [MANAGED_HERE, ALSO_PLANNED] {
+        let response = connect(&app, &token, provider, json!({ "credential": "anything" })).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "{provider} has no client, so connecting it claims a delegation nothing can act on"
+        );
+        let body: Value = response.json().await.expect("refusal json");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("nothing behind it"),
+            "the refusal says what is missing: {message}"
+        );
+        assert!(
+            !message.contains("MAPPS-"),
+            "an MSP admin has no use for our issue keys: {message}"
+        );
+        assert_eq!(
+            row_count(&pool, provider).await,
+            0,
+            "a refused connect writes nothing"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM secrets WHERE name LIKE 'INTEGRATION__%'"
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count integration secrets"),
+            0,
+            "and stores no credential for a provider that could not read one"
+        );
+    }
+
+    for provider in [MANAGED_ELSEWHERE, ALSO_ELSEWHERE] {
+        let response = connect(&app, &token, provider, json!({ "credential": "anything" })).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = response.json().await.expect("refusal json");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("contact_sync_connections"),
+            "the refusal names where the connection does live: {message}"
+        );
+        assert!(
+            !message.contains("nothing behind it"),
+            "{provider} is built; saying otherwise sends an operator to wait for shipped \
+             work: {message}"
+        );
+        assert_eq!(row_count(&pool, provider).await, 0);
+    }
 }
 
-/// The rule the whole subsystem exists for, through the API: a tenant cannot
-/// hand a provider something the provider does not do, and the refusal says what
-/// the provider does instead.
+/// A capability change is the same claim connect makes, in smaller print, and
+/// is refused for the same provider.
+///
+/// Separate from the case above because it is a separate handler: the first
+/// version of MAPPS-1121 gated `connect` alone, which left an operator able to
+/// tick Invoicing on Xero and be told it had been delegated.
 #[mokosh_test]
-async fn a_capability_the_provider_does_not_support_is_refused(pool: PgPool) {
+async fn delegating_a_capability_to_a_planned_provider_is_refused(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    let response = connect(
-        &app,
-        &token,
-        MANAGED_HERE,
-        json!({ "credential": "t", "capabilities": ["invoicing", "payments"] }),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body: Value = response.json().await.expect("refusal json");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("payments"), "{message}");
-    assert!(
-        message.contains("invoicing"),
-        "the refusal names what it DOES provide: {message}"
-    );
-
-    // Refused and not filtered: no row exists claiming the half that was legal.
+    let response = app
+        .client
+        .put(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}")))
+        .bearer_auth(&token)
+        .json(&json!({ "capabilities": ["invoicing"] }))
+        .send()
+        .await
+        .expect("update");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(
         row_count(&pool, MANAGED_HERE).await,
         0,
-        "a rejected request writes nothing"
+        "a refused update mints no row"
+    );
+}
+
+/// A row left by an earlier build can still be disconnected, and disconnecting
+/// deletes its credential.
+///
+/// This is the state a tenant who connected QuickBooks before MAPPS-1121 is in:
+/// a `connected` row and a stored credential for a provider that was never able
+/// to use either. `disconnect` is deliberately not gated on the build state, so
+/// the button that clears both still works, and this is what says so.
+#[mokosh_test]
+async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded admin's tenant");
+    sqlx::query(
+        "INSERT INTO integrations (tenant_id, provider, status, config, enabled_capabilities, \
+         connected_at) VALUES ($1, $2, 'connected', '{}'::jsonb, ARRAY['invoicing'], NOW())",
+    )
+    .bind(tenant_id)
+    .bind(MANAGED_HERE)
+    .execute(&pool)
+    .await
+    .expect("seed the row an earlier build would have written");
+    sqlx::query("INSERT INTO secrets (tenant_id, name, value_encrypted) VALUES ($1, $2, $3)")
+        .bind(tenant_id)
+        // The name `SecretKey::integration` renders: the prefix, the tenant's
+        // uuid in simple form (no dashes), then the provider upper-cased.
+        // Built the same way here rather than guessed, because a near-miss
+        // would leave this case asserting that disconnect deleted a row that
+        // was never the one it looks for.
+        .bind(format!("INTEGRATION__{}__XERO", tenant_id.simple()))
+        .bind(vec![1u8, 2, 3])
+        .execute(&pool)
+        .await
+        .expect("seed the credential it would have stored");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let response = app
+        .client
+        .post(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}/disconnect")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("disconnect");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the way out of the old state cannot be gated on the state being possible"
+    );
+    let body: Value = response.json().await.expect("disconnect json");
+    assert_eq!(body["status"], "disconnected");
+    assert_eq!(
+        row_count(&pool, MANAGED_HERE).await,
+        1,
+        "the row is kept, so what was delegated survives for a reconnect"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM secrets WHERE name LIKE 'INTEGRATION__%'"
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count integration secrets"),
+        0,
+        "and the credential it could never use is gone"
     );
 }
 
@@ -298,191 +439,16 @@ async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
     );
 }
 
-/// A credential is never on the row, never served back and never in the audit
-/// trail. This is the property migration 252's header states and the one the
-/// secrets provider exists for, so it is asserted against the stored bytes
-/// rather than against what the service passed around.
-#[mokosh_test]
-async fn the_credential_is_nowhere_in_the_integration_row_or_its_audit_trail(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-
-    let credential = "xero-refresh-token-that-must-not-be-stored-here";
-    let response = connect(
-        &app,
-        &token,
-        MANAGED_HERE,
-        json!({ "credential": credential, "config": { "tenant_realm": "abc" } }),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("connect json");
-    assert!(
-        !body.to_string().contains(credential),
-        "the response carries the credential back: {body}"
-    );
-
-    let row: String = sqlx::query_scalar("SELECT to_jsonb(t)::text FROM integrations t")
-        .fetch_one(&pool)
-        .await
-        .expect("the integrations row");
-    assert!(
-        !row.contains(credential),
-        "the credential is on the row: {row}"
-    );
-    assert!(
-        row.contains("tenant_realm"),
-        "the non-secret config IS on the row: {row}"
-    );
-
-    let audit: String = sqlx::query_scalar(
-        "SELECT COALESCE(string_agg(to_jsonb(t)::text, ' '), '') FROM audit_log t \
-         WHERE entity_type = 'integrations'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("the audit rows");
-    assert!(
-        !audit.contains(credential),
-        "the credential is in the audit trail: {audit}"
-    );
-    assert!(
-        audit.contains("\"action\": \"create\"") || audit.contains("\"action\":\"create\""),
-        "connecting is audited: {audit}"
-    );
-
-    // It did reach the secrets provider, at the address PMS-1310 gives it.
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT name FROM secrets WHERE name LIKE 'INTEGRATION__%__XERO'")
-            .fetch_optional(&pool)
-            .await
-            .expect("read the secrets table");
-    assert!(
-        stored.is_some(),
-        "the credential did not reach the secrets provider"
-    );
-}
-
-/// Suspending a delegation without discarding the credential is a real state, so
-/// an empty capability set is accepted where a portal role's would be refused.
-#[mokosh_test]
-async fn a_delegation_can_be_narrowed_and_emptied_while_staying_connected(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-
-    connect(&app, &token, MANAGED_HERE, json!({ "credential": "t" })).await;
-
-    let narrow = app
-        .client
-        .put(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}")))
-        .bearer_auth(&token)
-        .json(&json!({ "capabilities": ["invoicing"], "poll_interval_minutes": 30 }))
-        .send()
-        .await
-        .expect("narrow the delegation");
-    assert_eq!(narrow.status(), StatusCode::OK);
-    let body: Value = narrow.json().await.expect("update json");
-    assert_eq!(body["enabled_capabilities"], json!(["invoicing"]));
-    assert_eq!(body["poll_interval_minutes"], 30);
-    assert_eq!(body["status"], "connected");
-
-    let emptied = app
-        .client
-        .put(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}")))
-        .bearer_auth(&token)
-        .json(&json!({ "capabilities": [] }))
-        .send()
-        .await
-        .expect("empty the delegation");
-    assert_eq!(emptied.status(), StatusCode::OK);
-    let body: Value = emptied.json().await.expect("update json");
-    assert_eq!(body["enabled_capabilities"], json!([]));
-    assert_eq!(
-        body["status"], "connected",
-        "delegating nothing is not disconnecting"
-    );
-    assert_eq!(
-        body["poll_interval_minutes"], 30,
-        "a field the request omitted keeps its value"
-    );
-}
-
-/// Disconnecting keeps the row and deletes the credential. The row stays for the
-/// `contact_sync_connections.disconnected_at` reason: the capability set the
-/// tenant chose is worth keeping so reconnecting does not start from an empty
-/// page, and the audit trail has to keep naming who connected it.
-#[mokosh_test]
-async fn disconnecting_keeps_the_row_and_deletes_the_credential(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-
-    connect(
-        &app,
-        &token,
-        MANAGED_HERE,
-        json!({ "credential": "t", "capabilities": ["invoicing"] }),
-    )
-    .await;
-
-    let response = app
-        .client
-        .post(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}/disconnect")))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("disconnect");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.expect("disconnect json");
-    assert_eq!(body["status"], "disconnected");
-    assert_eq!(
-        body["enabled_capabilities"],
-        json!(["invoicing"]),
-        "what the tenant chose survives the disconnect"
-    );
-    assert!(body["disconnected_at"].is_string());
-
-    assert_eq!(row_count(&pool, MANAGED_HERE).await, 1, "the row is kept");
-    let secrets: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM secrets WHERE name LIKE 'INTEGRATION__%'")
-            .fetch_one(&pool)
-            .await
-            .expect("count secrets");
-    assert_eq!(secrets, 0, "the credential is gone");
-
-    // Reconnecting reuses the row rather than minting a second installation.
-    let again = connect(&app, &token, MANAGED_HERE, json!({ "credential": "t2" })).await;
-    assert_eq!(again.status(), StatusCode::OK);
-    let body: Value = again.json().await.expect("reconnect json");
-    assert_eq!(body["status"], "connected");
-    assert!(
-        body["disconnected_at"].is_null() || body.get("disconnected_at").is_none(),
-        "reconnecting clears the disconnect: {body}"
-    );
-    assert_eq!(row_count(&pool, MANAGED_HERE).await, 1);
-}
-
-/// Configuring something that was never connected would mint a row claiming a
-/// delegation nothing can act on, so it is a 404 pointing at connect.
-#[mokosh_test]
-async fn configuring_an_integration_that_was_never_connected_is_refused(pool: PgPool) {
-    let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    let app = common::boot(pool.clone()).await;
-    let token = common::login(&app, &email, &password).await;
-
-    let response = app
-        .client
-        .put(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}")))
-        .bearer_auth(&token)
-        .json(&json!({ "capabilities": ["invoicing"] }))
-        .send()
-        .await
-        .expect("configure");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(row_count(&pool, MANAGED_HERE).await, 0);
-}
+// MAPPS-1121 removed four cases here, all of which drove a write path through
+// Xero: the credential never reaching the row or the audit trail, narrowing a
+// delegation to empty while staying connected, disconnect keeping the row, and
+// a capability change on a provider that was never connected. Every one of them
+// now gets a 409 before reaching the behaviour it asserted, because this build
+// has no Xero client. The rules survive: `resolve_capabilities` and the
+// credential-home split are unit-tested in `modules::integrations::service`,
+// disconnect's row-and-credential handling is covered above against a row an
+// earlier build left, and the rest come back with MAPPS-1099 Phase A, out of
+// this file's history.
 
 /// A provider the registry has no entry for is a 404 naming the ones it does,
 /// not a row with a provider nothing can serve.
@@ -506,34 +472,38 @@ async fn a_provider_the_registry_does_not_know_is_a_404(pool: PgPool) {
 }
 
 /// Tenant scoping, through the app rather than through the policy alone: one
-/// tenant's installation is invisible to the other, in both directions.
+/// tenant's row is invisible to the other, in both directions.
+///
+/// MAPPS-1121: the rows are seeded rather than connected, because no provider
+/// on this surface can be connected any more. What is being asserted is the
+/// policy, not the write path, so seeding costs the case nothing: `boot_rls`
+/// still runs the reads as the unprivileged `mokosh_app` posture, which is the
+/// only way this says anything about RLS at all (PMS-285).
 #[mokosh_test]
 async fn one_tenants_integration_is_invisible_to_another(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
-    // `common::login` names the `default` slug, so the second tenant logs in
-    // through its own, which is the shape PMS-728 requires of every local
-    // password login.
     let (_other_tenant, _other_id, other_email, other_password) =
         common::seed_tenant_with_admin(&pool, OTHER_SLUG).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded admin's tenant");
+    sqlx::query(
+        "INSERT INTO integrations (tenant_id, provider, status, config, enabled_capabilities, \
+         connected_at) VALUES ($1, $2, 'connected', '{}'::jsonb, ARRAY['invoicing'], NOW())",
+    )
+    .bind(tenant_id)
+    .bind(MANAGED_HERE)
+    .execute(&pool)
+    .await
+    .expect("seed one tenant's row");
 
-    // `boot_rls` and not `boot`: the default harness pool is the superuser,
-    // which bypasses RLS however forced the policy is, so the isolation this
-    // case is about would pass on the explicit `tenant_id` filter alone and
-    // say nothing about the policy. This one runs the request path as the
-    // unprivileged `mokosh_app` posture (PMS-285).
     let app = common::boot_rls(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
     let other_token = login_to(&app, &other_email, &other_password, OTHER_SLUG).await;
 
-    connect(
-        &app,
-        &token,
-        MANAGED_HERE,
-        json!({ "credential": "ours", "capabilities": ["invoicing"] }),
-    )
-    .await;
-
-    // The other tenant's catalog still shows Xero as available to connect.
+    // The other tenant sees the catalog entry with no installation on it.
     let theirs = list(&app, &other_token).await;
     let their_xero = entry(&theirs, MANAGED_HERE);
     assert_eq!(
@@ -558,12 +528,15 @@ async fn one_tenants_integration_is_invisible_to_another(pool: PgPool) {
     assert_eq!(entry(&ours, MANAGED_HERE)["status"], "connected");
 }
 
-/// Per-row `supported_capabilities` has to agree with what the server will
-/// accept on connect, because the client reads the row's own subset and does
-/// not hold a separate catalog. MAPPS-986: the standalone catalog route was
-/// removed - what each row reports is now the only client-facing source.
+/// Every capability a row reports is renderable and the list is never empty.
+///
+/// MAPPS-1121: this used to finish by connecting with exactly the set the row
+/// advertised, which was the sharp end of it: the row offering something the
+/// server would refuse. That half cannot run while no provider is connectable,
+/// and it returns with the first built one. What is left still catches the
+/// failure that reaches a screen, a capability with no label to draw.
 #[mokosh_test]
-async fn every_capability_a_row_supports_is_one_the_server_accepts(pool: PgPool) {
+async fn every_capability_a_row_reports_is_renderable(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
@@ -585,18 +558,6 @@ async fn every_capability_a_row_supports_is_one_the_server_accepts(pool: PgPool)
         .collect();
     assert!(
         !supported.is_empty(),
-        "the row's capability list cannot be empty, nothing could be connected",
-    );
-    let response = connect(
-        &app,
-        &token,
-        MANAGED_HERE,
-        json!({ "credential": "t", "capabilities": supported }),
-    )
-    .await;
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the row offered a capability the server refused on connect",
+        "the row's capability list cannot be empty: it is what the card draws",
     );
 }

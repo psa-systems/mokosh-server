@@ -92,6 +92,13 @@ pub struct IntegrationResponse {
     /// What this tenant has handed over. Empty for a provider with no row.
     pub enabled_capabilities: Vec<String>,
     pub status: IntegrationStatus,
+    /// Whether this build has anything behind the provider (MAPPS-1121).
+    /// `false` means the entry exists so its capabilities can be named, and
+    /// connect and capability changes are refused: a client renders it as not
+    /// available rather than offering a credential field whose value nothing
+    /// would read. Served rather than derived from the provider name, the
+    /// reason `credential_elsewhere` is (PMS-1447).
+    pub available: bool,
     /// `Some` when the connection is owned by another subsystem, in which case
     /// connect, disconnect and capability changes are refused here.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +160,7 @@ impl IntegrationResponse {
                 .collect(),
             enabled_capabilities: Vec::new(),
             status: IntegrationStatus::NotConnected,
+            available: descriptor.build.is_built(),
             managed_elsewhere: match descriptor.connection_home {
                 ConnectionHome::Integrations => None,
                 ConnectionHome::Elsewhere {

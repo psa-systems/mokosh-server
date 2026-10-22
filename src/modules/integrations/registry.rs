@@ -160,6 +160,37 @@ const POLLED: PollingSpec = PollingSpec {
     min_minutes: MIN_POLL_INTERVAL_MINUTES,
 };
 
+/// Whether there is anything behind a registry entry (MAPPS-1121).
+///
+/// PMS-1310 built the capability model before the providers, which is a
+/// reasonable order to build in and left a gap nothing stated: a provider is
+/// listed here whether or not a line of code can act on it. The page therefore
+/// offered QuickBooks, Xero and Microsoft 365 a credential field, and
+/// `connect` stored whatever was typed into it and answered `connected`. Both
+/// ends were honest on their own terms and the result was a tenant told that a
+/// delegation had happened when nothing could act on it.
+///
+/// So the entry now says. `Planned` is not a lesser entry: the capability
+/// vocabulary is the point of the registry, and a provider nobody can see is a
+/// provider nobody can ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderBuild {
+    /// A client exists and something acts on the capabilities.
+    Built,
+    /// Declared so the capability model can name it; nothing behind it yet.
+    ///
+    /// `tracked_by` is the issue that builds it, kept here rather than in the
+    /// client so the two cannot disagree, and NOT rendered to a tenant: an MSP
+    /// reading their own settings has no use for our issue keys.
+    Planned { tracked_by: &'static str },
+}
+
+impl ProviderBuild {
+    pub fn is_built(self) -> bool {
+        matches!(self, ProviderBuild::Built)
+    }
+}
+
 /// Everything the integrations page needs about one provider, and everything
 /// the service needs to refuse a request it should refuse.
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +209,9 @@ pub struct ProviderDescriptor {
     pub polling: Option<PollingSpec>,
     pub connection_home: ConnectionHome,
     pub credential_home: CredentialHome,
+    /// Whether this build can actually do anything with the provider
+    /// (MAPPS-1121).
+    pub build: ProviderBuild,
 }
 
 impl ProviderDescriptor {
@@ -215,6 +249,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         polling: None,
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::PaymentGateway,
+        build: ProviderBuild::Built,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Paypal,
@@ -225,6 +260,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         polling: None,
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::PaymentGateway,
+        build: ProviderBuild::Built,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Quickbooks,
@@ -235,6 +271,9 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         polling: Some(POLLED),
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::Integration,
+        build: ProviderBuild::Planned {
+            tracked_by: "MAPPS-1099",
+        },
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Xero,
@@ -245,6 +284,9 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         polling: Some(POLLED),
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::Integration,
+        build: ProviderBuild::Planned {
+            tracked_by: "MAPPS-1099",
+        },
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Google,
@@ -259,6 +301,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
             issue: "PMS-1315",
         },
         credential_home: CredentialHome::ContactSync,
+        build: ProviderBuild::Built,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Microsoft,
@@ -268,8 +311,20 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
                       are already on.",
         supported_capabilities: &[Capability::Contacts],
         polling: Some(POLLED),
-        connection_home: ConnectionHome::Integrations,
-        credential_home: CredentialHome::Integration,
+        // MAPPS-1121: this entry said the connection was made here, with a
+        // credential pasted into the integrations page. MAPPS-1101 shipped the
+        // real thing and it is the Entra consent round trip in `contact_sync`:
+        // `POST /integrations/contact-sync/microsoft/authorize` writes
+        // `contact_sync_connections`, exactly as Google does. So the entry now
+        // says what Google's has always said, and this surface refuses to
+        // connect it.
+        connection_home: ConnectionHome::Elsewhere {
+            table: "contact_sync_connections",
+            configured_at: "Settings > Microsoft 365 Contacts",
+            issue: "MAPPS-1124",
+        },
+        credential_home: CredentialHome::ContactSync,
+        build: ProviderBuild::Built,
     },
 ];
 
@@ -449,6 +504,99 @@ mod tests {
                     entry.provider.as_str()
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mapps1121_build_state_tests {
+    use super::*;
+
+    /// A `Planned` entry names the issue that builds it.
+    ///
+    /// The field is the only thing tying a listed-but-absent provider to the
+    /// work that makes it real; an empty one leaves the next reader grepping
+    /// for whether anyone intends to build it.
+    #[test]
+    fn every_planned_provider_names_its_tracking_issue() {
+        for entry in REGISTRY {
+            if let ProviderBuild::Planned { tracked_by } = entry.build {
+                assert!(
+                    tracked_by.starts_with("MAPPS-") || tracked_by.starts_with("PMS-"),
+                    "{} is planned but `tracked_by` is {tracked_by:?}",
+                    entry.display_name
+                );
+            }
+        }
+    }
+
+    /// Built means a client exists, and this is what stops the flag drifting
+    /// from the tree.
+    ///
+    /// Asserted by searching the module tree for something only a real client
+    /// has: Stripe and PayPal have their payment clients, Google has its
+    /// contact-sync provider. A provider flipped to `Built` without one fails
+    /// here rather than on a tenant's screen, which is where it failed last
+    /// time (the page offered a credential field for three providers with
+    /// nothing behind them).
+    #[test]
+    fn built_providers_have_something_behind_them() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules");
+        let mut sources = String::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src/modules") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    sources.push_str(&std::fs::read_to_string(&path).expect("read source"));
+                }
+            }
+        }
+        // One marker per built provider: a string that only its real
+        // implementation contains, not the registry's own description. Every
+        // needle is assembled at runtime, because this file is inside the tree
+        // being scanned and a literal would match itself: the first run of this
+        // test failed on a needle written out in this very comment, which is
+        // the self-match this repository has hit before in source-scanning
+        // guards.
+        let host = |name: &str, tld: &str| format!("{name}{tld}");
+        for (provider, marker) in [
+            (IntegrationProvider::Stripe, host("api.stripe", ".com")),
+            (IntegrationProvider::Paypal, host("api-m.paypal", ".com")),
+            (
+                IntegrationProvider::Google,
+                host("people.googleapis", ".com"),
+            ),
+            // MAPPS-1101 landed between this ticket being written and being
+            // implemented, which is exactly the drift this test exists for.
+            (
+                IntegrationProvider::Microsoft,
+                host("graph.microsoft", ".com"),
+            ),
+        ] {
+            assert!(
+                descriptor(provider).build.is_built(),
+                "{provider:?} is a built provider"
+            );
+            assert!(
+                sources.contains(&marker),
+                "{provider:?} is marked Built but nothing in src/modules talks to {marker}"
+            );
+        }
+        for provider in [IntegrationProvider::Quickbooks, IntegrationProvider::Xero] {
+            assert!(
+                !descriptor(provider).build.is_built(),
+                "{provider:?} has no client, no capability reader and no poll job; marking it \
+                 Built is what put a credential field in front of a tenant"
+            );
+        }
+        for absent in [host("xero", ".com"), host("quickbooks.api.intuit", ".com")] {
+            assert!(
+                !sources.contains(&absent),
+                "{absent} now exists, so its provider's build state is stale"
+            );
         }
     }
 }
