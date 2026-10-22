@@ -88,19 +88,73 @@ impl IntegrationsService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         tx.commit().await?;
 
-        // MAPPS-1098: payment providers are configured on
-        // `Settings > Payment Gateways` end to end, so they are not offered
-        // on this list. The row they persist still exists (billing writes
-        // it via `set_payment_connection`); this surface just does not
-        // expose them.
+        // MAPPS-1122: every provider is listed, payment providers included.
+        // Changing one is still confined to its own surface
+        // (`is_writable_on_integrations_page`); what the panel does here is
+        // say what exists and what state it is in.
+        let contact_sync = self.contact_sync_states(tenant_id).await?;
         Ok(registry::REGISTRY
             .iter()
-            .filter(|descriptor| descriptor.is_exposed_on_integrations_page())
             .map(|descriptor| {
                 let row = rows
                     .iter()
                     .find(|row| row.provider == descriptor.provider.as_str());
-                compose(descriptor, row)
+                compose(
+                    descriptor,
+                    row,
+                    contact_sync.get(descriptor.provider.as_str()),
+                )
+            })
+            .collect())
+    }
+
+    /// The contact-sync connections this tenant holds, by provider
+    /// discriminator (MAPPS-1122).
+    ///
+    /// One query for the whole page rather than one per provider: three of the
+    /// six registry entries are contact-sync sources, and a per-provider read
+    /// would be the N+1 the registry's own `company_name` ticket exists to
+    /// avoid.
+    ///
+    /// Read through `begin_with_tenant` like everything else here, so the
+    /// policy confines it (PMS-285), and projected to the four fields the
+    /// panel renders rather than taking the module's row type across the
+    /// boundary.
+    async fn contact_sync_states(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<std::collections::HashMap<String, ContactSyncState>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<ContactSyncRow> = sqlx::query_as(
+            "SELECT provider, is_active, sync_status, last_error, created_at, disconnected_at \
+                 FROM contact_sync_connections WHERE tenant_id = $1",
+        )
+        .bind(*tenant_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit().await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let status =
+                    contact_sync_status(row.is_active, &row.sync_status, row.disconnected_at);
+                (
+                    row.provider,
+                    ContactSyncState {
+                        status,
+                        // Only when the state IS the error: a stale message
+                        // from a sync that later succeeded would read as a
+                        // live failure.
+                        last_error: match status {
+                            IntegrationStatus::Error => row.last_error,
+                            _ => None,
+                        },
+                        connected_at: Some(row.created_at),
+                        disconnected_at: row.disconnected_at,
+                    },
+                )
             })
             .collect())
     }
@@ -114,7 +168,12 @@ impl IntegrationsService {
     ) -> AppResult<IntegrationResponse> {
         let descriptor = registry::descriptor(provider);
         let row = self.read_row(tenant_id, provider).await?;
-        Ok(compose(descriptor, row.as_ref()))
+        let contact_sync = self.contact_sync_states(tenant_id).await?;
+        Ok(compose(
+            descriptor,
+            row.as_ref(),
+            contact_sync.get(provider.as_str()),
+        ))
     }
 
     /// Change what this tenant delegates, and the non-secret settings.
@@ -198,7 +257,7 @@ impl IntegrationsService {
         .await?;
         tx.commit().await?;
 
-        Ok(compose(descriptor, Some(&updated)))
+        Ok(compose(descriptor, Some(&updated), None))
     }
 
     /// Store the credential and mark the integration connected.
@@ -307,7 +366,7 @@ impl IntegrationsService {
         .await?;
         tx.commit().await?;
 
-        Ok(compose(descriptor, Some(&row)))
+        Ok(compose(descriptor, Some(&row), None))
     }
 
     /// Connect a provider whose credential is entered on another surface
@@ -466,7 +525,7 @@ impl IntegrationsService {
         .await?;
         tx.commit().await?;
 
-        Ok(compose(descriptor, Some(&row)))
+        Ok(compose(descriptor, Some(&row), None))
     }
 
     /// Mark the integration disconnected, and delete its credential when this
@@ -565,7 +624,7 @@ impl IntegrationsService {
                 .await?;
         }
 
-        Ok(compose(descriptor, Some(&row)))
+        Ok(compose(descriptor, Some(&row), None))
     }
 
     async fn read_row(
@@ -619,8 +678,24 @@ async fn read_row_in_tx(
 }
 
 /// The registry's half and the tenant's half, joined.
-fn compose(descriptor: &ProviderDescriptor, row: Option<&IntegrationRow>) -> IntegrationResponse {
+fn compose(
+    descriptor: &ProviderDescriptor,
+    row: Option<&IntegrationRow>,
+    contact_sync: Option<&ContactSyncState>,
+) -> IntegrationResponse {
     let mut response = IntegrationResponse::not_installed(descriptor);
+    // MAPPS-1122: a provider whose connection lives in another subsystem has
+    // its status THERE, and this read it from the `integrations` row anyway.
+    // There is no row for Google, so a tenant with Google Contacts connected
+    // and syncing read "Not connected" on a page whose whole job is to say
+    // what is connected. The owning subsystem answers for it.
+    if let Some(state) = contact_sync {
+        response.status = state.status;
+        response.last_error = state.last_error.clone();
+        response.connected_at = state.connected_at;
+        response.disconnected_at = state.disconnected_at;
+        return response;
+    }
     let Some(row) = row else {
         return response;
     };
@@ -636,6 +711,56 @@ fn compose(descriptor: &ProviderDescriptor, row: Option<&IntegrationRow>) -> Int
     response.disconnected_at = row.disconnected_at;
     response.last_error = row.last_error.clone();
     response
+}
+
+/// A contact-sync connection's state, as one of the four statuses this
+/// surface speaks (MAPPS-1122).
+///
+/// `reconnect_required` is an error and not a disconnection: the row is still
+/// there and the tenant still wants the integration, which is why contact sync
+/// gives it its own outcome rather than folding it into `failed` (PSA-70 J).
+/// `throttled` is the provider asking us to wait and must not read as broken.
+fn contact_sync_status(
+    is_active: bool,
+    sync_status: &str,
+    disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> IntegrationStatus {
+    if disconnected_at.is_some() || !is_active {
+        return IntegrationStatus::Disconnected;
+    }
+    match sync_status {
+        "failed" | "reconnect_required" => IntegrationStatus::Error,
+        _ => IntegrationStatus::Connected,
+    }
+}
+
+/// The columns [`IntegrationsService::contact_sync_states`] reads.
+///
+/// A named row type rather than the tuple this was: six columns is past where
+/// a tuple reads (clippy's `type_complexity` says so, and CI is `-D warnings`),
+/// and the positional destructuring was one swapped pair away from reporting
+/// `is_active` as the status.
+#[derive(sqlx::FromRow)]
+struct ContactSyncRow {
+    provider: String,
+    is_active: bool,
+    sync_status: String,
+    last_error: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One contact-sync connection, reduced to what the panel renders
+/// (MAPPS-1122).
+///
+/// A projection rather than the module's own row type: this is a read across a
+/// subsystem boundary, and taking the whole row would make every column of
+/// `contact_sync_connections` part of what integrations depends on.
+struct ContactSyncState {
+    status: IntegrationStatus,
+    last_error: Option<String>,
+    connected_at: Option<chrono::DateTime<chrono::Utc>>,
+    disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Refuse a provider whose connection is owned by another subsystem, naming

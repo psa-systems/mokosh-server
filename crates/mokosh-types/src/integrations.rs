@@ -131,6 +131,10 @@ pub enum IntegrationProvider {
     Xero,
     Google,
     Microsoft,
+    /// MAPPS-1122: iCloud contacts. Its connection and credential both live in
+    /// contact sync (PMS-1341), so it is listed here and never connected here;
+    /// the panel's job is to say it exists and where it is set up.
+    Icloud,
 }
 
 impl IntegrationProvider {
@@ -141,6 +145,7 @@ impl IntegrationProvider {
         IntegrationProvider::Xero,
         IntegrationProvider::Google,
         IntegrationProvider::Microsoft,
+        IntegrationProvider::Icloud,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -151,6 +156,7 @@ impl IntegrationProvider {
             Self::Xero => "xero",
             Self::Google => "google",
             Self::Microsoft => "microsoft",
+            Self::Icloud => "icloud",
         }
     }
 
@@ -162,6 +168,7 @@ impl IntegrationProvider {
             "xero" => Some(Self::Xero),
             "google" => Some(Self::Google),
             "microsoft" => Some(Self::Microsoft),
+            "icloud" => Some(Self::Icloud),
             _ => None,
         }
     }
@@ -252,8 +259,9 @@ mod tests {
         );
         assert_eq!(
             IntegrationProvider::ALL.len(),
-            6,
-            "a provider was added without adding it to IntegrationProvider::ALL"
+            7,
+            "a provider was added without adding it to IntegrationProvider::ALL \
+             (MAPPS-1122 added Icloud, so the count is 7, not 6)"
         );
     }
 }
