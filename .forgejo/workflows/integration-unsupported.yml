@@ -6,7 +6,7 @@
 # suites. This workflow runs their complement: the tests for functionality
 # nothing currently uses, whose setup costs the job real time and is the part
 # most likely to break for reasons that have nothing to do with the commit.
-# Today that is `tests/s3_storage.rs` alone.
+# Today that is `tests/suites/s3_storage.rs` alone.
 #
 # The split is NOT written here. `.config/nextest.toml` carries it, as a
 # `default-filter` on the `ci` and `unsupported` profiles, so this workflow
@@ -16,9 +16,9 @@
 # that file.
 #
 # What is deliberately not given up: the code stays and the tests stay, and
-# `integration.yml` still COMPILES every `tests/*.rs` binary on every pull
+# `integration.yml` still COMPILES every suite on every pull
 # request, because `cargo nextest archive` builds them whatever the filter
-# says. A change that stops `tests/s3_storage.rs` compiling still fails the
+# says. A change that stops `tests/suites/s3_storage.rs` compiling still fails the
 # PR. Only the assertions move to a schedule.
 #
 # Weekly rather than per-PR, and Monday morning rather than the weekend, so a
@@ -82,7 +82,7 @@ jobs:
 
       - name: Install cargo-nextest
         # PMS-1177: nextest schedules test CASES from every archived binary
-        # concurrently instead of running one `tests/*.rs` binary to
+        # concurrently instead of running one suite to
         # completion before starting the next, which is where most of the
         # previous wall clock went.
         #
@@ -121,7 +121,7 @@ jobs:
         run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
 
       - name: Start MinIO for the S3 storage suite
-        # PMS-958. `tests/s3_storage.rs` round-trips the S3 backend against a
+        # PMS-958. `tests/suites/s3_storage.rs` round-trips the S3 backend against a
         # real object store and skips (loudly) when STORAGE_S3_ENDPOINT is unset, so
         # this step is what makes it run here. A `services:` entry cannot do
         # it: the MinIO image carries no command, `server /data` has to be
