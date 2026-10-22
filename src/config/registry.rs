@@ -276,6 +276,12 @@ declare_keys! {
     Application BUNYIP_WEBHOOK_SECRET = "BUNYIP_WEBHOOK_SECRET", since "v0.6.0", required;
     Application CLIENT_ORIGIN = "CLIENT_ORIGIN", since "v0.2.0", required "v0.14.0";
     Application CORS_ORIGIN = "CORS_ORIGIN", since "v0.2.0", optional;
+    /// Optional `Domain=` attribute for the contact-portal refresh cookie
+    /// (`mokosh:contact_token`). Set to the shared apex (e.g. `.a8n.run`) when
+    /// the SPA runs on tenant-*.<apex> and reaches the API host at a different
+    /// subdomain, so the cookie reaches `/api/v1/contact/auth/refresh` from
+    /// that origin; unset leaves the cookie host-scoped as before.
+    Application PORTAL_COOKIE_DOMAIN = "PORTAL_COOKIE_DOMAIN", since "v0.19.0", optional;
     Application SPA_BASE_URL = "SPA_BASE_URL", since "v0.12.0", required "v0.14.0";
     Application PUBLIC_API_BASE_URL = "PUBLIC_API_BASE_URL", since "v0.12.0", optional;
     Application ABUSE_CONTACT_EMAIL = "ABUSE_CONTACT_EMAIL", since "v0.12.0", optional;
