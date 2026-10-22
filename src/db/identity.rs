@@ -14,7 +14,7 @@
 //! `tenant_isolation` policy as a backstop. A caller that hands one of
 //! these functions the bare NOBYPASSRLS `db().pool()` now reads zero
 //! membership rows. `identities` has no `tenant_id` to scope to and stays
-//! exempt, named in `TENANTLESS_WITHOUT_RLS` (`tests/rls_coverage.rs`).
+//! exempt, named in `TENANTLESS_WITHOUT_RLS` (`tests/suites/rls_coverage.rs`).
 //! Migration `157_identities_and_memberships.sql` created both tables; its
 //! header's "neither table is RLS-enabled" predates 191.
 

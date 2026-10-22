@@ -38,7 +38,7 @@ in the 2026-06-12 draft had all moved by the time anyone followed them.
   provisions a personal tenant for new users via `TenantService::ensure_personal_tenant(sub)`,
   and the PMS-243/245 backfill (`is_stuck_in_default`, `rehome_user_between_tenants`) moves
   non-admin users off the shared default tenant `Uuid::from_u128(1)` into their own.
-  `tests/bunyip_login.rs` pins the three cases: a self-signup user is not placed in the shared
+  `tests/suites/bunyip_login.rs` pins the three cases: a self-signup user is not placed in the shared
   default tenant, a non-admin already parked there is backfilled out, and a platform
   `super_admin` legitimately stays (the default tenant is infra-only, PMS-262).
 - **Enforcement is fail-closed.** `migrations/038_rls_fail_closed.sql` (PMS-257) replaced the
@@ -67,7 +67,7 @@ in the 2026-06-12 draft had all moved by the time anyone followed them.
   `BYPASSRLS` role bypasses RLS unconditionally: role posture, not the policy, is what decides
   whether the backstop is live. `docs/postgres-security.md` covers the role provisioning.
 - **Coverage of the invariant is tested, and the allowlist is where an exemption is decided.**
-  `tests/rls_coverage.rs` (PMS-683) introspects the fully-migrated schema and lists every
+  `tests/suites/rls_coverage.rs` (PMS-683) introspects the fully-migrated schema and lists every
   `public` table that has a `tenant_id` column but is missing RLS enabled, RLS forced, or a
   `tenant_isolation` policy. Its `ALLOWED_WITHOUT_RLS` allowlist holds one entry,
   `tenant_membership_entitlements`, whose read is pre-auth and cross-tenant and so cannot
@@ -88,12 +88,12 @@ in the 2026-06-12 draft had all moved by the time anyone followed them.
   `tenant_membership_entitlements` was declared exempt in migration 154's header and again at
   the call site, and the one list that enforces anything was never told, so the guard read the
   table as an oversight rather than a decision. A rule recorded only in prose is not a rule.
-- **Behaviour is tested too, not just schema shape.** `tests/rls_isolation.rs` and
-  `tests/tenantless_table_rls.rs` drive the policies through a purpose-created
+- **Behaviour is tested too, not just schema shape.** `tests/suites/rls_isolation.rs` and
+  `tests/suites/tenantless_table_rls.rs` drive the policies through a purpose-created
   `NOSUPERUSER NOBYPASSRLS` role (`#[mokosh_test]` itself connects as the superuser, which
-  bypasses RLS), and `tests/rls_serving_reads.rs` pins the opposite failure: a serving read
+  bypasses RLS), and `tests/suites/rls_serving_reads.rs` pins the opposite failure: a serving read
   that reaches the app role must still return its own tenant's rows rather than fail-closing
-  to an empty 200. `tests/per_user_isolation.rs` and `tests/worker_tenant_isolation.rs` cover
+  to an empty 200. `tests/suites/per_user_isolation.rs` and `tests/suites/worker_tenant_isolation.rs` cover
   the request path and the background workers.
 - **Type-safe tenant threading is done (PMS-139).** Service methods take `TenantId`, only
   constructible from an authenticated claim via `CurrentUser::tenant()`.
@@ -101,7 +101,7 @@ in the 2026-06-12 draft had all moved by the time anyone followed them.
 ## Schema inventory (76 tables, snapshot of migrations at 2026-06-12)
 
 This is a dated snapshot, not a live list: migrations have added tenant tables since. The
-authoritative inventory is the query in `tests/rls_coverage.rs`, which reads the migrated
+authoritative inventory is the query in `tests/suites/rls_coverage.rs`, which reads the migrated
 schema itself; read that rather than trusting the counts below.
 
 `tenant_id` = has the column (so the `024`/`038` RLS loops attach to it). `user cols` = direct
@@ -130,12 +130,12 @@ the only table here with no policy.
 | `credit_note_lines` | id | - | fail-closed parent-join policy (parent `credit_notes`), migration `128` |
 
 The parent-join form was chosen over a denormalized column: no backfill, and no `NOT NULL`
-column to keep populated on every INSERT, so no drift risk. `tests/tenantless_table_rls.rs`
+column to keep populated on every INSERT, so no drift risk. `tests/suites/tenantless_table_rls.rs`
 pins the behaviour (per-tenant uniqueness on `user_oauth_identities`, and the parent-join
 policy fail-closing on `kb_article_versions` and on `quote_lines`).
 
 The gap this closed was not the missing policies but the missing sweep. A table in this shape
-was invisible to `tests/rls_coverage.rs`, whose query required a `tenant_id` column, and
+was invisible to `tests/suites/rls_coverage.rs`, whose query required a `tenant_id` column, and
 `tenantless_table_rls.rs` names tables rather than sweeping, so `quote_lines` (`092`) and
 `credit_note_lines` (`122`) were both added after `041` in exactly this shape and neither made
 a test go red. `every_tenantless_table_has_rls_or_is_exempt` (PMS-874) now sweeps the other
@@ -203,7 +203,7 @@ plan. Status belongs in YouTrack, not here; follow the issue ids.
    `AuthService::logout_all` take a `tenant_id` and run under the GUC.
    `AuthService::find_user_placement` still reads `users` across tenants by design (it resolves
    which tenant a `sub` belongs to, before any session exists) and runs on the migrator pool;
-   `routes_do_not_reach_global_login_helpers` in `tests/auth.rs` pins that no `routes.rs`
+   `routes_do_not_reach_global_login_helpers` in `tests/suites/auth.rs` pins that no `routes.rs`
    reaches it. `InvitationsService::newest_pending_for` is the other deliberate pre-auth
    cross-tenant bridge, on the migrator pool and pinned by the same test.
    `TenantService::list_tenants` enumerates the RLS-exempt `tenants` root on the migrator pool
@@ -211,7 +211,7 @@ plan. Status belongs in YouTrack, not here; follow the issue ids.
 6. **Audit background workers + `from_trusted` escape hatches (PMS-261).** The workers
    enumerate tenants on the migrator pool, then bridge each unit of work through
    `TenantId::from_trusted`; `src/modules/audit/context.rs` documents that seam.
-   `tests/worker_tenant_isolation.rs` pins that a worker's per-tenant unit of work neither
+   `tests/suites/worker_tenant_isolation.rs` pins that a worker's per-tenant unit of work neither
    reads nor writes another tenant's rows.
 7. **Remove/redefine the `single-tenant` cargo feature + default-tenant landing audit.** The
    feature is gone (PMS-262): `Cargo.toml` declares only `multi-tenant` and `server`, and
@@ -227,11 +227,11 @@ plan. Status belongs in YouTrack, not here; follow the issue ids.
    Resolved: no production data exists (the DB is wiped before go-live), so the backfill is a
    no-op; `migrations/040_backfill_comingled_default_tenant.sql` records that and asserts the
    zero-co-mingling invariant fail-loud. See the resolved decision below.
-9. **Per-user isolation integration test suite (PMS-264).** `tests/per_user_isolation.rs`:
+9. **Per-user isolation integration test suite (PMS-264).** `tests/suites/per_user_isolation.rs`:
    two users in two personal tenants, driven through the real HTTP API, asserting cross-user
    read and write denial per module. The DB-engine face of the same guarantee (a write whose
    `tenant_id` differs from the GUC is rejected with SQLSTATE `42501`) is in
-   `tests/rls_isolation.rs`.
+   `tests/suites/rls_isolation.rs`.
 
 ## Editable-lookup seeding (PMS-259)
 
@@ -321,7 +321,7 @@ Mechanism:
    attaches the `guard_system_shared_row` trigger. It raises `undefined_column` (42703) before
    touching anything if the target has no `tenant_id` column, which is what the `041`
    parent-join tables get. The global rows are then inserted from a privileged
-   (`app.allow_system_writes = 'on'`) session. `tests/system_shared_class.rs` proves both
+   (`app.allow_system_writes = 'on'`) session. `tests/suites/system_shared_class.rs` proves both
    halves on `saved_dashboards`, a table created long after `039` ran.
 
 This keeps genuinely global config from being needlessly duplicated per tenant while preserving

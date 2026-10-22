@@ -1510,7 +1510,7 @@ impl TicketService {
         // Get SLA targets for this priority. The columns are declared
         // DECIMAL(10, 2); cast to float8 in SQL so sqlx can decode them
         // into `Option<f64>` without a column-type mismatch (the test
-        // harness in `tests/tickets.rs` surfaced this as
+        // harness in `tests/suites/tickets.rs` surfaced this as
         // `ColumnDecode { ... Rust type Option<f64> is not compatible
         // with SQL type NUMERIC }`).
         // `sla_targets` has no `tenant_id` column but is RLS-covered via a parent

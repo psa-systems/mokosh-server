@@ -41,7 +41,7 @@
 //! superuser bypasses RLS however forced the policy is, and the integration
 //! harness's default `boot` hands the service exactly such a pool, so leaning
 //! on the policy alone would mean the isolation is untested where it is most
-//! likely to be got wrong. `tests/integrations.rs` boots through `boot_rls` so
+//! likely to be got wrong. `tests/suites/integrations.rs` boots through `boot_rls` so
 //! the policy is exercised too.
 
 use std::sync::Arc;
