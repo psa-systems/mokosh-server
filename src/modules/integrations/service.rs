@@ -132,6 +132,12 @@ impl IntegrationsService {
     ) -> AppResult<IntegrationResponse> {
         let descriptor = registry::descriptor(provider);
         assert_managed_here(descriptor)?;
+        // MAPPS-1121: a capability change is the same claim `connect` makes,
+        // in smaller print. `disconnect` is deliberately NOT gated: a tenant
+        // who connected one of these before this landed has a row and a stored
+        // credential, and the way to be rid of both is the button that removes
+        // them.
+        assert_built(descriptor)?;
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let existing: Option<IntegrationRow> = sqlx::query_as(&format!(
@@ -217,6 +223,7 @@ impl IntegrationsService {
     ) -> AppResult<IntegrationResponse> {
         let descriptor = registry::descriptor(provider);
         assert_managed_here(descriptor)?;
+        assert_built(descriptor)?;
 
         if descriptor.credential_home != CredentialHome::Integration {
             return self
@@ -652,6 +659,30 @@ fn assert_managed_here(descriptor: &ProviderDescriptor) -> AppResult<()> {
     }
 }
 
+/// Refuse a provider this build has nothing behind (MAPPS-1121).
+///
+/// A 409 rather than a 400, the `assert_managed_here` reading: the request is
+/// well formed and the provider is really listed, and what is wrong is that
+/// there is nothing here to connect it to. Checked before the credential is
+/// read, so nothing is ever written to the secret provider for a provider that
+/// cannot use it, and before the row, so the table never claims a delegation
+/// nothing can act on.
+///
+/// The message does not carry `tracked_by`: it reaches a tenant's screen, and
+/// an MSP admin has no use for our issue keys.
+fn assert_built(descriptor: &ProviderDescriptor) -> AppResult<()> {
+    if descriptor.build.is_built() {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "{} is listed so the capabilities it would take can be named, but this build has \
+         nothing behind it yet: there is no client to hand a credential to and nothing reads \
+         what it would be delegated. Connecting it would report a delegation that cannot \
+         happen.",
+        descriptor.display_name
+    )))
+}
+
 /// The subset rule: every requested capability has to be one the provider
 /// supports, and nothing may be asked for twice.
 ///
@@ -761,6 +792,64 @@ mod tests {
 
     fn xero() -> &'static ProviderDescriptor {
         registry::descriptor(IntegrationProvider::Xero)
+    }
+
+    /// MAPPS-1121: a provider with nothing behind it is refused before any
+    /// credential is read.
+    ///
+    /// The refusal is the whole fix. Before it, `connect` stored whatever
+    /// string was typed into the page's Credential field under
+    /// `SecretKey::integration`, wrote `status = 'connected'`, and returned
+    /// 200 for a provider with no client, no capability reader and no poll
+    /// job. A tenant was told a delegation had happened that nothing could
+    /// act on, which is worse than the button failing.
+    #[test]
+    fn a_planned_provider_is_refused_and_a_built_one_is_not() {
+        for provider in [IntegrationProvider::Quickbooks, IntegrationProvider::Xero] {
+            let descriptor = registry::descriptor(provider);
+            let error = assert_built(descriptor).expect_err("planned, so refused");
+            let message = format!("{error}");
+            assert!(
+                message.contains(descriptor.display_name),
+                "the refusal names the provider: {message}"
+            );
+            assert!(
+                !message.contains("MAPPS-"),
+                "an MSP admin reading their own settings has no use for our issue keys: \
+                 {message}"
+            );
+        }
+        for provider in [
+            IntegrationProvider::Stripe,
+            IntegrationProvider::Paypal,
+            IntegrationProvider::Google,
+            IntegrationProvider::Microsoft,
+        ] {
+            assert_built(registry::descriptor(provider)).expect("built, so not refused here");
+        }
+    }
+
+    /// Microsoft 365 is refused on this surface for the OTHER reason, and the
+    /// distinction matters to whoever reads the message.
+    ///
+    /// Its client shipped (MAPPS-1101); what is true is that the connection is
+    /// the Entra consent round trip in `contact_sync`, so this is the wrong
+    /// surface rather than an absent provider. `assert_managed_here` is what
+    /// says so, and it names where the connection does live.
+    #[test]
+    fn microsoft_is_refused_as_managed_elsewhere_not_as_unbuilt() {
+        let descriptor = registry::descriptor(IntegrationProvider::Microsoft);
+        let error = assert_managed_here(descriptor).expect_err("its connection lives elsewhere");
+        let message = format!("{error}");
+        assert!(
+            message.contains("contact_sync_connections"),
+            "names where the connection lives: {message}"
+        );
+        assert!(
+            !message.contains("nothing behind it"),
+            "it is built; saying otherwise sends an admin to wait for work that is done: \
+             {message}"
+        );
     }
 
     /// The rule the whole subsystem exists for: a tenant cannot hand a provider
