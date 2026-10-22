@@ -259,8 +259,9 @@ mod tests {
         );
         assert_eq!(
             IntegrationProvider::ALL.len(),
-            6,
-            "a provider was added without adding it to IntegrationProvider::ALL"
+            7,
+            "a provider was added without adding it to IntegrationProvider::ALL \
+             (MAPPS-1122 added Icloud, so the count is 7, not 6)"
         );
     }
 }
