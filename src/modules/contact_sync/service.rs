@@ -33,10 +33,10 @@ use crate::utils::error::{AppError, AppResult};
 const STATE_TTL_MINUTES: i64 = 10;
 
 /// The provider this phase implements.
-const GOOGLE: &str = "google";
+pub(crate) const GOOGLE: &str = "google";
 /// MAPPS-1101: the Microsoft 365 provider discriminator used throughout the
 /// state table, the connections table, and the dispatch factory.
-const MICROSOFT: &str = "microsoft";
+pub(crate) const MICROSOFT: &str = "microsoft";
 
 #[derive(Clone)]
 pub struct ContactSyncService {
@@ -1117,13 +1117,11 @@ impl ContactSyncService {
         // the one the caller is actually using. Reading Google's flag for an
         // iCloud request would have made one integration turn the other off;
         // PMS-1512 gives Microsoft the same treatment.
-        let on = if provider == ICLOUD {
-            crate::modules::settings::read_icloud_contacts_enabled(&self.db, tenant_id).await?
-        } else if provider == MICROSOFT {
-            crate::modules::settings::read_microsoft_contacts_enabled(&self.db, tenant_id).await?
-        } else {
-            crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
-        };
+        //
+        // PMS-1524 moved the selection to `switch::contacts_enabled`, because
+        // the same three-way choice is made again before a queued run executes
+        // and that copy had not been given Microsoft's key.
+        let on = super::switch::contacts_enabled(&self.db, tenant_id, provider).await?;
         if on {
             Ok(())
         } else {
