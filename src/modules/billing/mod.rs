@@ -35,6 +35,7 @@ pub mod issuer;
 pub mod issuer_delegation;
 pub mod models;
 pub mod provider_invoice;
+pub mod webhook_invoice_issuer;
 // PMS-979: what an invoice number is and who it belongs to.
 pub mod numbering;
 pub mod provider;
