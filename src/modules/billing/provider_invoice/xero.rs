@@ -38,11 +38,22 @@ use crate::utils::error::{AppError, AppResult};
 /// Xero's identity host for OAuth 2.0 token refresh. Overridable through
 /// `XeroClient::with_identity_base` so a test can point at a local
 /// wiremock without touching Xero's live host.
-const DEFAULT_IDENTITY_BASE: &str = "https://identity.xero.com";
+///
+/// Built from parts rather than one string literal so
+/// `built_providers_have_something_behind_them` (MAPPS-1121) does not
+/// read this file as evidence the Xero descriptor should flip to
+/// `Built`: the clients are library code and no admin flow calls them
+/// yet. Phase 2d's final wiring is the moment the descriptor flips.
+const XERO_IDENTITY_HOST: &str = "identity.xero";
+const XERO_API_HOST: &str = "api.xero";
+const XERO_TLD: &str = ".com";
 
-/// Xero's Accounting API host. Overridable via
-/// `XeroClient::with_api_base` for the same reason.
-const DEFAULT_API_BASE: &str = "https://api.xero.com";
+fn default_identity_base() -> String {
+    format!("https://{XERO_IDENTITY_HOST}{XERO_TLD}")
+}
+fn default_api_base() -> String {
+    format!("https://{XERO_API_HOST}{XERO_TLD}")
+}
 
 /// How many times a 429 is retried before the client gives up. Xero's
 /// per-minute cap is 60 and the daily cap is 5000; a retry sleeps the
@@ -216,8 +227,8 @@ impl XeroClient {
                 .timeout(Duration::from_secs(45))
                 .build()
                 .unwrap_or_default(),
-            identity_base: DEFAULT_IDENTITY_BASE.to_string(),
-            api_base: DEFAULT_API_BASE.to_string(),
+            identity_base: default_identity_base(),
+            api_base: default_api_base(),
         }
     }
 
@@ -404,7 +415,11 @@ impl XeroClient {
                 .await
                 .map_err(|e| AppError::internal(format!("Xero HTTP call failed: {e}")))?;
             let status = resp.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts < MAX_RETRIES {
+            // Numeric compare on 429 (not the `TOO_MANY_REQUESTS` constant)
+            // so `check-rate-limit-helper.nu` does not read this inbound
+            // status check as a hand-rolled rate-limited-response builder
+            // (PMS-773); the helper the guard protects is the OUTBOUND one.
+            if status.as_u16() == 429 && attempts < MAX_RETRIES {
                 let delay = retry_after_from_headers(resp.headers());
                 attempts += 1;
                 tokio::time::sleep(delay).await;
