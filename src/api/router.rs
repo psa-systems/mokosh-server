@@ -359,6 +359,16 @@ pub fn create_api_router(
     // deployment on Infisical keeps its integration credentials there too.
     let integrations_service =
         crate::modules::integrations::IntegrationsService::new(db.clone(), secrets.clone());
+    // MAPPS-1099 Phase 2b: wire the feature-flagged invoice-issuer dispatch
+    // onto the serving `BillingService`. The flag defaults OFF
+    // (`Feature::DelegatedInvoiceIssuer`), so this is a no-op on every
+    // environment until an admin flips it; even flipped on, only a tenant
+    // with Xero or QuickBooks connected and the `Invoicing` capability
+    // enabled sees the delegated path (and today that path refuses with a
+    // clear error because the credential + mapping tables are the subject of
+    // the Phase 2b-rest PR).
+    let billing_service = billing_service
+        .with_invoice_dispatch(features.clone(), Arc::new(integrations_service.clone()));
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.clone());
@@ -671,6 +681,17 @@ pub fn create_api_router(
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
         .merge(billing_routes(billing_service, public_api_base_url.clone()))
+        // MAPPS-1099 Phase 2c: admin surfaces that populate the
+        // invoice-issuer mapping tables (Mokosh company -> external
+        // customer, Mokosh product -> external item). Behind the same
+        // `Feature::DelegatedInvoiceIssuer` flag the dispatch reads;
+        // every route answers 404 while the flag is off.
+        .merge(crate::modules::billing::invoice_issuer_mapping_routes::invoice_issuer_mapping_routes(
+            crate::modules::billing::invoice_issuer_mapping_routes::InvoiceIssuerMappingRouterState {
+                service: Arc::new(crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService::new(db.clone())),
+                features: features.clone(),
+            },
+        ))
         // Quotes: the sales document that precedes a Project, plus its
         // line items. Shares the billing module gate + finance role with
         // invoices. PMS-672.

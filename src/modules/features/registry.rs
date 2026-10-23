@@ -62,6 +62,19 @@ pub enum Feature {
     /// banner. The existing single-asset `POST /api/v1/assets` is unaffected
     /// either way.
     AssetsCatalog,
+    /// Delegated invoice issuer (MAPPS-1099 Phase 2). Gates the dispatch
+    /// that reads a tenant's `integrations.enabled_capabilities` and picks
+    /// an external invoice issuer (Xero or QuickBooks) when one is
+    /// configured. Off: `create_invoice` runs the current local path for
+    /// every tenant, every time; the dispatch helper
+    /// (`crate::modules::billing::invoice_issuer::select_issuer`) still
+    /// returns `IssuerSelection::Local`, so no provider HTTP is ever
+    /// reached. On: a tenant with a connected Xero or QuickBooks row
+    /// carrying `Capability::Invoicing` has the row persisted with the
+    /// external provider's identifiers; a tenant without one still runs
+    /// the local path. The flag defaults OFF on every deployment so the
+    /// Phase 2 merge is a no-op until operations flips it on in staging.
+    DelegatedInvoiceIssuer,
 }
 
 impl Feature {
@@ -70,6 +83,7 @@ impl Feature {
         Feature::IntegrationsOverview,
         Feature::AssetsSearchV2,
         Feature::AssetsCatalog,
+        Feature::DelegatedInvoiceIssuer,
     ];
 
     /// The stable key: the `feature_toggles.key` value and the wire name. Never
@@ -79,6 +93,7 @@ impl Feature {
             Feature::IntegrationsOverview => "integrations_overview",
             Feature::AssetsSearchV2 => "assets_search_v2",
             Feature::AssetsCatalog => "assets_catalog",
+            Feature::DelegatedInvoiceIssuer => "delegated_invoice_issuer",
         }
     }
 
@@ -88,6 +103,7 @@ impl Feature {
             Feature::IntegrationsOverview => "Integrations overview",
             Feature::AssetsSearchV2 => "Asset search v2",
             Feature::AssetsCatalog => "Asset catalog + bulk order",
+            Feature::DelegatedInvoiceIssuer => "Delegated invoice issuer",
         }
     }
 
@@ -115,6 +131,17 @@ impl Feature {
                  up to 500 serials per call, and the signature detector surfaces hot patterns. \
                  The single-asset POST /api/v1/assets is unaffected either way."
             }
+            Feature::DelegatedInvoiceIssuer => {
+                "The dispatch that lets a tenant hand invoice issuing to Xero or QuickBooks \
+                 when the integration is connected with the Invoicing capability. Off: every \
+                 invoice is issued locally by Mokosh (the current behaviour) regardless of \
+                 which capabilities a tenant has turned on; the external-provider HTTP clients \
+                 are compiled in but never reached. On: a tenant whose Xero or QuickBooks row \
+                 enables Invoicing has new invoices issued through that provider and the \
+                 external numbers persisted on the local row; a tenant without one still \
+                 issues locally. Leave off until the external-provider credential mapping \
+                 lands in a follow-up PR."
+            }
         }
     }
 
@@ -125,6 +152,7 @@ impl Feature {
             Feature::IntegrationsOverview => "MAPPS-971",
             Feature::AssetsSearchV2 => "PMS-1486",
             Feature::AssetsCatalog => "PMS-1492",
+            Feature::DelegatedInvoiceIssuer => "MAPPS-1099",
         }
     }
 
