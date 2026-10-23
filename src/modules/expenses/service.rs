@@ -616,7 +616,7 @@ impl ExpensesService {
         .ok_or_else(|| AppError::NotFound("Bill".to_string()))?;
         if !allowed_from.iter().any(|s| *s == before.status) {
             return Err(AppError::Conflict(format!(
-                "cannot move bill from {} to {to}",
+                "Cannot move bill from {} to {to}.",
                 before.status
             )));
         }
@@ -858,12 +858,12 @@ impl ExpensesService {
         .ok_or_else(|| AppError::NotFound("Expense".to_string()))?;
         if before.status == "reimbursed" {
             return Err(AppError::Conflict(
-                "a reimbursed expense is immutable; file a reversing expense instead".to_string(),
+                "A reimbursed expense is immutable. File a reversing expense instead.".to_string(),
             ));
         }
         if !allowed_from.iter().any(|s| *s == before.status) {
             return Err(AppError::Conflict(format!(
-                "cannot move expense from {} to {to}",
+                "Cannot move expense from {} to {to}.",
                 before.status
             )));
         }
