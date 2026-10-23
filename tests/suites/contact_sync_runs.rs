@@ -52,12 +52,18 @@ impl Script {
     }
 }
 
-struct ScriptedSource(Script);
+/// The scripted address book, answering as whichever provider the run names.
+///
+/// PMS-1524: the id used to be the literal `"google"`, which was fine while
+/// every case here was Google's and became the thing that failed a Microsoft
+/// run before it reached what the case was about - the engine refuses a source
+/// whose id does not match the connection's provider, and rightly so.
+struct ScriptedSource(Script, &'static str);
 
 #[async_trait]
 impl ContactSyncProvider for ScriptedSource {
     fn id(&self) -> &'static str {
-        "google"
+        self.1
     }
 
     async fn list_groups(&self) -> SourceResult<Vec<SourceGroup>> {
@@ -88,9 +94,14 @@ impl SourceFactory for ScriptedFactory {
         &self,
         _tenant_id: TenantId,
         _connection_id: Uuid,
-        _provider: &str,
+        provider: &str,
     ) -> AppResult<Box<dyn ContactSyncProvider>> {
-        Ok(Box::new(ScriptedSource(self.0.clone())))
+        let id = match provider {
+            "microsoft" => "microsoft",
+            "icloud" => "icloud",
+            _ => "google",
+        };
+        Ok(Box::new(ScriptedSource(self.0.clone(), id)))
     }
 }
 
@@ -716,6 +727,86 @@ async fn admins_start_imports_and_staff_follow_them(pool: PgPool) {
         let (status, _) = f.call_as(&tech, Method::GET, &path, None).await;
         assert_eq!(status, StatusCode::OK, "{path}");
     }
+}
+
+/// PMS-1524: a queued Microsoft 365 run is stopped by Microsoft's switch and
+/// by nothing else.
+///
+/// `runs::attempt` re-reads the switch before touching the provider, because
+/// the tenant may have turned the integration off after the run was queued
+/// (PMS-1241). PMS-1341 taught that re-read about iCloud and PMS-1512 did not
+/// teach it about Microsoft 365, so `microsoft` fell into Google's branch: a
+/// tenant who switched Google off had their Microsoft runs cancelled, and a
+/// tenant who switched Microsoft off kept syncing from it.
+///
+/// Both directions are asserted, because either one alone passes against the
+/// code this fixes: the old branch answers Google's key for a Microsoft run, so
+/// a test that only turns Microsoft off watches a run that was never going to
+/// be stopped, and one that only turns Google off watches a run that was
+/// already being stopped for the wrong reason.
+#[mokosh_test]
+async fn a_microsoft_run_is_stopped_by_its_own_switch_and_not_by_googles(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+
+    let microsoft_connection = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contact_sync_connections (id, tenant_id, provider, account_email, selected_groups) \
+         VALUES ($1, $2, 'microsoft', 'ops@contoso.example', $3)",
+    )
+    .bind(microsoft_connection)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(json!([CLIENTS]))
+    .execute(&f.pool)
+    .await
+    .expect("seed a microsoft connection");
+
+    let queue_microsoft_run = |id: Uuid| {
+        sqlx::query(
+            "INSERT INTO contact_sync_runs (id, tenant_id, connection_id, trigger, status) \
+             VALUES ($1, $2, $3, 'manual', 'queued')",
+        )
+        .bind(id)
+        .bind(common::DEFAULT_TENANT_ID)
+        .bind(microsoft_connection)
+        .execute(&f.pool)
+    };
+    let switch = |key: &'static str, on: bool| {
+        f.call(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "category": "integrations", "key": key, "value": on })),
+        )
+    };
+
+    // Google off. A Microsoft run is not Google's to cancel.
+    let (status, body) = switch("google_contacts_enabled", false).await;
+    assert!(status.is_success(), "{status}: {body}");
+    let survives = Uuid::new_v4();
+    queue_microsoft_run(survives).await.expect("queue");
+    f.script.full(vec![person(1)]);
+    let run = f.run_now(survives).await;
+    assert_eq!(
+        run["status"], "completed",
+        "Google's switch must not stop a Microsoft run: {run}"
+    );
+
+    // Microsoft off. Now it is.
+    let (status, body) = switch("microsoft_contacts_enabled", false).await;
+    assert!(status.is_success(), "{status}: {body}");
+    let stopped = Uuid::new_v4();
+    queue_microsoft_run(stopped).await.expect("queue");
+    let run = f.run_now(stopped).await;
+    assert_eq!(
+        run["status"], "cancelled",
+        "Microsoft's own switch has to stop a Microsoft run: {run}"
+    );
+    assert!(
+        run["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("turned off"),
+        "{run}"
+    );
 }
 
 /// PMS-1241: the tenant-wide off switch. Off, nothing connects, imports or
