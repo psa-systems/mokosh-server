@@ -332,10 +332,24 @@ check-fmt:
 fmt:
     cargo fmt --all
 
-# Run tests
+# Run the unit tests (the Postgres-backed suite is `just test-integration`)
 [group: 'test']
 test:
-    cargo test --workspace
+    cargo test --workspace --lib --bins
+
+# PMS-1523: `--lib --bins`, not the whole workspace. PMS-1520 made every
+# `tests/suites/*.rs` a module of ONE binary, which cut the CI artifact from
+# 3.05 GB to 97.8 MB and removed a kind of isolation nobody had written down:
+# one binary per file was also one PROCESS per file under `cargo test`, and 19
+# cases depend on that. Three classes, all genuinely per-process: a global
+# tracing subscriber (11 sites, `set_global_default` succeeds once per
+# process), a `#[global_allocator]` counter asserting what THE PROCESS
+# allocated, and a stub bunyip OP with its per-process caches.
+#
+# nextest runs each case in its own process, so the suite is green there and
+# that is how CI and `just test-integration` run it. This recipe therefore
+# stops pretending `cargo test` can run it, rather than leaving a documented
+# command that fails 19 tests for reasons unrelated to the change under test.
 
 # Create the DB roles the migrations grant to, on the dev cluster (PMS-988).
 # Migration 207 grants on `app_secrets` to `mokosh_app`, and a GRANT to a role
