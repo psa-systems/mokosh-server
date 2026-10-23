@@ -159,7 +159,7 @@ async fn receiver_with_apps(
     });
     let router = axum::Router::new()
         .route(
-            "/webhooks/{tenant_id}",
+            "/webhooks",
             axum::routing::post(invoice_issuer_webhook_handler),
         )
         .with_state(state);
@@ -184,7 +184,7 @@ async fn deliver(
     };
     let request = axum::http::Request::builder()
         .method("POST")
-        .uri(format!("/webhooks/{}", common::DEFAULT_TENANT_ID))
+        .uri("/webhooks")
         .header("content-type", "application/json")
         .header(header, signature)
         .body(axum::body::Body::from(raw))
@@ -243,6 +243,25 @@ fn fixture_apps(webhook_key: Option<&str>) -> IssuerApps {
 
 /// A delegated invoice, in the state MAPPS-1135 creates it: `sent`, with
 /// the provider's identifiers on it.
+/// Record which external organisation this tenant's connection is, which is
+/// what the delivery names and what `tenant_for_external_organisation`
+/// resolves (MAPPS-1141). Written by the OAuth exchange in production.
+async fn seed_organisation(pool: &PgPool, tenant_id: Uuid, provider: &str, organisation_id: &str) {
+    sqlx::query(
+        "INSERT INTO integrations (tenant_id, provider, status, enabled_capabilities, \
+             external_organisation_id) \
+         VALUES ($1, $2, 'connected', ARRAY['invoicing']::text[], $3) \
+         ON CONFLICT (tenant_id, provider) DO UPDATE \
+           SET external_organisation_id = EXCLUDED.external_organisation_id",
+    )
+    .bind(tenant_id)
+    .bind(provider)
+    .bind(organisation_id)
+    .execute(pool)
+    .await
+    .expect("record the organisation");
+}
+
 async fn seed_delegated_invoice(pool: &PgPool, provider: &str, external_id: &str) -> Uuid {
     let company_id = common::seed_company(pool).await;
     let id = Uuid::new_v4();
@@ -329,6 +348,7 @@ async fn a_paid_event_records_what_the_provider_collected(pool: PgPool) {
     let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
     seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
     *script.xero_status.lock().unwrap() = "PAID".to_string();
 
     let status = deliver(
@@ -385,6 +405,7 @@ async fn quickbooks_reports_a_payment_the_same_way(pool: PgPool) {
     let invoice_id = seed_delegated_invoice(&pool, "quickbooks", QBO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Quickbooks).await;
     seed_blob(&secrets, InvoiceProviderKind::Quickbooks).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "quickbooks", "4620816365").await;
     // QBO reports payment as a zero balance, not as a status string.
     *script.qbo_balance.lock().unwrap() = 0.0;
 
@@ -415,6 +436,7 @@ async fn a_voided_event_voids_the_local_mirror(pool: PgPool) {
     let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
     seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
     *script.xero_status.lock().unwrap() = "VOIDED".to_string();
 
     let status = deliver(
@@ -450,6 +472,7 @@ async fn an_unverified_delivery_changes_nothing(pool: PgPool) {
     let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
     seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
     *script.xero_status.lock().unwrap() = "PAID".to_string();
 
     let status = deliver(
@@ -470,10 +493,11 @@ async fn an_unverified_delivery_changes_nothing(pool: PgPool) {
         0,
         "and the provider is never asked: nothing in that body was believed"
     );
-    assert_eq!(
-        deliveries(&pool).await,
-        vec![("xero".to_string(), "refused".to_string())],
-        "refused and failed are different things, and this is the first"
+    assert!(
+        deliveries(&pool).await.is_empty(),
+        "MAPPS-1141: with one URL the signature is checked before the body is read, so \
+         there is no tenant yet to attribute a refusal to. That is what having one \
+         subscription per provider costs, and the log line is what remains"
     );
 }
 
@@ -494,6 +518,7 @@ async fn a_deployment_without_a_webhook_key_refuses_and_records_nothing(pool: Pg
     let (router, secrets, _db) =
         receiver_with_apps(&pool, &base, InvoiceProviderKind::Xero, fixture_apps(None)).await;
     seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
 
     let status = deliver(
         &router,
@@ -520,6 +545,7 @@ async fn a_delivery_for_an_unknown_invoice_is_ignored_not_retried(pool: PgPool) 
     seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
     seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
 
     let status = deliver(
         &router,
@@ -540,6 +566,111 @@ async fn a_delivery_for_an_unknown_invoice_is_ignored_not_retried(pool: PgPool) 
     );
 }
 
+/// A delivery naming two organisations is applied to each one's own tenant.
+///
+/// Xero batches events into one POST, and with a single application that
+/// batch can legitimately span organisations belonging to different
+/// customers of this deployment. Attributing one tenant's invoice to
+/// another is the one mistake this route must not make, so the fixture
+/// gives two tenants an invoice each with the same external id and checks
+/// that only the right one moves.
+#[mokosh_test]
+async fn a_batch_spanning_two_organisations_reaches_both_tenants(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let ours = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+
+    // A second tenant, holding a second organisation.
+    let other_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name, slug, kind) VALUES ($1, 'Other MSP', $2, 'org')")
+        .bind(other_tenant)
+        .bind(format!("other-{}", &other_tenant.to_string()[..8]))
+        .execute(&pool)
+        .await
+        .expect("seed the other tenant");
+    seed_organisation(&pool, other_tenant, "xero", "xero-org-2").await;
+
+    // Only the first tenant's event is in this delivery, and the second
+    // organisation is named by an event for an invoice that tenant does not
+    // hold. Both resolve; neither leaks into the other.
+    let body = json!({
+        "events": [
+            { "resourceId": XERO_INVOICE_ID, "eventCategory": "INVOICE", "eventType": "UPDATE",
+              "tenantId": "xero-org-1" },
+            { "resourceId": XERO_INVOICE_ID, "eventCategory": "INVOICE", "eventType": "UPDATE",
+              "tenantId": "xero-org-2" },
+        ],
+        "firstEventSequence": 1,
+        "lastEventSequence": 2,
+    });
+    *script.xero_status.lock().unwrap() = "PAID".to_string();
+
+    let status = deliver(&router, InvoiceProviderKind::Xero, &body, SIGNING_KEY).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        invoice_state(&pool, ours).await,
+        ("paid".to_string(), Decimal::ZERO),
+        "the tenant whose organisation the event named is the one that moved"
+    );
+    let rows = deliveries(&pool).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "one row per event, each against its own tenant"
+    );
+    let tenants: Vec<Uuid> =
+        sqlx::query_scalar("SELECT tenant_id FROM payment_webhook_deliveries ORDER BY received_at")
+            .fetch_all(&pool)
+            .await
+            .expect("read the delivery tenants");
+    assert_eq!(
+        tenants,
+        vec![common::DEFAULT_TENANT_ID, other_tenant],
+        "and the second event is recorded against the second tenant, not the first"
+    );
+}
+
+/// A verified delivery for an organisation nobody holds is answered and
+/// left alone.
+///
+/// Not an attack: a tenant disconnects, or an MSP connects an organisation
+/// to somebody else's Mokosh. A retry would not change it, so it answers
+/// 200, and there is no tenant to write a row against.
+#[mokosh_test]
+async fn an_unknown_organisation_is_answered_and_not_recorded(pool: PgPool) {
+    let (script, base) = start_stub().await;
+    common::seed_admin(&pool).await;
+    let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
+    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
+    *script.xero_status.lock().unwrap() = "PAID".to_string();
+
+    let body = json!({
+        "events": [{
+            "resourceId": XERO_INVOICE_ID,
+            "eventCategory": "INVOICE",
+            "eventType": "UPDATE",
+            "tenantId": "an-organisation-nobody-here-connected",
+        }],
+        "firstEventSequence": 1,
+        "lastEventSequence": 1,
+    });
+    let status = deliver(&router, InvoiceProviderKind::Xero, &body, SIGNING_KEY).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        invoice_state(&pool, invoice_id).await,
+        ("sent".to_string(), Decimal::from(300)),
+        "an invoice with the same external id in another organisation is not ours to pay"
+    );
+    assert!(deliveries(&pool).await.is_empty());
+    assert_eq!(*script.fetches.lock().unwrap(), 0);
+}
+
 /// Xero's "intent to receive" validation carries no events and must
 /// answer 2xx, or the subscription is never activated.
 #[mokosh_test]
@@ -548,6 +679,7 @@ async fn the_intent_to_receive_call_is_answered(pool: PgPool) {
     common::seed_admin(&pool).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
     seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
 
     let status = deliver(
         &router,
@@ -557,9 +689,10 @@ async fn the_intent_to_receive_call_is_answered(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        deliveries(&pool).await,
-        vec![("xero".to_string(), "ignored".to_string())]
+    assert!(
+        deliveries(&pool).await.is_empty(),
+        "a delivery with no events names no organisation, so there is no tenant to \
+         write a row against (MAPPS-1141)"
     );
 }
 
@@ -571,6 +704,7 @@ async fn an_open_invoice_is_left_as_it_is(pool: PgPool) {
     let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
     seed_blob(&secrets, InvoiceProviderKind::Xero).await;
+    seed_organisation(&pool, common::DEFAULT_TENANT_ID, "xero", "xero-org-1").await;
     *script.xero_status.lock().unwrap() = "AUTHORISED".to_string();
 
     let status = deliver(
