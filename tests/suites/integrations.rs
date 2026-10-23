@@ -681,6 +681,109 @@ async fn a_contact_sync_provider_reports_the_state_contact_sync_is_in(pool: PgPo
     );
 }
 
+/// MAPPS-1131: what a contact-sync provider is DELEGATED comes from contact
+/// sync too, and it takes both halves.
+///
+/// MAPPS-1122 moved the status to the owning subsystem and stopped there. These
+/// three providers have no `integrations` row at all - `ConnectionHome::Elsewhere`,
+/// so two tables cannot disagree about one fact - which left
+/// `enabled_capabilities` permanently empty, and a tenant actively syncing
+/// Google Contacts was listed as connected with nothing delegated to it.
+///
+/// The two halves are asserted apart, because each alone is a state a tenant
+/// can be in and they mean different things: a live connection with the switch
+/// off is an account still linked and nothing being read from it.
+#[mokosh_test]
+async fn a_contact_sync_provider_reports_what_it_is_actually_delegated(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded admin's tenant");
+
+    // google: live and switched on. icloud: live, switched OFF. microsoft:
+    // disconnected, switched on.
+    for (provider, disconnected) in [("google", false), ("icloud", false), ("microsoft", true)] {
+        sqlx::query(
+            "INSERT INTO contact_sync_connections \
+             (tenant_id, provider, account_email, is_active, sync_status, disconnected_at) \
+             VALUES ($1, $2, $3, TRUE, 'success', $4)",
+        )
+        .bind(tenant_id)
+        .bind(provider)
+        .bind(format!("admin@{provider}.example"))
+        .bind(disconnected.then(chrono::Utc::now))
+        .execute(&pool)
+        .await
+        .expect("seed a contact-sync connection");
+    }
+    sqlx::query(
+        "INSERT INTO tenant_settings (tenant_id, category, key, value) \
+         VALUES ($1, 'integrations', 'icloud_contacts_enabled', 'false'::jsonb)",
+    )
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("switch iCloud off");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let entries = list(&app, &token).await;
+
+    let delegated = |provider: &str| -> Vec<String> {
+        entry(&entries, provider)["enabled_capabilities"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|c| c.as_str().expect("capability").to_string())
+            .collect()
+    };
+
+    assert_eq!(
+        delegated("google"),
+        vec!["contacts".to_string()],
+        "a tenant syncing Google Contacts has delegated contacts to it"
+    );
+
+    let icloud = entry(&entries, "icloud");
+    assert_eq!(
+        icloud["status"], "connected",
+        "the account is still linked, and saying otherwise would hide a credential that still exists: {icloud}"
+    );
+    assert!(
+        delegated("icloud").is_empty(),
+        "the switch is off, so nothing is being read from it: {icloud}"
+    );
+
+    assert!(
+        delegated("microsoft").is_empty(),
+        "a disconnected connection hands nothing over, switch or no switch"
+    );
+
+    // The row that is not an integration. `contact_sync_connections` holds a
+    // vcard row per tenant since PMS-1290; it has no registry entry, so it is
+    // neither listed nor asked for a switch it does not have.
+    sqlx::query(
+        "INSERT INTO contact_sync_connections (tenant_id, provider, account_email, is_active) \
+         VALUES ($1, 'vcard', 'files@msp.example', TRUE)",
+    )
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("seed the vcard row");
+    let after = list(&app, &token).await;
+    assert!(
+        after.iter().all(|row| row["provider"] != "vcard"),
+        "an uploaded file is not an integration"
+    );
+    assert_eq!(
+        after.len(),
+        entries.len(),
+        "and it changes nothing else about the catalog"
+    );
+}
+
 /// A disconnected contact-sync row reads as disconnected, not as never set up.
 ///
 /// Contact sync KEEPS the row when an admin disconnects (PSA-70 J), because the
