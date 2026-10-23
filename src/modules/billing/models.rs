@@ -475,6 +475,20 @@ pub struct PaymentResponse {
     pub created_at: DateTime<Utc>,
 }
 
+/// The columns a webhook receiver needs about an invoice its provider holds
+/// (MAPPS-1136).
+///
+/// Three fields rather than the whole `InvoiceResponse`: the receiver is
+/// about to record what the provider collected, and the amount and the
+/// currency are what that record takes. Reading the rest would be reading
+/// it to throw away.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DelegatedInvoiceRow {
+    pub id: uuid::Uuid,
+    pub balance_due: Decimal,
+    pub currency: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreatePaymentRequest {
     pub invoice_id: Option<Uuid>,
