@@ -29,6 +29,7 @@
 pub mod credential_move;
 pub mod descriptions;
 pub mod documents;
+pub mod invoice_issuer;
 pub mod issuer;
 pub mod issuer_delegation;
 pub mod models;

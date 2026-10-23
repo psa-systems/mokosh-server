@@ -985,7 +985,8 @@ impl BillingService {
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
                    tax_rate_id, tax_rate, amends_invoice_id,
-                   delivery_method, delivery_note, delivered_by_id
+                   delivery_method, delivery_note, delivered_by_id,
+                   external_provider, external_invoice_id, external_number
             FROM invoices
             WHERE {data_where}
             ORDER BY {order_by}
@@ -6123,7 +6124,8 @@ impl BillingService {
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
                    tax_rate_id, tax_rate, amends_invoice_id,
-                   delivery_method, delivery_note, delivered_by_id
+                   delivery_method, delivery_note, delivered_by_id,
+                   external_provider, external_invoice_id, external_number
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -7996,6 +7998,14 @@ struct InvoiceRow {
     delivery_method: Option<String>,
     delivery_note: Option<String>,
     delivered_by_id: Option<Uuid>,
+    /// MAPPS-1099: external-issuer columns from migration 278, NULL on every
+    /// row until the Xero / QuickBooks clients land. The read path carries
+    /// them through to `InvoiceResponse` so the SPA can distinguish a
+    /// Mokosh-issued invoice from one issued by a delegated provider as
+    /// soon as the first delegated row exists.
+    external_provider: Option<String>,
+    external_invoice_id: Option<String>,
+    external_number: Option<String>,
 }
 
 impl From<InvoiceRow> for InvoiceResponse {
@@ -8059,6 +8069,9 @@ impl From<InvoiceRow> for InvoiceResponse {
             delivered_by_id: r.delivered_by_id,
             // Resolved by `enrich_invoices` the way `voided_by_name` is.
             delivered_by_name: None,
+            external_provider: r.external_provider,
+            external_invoice_id: r.external_invoice_id,
+            external_number: r.external_number,
         }
     }
 }
