@@ -261,6 +261,48 @@ impl QuickBooksClient {
     /// writes the pair back into the secret store before the next
     /// invoice call. A terminal failure (`invalid_grant`) surfaces as
     /// `AppError::Unauthorized` so the handler shows reconnect copy.
+    /// Exchange an authorization code for the first token pair
+    /// (MAPPS-1142).
+    ///
+    /// Intuit needs no follow-up call to say which company file was
+    /// authorized: the callback carries `realmId` itself, which is why
+    /// this returns the token response alone where Xero's exchange is
+    /// followed by `list_connections`.
+    pub async fn exchange_code(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        redirect_uri: &str,
+        code: &str,
+        code_verifier: &str,
+    ) -> AppResult<QuickBooksTokenResponse> {
+        let url = format!("{}/oauth2/v1/tokens/bearer", self.identity_base);
+        let resp = self
+            .http
+            .post(url)
+            .basic_auth(client_id, Some(client_secret))
+            .header("Accept", "application/json")
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", code_verifier),
+            ])
+            .send()
+            .await
+            .map_err(|e| AppError::internal(format!("QuickBooks token exchange failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::BadRequest(format!(
+                "QuickBooks refused the connection ({status}). Start again from Settings. {body}"
+            )));
+        }
+        resp.json().await.map_err(|e| {
+            AppError::internal(format!("QuickBooks token response did not parse: {e}"))
+        })
+    }
+
     pub async fn refresh_access_token(
         &self,
         creds: &QuickBooksCredentials,
