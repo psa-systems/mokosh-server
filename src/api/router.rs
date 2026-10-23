@@ -359,16 +359,32 @@ pub fn create_api_router(
     // deployment on Infisical keeps its integration credentials there too.
     let integrations_service =
         crate::modules::integrations::IntegrationsService::new(db.clone(), secrets.clone());
-    // MAPPS-1099 Phase 2b: wire the feature-flagged invoice-issuer dispatch
-    // onto the serving `BillingService`. The flag defaults OFF
+    // MAPPS-1099 / MAPPS-1134: wire the feature-flagged invoice-issuer
+    // dispatch onto the serving `BillingService`. The flag defaults OFF
     // (`Feature::DelegatedInvoiceIssuer`), so this is a no-op on every
     // environment until an admin flips it; even flipped on, only a tenant
     // with Xero or QuickBooks connected and the `Invoicing` capability
-    // enabled sees the delegated path (and today that path refuses with a
-    // clear error because the credential + mapping tables are the subject of
-    // the Phase 2b-rest PR).
-    let billing_service = billing_service
-        .with_invoice_dispatch(features.clone(), Arc::new(integrations_service.clone()));
+    // enabled sees the delegated path.
+    //
+    // The two clients are built here with their real hosts. They are the
+    // only place those hosts are named, and a test builds the same
+    // dispatcher with `with_api_base` / `with_identity_base` pointing at a
+    // stub, which is what lets the delegated path be exercised end to end
+    // without reaching Xero or Intuit.
+    let billing_service = billing_service.with_invoice_dispatch(Arc::new(
+        crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher::new(
+            features.clone(),
+            Arc::new(integrations_service.clone()),
+            Arc::new(
+                crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService::new(
+                    db.clone(),
+                ),
+            ),
+            secrets.clone(),
+            Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
+            Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
+        ),
+    ));
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.clone());
