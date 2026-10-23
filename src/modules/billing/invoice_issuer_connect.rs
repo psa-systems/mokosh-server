@@ -38,6 +38,7 @@ use crate::modules::contact_sync::oauth::Pkce;
 use crate::secrets::{SecretKey, SecretProvider};
 use crate::utils::crypto::{generate_token, hash_password, verify_password};
 use crate::utils::error::{AppError, AppResult};
+use mokosh_types::integrations::{Capability, IntegrationStatus};
 
 use std::sync::Arc;
 
@@ -290,6 +291,61 @@ impl InvoiceIssuerConnectService {
         ))
     }
 
+    /// What a settings page for one provider reads (MAPPS-1143).
+    ///
+    /// Four facts, and three of them the integrations catalog cannot
+    /// express. `configured` is the deployment's, not the tenant's, and is
+    /// the whole answer a tenant gets about the application (PMS-1430: the
+    /// client is the host's and there is nothing for a tenant to edit).
+    /// `organisation_id` is how an admin with two Xero organisations tells
+    /// a right connection from a wrong one. `delegated` is whether
+    /// `invoicing` is actually enabled, which the OAuth flow sets and
+    /// nothing else does.
+    pub async fn overview(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+    ) -> AppResult<InvoiceIssuerOverview> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<OverviewRow> = sqlx::query_as(
+            "SELECT status, enabled_capabilities, external_organisation_id, last_error \
+             FROM integrations WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let configured = self.apps.get(provider).is_some();
+        let Some(row) = row else {
+            // Never connected is an offer, not an error.
+            return Ok(InvoiceIssuerOverview {
+                provider: provider.as_str().to_string(),
+                configured,
+                status: IntegrationStatus::NotConnected,
+                organisation_id: None,
+                delegated: false,
+                last_error: None,
+            });
+        };
+        Ok(InvoiceIssuerOverview {
+            provider: provider.as_str().to_string(),
+            configured,
+            // A status the enum does not know means the CHECK constraint and
+            // the enum have drifted, which is a deployment running a schema
+            // this build does not understand. Reading it as `error` is the
+            // honest answer, the same call `integrations::compose` makes.
+            status: IntegrationStatus::from_str(&row.status).unwrap_or(IntegrationStatus::Error),
+            organisation_id: row.external_organisation_id,
+            delegated: row
+                .enabled_capabilities
+                .iter()
+                .any(|c| c == Capability::Invoicing.as_str()),
+            last_error: row.last_error,
+        })
+    }
+
     /// Verify the state, consume it, and answer what the exchange needs.
     ///
     /// Consumed BEFORE the exchange, so a slow or failing exchange cannot
@@ -387,6 +443,34 @@ impl InvoiceIssuerConnectService {
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// What a per-provider settings page renders (MAPPS-1143).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InvoiceIssuerOverview {
+    pub provider: String,
+    /// Whether this DEPLOYMENT holds an application for the provider.
+    /// PMS-1430: the whole answer a tenant gets, because the application is
+    /// the host's and there is nothing for a tenant to edit.
+    pub configured: bool,
+    pub status: IntegrationStatus,
+    /// The Xero organisation or QuickBooks company on the other end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organisation_id: Option<String>,
+    /// Whether `invoicing` is enabled, which is what makes an invoice go
+    /// through the provider rather than through Mokosh.
+    pub delegated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// The integrations row, as the overview reads it.
+#[derive(sqlx::FromRow)]
+struct OverviewRow {
+    status: String,
+    enabled_capabilities: Vec<String>,
+    external_organisation_id: Option<String>,
+    last_error: Option<String>,
 }
 
 /// The state row, as the callback reads it back.
@@ -532,6 +616,7 @@ struct CallbackQuery {
 /// Admin-only, under `/api/v1/integrations`.
 pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) -> Router {
     Router::new()
+        .route("/integrations/invoice-issuer/{provider}", get(overview))
         .route(
             "/integrations/invoice-issuer/{provider}/authorize",
             post(authorize),
@@ -555,6 +640,17 @@ fn parse_provider(raw: &str) -> AppResult<InvoiceProviderKind> {
             "{raw} is not an invoice-issuer provider. The providers are: xero, quickbooks"
         ))
     })
+}
+
+/// What the settings card reads.
+async fn overview(
+    State(state): State<InvoiceIssuerConnectRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Path(provider): Path<String>,
+) -> AppResult<Json<InvoiceIssuerOverview>> {
+    let provider = parse_provider(&provider)?;
+    Ok(Json(state.service.overview(user.tenant(), provider).await?))
 }
 
 async fn authorize(
