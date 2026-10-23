@@ -676,6 +676,17 @@ pub fn create_api_router(
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
         .merge(billing_routes(billing_service, public_api_base_url.clone()))
+        // MAPPS-1099 Phase 2c: admin surfaces that populate the
+        // invoice-issuer mapping tables (Mokosh company -> external
+        // customer, Mokosh product -> external item). Behind the same
+        // `Feature::DelegatedInvoiceIssuer` flag the dispatch reads;
+        // every route answers 404 while the flag is off.
+        .merge(crate::modules::billing::invoice_issuer_mapping_routes::invoice_issuer_mapping_routes(
+            crate::modules::billing::invoice_issuer_mapping_routes::InvoiceIssuerMappingRouterState {
+                service: Arc::new(crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService::new(db.clone())),
+                features: features.clone(),
+            },
+        ))
         // Quotes: the sales document that precedes a Project, plus its
         // line items. Shares the billing module gate + finance role with
         // invoices. PMS-672.

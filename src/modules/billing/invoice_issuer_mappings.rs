@@ -151,6 +151,44 @@ impl InvoiceIssuerMappingService {
         Ok(row)
     }
 
+    /// Every company mapping this tenant has, both providers. Used by
+    /// the admin SPA's listing surface.
+    pub async fn list_company_mappings(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<Vec<CompanyMapping>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<CompanyMapping> = sqlx::query_as(
+            r#"SELECT id, tenant_id, provider, company_id, external_customer_id
+               FROM invoice_issuer_company_mappings
+               WHERE tenant_id = $1
+               ORDER BY provider, company_id"#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Every product mapping this tenant has, both providers. Same
+    /// shape as [`Self::list_company_mappings`].
+    pub async fn list_product_mappings(
+        &self,
+        tenant_id: TenantId,
+    ) -> AppResult<Vec<ProductMapping>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<ProductMapping> = sqlx::query_as(
+            r#"SELECT id, tenant_id, provider, product_id, external_item_id
+               FROM invoice_issuer_product_mappings
+               WHERE tenant_id = $1
+               ORDER BY provider, product_id"#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        Ok(rows)
+    }
+
     /// Set (or replace) the product mapping for one `(tenant, provider,
     /// product)` triple. Same shape as [`Self::upsert_customer_mapping`].
     pub async fn upsert_product_mapping(
