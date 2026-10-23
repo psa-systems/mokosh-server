@@ -135,28 +135,40 @@ impl IntegrationsService {
         .map_err(|e| AppError::Database(e.to_string()))?;
         tx.commit().await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let status =
-                    contact_sync_status(row.is_active, &row.sync_status, row.disconnected_at);
-                (
-                    row.provider,
-                    ContactSyncState {
-                        status,
-                        // Only when the state IS the error: a stale message
-                        // from a sync that later succeeded would read as a
-                        // live failure.
-                        last_error: match status {
-                            IntegrationStatus::Error => row.last_error,
-                            _ => None,
-                        },
-                        connected_at: Some(row.created_at),
-                        disconnected_at: row.disconnected_at,
+        let mut states = std::collections::HashMap::new();
+        for row in rows {
+            // The registry's providers only. `contact_sync_connections` also
+            // holds a `vcard` row per tenant since PMS-1290, which is an
+            // uploaded file rather than an integration: it has no registry
+            // entry, nothing on this page looks it up, and it has no
+            // tenant-wide switch to read.
+            if IntegrationProvider::from_str(&row.provider).is_none() {
+                continue;
+            }
+            let enabled = crate::modules::contact_sync::switch::contacts_enabled(
+                &self.db,
+                tenant_id,
+                &row.provider,
+            )
+            .await?;
+            let status = contact_sync_status(row.is_active, &row.sync_status, row.disconnected_at);
+            states.insert(
+                row.provider,
+                ContactSyncState {
+                    status,
+                    enabled,
+                    // Only when the state IS the error: a stale message from a
+                    // sync that later succeeded would read as a live failure.
+                    last_error: match status {
+                        IntegrationStatus::Error => row.last_error,
+                        _ => None,
                     },
-                )
-            })
-            .collect())
+                    connected_at: Some(row.created_at),
+                    disconnected_at: row.disconnected_at,
+                },
+            );
+        }
+        Ok(states)
     }
 
     /// One provider. Answers for a provider with no row too, for the same
@@ -694,6 +706,31 @@ fn compose(
         response.last_error = state.last_error.clone();
         response.connected_at = state.connected_at;
         response.disconnected_at = state.disconnected_at;
+        // MAPPS-1131: and the DELEGATION from there too. MAPPS-1122 moved the
+        // status and stopped, so a tenant actively syncing Google Contacts was
+        // listed as connected with nothing delegated to it: these providers
+        // have no `integrations` row at all (`ConnectionHome::Elsewhere`, so
+        // two tables cannot disagree about one fact), which left
+        // `enabled_capabilities` permanently empty.
+        //
+        // Delegated means both halves: a live connection AND the tenant-wide
+        // switch. A disconnected connection is handing nothing over, and
+        // neither is a live one whose switch is off - `assert_enabled` refuses
+        // a sync on the switch alone. `Error` counts as live: the account is
+        // linked and the last attempt to read it failed, which is a failing
+        // delegation, not an absent one.
+        if state.enabled
+            && matches!(
+                state.status,
+                IntegrationStatus::Connected | IntegrationStatus::Error
+            )
+        {
+            response.enabled_capabilities = descriptor
+                .supported_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect();
+        }
         return response;
     }
     let Some(row) = row else {
@@ -758,6 +795,14 @@ struct ContactSyncRow {
 /// `contact_sync_connections` part of what integrations depends on.
 struct ContactSyncState {
     status: IntegrationStatus,
+    /// Whether the tenant-wide switch for this provider is on (MAPPS-1131).
+    ///
+    /// A second fact from a second table, and both are needed to answer what is
+    /// delegated: the connection says the account is linked, and the switch
+    /// says whether anything is allowed to read it. `assert_enabled` refuses a
+    /// sync request on the switch alone, so a tenant with a live connection and
+    /// the switch off has handed nothing over.
+    enabled: bool,
     last_error: Option<String>,
     connected_at: Option<chrono::DateTime<chrono::Utc>>,
     disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
