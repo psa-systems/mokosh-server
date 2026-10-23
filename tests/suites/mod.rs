@@ -90,6 +90,7 @@ pub mod email_intake_attachments;
 pub mod email_intake_phase2;
 pub mod employee_time;
 pub mod expenses_vendors_categories;
+pub mod expenses_workflow;
 pub mod feature_toggles;
 pub mod file_ledger;
 pub mod fk_validation_query_budget;
