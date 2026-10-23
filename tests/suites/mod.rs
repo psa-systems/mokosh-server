@@ -116,6 +116,7 @@ pub mod invoice_amendments;
 pub mod invoice_billing_contact;
 pub mod invoice_branding;
 pub mod invoice_company_change;
+pub mod invoice_issuer_connect;
 pub mod invoice_issuer_delegation;
 pub mod invoice_issuer_webhooks;
 pub mod invoice_ledger_reconciles;
