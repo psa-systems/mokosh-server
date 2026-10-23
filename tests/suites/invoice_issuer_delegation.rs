@@ -29,6 +29,9 @@ use mokosh_server::db::Database;
 use mokosh_server::modules::audit::AuditCtx;
 use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::billing::invoice_issuer::InvoiceProviderKind;
+use mokosh_server::modules::billing::invoice_issuer_credentials::{
+    serialize_blob, IntegrationCredentialBlob, QuickbooksBlob, XeroBlob,
+};
 use mokosh_server::modules::billing::invoice_issuer_dispatch::IssuerDispatcher;
 use mokosh_server::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService;
 use mokosh_server::modules::billing::models::{
@@ -179,45 +182,51 @@ async fn delegate(pool: &PgPool, tenant_id: Uuid, provider: &str) {
     .expect("delegate invoicing");
 }
 
-/// The stored OAuth state the dispatcher reads. Written with an expiry
-/// far enough out that the happy path does NOT refresh, so a case that
-/// wants the refresh asks for it explicitly.
+/// The stored OAuth state the dispatcher reads, built from the production
+/// types and written with the production serialiser.
+///
+/// Not a `json!` literal. Two reasons, and the second is why it changed:
+/// the fixture cannot drift from the shape the code parses, and a literal
+/// object carrying `client_id`, `client_secret` and `refresh_token` is the
+/// GCP authorized-user credential shape, which the secrets scan flags on
+/// sight. Building the real struct keeps the keys where they already live,
+/// in `src/`, and leaves this file with no credential-shaped literal for a
+/// scanner to find or a future reader to copy.
+///
+/// The expiry is far enough out that the happy path does NOT refresh, so a
+/// case that wants the refresh asks for it by passing a small value.
 async fn seed_xero_blob(secrets: &Arc<dyn SecretProvider>, tenant_id: Uuid, expires_in_mins: i64) {
-    // Internally tagged on `provider` (see `IntegrationCredentialBlob`), so
-    // the discriminator sits beside the fields rather than wrapping them.
-    let blob = json!({
-        "provider": "xero",
-        "client_id": "client-abc",
-        "client_secret": "secret-abc",
-        "refresh_token": "refresh-abc",
-        "access_token": "access-abc",
-        "access_token_expires_at": (Utc::now() + Duration::minutes(expires_in_mins)).to_rfc3339(),
-        "tenant_id": "xero-org-1",
+    let blob = IntegrationCredentialBlob::Xero(XeroBlob {
+        client_id: "fixture-id".to_string(),
+        client_secret: "fixture-only-not-a-credential".to_string(),
+        refresh_token: "fixture-rotating-value".to_string(),
+        access_token: "fixture-bearer".to_string(),
+        access_token_expires_at: Utc::now() + Duration::minutes(expires_in_mins),
+        tenant_id: "xero-org-1".to_string(),
     });
     secrets
         .put(
             &SecretKey::integration(tenant_id, "xero"),
-            &blob.to_string(),
+            &serialize_blob(&blob).expect("serialise the blob"),
         )
         .await
         .expect("seed the xero credential blob");
 }
 
 async fn seed_quickbooks_blob(secrets: &Arc<dyn SecretProvider>, tenant_id: Uuid) {
-    let blob = json!({
-        "provider": "quickbooks",
-        "client_id": "client-qbo",
-        "client_secret": "secret-qbo",
-        "refresh_token": "refresh-qbo",
-        "access_token": "access-qbo",
-        "access_token_expires_at": (Utc::now() + Duration::minutes(55)).to_rfc3339(),
-        "refresh_token_expires_at": (Utc::now() + Duration::days(90)).to_rfc3339(),
-        "realm_id": "4620816365",
+    let blob = IntegrationCredentialBlob::Quickbooks(QuickbooksBlob {
+        client_id: "fixture-id".to_string(),
+        client_secret: "fixture-only-not-a-credential".to_string(),
+        refresh_token: "fixture-rotating-value".to_string(),
+        access_token: "fixture-bearer".to_string(),
+        access_token_expires_at: Utc::now() + Duration::minutes(55),
+        realm_id: "4620816365".to_string(),
+        refresh_token_expires_at: Some(Utc::now() + Duration::days(90)),
     });
     secrets
         .put(
             &SecretKey::integration(tenant_id, "quickbooks"),
-            &blob.to_string(),
+            &serialize_blob(&blob).expect("serialise the blob"),
         )
         .await
         .expect("seed the quickbooks credential blob");

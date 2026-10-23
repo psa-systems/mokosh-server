@@ -428,5 +428,16 @@ jobs:
           # suppresses the specific URL shapes everywhere they appear in
           # git history. The regex is deliberately narrow: each
           # alternative names a specific throwaway credential pair.
-          kingfisher_skip_regex: "postgres://(postgres:postgres|unused:unused|user:(pass|p=ssw=rd)|infisical:\\(\\$infisical_pg_password\\)|[^@:]+:\\(\\$[a-z_]+\\))@"
+          #
+          # MAPPS-1134 adds the second alternative. The first version of
+          # `tests/suites/invoice_issuer_delegation.rs` seeded its Xero and
+          # QuickBooks fixtures as `json!` literals, and an object carrying
+          # `client_id`, `client_secret` and `refresh_token` is the GCP
+          # authorized-user credential shape, which the scan reads as a
+          # Google credential. The fixtures are built from the real structs
+          # now and the working tree is clean, but the first commit's blob
+          # stays reachable through `.git/objects/`, where `--exclude` does
+          # not go. The alternative names those eight throwaway values and
+          # nothing else.
+          kingfisher_skip_regex: "postgres://(postgres:postgres|unused:unused|user:(pass|p=ssw=rd)|infisical:\\(\\$infisical_pg_password\\)|[^@:]+:\\(\\$[a-z_]+\\))@|(client|secret|refresh|access)-(abc|qbo)"
           noseyparker_ignore_file: .noseyparker-ignore.txt
