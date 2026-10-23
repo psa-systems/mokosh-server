@@ -261,6 +261,19 @@ fn request(company_id: Uuid) -> CreateInvoiceRequest {
     }
 }
 
+/// The five columns that record how an invoice was sent, read as one row.
+///
+/// A named type rather than a tuple because five is past where a reader can
+/// keep the order straight, and `clippy::type_complexity` says so.
+#[derive(sqlx::FromRow)]
+struct SendColumns {
+    status: String,
+    sent_at: Option<chrono::DateTime<Utc>>,
+    emailed_to: Option<String>,
+    emailed_at: Option<chrono::DateTime<Utc>>,
+    delivery_method: Option<String>,
+}
+
 /// A product this tenant sells, for the QuickBooks path.
 ///
 /// QuickBooks refuses a line that does not name an item, so a delegated
@@ -378,6 +391,129 @@ async fn a_delegated_tenant_has_the_invoice_issued_by_xero(pool: PgPool) {
         !created.invoice_number.is_empty(),
         "the local number is still minted: every existing Mokosh reference to this invoice uses it"
     );
+}
+
+/// MAPPS-1135: a delegated invoice is created `sent`, and the columns that
+/// record how Mokosh sent it stay empty because Mokosh did not.
+///
+/// Left in draft it would be invisible to every receivables read, could not
+/// be amended or written off, and could not take the payment a provider
+/// webhook reports: `create_payment` refuses a draft (PMS-999), which is
+/// asserted here too because Phase 3b depends on it.
+#[mokosh_test]
+async fn a_delegated_invoice_is_sent_by_the_provider_not_by_us(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (billing, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    delegate(&pool, common::DEFAULT_TENANT_ID, "xero").await;
+    seed_xero_blob(&secrets, common::DEFAULT_TENANT_ID, 55).await;
+    InvoiceIssuerMappingService::new(db)
+        .upsert_customer_mapping(
+            tenant,
+            InvoiceProviderKind::Xero,
+            company_id,
+            "3f6c6a2e-9d41-4a39-9f6a-6d1a1c2b3d4e",
+        )
+        .await
+        .expect("map the company");
+
+    let created = billing
+        .create_invoice(
+            tenant,
+            &request(company_id),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create the invoice");
+    assert_eq!(stub.lock().unwrap().issue.len(), 1);
+
+    let row: SendColumns = sqlx::query_as(
+        "SELECT status, sent_at, emailed_to, emailed_at, delivery_method \
+         FROM invoices WHERE id = $1",
+    )
+    .bind(created.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the row");
+
+    assert_eq!(
+        row.status, "sent",
+        "the provider sent it, and sent means it went"
+    );
+    assert!(
+        row.sent_at.is_some(),
+        "and it went at a time worth recording"
+    );
+    assert_eq!(
+        (row.emailed_to, row.emailed_at, row.delivery_method),
+        (None, None, None),
+        "Mokosh mailed nothing: a recipient or a method here would be a claim about \
+         a delivery it did not make"
+    );
+
+    // What MAPPS-1136 needs from this ticket: the provider reports a
+    // payment, and it has somewhere to land.
+    let payment = billing
+        .create_payment(
+            tenant,
+            &mokosh_server::modules::billing::models::CreatePaymentRequest {
+                invoice_id: Some(created.id),
+                company_id,
+                payment_date: NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
+                amount: Decimal::from(300),
+                payment_method: mokosh_server::modules::billing::models::PaymentMethod::Other,
+                reference_number: Some("9f1d1c62-0f3a-4a1e-9c6f-7b2c9d4e5a60".to_string()),
+                gateway_transaction_id: None,
+                notes: Some("Reported paid by Xero".to_string()),
+            },
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("a delegated invoice can take the payment its provider reports");
+    assert_eq!(payment.amount, Decimal::from(300));
+
+    let (status, balance): (String, Decimal) =
+        sqlx::query_as("SELECT status, balance_due FROM invoices WHERE id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the row back");
+    assert_eq!(
+        (status.as_str(), balance),
+        ("paid", Decimal::ZERO),
+        "and the one writer derives the rest, as it does for every other invoice"
+    );
+}
+
+/// A local invoice is untouched: still created `draft`, with no sent_at.
+#[mokosh_test]
+async fn a_local_invoice_is_still_a_draft(pool: PgPool) {
+    let (_stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (billing, _db, _secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    let created = billing
+        .create_invoice(
+            tenant,
+            &request(company_id),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create the invoice");
+
+    let (status, sent_at): (String, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT status, sent_at FROM invoices WHERE id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the row");
+    assert_eq!(status, "draft");
+    assert!(sent_at.is_none());
 }
 
 /// An access token near expiry is refreshed before the issue call, and the

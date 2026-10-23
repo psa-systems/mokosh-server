@@ -1237,10 +1237,10 @@ impl BillingService {
                 payment_term_id,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
                 balance_due, currency, notes, po_number, number_scheme,
-                external_provider, external_invoice_id, external_number
+                external_provider, external_invoice_id, external_number, sent_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $17, $10, $11,
-                    $12, $13, 0, $13, $14, $15, $16, $18, $19, $20, $21)
+            VALUES ($1, $2, $3, $4, $5, $6, $22, $7, $8, $9, $17, $10, $11,
+                    $12, $13, 0, $13, $14, $15, $16, $18, $19, $20, $21, $23)
             "#,
         )
         .bind(invoice_id)
@@ -1269,6 +1269,27 @@ impl BillingService {
         .bind(external.as_ref().map(|e| e.provider.as_str()))
         .bind(external.as_ref().map(|e| e.external_invoice_id.as_str()))
         .bind(external.as_ref().map(|e| e.external_number.as_str()))
+        // MAPPS-1135: a delegated invoice is created `sent`, because the
+        // provider sent it, and `sent` is what this model means by that
+        // (PMS-991: "sent means it went"). The transition that would
+        // otherwise set it is `update_invoice`'s send, and that send is
+        // exactly what delegation replaces: it resolves a recipient,
+        // renders a document, freezes an issuer and mails it, and the
+        // provider did all four.
+        //
+        // The columns recording HOW it went stay NULL, because Mokosh did
+        // none of it: `emailed_to`, `emailed_at`, `delivery_method` and
+        // the issuer snapshot. Migration 263's note is the precedent for
+        // leaving them rather than inventing a value - a method we did not
+        // use is the false claim that migration exists to remove.
+        // `external_provider` is the record of who delivered it.
+        //
+        // Left in draft, the row would be invisible to every receivables
+        // read, uncorrectable by amendment or write-off, and unable to
+        // accept the payment a provider webhook reports (PMS-999 refuses a
+        // payment against a draft, deliberately).
+        .bind(if external.is_some() { "sent" } else { "draft" })
+        .bind(external.as_ref().map(|_| Utc::now()))
         .execute(&mut *tx)
         .await?;
 
@@ -2160,6 +2181,13 @@ impl BillingService {
               AND status IN ('sent', 'partially_paid')
               AND balance_due > 0
               AND due_date < $2
+              -- MAPPS-1135: an invoice the provider issued is an invoice
+              -- the provider chases. Since a delegated invoice is created
+              -- `sent` it otherwise matches this predicate exactly, and
+              -- the result would be two organisations emailing one
+              -- customer about one debt, one of them with a document that
+              -- customer has never seen.
+              AND external_provider IS NULL
             ORDER BY due_date, invoice_number
             "#,
         )
