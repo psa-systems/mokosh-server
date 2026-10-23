@@ -38,9 +38,9 @@ use crate::utils::error::{AppError, AppResult};
 
 /// The JSON blob stored under `SecretKind::Integration { provider }`
 /// for a delegated invoice-issuer connection. One variant per
-/// provider; serialising as external-tagged JSON keeps the provider
-/// discriminator in the stored value so a reader cannot confuse a
-/// Xero blob for a QBO blob.
+/// provider; the `provider` tag sits beside the fields (serde calls
+/// this internally tagged) so the discriminator is in the stored value
+/// and a reader cannot confuse a Xero blob for a QBO blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum IntegrationCredentialBlob {

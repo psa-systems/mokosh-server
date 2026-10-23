@@ -72,27 +72,6 @@ pub enum IssuerSelection {
     Delegated { provider: InvoiceProviderKind },
 }
 
-/// MAPPS-1099 Phase 2b: the two deps `create_invoice` reads once per
-/// invoice to decide which issuer to use. Held as `Option<...>` on
-/// `BillingService` so a constructor that never calls
-/// [`crate::modules::billing::service::BillingService::with_invoice_dispatch`]
-/// never reads either dep and never runs the dispatch. Every test
-/// harness and QA seeder stays on that unset path, so a merge is a
-/// no-op on every environment and staging and production both see
-/// zero behaviour change until an admin flips the toggle.
-#[derive(Clone)]
-pub struct InvoiceDispatchContext {
-    pub features: crate::modules::features::FeatureSnapshot,
-    pub integrations: std::sync::Arc<crate::modules::integrations::IntegrationsService>,
-}
-
-impl std::fmt::Debug for InvoiceDispatchContext {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InvoiceDispatchContext")
-            .finish_non_exhaustive()
-    }
-}
-
 /// Phase 2 dispatch helper. Pure logic over the two inputs it reads:
 /// the deployment-wide feature toggle (gates the whole delegated path,
 /// so the merge is a no-op on every environment until operations flips

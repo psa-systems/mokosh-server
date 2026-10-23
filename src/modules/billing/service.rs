@@ -48,14 +48,20 @@ pub struct BillingService {
     /// built here, so the provider is chosen once at startup by
     /// `secrets::provider_from_env` and no constructor can pick a different one.
     secrets: Arc<dyn crate::secrets::SecretProvider>,
-    /// MAPPS-1099 Phase 2b: the feature-flagged dispatch between the
-    /// local path and the Xero / QuickBooks clients. `None` on every
-    /// test harness, QA seeder and portal-side instance so a build that
-    /// does not opt into the dispatch keeps today's behaviour byte for
-    /// byte; wired on the serving instance by
-    /// [`Self::with_invoice_dispatch`] after `IntegrationsService` is
-    /// built.
-    invoice_dispatch: Option<crate::modules::billing::invoice_issuer::InvoiceDispatchContext>,
+    /// MAPPS-1099: the feature-flagged dispatch between the local path
+    /// and the Xero / QuickBooks clients. `None` on every test harness,
+    /// QA seeder and portal-side instance so a build that does not opt
+    /// into the dispatch keeps today's behaviour byte for byte; wired on
+    /// the serving instance by [`Self::with_invoice_dispatch`] after
+    /// `IntegrationsService` is built.
+    ///
+    /// MAPPS-1134 replaced the Phase 2b `InvoiceDispatchContext` (the
+    /// feature snapshot and the integrations service, which this file
+    /// used to re-read the capability from) with the dispatcher itself.
+    /// The two were deciding the same thing in two places, and only one
+    /// of them could carry it out.
+    invoice_dispatch:
+        Option<Arc<crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher>>,
 }
 
 /// PMS-990: the due date offset when neither the invoice's term nor the
@@ -833,97 +839,61 @@ impl BillingService {
         }
     }
 
-    /// MAPPS-1099 Phase 2b: enable the feature-flagged dispatch between
-    /// the local invoice path and an external provider (Xero or
-    /// QuickBooks). An instance built without this is byte-identical in
-    /// behaviour to the current code: `create_invoice` runs the local
-    /// path end to end for every tenant, every time. An instance built
-    /// WITH this still runs the local path for every tenant until an
-    /// admin flips `Feature::DelegatedInvoiceIssuer` on, and even then
-    /// only reroutes a tenant whose `integrations` row carries
-    /// `Capability::Invoicing` for Xero or QuickBooks. The flag
-    /// defaults OFF (missing `feature_toggles` row reads as off,
-    /// PMS-1414), so a merge is a no-op on every environment.
+    /// MAPPS-1099: enable the feature-flagged dispatch between the local
+    /// invoice path and an external provider (Xero or QuickBooks). An
+    /// instance built without this is byte-identical in behaviour to the
+    /// local-only code: `create_invoice` runs the local path end to end
+    /// for every tenant, every time. An instance built WITH this still
+    /// runs the local path for every tenant until an admin flips
+    /// `Feature::DelegatedInvoiceIssuer` on, and even then only reroutes
+    /// a tenant whose `integrations` row carries `Capability::Invoicing`
+    /// for Xero or QuickBooks. The flag defaults OFF (a missing
+    /// `feature_toggles` row reads as off, PMS-1414).
     pub fn with_invoice_dispatch(
         mut self,
-        features: crate::modules::features::FeatureSnapshot,
-        integrations: Arc<crate::modules::integrations::IntegrationsService>,
+        dispatcher: Arc<crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher>,
     ) -> Self {
-        self.invoice_dispatch = Some(
-            crate::modules::billing::invoice_issuer::InvoiceDispatchContext {
-                features,
-                integrations,
-            },
-        );
+        self.invoice_dispatch = Some(dispatcher);
         self
     }
 
-    /// MAPPS-1099 Phase 2b: decide the issuer for the next invoice this
-    /// tenant creates, and refuse the call when the delegated path was
-    /// picked (the per-provider credential + mapping tables land in a
-    /// follow-up PR, so we cannot carry out a delegated issue today).
+    /// MAPPS-1134: issue this invoice externally when the tenant has
+    /// delegated it, and answer `None` for every path that leaves the
+    /// local behaviour alone.
     ///
-    /// Returns `Ok(())` on three code paths:
+    /// `None` on four paths:
     /// 1. The dispatch was never wired (every test harness, QA seeder,
     ///    and portal-side instance).
-    /// 2. The dispatch is wired but the feature toggle is OFF (every
-    ///    deployment on merge day, since the toggle defaults OFF).
-    /// 3. The dispatch is wired, the toggle is ON, but neither Xero nor
-    ///    QuickBooks is connected on this tenant with
-    ///    `Capability::Invoicing` enabled.
+    /// 2. The dispatch is wired but the feature toggle is OFF, which is
+    ///    every deployment until operations flips it. This is checked
+    ///    here rather than inside `plan`, because the caller does
+    ///    preparatory reads before it can build the request shape and
+    ///    the toggle being off has to cost nothing at all: no extra
+    ///    query, no reordering, nothing for a reviewer to weigh up
+    ///    against the local path they already trust.
+    /// 3. The toggle is on but neither Xero nor QuickBooks carries
+    ///    `Capability::Invoicing` on this tenant.
+    /// 4. A provider is delegated and `plan` chose the local path
+    ///    anyway, which it does not today and is free to in future.
     ///
-    /// Returns `Err(AppError::internal(...))` on the one code path a
-    /// tenant has opted into: the toggle is ON and this tenant has
-    /// delegated. The message names the ticket and the gap so an
-    /// operator can see what to turn off (either the toggle or the
-    /// `Invoicing` capability on the integration row) until the
-    /// follow-up PR lands.
-    async fn pick_invoice_issuer(&self, tenant_id: TenantId) -> AppResult<()> {
-        use crate::modules::billing::invoice_issuer::{select_issuer_with, IssuerSelection};
-        use mokosh_types::integrations::{Capability, IntegrationProvider};
+    /// `Some(ExternalInvoiceRef)` means the external provider HAS the
+    /// invoice: the caller writes its columns onto the local row. An
+    /// error means it does not, and no local row may be written, which
+    /// is why this runs before the transaction opens rather than inside
+    /// it.
+    async fn issue_externally(
+        &self,
+        tenant_id: TenantId,
+        shape: &crate::modules::billing::invoice_issuer_dispatch::CreateInvoiceRequestShape<'_>,
+    ) -> AppResult<Option<crate::modules::billing::invoice_issuer::ExternalInvoiceRef>> {
+        use crate::modules::billing::invoice_issuer_dispatch::IssuerPlan;
 
-        let Some(dispatch) = &self.invoice_dispatch else {
-            return Ok(());
+        let Some(dispatcher) = &self.invoice_dispatch else {
+            return Ok(None);
         };
-        if !dispatch
-            .features
-            .is_enabled(crate::modules::features::Feature::DelegatedInvoiceIssuer)
-        {
-            return Ok(());
-        }
-
-        let invoicing = Capability::Invoicing.as_str().to_string();
-        let xero_delegated = dispatch
-            .integrations
-            .get(tenant_id, IntegrationProvider::Xero)
-            .await?
-            .enabled_capabilities
-            .contains(&invoicing);
-        let quickbooks_delegated = dispatch
-            .integrations
-            .get(tenant_id, IntegrationProvider::Quickbooks)
-            .await?
-            .enabled_capabilities
-            .contains(&invoicing);
-
-        let selection = select_issuer_with(true, || xero_delegated, || quickbooks_delegated);
-        match selection {
-            IssuerSelection::Local => Ok(()),
-            IssuerSelection::Delegated { provider } => {
-                tracing::warn!(
-                    tenant_id = %tenant_id,
-                    provider = %provider.as_str(),
-                    "MAPPS-1099: delegated invoice issuing picked but credential + mapping tables \
-                     have not landed; refusing the create so the local path does not silently \
-                     mint the invoice the admin asked the provider to issue"
-                );
-                Err(AppError::internal(format!(
-                    "Delegated invoice issuing to {} is not yet available on this build; \
-                     disable the Invoicing capability on the integration or turn off the \
-                     Delegated invoice issuer feature while MAPPS-1099 Phase 2b-rest lands",
-                    provider.as_str()
-                )))
-            }
+        match dispatcher.plan(tenant_id, shape).await? {
+            IssuerPlan::Local => Ok(None),
+            IssuerPlan::Delegated(external) => Ok(Some(external)),
         }
     }
 
@@ -1151,18 +1121,62 @@ impl BillingService {
         request: &CreateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
-        // MAPPS-1099 Phase 2b: before anything is written, pick the
-        // issuer for this invoice. The dispatch runs only when it was
-        // wired (`with_invoice_dispatch`) AND the toggle is on. The
-        // local branch is the default; a `Delegated` branch is an
-        // explicit refusal for now, because the per-provider credential
-        // + mapping tables (Mokosh company -> Xero `ContactID` /
-        // QuickBooks `CustomerRef`) land in a follow-up PR. The explicit
-        // refusal is safer than silently falling back: an admin who
-        // enabled the toggle AND the integration's Invoicing capability
-        // asked for delegated issuing, and we must not pretend the
-        // local path is what they wanted.
-        self.pick_invoice_issuer(tenant_id).await?;
+        // MAPPS-1134: when the tenant has delegated Invoicing, the
+        // external provider issues the invoice BEFORE anything local is
+        // written, so a provider that refuses leaves no row behind and
+        // consumes no number from the tenant's sequence.
+        //
+        // That ordering is why this is a separate pass rather than a
+        // call inside the transaction below. `plan` needs the resolved
+        // due date and currency, which are read from the database, and
+        // the transaction opens by LOCKING the tenant's invoice-number
+        // sequence row (`next_invoice_number`, which serialises
+        // concurrent creates on purpose). Calling Xero from inside it
+        // would hold that lock across an HTTP round trip: every other
+        // invoice create for the tenant would queue behind a third
+        // party, and a provider timeout would hold the lock for its
+        // whole duration.
+        //
+        // The whole pass is skipped unless the toggle is on, so every
+        // deployment that has not flipped `DelegatedInvoiceIssuer` runs
+        // exactly the statements it ran before, in the same order and
+        // the same number of them.
+        let external = match self.invoice_dispatch.as_ref() {
+            Some(dispatcher) if dispatcher.delegation_enabled() => {
+                let mut pre = self.db.begin_with_tenant(tenant_id).await?;
+                // The same two guards the write path runs, moved ahead of
+                // the provider call: an invoice for a company this tenant
+                // does not own must not reach Xero either (PMS-1367).
+                Self::assert_company_in_tenant(&mut pre, tenant_id, request.company_id).await?;
+                if let Some(pt) = request.payment_term_id {
+                    Self::assert_payment_term_in_tenant(&mut pre, tenant_id, pt).await?;
+                }
+                let (due_date, _) = Self::resolve_due_date(
+                    &mut pre,
+                    tenant_id,
+                    request.invoice_date,
+                    request.payment_term_id,
+                    request.due_date,
+                )
+                .await?;
+                let currency = match request.currency.as_deref() {
+                    Some(c) => c.to_string(),
+                    None => read_default_currency(&mut pre, tenant_id).await?,
+                };
+                pre.commit().await?;
+
+                let shape =
+                    crate::modules::billing::invoice_issuer_dispatch::CreateInvoiceRequestShape {
+                        company_id: request.company_id,
+                        invoice_date: request.invoice_date,
+                        due_date,
+                        currency: &currency,
+                        lines: &request.lines,
+                    };
+                self.issue_externally(tenant_id, &shape).await?
+            }
+            _ => None,
+        };
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
@@ -1222,10 +1236,11 @@ impl BillingService {
                 contract_id, status, invoice_date, due_date, payment_terms,
                 payment_term_id,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number, number_scheme
+                balance_due, currency, notes, po_number, number_scheme,
+                external_provider, external_invoice_id, external_number
             )
             VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $17, $10, $11,
-                    $12, $13, 0, $13, $14, $15, $16, $18)
+                    $12, $13, 0, $13, $14, $15, $16, $18, $19, $20, $21)
             "#,
         )
         .bind(invoice_id)
@@ -1246,6 +1261,14 @@ impl BillingService {
         .bind(&request.po_number)
         .bind(payment_term_id)
         .bind(number_scheme.as_str())
+        // MAPPS-1134: NULL on the local path, which is every row on a
+        // deployment that has not delegated. The local `invoice_number`
+        // is still minted either way: the external number is what the
+        // customer sees, and the local one is what every existing Mokosh
+        // reference to this invoice already uses.
+        .bind(external.as_ref().map(|e| e.provider.as_str()))
+        .bind(external.as_ref().map(|e| e.external_invoice_id.as_str()))
+        .bind(external.as_ref().map(|e| e.external_number.as_str()))
         .execute(&mut *tx)
         .await?;
 

@@ -87,6 +87,20 @@ impl IssuerDispatcher {
         }
     }
 
+    /// Whether the deployment-wide toggle is on, with no query and no
+    /// await (MAPPS-1134).
+    ///
+    /// `plan` checks this too and returns `Local`, which is the right
+    /// answer for a caller that already has everything `plan` needs.
+    /// `BillingService::create_invoice` does not: it has to read the due
+    /// date and the currency before it can build the request shape, and
+    /// on every deployment today that work would be done only to be
+    /// thrown away. Asking first keeps the untouched path untouched.
+    pub fn delegation_enabled(&self) -> bool {
+        self.features
+            .is_enabled(crate::modules::features::Feature::DelegatedInvoiceIssuer)
+    }
+
     /// Decide and (if delegated) carry out the external issue for one
     /// invoice. Returns `IssuerPlan::Local` for every path that leaves
     /// `create_invoice`'s current body unchanged:
