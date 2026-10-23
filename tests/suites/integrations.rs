@@ -841,6 +841,73 @@ async fn a_contact_sync_provider_reports_what_it_is_actually_delegated(pool: PgP
     );
 }
 
+/// PMS-1525: migration 283 clears the capability from the rows that carry it,
+/// and leaves `payments` alone.
+///
+/// The row is seeded the way a deployment actually has it and then given the
+/// extra value the closed route used to be able to write. No API can produce
+/// this state any more, which is exactly why it needs a migration rather than
+/// a release note telling an admin to untick it.
+///
+/// The migration has already run against this database (every suite database
+/// is migrated before a case touches it) and the row is seeded after, so the
+/// case runs the migration's own statement to prove the state cannot survive
+/// it, and then reads the result back through the API the panel uses.
+#[mokosh_test]
+async fn a_stripe_row_no_longer_claims_an_invoicing_delegation(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded admin's tenant");
+    sqlx::query(
+        "INSERT INTO integrations (tenant_id, provider, status, enabled_capabilities) \
+         VALUES ($1, 'stripe', 'connected', ARRAY['payments', 'invoicing']::text[])",
+    )
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("seed a stripe row from before the capability was retired");
+
+    sqlx::query(
+        "UPDATE integrations SET enabled_capabilities = array_remove(enabled_capabilities, 'invoicing') \
+         WHERE provider = 'stripe' AND 'invoicing' = ANY(enabled_capabilities)",
+    )
+    .execute(&pool)
+    .await
+    .expect("run the migration statement");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let entries = list(&app, &token).await;
+    let stripe = entry(&entries, "stripe");
+
+    let delegated: Vec<&str> = stripe["enabled_capabilities"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|c| c.as_str().expect("capability"))
+        .collect();
+    assert_eq!(
+        delegated,
+        vec!["payments"],
+        "card payments are real and read; invoicing was neither: {stripe}"
+    );
+
+    let supported: Vec<&str> = stripe["supported_capabilities"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|c| c["key"].as_str().expect("key"))
+        .collect();
+    assert_eq!(
+        supported,
+        vec!["payments"],
+        "and the catalog stops offering a capability no issuer can receive: {stripe}"
+    );
+}
+
 /// A disconnected contact-sync row reads as disconnected, not as never set up.
 ///
 /// Contact sync KEEPS the row when an admin disconnects (PSA-70 J), because the
