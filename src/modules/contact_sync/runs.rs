@@ -434,11 +434,15 @@ impl ContactSyncRunner {
             // Google's flag for an iCloud run would have made one integration
             // turn the other off, which is the shape of bug that is only ever
             // found by the tenant it surprises.
-            let allowed = if provider == super::icloud::ICLOUD {
-                crate::modules::settings::read_icloud_contacts_enabled(&self.db, tenant_id).await?
-            } else {
-                crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
-            };
+            //
+            // PMS-1524: which is what this code then did to Microsoft 365.
+            // PMS-1512 gave it a key and updated the check that gates QUEUING a
+            // run; this one gates RUNNING it, kept its two-way `if`, and sent
+            // every Microsoft run to Google's key. Both directions were wrong:
+            // Google off cancelled Microsoft runs, and Microsoft off left them
+            // syncing. The selection is `switch::contacts_enabled` now, shared
+            // with the queue-time check so the two cannot disagree again.
+            let allowed = super::switch::contacts_enabled(&self.db, tenant_id, &provider).await?;
             if !allowed {
                 return Err(AppError::Conflict(turned_off(&provider)));
             }
@@ -462,6 +466,15 @@ impl ContactSyncRunner {
         claimed: &Claimed,
         outcome: AppResult<SyncReport>,
     ) -> AppResult<()> {
+        // PMS-1524: the switch is named from the provider rather than listed,
+        // which is the third place this choice is made and the second that had
+        // not been given Microsoft 365's key (PMS-1512). A Microsoft run the
+        // switch stopped was recorded as `failed` rather than `cancelled`, so
+        // being switched off counted toward the failure streak and, after
+        // NOTIFY_AFTER of them, told the tenant their integration was failing.
+        // `{provider}_contacts_enabled` is the naming every one of these keys
+        // follows, so a provider added later is covered by having a key at all;
+        // `vcard` has none and matches nothing, which is correct.
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let (connection_status, disconnected, turned_off, provider, import_file_id): (
             String,
@@ -474,10 +487,7 @@ impl ContactSyncRunner {
                     EXISTS (SELECT 1 FROM tenant_settings s \
                             WHERE s.tenant_id = c.tenant_id AND s.category = 'integrations' \
                               AND s.value = 'false'::jsonb \
-                              AND ((c.provider = 'google' \
-                                    AND s.key = 'google_contacts_enabled') \
-                                OR (c.provider = 'icloud' \
-                                    AND s.key = 'icloud_contacts_enabled'))), \
+                              AND s.key = c.provider || '_contacts_enabled'), \
                     c.provider, \
                     (SELECT r.import_file_id FROM contact_sync_runs r \
                      WHERE r.tenant_id = c.tenant_id AND r.id = $3) \
