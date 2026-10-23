@@ -14,6 +14,19 @@
 //! The dispatch that READS these mappings in `BillingService::create_invoice`
 //! is Phase 2d; this PR gives operations the surface to populate the
 //! tables so a Phase 2d flip-the-switch run has something to resolve.
+//!
+//! parity record 2026-10-23: these four routes have no SPA caller yet.
+//! They land ahead of the SPA mapping-admin surface MAPPS-1099 Phase 3
+//! wires (MAPPS-1172); on current deployments the whole module answers
+//! 404 behind `Feature::DelegatedInvoiceIssuer` (off), so the server
+//! shipping first does not expose anything a non-opted-in tenant can
+//! see. The MAPPS-1083 recorded-exemption rule matches each path
+//! literally, so every route this module mounts gets its own `//` line:
+//!
+//! - /invoice-issuer-mappings/companies
+//! - /invoice-issuer-mappings/companies/{provider}/{company_id}
+//! - /invoice-issuer-mappings/products
+//! - /invoice-issuer-mappings/products/{provider}/{product_id}
 
 use std::sync::Arc;
 
