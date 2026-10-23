@@ -6,16 +6,31 @@
 //! Phase C (Xero / QuickBooks delegation) is blocked on MAPPS-1099.
 //!
 //! parity record 2026-10-23: every route this module mounts has no
-//! SPA caller yet. The Phase A leaves (`/vendors`, `/vendors/{id}`,
-//! `/expense-categories`, `/expense-categories/{id}`) and the Phase B
-//! headers (`/bills`, `/bills/{id}`, `/bills/{id}/{approve,void}`,
-//! `/expenses`, `/expenses/{id}`, `/expenses/{id}/{submit,approve,reject,reimburse}`)
-//! all land ahead of the SPA half MAPPS-1123 (Bills and Expenses
-//! settings + ledger surfaces) wires up. The server ships first so
-//! the SPA has something concrete to call against; the parity record
-//! covers both phases rather than two separate dated entries so a
-//! Phase C follow-up has one line to update once the SPA callers
-//! merge.
+//! SPA caller yet. They all land ahead of the SPA half MAPPS-1123
+//! (Bills and Expenses settings + ledger surfaces) wires up. The
+//! server ships first so the SPA has something concrete to call
+//! against; one dated record covers both phases so a Phase C
+//! follow-up has one line to update once the SPA callers merge.
+//! The MAPPS-1083 recorded-exemption rule matches each path literally,
+//! so every route the file mounts gets its own `//` line below.
+//!
+//! Phase A leaf lookups:
+//! - /vendors
+//! - /vendors/{id}
+//! - /expense-categories
+//! - /expense-categories/{id}
+//!
+//! Phase B headers and lifecycle transitions:
+//! - /bills
+//! - /bills/{id}
+//! - /bills/{id}/approve
+//! - /bills/{id}/void
+//! - /expenses
+//! - /expenses/{id}
+//! - /expenses/{id}/submit
+//! - /expenses/{id}/approve
+//! - /expenses/{id}/reject
+//! - /expenses/{id}/reimburse
 
 use std::sync::Arc;
 
