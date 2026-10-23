@@ -48,6 +48,14 @@ pub struct BillingService {
     /// built here, so the provider is chosen once at startup by
     /// `secrets::provider_from_env` and no constructor can pick a different one.
     secrets: Arc<dyn crate::secrets::SecretProvider>,
+    /// MAPPS-1099 Phase 2b: the feature-flagged dispatch between the
+    /// local path and the Xero / QuickBooks clients. `None` on every
+    /// test harness, QA seeder and portal-side instance so a build that
+    /// does not opt into the dispatch keeps today's behaviour byte for
+    /// byte; wired on the serving instance by
+    /// [`Self::with_invoice_dispatch`] after `IntegrationsService` is
+    /// built.
+    invoice_dispatch: Option<crate::modules::billing::invoice_issuer::InvoiceDispatchContext>,
 }
 
 /// PMS-990: the due date offset when neither the invoice's term nor the
@@ -83,6 +91,7 @@ impl BillingService {
             mailer: None,
             portal_origin: None,
             secrets,
+            invoice_dispatch: None,
         }
     }
 
@@ -797,6 +806,7 @@ impl BillingService {
             mailer: None,
             portal_origin: None,
             secrets,
+            invoice_dispatch: None,
         }
     }
 
@@ -819,6 +829,101 @@ impl BillingService {
             mailer: Some(mailer),
             portal_origin: Some(portal_origin),
             secrets,
+            invoice_dispatch: None,
+        }
+    }
+
+    /// MAPPS-1099 Phase 2b: enable the feature-flagged dispatch between
+    /// the local invoice path and an external provider (Xero or
+    /// QuickBooks). An instance built without this is byte-identical in
+    /// behaviour to the current code: `create_invoice` runs the local
+    /// path end to end for every tenant, every time. An instance built
+    /// WITH this still runs the local path for every tenant until an
+    /// admin flips `Feature::DelegatedInvoiceIssuer` on, and even then
+    /// only reroutes a tenant whose `integrations` row carries
+    /// `Capability::Invoicing` for Xero or QuickBooks. The flag
+    /// defaults OFF (missing `feature_toggles` row reads as off,
+    /// PMS-1414), so a merge is a no-op on every environment.
+    pub fn with_invoice_dispatch(
+        mut self,
+        features: crate::modules::features::FeatureSnapshot,
+        integrations: Arc<crate::modules::integrations::IntegrationsService>,
+    ) -> Self {
+        self.invoice_dispatch = Some(
+            crate::modules::billing::invoice_issuer::InvoiceDispatchContext {
+                features,
+                integrations,
+            },
+        );
+        self
+    }
+
+    /// MAPPS-1099 Phase 2b: decide the issuer for the next invoice this
+    /// tenant creates, and refuse the call when the delegated path was
+    /// picked (the per-provider credential + mapping tables land in a
+    /// follow-up PR, so we cannot carry out a delegated issue today).
+    ///
+    /// Returns `Ok(())` on three code paths:
+    /// 1. The dispatch was never wired (every test harness, QA seeder,
+    ///    and portal-side instance).
+    /// 2. The dispatch is wired but the feature toggle is OFF (every
+    ///    deployment on merge day, since the toggle defaults OFF).
+    /// 3. The dispatch is wired, the toggle is ON, but neither Xero nor
+    ///    QuickBooks is connected on this tenant with
+    ///    `Capability::Invoicing` enabled.
+    ///
+    /// Returns `Err(AppError::internal(...))` on the one code path a
+    /// tenant has opted into: the toggle is ON and this tenant has
+    /// delegated. The message names the ticket and the gap so an
+    /// operator can see what to turn off (either the toggle or the
+    /// `Invoicing` capability on the integration row) until the
+    /// follow-up PR lands.
+    async fn pick_invoice_issuer(&self, tenant_id: TenantId) -> AppResult<()> {
+        use crate::modules::billing::invoice_issuer::{select_issuer_with, IssuerSelection};
+        use mokosh_types::integrations::{Capability, IntegrationProvider};
+
+        let Some(dispatch) = &self.invoice_dispatch else {
+            return Ok(());
+        };
+        if !dispatch
+            .features
+            .is_enabled(crate::modules::features::Feature::DelegatedInvoiceIssuer)
+        {
+            return Ok(());
+        }
+
+        let invoicing = Capability::Invoicing.as_str().to_string();
+        let xero_delegated = dispatch
+            .integrations
+            .get(tenant_id, IntegrationProvider::Xero)
+            .await?
+            .enabled_capabilities
+            .contains(&invoicing);
+        let quickbooks_delegated = dispatch
+            .integrations
+            .get(tenant_id, IntegrationProvider::Quickbooks)
+            .await?
+            .enabled_capabilities
+            .contains(&invoicing);
+
+        let selection = select_issuer_with(true, || xero_delegated, || quickbooks_delegated);
+        match selection {
+            IssuerSelection::Local => Ok(()),
+            IssuerSelection::Delegated { provider } => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    provider = %provider.as_str(),
+                    "MAPPS-1099: delegated invoice issuing picked but credential + mapping tables \
+                     have not landed; refusing the create so the local path does not silently \
+                     mint the invoice the admin asked the provider to issue"
+                );
+                Err(AppError::internal(format!(
+                    "Delegated invoice issuing to {} is not yet available on this build; \
+                     disable the Invoicing capability on the integration or turn off the \
+                     Delegated invoice issuer feature while MAPPS-1099 Phase 2b-rest lands",
+                    provider.as_str()
+                )))
+            }
         }
     }
 
@@ -985,7 +1090,8 @@ impl BillingService {
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
                    tax_rate_id, tax_rate, amends_invoice_id,
-                   delivery_method, delivery_note, delivered_by_id
+                   delivery_method, delivery_note, delivered_by_id,
+                   external_provider, external_invoice_id, external_number
             FROM invoices
             WHERE {data_where}
             ORDER BY {order_by}
@@ -1045,6 +1151,19 @@ impl BillingService {
         request: &CreateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
+        // MAPPS-1099 Phase 2b: before anything is written, pick the
+        // issuer for this invoice. The dispatch runs only when it was
+        // wired (`with_invoice_dispatch`) AND the toggle is on. The
+        // local branch is the default; a `Delegated` branch is an
+        // explicit refusal for now, because the per-provider credential
+        // + mapping tables (Mokosh company -> Xero `ContactID` /
+        // QuickBooks `CustomerRef`) land in a follow-up PR. The explicit
+        // refusal is safer than silently falling back: an admin who
+        // enabled the toggle AND the integration's Invoicing capability
+        // asked for delegated issuing, and we must not pretend the
+        // local path is what they wanted.
+        self.pick_invoice_issuer(tenant_id).await?;
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // The sequence row is locked by the shared helper, so concurrent
@@ -6123,7 +6242,8 @@ impl BillingService {
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
                    tax_rate_id, tax_rate, amends_invoice_id,
-                   delivery_method, delivery_note, delivered_by_id
+                   delivery_method, delivery_note, delivered_by_id,
+                   external_provider, external_invoice_id, external_number
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -7996,6 +8116,14 @@ struct InvoiceRow {
     delivery_method: Option<String>,
     delivery_note: Option<String>,
     delivered_by_id: Option<Uuid>,
+    /// MAPPS-1099: external-issuer columns from migration 278, NULL on every
+    /// row until the Xero / QuickBooks clients land. The read path carries
+    /// them through to `InvoiceResponse` so the SPA can distinguish a
+    /// Mokosh-issued invoice from one issued by a delegated provider as
+    /// soon as the first delegated row exists.
+    external_provider: Option<String>,
+    external_invoice_id: Option<String>,
+    external_number: Option<String>,
 }
 
 impl From<InvoiceRow> for InvoiceResponse {
@@ -8059,6 +8187,9 @@ impl From<InvoiceRow> for InvoiceResponse {
             delivered_by_id: r.delivered_by_id,
             // Resolved by `enrich_invoices` the way `voided_by_name` is.
             delivered_by_name: None,
+            external_provider: r.external_provider,
+            external_invoice_id: r.external_invoice_id,
+            external_number: r.external_number,
         }
     }
 }

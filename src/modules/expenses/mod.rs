@@ -7,34 +7,37 @@
 //! module is the inbound plane the `Capability::BillsAndExpenses`
 //! registry entry promises but could not deliver until MAPPS-1100.
 //!
-//! # What ships in Phase 0 (this PR)
+//! # What ships in Phase 0
 //!
 //! - Migration 279 creating `vendors`, `expense_categories`, `bills`,
 //!   `bill_lines`, `expenses`, `expense_lines` with tenant isolation and
 //!   `mokosh_app` grants.
 //! - [`models`]: the Rust types that mirror the schema, derivable to and
-//!   from a sqlx row. Service / routes / worker types ride on these.
+//!   from a sqlx row.
 //!
-//! # What does NOT ship in Phase 0
+//! # What ships in Phase A (this PR)
 //!
-//! - **routes.rs**: no HTTP surface mounted. Mounting a `/api/v1/bills`
-//!   route that returns NotImplemented is the "advertises what the build
-//!   cannot deliver" anti-pattern MAPPS-1098 and MAPPS-1102 explicitly
-//!   enforced against. The routes land with the first write path that
-//!   actually serves (Phase A).
-//! - **service.rs**: no CRUD methods yet. The repository shape is a
-//!   Phase A decision made against the first endpoint the SPA calls.
-//! - **worker**: due-date reminders and reimbursement batching are
-//!   Phase B.
-//! - **delegation to Xero / QuickBooks**: Phase C, blocked on MAPPS-1099
-//!   shipping OAuth + webhook infrastructure.
+//! - [`service::ExpensesService`]: the one writer. Vendors and expense
+//!   categories CRUD, admin+finance gated, tenant-isolated through
+//!   `begin_with_tenant`, every mutation writing an `audit_log` row in
+//!   the same transaction as the change.
+//! - [`routes::expenses_routes`]: `/api/v1/vendors` and
+//!   `/api/v1/expense-categories` CRUD, merged into the staff plane.
 //!
-//! The scaffolding here is clearly marked as pre-wiring: no code
-//! constructs these types, no route is mounted, and this module is not
-//! yet referenced from `src/api/router.rs`. The migration + models give
-//! the next phase a schema and a Rust surface to build against without
-//! re-litigating field shapes in the same PR as the first service
-//! method.
+//! Only the leaf lookups land here because they are prerequisites for
+//! the bill/expense headers themselves. Mounting empty `/api/v1/bills`
+//! and `/api/v1/expenses` endpoints that return `NotImplemented` is the
+//! "advertises what the build cannot deliver" anti-pattern MAPPS-1098
+//! and MAPPS-1102 enforce against.
+//!
+//! # What does NOT ship in Phase A
+//!
+//! - **bills / expenses headers**: lands in Phase B with the first
+//!   write path for each.
+//! - **worker**: due-date reminders and reimbursement batching are a
+//!   later phase.
+//! - **delegation to Xero / QuickBooks**: blocked on MAPPS-1099 shipping
+//!   OAuth + webhook infrastructure.
 //!
 //! # Why six tables and not fewer
 //!
@@ -47,3 +50,8 @@
 //! headers; `vendors` and `expense_categories` are shared lookup rows.
 
 pub mod models;
+pub mod routes;
+pub mod service;
+
+pub use routes::expenses_routes;
+pub use service::ExpensesService;

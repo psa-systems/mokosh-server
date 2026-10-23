@@ -181,6 +181,25 @@ pub struct InvoiceResponse {
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
     pub lines: Option<Vec<InvoiceLineResponse>>,
+    /// MAPPS-1099: the external provider (`xero`, `quickbooks`) that issued
+    /// this invoice, when the tenant delegated the Invoicing capability. The
+    /// column is schema-ready (migration 278) but the write path lands with
+    /// the Xero / QuickBooks clients in a later phase of MAPPS-1099; today
+    /// every row carries `None` here and `None` on the two sibling fields,
+    /// which is "Mokosh issued this invoice" and the current behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_provider: Option<String>,
+    /// The external provider's own id for this invoice (Xero's guid,
+    /// QuickBooks's numeric id), used by the webhook receiver to reconcile
+    /// provider events back to the local row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_invoice_id: Option<String>,
+    /// The human-readable number as the external provider rendered it, kept
+    /// because that is what the customer sees and what admins reconcile
+    /// against. `None` for a Mokosh-issued invoice, which prints
+    /// `invoice_number` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_number: Option<String>,
 }
 
 /// MAPPS-984: server-side aggregate for the dashboard "open invoices"

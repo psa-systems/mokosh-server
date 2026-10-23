@@ -729,6 +729,7 @@ mod pms1194_sort_guard {
             "email_intake",
             include_str!("../modules/email_intake/routes.rs"),
         ),
+        ("expenses", include_str!("../modules/expenses/routes.rs")),
         ("features", include_str!("../modules/features/routes.rs")),
         ("forms", include_str!("../modules/forms/routes.rs")),
         (

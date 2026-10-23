@@ -38,6 +38,7 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
+use crate::modules::expenses::{expenses_routes, ExpensesService};
 use crate::modules::forms::{forms_routes, public_form_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::attachments::{
@@ -337,6 +338,10 @@ pub fn create_api_router(
         spa_base_url.clone(),
     );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
+    // MAPPS-1100 Phase A: Bills and Expenses leaf lookups. Vendors +
+    // expense categories only; the bills/expenses headers themselves
+    // land in Phase B.
+    let expenses_service = ExpensesService::new(db.clone());
     // PMS-1129: an @mention in a KB comment notifies through the queue.
     let kb_service = KbService::new(db.clone()).with_notifications(notifications_service.clone());
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
@@ -354,6 +359,16 @@ pub fn create_api_router(
     // deployment on Infisical keeps its integration credentials there too.
     let integrations_service =
         crate::modules::integrations::IntegrationsService::new(db.clone(), secrets.clone());
+    // MAPPS-1099 Phase 2b: wire the feature-flagged invoice-issuer dispatch
+    // onto the serving `BillingService`. The flag defaults OFF
+    // (`Feature::DelegatedInvoiceIssuer`), so this is a no-op on every
+    // environment until an admin flips it; even flipped on, only a tenant
+    // with Xero or QuickBooks connected and the `Invoicing` capability
+    // enabled sees the delegated path (and today that path refuses with a
+    // clear error because the credential + mapping tables are the subject of
+    // the Phase 2b-rest PR).
+    let billing_service = billing_service
+        .with_invoice_dispatch(features.clone(), Arc::new(integrations_service.clone()));
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.clone());
@@ -666,10 +681,26 @@ pub fn create_api_router(
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
         .merge(billing_routes(billing_service, public_api_base_url.clone()))
+        // MAPPS-1099 Phase 2c: admin surfaces that populate the
+        // invoice-issuer mapping tables (Mokosh company -> external
+        // customer, Mokosh product -> external item). Behind the same
+        // `Feature::DelegatedInvoiceIssuer` flag the dispatch reads;
+        // every route answers 404 while the flag is off.
+        .merge(crate::modules::billing::invoice_issuer_mapping_routes::invoice_issuer_mapping_routes(
+            crate::modules::billing::invoice_issuer_mapping_routes::InvoiceIssuerMappingRouterState {
+                service: Arc::new(crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService::new(db.clone())),
+                features: features.clone(),
+            },
+        ))
         // Quotes: the sales document that precedes a Project, plus its
         // line items. Shares the billing module gate + finance role with
         // invoices. PMS-672.
         .merge(quotes_routes(quotes_service))
+        // MAPPS-1100: the inbound-money plane (vendors + expense
+        // categories so far; bills + expenses themselves land next). Same
+        // RequireBilling + RequireFinance gates as the customer-facing
+        // billing plane.
+        .merge(expenses_routes(expenses_service))
         // Assets / CMDB: types, assets, relationships, config items,
         // credential vault, audit log. PMS-72.
         //
