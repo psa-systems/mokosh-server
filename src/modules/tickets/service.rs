@@ -3262,20 +3262,37 @@ fn build_ticket_filter_sql(
         // number, so a search moved server-side without these silently finds
         // less than the same box did in the browser.
         //
-        // Correlated EXISTS rather than joins, for two reasons. This predicate
-        // is shared by the data query and by two count queries whose FROM
-        // clauses differ and carry no company or user join, and an INNER JOIN
-        // to `users` would drop every unassigned ticket from the result -
-        // turning a search into a filter nobody asked for. Both tables are
-        // RLS-covered and this runs inside the tenant transaction.
+        // PMS-1249: the predicate is a `t.id IN (<union of pre-filtered id
+        // sets>)` rather than the four-branch inline OR / EXISTS the SPA
+        // started with. The inline shape made the planner evaluate the whole
+        // OR as a row-by-row `Filter` over every row the tenant bitmap
+        // returned (PMS-1248's EXPLAIN recorded 95k rows filtered on a
+        // 100k-ticket tenant), because a correlated hashed SubPlan cannot
+        // participate in a `BitmapOr` alongside `tickets`' own indexes. The
+        // UNION ALL below lets each branch read its own trigram index
+        // independently (`idx_tickets_title_trgm` 005, `idx_tickets_number_trgm`
+        // 107, `idx_companies_name_trgm` 004, `idx_users_fullname_trgm` 237),
+        // and the planner combines the id sets with a hash aggregate instead
+        // of a per-row filter. The same `${idx}` bind is referenced four
+        // times, which Postgres allows and sqlx happily reuses on one bind
+        // slot. The restructure is shared with the two count queries whose
+        // FROM clauses differ (and carry no company / user join), and does
+        // not drop unassigned tickets the way an INNER JOIN would.
         let text_match = |idx: u32| {
             format!(
-                "(t.title ILIKE ${idx} OR t.ticket_number ILIKE ${idx} \
-                  OR EXISTS (SELECT 1 FROM companies c \
-                             WHERE c.id = t.company_id AND c.name ILIKE ${idx}) \
-                  OR EXISTS (SELECT 1 FROM users u \
-                             WHERE u.id = t.assigned_to_id \
-                               AND (u.first_name || ' ' || u.last_name) ILIKE ${idx}))"
+                "t.id IN ( \
+                   SELECT id FROM tickets WHERE title ILIKE ${idx} \
+                   UNION ALL \
+                   SELECT id FROM tickets WHERE ticket_number ILIKE ${idx} \
+                   UNION ALL \
+                   SELECT id FROM tickets WHERE company_id IN ( \
+                     SELECT id FROM companies WHERE name ILIKE ${idx} \
+                   ) \
+                   UNION ALL \
+                   SELECT id FROM tickets WHERE assigned_to_id IN ( \
+                     SELECT id FROM users WHERE (first_name || ' ' || last_name) ILIKE ${idx} \
+                   ) \
+                 )"
             )
         };
         data_conds.push(text_match(data_idx));
