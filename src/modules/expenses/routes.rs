@@ -3,6 +3,15 @@
 //!
 //! The bills and expenses headers land in a follow-up PR with their
 //! own routes; see [`crate::modules::expenses`] for the staging plan.
+//!
+//! parity record 2026-10-23: `/vendors`, `/vendors/{id}`,
+//! `/expense-categories` and `/expense-categories/{id}` have no SPA
+//! caller yet. These are the Phase A leaf lookups; the SPA half is
+//! MAPPS-1123 (Bills and Expenses settings surfaces), which lands
+//! after the Phase B headers at `/api/v1/bills` and `/api/v1/expenses`
+//! so the admin can configure the lookup rows and then see them used
+//! on the headers. The server half ships first so the SPA has
+//! something concrete to call against.
 
 use std::sync::Arc;
 

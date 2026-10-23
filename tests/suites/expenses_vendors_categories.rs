@@ -125,11 +125,14 @@ async fn mutations_write_an_audit_row_in_the_same_transaction(pool: PgPool) {
         .expect("create");
 
     // Audit row visible without the tenant GUC set, because the audit
-    // query writes with `tenant_id` as a bound column (not an RLS gate).
+    // query writes with `tenant_id` as a bound column (not an RLS gate)
+    // and `audit_log` has no RLS policy. Ordering is `timestamp`, the
+    // column `migrations/015_audit.sql` actually names (`created_at` is
+    // not present on this table).
     let rows: Vec<(String, Option<uuid::Uuid>)> = sqlx::query_as(
         "SELECT action, entity_id FROM audit_log \
          WHERE tenant_id = $1 AND entity_type = 'vendors' AND entity_id = $2 \
-         ORDER BY created_at",
+         ORDER BY timestamp",
     )
     .bind(common::DEFAULT_TENANT_ID)
     .bind(v.id)
