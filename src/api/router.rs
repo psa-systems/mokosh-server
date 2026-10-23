@@ -354,6 +354,16 @@ pub fn create_api_router(
     // deployment on Infisical keeps its integration credentials there too.
     let integrations_service =
         crate::modules::integrations::IntegrationsService::new(db.clone(), secrets.clone());
+    // MAPPS-1099 Phase 2b: wire the feature-flagged invoice-issuer dispatch
+    // onto the serving `BillingService`. The flag defaults OFF
+    // (`Feature::DelegatedInvoiceIssuer`), so this is a no-op on every
+    // environment until an admin flips it; even flipped on, only a tenant
+    // with Xero or QuickBooks connected and the `Invoicing` capability
+    // enabled sees the delegated path (and today that path refuses with a
+    // clear error because the credential + mapping tables are the subject of
+    // the Phase 2b-rest PR).
+    let billing_service = billing_service
+        .with_invoice_dispatch(features.clone(), Arc::new(integrations_service.clone()));
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.clone());
