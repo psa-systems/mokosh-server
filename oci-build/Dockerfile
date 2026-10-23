@@ -79,24 +79,29 @@ COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bins
 
-# Runtime stage
-FROM alpine:3.21
+# Runtime stage. PMS-1513 / GOV-82: starts as root; the shared
+# `gosu-entrypoint.sh` remaps `appuser` to PUID/PGID (or the owner of the
+# first `DATA_DIRS` entry) and drops to it with `gosu`. `gosu` lives in
+# Alpine 3.23's community repo, so the runtime stage pins 3.23 and no later
+# `USER` line resets to a baked uid.
+FROM alpine:3.23
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata gosu shadow
 
-RUN adduser --disabled-password --uid 1001 appuser
+RUN addgroup -g 1001 appuser \
+    && adduser -D -H -u 1001 -G appuser appuser
 
-COPY --from=builder /build/target/release/mokosh-server /app/mokosh-server
-COPY --from=builder /build/target/release/mokosh-bootstrap /app/mokosh-bootstrap
-COPY --from=builder /build/migrations /app/migrations
+COPY --from=builder --chown=appuser:appuser /build/target/release/mokosh-server /app/mokosh-server
+COPY --from=builder --chown=appuser:appuser /build/target/release/mokosh-bootstrap /app/mokosh-bootstrap
+COPY --from=builder --chown=appuser:appuser /build/migrations /app/migrations
 
 # PMS-1007: the Noto Sans faces the PDF renderer draws with are compiled into
 # the binary, so the SIL Open Font License they are distributed under has to
 # travel separately. It is a licence obligation, not a runtime input: nothing
 # reads this file.
-COPY --from=builder /build/src/pdf/fonts/OFL.txt /app/licenses/NotoSans-OFL.txt
+COPY --from=builder --chown=appuser:appuser /build/src/pdf/fonts/OFL.txt /app/licenses/NotoSans-OFL.txt
 
 # PMS-757: the uploads directory has to EXIST in the image, owned by the runtime
 # user, before a deployment mounts a volume over it.
@@ -106,11 +111,17 @@ COPY --from=builder /build/src/pdf/fonts/OFL.txt /app/licenses/NotoSans-OFL.txt
 # root-owned, and this container runs as uid 1001, so every upload would fail
 # the day persistence was added. `ATTACHMENT_DIR` defaults to `./attachments`
 # against WORKDIR /app, so this path is also what a bare `docker run` uses.
-RUN mkdir -p /app/attachments
+RUN mkdir -p /app/attachments \
+    && chown --recursive appuser:appuser /app
 
-RUN chown --recursive appuser:appuser /app
+COPY --chmod=0755 oci-build/gosu-entrypoint.sh /usr/local/bin/gosu-entrypoint.sh
 
-USER appuser
+# PMS-1513: `APP_USER` + `DATA_DIRS` are read by the shared entrypoint.
+# `DATA_DIRS` lists every runtime-writable directory, primary persistent
+# volume first (its owner is the uid the entrypoint adopts when PUID/PGID
+# are unset).
+ENV APP_USER=appuser \
+    DATA_DIRS="/app/attachments"
 
 ARG MOKOSH_GIT_HASH=""
 ARG MOKOSH_GIT_DESCRIBE=""
@@ -123,4 +134,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8080/api/v1/health || exit 1
 
-ENTRYPOINT ["/app/mokosh-server"]
+# PMS-1513 / GOV-82: the container starts as root, `gosu-entrypoint.sh`
+# drops to `appuser` after remapping it to PUID/PGID (or the volume owner),
+# and a compose `user:` pin disables the remap and chown.
+ENTRYPOINT ["/usr/local/bin/gosu-entrypoint.sh", "/app/mokosh-server"]

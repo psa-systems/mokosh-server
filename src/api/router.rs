@@ -38,6 +38,7 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
+use crate::modules::expenses::{expenses_routes, ExpensesService};
 use crate::modules::forms::{forms_routes, public_form_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::attachments::{
@@ -337,6 +338,10 @@ pub fn create_api_router(
         spa_base_url.clone(),
     );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
+    // MAPPS-1100 Phase A: Bills and Expenses leaf lookups. Vendors +
+    // expense categories only; the bills/expenses headers themselves
+    // land in Phase B.
+    let expenses_service = ExpensesService::new(db.clone());
     // PMS-1129: an @mention in a KB comment notifies through the queue.
     let kb_service = KbService::new(db.clone()).with_notifications(notifications_service.clone());
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
@@ -691,6 +696,11 @@ pub fn create_api_router(
         // line items. Shares the billing module gate + finance role with
         // invoices. PMS-672.
         .merge(quotes_routes(quotes_service))
+        // MAPPS-1100: the inbound-money plane (vendors + expense
+        // categories so far; bills + expenses themselves land next). Same
+        // RequireBilling + RequireFinance gates as the customer-facing
+        // billing plane.
+        .merge(expenses_routes(expenses_service))
         // Assets / CMDB: types, assets, relationships, config items,
         // credential vault, audit log. PMS-72.
         //
