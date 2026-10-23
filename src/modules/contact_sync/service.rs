@@ -177,6 +177,11 @@ pub struct ContactSyncOverview {
     /// existing client reads `connection` and a tenant holding both is the point:
     /// two cards, two credentials, two selections, one response.
     pub icloud_connection: Option<ConnectionStatus>,
+    /// This deployment's host has an Entra ID client, the Microsoft half of
+    /// `configured` (MAPPS-1101). Without one nobody on the deployment can
+    /// connect, and the card says so rather than offering a button whose only
+    /// outcome is a 500 an admin cannot act on.
+    pub microsoft_configured: bool,
     /// `integrations/microsoft_contacts_enabled` (PMS-1512), the Microsoft 365
     /// half of `enabled`.
     ///
@@ -1035,6 +1040,7 @@ impl ContactSyncService {
             )
             .await?,
             icloud_connection: self.connection(tenant_id, ICLOUD).await?,
+            microsoft_configured: self.microsoft_oauth_client().is_some(),
             microsoft_enabled: crate::modules::settings::read_microsoft_contacts_enabled(
                 &self.db, tenant_id,
             )
