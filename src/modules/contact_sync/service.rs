@@ -33,10 +33,10 @@ use crate::utils::error::{AppError, AppResult};
 const STATE_TTL_MINUTES: i64 = 10;
 
 /// The provider this phase implements.
-const GOOGLE: &str = "google";
+pub(crate) const GOOGLE: &str = "google";
 /// MAPPS-1101: the Microsoft 365 provider discriminator used throughout the
 /// state table, the connections table, and the dispatch factory.
-const MICROSOFT: &str = "microsoft";
+pub(crate) const MICROSOFT: &str = "microsoft";
 
 #[derive(Clone)]
 pub struct ContactSyncService {
@@ -177,6 +177,21 @@ pub struct ContactSyncOverview {
     /// existing client reads `connection` and a tenant holding both is the point:
     /// two cards, two credentials, two selections, one response.
     pub icloud_connection: Option<ConnectionStatus>,
+    /// This deployment's host has an Entra ID client, the Microsoft half of
+    /// `configured` (MAPPS-1101). Without one nobody on the deployment can
+    /// connect, and the card says so rather than offering a button whose only
+    /// outcome is a 500 an admin cannot act on.
+    pub microsoft_configured: bool,
+    /// `integrations/microsoft_contacts_enabled` (PMS-1512), the Microsoft 365
+    /// half of `enabled`.
+    ///
+    /// MAPPS-1124: MAPPS-1101 shipped the Graph client, the Entra OAuth routes
+    /// and the sync dispatch, and this response never grew the pair that lets a
+    /// Settings page draw any of it. A provider the server can sync and the
+    /// client cannot see is a provider nobody can turn on.
+    pub microsoft_enabled: bool,
+    /// The Microsoft 365 connection, `null` when there is none.
+    pub microsoft_connection: Option<ConnectionStatus>,
 }
 
 /// What one connection looks like to the Settings card.
@@ -1025,6 +1040,12 @@ impl ContactSyncService {
             )
             .await?,
             icloud_connection: self.connection(tenant_id, ICLOUD).await?,
+            microsoft_configured: self.microsoft_oauth_client().is_some(),
+            microsoft_enabled: crate::modules::settings::read_microsoft_contacts_enabled(
+                &self.db, tenant_id,
+            )
+            .await?,
+            microsoft_connection: self.connection(tenant_id, MICROSOFT).await?,
         })
     }
 
@@ -1117,13 +1138,11 @@ impl ContactSyncService {
         // the one the caller is actually using. Reading Google's flag for an
         // iCloud request would have made one integration turn the other off;
         // PMS-1512 gives Microsoft the same treatment.
-        let on = if provider == ICLOUD {
-            crate::modules::settings::read_icloud_contacts_enabled(&self.db, tenant_id).await?
-        } else if provider == MICROSOFT {
-            crate::modules::settings::read_microsoft_contacts_enabled(&self.db, tenant_id).await?
-        } else {
-            crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
-        };
+        //
+        // PMS-1524 moved the selection to `switch::contacts_enabled`, because
+        // the same three-way choice is made again before a queued run executes
+        // and that copy had not been given Microsoft's key.
+        let on = super::switch::contacts_enabled(&self.db, tenant_id, provider).await?;
         if on {
             Ok(())
         } else {
