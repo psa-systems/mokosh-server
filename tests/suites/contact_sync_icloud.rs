@@ -388,3 +388,57 @@ async fn the_icloud_switch_is_the_one_that_stops_an_icloud_connect(pool: PgPool)
         .to_string();
     assert!(refused.contains("iCloud Contacts"), "{refused}");
 }
+
+/// MAPPS-1124: the overview carries the Microsoft 365 pair too.
+///
+/// MAPPS-1101 shipped the Graph client, the Entra OAuth routes and the sync
+/// dispatch, and this response never grew the two fields a Settings page needs
+/// to draw any of it. A provider the server can sync and the client cannot see
+/// is a provider nobody can turn on, which is why the SPA had no page for it.
+///
+/// Asserted alongside the other two rather than alone: what the response has to
+/// get right is that three connections coexist and each card reads its own.
+#[mokosh_test]
+async fn the_overview_carries_a_microsoft_connection_beside_the_other_two(pool: PgPool) {
+    let f = Fixture::new(pool, discovery()).await;
+
+    let before = f
+        .service
+        .overview(f.tenant)
+        .await
+        .expect("an overview before anything is connected");
+    assert!(
+        before.microsoft_connection.is_none(),
+        "nothing is connected yet"
+    );
+
+    f.service
+        .record_connection(
+            f.tenant,
+            f.admin,
+            "microsoft",
+            "ops@msp.onmicrosoft.example",
+            "refresh-token",
+        )
+        .await
+        .expect("a Microsoft connection");
+    f.service
+        .record_connection(f.tenant, f.admin, "google", "ops@msp.example", "grant")
+        .await
+        .expect("a Google connection");
+
+    let overview = f.service.overview(f.tenant).await.expect("the overview");
+    let microsoft = overview
+        .microsoft_connection
+        .expect("the Microsoft 365 card");
+    assert_eq!(microsoft.provider, "microsoft");
+    assert_eq!(microsoft.account_email, "ops@msp.onmicrosoft.example");
+    assert_eq!(
+        overview
+            .connection
+            .expect("the Google card still reads its own")
+            .account_email,
+        "ops@msp.example",
+        "one provider's connection must never be served as another's"
+    );
+}
