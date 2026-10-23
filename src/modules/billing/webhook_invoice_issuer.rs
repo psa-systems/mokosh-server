@@ -318,16 +318,24 @@ pub async fn invoice_issuer_webhook_handler(
     let scoped = TenantId::from_trusted(tenant_id);
     let provider = state.provider;
 
-    // No stored key is a 401 and no row: this endpoint is unauthenticated
-    // by construction, so recording before a connection is known to exist
-    // would let anyone who learns the URL write history into any tenant id
-    // they can name. That is `provider_webhook_handler`'s rule and the
-    // reasoning carries over unchanged.
-    let key = match state.dispatcher.webhook_key(scoped, provider).await {
-        Ok(Some(key)) if !key.trim().is_empty() => key,
-        Ok(_) => return Err(AppError::Unauthorized),
-        Err(_) => return Err(AppError::Unauthorized),
+    // MAPPS-1139: the key belongs to the deployment, because the webhook
+    // subscription belongs to the application and the application is the
+    // deployment's. A host that connects and issues but never subscribed has
+    // none, and every delivery is refused: a deployment that cannot verify
+    // what it is being told must not act on it.
+    //
+    // No key is a 401 and no row. This endpoint is unauthenticated by
+    // construction, so recording before anything is verified would let
+    // anyone who learns the URL write history into any tenant id they can
+    // name. That is `provider_webhook_handler`'s rule and it carries over.
+    let Some(key) = state
+        .dispatcher
+        .webhook_key(provider)
+        .filter(|k| !k.trim().is_empty())
+    else {
+        return Err(AppError::Unauthorized);
     };
+    let key = key.to_string();
 
     let Some(signature) = signature_header(provider, &headers) else {
         record(

@@ -657,6 +657,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // MAPPS-1139: the deployment's Xero and Intuit applications, resolved
+    // here for the same reason the Google pair is. A host holding one half of
+    // a pair is a boot error naming the missing key, raised where an operator
+    // is present to read it rather than at a customer's first click.
+    let issuer_apps = std::sync::Arc::new(match mokosh_server::app_secrets::current() {
+        Some(secrets) => {
+            mokosh_server::modules::billing::invoice_issuer_app::IssuerApps::from_app_secrets(
+                secrets.as_ref(),
+            )?
+        }
+        None => Default::default(),
+    });
+
     // PMS-1444: ONE handle, shared by the router's service, the worker's
     // service and the settings write path. A deployment operator setting the
     // pair from Settings swaps this, so the next Connect and the next token
@@ -1253,6 +1266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         google_client,
         microsoft_client,
         app_secrets,
+        issuer_apps,
         features,
     );
     let router = psa_router;

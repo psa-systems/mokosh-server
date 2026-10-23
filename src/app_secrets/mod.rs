@@ -87,16 +87,47 @@ pub enum GovernedSecret {
     MicrosoftContactsClientId,
     /// The host's Microsoft 365 OAuth client secret (MAPPS-1101).
     MicrosoftContactsClientSecret,
+    /// The host's Xero OAuth client id (MAPPS-1139). Same posture as the
+    /// Google and Microsoft pairs, for PMS-1430's reasons: a tenant-owned
+    /// app costs the tenant a developer-console walkthrough before they can
+    /// issue one invoice, and an app left unverified is capped and warned
+    /// about. The deployment registers one verified application and the MSP
+    /// presses Connect.
+    XeroClientId,
+    /// The host's Xero OAuth client secret (MAPPS-1139).
+    XeroClientSecret,
+    /// The key Xero signs webhook deliveries with (MAPPS-1139).
+    ///
+    /// Deployment-wide because the webhook subscription belongs to the
+    /// application, and the application is the deployment's. One
+    /// subscription, one key, one URL; the delivery names the Xero
+    /// organisation and `integrations.external_organisation_id` says whose
+    /// it is.
+    XeroWebhookKey,
+    /// The host's QuickBooks Online OAuth client id (MAPPS-1139).
+    QuickbooksClientId,
+    /// The host's QuickBooks Online OAuth client secret (MAPPS-1139).
+    QuickbooksClientSecret,
+    /// Intuit's verifier token, the key it signs webhook deliveries with
+    /// (MAPPS-1139). Same posture as [`Self::XeroWebhookKey`]; Intuit just
+    /// calls it something else.
+    QuickbooksVerifierToken,
 }
 
 impl GovernedSecret {
     /// Every governed secret, in report order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 11] = [
         Self::SmtpPassword,
         Self::GoogleContactsClientId,
         Self::GoogleContactsClientSecret,
         Self::MicrosoftContactsClientId,
         Self::MicrosoftContactsClientSecret,
+        Self::XeroClientId,
+        Self::XeroClientSecret,
+        Self::XeroWebhookKey,
+        Self::QuickbooksClientId,
+        Self::QuickbooksClientSecret,
+        Self::QuickbooksVerifierToken,
     ];
 
     /// The env-style key: the plain variable name the operator writes, and
@@ -108,6 +139,12 @@ impl GovernedSecret {
             Self::GoogleContactsClientSecret => "GOOGLE_CONTACTS_CLIENT_SECRET",
             Self::MicrosoftContactsClientId => "MICROSOFT_CONTACTS_CLIENT_ID",
             Self::MicrosoftContactsClientSecret => "MICROSOFT_CONTACTS_CLIENT_SECRET",
+            Self::XeroClientId => "XERO_CLIENT_ID",
+            Self::XeroClientSecret => "XERO_CLIENT_SECRET",
+            Self::XeroWebhookKey => "XERO_WEBHOOK_KEY",
+            Self::QuickbooksClientId => "QUICKBOOKS_CLIENT_ID",
+            Self::QuickbooksClientSecret => "QUICKBOOKS_CLIENT_SECRET",
+            Self::QuickbooksVerifierToken => "QUICKBOOKS_VERIFIER_TOKEN",
         }
     }
 
@@ -154,6 +191,18 @@ impl GovernedSecret {
             Self::MicrosoftContactsClientId | Self::MicrosoftContactsClientSecret => {
                 "Microsoft 365 Contacts import is off, so no tenant on this deployment can connect a Microsoft account"
             }
+            Self::XeroClientId | Self::XeroClientSecret => {
+                "delegated invoice issuing through Xero is off, so no tenant on this deployment can connect a Xero organisation"
+            }
+            Self::XeroWebhookKey => {
+                "Xero webhook deliveries cannot be verified, so an invoice Xero marks paid stays outstanding in Mokosh until somebody records it by hand"
+            }
+            Self::QuickbooksClientId | Self::QuickbooksClientSecret => {
+                "delegated invoice issuing through QuickBooks is off, so no tenant on this deployment can connect a QuickBooks company"
+            }
+            Self::QuickbooksVerifierToken => {
+                "QuickBooks webhook deliveries cannot be verified, so an invoice QuickBooks marks paid stays outstanding in Mokosh until somebody records it by hand"
+            }
         }
     }
 
@@ -168,6 +217,12 @@ impl GovernedSecret {
             Self::GoogleContactsClientSecret => "google_contacts_client_secret",
             Self::MicrosoftContactsClientId => "microsoft_contacts_client_id",
             Self::MicrosoftContactsClientSecret => "microsoft_contacts_client_secret",
+            Self::XeroClientId => "xero_client_id",
+            Self::XeroClientSecret => "xero_client_secret",
+            Self::XeroWebhookKey => "xero_webhook_key",
+            Self::QuickbooksClientId => "quickbooks_client_id",
+            Self::QuickbooksClientSecret => "quickbooks_client_secret",
+            Self::QuickbooksVerifierToken => "quickbooks_verifier_token",
         }
     }
 }
