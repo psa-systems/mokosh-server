@@ -15,6 +15,10 @@
 //! anti-pattern MAPPS-1098 and MAPPS-1102 enforce against. The client
 //! lands first; the dispatch and the handler wiring follow in Phase 2.
 
+pub mod quickbooks;
 pub mod xero;
 
+pub use quickbooks::{
+    QuickBooksClient, QuickBooksCredentials, QuickBooksInvoiceStatus, QuickBooksIssueInvoiceRequest,
+};
 pub use xero::{XeroClient, XeroCredentials, XeroInvoiceStatus, XeroIssueInvoiceRequest};
