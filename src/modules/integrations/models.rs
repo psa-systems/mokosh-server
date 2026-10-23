@@ -97,6 +97,20 @@ pub struct IntegrationResponse {
     /// nowhere to send an operator yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup: Option<SetupSurfaceResponse>,
+    /// Whether this provider's lifecycle can be CHANGED through this surface
+    /// (MAPPS-1129).
+    ///
+    /// `false` means the four per-provider routes answer 404 for it and the
+    /// panel's job here is to say what it is connected to and link to the
+    /// surface in `setup`. Served rather than derived, for the reason
+    /// `available` and `credential_elsewhere` are (PMS-1447): a client cannot
+    /// work it out from a provider name, and the one that tried rendered
+    /// capability checkboxes, Connect and Disconnect on Stripe and PayPal,
+    /// whose every call `parse_provider` refuses.
+    ///
+    /// It is the same predicate that route refuses on, so the two cannot drift
+    /// into a surface that offers a control the server will not take.
+    pub configurable_here: bool,
     /// Whether this build has anything behind the provider (MAPPS-1121).
     /// `false` means the entry exists so its capabilities can be named, and
     /// connect and capability changes are refused: a client renders it as not
@@ -187,6 +201,7 @@ impl IntegrationResponse {
             enabled_capabilities: Vec::new(),
             status: IntegrationStatus::NotConnected,
             setup: descriptor.setup_surface().map(SetupSurfaceResponse::from),
+            configurable_here: descriptor.is_writable_on_integrations_page(),
             available: descriptor.build.is_built(),
             managed_elsewhere: match descriptor.connection_home {
                 ConnectionHome::Integrations => None,
