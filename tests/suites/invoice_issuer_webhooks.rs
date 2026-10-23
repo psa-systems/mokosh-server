@@ -29,6 +29,7 @@ use chrono::{Duration, NaiveDate, Utc};
 use hmac::{Hmac, Mac};
 use mokosh_server::db::Database;
 use mokosh_server::modules::billing::invoice_issuer::InvoiceProviderKind;
+use mokosh_server::modules::billing::invoice_issuer_app::{IssuerApp, IssuerApps};
 use mokosh_server::modules::billing::invoice_issuer_credentials::{
     serialize_blob, IntegrationCredentialBlob, QuickbooksBlob, XeroBlob,
 };
@@ -118,6 +119,15 @@ async fn receiver(
     base: &str,
     provider: InvoiceProviderKind,
 ) -> (axum::Router, Arc<dyn SecretProvider>, Database) {
+    receiver_with_apps(pool, base, provider, fixture_apps(Some(SIGNING_KEY))).await
+}
+
+async fn receiver_with_apps(
+    pool: &PgPool,
+    base: &str,
+    provider: InvoiceProviderKind,
+    apps: IssuerApps,
+) -> (axum::Router, Arc<dyn SecretProvider>, Database) {
     let app_pool = common::build_app_role_pool(pool).await;
     let db = Database::from_pools(app_pool, pool.clone());
     let secrets: Arc<dyn SecretProvider> =
@@ -130,6 +140,7 @@ async fn receiver(
         Arc::new(IntegrationsService::new(db.clone(), secrets.clone())),
         Arc::new(InvoiceIssuerMappingService::new(db.clone())),
         secrets.clone(),
+        Arc::new(apps),
         Arc::new(
             XeroClient::new()
                 .with_api_base(base)
@@ -186,30 +197,20 @@ async fn deliver(
     StatusCode::from_u16(response.status().as_u16()).expect("status")
 }
 
-async fn seed_blob(
-    secrets: &Arc<dyn SecretProvider>,
-    provider: InvoiceProviderKind,
-    key: Option<&str>,
-) {
+async fn seed_blob(secrets: &Arc<dyn SecretProvider>, provider: InvoiceProviderKind) {
     let blob = match provider {
         InvoiceProviderKind::Xero => IntegrationCredentialBlob::Xero(XeroBlob {
-            client_id: "fixture-id".to_string(),
-            client_secret: "fixture-only-not-a-credential".to_string(),
             refresh_token: "fixture-rotating-value".to_string(),
             access_token: "fixture-bearer".to_string(),
             access_token_expires_at: Utc::now() + Duration::minutes(55),
             tenant_id: "xero-org-1".to_string(),
-            webhook_signing_key: key.map(str::to_string),
         }),
         InvoiceProviderKind::Quickbooks => IntegrationCredentialBlob::Quickbooks(QuickbooksBlob {
-            client_id: "fixture-id".to_string(),
-            client_secret: "fixture-only-not-a-credential".to_string(),
             refresh_token: "fixture-rotating-value".to_string(),
             access_token: "fixture-bearer".to_string(),
             access_token_expires_at: Utc::now() + Duration::minutes(55),
             realm_id: "4620816365".to_string(),
             refresh_token_expires_at: Some(Utc::now() + Duration::days(90)),
-            verifier_token: key.map(str::to_string),
         }),
     };
     secrets
@@ -219,6 +220,25 @@ async fn seed_blob(
         )
         .await
         .expect("seed the blob");
+}
+
+/// The deployment's applications, as a fixture supplies them.
+///
+/// MAPPS-1139: the client id and secret are the HOST's, read from governed
+/// application-tier secrets at boot, so a test supplies them here rather
+/// than writing them into a tenant's blob.
+fn fixture_apps(webhook_key: Option<&str>) -> IssuerApps {
+    let app = || {
+        Some(IssuerApp {
+            client_id: "fixture-app".to_string(),
+            client_secret: "fixture-only-not-a-credential".to_string(),
+            webhook_key: webhook_key.map(str::to_string),
+        })
+    };
+    IssuerApps {
+        xero: app(),
+        quickbooks: app(),
+    }
 }
 
 /// A delegated invoice, in the state MAPPS-1135 creates it: `sent`, with
@@ -308,7 +328,7 @@ async fn a_paid_event_records_what_the_provider_collected(pool: PgPool) {
     common::seed_admin(&pool).await;
     let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
-    seed_blob(&secrets, InvoiceProviderKind::Xero, Some(SIGNING_KEY)).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
     *script.xero_status.lock().unwrap() = "PAID".to_string();
 
     let status = deliver(
@@ -364,7 +384,7 @@ async fn quickbooks_reports_a_payment_the_same_way(pool: PgPool) {
     common::seed_admin(&pool).await;
     let invoice_id = seed_delegated_invoice(&pool, "quickbooks", QBO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Quickbooks).await;
-    seed_blob(&secrets, InvoiceProviderKind::Quickbooks, Some(SIGNING_KEY)).await;
+    seed_blob(&secrets, InvoiceProviderKind::Quickbooks).await;
     // QBO reports payment as a zero balance, not as a status string.
     *script.qbo_balance.lock().unwrap() = 0.0;
 
@@ -394,7 +414,7 @@ async fn a_voided_event_voids_the_local_mirror(pool: PgPool) {
     common::seed_admin(&pool).await;
     let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
-    seed_blob(&secrets, InvoiceProviderKind::Xero, Some(SIGNING_KEY)).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
     *script.xero_status.lock().unwrap() = "VOIDED".to_string();
 
     let status = deliver(
@@ -429,7 +449,7 @@ async fn an_unverified_delivery_changes_nothing(pool: PgPool) {
     common::seed_admin(&pool).await;
     let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
-    seed_blob(&secrets, InvoiceProviderKind::Xero, Some(SIGNING_KEY)).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
     *script.xero_status.lock().unwrap() = "PAID".to_string();
 
     let status = deliver(
@@ -457,15 +477,23 @@ async fn an_unverified_delivery_changes_nothing(pool: PgPool) {
     );
 }
 
-/// A tenant with no stored key refuses every delivery and records
-/// nothing, because this route is unauthenticated by construction.
+/// A deployment that never subscribed to webhooks refuses every delivery
+/// and records nothing.
+///
+/// MAPPS-1139 moved the key from the tenant's blob to the deployment's
+/// application, because the webhook subscription belongs to the
+/// application. So this is a host with no key rather than a tenant with
+/// none, and the answer is the same: a deployment that cannot verify what
+/// it is being told must not act on it, and must not write a row either,
+/// since this route is unauthenticated by construction.
 #[mokosh_test]
-async fn a_connection_without_a_key_refuses_and_records_nothing(pool: PgPool) {
+async fn a_deployment_without_a_webhook_key_refuses_and_records_nothing(pool: PgPool) {
     let (_script, base) = start_stub().await;
     common::seed_admin(&pool).await;
     seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
-    let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
-    seed_blob(&secrets, InvoiceProviderKind::Xero, None).await;
+    let (router, secrets, _db) =
+        receiver_with_apps(&pool, &base, InvoiceProviderKind::Xero, fixture_apps(None)).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
 
     let status = deliver(
         &router,
@@ -491,7 +519,7 @@ async fn a_delivery_for_an_unknown_invoice_is_ignored_not_retried(pool: PgPool) 
     common::seed_admin(&pool).await;
     seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
-    seed_blob(&secrets, InvoiceProviderKind::Xero, Some(SIGNING_KEY)).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
 
     let status = deliver(
         &router,
@@ -519,7 +547,7 @@ async fn the_intent_to_receive_call_is_answered(pool: PgPool) {
     let (_script, base) = start_stub().await;
     common::seed_admin(&pool).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
-    seed_blob(&secrets, InvoiceProviderKind::Xero, Some(SIGNING_KEY)).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
 
     let status = deliver(
         &router,
@@ -542,7 +570,7 @@ async fn an_open_invoice_is_left_as_it_is(pool: PgPool) {
     common::seed_admin(&pool).await;
     let invoice_id = seed_delegated_invoice(&pool, "xero", XERO_INVOICE_ID).await;
     let (router, secrets, _db) = receiver(&pool, &base, InvoiceProviderKind::Xero).await;
-    seed_blob(&secrets, InvoiceProviderKind::Xero, Some(SIGNING_KEY)).await;
+    seed_blob(&secrets, InvoiceProviderKind::Xero).await;
     *script.xero_status.lock().unwrap() = "AUTHORISED".to_string();
 
     let status = deliver(

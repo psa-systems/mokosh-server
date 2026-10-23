@@ -154,6 +154,11 @@ pub fn create_api_router(
     // against a database of its own, and the provider it would find is
     // whichever one initialised the global first.
     app_secrets: Arc<crate::app_secrets::AppSecrets>,
+    // MAPPS-1139: the deployment's Xero and Intuit applications, resolved in
+    // `main` so a half-configured pair fails the boot rather than a customer's
+    // first click. Empty is a deployment that has neither, which refuses at
+    // the point a tenant tries to use one.
+    issuer_apps: Arc<crate::modules::billing::invoice_issuer_app::IssuerApps>,
     // PMS-1414: the process's feature-toggle snapshot. Passed rather than built
     // here so `main` can hand the SAME handle to the refresh job: a router with
     // its own copy would never see a flip made by the interval tick.
@@ -381,6 +386,13 @@ pub fn create_api_router(
                 ),
             ),
             secrets.clone(),
+            // MAPPS-1139: the deployment's own Xero and Intuit applications,
+            // read through the application-tier secret seam exactly as the
+            // Google and Microsoft 365 clients are. A deployment with neither
+            // configured still builds the dispatcher; it refuses at the point
+            // a tenant tries to use one, naming the deployment rather than
+            // failing somewhere inside a provider call.
+            issuer_apps.clone(),
             Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
             Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
         ),

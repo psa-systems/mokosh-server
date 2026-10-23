@@ -31,9 +31,10 @@ use crate::modules::auth::TenantId;
 use crate::modules::billing::invoice_issuer::{
     select_issuer_with, ExternalInvoiceRef, InvoiceProviderKind, IssuerSelection,
 };
+use crate::modules::billing::invoice_issuer_app::{IssuerApp, IssuerApps};
 use crate::modules::billing::invoice_issuer_credentials::{
-    apply_quickbooks_refresh, apply_xero_refresh, parse_blob, serialize_blob,
-    IntegrationCredentialBlob,
+    apply_quickbooks_refresh, apply_xero_refresh, parse_blob, quickbooks_credentials,
+    serialize_blob, xero_credentials, IntegrationCredentialBlob,
 };
 use crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService;
 use crate::modules::billing::models::CreateInvoiceLineRequest;
@@ -79,6 +80,10 @@ pub struct IssuerDispatcher {
     integrations: Arc<IntegrationsService>,
     mappings: Arc<InvoiceIssuerMappingService>,
     secrets: Arc<dyn SecretProvider>,
+    /// The deployment's own applications (MAPPS-1139). Resolved once at
+    /// boot, held here because every call needs the host half of the
+    /// credentials and a tenant holds only its tokens.
+    apps: Arc<IssuerApps>,
     xero: Arc<XeroClient>,
     quickbooks: Arc<QuickBooksClient>,
 }
@@ -89,6 +94,7 @@ impl IssuerDispatcher {
         integrations: Arc<IntegrationsService>,
         mappings: Arc<InvoiceIssuerMappingService>,
         secrets: Arc<dyn SecretProvider>,
+        apps: Arc<IssuerApps>,
         xero: Arc<XeroClient>,
         quickbooks: Arc<QuickBooksClient>,
     ) -> Self {
@@ -97,6 +103,7 @@ impl IssuerDispatcher {
             integrations,
             mappings,
             secrets,
+            apps,
             xero,
             quickbooks,
         }
@@ -192,7 +199,8 @@ impl IssuerDispatcher {
         let IntegrationCredentialBlob::Xero(xero_blob) = &blob else {
             return Err(AppError::Unauthorized);
         };
-        let credentials = xero_blob.into();
+        let credentials =
+            xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, xero_blob);
 
         let company_mapping = self
             .mappings
@@ -255,7 +263,10 @@ impl IssuerDispatcher {
         let IntegrationCredentialBlob::Quickbooks(qbo_blob) = &blob else {
             return Err(AppError::Unauthorized);
         };
-        let credentials = qbo_blob.into();
+        let credentials = quickbooks_credentials(
+            self.apps.require(InvoiceProviderKind::Quickbooks)?,
+            qbo_blob,
+        );
 
         let company_mapping = self
             .mappings
@@ -330,17 +341,17 @@ impl IssuerDispatcher {
     /// Read without refreshing anything: verifying a signature does not
     /// touch the provider, and a delivery that arrives while the access
     /// token happens to be stale must still be verifiable.
-    pub async fn webhook_key(
-        &self,
-        tenant_id: TenantId,
-        provider: InvoiceProviderKind,
-    ) -> AppResult<Option<String>> {
-        let key = SecretKey::integration(*tenant_id, provider.as_str());
-        let stored = self.secrets.get(&key).await?;
-        Ok(match parse_blob(stored.as_deref(), provider)? {
-            IntegrationCredentialBlob::Xero(x) => x.webhook_signing_key,
-            IntegrationCredentialBlob::Quickbooks(q) => q.verifier_token,
-        })
+    pub fn webhook_key(&self, provider: InvoiceProviderKind) -> Option<&str> {
+        self.apps
+            .get(provider)
+            .and_then(|app| app.webhook_key.as_deref())
+    }
+
+    /// The deployment's application for this provider, for a caller that
+    /// needs its client id (the authorize redirect) or has to refuse
+    /// because there is none.
+    pub fn app(&self, provider: InvoiceProviderKind) -> AppResult<&IssuerApp> {
+        self.apps.require(provider)
     }
 
     /// What the provider says this invoice's state is now (MAPPS-1136).
@@ -360,9 +371,10 @@ impl IssuerDispatcher {
         let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
         match &blob {
             IntegrationCredentialBlob::Xero(x) => {
+                let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
                 let status = self
                     .xero
-                    .fetch_invoice_status(&x.into(), external_invoice_id)
+                    .fetch_invoice_status(&creds, external_invoice_id)
                     .await?;
                 Ok(match status {
                     crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Paid => {
@@ -376,9 +388,11 @@ impl IssuerDispatcher {
                 })
             }
             IntegrationCredentialBlob::Quickbooks(q) => {
+                let creds =
+                    quickbooks_credentials(self.apps.require(InvoiceProviderKind::Quickbooks)?, q);
                 let status = self
                     .quickbooks
-                    .fetch_invoice_status(&q.into(), external_invoice_id)
+                    .fetch_invoice_status(&creds, external_invoice_id)
                     .await?;
                 Ok(match status {
                     crate::modules::billing::provider_invoice::quickbooks::QuickBooksInvoiceStatus::Paid => {
@@ -409,7 +423,8 @@ impl IssuerDispatcher {
                     x.access_token_expires_at,
                     now,
                 ) {
-                    let creds = (&*x).into();
+                    let creds =
+                        xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, &*x);
                     let response = self.xero.refresh_access_token(&creds).await?;
                     apply_xero_refresh(x, &response, now);
                     true
@@ -422,7 +437,10 @@ impl IssuerDispatcher {
                     q.access_token_expires_at,
                     now,
                 ) {
-                    let creds = (&*q).into();
+                    let creds = quickbooks_credentials(
+                        self.apps.require(InvoiceProviderKind::Quickbooks)?,
+                        &*q,
+                    );
                     let response = self.quickbooks.refresh_access_token(&creds).await?;
                     apply_quickbooks_refresh(q, &response, now);
                     true

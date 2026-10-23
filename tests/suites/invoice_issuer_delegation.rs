@@ -151,6 +151,7 @@ async fn service_with_dispatch(
         Arc::new(IntegrationsService::new(db.clone(), secrets.clone())),
         Arc::new(InvoiceIssuerMappingService::new(db.clone())),
         secrets.clone(),
+        Arc::new(fixture_apps()),
         Arc::new(
             XeroClient::new()
                 .with_api_base(base)
@@ -164,6 +165,28 @@ async fn service_with_dispatch(
     );
     let billing = BillingService::new(db.clone()).with_invoice_dispatch(Arc::new(dispatcher));
     (billing, db, secrets)
+}
+
+/// The deployment's applications, as a fixture supplies them.
+///
+/// MAPPS-1139: the client id and secret are the HOST's, read from governed
+/// application-tier secrets at boot, so a test supplies them here rather
+/// than writing them into a tenant's blob.
+fn fixture_apps() -> mokosh_server::modules::billing::invoice_issuer_app::IssuerApps {
+    use mokosh_server::modules::billing::invoice_issuer_app::{IssuerApp, IssuerApps};
+    let app = || {
+        Some(IssuerApp {
+            client_id: "fixture-app".to_string(),
+            client_secret: "fixture-only-not-a-credential".to_string(),
+            // No webhook subscription in these cases; the receivers' own
+            // suite is where that key earns its keep.
+            webhook_key: None,
+        })
+    };
+    IssuerApps {
+        xero: app(),
+        quickbooks: app(),
+    }
 }
 
 /// Delegate `Invoicing` for one provider on this tenant, the way the
@@ -197,15 +220,12 @@ async fn delegate(pool: &PgPool, tenant_id: Uuid, provider: &str) {
 /// case that wants the refresh asks for it by passing a small value.
 async fn seed_xero_blob(secrets: &Arc<dyn SecretProvider>, tenant_id: Uuid, expires_in_mins: i64) {
     let blob = IntegrationCredentialBlob::Xero(XeroBlob {
-        client_id: "fixture-id".to_string(),
-        client_secret: "fixture-only-not-a-credential".to_string(),
         refresh_token: "fixture-rotating-value".to_string(),
         access_token: "fixture-bearer".to_string(),
         access_token_expires_at: Utc::now() + Duration::minutes(expires_in_mins),
         tenant_id: "xero-org-1".to_string(),
         // No webhook subscription in these cases; MAPPS-1136's suite is
         // where that key earns its keep.
-        webhook_signing_key: None,
     });
     secrets
         .put(
@@ -218,14 +238,11 @@ async fn seed_xero_blob(secrets: &Arc<dyn SecretProvider>, tenant_id: Uuid, expi
 
 async fn seed_quickbooks_blob(secrets: &Arc<dyn SecretProvider>, tenant_id: Uuid) {
     let blob = IntegrationCredentialBlob::Quickbooks(QuickbooksBlob {
-        client_id: "fixture-id".to_string(),
-        client_secret: "fixture-only-not-a-credential".to_string(),
         refresh_token: "fixture-rotating-value".to_string(),
         access_token: "fixture-bearer".to_string(),
         access_token_expires_at: Utc::now() + Duration::minutes(55),
         realm_id: "4620816365".to_string(),
         refresh_token_expires_at: Some(Utc::now() + Duration::days(90)),
-        verifier_token: None,
     });
     secrets
         .put(

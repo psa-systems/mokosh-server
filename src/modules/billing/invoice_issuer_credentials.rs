@@ -31,6 +31,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::modules::billing::invoice_issuer::InvoiceProviderKind;
+use crate::modules::billing::invoice_issuer_app::IssuerApp;
 use crate::modules::billing::provider_invoice::{
     QuickBooksCredentials, QuickBooksTokenResponse, XeroCredentials, XeroTokenResponse,
 };
@@ -57,26 +58,10 @@ pub enum IntegrationCredentialBlob {
 /// does not drift as the server sits idle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XeroBlob {
-    pub client_id: String,
-    pub client_secret: String,
     pub refresh_token: String,
     pub access_token: String,
     pub access_token_expires_at: DateTime<Utc>,
     pub tenant_id: String,
-    /// The key Xero signs webhook deliveries with (MAPPS-1136).
-    ///
-    /// Optional, and defaulted, for two reasons. A blob written before this
-    /// field existed still parses, and a tenant who connected without
-    /// subscribing to webhooks has nothing to put here: the receiver then
-    /// refuses every delivery for them, which is the right answer for a
-    /// deployment that cannot verify what it is being told.
-    ///
-    /// It lives beside the credential rather than in configuration because
-    /// `client_id` and `client_secret` already do: this build's model is
-    /// that each MSP registers their own Xero app, so the webhook key is
-    /// theirs too.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub webhook_signing_key: Option<String>,
 }
 
 /// QuickBooks's stored OAuth state. QBO rotates the refresh token's
@@ -85,44 +70,41 @@ pub struct XeroBlob {
 /// access-token expiry and the refresh-token expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuickbooksBlob {
-    pub client_id: String,
-    pub client_secret: String,
     pub refresh_token: String,
     pub access_token: String,
     pub access_token_expires_at: DateTime<Utc>,
     pub realm_id: String,
     pub refresh_token_expires_at: Option<DateTime<Utc>>,
-    /// Intuit's verifier token, the key it signs webhook deliveries with
-    /// (MAPPS-1136). Same shape and same reasoning as Xero's
-    /// [`XeroBlob::webhook_signing_key`]; Intuit just calls it something
-    /// else, and the receiver reads the header it comes in under.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verifier_token: Option<String>,
 }
 
-impl From<&XeroBlob> for XeroCredentials {
-    fn from(b: &XeroBlob) -> Self {
-        XeroCredentials {
-            client_id: b.client_id.clone(),
-            client_secret: b.client_secret.clone(),
-            refresh_token: b.refresh_token.clone(),
-            access_token: b.access_token.clone(),
-            access_token_expires_at: b.access_token_expires_at,
-            tenant_id: b.tenant_id.clone(),
-        }
+/// The credentials a client call takes: the deployment's application plus
+/// this tenant's tokens (MAPPS-1139).
+///
+/// A free function rather than a `From`, because there are two inputs and
+/// they come from two tiers. The host half is a governed application-tier
+/// secret read once at boot; the tenant half is what the OAuth consent
+/// left behind. Keeping the join in one place is what stops a caller
+/// assembling three of the six fields from the wrong side.
+pub fn xero_credentials(app: &IssuerApp, blob: &XeroBlob) -> XeroCredentials {
+    XeroCredentials {
+        client_id: app.client_id.clone(),
+        client_secret: app.client_secret.clone(),
+        refresh_token: blob.refresh_token.clone(),
+        access_token: blob.access_token.clone(),
+        access_token_expires_at: blob.access_token_expires_at,
+        tenant_id: blob.tenant_id.clone(),
     }
 }
 
-impl From<&QuickbooksBlob> for QuickBooksCredentials {
-    fn from(b: &QuickbooksBlob) -> Self {
-        QuickBooksCredentials {
-            client_id: b.client_id.clone(),
-            client_secret: b.client_secret.clone(),
-            refresh_token: b.refresh_token.clone(),
-            access_token: b.access_token.clone(),
-            access_token_expires_at: b.access_token_expires_at,
-            realm_id: b.realm_id.clone(),
-        }
+/// QuickBooks' half of the same join. See [`xero_credentials`].
+pub fn quickbooks_credentials(app: &IssuerApp, blob: &QuickbooksBlob) -> QuickBooksCredentials {
+    QuickBooksCredentials {
+        client_id: app.client_id.clone(),
+        client_secret: app.client_secret.clone(),
+        refresh_token: blob.refresh_token.clone(),
+        access_token: blob.access_token.clone(),
+        access_token_expires_at: blob.access_token_expires_at,
+        realm_id: blob.realm_id.clone(),
     }
 }
 
@@ -210,13 +192,10 @@ mod tests {
     fn blob_round_trips_through_serde() {
         let now = fixed(1_900_000_000);
         let xero = IntegrationCredentialBlob::Xero(XeroBlob {
-            client_id: "cid".into(),
-            client_secret: "csec".into(),
             refresh_token: "r1".into(),
             access_token: "a1".into(),
             access_token_expires_at: now,
             tenant_id: "xero-tenant".into(),
-            webhook_signing_key: None,
         });
         let raw = serialize_blob(&xero).unwrap();
         let parsed = parse_blob(Some(&raw), InvoiceProviderKind::Xero).unwrap();
@@ -226,13 +205,10 @@ mod tests {
     #[test]
     fn parse_blob_refuses_a_blob_for_the_wrong_provider() {
         let xero = IntegrationCredentialBlob::Xero(XeroBlob {
-            client_id: "cid".into(),
-            client_secret: "csec".into(),
             refresh_token: "r".into(),
             access_token: "a".into(),
             access_token_expires_at: fixed(0),
             tenant_id: "t".into(),
-            webhook_signing_key: None,
         });
         let raw = serialize_blob(&xero).unwrap();
         let err = parse_blob(Some(&raw), InvoiceProviderKind::Quickbooks).unwrap_err();
@@ -258,13 +234,10 @@ mod tests {
     fn apply_xero_refresh_overwrites_both_tokens_and_bumps_the_expiry() {
         let now = fixed(1_900_000_000);
         let mut blob = XeroBlob {
-            client_id: "cid".into(),
-            client_secret: "csec".into(),
             refresh_token: "r-old".into(),
             access_token: "a-old".into(),
             access_token_expires_at: fixed(0),
             tenant_id: "t".into(),
-            webhook_signing_key: None,
         };
         apply_xero_refresh(
             &mut blob,
@@ -286,14 +259,11 @@ mod tests {
     fn apply_quickbooks_refresh_also_bumps_the_refresh_token_expiry() {
         let now = fixed(1_900_000_000);
         let mut blob = QuickbooksBlob {
-            client_id: "cid".into(),
-            client_secret: "csec".into(),
             refresh_token: "r-old".into(),
             access_token: "a-old".into(),
             access_token_expires_at: fixed(0),
             realm_id: "123".into(),
             refresh_token_expires_at: None,
-            verifier_token: None,
         };
         apply_quickbooks_refresh(
             &mut blob,
@@ -315,36 +285,52 @@ mod tests {
         );
     }
 
+    fn app() -> IssuerApp {
+        IssuerApp {
+            client_id: "host-app".into(),
+            client_secret: "host-secret".into(),
+            webhook_key: None,
+        }
+    }
+
+    /// MAPPS-1139: the credentials a call takes are the deployment's
+    /// application joined to the tenant's tokens, and each half comes from
+    /// its own side.
+    ///
+    /// Asserted as a join rather than as a copy, because the bug this
+    /// prevents is a caller taking the client id from the tenant's blob -
+    /// where it no longer exists - or the refresh token from the host,
+    /// where it never did.
     #[test]
-    fn xero_blob_to_credentials_copies_every_field() {
+    fn xero_credentials_join_the_host_app_to_the_tenants_tokens() {
         let blob = XeroBlob {
-            client_id: "cid".into(),
-            client_secret: "csec".into(),
             refresh_token: "r".into(),
             access_token: "a".into(),
             access_token_expires_at: fixed(123),
             tenant_id: "t".into(),
-            webhook_signing_key: None,
         };
-        let creds: XeroCredentials = (&blob).into();
-        assert_eq!(creds.client_id, blob.client_id);
-        assert_eq!(creds.refresh_token, blob.refresh_token);
-        assert_eq!(creds.tenant_id, blob.tenant_id);
+        let creds = xero_credentials(&app(), &blob);
+        assert_eq!(creds.client_id, "host-app", "the host half");
+        assert_eq!(creds.client_secret, "host-secret", "the host half");
+        assert_eq!(creds.refresh_token, blob.refresh_token, "the tenant half");
+        assert_eq!(creds.access_token, blob.access_token, "the tenant half");
+        assert_eq!(
+            creds.tenant_id, blob.tenant_id,
+            "the organisation the consent selected is the tenant's, not the host's"
+        );
     }
 
     #[test]
-    fn quickbooks_blob_to_credentials_copies_every_field() {
+    fn quickbooks_credentials_join_the_same_two_halves() {
         let blob = QuickbooksBlob {
-            client_id: "cid".into(),
-            client_secret: "csec".into(),
             refresh_token: "r".into(),
             access_token: "a".into(),
             access_token_expires_at: fixed(123),
             realm_id: "9130".into(),
             refresh_token_expires_at: None,
-            verifier_token: None,
         };
-        let creds: QuickBooksCredentials = (&blob).into();
+        let creds = quickbooks_credentials(&app(), &blob);
+        assert_eq!(creds.client_id, "host-app");
         assert_eq!(creds.realm_id, blob.realm_id);
         assert_eq!(creds.access_token, blob.access_token);
     }
