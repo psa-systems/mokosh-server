@@ -8,6 +8,7 @@ pub mod approvals_polymorphic;
 pub mod asset_catalog;
 pub mod asset_ci_impact;
 pub mod assets;
+pub mod assets_bulk_create_query_budget;
 pub mod assets_inline_edit;
 pub mod assets_search_v2;
 pub mod attachment_download_streaming;
