@@ -295,9 +295,19 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         provider: IntegrationProvider::Stripe,
         display_name: "Stripe",
         description: "Collect card payments on a hosted page, with a pay-now link on every \
-                      invoice. Stripe can also issue invoices of its own; take `payments` \
-                      alone to keep Mokosh as the system of record for the document.",
-        supported_capabilities: &[Capability::Payments, Capability::Invoicing],
+                      invoice. Mokosh stays the system of record for the document.",
+        // PMS-1525: `Invoicing` was declared here and no issuer could receive
+        // it. `ExternalInvoicingProvider` has two variants, Xero and
+        // QuickBooks, `invoice_issuer_dispatch` reads the capability for those
+        // two and for nothing else, and `issuer_delegation`'s own comment says
+        // Stripe is never an invoicing provider because its invoicing is
+        // "pay-now links on Mokosh-issued invoices", which is what
+        // `Capability::Payments` already means. A declared capability nothing
+        // can act on is a promise to an operator, and the rows carrying it were
+        // a delegation waiting to switch itself on the day somebody shipped a
+        // Stripe issuer. It comes back with that client, as PayPal's entry
+        // shows a payment provider looks without it.
+        supported_capabilities: &[Capability::Payments],
         polling: None,
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::PaymentGateway,
@@ -505,6 +515,34 @@ mod tests {
                 "no provider supports {}",
                 capability.as_str()
             );
+        }
+    }
+
+    /// PMS-1525: every provider declaring `Invoicing` is one an issuer can
+    /// actually receive it.
+    ///
+    /// This is the assertion whose absence let two files disagree in writing.
+    /// Stripe's entry declared the capability, and `issuer_delegation`'s own
+    /// comment said Stripe is never an invoicing provider - its invoicing is
+    /// "pay-now links on Mokosh-issued invoices", which is what
+    /// `Capability::Payments` already means. `invoice_issuer_dispatch` read the
+    /// capability for Xero and QuickBooks and for nothing else, so a tenant row
+    /// carrying it for Stripe claimed a delegation that never happened and
+    /// would have started happening the day somebody shipped a Stripe issuer.
+    ///
+    /// Checked against `ExternalInvoicingProvider::parse`, the function the
+    /// dispatch uses, rather than a list of names repeated here.
+    #[test]
+    fn only_a_provider_an_issuer_can_receive_declares_invoicing() {
+        use crate::modules::billing::issuer_delegation::ExternalInvoicingProvider;
+        for entry in REGISTRY {
+            if entry.supports(Capability::Invoicing) {
+                assert!(
+                    ExternalInvoicingProvider::parse(entry.provider.as_str()).is_some(),
+                    "{} declares Invoicing and no issuer can receive it",
+                    entry.provider.as_str()
+                );
+            }
         }
     }
 
