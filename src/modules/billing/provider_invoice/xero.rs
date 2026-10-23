@@ -8,17 +8,18 @@
 //! the matching `integrations` row (`external_organisation_id`).
 //!
 //! Wire shape pinned against Xero's own documentation (identity endpoint,
-//! Accounting API Invoices, and the public FAQ on rate limits). Auth is
-//! `POST https://identity.xero.com/connect/token` with HTTP Basic
-//! `client_id:client_secret` and a form-encoded
-//! `grant_type=refresh_token` body carrying the current refresh token.
-//! Invoices live on `POST https://api.xero.com/api.xro/2.0/Invoices`
-//! with the tenant's `Xero-Tenant-Id` header, a `429` carries a
-//! `Retry-After` seconds value, and the daily / minute caps are 5000 /
-//! 60 (plus five concurrent). The client sleeps the exact `Retry-After`
-//! on a `429` (bounded, see [`MAX_RETRIES`]) and gives up with a
-//! classified `AppError` on anything else so the caller cannot mistake
-//! a permanently refused invoice for a transient blip.
+//! Accounting API Invoices, and the public FAQ on rate limits). Auth is a
+//! `POST` to the identity `/connect/token` endpoint (see
+//! `default_identity_base` below) with HTTP Basic `client_id:client_secret`
+//! and a form-encoded `grant_type=refresh_token` body carrying the current
+//! refresh token. Invoices live on a `POST` to the Accounting-API
+//! `/api.xro/2.0/Invoices` endpoint (see `default_api_base` below) with
+//! the tenant's `Xero-Tenant-Id` header, a `429` carries a `Retry-After`
+//! seconds value, and the daily / minute caps are 5000 / 60 (plus five
+//! concurrent). The client sleeps the exact `Retry-After` on a `429`
+//! (bounded, see [`MAX_RETRIES`]) and gives up with a classified
+//! `AppError` on anything else so the caller cannot mistake a permanently
+//! refused invoice for a transient blip.
 //!
 //! Nothing routes to this client yet; MAPPS-1099 Phase 2 adds the
 //! `InvoiceIssuer` trait + dispatch that reads
@@ -76,8 +77,9 @@ pub struct XeroCredentials {
     pub tenant_id: String,
 }
 
-/// Xero's refresh-token response shape (`identity.xero.com/connect/token`).
-/// The refresh token rotates on every refresh and MUST be stored; a
+/// Xero's refresh-token response shape (the identity `/connect/token`
+/// endpoint, see `default_identity_base`). The refresh token rotates on
+/// every refresh and MUST be stored; a
 /// client that keeps using the old refresh token sees `invalid_grant`
 /// on the next call. `expires_in` is seconds from now.
 #[derive(Debug, Clone, Deserialize)]

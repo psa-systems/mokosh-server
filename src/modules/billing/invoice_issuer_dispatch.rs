@@ -171,8 +171,8 @@ impl IssuerDispatcher {
             .await?
             .ok_or_else(|| {
                 AppError::Conflict(format!(
-                    "company {} is not mapped to a Xero customer; set the mapping \
-                     at PUT /api/v1/invoice-issuer-mappings/companies/xero/{} first",
+                    "Company {} is not mapped to a Xero customer. Set the mapping \
+                     at PUT /api/v1/invoice-issuer-mappings/companies/xero/{} first.",
                     request.company_id, request.company_id
                 ))
             })?;
@@ -238,8 +238,8 @@ impl IssuerDispatcher {
             .await?
             .ok_or_else(|| {
                 AppError::Conflict(format!(
-                    "company {} is not mapped to a QuickBooks customer; set the mapping \
-                     at PUT /api/v1/invoice-issuer-mappings/companies/quickbooks/{} first",
+                    "Company {} is not mapped to a QuickBooks customer. Set the mapping \
+                     at PUT /api/v1/invoice-issuer-mappings/companies/quickbooks/{} first.",
                     request.company_id, request.company_id
                 ))
             })?;
@@ -256,15 +256,15 @@ impl IssuerDispatcher {
         for line in request.lines {
             let product_id = line.product_id.ok_or_else(|| {
                 AppError::Conflict(
-                    "every line of a QuickBooks-delegated invoice must link to a product; \
-                     set a product_id on each line before issuing"
+                    "Every line of a QuickBooks-delegated invoice must link to a product. \
+                     Set a product_id on each line before issuing."
                         .to_string(),
                 )
             })?;
             let mapping = product_map.get(&product_id).ok_or_else(|| {
                 AppError::Conflict(format!(
-                    "product {product_id} is not mapped to a QuickBooks item; set the mapping \
-                     at PUT /api/v1/invoice-issuer-mappings/products/quickbooks/{product_id} first"
+                    "Product {product_id} is not mapped to a QuickBooks item. Set the mapping \
+                     at PUT /api/v1/invoice-issuer-mappings/products/quickbooks/{product_id} first."
                 ))
             })?;
             qbo_lines.push(

@@ -104,7 +104,7 @@ fn require_delegated_issuer(state: &InvoiceIssuerMappingRouterState) -> AppResul
 fn parse_provider(raw: &str) -> AppResult<InvoiceProviderKind> {
     InvoiceProviderKind::parse(raw).ok_or_else(|| {
         AppError::BadRequest(format!(
-            "{raw:?} is not a delegated invoice-issuer provider; expected xero or quickbooks"
+            "'{raw}' is not a delegated invoice-issuer provider; expected xero or quickbooks"
         ))
     })
 }

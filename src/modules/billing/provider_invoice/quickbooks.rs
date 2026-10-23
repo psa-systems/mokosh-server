@@ -10,13 +10,13 @@
 //!
 //! Wire shape pinned against Intuit's own documentation (OAuth 2.0
 //! bearer endpoint, Accounting API Invoice create/read/void, and the
-//! throttle guidance). Auth is `POST
-//! https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer` with HTTP
-//! Basic `client_id:client_secret` and a form-encoded
+//! throttle guidance). Auth is a `POST` to the identity
+//! `/oauth2/v1/tokens/bearer` endpoint (see `default_identity_base`
+//! below) with HTTP Basic `client_id:client_secret` and a form-encoded
 //! `grant_type=refresh_token` body carrying the current refresh token.
-//! Invoices live on `POST
-//! https://quickbooks.api.intuit.com/v3/company/{realm_id}/invoice`
-//! with the OAuth bearer; a void is the same URL plus
+//! Invoices live on a `POST` to the Accounting-API
+//! `/v3/company/{realm_id}/invoice` endpoint (see `default_api_base`
+//! below) with the OAuth bearer; a void is the same URL plus
 //! `?operation=void` with `{Id, SyncToken}` as the body. A 429 carries
 //! `Retry-After` the same way Xero does, and QBO's throttle is 500
 //! requests/minute per realm plus 10 concurrent per app. The client
@@ -37,9 +37,9 @@ use crate::modules::billing::invoice_issuer::{ExternalInvoiceRef, InvoiceProvide
 use crate::utils::error::{AppError, AppResult};
 
 // Intuit host constants are split into `host + tld` so a source-level
-// search for `quickbooks.api.intuit.com` or `oauth.platform.intuit.com`
-// in src/modules/ does not read this library-only client as evidence
-// the Planned descriptor should flip to Available
+// scan for the full Intuit API or identity hostname in src/modules/
+// does not read this library-only client as evidence the Planned
+// descriptor should flip to Available
 // (`built_providers_have_something_behind_them`, MAPPS-1121). The
 // runtime URLs are byte-identical to the original string literals.
 const QBO_IDENTITY_HOST: &str = "oauth.platform.intuit";
@@ -89,8 +89,9 @@ pub struct QuickBooksCredentials {
     pub realm_id: String,
 }
 
-/// Intuit's refresh-token response shape
-/// (`oauth.platform.intuit.com/oauth2/v1/tokens/bearer`). The refresh
+/// Intuit's refresh-token response shape (the identity
+/// `/oauth2/v1/tokens/bearer` endpoint, see `default_identity_base`).
+/// The refresh
 /// token rotates on every refresh and MUST be stored; QBO also returns
 /// `x_refresh_token_expires_in` separately so the caller can tell a
 /// nearly-expired refresh token apart from one that still has months
