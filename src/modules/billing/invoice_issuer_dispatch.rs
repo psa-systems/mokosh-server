@@ -47,6 +47,21 @@ use crate::secrets::{SecretKey, SecretProvider};
 use crate::utils::error::{AppError, AppResult};
 use mokosh_types::integrations::{Capability, IntegrationProvider};
 
+/// What a provider says about an invoice it holds (MAPPS-1136).
+///
+/// Three outcomes rather than each provider's own enum, because the
+/// receiver acts on two of them and the third is every state that is
+/// neither: a draft, an authorised invoice nobody has paid, a partially
+/// paid one. Collapsing those into `Open` is deliberate - Mokosh records
+/// what the provider COLLECTED, and a partial payment arrives as its own
+/// event with its own amount rather than being inferred from a status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalInvoiceState {
+    Paid,
+    Voided,
+    Open,
+}
+
 /// What the dispatcher decided to do with one `create_invoice` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssuerPlan {
@@ -309,6 +324,75 @@ impl IssuerDispatcher {
     /// up-to-date state and `refreshed` is true iff a refresh ran
     /// (used by callers that want to log a telemetry event on
     /// rotation).
+    /// The key this tenant's provider signs webhook deliveries with
+    /// (MAPPS-1136), or `None` when they connected without one.
+    ///
+    /// Read without refreshing anything: verifying a signature does not
+    /// touch the provider, and a delivery that arrives while the access
+    /// token happens to be stale must still be verifiable.
+    pub async fn webhook_key(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+    ) -> AppResult<Option<String>> {
+        let key = SecretKey::integration(*tenant_id, provider.as_str());
+        let stored = self.secrets.get(&key).await?;
+        Ok(match parse_blob(stored.as_deref(), provider)? {
+            IntegrationCredentialBlob::Xero(x) => x.webhook_signing_key,
+            IntegrationCredentialBlob::Quickbooks(q) => q.verifier_token,
+        })
+    }
+
+    /// What the provider says this invoice's state is now (MAPPS-1136).
+    ///
+    /// Neither provider's webhook carries the state: Xero sends a resource
+    /// id and an event category, Intuit sends an entity name, an operation
+    /// and an id, and both mean "this changed, come and look". So the
+    /// receiver comes and looks, through the same credential load and
+    /// near-expiry refresh an issue goes through, because a webhook can
+    /// easily be the first call after a token has aged out.
+    pub async fn external_status(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        external_invoice_id: &str,
+    ) -> AppResult<ExternalInvoiceState> {
+        let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
+        match &blob {
+            IntegrationCredentialBlob::Xero(x) => {
+                let status = self
+                    .xero
+                    .fetch_invoice_status(&x.into(), external_invoice_id)
+                    .await?;
+                Ok(match status {
+                    crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Paid => {
+                        ExternalInvoiceState::Paid
+                    }
+                    crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Voided
+                    | crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Deleted => {
+                        ExternalInvoiceState::Voided
+                    }
+                    _ => ExternalInvoiceState::Open,
+                })
+            }
+            IntegrationCredentialBlob::Quickbooks(q) => {
+                let status = self
+                    .quickbooks
+                    .fetch_invoice_status(&q.into(), external_invoice_id)
+                    .await?;
+                Ok(match status {
+                    crate::modules::billing::provider_invoice::quickbooks::QuickBooksInvoiceStatus::Paid => {
+                        ExternalInvoiceState::Paid
+                    }
+                    crate::modules::billing::provider_invoice::quickbooks::QuickBooksInvoiceStatus::Voided => {
+                        ExternalInvoiceState::Voided
+                    }
+                    _ => ExternalInvoiceState::Open,
+                })
+            }
+        }
+    }
+
     async fn load_and_refresh_blob(
         &self,
         tenant_id: TenantId,
