@@ -108,6 +108,63 @@ async fn row_count(pool: &PgPool, provider: &str) -> i64 {
         .expect("count integrations")
 }
 
+/// MAPPS-1129: `configurable_here` agrees with what the write route actually
+/// does, for every provider in the catalog.
+///
+/// The client renders its one mutating control set - the capability
+/// checkboxes, Connect/Disconnect, the poll interval - exactly where it
+/// believes a change is accepted, and before this field it believed that
+/// wherever `managed_elsewhere` was absent. Stripe's connection home IS this
+/// subsystem since PMS-1312, so it carries no `managed_elsewhere`, and
+/// MAPPS-1122 put it back in this list; the page offered an admin checkboxes
+/// whose every tick came back 404.
+///
+/// Asserted against the route's own answer rather than against a list of
+/// provider names, because a second list is how the first one drifts. The
+/// question "will PUT take this?" has one true answer and this is it.
+#[mokosh_test]
+async fn the_catalog_says_which_providers_the_write_route_will_take(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let entries = list(&app, &token).await;
+    assert!(!entries.is_empty(), "the catalog is never empty");
+    let mut refused = 0;
+    for row in &entries {
+        let provider = row["provider"].as_str().expect("provider");
+        let configurable = row["configurable_here"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("{provider} does not say whether it is configurable: {row}"));
+
+        let put = app
+            .client
+            .put(app.url(&format!("/api/v1/integrations/{provider}")))
+            .bearer_auth(&token)
+            .json(&json!({ "capabilities": [] }))
+            .send()
+            .await
+            .expect("put");
+        let takes_it = put.status() != StatusCode::NOT_FOUND;
+        assert_eq!(
+            configurable,
+            takes_it,
+            "{provider} says configurable_here={configurable} and PUT answered {}; a client \
+             renders its controls off this field, so the two disagreeing is a control that \
+             404s (MAPPS-1129)",
+            put.status()
+        );
+        if !configurable {
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        refused, 2,
+        "Stripe and PayPal are the providers Settings > Payment Gateways owns; a third would \
+         mean another surface took one over without this field being checked"
+    );
+}
+
 /// The page's job is to show what COULD be connected, so every provider in the
 /// registry is listed on a tenant that has installed nothing, and each carries
 /// the supported set the server will hold it to.
