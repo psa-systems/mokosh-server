@@ -1106,23 +1106,28 @@ pub fn create_api_router(
             crate::utils::error::normalize_error_envelope,
         ));
 
-    // MAPPS-1136: the invoice-issuer webhook receivers, nested under
-    // `/api/v1/xero` and `/api/v1/quickbooks` OUTSIDE the auth chain for the
-    // same reason the payment ones are: the provider authenticates itself with
-    // an HMAC over the raw body, keyed by the webhook secret stored with that
-    // tenant's connection. The tenant id in the path selects whose key to
-    // verify against and is not itself a credential.
+    // MAPPS-1136 / MAPPS-1141: the invoice-issuer webhook receivers, under
+    // `/api/v1/webhooks/{provider}` OUTSIDE the auth chain for the same reason
+    // the payment ones are: the provider authenticates itself with an HMAC
+    // over the raw body.
     //
-    // Both prefixes are in `RAW_BODY_PATHS`, because a byte the JSON sanitizer
+    // ONE URL per provider, not one per tenant, because there is one
+    // application per provider and therefore one webhook subscription for the
+    // host to configure. The delivery says which organisation it is about and
+    // `integrations.external_organisation_id` says whose that is. The payment
+    // receivers keep their per-tenant path, which is still right there: a
+    // gateway's webhook secret IS the tenant's.
+    //
+    // The prefix is in `RAW_BODY_PATHS`, because a byte the JSON sanitizer
     // rewrote is a signature that does not verify.
     //
     // They share the dispatcher the serving `BillingService` was given, rather
     // than building a second one: it owns the credential load, the near-expiry
     // refresh and the two clients, and a receiver needs all three.
-    let invoice_issuer_webhooks = |provider| {
+    let invoice_issuer_webhooks = |path: &'static str, provider| {
         Router::new()
             .route(
-                "/webhooks/{tenant_id}",
+                path,
                 post(
                     crate::modules::billing::webhook_invoice_issuer::invoice_issuer_webhook_handler,
                 ),
@@ -1250,16 +1255,15 @@ pub fn create_api_router(
         .nest("/api/v1/stripe", stripe_webhooks)
         .nest("/api/v1/paypal", paypal_webhooks)
         .nest(
-            "/api/v1/xero",
+            "/api/v1/webhooks",
             invoice_issuer_webhooks(
+                "/xero",
                 crate::modules::billing::invoice_issuer::InvoiceProviderKind::Xero,
-            ),
-        )
-        .nest(
-            "/api/v1/quickbooks",
-            invoice_issuer_webhooks(
+            )
+            .merge(invoice_issuer_webhooks(
+                "/quickbooks",
                 crate::modules::billing::invoice_issuer::InvoiceProviderKind::Quickbooks,
-            ),
+            )),
         )
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())

@@ -165,7 +165,7 @@ mod tests {
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -207,6 +207,10 @@ struct XeroEvent {
     resource_id: String,
     #[serde(rename = "eventCategory", default)]
     event_category: String,
+    /// The Xero organisation the event is about, which is what
+    /// `integrations.external_organisation_id` holds.
+    #[serde(rename = "tenantId", default)]
+    tenant_id: String,
 }
 
 /// Intuit's delivery.
@@ -218,6 +222,10 @@ struct QuickBooksDelivery {
 
 #[derive(Debug, Deserialize)]
 struct QuickBooksNotification {
+    /// Intuit's company file id, which is what
+    /// `integrations.external_organisation_id` holds for QuickBooks.
+    #[serde(rename = "realmId", default)]
+    realm_id: String,
     #[serde(rename = "dataChangeEvent", default)]
     data_change_event: Option<QuickBooksDataChange>,
 }
@@ -245,7 +253,7 @@ struct QuickBooksEntity {
 /// nothing, which is harmless, but it would also record a delivery as
 /// "matched nothing" when the honest answer is that it was never about an
 /// invoice.
-fn invoice_ids(provider: InvoiceProviderKind, body: &[u8]) -> AppResult<Vec<String>> {
+fn invoice_events(provider: InvoiceProviderKind, body: &[u8]) -> AppResult<Vec<InvoiceEvent>> {
     match provider {
         InvoiceProviderKind::Xero => {
             let delivery: XeroDelivery = serde_json::from_slice(body)
@@ -254,8 +262,11 @@ fn invoice_ids(provider: InvoiceProviderKind, body: &[u8]) -> AppResult<Vec<Stri
                 .events
                 .into_iter()
                 .filter(|e| e.event_category.eq_ignore_ascii_case("INVOICE"))
-                .map(|e| e.resource_id)
-                .filter(|id| !id.is_empty())
+                .map(|e| InvoiceEvent {
+                    organisation_id: e.tenant_id,
+                    external_invoice_id: e.resource_id,
+                })
+                .filter(|e| !e.external_invoice_id.is_empty() && !e.organisation_id.is_empty())
                 .collect())
         }
         InvoiceProviderKind::Quickbooks => {
@@ -265,14 +276,33 @@ fn invoice_ids(provider: InvoiceProviderKind, body: &[u8]) -> AppResult<Vec<Stri
             Ok(delivery
                 .event_notifications
                 .into_iter()
-                .filter_map(|n| n.data_change_event)
-                .flat_map(|c| c.entities)
-                .filter(|e| e.name.eq_ignore_ascii_case("Invoice"))
-                .map(|e| e.id)
-                .filter(|id| !id.is_empty())
+                .flat_map(|n| {
+                    let realm_id = n.realm_id;
+                    n.data_change_event
+                        .into_iter()
+                        .flat_map(|c| c.entities)
+                        .filter(|e| e.name.eq_ignore_ascii_case("Invoice"))
+                        .map(move |e| InvoiceEvent {
+                            organisation_id: realm_id.clone(),
+                            external_invoice_id: e.id,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|e| !e.external_invoice_id.is_empty() && !e.organisation_id.is_empty())
                 .collect())
         }
     }
+}
+
+/// One invoice event, with the organisation it belongs to.
+///
+/// The pair rather than the id alone, because the organisation is how the
+/// tenant is found now (MAPPS-1141) and a delivery is not guaranteed to be
+/// about one of them: Xero batches events into one POST.
+#[derive(Debug)]
+struct InvoiceEvent {
+    organisation_id: String,
+    external_invoice_id: String,
 }
 
 /// The header each provider puts its signature in.
@@ -311,11 +341,9 @@ fn verify(provider: InvoiceProviderKind, body: &[u8], signature: &str, key: &str
 /// provider had said it.
 pub async fn invoice_issuer_webhook_handler(
     State(state): State<Arc<InvoiceIssuerWebhookState>>,
-    Path(tenant_id): Path<Uuid>,
     headers: HeaderMap,
     body: Bytes,
 ) -> AppResult<impl IntoResponse> {
-    let scoped = TenantId::from_trusted(tenant_id);
     let provider = state.provider;
 
     // MAPPS-1139: the key belongs to the deployment, because the webhook
@@ -324,10 +352,10 @@ pub async fn invoice_issuer_webhook_handler(
     // none, and every delivery is refused: a deployment that cannot verify
     // what it is being told must not act on it.
     //
-    // No key is a 401 and no row. This endpoint is unauthenticated by
-    // construction, so recording before anything is verified would let
-    // anyone who learns the URL write history into any tenant id they can
-    // name. That is `provider_webhook_handler`'s rule and it carries over.
+    // No key, no signature and a signature that does not verify are all a
+    // 401 with nothing written. There is no tenant to write a row against
+    // yet, which is the shape of this route (MAPPS-1141): the signature is
+    // checked first and the delivery says afterwards whose it is.
     let Some(key) = state
         .dispatcher
         .webhook_key(provider)
@@ -335,37 +363,52 @@ pub async fn invoice_issuer_webhook_handler(
     else {
         return Err(AppError::Unauthorized);
     };
-    let key = key.to_string();
-
     let Some(signature) = signature_header(provider, &headers) else {
-        record(
-            &state,
-            tenant_id,
-            "refused",
-            None,
-            Some("no signature header"),
-        )
-        .await;
         return Err(AppError::Unauthorized);
     };
-    if !verify(provider, &body, signature, &key) {
-        record(
-            &state,
-            tenant_id,
-            "refused",
-            None,
-            Some("signature did not verify"),
-        )
-        .await;
+    if !verify(provider, &body, signature, key) {
         return Err(AppError::Unauthorized);
     }
 
-    let result = apply(&state, scoped, &body).await;
-    match &result {
-        Ok(outcome) => record(&state, tenant_id, outcome.as_str(), None, None).await,
-        Err(e) => record(&state, tenant_id, "failed", None, Some(&e.to_string())).await,
+    // Verified, so the body can be read. Each event names the organisation
+    // it is about and is resolved on its own: Xero batches events into one
+    // POST and the batch is not guaranteed to be about one organisation,
+    // and attributing one tenant's invoice to another is the one mistake
+    // this route must not make.
+    let events = invoice_events(provider, &body)?;
+    for event in events {
+        let Some(tenant_id) = state
+            .billing
+            .tenant_for_external_organisation(provider.as_str(), &event.organisation_id)
+            .await?
+        else {
+            // A real state, not an attack: a tenant disconnected, or the
+            // organisation is connected to somebody else's Mokosh. No row,
+            // because `payment_webhook_deliveries.tenant_id` is NOT NULL and
+            // there is no tenant to write it against, which is what this
+            // route gives up for having one URL.
+            tracing::info!(
+                target: "mokosh_server.billing",
+                provider = provider.as_str(),
+                organisation_id = %event.organisation_id,
+                "invoice-issuer webhook: no tenant holds this organisation; ignoring the event"
+            );
+            continue;
+        };
+        let scoped = TenantId::from_trusted(tenant_id);
+        let result = apply_one(&state, scoped, &event).await;
+        match &result {
+            Ok(outcome) => record(&state, tenant_id, outcome.as_str(), None, None).await,
+            Err(e) => {
+                record(&state, tenant_id, "failed", None, Some(&e.to_string())).await;
+                return Err(result.err().unwrap_or_else(|| {
+                    AppError::internal("an invoice-issuer delivery failed".to_string())
+                }));
+            }
+        }
     }
-    result.map(|_| StatusCode::OK)
+
+    Ok(StatusCode::OK)
 }
 
 /// What one delivery did, as `payment_webhook_deliveries.outcome` names it.
@@ -391,30 +434,31 @@ impl Outcome {
     }
 }
 
-async fn apply(
+/// One event, for the tenant it resolved to.
+async fn apply_one(
     state: &InvoiceIssuerWebhookState,
     tenant_id: TenantId,
-    body: &[u8],
+    event: &InvoiceEvent,
 ) -> AppResult<Outcome> {
     let provider = state.provider;
-    let ids = invoice_ids(provider, body)?;
+    let external_id = &event.external_invoice_id;
     let mut outcome = Outcome::Ignored;
 
-    for external_id in ids {
+    {
         let Some(local) = state
             .billing
-            .delegated_invoice(tenant_id, provider.as_str(), &external_id)
+            .delegated_invoice(tenant_id, provider.as_str(), external_id)
             .await?
         else {
             // A provider re-delivers, and it delivers events for invoices
             // this tenant created in the provider's own UI. Neither is an
             // error, and answering with one makes them retry forever.
-            continue;
+            return Ok(Outcome::Ignored);
         };
 
         match state
             .dispatcher
-            .external_status(tenant_id, provider, &external_id)
+            .external_status(tenant_id, provider, external_id)
             .await?
         {
             ExternalInvoiceState::Paid => {
@@ -426,7 +470,7 @@ async fn apply(
                 // being unlucky. There is no money to record, so there is
                 // nothing to do.
                 if local.balance_due <= rust_decimal::Decimal::ZERO {
-                    continue;
+                    return Ok(Outcome::Ignored);
                 }
                 // The money went to the provider, so Mokosh records what
                 // the provider collected and lets the one writer derive the
@@ -439,7 +483,7 @@ async fn apply(
                         tenant_id,
                         provider.as_str(),
                         local.id,
-                        &external_id,
+                        external_id,
                         local.balance_due,
                         &local.currency,
                         &serde_json::json!({

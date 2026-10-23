@@ -3861,6 +3861,35 @@ impl BillingService {
     /// `gateway_transaction_id` = the provider reference, `gateway_response` =
     /// the raw event, `currency` recorded) under the invoice row lock and
     /// recomputes the invoice's payment state, returning `Ok(true)`.
+    /// Whose tenant an invoice-issuer delivery is about (MAPPS-1141).
+    ///
+    /// The delivery names an ORGANISATION - Xero's `tenantId`, Intuit's
+    /// `realmId` - and `integrations.external_organisation_id` is where the
+    /// OAuth exchange wrote it. This is the one caller in the subsystem that
+    /// legitimately does not know its tenant yet, which is why it looks one
+    /// up instead of being handed one.
+    ///
+    /// SAFETY (PMS-285): the lookup spans every tenant, because the question
+    /// it answers is which tenant this is. It runs on the migrator pool for
+    /// that reason and returns a tenant id and nothing else; every read and
+    /// write after it is scoped to the tenant it returned.
+    pub async fn tenant_for_external_organisation(
+        &self,
+        provider: &str,
+        organisation_id: &str,
+    ) -> AppResult<Option<Uuid>> {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "SELECT tenant_id FROM integrations \
+             WHERE provider = $1 AND external_organisation_id = $2",
+        )
+        .bind(provider)
+        .bind(organisation_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(found)
+    }
+
     /// The local row for an invoice a provider holds (MAPPS-1136).
     ///
     /// Keyed on the pair, not on the external id alone: the id is the
