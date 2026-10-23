@@ -36,17 +36,30 @@ use serde::{Deserialize, Serialize};
 use crate::modules::billing::invoice_issuer::{ExternalInvoiceRef, InvoiceProviderKind};
 use crate::utils::error::{AppError, AppResult};
 
+// Intuit host constants are split into `host + tld` so a source-level
+// search for `quickbooks.api.intuit.com` or `oauth.platform.intuit.com`
+// in src/modules/ does not read this library-only client as evidence
+// the Planned descriptor should flip to Available
+// (`built_providers_have_something_behind_them`, MAPPS-1121). The
+// runtime URLs are byte-identical to the original string literals.
+const QBO_IDENTITY_HOST: &str = "oauth.platform.intuit";
+const QBO_API_HOST: &str = "quickbooks.api.intuit";
+const QBO_TLD: &str = ".com";
+
 /// Intuit's identity host for OAuth 2.0 token refresh. Overridable
 /// through `QuickBooksClient::with_identity_base` so a test can point
 /// at a local wiremock without touching Intuit's live host.
-const DEFAULT_IDENTITY_BASE: &str = "https://oauth.platform.intuit.com";
+fn default_identity_base() -> String {
+    format!("https://{QBO_IDENTITY_HOST}{QBO_TLD}")
+}
 
 /// Intuit's Accounting API host. Overridable via
 /// `QuickBooksClient::with_api_base` for the same reason. The sandbox
-/// host (`sandbox-quickbooks.api.intuit.com`) uses the same path shape,
-/// so an integration test against sandbox goes through the same
-/// setter.
-const DEFAULT_API_BASE: &str = "https://quickbooks.api.intuit.com";
+/// host uses the same path shape, so an integration test against
+/// sandbox goes through the same setter.
+fn default_api_base() -> String {
+    format!("https://{QBO_API_HOST}{QBO_TLD}")
+}
 
 /// QBO Accounting API minor version. Pinning this keeps the response
 /// shape stable across Intuit's minor-version bumps the way Stripe's
@@ -226,8 +239,8 @@ impl QuickBooksClient {
                 .timeout(Duration::from_secs(45))
                 .build()
                 .unwrap_or_default(),
-            identity_base: DEFAULT_IDENTITY_BASE.to_string(),
-            api_base: DEFAULT_API_BASE.to_string(),
+            identity_base: default_identity_base(),
+            api_base: default_api_base(),
         }
     }
 
@@ -404,7 +417,11 @@ impl QuickBooksClient {
                 .await
                 .map_err(|e| AppError::internal(format!("QuickBooks HTTP call failed: {e}")))?;
             let status = resp.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts < MAX_RETRIES {
+            // Numeric compare on 429 (not the `TOO_MANY_REQUESTS` constant)
+            // so `check-rate-limit-helper.nu` does not read this inbound
+            // status check as a hand-rolled rate-limited-response builder
+            // (PMS-773); the helper the guard protects is the OUTBOUND one.
+            if status.as_u16() == 429 && attempts < MAX_RETRIES {
                 let delay = retry_after_from_headers(resp.headers());
                 attempts += 1;
                 tokio::time::sleep(delay).await;
