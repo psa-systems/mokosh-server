@@ -63,6 +63,20 @@ pub struct XeroBlob {
     pub access_token: String,
     pub access_token_expires_at: DateTime<Utc>,
     pub tenant_id: String,
+    /// The key Xero signs webhook deliveries with (MAPPS-1136).
+    ///
+    /// Optional, and defaulted, for two reasons. A blob written before this
+    /// field existed still parses, and a tenant who connected without
+    /// subscribing to webhooks has nothing to put here: the receiver then
+    /// refuses every delivery for them, which is the right answer for a
+    /// deployment that cannot verify what it is being told.
+    ///
+    /// It lives beside the credential rather than in configuration because
+    /// `client_id` and `client_secret` already do: this build's model is
+    /// that each MSP registers their own Xero app, so the webhook key is
+    /// theirs too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_signing_key: Option<String>,
 }
 
 /// QuickBooks's stored OAuth state. QBO rotates the refresh token's
@@ -78,6 +92,12 @@ pub struct QuickbooksBlob {
     pub access_token_expires_at: DateTime<Utc>,
     pub realm_id: String,
     pub refresh_token_expires_at: Option<DateTime<Utc>>,
+    /// Intuit's verifier token, the key it signs webhook deliveries with
+    /// (MAPPS-1136). Same shape and same reasoning as Xero's
+    /// [`XeroBlob::webhook_signing_key`]; Intuit just calls it something
+    /// else, and the receiver reads the header it comes in under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_token: Option<String>,
 }
 
 impl From<&XeroBlob> for XeroCredentials {
@@ -196,6 +216,7 @@ mod tests {
             access_token: "a1".into(),
             access_token_expires_at: now,
             tenant_id: "xero-tenant".into(),
+            webhook_signing_key: None,
         });
         let raw = serialize_blob(&xero).unwrap();
         let parsed = parse_blob(Some(&raw), InvoiceProviderKind::Xero).unwrap();
@@ -211,6 +232,7 @@ mod tests {
             access_token: "a".into(),
             access_token_expires_at: fixed(0),
             tenant_id: "t".into(),
+            webhook_signing_key: None,
         });
         let raw = serialize_blob(&xero).unwrap();
         let err = parse_blob(Some(&raw), InvoiceProviderKind::Quickbooks).unwrap_err();
@@ -242,6 +264,7 @@ mod tests {
             access_token: "a-old".into(),
             access_token_expires_at: fixed(0),
             tenant_id: "t".into(),
+            webhook_signing_key: None,
         };
         apply_xero_refresh(
             &mut blob,
@@ -270,6 +293,7 @@ mod tests {
             access_token_expires_at: fixed(0),
             realm_id: "123".into(),
             refresh_token_expires_at: None,
+            verifier_token: None,
         };
         apply_quickbooks_refresh(
             &mut blob,
@@ -300,6 +324,7 @@ mod tests {
             access_token: "a".into(),
             access_token_expires_at: fixed(123),
             tenant_id: "t".into(),
+            webhook_signing_key: None,
         };
         let creds: XeroCredentials = (&blob).into();
         assert_eq!(creds.client_id, blob.client_id);
@@ -317,6 +342,7 @@ mod tests {
             access_token_expires_at: fixed(123),
             realm_id: "9130".into(),
             refresh_token_expires_at: None,
+            verifier_token: None,
         };
         let creds: QuickBooksCredentials = (&blob).into();
         assert_eq!(creds.realm_id, blob.realm_id);

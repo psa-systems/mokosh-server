@@ -203,6 +203,9 @@ async fn seed_xero_blob(secrets: &Arc<dyn SecretProvider>, tenant_id: Uuid, expi
         access_token: "fixture-bearer".to_string(),
         access_token_expires_at: Utc::now() + Duration::minutes(expires_in_mins),
         tenant_id: "xero-org-1".to_string(),
+        // No webhook subscription in these cases; MAPPS-1136's suite is
+        // where that key earns its keep.
+        webhook_signing_key: None,
     });
     secrets
         .put(
@@ -222,6 +225,7 @@ async fn seed_quickbooks_blob(secrets: &Arc<dyn SecretProvider>, tenant_id: Uuid
         access_token_expires_at: Utc::now() + Duration::minutes(55),
         realm_id: "4620816365".to_string(),
         refresh_token_expires_at: Some(Utc::now() + Duration::days(90)),
+        verifier_token: None,
     });
     secrets
         .put(

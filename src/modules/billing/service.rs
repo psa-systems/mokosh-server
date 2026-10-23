@@ -3861,6 +3861,110 @@ impl BillingService {
     /// `gateway_transaction_id` = the provider reference, `gateway_response` =
     /// the raw event, `currency` recorded) under the invoice row lock and
     /// recomputes the invoice's payment state, returning `Ok(true)`.
+    /// The local row for an invoice a provider holds (MAPPS-1136).
+    ///
+    /// Keyed on the pair, not on the external id alone: the id is the
+    /// provider's and two providers can mint the same one. `balance_due`
+    /// and `currency` come back with it because the caller is about to
+    /// record what the provider collected, and both are what that record
+    /// needs.
+    pub async fn delegated_invoice(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+        external_invoice_id: &str,
+    ) -> AppResult<Option<DelegatedInvoiceRow>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as(
+            "SELECT id, balance_due, currency FROM invoices \
+             WHERE tenant_id = $1 AND external_provider = $2 AND external_invoice_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(provider)
+        .bind(external_invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Void an invoice because the provider that issued it voided it
+    /// (MAPPS-1136).
+    ///
+    /// Separate from [`Self::void_invoice`], which refuses anything past
+    /// draft on the grounds that the customer already holds the document
+    /// and a credit note is the instrument for correcting one. That rule is
+    /// right for an invoice Mokosh issued and wrong here: the document the
+    /// customer holds is the provider's, the provider voided it, and
+    /// Mokosh insisting on a credit note would be a second correction for
+    /// one event.
+    ///
+    /// Guarded on the delegation rather than on a status: the provider
+    /// named here must be the one on the row, so a delivery for one
+    /// provider cannot void an invoice issued through another, and a local
+    /// invoice (`external_provider IS NULL`) matches nothing. No
+    /// `voided_by_id`, because no person did this; `void_reason` says who
+    /// did.
+    pub async fn void_delegated_invoice(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        provider: &str,
+    ) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let voided = sqlx::query(
+            r#"
+            UPDATE invoices
+            SET status      = 'void',
+                voided_at   = NOW(),
+                void_reason = $3,
+                updated_at  = NOW()
+            WHERE id = $1 AND tenant_id = $2
+              AND external_provider = $4
+              AND status <> 'void'
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .bind(format!("Voided in {provider}, which issued it"))
+        .bind(provider)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !voided {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            &AuditCtx::system(tenant_id.get()),
+            AuditAction::Update,
+            "invoices",
+            Some(invoice_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn record_gateway_payment(
         &self,
