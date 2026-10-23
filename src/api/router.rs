@@ -371,7 +371,7 @@ pub fn create_api_router(
     // dispatcher with `with_api_base` / `with_identity_base` pointing at a
     // stub, which is what lets the delegated path be exercised end to end
     // without reaching Xero or Intuit.
-    let billing_service = billing_service.with_invoice_dispatch(Arc::new(
+    let issuer_dispatcher = Arc::new(
         crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher::new(
             features.clone(),
             Arc::new(integrations_service.clone()),
@@ -384,7 +384,8 @@ pub fn create_api_router(
             Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
             Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
         ),
-    ));
+    );
+    let billing_service = billing_service.with_invoice_dispatch(issuer_dispatcher.clone());
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.clone());
@@ -1093,6 +1094,43 @@ pub fn create_api_router(
             crate::utils::error::normalize_error_envelope,
         ));
 
+    // MAPPS-1136: the invoice-issuer webhook receivers, nested under
+    // `/api/v1/xero` and `/api/v1/quickbooks` OUTSIDE the auth chain for the
+    // same reason the payment ones are: the provider authenticates itself with
+    // an HMAC over the raw body, keyed by the webhook secret stored with that
+    // tenant's connection. The tenant id in the path selects whose key to
+    // verify against and is not itself a credential.
+    //
+    // Both prefixes are in `RAW_BODY_PATHS`, because a byte the JSON sanitizer
+    // rewrote is a signature that does not verify.
+    //
+    // They share the dispatcher the serving `BillingService` was given, rather
+    // than building a second one: it owns the credential load, the near-expiry
+    // refresh and the two clients, and a receiver needs all three.
+    let invoice_issuer_webhooks = |provider| {
+        Router::new()
+            .route(
+                "/webhooks/{tenant_id}",
+                post(
+                    crate::modules::billing::webhook_invoice_issuer::invoice_issuer_webhook_handler,
+                ),
+            )
+            .with_state(Arc::new(
+                crate::modules::billing::webhook_invoice_issuer::InvoiceIssuerWebhookState {
+                    billing: Arc::new(BillingService::with_secrets(
+                        db.clone(),
+                        encryption_key,
+                        secrets.clone(),
+                    )),
+                    dispatcher: issuer_dispatcher.clone(),
+                    provider,
+                },
+            ))
+            .layer(middleware::from_fn(
+                crate::utils::error::normalize_error_envelope,
+            ))
+    };
+
     // Combine everything. The `.fallback` swallows any non-/api/v1/* request
     // (including hitting `/` directly in a browser) with a small placeholder
     // page that links the user back to the Mokosh frontend. This keeps
@@ -1199,6 +1237,18 @@ pub fn create_api_router(
         .nest("/api/v1/bunyip", bunyip_nest)
         .nest("/api/v1/stripe", stripe_webhooks)
         .nest("/api/v1/paypal", paypal_webhooks)
+        .nest(
+            "/api/v1/xero",
+            invoice_issuer_webhooks(
+                crate::modules::billing::invoice_issuer::InvoiceProviderKind::Xero,
+            ),
+        )
+        .nest(
+            "/api/v1/quickbooks",
+            invoice_issuer_webhooks(
+                crate::modules::billing::invoice_issuer::InvoiceProviderKind::Quickbooks,
+            ),
+        )
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))

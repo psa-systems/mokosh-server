@@ -179,6 +179,11 @@ mod server_impl {
         // delivery by being sent the body back and comparing it to what it
         // delivered, so a byte rewritten here is a FAILURE there.
         "/api/v1/paypal/",
+        // MAPPS-1136: both invoice-issuer receivers verify HMAC-SHA256 over
+        // the RAW body, so a byte the sanitizer rewrites is a signature that
+        // does not verify and a delivery refused for the wrong reason.
+        "/api/v1/xero/",
+        "/api/v1/quickbooks/",
     ];
 
     /// True for a `Content-Type` axum's `Json` extractor would accept:
