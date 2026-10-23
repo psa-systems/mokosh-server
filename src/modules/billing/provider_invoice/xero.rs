@@ -82,6 +82,15 @@ pub struct XeroCredentials {
 /// every refresh and MUST be stored; a
 /// client that keeps using the old refresh token sees `invalid_grant`
 /// on the next call. `expires_in` is seconds from now.
+/// One organisation a grant covers, as `GET /connections` lists it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct XeroConnection {
+    #[serde(rename = "tenantId")]
+    pub tenant_id: String,
+    #[serde(rename = "tenantName", default)]
+    pub tenant_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct XeroTokenResponse {
     pub access_token: String,
@@ -254,6 +263,75 @@ impl XeroClient {
     /// refresh tokens rotate on every call: the old one is immediately
     /// invalid). The caller writes the new pair back into the secret
     /// store before the next invoice call.
+    /// Exchange an authorization code for the first token pair
+    /// (MAPPS-1142).
+    ///
+    /// Same endpoint as the refresh, a different grant. The redirect URI is
+    /// repeated byte for byte from the state row, because Xero compares it
+    /// to the one the authorization request carried and a deployment can
+    /// change `PUBLIC_API_BASE_URL` while a consent screen is open.
+    pub async fn exchange_code(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        redirect_uri: &str,
+        code: &str,
+        code_verifier: &str,
+    ) -> AppResult<XeroTokenResponse> {
+        let url = format!("{}/connect/token", self.identity_base);
+        let resp = self
+            .http
+            .post(url)
+            .basic_auth(client_id, Some(client_secret))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", code_verifier),
+            ])
+            .send()
+            .await
+            .map_err(|e| AppError::internal(format!("Xero token exchange failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::BadRequest(format!(
+                "Xero refused the connection ({status}). Start again from Settings. {body}"
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| AppError::internal(format!("Xero token response did not parse: {e}")))
+    }
+
+    /// The Xero organisations this grant covers (MAPPS-1142).
+    ///
+    /// Xero's token response says nothing about which organisation was
+    /// authorized, so this is the call that answers it. The
+    /// `Xero-Tenant-Id` header is deliberately absent: it is what this asks
+    /// FOR.
+    pub async fn list_connections(&self, access_token: &str) -> AppResult<Vec<XeroConnection>> {
+        let url = format!("{}/connections", self.api_base);
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| AppError::internal(format!("Xero connections call failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::internal(format!(
+                "Xero connections returned {status}: {body}"
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| AppError::internal(format!("Xero connections did not parse: {e}")))
+    }
+
     pub async fn refresh_access_token(
         &self,
         creds: &XeroCredentials,

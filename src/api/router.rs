@@ -398,6 +398,22 @@ pub fn create_api_router(
         ),
     );
     let billing_service = billing_service.with_invoice_dispatch(issuer_dispatcher.clone());
+    // MAPPS-1142: the OAuth round trip that writes the credential blob the
+    // dispatcher and the receivers read. Its own service rather than another
+    // method on `IntegrationsService`, because what it does is a browser round
+    // trip with a single-use state, which is contact sync's shape and not the
+    // integrations catalog's.
+    let issuer_connect = Arc::new(
+        crate::modules::billing::invoice_issuer_connect::InvoiceIssuerConnectService::new(
+            db.clone(),
+            secrets.clone(),
+            issuer_apps.clone(),
+            Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
+            Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
+            public_api_base_url.clone(),
+            client_origin.clone(),
+        ),
+    );
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.clone());
@@ -782,6 +798,13 @@ pub fn create_api_router(
         .merge(crate::modules::integrations::integration_routes(
             integrations_service,
         ))
+        // MAPPS-1142: starting a Xero or QuickBooks connection. Admin-gated
+        // inside, beside the catalog it ends up writing a row in.
+        .merge(
+            crate::modules::billing::invoice_issuer_connect::invoice_issuer_connect_routes(
+                issuer_connect.clone(),
+            ),
+        )
         // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
         .merge(rmm_routes(rmm_service))
         // Client service status: monitored systems and observed check
@@ -1165,6 +1188,16 @@ pub fn create_api_router(
         .merge(crate::modules::features::routes::public_config_routes(
             features.clone(),
         ))
+        // MAPPS-1142: the OAuth redirect Xero and Intuit send an admin's
+        // browser to. Unauthenticated by construction, the same reasoning as
+        // the contact-sync callbacks below: a redirect carries no session, and
+        // the single-use state is the only identity it has. Every outcome is a
+        // redirect back to the SPA.
+        .merge(
+            crate::modules::billing::invoice_issuer_connect::invoice_issuer_public_routes(
+                issuer_connect.clone(),
+            ),
+        )
         // PMS-1212 (PSA-70): the OAuth redirect Google sends an admin's
         // browser to. Unauthenticated by construction - a redirect carries no
         // session - and its credential is the single-use `state` parameter,
