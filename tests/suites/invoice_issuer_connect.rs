@@ -403,6 +403,107 @@ async fn a_grant_over_several_organisations_is_refused(pool: PgPool) {
     assert!(integration_row(&pool, "xero").await.is_none());
 }
 
+/// What the settings page reads, through the four states it has to
+/// render.
+///
+/// `configured` is the deployment's answer and the one the catalog cannot
+/// give: a built provider on a deployment holding no client id still
+/// cannot be connected, and a page that offered Connect for it would be
+/// MAPPS-1121 again.
+#[mokosh_test]
+async fn the_overview_answers_for_the_deployment_and_for_the_tenant(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    // A deployment with no application: configured false, and never
+    // connected reads as an offer rather than an error.
+    let (bare, _secrets, _db) = service(&pool, &base, IssuerApps::default()).await;
+    let view = bare
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert!(!view.configured, "no application on this deployment");
+    assert_eq!(view.status.as_str(), "not_connected");
+    assert!(view.organisation_id.is_none());
+    assert!(!view.delegated);
+
+    // Configured, still not connected.
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+    let view = svc
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert!(view.configured);
+    assert_eq!(view.status.as_str(), "not_connected");
+
+    // Connected, through the flow that is the only thing that sets it.
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("complete");
+    let view = svc
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert_eq!(view.status.as_str(), "connected");
+    assert_eq!(
+        view.organisation_id.as_deref(),
+        Some("xero-org-1"),
+        "an admin with two Xero organisations needs to know which one this is"
+    );
+    assert!(
+        view.delegated,
+        "connecting through this flow IS the delegation"
+    );
+
+    // And the other provider is untouched by any of it.
+    let other = svc
+        .overview(tenant, InvoiceProviderKind::Quickbooks)
+        .await
+        .expect("overview");
+    assert_eq!(other.status.as_str(), "not_connected");
+    assert!(other.configured, "the deployment holds both applications");
+}
+
+/// One tenant's connection is invisible to another.
+#[mokosh_test]
+async fn an_overview_does_not_leak_another_tenants_connection(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("complete");
+
+    let other_tenant = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name, slug, kind) VALUES ($1, 'Other MSP', $2, 'org')")
+        .bind(other_tenant)
+        .bind(format!("other-{}", &other_tenant.to_string()[..8]))
+        .execute(&pool)
+        .await
+        .expect("seed the other tenant");
+
+    let view = svc
+        .overview(
+            TenantId::from_trusted(other_tenant),
+            InvoiceProviderKind::Xero,
+        )
+        .await
+        .expect("overview");
+    assert_eq!(view.status.as_str(), "not_connected");
+    assert!(view.organisation_id.is_none());
+}
+
 /// A deployment with no application for the provider cannot start a
 /// connection, and says so in the deployment's terms.
 #[mokosh_test]
