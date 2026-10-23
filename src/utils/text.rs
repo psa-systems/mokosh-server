@@ -182,8 +182,9 @@ mod server_impl {
         // MAPPS-1136: both invoice-issuer receivers verify HMAC-SHA256 over
         // the RAW body, so a byte the sanitizer rewrites is a signature that
         // does not verify and a delivery refused for the wrong reason.
-        "/api/v1/xero/",
-        "/api/v1/quickbooks/",
+        // MAPPS-1141 moved them under one prefix, because there is one
+        // subscription per provider and therefore one URL.
+        "/api/v1/webhooks/",
     ];
 
     /// True for a `Content-Type` axum's `Json` extractor would accept:
