@@ -30,6 +30,7 @@ pub mod credential_move;
 pub mod descriptions;
 pub mod documents;
 pub mod invoice_issuer;
+pub mod invoice_issuer_credentials;
 pub mod invoice_issuer_mapping_routes;
 pub mod invoice_issuer_mappings;
 pub mod issuer;

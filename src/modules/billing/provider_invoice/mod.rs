@@ -19,6 +19,9 @@ pub mod quickbooks;
 pub mod xero;
 
 pub use quickbooks::{
-    QuickBooksClient, QuickBooksCredentials, QuickBooksInvoiceStatus, QuickBooksIssueInvoiceRequest,
+    QuickBooksClient, QuickBooksCredentials, QuickBooksInvoiceStatus,
+    QuickBooksIssueInvoiceRequest, QuickBooksTokenResponse,
 };
-pub use xero::{XeroClient, XeroCredentials, XeroInvoiceStatus, XeroIssueInvoiceRequest};
+pub use xero::{
+    XeroClient, XeroCredentials, XeroInvoiceStatus, XeroIssueInvoiceRequest, XeroTokenResponse,
+};
