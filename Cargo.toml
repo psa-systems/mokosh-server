@@ -63,7 +63,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Axum HTTP server
-axum = { version = "0.8.3", features = ["macros", "multipart", "ws"] }
+axum = { version = "0.8.9", features = ["macros", "multipart", "ws"] }
 tower = { version = "0.5", features = ["full"] }
 # PMS-780: `compression-br` alongside `compression-gzip` so the global
 # `CompressionLayer` can answer `Accept-Encoding: br`; without the feature it
