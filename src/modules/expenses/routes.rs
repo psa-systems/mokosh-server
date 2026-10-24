@@ -3,7 +3,8 @@
 //!
 //! Phase A: vendors, expense categories.
 //! Phase B: bill + expense headers with lifecycle transitions.
-//! Phase C (Xero / QuickBooks delegation) is blocked on MAPPS-1099.
+//! Phase C (Xero / QuickBooks delegation) builds on the OAuth + webhook
+//! infrastructure MAPPS-1099 shipped; it has not yet been started.
 //!
 //! parity record 2026-10-23: every route this module mounts has no
 //! SPA caller yet. They all land ahead of the SPA half MAPPS-1123
