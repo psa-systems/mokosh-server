@@ -1015,7 +1015,7 @@ dependencies = [
 [[package]]
 name = "dunite-stripe-core"
 version = "0.1.0"
-source = "git+https://dev.a8n.run/psa-systems/dunite?rev=cc10e8358a6f21160544a415a9488c16827af699#cc10e8358a6f21160544a415a9488c16827af699"
+source = "git+https://dev.a8n.run/psa-systems/dunite?rev=91e27f2b798128aa2cf54f742df8248564888bf0#91e27f2b798128aa2cf54f742df8248564888bf0"
 dependencies = [
  "hex",
  "hmac 0.12.1",
