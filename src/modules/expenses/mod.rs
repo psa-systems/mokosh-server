@@ -36,8 +36,8 @@
 //!   write path for each.
 //! - **worker**: due-date reminders and reimbursement batching are a
 //!   later phase.
-//! - **delegation to Xero / QuickBooks**: blocked on MAPPS-1099 shipping
-//!   OAuth + webhook infrastructure.
+//! - **delegation to Xero / QuickBooks**: builds on the OAuth + webhook
+//!   infrastructure MAPPS-1099 shipped; not yet started.
 //!
 //! # Why six tables and not fewer
 //!
