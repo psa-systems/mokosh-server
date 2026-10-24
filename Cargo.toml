@@ -244,7 +244,7 @@ allsorts = { package = "allsorts-azul", version = "0.17.1", default-features = f
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for
 # deterministic virtual-clock tests (used by tests/scheduler.rs).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
-tempfile = "3"
+tempfile = "3.27.0"
 # Integration-test HTTP client. Tests pull the bearer token out of the
 # login JSON body and attach it via `.bearer_auth(&token)` on each call,
 # so no cookie jar is required (the legacy AuthMiddleware authenticates
