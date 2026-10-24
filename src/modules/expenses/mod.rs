@@ -15,7 +15,7 @@
 //! - [`models`]: the Rust types that mirror the schema, derivable to and
 //!   from a sqlx row.
 //!
-//! # What ships in Phase A (this PR)
+//! # What ships in Phase A
 //!
 //! - [`service::ExpensesService`]: the one writer. Vendors and expense
 //!   categories CRUD, admin+finance gated, tenant-isolated through
@@ -24,16 +24,27 @@
 //! - [`routes::expenses_routes`]: `/api/v1/vendors` and
 //!   `/api/v1/expense-categories` CRUD, merged into the staff plane.
 //!
-//! Only the leaf lookups land here because they are prerequisites for
-//! the bill/expense headers themselves. Mounting empty `/api/v1/bills`
-//! and `/api/v1/expenses` endpoints that return `NotImplemented` is the
-//! "advertises what the build cannot deliver" anti-pattern MAPPS-1098
-//! and MAPPS-1102 enforce against.
+//! Only the leaf lookups land in Phase A because they are prerequisites
+//! for the bill/expense headers themselves. Mounting empty
+//! `/api/v1/bills` and `/api/v1/expenses` endpoints that return
+//! `NotImplemented` is the "advertises what the build cannot deliver"
+//! anti-pattern MAPPS-1098 and MAPPS-1102 enforce against.
 //!
-//! # What does NOT ship in Phase A
+//! # What ships in Phase B
 //!
-//! - **bills / expenses headers**: lands in Phase B with the first
-//!   write path for each.
+//! - [`service::ExpensesService`] gains the bill and expense headers,
+//!   each atomic with its lines in one transaction: bills
+//!   (`draft -> approved -> paid`, `void`) and expenses
+//!   (`draft -> submitted -> approved -> reimbursed`, `rejected`).
+//! - [`routes::expenses_routes`] mounts `/api/v1/bills`,
+//!   `/api/v1/bills/{id}`, `/api/v1/bills/{id}/approve`,
+//!   `/api/v1/bills/{id}/void`, `/api/v1/expenses`,
+//!   `/api/v1/expenses/{id}`, `/api/v1/expenses/{id}/submit`,
+//!   `/api/v1/expenses/{id}/approve`, `/api/v1/expenses/{id}/reject`,
+//!   and `/api/v1/expenses/{id}/reimburse`.
+//!
+//! # What does NOT ship
+//!
 //! - **worker**: due-date reminders and reimbursement batching are a
 //!   later phase.
 //! - **delegation to Xero / QuickBooks**: blocked on MAPPS-1099 shipping
