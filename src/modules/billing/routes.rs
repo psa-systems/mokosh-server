@@ -957,6 +957,29 @@ async fn get_invoice_pdf(
             return Err(AppError::NotFound("Invoice".to_string()));
         }
     }
+    // MAPPS-1147: a delegated invoice has no Mokosh document, and must not
+    // be given one.
+    //
+    // It is `sent` and therefore frozen (MAPPS-1135), and deliberately has
+    // no stored bytes: the document the customer holds is the provider's
+    // and Mokosh never rendered one. Without this the live-render fallback
+    // below fires and answers a Mokosh-branded PDF carrying Mokosh's
+    // number for an invoice Xero issued, numbered and delivered. Two
+    // documents for one invoice, and an admin who forwards the wrong one
+    // has sent their customer a second invoice.
+    //
+    // A refusal naming where the document is, rather than a redirect into
+    // the provider, which Mokosh cannot authenticate this caller for.
+    if let Some(provider) = invoice.external_provider.as_deref() {
+        return Err(AppError::Conflict(format!(
+            "This invoice was issued by {provider}, so its document is {provider}'s. Open it              there{}.",
+            invoice
+                .external_number
+                .as_deref()
+                .map(|n| format!(" as {n}"))
+                .unwrap_or_default()
+        )));
+    }
     let preview = preview.resolve(
         invoice.status.is_frozen(),
         matches!(caller, CallerContext::Staff(_)),
