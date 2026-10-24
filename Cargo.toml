@@ -238,7 +238,7 @@ printpdf = { version = "0.12.7", default-features = false, features = ["png", "j
 # subsetter it calls is this crate - already in the build graph as printpdf's own
 # non-optional dependency, so naming it here adds no compile. Same version and
 # same feature set as printpdf pins, so both see one build of it.
-allsorts = { package = "allsorts-azul", version = "0.17.1", default-features = false, features = ["flate2_rust"] }
+allsorts = { package = "allsorts-azul", version = "0.17.2", default-features = false, features = ["flate2_rust"] }
 
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for
