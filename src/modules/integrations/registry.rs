@@ -104,6 +104,19 @@ pub enum CredentialHome {
     /// PMS-1315 has one more question to answer than PMS-1312 did and the
     /// difference belongs in the registry rather than in whoever reads it next.
     ContactSync,
+    /// `SecretKind::Integration`, written by the invoice-issuer OAuth round
+    /// trip on the provider's own settings page (MAPPS-1142).
+    ///
+    /// The same storage as [`Self::Integration`] and a different home,
+    /// because what matters here is not where the bytes live but whether
+    /// this surface can produce them. Nothing is ENTERED: it is a consent
+    /// round trip, so there is no field to render and no credential for a
+    /// Connect button on Connected Services to send. That is why
+    /// `entered_at` answers `None` and [`ProviderDescriptor::setup_surface`]
+    /// names the page instead, per provider - Xero and QuickBooks have
+    /// different ones, which is the same reason MAPPS-1122 made the surface
+    /// per provider rather than per credential home.
+    InvoiceIssuer,
 }
 
 impl CredentialHome {
@@ -114,6 +127,7 @@ impl CredentialHome {
             Self::Integration => "integration",
             Self::PaymentGateway => "payment_gateway",
             Self::ContactSync => "contact_sync",
+            Self::InvoiceIssuer => "invoice_issuer",
         }
     }
 
@@ -132,6 +146,11 @@ impl CredentialHome {
             Self::Integration => None,
             Self::PaymentGateway => Some("Settings > Payment Gateways"),
             Self::ContactSync => Some("Settings > Google Contacts"),
+            // Nothing is entered: the credential is an OAuth grant, so
+            // there is no surface where somebody types one. Which page
+            // STARTS that grant differs per provider and is
+            // `setup_surface`'s answer, not this one's.
+            Self::InvoiceIssuer => None,
         }
     }
 }
@@ -235,7 +254,13 @@ impl ProviderDescriptor {
     /// missing from it. Listing a provider costs nothing and says something;
     /// offering a second place to change it was the problem.
     pub fn is_writable_on_integrations_page(&self) -> bool {
-        !matches!(self.credential_home, CredentialHome::PaymentGateway)
+        // A whitelist since MAPPS-1153, and the inversion is the point. It
+        // used to answer "anything that is not a payment gateway", so a
+        // credential home added later became writable here by default and
+        // nobody had to decide that. `Integration` is the only home whose
+        // credential arrives in the connect request, which is the only way
+        // this surface can connect anything.
+        matches!(self.credential_home, CredentialHome::Integration)
     }
 
     /// The settings surface that owns this provider's setup, for the panel's
@@ -267,6 +292,16 @@ impl ProviderDescriptor {
             (IntegrationProvider::Microsoft, _) => Some(SetupSurface {
                 kind: "contact_sync_microsoft",
                 label: "Settings > Microsoft 365 Contacts",
+            }),
+            // MAPPS-1153: each issuer has its own page, which is where the
+            // consent round trip starts and where the mappings live.
+            (IntegrationProvider::Xero, _) => Some(SetupSurface {
+                kind: "invoice_issuer_xero",
+                label: "Settings > Xero",
+            }),
+            (IntegrationProvider::Quickbooks, _) => Some(SetupSurface {
+                kind: "invoice_issuer_quickbooks",
+                label: "Settings > QuickBooks",
             }),
             _ => None,
         }
@@ -332,10 +367,8 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         supported_capabilities: &[Capability::Invoicing, Capability::BillsAndExpenses],
         polling: Some(POLLED),
         connection_home: ConnectionHome::Integrations,
-        credential_home: CredentialHome::Integration,
-        build: ProviderBuild::Planned {
-            tracked_by: "MAPPS-1099",
-        },
+        credential_home: CredentialHome::InvoiceIssuer,
+        build: ProviderBuild::Built,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Xero,
@@ -345,10 +378,8 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         supported_capabilities: &[Capability::Invoicing, Capability::BillsAndExpenses],
         polling: Some(POLLED),
         connection_home: ConnectionHome::Integrations,
-        credential_home: CredentialHome::Integration,
-        build: ProviderBuild::Planned {
-            tracked_by: "MAPPS-1099",
-        },
+        credential_home: CredentialHome::InvoiceIssuer,
+        build: ProviderBuild::Built,
     },
     ProviderDescriptor {
         provider: IntegrationProvider::Google,
@@ -554,7 +585,7 @@ mod tests {
     #[test]
     fn is_writable_on_integrations_page_matches_credential_home() {
         for entry in REGISTRY {
-            let want = !matches!(entry.credential_home, CredentialHome::PaymentGateway);
+            let want = matches!(entry.credential_home, CredentialHome::Integration);
             assert_eq!(
                 entry.is_writable_on_integrations_page(),
                 want,
@@ -579,24 +610,67 @@ mod tests {
         }
     }
 
-    /// MAPPS-1098: the non-payment providers in the current registry stay
-    /// on the integrations page. A regression here means a legitimate
-    /// provider disappears from the only screen it has.
+    /// MAPPS-1153: no provider in this registry is configured on the
+    /// integrations page, and every one of them says where it IS.
+    ///
+    /// This replaces a test asserting the opposite for four of them, and
+    /// the inversion is the end of MAPPS-1122's argument rather than a
+    /// reversal of it: Connected Services is a panel that says what is
+    /// connected and where each one is set up, so a provider configured
+    /// there would be the exception. The payment providers are the payments
+    /// surface's, the contact sources are contact sync's, and the invoice
+    /// issuers are their own pages'.
+    ///
+    /// The second assertion is what makes the first safe. A provider that
+    /// is not writable here and names no surface is unreachable: listed,
+    /// unconfigurable, and pointing nowhere.
     #[test]
-    fn non_payment_providers_are_exposed_on_integrations_page() {
-        for provider in [
-            IntegrationProvider::Quickbooks,
-            IntegrationProvider::Xero,
-            IntegrationProvider::Google,
-            IntegrationProvider::Microsoft,
-        ] {
-            let d = descriptor(provider);
+    fn no_provider_is_configured_on_the_integrations_page_and_each_says_where_it_is() {
+        for entry in REGISTRY {
             assert!(
-                d.is_writable_on_integrations_page(),
-                "{} must appear on Settings > Integrations",
-                provider.as_str()
+                !entry.is_writable_on_integrations_page(),
+                "{} would be configured on the panel, which is not what the panel is for",
+                entry.display_name
+            );
+            assert!(
+                entry.setup_surface().is_some(),
+                "{} is not configured here and names no page that does",
+                entry.display_name
             );
         }
+    }
+
+    /// A credential home added later is not writable here until somebody
+    /// says so.
+    ///
+    /// The predicate used to answer "anything that is not a payment
+    /// gateway", so a new home became writable by default and the decision
+    /// was made by omission. Asserted per home rather than per provider,
+    /// because the next one will arrive without a provider carrying it yet.
+    #[test]
+    fn only_the_integration_credential_home_is_writable_here() {
+        for home in [
+            CredentialHome::PaymentGateway,
+            CredentialHome::ContactSync,
+            CredentialHome::InvoiceIssuer,
+        ] {
+            let entry = ProviderDescriptor {
+                credential_home: home,
+                ..*descriptor(IntegrationProvider::Google)
+            };
+            assert!(
+                !entry.is_writable_on_integrations_page(),
+                "{home:?} is configured on its own surface, not on the panel"
+            );
+        }
+        let arrives_here = ProviderDescriptor {
+            credential_home: CredentialHome::Integration,
+            ..*descriptor(IntegrationProvider::Google)
+        };
+        assert!(
+            arrives_here.is_writable_on_integrations_page(),
+            "a credential that arrives in the connect request is the one case this surface serves"
+        );
     }
 
     /// MAPPS-1102: the `point_of_sale` capability was dropped. Pin that no
@@ -685,6 +759,16 @@ mod mapps1121_build_state_tests {
                 IntegrationProvider::Microsoft,
                 host("graph.microsoft", ".com"),
             ),
+            // MAPPS-1153: the two invoice issuers, flipped once they had a
+            // client, a consent round trip, a settings page and a mapping
+            // surface. Their hosts were assembled from parts until now,
+            // precisely so this test would not read a library-only client as
+            // evidence; the parts are gone and the marker is the real host.
+            (IntegrationProvider::Xero, host("api.xero", ".com")),
+            (
+                IntegrationProvider::Quickbooks,
+                host("quickbooks.api.intuit", ".com"),
+            ),
         ] {
             assert!(
                 descriptor(provider).build.is_built(),
@@ -695,18 +779,17 @@ mod mapps1121_build_state_tests {
                 "{provider:?} is marked Built but nothing in src/modules talks to {marker}"
             );
         }
-        for provider in [IntegrationProvider::Quickbooks, IntegrationProvider::Xero] {
-            assert!(
-                !descriptor(provider).build.is_built(),
-                "{provider:?} has no client, no capability reader and no poll job; marking it \
-                 Built is what put a credential field in front of a tenant"
-            );
-        }
-        for absent in [host("xero", ".com"), host("quickbooks.api.intuit", ".com")] {
-            assert!(
-                !sources.contains(&absent),
-                "{absent} now exists, so its provider's build state is stale"
-            );
+        // Nothing is planned any more, and the rule still has to hold for
+        // whatever is added next: a `Planned` entry must not be the one with
+        // a client behind it.
+        for entry in REGISTRY {
+            if !entry.build.is_built() {
+                panic!(
+                    "{} is planned; add its marker above when it flips, or this test stops \
+                     meaning anything",
+                    entry.display_name
+                );
+            }
         }
     }
 }
@@ -751,20 +834,34 @@ mod mapps1122_panel_tests {
 
     /// A provider with nothing behind it has nowhere to send anyone.
     ///
-    /// The panel's one action is "Set up", and offering it for QuickBooks
-    /// would land on a page that does not exist. MAPPS-1121 says the card is
-    /// "not available yet"; this is the other half of that statement.
+    /// The panel's one action is "Set up", and offering it for a provider
+    /// with no page would land an operator on nothing. MAPPS-1121 says such
+    /// a card is "not available yet"; this is the other half of that
+    /// statement.
+    ///
+    /// MAPPS-1153 flipped the last two `Planned` entries, so the rule is
+    /// asserted over the registry rather than against a list of names: it
+    /// has to keep holding for the next provider added as planned, and a
+    /// test naming Xero would have been deleted rather than kept.
     #[test]
     fn a_planned_provider_offers_no_setup_surface() {
-        for provider in [IntegrationProvider::Quickbooks, IntegrationProvider::Xero] {
-            let entry = descriptor(provider);
-            assert!(!entry.build.is_built());
-            assert!(
-                entry.setup_surface().is_none(),
-                "{} has nowhere to send an operator yet",
-                entry.display_name
-            );
+        let mut built_with_a_surface = 0;
+        for entry in REGISTRY {
+            if entry.build.is_built() {
+                built_with_a_surface += entry.setup_surface().is_some() as usize;
+            } else {
+                assert!(
+                    entry.setup_surface().is_none(),
+                    "{} is planned and has nowhere to send an operator",
+                    entry.display_name
+                );
+            }
         }
+        assert_eq!(
+            built_with_a_surface,
+            REGISTRY.len(),
+            "every built provider names the page that owns it, which is what the panel links to"
+        );
     }
 
     /// Listing a provider and letting it be changed here are different
