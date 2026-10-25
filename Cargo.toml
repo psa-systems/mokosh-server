@@ -166,7 +166,7 @@ encoding_rs = "0.8"
 # directly, event by event, because the parts this needs (hrefs, etags,
 # address-data, the sync token) are a handful of elements rather than a document
 # model.
-quick-xml = { version = "0.37", default-features = false }
+quick-xml = { version = "0.41", default-features = false }
 
 # CIDR parsing for the trusted-proxy allowlist that gates X-Forwarded-For
 # client-IP extraction (PMS-587).
