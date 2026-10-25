@@ -6,7 +6,8 @@
 //! bills (`draft -> approved -> paid`, `void`) and expenses
 //! (`draft -> submitted -> approved -> reimbursed`, `rejected`), each
 //! atomic with its lines in one transaction. Delegation to Xero /
-//! QuickBooks is Phase C, blocked on MAPPS-1099.
+//! QuickBooks is Phase C: it builds on the OAuth + webhook infrastructure
+//! MAPPS-1099 shipped, and has not yet been started.
 //!
 //! Every mutation runs inside `begin_with_tenant` and writes an
 //! `audit_log` row in the same transaction, matching the billing

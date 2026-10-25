@@ -291,6 +291,44 @@ impl InvoiceIssuerConnectService {
         ))
     }
 
+    /// Stop delegating to a provider, and forget how to reach it
+    /// (MAPPS-1145).
+    ///
+    /// The credential goes, because the blob is what every delegated call
+    /// reads and a disconnect that left it behind would leave a working
+    /// connection the UI says is off.
+    ///
+    /// The capability set stays. That is the house rule for `disconnected`
+    /// (PMS-1312, and the reason the four statuses are not a boolean):
+    /// what a tenant delegated is their answer, and reconnecting should not
+    /// start from an empty page. It is safe to keep only because
+    /// `IssuerDispatcher::plan` requires a LIVE connection as well as the
+    /// capability; before MAPPS-1145 it read the capability alone, and a
+    /// row in this state would have sent every new invoice down a
+    /// delegated path whose credential had just been deleted.
+    pub async fn disconnect(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+    ) -> AppResult<()> {
+        self.secrets
+            .delete(&SecretKey::integration(*tenant_id, provider.as_str()))
+            .await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE integrations \
+             SET status = 'disconnected', disconnected_at = NOW(), last_error = NULL, \
+                 updated_at = NOW() \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// What a settings page for one provider reads (MAPPS-1143).
     ///
     /// Four facts, and three of them the integrations catalog cannot
@@ -621,6 +659,10 @@ pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) 
             "/integrations/invoice-issuer/{provider}/authorize",
             post(authorize),
         )
+        .route(
+            "/integrations/invoice-issuer/{provider}/disconnect",
+            post(disconnect),
+        )
         .with_state(InvoiceIssuerConnectRouterState { service })
 }
 
@@ -665,6 +707,17 @@ async fn authorize(
         .begin(user.tenant(), user.id, provider)
         .await?;
     Ok(Json(AuthorizeResponse { authorize_url }))
+}
+
+async fn disconnect(
+    State(state): State<InvoiceIssuerConnectRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Path(provider): Path<String>,
+) -> AppResult<axum::http::StatusCode> {
+    let provider = parse_provider(&provider)?;
+    state.service.disconnect(user.tenant(), provider).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Always a redirect, never a JSON body: the caller is a browser.

@@ -791,6 +791,75 @@ async fn the_flag_off_reaches_no_provider_at_all(pool: PgPool) {
     );
 }
 
+/// MAPPS-1145: a disconnected provider takes the local path, and does not
+/// fail.
+///
+/// The capability survives a disconnect on purpose, so this row says
+/// `invoicing` is delegated and holds no credential. `plan` used to read
+/// the capability alone, which would send this invoice to the provider and
+/// refuse it `Unauthorized` on a blob that is gone - every invoice create
+/// for the tenant failing, with a row that says `disconnected` as the only
+/// clue.
+#[mokosh_test]
+async fn a_disconnected_provider_falls_back_to_the_local_path(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (billing, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    // The exact state a disconnect leaves: capability kept, status
+    // disconnected, and no credential at all.
+    sqlx::query(
+        "INSERT INTO integrations (tenant_id, provider, status, enabled_capabilities, \
+             disconnected_at) \
+         VALUES ($1, 'xero', 'disconnected', ARRAY['invoicing']::text[], NOW())",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("seed a disconnected row");
+    InvoiceIssuerMappingService::new(db)
+        .upsert_customer_mapping(
+            tenant,
+            InvoiceProviderKind::Xero,
+            company_id,
+            "3f6c6a2e-9d41-4a39-9f6a-6d1a1c2b3d4e",
+        )
+        .await
+        .expect("map the company");
+    assert!(
+        secrets
+            .get(&mokosh_server::secrets::SecretKey::integration(
+                common::DEFAULT_TENANT_ID,
+                "xero"
+            ))
+            .await
+            .expect("read")
+            .is_none(),
+        "the fixture holds no credential, which is what a disconnect leaves"
+    );
+
+    let created = billing
+        .create_invoice(
+            tenant,
+            &request(company_id),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("a disconnected provider must not break invoicing");
+
+    assert_eq!(stub.lock().unwrap().issue.len(), 0, "nothing is sent");
+    let columns = external_columns(&pool, created.id)
+        .await
+        .expect("the row exists");
+    assert_eq!(
+        (columns.0, columns.1, columns.2),
+        (None, None, None),
+        "and the invoice is Mokosh's own"
+    );
+}
+
 /// The toggle on, and nothing delegated: still the local path.
 #[mokosh_test]
 async fn a_tenant_that_delegated_nothing_keeps_the_local_path(pool: PgPool) {

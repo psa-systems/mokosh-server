@@ -26,9 +26,9 @@ authors = ["Mokosh Server Team"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 async-trait = "0.1"
-secrecy = { version = "0.10", features = ["serde"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
 ipnetwork = "0.20"
 # `pool` is NOT a lettre default; opt in so LettreMailer reuses TCP
 # connections across sends. `native-tls` over rustls because some SMTP
@@ -63,7 +63,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Axum HTTP server
-axum = { version = "0.8.3", features = ["macros", "multipart", "ws"] }
+axum = { version = "0.8.9", features = ["macros", "multipart", "ws"] }
 tower = { version = "0.5", features = ["full"] }
 # PMS-780: `compression-br` alongside `compression-gzip` so the global
 # `CompressionLayer` can answer `Accept-Encoding: br`; without the feature it
@@ -238,7 +238,7 @@ printpdf = { version = "0.12.7", default-features = false, features = ["png", "j
 # subsetter it calls is this crate - already in the build graph as printpdf's own
 # non-optional dependency, so naming it here adds no compile. Same version and
 # same feature set as printpdf pins, so both see one build of it.
-allsorts = { package = "allsorts-azul", version = "0.17.1", default-features = false, features = ["flate2_rust"] }
+allsorts = { package = "allsorts-azul", version = "0.17.2", default-features = false, features = ["flate2_rust"] }
 
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for
