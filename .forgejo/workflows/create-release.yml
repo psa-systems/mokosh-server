@@ -29,11 +29,10 @@
 # `secrets: inherit` is required. A called workflow receives no secret it is not
 # passed, and the release POST needs FORGEJO_PAT (write:repository).
 #
-# common also accepts a `release/v*` TAG-push caller (PC-68), which it calls the
-# recommended shape because the release is then cut from the reviewed tagged
-# commit rather than a PR head. This repo stays on the merge trigger so that
-# adopting common does not also change when a release happens; moving is a
-# separate change, and `just publish-release` is the recipe it needs.
+# common also accepts a `release/v*` TAG-push caller (PC-68), kept there for
+# backward compatibility; `just publish-release`, the recipe that fed it, was
+# retired when every consumer moved to release-on-merge (PC-86). This repo
+# already stayed on the merge trigger, so the bump changes nothing here.
 name: Create release
 
 on:
