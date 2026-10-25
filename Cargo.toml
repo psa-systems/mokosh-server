@@ -23,8 +23,8 @@ authors = ["Mokosh Server Team"]
 # (PMS-785): an entry nobody inherits pins a version and a feature set the build
 # never uses. `scripts/check-workspace-deps.nu` fails the build if that drifts.
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 async-trait = "0.1.92"
@@ -277,7 +277,7 @@ hmac = "0.12"
 sha2 = "0.10"
 # MAPPS-542: exercise `PaginationParams` deserialization from a raw query
 # string in unit tests, matching what axum's `Query` extractor does.
-serde_urlencoded = "0.7"
+serde_urlencoded = "0.7.1"
 # PMS-1254: `#[mokosh_test]`, which clones each test's database from a
 # migrated template instead of applying every migration into it. A
 # dev-dependency only, so nothing it expands to reaches a release build. It
