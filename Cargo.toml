@@ -105,7 +105,7 @@ chrono-tz = "0.9"
 argon2 = "0.5"
 
 # JWT tokens
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # Validation
 validator = { version = "0.19", features = ["derive"] }
