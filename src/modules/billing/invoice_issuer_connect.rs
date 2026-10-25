@@ -48,28 +48,21 @@ use std::sync::Arc;
 /// The same number contact sync uses, for the same reason.
 const STATE_TTL_MINUTES: i64 = 10;
 
-/// The two consent endpoints, built from parts rather than written as one
-/// literal each.
+/// The two consent endpoints.
 ///
-/// The clients do the same and say why: `built_providers_have_something
-/// _behind_them` (MAPPS-1121) scans `src/modules` for a provider's real
-/// host and fails when it finds one behind a descriptor still marked
-/// `Planned`. Both descriptors are still `Planned`, because flipping them
-/// puts a Connect button and a credential box on Connected Services while
-/// the page that drives THIS flow does not exist yet, which is the exact
-/// defect MAPPS-1121 removed. The flip belongs with that page, and it has
-/// to move `credential_home` at the same time: the credential here is an
-/// OAuth round trip, not something an admin pastes.
-const XERO_AUTH_HOST: &str = "login.xero";
-const QUICKBOOKS_AUTH_HOST: &str = "appcenter.intuit";
-const DOT_COM: &str = ".com";
-
+/// Assembled from parts until MAPPS-1153, for the reason the clients'
+/// hosts were: `built_providers_have_something_behind_them` (MAPPS-1121)
+/// scans `src/modules` for a provider's real host and fails when it finds
+/// one behind a descriptor still marked `Planned`. Both descriptors are
+/// `Built` now - the page that drives this flow exists, and
+/// `credential_home` moved with the flip so Connected Services links to
+/// that page instead of offering a credential box.
 fn xero_auth_endpoint() -> String {
-    format!("https://{XERO_AUTH_HOST}{DOT_COM}/identity/connect/authorize")
+    "https://login.xero.com/identity/connect/authorize".to_string()
 }
 
 fn quickbooks_auth_endpoint() -> String {
-    format!("https://{QUICKBOOKS_AUTH_HOST}{DOT_COM}/connect/oauth2")
+    "https://appcenter.intuit.com/connect/oauth2".to_string()
 }
 
 /// What Mokosh asks each provider for.

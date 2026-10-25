@@ -36,21 +36,19 @@ use serde::{Deserialize, Serialize};
 use crate::modules::billing::invoice_issuer::{ExternalInvoiceRef, InvoiceProviderKind};
 use crate::utils::error::{AppError, AppResult};
 
-// Intuit host constants are split into `host + tld` so a source-level
-// scan for the full Intuit API or identity hostname in src/modules/
-// does not read this library-only client as evidence the Planned
-// descriptor should flip to Available
+// These hosts were split into `host + tld` until MAPPS-1153, so that a
+// source-level scan would not read a library-only client as evidence the
+// `Planned` descriptor should flip
 // (`built_providers_have_something_behind_them`, MAPPS-1121). The
-// runtime URLs are byte-identical to the original string literals.
-const QBO_IDENTITY_HOST: &str = "oauth.platform.intuit";
-const QBO_API_HOST: &str = "quickbooks.api.intuit";
-const QBO_TLD: &str = ".com";
+// descriptor has flipped and that guard now asserts the opposite: a built
+// provider must have a real host behind it. The runtime URLs are
+// byte-identical to what the parts produced.
 
 /// Intuit's identity host for OAuth 2.0 token refresh. Overridable
 /// through `QuickBooksClient::with_identity_base` so a test can point
-/// at a local wiremock without touching Intuit's live host.
+/// at a local stub without touching Intuit's live host.
 fn default_identity_base() -> String {
-    format!("https://{QBO_IDENTITY_HOST}{QBO_TLD}")
+    "https://oauth.platform.intuit.com".to_string()
 }
 
 /// Intuit's Accounting API host. Overridable via
@@ -58,7 +56,7 @@ fn default_identity_base() -> String {
 /// host uses the same path shape, so an integration test against
 /// sandbox goes through the same setter.
 fn default_api_base() -> String {
-    format!("https://{QBO_API_HOST}{QBO_TLD}")
+    "https://quickbooks.api.intuit.com".to_string()
 }
 
 /// QBO Accounting API minor version. Pinning this keeps the response

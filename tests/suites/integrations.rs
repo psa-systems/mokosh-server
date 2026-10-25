@@ -159,9 +159,11 @@ async fn the_catalog_says_which_providers_the_write_route_will_take(pool: PgPool
         }
     }
     assert_eq!(
-        refused, 2,
-        "Stripe and PayPal are the providers Settings > Payment Gateways owns; a third would \
-         mean another surface took one over without this field being checked"
+        refused,
+        entries.len(),
+        "MAPPS-1153: every provider is configured on its own surface now, so none of them is \
+         configurable here. A provider that WAS would be the exception and should be read \
+         twice, which is why this counts rather than sampling"
     );
 }
 
@@ -207,8 +209,10 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
         ("google", Some("contact_sync_google")),
         ("icloud", Some("contact_sync_icloud")),
         ("microsoft", Some("contact_sync_microsoft")),
-        ("quickbooks", None),
-        ("xero", None),
+        // MAPPS-1153: both issuers have their own page now, which is where
+        // the consent round trip starts and where the mappings live.
+        ("quickbooks", Some("invoice_issuer_quickbooks")),
+        ("xero", Some("invoice_issuer_xero")),
     ] {
         let row = entry(&entries, provider);
         match kind {
@@ -230,8 +234,9 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
     // so its capabilities can be named; Google's client exists, so the two
     // differ here even though neither can be connected on this surface.
     assert_eq!(
-        xero["available"], false,
-        "no Xero client, nothing reads its capabilities, no poll job"
+        xero["available"], true,
+        "MAPPS-1153: the client, the consent flow, the mapping surface and the settings page \
+         all exist now, which is what `available` has always meant"
     );
     assert_eq!(
         entry(&entries, MANAGED_ELSEWHERE)["available"],
@@ -354,18 +359,35 @@ async fn no_provider_can_be_connected_here_and_each_refusal_says_why(pool: PgPoo
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    for provider in [MANAGED_HERE, ALSO_PLANNED] {
+    // MAPPS-1153: every provider is configured on its own surface, so the
+    // route refuses all seven BEFORE the service's own reasons are reached.
+    // The 404 is the registry's answer and the message carries the one thing
+    // an operator needs, which is the page that does own the lifecycle.
+    //
+    // The service-level refusals this case used to read through HTTP are
+    // still there and still different from each other - `assert_built` for a
+    // provider with nothing behind it, `assert_managed_here` for one owned by
+    // another subsystem - and they are unit-tested where they live. What
+    // changed is that nothing can reach them through this route, which is the
+    // statement below.
+    for (provider, surface) in [
+        (MANAGED_HERE, "Settings > Xero"),
+        (ALSO_PLANNED, "Settings > QuickBooks"),
+        (MANAGED_ELSEWHERE, "Settings > Google Contacts"),
+        (ALSO_ELSEWHERE, "Settings > Microsoft 365 Contacts"),
+        ("stripe", "Settings > Payment Gateways"),
+    ] {
         let response = connect(&app, &token, provider, json!({ "credential": "anything" })).await;
         assert_eq!(
             response.status(),
-            StatusCode::CONFLICT,
-            "{provider} has no client, so connecting it claims a delegation nothing can act on"
+            StatusCode::NOT_FOUND,
+            "{provider} is configured on its own page, so this surface does not offer it"
         );
         let body: Value = response.json().await.expect("refusal json");
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("nothing behind it"),
-            "the refusal says what is missing: {message}"
+            message.contains(surface),
+            "{provider} must name the page that owns it, not another provider's: {message}"
         );
         assert!(
             !message.contains("MAPPS-"),
@@ -384,26 +406,37 @@ async fn no_provider_can_be_connected_here_and_each_refusal_says_why(pool: PgPoo
             .await
             .expect("count integration secrets"),
             0,
-            "and stores no credential for a provider that could not read one"
+            "and stores no credential for a provider it would not have read one for"
         );
     }
 
-    for provider in [MANAGED_ELSEWHERE, ALSO_ELSEWHERE] {
-        let response = connect(&app, &token, provider, json!({ "credential": "anything" })).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+    // The refusals still differ, which was this case's point when they were
+    // reachable: four providers, four pages, and none of them sent to
+    // another's.
+    let mut surfaces: Vec<String> = Vec::new();
+    for provider in [
+        MANAGED_HERE,
+        ALSO_PLANNED,
+        MANAGED_ELSEWHERE,
+        ALSO_ELSEWHERE,
+    ] {
+        let response = connect(&app, &token, provider, json!({})).await;
         let body: Value = response.json().await.expect("refusal json");
-        let message = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("contact_sync_connections"),
-            "the refusal names where the connection does live: {message}"
+        surfaces.push(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         );
-        assert!(
-            !message.contains("nothing behind it"),
-            "{provider} is built; saying otherwise sends an operator to wait for shipped \
-             work: {message}"
-        );
-        assert_eq!(row_count(&pool, provider).await, 0);
     }
+    let mut unique = surfaces.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        surfaces.len(),
+        "two providers were sent to the same page: {surfaces:?}"
+    );
 }
 
 /// A capability change is the same claim connect makes, in smaller print, and
@@ -426,7 +459,19 @@ async fn delegating_a_capability_to_a_planned_provider_is_refused(pool: PgPool) 
         .send()
         .await
         .expect("update");
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "MAPPS-1153: Xero's lifecycle is its own page's, so this route does not offer it"
+    );
+    let body: Value = response.json().await.expect("refusal json");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Settings > Xero"),
+        "and says where the delegation IS changed: {body}"
+    );
     assert_eq!(
         row_count(&pool, MANAGED_HERE).await,
         0,
@@ -473,6 +518,9 @@ async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) 
 
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
+
+    // MAPPS-1153: this route does not offer Xero any more, and says where
+    // the lifecycle lives instead.
     let response = app
         .client
         .post(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}/disconnect")))
@@ -480,13 +528,35 @@ async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) 
         .send()
         .await
         .expect("disconnect");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // And the way out exists on the page that owns it, which is the half of
+    // this case that matters: the invariant is that a tenant is never
+    // stranded in a state an earlier build wrote, not that one particular
+    // route is the exit.
+    let response = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/integrations/invoice-issuer/{MANAGED_HERE}/disconnect"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("disconnect through the owning surface");
     assert_eq!(
         response.status(),
-        StatusCode::OK,
+        StatusCode::NO_CONTENT,
         "the way out of the old state cannot be gated on the state being possible"
     );
-    let body: Value = response.json().await.expect("disconnect json");
-    assert_eq!(body["status"], "disconnected");
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM integrations WHERE tenant_id = $1 AND provider = $2",
+    )
+    .bind(tenant_id)
+    .bind(MANAGED_HERE)
+    .fetch_one(&pool)
+    .await
+    .expect("read the row back");
+    assert_eq!(status, "disconnected");
     assert_eq!(
         row_count(&pool, MANAGED_HERE).await,
         1,
@@ -505,8 +575,18 @@ async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) 
 }
 
 /// The guard that keeps one connection in one place while PMS-1315 is
-/// outstanding. A 409 rather than a 404, because Google exists and is listed;
-/// what is wrong is that this is the wrong surface for it.
+/// outstanding.
+///
+/// It answered 409 through this route until MAPPS-1153 - Google exists and
+/// is listed, and what was wrong was the surface. Now the registry refuses
+/// first with a 404, because Google is not configured here at all, and the
+/// message names the page that does own it. The 409 and its PMS-1315
+/// reference are still what `assert_managed_here` produces for a caller
+/// that reaches the service directly, and that is where they are pinned.
+///
+/// The case is kept rather than deleted because what it protects is
+/// unchanged: a credential for a provider owned by another subsystem must
+/// not be stored here, whatever the status code on the way out.
 #[mokosh_test]
 async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -520,11 +600,13 @@ async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
         json!({ "credential": "refresh-token-x" }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body: Value = response.json().await.expect("refusal json");
     let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("Contact sync"), "{message}");
-    assert!(message.contains("PMS-1315"), "{message}");
+    assert!(
+        message.contains("Settings > Google Contacts"),
+        "the refusal names the page that owns the connection: {message}"
+    );
 
     assert_eq!(
         row_count(&pool, MANAGED_ELSEWHERE).await,
