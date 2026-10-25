@@ -1,32 +1,30 @@
 //! MAPPS-1099 Phase 2c: HTTP surface for the invoice-issuer mapping
 //! tables.
 //!
-//! Four admin-only routes behind `Feature::DelegatedInvoiceIssuer`:
-//! `PUT`/`DELETE` on `/api/v1/invoice-issuer-mappings/companies/{provider}/{company_id}`
-//! and `/api/v1/invoice-issuer-mappings/products/{provider}/{product_id}`,
-//! plus two `GET`s for the admin listing surface. Off: every route
-//! answers 404 (not 403) so a probe of a deployment that has not opted
-//! into the flag cannot tell the mappings table exists at all. On: the
-//! `RequireAdmin` + `RequireFinance` pair of today's billing surface
-//! applies; the service layer PR 2b-rest shipped carries the write
-//! itself.
+//! Four admin-only routes behind `Feature::DelegatedInvoiceIssuer`: a
+//! `PUT` on `/api/v1/invoice-issuer-mappings/companies/{provider}/{company_id}`
+//! and on `/api/v1/invoice-issuer-mappings/products/{provider}/{product_id}`,
+//! and a `GET` listing each. Off: every route answers 404 (not 403) so a
+//! probe of a deployment that has not opted into the flag cannot tell the
+//! mappings table exists at all. On: the `RequireAdmin` +
+//! `RequireFinance` pair of today's billing surface applies; the service
+//! layer PR 2b-rest shipped carries the write itself.
+//!
+//! There is no DELETE. This header claimed one from the start and none
+//! was ever mounted; a mapping is overwritten rather than removed, and
+//! unmapping a company is a bigger decision than clearing a text field
+//! (MAPPS-1146).
 //!
 //! The dispatch that READS these mappings in `BillingService::create_invoice`
 //! is Phase 2d; this PR gives operations the surface to populate the
 //! tables so a Phase 2d flip-the-switch run has something to resolve.
 //!
-//! parity record 2026-10-23: these four routes have no SPA caller yet.
-//! They land ahead of the SPA mapping-admin surface MAPPS-1099 Phase 3
-//! wires (MAPPS-1172); on current deployments the whole module answers
-//! 404 behind `Feature::DelegatedInvoiceIssuer` (off), so the server
-//! shipping first does not expose anything a non-opted-in tenant can
-//! see. The MAPPS-1083 recorded-exemption rule matches each path
-//! literally, so every route this module mounts gets its own `//` line:
-//!
-//! - /invoice-issuer-mappings/companies
-//! - /invoice-issuer-mappings/companies/{provider}/{company_id}
-//! - /invoice-issuer-mappings/products
-//! - /invoice-issuer-mappings/products/{provider}/{product_id}
+//! MAPPS-1146 retired the parity exemption these routes carried rather
+//! than re-dating it: Settings > Integrations > {Xero,QuickBooks} >
+//! Mappings calls all four. The record pointed the next reader at
+//! MAPPS-1172 for the surface that would call them, and no such issue
+//! exists; a reference to nothing is worse than no reference, which is
+//! why the replacement is a caller and not a newer date.
 
 use std::sync::Arc;
 
