@@ -195,13 +195,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1042,7 +1042,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 [[package]]
 name = "dunite-ipenrich"
 version = "0.1.0"
-source = "git+https://dev.a8n.run/psa-systems/dunite?rev=ae62c276ab187852578daad1c4b9c823579b194a#ae62c276ab187852578daad1c4b9c823579b194a"
+source = "git+https://dev.a8n.run/psa-systems/dunite?rev=91e27f2b798128aa2cf54f742df8248564888bf0#91e27f2b798128aa2cf54f742df8248564888bf0"
 dependencies = [
  "ip2location",
 ]
@@ -1050,7 +1050,7 @@ dependencies = [
 [[package]]
 name = "dunite-provider-status"
 version = "0.1.0"
-source = "git+https://dev.a8n.run/psa-systems/dunite?rev=f3d31295e98ef716ec9f2a6d49f4c16c7dca994a#f3d31295e98ef716ec9f2a6d49f4c16c7dca994a"
+source = "git+https://dev.a8n.run/psa-systems/dunite?rev=91e27f2b798128aa2cf54f742df8248564888bf0#91e27f2b798128aa2cf54f742df8248564888bf0"
 dependencies = [
  "chrono",
  "serde",
@@ -1060,7 +1060,7 @@ dependencies = [
 [[package]]
 name = "dunite-stripe-core"
 version = "0.1.0"
-source = "git+https://dev.a8n.run/psa-systems/dunite?rev=cc10e8358a6f21160544a415a9488c16827af699#cc10e8358a6f21160544a415a9488c16827af699"
+source = "git+https://dev.a8n.run/psa-systems/dunite?rev=91e27f2b798128aa2cf54f742df8248564888bf0#91e27f2b798128aa2cf54f742df8248564888bf0"
 dependencies = [
  "hex",
  "hmac 0.12.1",
