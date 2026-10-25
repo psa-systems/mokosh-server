@@ -137,7 +137,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Environment
-dotenvy = "0.15"
+dotenvy = "0.15.7"
 
 # Email. Lettre powers the host-crate `Mailer` (utils/email.rs).
 lettre = { workspace = true }
