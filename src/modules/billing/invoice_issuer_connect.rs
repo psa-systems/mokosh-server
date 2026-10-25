@@ -48,28 +48,21 @@ use std::sync::Arc;
 /// The same number contact sync uses, for the same reason.
 const STATE_TTL_MINUTES: i64 = 10;
 
-/// The two consent endpoints, built from parts rather than written as one
-/// literal each.
+/// The two consent endpoints.
 ///
-/// The clients do the same and say why: `built_providers_have_something
-/// _behind_them` (MAPPS-1121) scans `src/modules` for a provider's real
-/// host and fails when it finds one behind a descriptor still marked
-/// `Planned`. Both descriptors are still `Planned`, because flipping them
-/// puts a Connect button and a credential box on Connected Services while
-/// the page that drives THIS flow does not exist yet, which is the exact
-/// defect MAPPS-1121 removed. The flip belongs with that page, and it has
-/// to move `credential_home` at the same time: the credential here is an
-/// OAuth round trip, not something an admin pastes.
-const XERO_AUTH_HOST: &str = "login.xero";
-const QUICKBOOKS_AUTH_HOST: &str = "appcenter.intuit";
-const DOT_COM: &str = ".com";
-
+/// Assembled from parts until MAPPS-1153, for the reason the clients'
+/// hosts were: `built_providers_have_something_behind_them` (MAPPS-1121)
+/// scans `src/modules` for a provider's real host and fails when it finds
+/// one behind a descriptor still marked `Planned`. Both descriptors are
+/// `Built` now - the page that drives this flow exists, and
+/// `credential_home` moved with the flip so Connected Services links to
+/// that page instead of offering a credential box.
 fn xero_auth_endpoint() -> String {
-    format!("https://{XERO_AUTH_HOST}{DOT_COM}/identity/connect/authorize")
+    "https://login.xero.com/identity/connect/authorize".to_string()
 }
 
 fn quickbooks_auth_endpoint() -> String {
-    format!("https://{QUICKBOOKS_AUTH_HOST}{DOT_COM}/connect/oauth2")
+    "https://appcenter.intuit.com/connect/oauth2".to_string()
 }
 
 /// What Mokosh asks each provider for.
@@ -289,6 +282,44 @@ impl InvoiceIssuerConnectService {
             "{}/settings/integrations",
             self.app_base.trim_end_matches('/')
         ))
+    }
+
+    /// Stop delegating to a provider, and forget how to reach it
+    /// (MAPPS-1145).
+    ///
+    /// The credential goes, because the blob is what every delegated call
+    /// reads and a disconnect that left it behind would leave a working
+    /// connection the UI says is off.
+    ///
+    /// The capability set stays. That is the house rule for `disconnected`
+    /// (PMS-1312, and the reason the four statuses are not a boolean):
+    /// what a tenant delegated is their answer, and reconnecting should not
+    /// start from an empty page. It is safe to keep only because
+    /// `IssuerDispatcher::plan` requires a LIVE connection as well as the
+    /// capability; before MAPPS-1145 it read the capability alone, and a
+    /// row in this state would have sent every new invoice down a
+    /// delegated path whose credential had just been deleted.
+    pub async fn disconnect(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+    ) -> AppResult<()> {
+        self.secrets
+            .delete(&SecretKey::integration(*tenant_id, provider.as_str()))
+            .await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE integrations \
+             SET status = 'disconnected', disconnected_at = NOW(), last_error = NULL, \
+                 updated_at = NOW() \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// What a settings page for one provider reads (MAPPS-1143).
@@ -621,6 +652,10 @@ pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) 
             "/integrations/invoice-issuer/{provider}/authorize",
             post(authorize),
         )
+        .route(
+            "/integrations/invoice-issuer/{provider}/disconnect",
+            post(disconnect),
+        )
         .with_state(InvoiceIssuerConnectRouterState { service })
 }
 
@@ -665,6 +700,17 @@ async fn authorize(
         .begin(user.tenant(), user.id, provider)
         .await?;
     Ok(Json(AuthorizeResponse { authorize_url }))
+}
+
+async fn disconnect(
+    State(state): State<InvoiceIssuerConnectRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Path(provider): Path<String>,
+) -> AppResult<axum::http::StatusCode> {
+    let provider = parse_provider(&provider)?;
+    state.service.disconnect(user.tenant(), provider).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Always a redirect, never a JSON body: the caller is a browser.

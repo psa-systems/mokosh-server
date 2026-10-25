@@ -15,7 +15,7 @@ use validator::Validate;
 
 pub use mokosh_types::integrations::{Capability, IntegrationProvider, IntegrationStatus};
 
-use super::registry::{ConnectionHome, ProviderDescriptor};
+use super::registry::{ConnectionHome, CredentialHome, ProviderDescriptor};
 
 /// One capability, as the checkbox list renders it.
 ///
@@ -172,13 +172,31 @@ impl From<crate::modules::integrations::registry::SetupSurface> for SetupSurface
 /// "which home" to "what the client is told" lives beside the DTO it fills,
 /// which is where a reader looking at the JSON will come looking for it.
 fn credential_elsewhere(descriptor: &ProviderDescriptor) -> Option<CredentialElsewhereResponse> {
-    descriptor
-        .credential_home
-        .entered_at()
-        .map(|entered_at| CredentialElsewhereResponse {
-            kind: descriptor.credential_home.as_str().to_string(),
-            entered_at: entered_at.to_string(),
-        })
+    // MAPPS-1153: composed from the HOME, and labelled from the provider's
+    // own surface when it has one.
+    //
+    // It used to be composed from `entered_at` alone, which made the home's
+    // one string do a per-provider job: `ContactSync` answers "Settings >
+    // Google Contacts" for all three contact sources, so iCloud's card
+    // named Google's page. `InvoiceIssuer` cannot have such a string at all
+    // - nothing is entered, and the two providers have different pages -
+    // which is what made the mismatch visible.
+    //
+    // The condition is now the home itself, so a provider whose credential
+    // does NOT arrive in the connect request always says so, and the label
+    // comes from `setup_surface` when there is one.
+    if descriptor.credential_home == CredentialHome::Integration {
+        return None;
+    }
+    let entered_at = descriptor
+        .setup_surface()
+        .map(|surface| surface.label.to_string())
+        .or_else(|| descriptor.credential_home.entered_at().map(str::to_string))
+        .unwrap_or_else(|| "its own settings page".to_string());
+    Some(CredentialElsewhereResponse {
+        kind: descriptor.credential_home.as_str().to_string(),
+        entered_at,
+    })
 }
 
 impl IntegrationResponse {

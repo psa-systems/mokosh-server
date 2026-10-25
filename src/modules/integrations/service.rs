@@ -975,18 +975,31 @@ mod tests {
     /// act on, which is worse than the button failing.
     #[test]
     fn a_planned_provider_is_refused_and_a_built_one_is_not() {
+        // MAPPS-1153 flipped the last two planned entries, so the refusal
+        // is exercised against a descriptor built for it rather than
+        // against whichever provider happened to be unfinished. The rule
+        // outlives the providers that prompted it, and a test naming Xero
+        // would have been deleted with the flip rather than kept.
+        let planned = ProviderDescriptor {
+            build: registry::ProviderBuild::Planned {
+                tracked_by: "MAPPS-1099",
+            },
+            ..*registry::descriptor(IntegrationProvider::Xero)
+        };
+        let error = assert_built(&planned).expect_err("planned, so refused");
+        let message = format!("{error}");
+        assert!(
+            message.contains(planned.display_name),
+            "the refusal names the provider: {message}"
+        );
+        assert!(
+            !message.contains("MAPPS-"),
+            "an MSP admin reading their own settings has no use for our issue keys: {message}"
+        );
         for provider in [IntegrationProvider::Quickbooks, IntegrationProvider::Xero] {
-            let descriptor = registry::descriptor(provider);
-            let error = assert_built(descriptor).expect_err("planned, so refused");
-            let message = format!("{error}");
             assert!(
-                message.contains(descriptor.display_name),
-                "the refusal names the provider: {message}"
-            );
-            assert!(
-                !message.contains("MAPPS-"),
-                "an MSP admin reading their own settings has no use for our issue keys: \
-                 {message}"
+                assert_built(registry::descriptor(provider)).is_ok(),
+                "{provider:?} has a client, a consent flow and a settings page now"
             );
         }
         for provider in [
@@ -1143,6 +1156,16 @@ mod tests {
             (IntegrationProvider::Stripe, "Payment Gateways"),
             (IntegrationProvider::Paypal, "Payment Gateways"),
             (IntegrationProvider::Google, "Google Contacts"),
+            // MAPPS-1153: and the ones that made the per-home label a lie.
+            // `ContactSync` answered "Settings > Google Contacts" for all
+            // three contact sources, so iCloud's card named Google's page;
+            // `InvoiceIssuer` has no such string at all, because nothing is
+            // entered and the two providers have different pages. The label
+            // comes from each provider's own setup surface now.
+            (IntegrationProvider::Icloud, "iCloud Contacts"),
+            (IntegrationProvider::Microsoft, "Microsoft 365 Contacts"),
+            (IntegrationProvider::Xero, "Xero"),
+            (IntegrationProvider::Quickbooks, "QuickBooks"),
         ] {
             let response = IntegrationResponse::not_installed(registry::descriptor(provider));
             let elsewhere = response
@@ -1155,14 +1178,18 @@ mod tests {
             );
         }
         // And one that takes its credential here, so the absence is asserted
-        // rather than assumed from the loop above.
+        // rather than assumed from the loop above. No provider in the
+        // registry does since MAPPS-1153, so it is a descriptor built for
+        // the case: the rule is about the home, not about who holds it.
+        let arrives_here = registry::ProviderDescriptor {
+            credential_home: registry::CredentialHome::Integration,
+            ..*registry::descriptor(IntegrationProvider::Quickbooks)
+        };
         assert!(
-            IntegrationResponse::not_installed(registry::descriptor(
-                IntegrationProvider::Quickbooks
-            ))
-            .credential_elsewhere
-            .is_none(),
-            "QuickBooks takes its credential in the connect request"
+            IntegrationResponse::not_installed(&arrives_here)
+                .credential_elsewhere
+                .is_none(),
+            "a credential that arrives in the connect request names no other surface"
         );
     }
 
