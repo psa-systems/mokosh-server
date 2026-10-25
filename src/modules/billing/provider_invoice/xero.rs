@@ -37,23 +37,20 @@ use crate::modules::billing::invoice_issuer::{ExternalInvoiceRef, InvoiceProvide
 use crate::utils::error::{AppError, AppResult};
 
 /// Xero's identity host for OAuth 2.0 token refresh. Overridable through
-/// `XeroClient::with_identity_base` so a test can point at a local
-/// wiremock without touching Xero's live host.
+/// `XeroClient::with_identity_base` so a test can point at a local stub
+/// without touching Xero's live host.
 ///
-/// Built from parts rather than one string literal so
-/// `built_providers_have_something_behind_them` (MAPPS-1121) does not
-/// read this file as evidence the Xero descriptor should flip to
-/// `Built`: the clients are library code and no admin flow calls them
-/// yet. Phase 2d's final wiring is the moment the descriptor flips.
-const XERO_IDENTITY_HOST: &str = "identity.xero";
-const XERO_API_HOST: &str = "api.xero";
-const XERO_TLD: &str = ".com";
-
+/// These were assembled from parts until MAPPS-1153, so that
+/// `built_providers_have_something_behind_them` (MAPPS-1121) would not
+/// read a library-only client as evidence the descriptor should flip to
+/// `Built`. The descriptor has flipped, and that guard now asserts the
+/// opposite: a built provider must have a real host behind it, and these
+/// literals are what it finds.
 fn default_identity_base() -> String {
-    format!("https://{XERO_IDENTITY_HOST}{XERO_TLD}")
+    "https://identity.xero.com".to_string()
 }
 fn default_api_base() -> String {
-    format!("https://{XERO_API_HOST}{XERO_TLD}")
+    "https://api.xero.com".to_string()
 }
 
 /// How many times a 429 is retried before the client gives up. Xero's

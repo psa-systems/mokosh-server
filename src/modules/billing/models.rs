@@ -182,11 +182,13 @@ pub struct InvoiceResponse {
     /// `Some` on `GET /:id`, `None` on list rollups.
     pub lines: Option<Vec<InvoiceLineResponse>>,
     /// MAPPS-1099: the external provider (`xero`, `quickbooks`) that issued
-    /// this invoice, when the tenant delegated the Invoicing capability. The
-    /// column is schema-ready (migration 278) but the write path lands with
-    /// the Xero / QuickBooks clients in a later phase of MAPPS-1099; today
-    /// every row carries `None` here and `None` on the two sibling fields,
-    /// which is "Mokosh issued this invoice" and the current behaviour.
+    /// this invoice, when the tenant delegated the Invoicing capability.
+    /// `None` is "Mokosh issued this invoice", which is every row on a
+    /// deployment that has not turned `DelegatedInvoiceIssuer` on.
+    ///
+    /// Set by `create_invoice` since MAPPS-1134. Before that the column was
+    /// schema-ready and unwritten, and this comment said so for three
+    /// phases after it stopped being true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_provider: Option<String>,
     /// The external provider's own id for this invoice (Xero's guid,
