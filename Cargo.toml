@@ -130,7 +130,7 @@ zxcvbn = "3"
 
 # Error handling
 thiserror = "2"
-anyhow = "1"
+anyhow = "1.0.104"
 
 # Logging/Tracing
 tracing = "0.1"
