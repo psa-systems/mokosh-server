@@ -509,6 +509,63 @@ async fn a_delegated_invoice_is_sent_by_the_provider_not_by_us(pool: PgPool) {
     );
 }
 
+/// MAPPS-1147: a delegated invoice has no Mokosh document, and the PDF
+/// route says so instead of rendering one.
+///
+/// The invoice is `sent` and therefore frozen, and deliberately has no
+/// stored bytes, so the live-render fallback would otherwise fire and
+/// answer a Mokosh-branded PDF carrying Mokosh's number for an invoice
+/// Xero issued and delivered. An admin who forwarded it would have sent
+/// their customer a second invoice.
+#[mokosh_test]
+async fn the_pdf_route_refuses_an_invoice_the_provider_issued(pool: PgPool) {
+    let (_stub, base) = start_stub().await;
+    let (_admin, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (billing, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    delegate(&pool, common::DEFAULT_TENANT_ID, "xero").await;
+    seed_xero_blob(&secrets, common::DEFAULT_TENANT_ID, 55).await;
+    InvoiceIssuerMappingService::new(db)
+        .upsert_customer_mapping(
+            tenant,
+            InvoiceProviderKind::Xero,
+            company_id,
+            "3f6c6a2e-9d41-4a39-9f6a-6d1a1c2b3d4e",
+        )
+        .await
+        .expect("map the company");
+    let delegated = billing
+        .create_invoice(
+            tenant,
+            &request(company_id),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create the delegated invoice");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let response = app
+        .client
+        .get(app.url(&format!("/api/v1/invoices/{}/pdf", delegated.id)))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("ask for the pdf");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a delegated invoice has no Mokosh document to serve"
+    );
+    let body = response.text().await.unwrap_or_default();
+    assert!(
+        body.contains("xero") && body.contains("INV-0042"),
+        "the refusal says where the document is and under which number: {body}"
+    );
+}
+
 /// A local invoice is untouched: still created `draft`, with no sent_at.
 #[mokosh_test]
 async fn a_local_invoice_is_still_a_draft(pool: PgPool) {
