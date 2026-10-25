@@ -229,7 +229,7 @@ dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "cc
 # no second implementation to drift. Leaf crate (owns its error, depends only on
 # ip2location), so it is pinned to the dunite rev that introduced it independently
 # of dunite-stripe-core above.
-dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "ae62c276ab187852578daad1c4b9c823579b194a" }
+dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
 # PMS-1014: the shared provider-status contract (report, summary, envelope).
 # Extracted from mokosh's local types so BUNYIP-634's aggregator binds to one
 # definition instead of a copy per producer. Leaf crate, pinned to the dunite
