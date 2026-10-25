@@ -104,8 +104,20 @@ chrono-tz = "0.9"
 # Password hashing
 argon2 = "0.5"
 
-# JWT tokens
-jsonwebtoken = "9"
+# JWT tokens.
+#
+# `rust_crypto` is not optional: jsonwebtoken 10 moved to rustls-style
+# provider selection and its default features enable NEITHER provider, so a
+# bare `jsonwebtoken = "10"` compiles and then panics on the first sign or
+# verify with "Could not automatically determine the process-level
+# CryptoProvider". Every login in the integration suite died that way.
+#
+# `rust_crypto` rather than `aws_lc_rs`: it covers everything both auth paths
+# use (HS256 for the legacy sessions, RSA / P-256 / P-384 / Ed25519 for
+# bunyip's `at+jwt`), and it is pure Rust. `aws_lc_rs` would add a C and
+# CMake build dependency to every image and every runner, which is the class
+# of thing that has broken this repository's CI before.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # Validation
 validator = { version = "0.19", features = ["derive"] }
