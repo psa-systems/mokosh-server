@@ -156,19 +156,10 @@ impl IssuerDispatcher {
             return Ok(IssuerPlan::Local);
         }
 
-        let invoicing = Capability::Invoicing.as_str().to_string();
-        let xero_delegated = self
-            .integrations
-            .get(tenant_id, IntegrationProvider::Xero)
-            .await?
-            .enabled_capabilities
-            .contains(&invoicing);
+        let xero_delegated = self.delegates(tenant_id, IntegrationProvider::Xero).await?;
         let quickbooks_delegated = self
-            .integrations
-            .get(tenant_id, IntegrationProvider::Quickbooks)
-            .await?
-            .enabled_capabilities
-            .contains(&invoicing);
+            .delegates(tenant_id, IntegrationProvider::Quickbooks)
+            .await?;
         let selection = select_issuer_with(true, || xero_delegated, || quickbooks_delegated);
 
         match selection {
@@ -186,6 +177,41 @@ impl IssuerDispatcher {
                 Ok(IssuerPlan::Delegated(ref_))
             }
         }
+    }
+
+    /// Whether this tenant's invoices go through `provider`.
+    ///
+    /// The capability AND a live connection, which MAPPS-1145 made two
+    /// questions rather than one. Reading the capability alone was correct
+    /// while nothing could take a connection away: it is what an admin
+    /// turned on, and a connected provider is what had turned it on. A
+    /// disconnect makes the two come apart, and the capability survives one
+    /// on purpose (PMS-1312: what was delegated is the tenant's answer and
+    /// reconnecting should not start from an empty page). Left as one
+    /// question, every invoice created after a disconnect would take the
+    /// delegated path and fail `Unauthorized` on a credential that had just
+    /// been deleted.
+    ///
+    /// `error` counts as live, deliberately. The provider is failing and the
+    /// admin asked for delegation, so the call fails loudly rather than
+    /// quietly minting a local invoice under a number the customer will
+    /// never be shown.
+    async fn delegates(
+        &self,
+        tenant_id: TenantId,
+        provider: IntegrationProvider,
+    ) -> AppResult<bool> {
+        let integration = self.integrations.get(tenant_id, provider).await?;
+        let live = matches!(
+            integration.status,
+            crate::modules::integrations::IntegrationStatus::Connected
+                | crate::modules::integrations::IntegrationStatus::Error
+        );
+        Ok(live
+            && integration
+                .enabled_capabilities
+                .iter()
+                .any(|c| c == Capability::Invoicing.as_str()))
     }
 
     async fn issue_through_xero(

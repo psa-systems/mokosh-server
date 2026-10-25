@@ -469,6 +469,86 @@ async fn the_overview_answers_for_the_deployment_and_for_the_tenant(pool: PgPool
     assert!(other.configured, "the deployment holds both applications");
 }
 
+/// Disconnecting forgets the credential, keeps what was delegated, and
+/// leaves the next invoice on the local path.
+///
+/// The last clause is the one worth the case. `plan` used to decide by
+/// reading the capability alone, and the capability survives a disconnect
+/// on purpose, so this exact state would have sent every new invoice down
+/// a delegated path whose credential had just been deleted - every invoice
+/// create for the tenant refusing, with a row that says `disconnected` as
+/// the explanation.
+#[mokosh_test]
+async fn disconnecting_forgets_the_credential_and_stops_delegating(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (svc, secrets, db) = service(&pool, &base, apps()).await;
+
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("complete");
+
+    svc.disconnect(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("disconnect");
+
+    assert!(
+        secrets
+            .get(&SecretKey::integration(common::DEFAULT_TENANT_ID, "xero"))
+            .await
+            .expect("read")
+            .is_none(),
+        "a disconnect that left the credential behind would leave a working connection \
+         the page says is off"
+    );
+    let view = svc
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert_eq!(view.status.as_str(), "disconnected");
+    assert!(
+        view.delegated,
+        "what was delegated is the tenant's answer and survives, so reconnecting does \
+         not start from an empty page"
+    );
+
+    // And the invoice path reads the pair, not the capability alone.
+    let integrations =
+        mokosh_server::modules::integrations::IntegrationsService::new(db.clone(), secrets.clone());
+    let row = integrations
+        .get(
+            tenant,
+            mokosh_types::integrations::IntegrationProvider::Xero,
+        )
+        .await
+        .expect("read the row");
+    assert!(
+        row.enabled_capabilities.iter().any(|c| c == "invoicing"),
+        "the capability is still there, which is exactly why the status has to be read too"
+    );
+
+    // Reconnecting restores a usable connection without the admin choosing
+    // anything again.
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin again");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("complete again");
+    let view = svc
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert_eq!(view.status.as_str(), "connected");
+    assert!(view.delegated);
+}
+
 /// One tenant's connection is invisible to another.
 #[mokosh_test]
 async fn an_overview_does_not_leak_another_tenants_connection(pool: PgPool) {
