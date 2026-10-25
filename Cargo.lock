@@ -1042,7 +1042,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 [[package]]
 name = "dunite-ipenrich"
 version = "0.1.0"
-source = "git+https://dev.a8n.run/psa-systems/dunite?rev=ae62c276ab187852578daad1c4b9c823579b194a#ae62c276ab187852578daad1c4b9c823579b194a"
+source = "git+https://dev.a8n.run/psa-systems/dunite?rev=91e27f2b798128aa2cf54f742df8248564888bf0#91e27f2b798128aa2cf54f742df8248564888bf0"
 dependencies = [
  "ip2location",
 ]
