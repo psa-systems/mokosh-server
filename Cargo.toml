@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4.45", features = ["serde"] }
-async-trait = "0.1"
+async-trait = "0.1.92"
 secrecy = { version = "0.10.3", features = ["serde"] }
 ipnetwork = "0.20"
 # `pool` is NOT a lettre default; opt in so LettreMailer reuses TCP
@@ -222,19 +222,19 @@ mokosh-types = { path = "crates/mokosh-types" }
 # by a8n-tools and bunyip so the same defect is not solved three times. Pinned by
 # rev (not branch) so a dunite bump is an explicit reviewable diff, mirroring
 # bunyip's dunite pins. Pinned to dunite main.
-dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "cc10e8358a6f21160544a415a9488c16827af699" }
+dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
 
 # BUNYIP-475: the shared ASN / VPN enrichment crate (BUNYIP-437), consumed here
 # as mokosh's second-product use of the same offline IP2Proxy signal so there is
 # no second implementation to drift. Leaf crate (owns its error, depends only on
 # ip2location), so it is pinned to the dunite rev that introduced it independently
 # of dunite-stripe-core above.
-dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "ae62c276ab187852578daad1c4b9c823579b194a" }
+dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
 # PMS-1014: the shared provider-status contract (report, summary, envelope).
 # Extracted from mokosh's local types so BUNYIP-634's aggregator binds to one
 # definition instead of a copy per producer. Leaf crate, pinned to the dunite
 # rev that introduced it independently of the dunite-* deps above.
-dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "f3d31295e98ef716ec9f2a6d49f4c16c7dca994a" }
+dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
 # PMS-876 took no default features (they carry HTML rendering and hyphenation
 # dictionaries nothing here uses). PMS-911 adds the image codecs, and exactly
 # the four `utils::inline_image` already accepts for an uploaded logo: a
