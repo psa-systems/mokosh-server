@@ -99,14 +99,50 @@ async fn service(
     Arc<dyn SecretProvider>,
     Database,
 ) {
+    // The deployment toggle on, which is what a deployment that has decided
+    // to use this looks like. `service_without_the_toggle` is the other one.
+    service_with_toggle(pool, base, apps, true).await
+}
+
+async fn service_without_the_toggle(
+    pool: &PgPool,
+    base: &str,
+    apps: IssuerApps,
+) -> (
+    InvoiceIssuerConnectService,
+    Arc<dyn SecretProvider>,
+    Database,
+) {
+    service_with_toggle(pool, base, apps, false).await
+}
+
+async fn service_with_toggle(
+    pool: &PgPool,
+    base: &str,
+    apps: IssuerApps,
+    delegation_enabled: bool,
+) -> (
+    InvoiceIssuerConnectService,
+    Arc<dyn SecretProvider>,
+    Database,
+) {
     let app_pool = common::build_app_role_pool(pool).await;
     let db = Database::from_pools(app_pool, pool.clone());
     let secrets: Arc<dyn SecretProvider> =
         Arc::new(DatabaseSecretProvider::new(db.clone(), [0u8; 32]));
+    let toggles = if delegation_enabled {
+        mokosh_server::modules::features::FeatureToggles::from_rows([(
+            mokosh_server::modules::features::Feature::DelegatedInvoiceIssuer.key(),
+            true,
+        )])
+    } else {
+        mokosh_server::modules::features::FeatureToggles::default()
+    };
     let service = InvoiceIssuerConnectService::new(
         db.clone(),
         secrets.clone(),
         Arc::new(apps),
+        mokosh_server::modules::features::FeatureSnapshot::new(toggles),
         Arc::new(
             XeroClient::new()
                 .with_api_base(base)
@@ -547,6 +583,62 @@ async fn disconnecting_forgets_the_credential_and_stops_delegating(pool: PgPool)
         .expect("overview");
     assert_eq!(view.status.as_str(), "connected");
     assert!(view.delegated);
+}
+
+/// MAPPS-1154: the overview says whether the DEPLOYMENT has delegated
+/// issuing switched on, which is the gate that is off everywhere by
+/// default.
+///
+/// Without it a tenant can be configured, connected and delegated and
+/// still have every invoice issued locally, because `IssuerDispatcher::plan`
+/// answers `Local` while the toggle is off - and the card would be saying
+/// the opposite. The connect itself is deliberately NOT gated: preparing a
+/// tenant before the flip is a reasonable order to work in.
+#[mokosh_test]
+async fn the_overview_says_whether_the_deployment_has_switched_it_on(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    let (off, _secrets, _db) = service_without_the_toggle(&pool, &base, apps()).await;
+    let view = off
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert!(view.configured, "the deployment holds an application");
+    assert!(
+        !view.delegation_enabled,
+        "and has not switched delegated issuing on, which is the default everywhere"
+    );
+
+    // Connecting still works with the toggle off, and the two facts stay
+    // apart: the tenant has delegated, the deployment has not switched it on.
+    let url = off
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    off.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("complete");
+    let view = off
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert_eq!(view.status.as_str(), "connected");
+    assert!(view.delegated, "the tenant delegated invoicing");
+    assert!(
+        !view.delegation_enabled,
+        "and no invoice will go to Xero until the deployment switches it on"
+    );
+
+    // The same tenant read through a service whose deployment HAS switched
+    // it on. Same row, different deployment answer.
+    let (on, _secrets, _db) = service(&pool, &base, apps()).await;
+    let view = on
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert!(view.delegated && view.delegation_enabled);
 }
 
 /// One tenant's connection is invisible to another.
