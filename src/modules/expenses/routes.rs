@@ -1,31 +1,20 @@
-//! MAPPS-1100 Phases A + B: HTTP surface for the Bills and Expenses
-//! subsystem.
+//! HTTP surface for the Bills and Expenses subsystem (MAPPS-1100 Phases
+//! A and B, delegation in MAPPS-1155).
 //!
-//! Phase A: vendors, expense categories.
-//! Phase B: bill + expense headers with lifecycle transitions.
-//! Phase C (Xero / QuickBooks delegation) builds on the OAuth + webhook
-//! infrastructure MAPPS-1099 shipped; it has not yet been started.
+//! Phase A: vendors, expense categories. Phase B: the bill and expense
+//! headers with their lifecycle transitions. MAPPS-1155 added the push to
+//! Xero or QuickBooks inside `create_bill`, which changes no route here.
 //!
-//! parity record 2026-10-23: every route this module mounts has no
-//! SPA caller yet. They all land ahead of the SPA half MAPPS-1123
-//! (Bills and Expenses settings + ledger surfaces) wires up. The
-//! server ships first so the SPA has something concrete to call
-//! against; one dated record covers both phases so a Phase C
-//! follow-up has one line to update once the SPA callers merge.
-//! The MAPPS-1083 recorded-exemption rule matches each path literally,
-//! so every route the file mounts gets its own `//` line below.
+//! The vendor, expense-category and bill routes are called by
+//! `/settings/vendors`, `/settings/expense-categories` and `/bills` in
+//! mokosh-apps (MAPPS-1157), so the record that exempted them is gone.
 //!
-//! Phase A leaf lookups:
-//! - /vendors
-//! - /vendors/{id}
-//! - /expense-categories
-//! - /expense-categories/{id}
-//!
-//! Phase B headers and lifecycle transitions:
-//! - /bills
-//! - /bills/{id}
-//! - /bills/{id}/approve
-//! - /bills/{id}/void
+//! parity record 2026-10-26 (PMS-1534): the six expense-claim paths below
+//! have no SPA caller yet. MAPPS-1163 builds it; MAPPS-1157 shipped the
+//! rest of this module's surfaces and left claims out deliberately,
+//! because a claim from a person has a submitter and an approver where a
+//! bill has neither. The MAPPS-1083 recorded-exemption rule matches each
+//! path literally, so each one gets its own line:
 //! - /expenses
 //! - /expenses/{id}
 //! - /expenses/{id}/submit
