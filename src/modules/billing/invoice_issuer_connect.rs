@@ -80,6 +80,14 @@ pub struct InvoiceIssuerConnectService {
     db: Database,
     secrets: Arc<dyn SecretProvider>,
     apps: Arc<IssuerApps>,
+    /// The deployment's feature toggles (MAPPS-1154).
+    ///
+    /// Held so the settings card can say whether delegated issuing is
+    /// switched ON for this deployment. The connect flow itself does not
+    /// gate on it: connecting first and switching on afterwards is a
+    /// reasonable order to do things in, and refusing the connect would
+    /// leave an operator unable to prepare a tenant before the flip.
+    features: crate::modules::features::FeatureSnapshot,
     xero: Arc<XeroClient>,
     quickbooks: Arc<QuickBooksClient>,
     /// Where the provider returns the browser to. `None` is a deployment
@@ -91,10 +99,12 @@ pub struct InvoiceIssuerConnectService {
 }
 
 impl InvoiceIssuerConnectService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Database,
         secrets: Arc<dyn SecretProvider>,
         apps: Arc<IssuerApps>,
+        features: crate::modules::features::FeatureSnapshot,
         xero: Arc<XeroClient>,
         quickbooks: Arc<QuickBooksClient>,
         public_api_base: Option<String>,
@@ -104,6 +114,7 @@ impl InvoiceIssuerConnectService {
             db,
             secrets,
             apps,
+            features,
             xero,
             quickbooks,
             public_api_base,
@@ -349,6 +360,9 @@ impl InvoiceIssuerConnectService {
         tx.commit().await?;
 
         let configured = self.apps.get(provider).is_some();
+        let delegation_enabled = self
+            .features
+            .is_enabled(crate::modules::features::Feature::DelegatedInvoiceIssuer);
         let Some(row) = row else {
             // Never connected is an offer, not an error.
             return Ok(InvoiceIssuerOverview {
@@ -357,6 +371,7 @@ impl InvoiceIssuerConnectService {
                 status: IntegrationStatus::NotConnected,
                 organisation_id: None,
                 delegated: false,
+                delegation_enabled,
                 last_error: None,
             });
         };
@@ -373,6 +388,7 @@ impl InvoiceIssuerConnectService {
                 .enabled_capabilities
                 .iter()
                 .any(|c| c == Capability::Invoicing.as_str()),
+            delegation_enabled,
             last_error: row.last_error,
         })
     }
@@ -491,6 +507,15 @@ pub struct InvoiceIssuerOverview {
     /// Whether `invoicing` is enabled, which is what makes an invoice go
     /// through the provider rather than through Mokosh.
     pub delegated: bool,
+    /// Whether delegated issuing is switched on for this DEPLOYMENT
+    /// (MAPPS-1154).
+    ///
+    /// The fourth gate, and the one that is off everywhere by default. A
+    /// tenant can be configured, connected and delegated and still have
+    /// every invoice issued locally, because `IssuerDispatcher::plan`
+    /// answers `Local` while this is false. The card has to say so, or it
+    /// claims an arrangement the deployment has switched off.
+    pub delegation_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }

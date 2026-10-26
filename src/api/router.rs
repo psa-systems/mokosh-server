@@ -408,6 +408,11 @@ pub fn create_api_router(
             db.clone(),
             secrets.clone(),
             issuer_apps.clone(),
+            // MAPPS-1154: so the settings card can say whether delegated
+            // issuing is switched on for this deployment. The connect flow
+            // does not gate on it; the card just stops claiming an
+            // arrangement the toggle has switched off.
+            features.clone(),
             Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
             Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
             public_api_base_url.clone(),
