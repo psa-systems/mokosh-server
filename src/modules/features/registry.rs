@@ -75,6 +75,15 @@ pub enum Feature {
     /// the local path. The flag defaults OFF on every deployment so the
     /// Phase 2 merge is a no-op until operations flips it on in staging.
     DelegatedInvoiceIssuer,
+    /// Delegated BILLS (MAPPS-1155). Its own switch and not
+    /// [`Feature::DelegatedInvoiceIssuer`]'s, although both ride the same
+    /// Xero and QuickBooks connection: that flag is named for, and
+    /// documented as, the invoice issuer, and a second capability riding
+    /// it is how an operator turns on something they did not read about.
+    /// Off: `expenses::create_bill` is byte-identical to the local path.
+    /// On: a tenant that delegated `BillsAndExpenses` has its bills raised
+    /// in the provider, which is where that MSP's accounting lives.
+    DelegatedBills,
 }
 
 impl Feature {
@@ -84,6 +93,7 @@ impl Feature {
         Feature::AssetsSearchV2,
         Feature::AssetsCatalog,
         Feature::DelegatedInvoiceIssuer,
+        Feature::DelegatedBills,
     ];
 
     /// The stable key: the `feature_toggles.key` value and the wire name. Never
@@ -94,6 +104,7 @@ impl Feature {
             Feature::AssetsSearchV2 => "assets_search_v2",
             Feature::AssetsCatalog => "assets_catalog",
             Feature::DelegatedInvoiceIssuer => "delegated_invoice_issuer",
+            Feature::DelegatedBills => "delegated_bills",
         }
     }
 
@@ -104,6 +115,7 @@ impl Feature {
             Feature::AssetsSearchV2 => "Asset search v2",
             Feature::AssetsCatalog => "Asset catalog + bulk order",
             Feature::DelegatedInvoiceIssuer => "Delegated invoice issuer",
+            Feature::DelegatedBills => "Delegated bills",
         }
     }
 
@@ -142,6 +154,9 @@ impl Feature {
                  issues locally. Leave off until the external-provider credential mapping \
                  lands in a follow-up PR."
             }
+            Feature::DelegatedBills => {
+                "Whether a tenant that has delegated Bills and expenses to Xero or QuickBooks                  has its bills raised there. Off: every bill is Mokosh's, which is what it is                  today. On: a bill for a vendor mapped to that provider is created over there                  and Mokosh keeps the reference. Separate from the invoice switch because it                  moves a different ledger, in the other direction."
+            }
         }
     }
 
@@ -153,6 +168,7 @@ impl Feature {
             Feature::AssetsSearchV2 => "PMS-1486",
             Feature::AssetsCatalog => "PMS-1492",
             Feature::DelegatedInvoiceIssuer => "MAPPS-1099",
+            Feature::DelegatedBills => "MAPPS-1155",
         }
     }
 

@@ -33,7 +33,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::modules::billing::invoice_issuer::{ExternalInvoiceRef, InvoiceProviderKind};
+use crate::modules::billing::invoice_issuer::{
+    ExternalBillRef, ExternalInvoiceRef, InvoiceProviderKind,
+};
 use crate::utils::error::{AppError, AppResult};
 
 /// Xero's identity host for OAuth 2.0 token refresh. Overridable through
@@ -79,6 +81,19 @@ pub struct XeroCredentials {
 /// every refresh and MUST be stored; a
 /// client that keeps using the old refresh token sees `invalid_grant`
 /// on the next call. `expires_in` is seconds from now.
+/// What a bill push needs from the caller (MAPPS-1155).
+///
+/// `contact_id` is the vendor's id in Xero, not the customer's: a bill is
+/// raised against whoever the MSP owes.
+#[derive(Debug, Clone)]
+pub struct XeroCreateBillRequest {
+    pub contact_id: Uuid,
+    pub issue_date: NaiveDate,
+    pub due_date: NaiveDate,
+    pub currency: String,
+    pub lines: Vec<XeroLineItemInput>,
+}
+
 /// One organisation a grant covers, as `GET /connections` lists it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct XeroConnection {
@@ -260,6 +275,67 @@ impl XeroClient {
     /// refresh tokens rotate on every call: the old one is immediately
     /// invalid). The caller writes the new pair back into the secret
     /// store before the next invoice call.
+    /// Raise a bill against a vendor (MAPPS-1155).
+    ///
+    /// The same endpoint, the same retry policy and the same credentials
+    /// as [`Self::issue_invoice`], with one field different: `ACCPAY`
+    /// rather than `ACCREC`. In Xero an invoice and a bill are one
+    /// resource distinguished by `Type`, which is why the client carries
+    /// that as a field rather than a literal.
+    ///
+    /// Getting it wrong is not a cosmetic error. `ACCREC` against a
+    /// vendor would put money the MSP OWES on the receivable side of
+    /// their accounts, and a test asserts the type on the wire for
+    /// exactly that reason.
+    pub async fn create_bill(
+        &self,
+        creds: &XeroCredentials,
+        request: &XeroCreateBillRequest,
+    ) -> AppResult<ExternalBillRef> {
+        let body = XeroCreateInvoiceBody {
+            kind: "ACCPAY",
+            contact: XeroContactRef {
+                contact_id: request.contact_id,
+            },
+            line_items: request
+                .lines
+                .iter()
+                .map(|l| XeroLineItemBody {
+                    description: l.description.clone(),
+                    quantity: minor_to_decimal(l.quantity_hundredths, 2),
+                    unit_amount: minor_to_decimal(l.unit_price_minor, 2),
+                })
+                .collect(),
+            date: request.issue_date,
+            due_date: request.due_date,
+            currency_code: request.currency.to_ascii_uppercase(),
+            // AUTHORISED: the MSP has the bill in their hand already, so a
+            // draft over there would be a second place to approve
+            // something that is not in question.
+            status: "AUTHORISED",
+        };
+        let url = format!("{}/api.xro/2.0/Invoices", self.api_base);
+        let envelope: XeroInvoiceEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Xero-Tenant-Id", &creds.tenant_id)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        let dto = envelope
+            .invoices
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::internal("Xero returned no bill".to_string()))?;
+        Ok(ExternalBillRef {
+            provider: InvoiceProviderKind::Xero,
+            external_bill_id: dto.invoice_id,
+        })
+    }
+
     /// Exchange an authorization code for the first token pair
     /// (MAPPS-1142).
     ///
@@ -658,6 +734,64 @@ mod tests {
         assert_eq!(env.invoices[0].invoice_id, "abc");
         assert_eq!(env.invoices[0].invoice_number.as_deref(), Some("INV-001"));
         assert_eq!(env.invoices[0].status, "AUTHORISED");
+    }
+
+    /// MAPPS-1155: a bill is `ACCPAY`, and getting that wrong is not
+    /// cosmetic.
+    ///
+    /// Xero keeps invoices and bills in one resource and tells them apart
+    /// by `Type`. `ACCREC` against a vendor would put money the MSP OWES
+    /// on the receivable side of their accounts, where it would read as
+    /// revenue. The client builds the body from the same struct for both,
+    /// so this is the one field standing between the two meanings.
+    #[test]
+    fn a_bill_is_accpay_and_an_invoice_is_accrec() {
+        let bill = XeroCreateInvoiceBody {
+            kind: "ACCPAY",
+            contact: XeroContactRef {
+                contact_id: Uuid::nil(),
+            },
+            line_items: vec![XeroLineItemBody {
+                description: "Rack space".to_string(),
+                quantity: "1.00".to_string(),
+                unit_amount: "120.00".to_string(),
+            }],
+            date: NaiveDate::from_ymd_opt(2026, 10, 25).unwrap(),
+            due_date: NaiveDate::from_ymd_opt(2026, 11, 25).unwrap(),
+            currency_code: "USD".to_string(),
+            status: "AUTHORISED",
+        };
+        let v = serde_json::to_value(&bill).expect("serialise");
+        assert_eq!(v["Type"], "ACCPAY", "a bill is payable, not receivable");
+        assert_eq!(v["LineItems"][0]["Description"], "Rack space");
+        assert_eq!(
+            v["Status"], "AUTHORISED",
+            "the MSP already has the bill, so a draft over there would be a \
+             second place to approve something that is not in question"
+        );
+
+        // And the source of the literal is the only difference between the
+        // two documents, which is why they cannot be confused by accident
+        // anywhere except here.
+        let src = include_str!("xero.rs");
+        let start = src.find("pub async fn create_bill").expect("the bill call");
+        // To the next method, not to a named one: everything between
+        // `create_bill` and the next `pub async fn` is its body, and an
+        // end marker further down would sweep in `issue_invoice`, which
+        // legitimately says ACCREC.
+        let end = start
+            + src[start..]
+                .find("\n    pub async fn ")
+                .expect("the next method");
+        let create_bill = &src[start..end];
+        assert!(
+            create_bill.contains(r#"kind: "ACCPAY""#),
+            "the bill call sends ACCPAY"
+        );
+        assert!(
+            !create_bill.contains(r#"kind: "ACCREC""#),
+            "and never the receivable type"
+        );
     }
 
     #[test]

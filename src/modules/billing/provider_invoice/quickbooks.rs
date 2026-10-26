@@ -33,7 +33,9 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::modules::billing::invoice_issuer::{ExternalInvoiceRef, InvoiceProviderKind};
+use crate::modules::billing::invoice_issuer::{
+    ExternalBillRef, ExternalInvoiceRef, InvoiceProviderKind,
+};
 use crate::utils::error::{AppError, AppResult};
 
 // These hosts were split into `host + tld` until MAPPS-1153, so that a
@@ -187,6 +189,81 @@ struct QuickBooksCreateInvoiceBody {
     currency_ref: QuickBooksRef,
 }
 
+/// A QuickBooks bill (MAPPS-1155).
+///
+/// Its own resource and its own body, not an invoice with a different
+/// reference: `/bill` takes a `VendorRef` and its lines are
+/// `AccountBasedExpenseLineDetail` against an expense account, where an
+/// invoice line is a `SalesItemLineDetail` against an item. Reusing the
+/// invoice body would send a sales line to the payables side.
+#[derive(Debug, Serialize)]
+struct QuickBooksCreateBillBody {
+    #[serde(rename = "VendorRef")]
+    vendor_ref: QuickBooksRef,
+    #[serde(rename = "Line")]
+    line: Vec<QuickBooksBillLineBody>,
+    #[serde(rename = "TxnDate")]
+    txn_date: NaiveDate,
+    #[serde(rename = "DueDate")]
+    due_date: NaiveDate,
+    #[serde(rename = "CurrencyRef")]
+    currency_ref: QuickBooksRef,
+}
+
+#[derive(Debug, Serialize)]
+struct QuickBooksBillLineBody {
+    // A string for the reason the invoice line's is: QBO takes the amount
+    // as a decimal literal and `minor_to_decimal` renders it, so the
+    // client never hands a float to a money field.
+    #[serde(rename = "Amount")]
+    amount: String,
+    #[serde(rename = "DetailType")]
+    detail_type: &'static str,
+    #[serde(rename = "Description")]
+    description: String,
+    #[serde(rename = "AccountBasedExpenseLineDetail")]
+    account_based_expense_line_detail: QuickBooksAccountDetail,
+}
+
+#[derive(Debug, Serialize)]
+struct QuickBooksAccountDetail {
+    #[serde(rename = "AccountRef")]
+    account_ref: QuickBooksRef,
+}
+
+/// What QuickBooks answers for a created bill.
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillEnvelope {
+    #[serde(rename = "Bill")]
+    bill: QuickBooksBillDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillDto {
+    #[serde(rename = "Id")]
+    id: String,
+}
+
+/// What a bill push needs from the caller (MAPPS-1155).
+#[derive(Debug, Clone)]
+pub struct QuickBooksCreateBillRequest {
+    pub vendor_id: String,
+    pub issue_date: NaiveDate,
+    pub due_date: NaiveDate,
+    pub currency: String,
+    pub lines: Vec<QuickBooksBillLineInput>,
+}
+
+/// One line of a bill: an amount against an expense ACCOUNT, which is
+/// what QuickBooks puts on the payables side.
+#[derive(Debug, Clone)]
+pub struct QuickBooksBillLineInput {
+    pub description: String,
+    pub amount_minor: i64,
+    /// The QuickBooks account this cost lands in.
+    pub account_id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct QuickBooksRef {
     value: String,
@@ -253,12 +330,59 @@ impl QuickBooksClient {
         self
     }
 
-    /// Refresh the access token on `creds`. QBO rotates refresh tokens
-    /// on every refresh and separately rotates the refresh token's own
-    /// 100-day lifetime; both come back on the response and the caller
-    /// writes the pair back into the secret store before the next
-    /// invoice call. A terminal failure (`invalid_grant`) surfaces as
-    /// `AppError::Unauthorized` so the handler shows reconnect copy.
+    /// Raise a bill against a vendor (MAPPS-1155).
+    ///
+    /// `/bill` rather than `/invoice`, with a `VendorRef` and
+    /// account-based lines. The token refresh, the retry policy and the
+    /// credentials are the ones MAPPS-1099 already built.
+    pub async fn create_bill(
+        &self,
+        creds: &QuickBooksCredentials,
+        request: &QuickBooksCreateBillRequest,
+    ) -> AppResult<ExternalBillRef> {
+        let body = QuickBooksCreateBillBody {
+            vendor_ref: QuickBooksRef {
+                value: request.vendor_id.clone(),
+            },
+            line: request
+                .lines
+                .iter()
+                .map(|l| QuickBooksBillLineBody {
+                    amount: minor_to_decimal(l.amount_minor, 2),
+                    detail_type: "AccountBasedExpenseLineDetail",
+                    description: l.description.clone(),
+                    account_based_expense_line_detail: QuickBooksAccountDetail {
+                        account_ref: QuickBooksRef {
+                            value: l.account_id.clone(),
+                        },
+                    },
+                })
+                .collect(),
+            txn_date: request.issue_date,
+            due_date: request.due_date,
+            currency_ref: QuickBooksRef {
+                value: request.currency.to_ascii_uppercase(),
+            },
+        };
+        let url = format!(
+            "{}/v3/company/{}/bill?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksBillEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(ExternalBillRef {
+            provider: InvoiceProviderKind::Quickbooks,
+            external_bill_id: envelope.bill.id,
+        })
+    }
+
     /// Exchange an authorization code for the first token pair
     /// (MAPPS-1142).
     ///
@@ -301,6 +425,12 @@ impl QuickBooksClient {
         })
     }
 
+    /// Refresh the access token on `creds`. QBO rotates refresh tokens
+    /// on every refresh and separately rotates the refresh token's own
+    /// 100-day lifetime; both come back on the response and the caller
+    /// writes the pair back into the secret store before the next
+    /// invoice call. A terminal failure (`invalid_grant`) surfaces as
+    /// `AppError::Unauthorized` so the handler shows reconnect copy.
     pub async fn refresh_access_token(
         &self,
         creds: &QuickBooksCredentials,

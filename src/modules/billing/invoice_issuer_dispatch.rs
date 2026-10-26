@@ -38,6 +38,9 @@ use crate::modules::billing::invoice_issuer_credentials::{
 };
 use crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService;
 use crate::modules::billing::models::CreateInvoiceLineRequest;
+use crate::modules::billing::provider_invoice::quickbooks::{
+    QuickBooksBillLineInput, QuickBooksCreateBillRequest,
+};
 use crate::modules::billing::provider_invoice::xero::XeroLineItemInput;
 use crate::modules::billing::provider_invoice::{
     QuickBooksClient, QuickBooksIssueInvoiceRequest, XeroClient, XeroIssueInvoiceRequest,
@@ -61,6 +64,37 @@ pub enum ExternalInvoiceState {
     Paid,
     Voided,
     Open,
+}
+
+/// What the dispatcher decided to do with one `create_bill` call
+/// (MAPPS-1155).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BillPlan {
+    Local,
+    Delegated(crate::modules::billing::invoice_issuer::ExternalBillRef),
+}
+
+/// The part of a bill the dispatcher needs, borrowed from the request so
+/// the caller does not build a second copy of it.
+pub struct CreateBillShape<'a> {
+    pub vendor_id: Uuid,
+    pub issue_date: NaiveDate,
+    pub due_date: NaiveDate,
+    pub currency: &'a str,
+    pub lines: &'a [BillLineShape],
+}
+
+/// One line, in the minor units both clients take.
+pub struct BillLineShape {
+    /// The Mokosh expense category, which is what resolves the ledger
+    /// account QuickBooks requires on every bill line. `None` is a
+    /// categoryless line, which Mokosh allows and QuickBooks does not;
+    /// the dispatcher refuses that line by name rather than picking an
+    /// account for the MSP.
+    pub category_id: Option<Uuid>,
+    pub description: String,
+    pub quantity_hundredths: i64,
+    pub unit_price_minor: i64,
 }
 
 /// What the dispatcher decided to do with one `create_invoice` call.
@@ -107,6 +141,191 @@ impl IssuerDispatcher {
             xero,
             quickbooks,
         }
+    }
+
+    /// Raise one bill in the provider the tenant delegated Bills and
+    /// expenses to (MAPPS-1155).
+    ///
+    /// The invoice path mirrored in the other direction: same credential
+    /// load, same near-expiry refresh, same clients, and a vendor mapping
+    /// where that one has a customer mapping. Returns `BillPlan::Local`
+    /// for every path that leaves `create_bill` alone - no dispatcher, the
+    /// deployment switch off, or the tenant not having delegated - and an
+    /// error when the provider was asked and refused, so the caller never
+    /// writes a local row for a bill the provider does not have.
+    pub async fn plan_bill(
+        &self,
+        tenant_id: TenantId,
+        request: &CreateBillShape<'_>,
+    ) -> AppResult<BillPlan> {
+        if !self
+            .features
+            .is_enabled(crate::modules::features::Feature::DelegatedBills)
+        {
+            return Ok(BillPlan::Local);
+        }
+        let bills = Capability::BillsAndExpenses.as_str();
+        let delegated = |integration: &crate::modules::integrations::IntegrationResponse| {
+            matches!(
+                integration.status,
+                crate::modules::integrations::IntegrationStatus::Connected
+                    | crate::modules::integrations::IntegrationStatus::Error
+            ) && integration.enabled_capabilities.iter().any(|c| c == bills)
+        };
+        let xero = self
+            .integrations
+            .get(tenant_id, IntegrationProvider::Xero)
+            .await?;
+        let quickbooks = self
+            .integrations
+            .get(tenant_id, IntegrationProvider::Quickbooks)
+            .await?;
+        // Xero before QuickBooks, the tie-break `select_issuer_with`
+        // already uses for invoices, so a tenant with both connected does
+        // not see one provider some days and the other on others.
+        let provider = if delegated(&xero) {
+            InvoiceProviderKind::Xero
+        } else if delegated(&quickbooks) {
+            InvoiceProviderKind::Quickbooks
+        } else {
+            return Ok(BillPlan::Local);
+        };
+
+        let mapping = self
+            .mappings
+            .get_vendor_mapping(tenant_id, provider, request.vendor_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "Vendor {} is not mapped to a {} vendor. Set the mapping at PUT \
+                     /api/v1/invoice-issuer-mappings/vendors/{}/{} first.",
+                    request.vendor_id,
+                    provider.as_str(),
+                    provider.as_str(),
+                    request.vendor_id
+                ))
+            })?;
+
+        match provider {
+            InvoiceProviderKind::Xero => {
+                let (blob, _refreshed) = self
+                    .load_and_refresh_blob(tenant_id, InvoiceProviderKind::Xero)
+                    .await?;
+                let IntegrationCredentialBlob::Xero(xero_blob) = &blob else {
+                    return Err(AppError::Unauthorized);
+                };
+                let creds =
+                    xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, xero_blob);
+                let contact_id = Uuid::parse_str(&mapping.external_vendor_id).map_err(|_| {
+                    AppError::internal(format!(
+                        "vendor {} is mapped to {:?} but Xero expects a UUID ContactID",
+                        request.vendor_id, mapping.external_vendor_id
+                    ))
+                })?;
+                let bill = self
+                    .xero
+                    .create_bill(
+                        &creds,
+                        &crate::modules::billing::provider_invoice::xero::XeroCreateBillRequest {
+                            contact_id,
+                            issue_date: request.issue_date,
+                            due_date: request.due_date,
+                            currency: request.currency.to_string(),
+                            lines: request
+                                .lines
+                                .iter()
+                                .map(|l| XeroLineItemInput {
+                                    description: l.description.clone(),
+                                    quantity_hundredths: l.quantity_hundredths,
+                                    unit_price_minor: l.unit_price_minor,
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await?;
+                Ok(BillPlan::Delegated(bill))
+            }
+            // QuickBooks puts a bill line against an expense ACCOUNT:
+            // `AccountBasedExpenseLineDetail.AccountRef` is required and
+            // the call is refused without it. Migration 286's mapping
+            // supplies it per expense category, at the granularity of
+            // the line that needs it, and an unmapped category is a
+            // refusal naming the category rather than a guess that files
+            // the MSP's costs in the wrong account in their own ledger.
+            InvoiceProviderKind::Quickbooks => {
+                let (blob, _refreshed) = self
+                    .load_and_refresh_blob(tenant_id, InvoiceProviderKind::Quickbooks)
+                    .await?;
+                let IntegrationCredentialBlob::Quickbooks(qbo_blob) = &blob else {
+                    return Err(AppError::Unauthorized);
+                };
+                let creds = quickbooks_credentials(
+                    self.apps.require(InvoiceProviderKind::Quickbooks)?,
+                    qbo_blob,
+                );
+                let category_ids: Vec<Uuid> =
+                    request.lines.iter().filter_map(|l| l.category_id).collect();
+                let account_map = self
+                    .mappings
+                    .get_expense_account_mappings(
+                        tenant_id,
+                        InvoiceProviderKind::Quickbooks,
+                        &category_ids,
+                    )
+                    .await?;
+                let mut qbo_lines = Vec::with_capacity(request.lines.len());
+                for line in request.lines {
+                    let category_id = line.category_id.ok_or_else(|| {
+                        AppError::Conflict(format!(
+                            "Bill line '{}' has no expense category, and a QuickBooks bill line \
+                             needs the account it posts to. Set a category on every line of a \
+                             delegated bill.",
+                            line.description
+                        ))
+                    })?;
+                    let mapping = account_map.get(&category_id).ok_or_else(|| {
+                        AppError::Conflict(format!(
+                            "Expense category {category_id} is not mapped to a QuickBooks \
+                             account. Set the mapping at PUT /api/v1/invoice-issuer-mappings\
+                             /expense-accounts/quickbooks/{category_id} first."
+                        ))
+                    })?;
+                    qbo_lines.push(QuickBooksBillLineInput {
+                        description: line.description.clone(),
+                        // The per-line rounding `BillTotals::from_lines`
+                        // uses, so the amount the provider holds is the
+                        // one the local row shows.
+                        amount_minor: line
+                            .unit_price_minor
+                            .saturating_mul(line.quantity_hundredths)
+                            / 100,
+                        account_id: mapping.external_account_id.clone(),
+                    });
+                }
+                let bill = self
+                    .quickbooks
+                    .create_bill(
+                        &creds,
+                        &QuickBooksCreateBillRequest {
+                            vendor_id: mapping.external_vendor_id.clone(),
+                            issue_date: request.issue_date,
+                            due_date: request.due_date,
+                            currency: request.currency.to_string(),
+                            lines: qbo_lines,
+                        },
+                    )
+                    .await?;
+                Ok(BillPlan::Delegated(bill))
+            }
+        }
+    }
+
+    /// Whether the deployment has delegated BILLS switched on
+    /// (MAPPS-1155). Its own switch, for the reason the feature registry
+    /// gives: the invoice flag names the invoice issuer.
+    pub fn bills_delegation_enabled(&self) -> bool {
+        self.features
+            .is_enabled(crate::modules::features::Feature::DelegatedBills)
     }
 
     /// Whether the deployment-wide toggle is on, with no query and no
