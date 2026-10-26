@@ -4,6 +4,10 @@
 //! parity record 2026-09-22: the SPA has no mileage entry surface today.
 //! The routes stay mounted so `RequireTimeTracking` and the block-hours
 //! consumption plumbing keep working; the entry screen is deferred.
+//!
+//! Exempted paths (named per MAPPS-1083):
+//!   - `/mileage-entries`
+//!   - `/mileage-entries/{id}`
 
 use std::sync::Arc;
 

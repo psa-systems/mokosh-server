@@ -40,12 +40,17 @@ pub enum Capability {
     Payments,
     /// Issuing the document the customer receives.
     Invoicing,
-    /// Selling at a counter, where the provider owns the terminal.
-    PointOfSale,
     /// What the MSP itself is billed for, and what it spends.
     BillsAndExpenses,
     /// People and organisations, synchronised both ways or one.
     Contacts,
+    // MAPPS-1102 (2026-10-21): PointOfSale removed. Retail counter sales are
+    // not a workflow Mokosh's MSP audience runs; no POS subsystem existed and
+    // no provider client did either. Migration 277 clears the string
+    // `point_of_sale` from any `integrations.enabled_capabilities` arrays.
+    // Re-adding this means filing a new ticket with the real subsystem + a
+    // provider client (Stripe Terminal or Square), not re-inserting the
+    // variant alone.
 }
 
 impl Capability {
@@ -54,7 +59,6 @@ impl Capability {
     pub const ALL: &'static [Capability] = &[
         Capability::Payments,
         Capability::Invoicing,
-        Capability::PointOfSale,
         Capability::BillsAndExpenses,
         Capability::Contacts,
     ];
@@ -63,7 +67,6 @@ impl Capability {
         match self {
             Self::Payments => "payments",
             Self::Invoicing => "invoicing",
-            Self::PointOfSale => "point_of_sale",
             Self::BillsAndExpenses => "bills_and_expenses",
             Self::Contacts => "contacts",
         }
@@ -73,7 +76,6 @@ impl Capability {
         match s {
             "payments" => Some(Self::Payments),
             "invoicing" => Some(Self::Invoicing),
-            "point_of_sale" => Some(Self::PointOfSale),
             "bills_and_expenses" => Some(Self::BillsAndExpenses),
             "contacts" => Some(Self::Contacts),
             _ => None,
@@ -86,7 +88,6 @@ impl Capability {
         match self {
             Self::Payments => "Payments",
             Self::Invoicing => "Invoicing",
-            Self::PointOfSale => "Point of sale",
             Self::BillsAndExpenses => "Bills and expenses",
             Self::Contacts => "Contacts",
         }
@@ -103,10 +104,6 @@ impl Capability {
             Self::Invoicing => {
                 "The provider issues the document the customer receives. Mokosh stops \
                  being the system of record for invoice numbering and delivery."
-            }
-            Self::PointOfSale => {
-                "The provider owns the counter terminal. Sales made there arrive here as \
-                 completed transactions."
             }
             Self::BillsAndExpenses => {
                 "The provider holds what the MSP is billed for and what it spends, so \
@@ -134,6 +131,10 @@ pub enum IntegrationProvider {
     Xero,
     Google,
     Microsoft,
+    /// MAPPS-1122: iCloud contacts. Its connection and credential both live in
+    /// contact sync (PMS-1341), so it is listed here and never connected here;
+    /// the panel's job is to say it exists and where it is set up.
+    Icloud,
 }
 
 impl IntegrationProvider {
@@ -144,6 +145,7 @@ impl IntegrationProvider {
         IntegrationProvider::Xero,
         IntegrationProvider::Google,
         IntegrationProvider::Microsoft,
+        IntegrationProvider::Icloud,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -154,6 +156,7 @@ impl IntegrationProvider {
             Self::Xero => "xero",
             Self::Google => "google",
             Self::Microsoft => "microsoft",
+            Self::Icloud => "icloud",
         }
     }
 
@@ -165,6 +168,7 @@ impl IntegrationProvider {
             "xero" => Some(Self::Xero),
             "google" => Some(Self::Google),
             "microsoft" => Some(Self::Microsoft),
+            "icloud" => Some(Self::Icloud),
             _ => None,
         }
     }
@@ -249,13 +253,15 @@ mod tests {
     fn the_all_lists_hold_every_variant() {
         assert_eq!(
             Capability::ALL.len(),
-            5,
-            "a capability was added without adding it to Capability::ALL"
+            4,
+            "a capability was added without adding it to Capability::ALL \
+             (MAPPS-1102 removed PointOfSale, so the count is 4, not 5)"
         );
         assert_eq!(
             IntegrationProvider::ALL.len(),
-            6,
-            "a provider was added without adding it to IntegrationProvider::ALL"
+            7,
+            "a provider was added without adding it to IntegrationProvider::ALL \
+             (MAPPS-1122 added Icloud, so the count is 7, not 6)"
         );
     }
 }

@@ -75,10 +75,10 @@ default:
 #   build-oci-image.yml owns that. Run it by hand before touching
 #   oci-build/Dockerfile.
 # - `test-integration` needs a Postgres container, which is why PMS-267 split it
-#   into integration.yml. Run it by hand before touching the tests/*.rs suite.
+#   into integration.yml. Run it by hand before touching the tests/suites/*.rs suite.
 [doc("Run every check.yml gate except its cargo test steps: the repo guards plus compile, clippy and fmt.")]
 [group: 'check']
-check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-single-build check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md
+check: check-compile check-clippy check-fmt check-migrations check-migration-immutability check-migration-versions-against-base check-guarded-content-migrations check-pool-safety check-validate-parity check-route-consumers check-mail-copy check-rate-limit-helper check-runner-labels check-oci-cache check-oci-publish-tags check-workspace-deps check-unused-deps check-env-example check-build-target-storage check-doc-recipes check-config-doc-paths check-config-docs check-doc-links check-claude-md
 
 # Keep docs/configuration.md's Required / Added in facts and changelog true to
 # the registry and src/config/variables.toml (PMS-1442).
@@ -165,7 +165,19 @@ check-env-example:
 # common's shared recipe (PC-79).
 [doc("Fail if two migrations share a numeric prefix (PMS-198).")]
 [group: 'check']
-check-migrations: check-migration-versions
+check-migrations: check-migration-versions check-migration-versions-against-base
+
+# PMS-1402: catch a prefix collision that only appears after the merge. The
+# per-branch check-migration-versions scan passes because each branch holds
+# only its own migration; two branches both picking 300_ each pass alone and
+# only collide when the second one lands. DEV-612 removed the push-to-main
+# re-check (which rolled the compile+test cost on every merge); this cheap
+# unions the base ref's migrations with HEAD's and re-asserts prefix
+# uniqueness WITHOUT the compile cost.
+[doc("Fail if a PR's migrations would collide with origin/main after the merge (PMS-1402).")]
+[group: 'check']
+check-migration-versions-against-base base_ref="origin/main":
+    nu scripts/check-migration-versions-against-base.nu migrations {{base_ref}}
 
 # Keep a guarded content UPDATE from matching zero rows in silence (PMS-1117).
 # A migration after prefix 209 that guards a WHERE clause on a content-column
@@ -277,14 +289,6 @@ check-oci-cache:
 check-oci-publish-tags:
     nu scripts/check-oci-publish-tags.nu
 
-# Build a commit once on the pull-request-to-main path (DEV-612). Fails if a
-# workflow that compiles declares both `push: main` and `pull_request: main`, or
-# if no compiling workflow gates pull requests into main at all.
-[doc("Fail if a compiling workflow builds the same tree twice (DEV-612).")]
-[group: 'check']
-check-single-build:
-    nu scripts/check-single-build.nu
-
 # Keep [workspace.dependencies] describing what the workspace shares (PMS-785).
 # Fails if an entry is inherited by no member, or if a member re-pins a crate
 # the workspace table already pins.
@@ -328,10 +332,24 @@ check-fmt:
 fmt:
     cargo fmt --all
 
-# Run tests
+# Run the unit tests (the Postgres-backed suite is `just test-integration`)
 [group: 'test']
 test:
-    cargo test --workspace
+    cargo test --workspace --lib --bins
+
+# PMS-1523: `--lib --bins`, not the whole workspace. PMS-1520 made every
+# `tests/suites/*.rs` a module of ONE binary, which cut the CI artifact from
+# 3.05 GB to 97.8 MB and removed a kind of isolation nobody had written down:
+# one binary per file was also one PROCESS per file under `cargo test`, and 19
+# cases depend on that. Three classes, all genuinely per-process: a global
+# tracing subscriber (11 sites, `set_global_default` succeeds once per
+# process), a `#[global_allocator]` counter asserting what THE PROCESS
+# allocated, and a stub bunyip OP with its per-process caches.
+#
+# nextest runs each case in its own process, so the suite is green there and
+# that is how CI and `just test-integration` run it. This recipe therefore
+# stops pretending `cargo test` can run it, rather than leaving a documented
+# command that fails 19 tests for reasons unrelated to the change under test.
 
 # Create the DB roles the migrations grant to, on the dev cluster (PMS-988).
 # Migration 207 grants on `app_secrets` to `mokosh_app`, and a GRANT to a role
@@ -358,7 +376,7 @@ ensure-test-db-roles: ensure-env
 # override is expanded inside the container so the credential stays in the
 # compose environment rather than reaching the host shell.
 #
-# PMS-1254: `tests/template_database.rs` runs first and builds the template the
+# PMS-1254: `tests/suites/template_database.rs` runs first and builds the template the
 # suite clones, so the migrations are applied by a step rather than by
 # whichever test process arrives first, and the line naming the template is
 # printed where it can be read rather than inside one case's captured output.
@@ -377,11 +395,11 @@ ensure-test-db-roles: ensure-env
 # exercise the same nextest release; update both in the same change.
 [group: 'test']
 test-integration: ensure-env ensure-test-db-roles
-    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci --no-capture -E '"'"'binary(template_database)'"'"' && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
+    docker compose --file {{ compose_file }} run --rm -e SQLX_OFFLINE=true server sh -c 'cargo install --locked --version 0.9.145 cargo-nextest && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci --no-capture -E '"'"'test(/^suites::template_database::/)'"'"' && DATABASE_URL="$MOKOSH_ADMIN_DATABASE_URL" cargo nextest run --profile ci'
 
 # Mirrors .forgejo/workflows/integration-unsupported.yml (PMS-1394): the suites
 # `test-integration` skips, for functionality nothing currently uses. Today that
-# is `tests/s3_storage.rs` alone, and it needs a MinIO, which is what
+# is `tests/suites/s3_storage.rs` alone, and it needs a MinIO, which is what
 # `dev-s3` starts and what fills the blank STORAGE_S3_* keys in `.env`. Without those
 # keys the suite skips loudly rather than failing, so running this recipe on a
 # stack that never ran `just dev-s3` reports nothing and passes.

@@ -1029,7 +1029,7 @@ impl NotificationsService {
     /// out of that transaction into two of their own, so the reads that decided
     /// WHAT to queue could not see the transaction that queued it. Both now run
     /// on the caller's connection, and
-    /// `tests/notification_dispatch_query_budget.rs` counts the `set_config`
+    /// `tests/suites/notification_dispatch_query_budget.rs` counts the `set_config`
     /// and the `COMMIT` so a third cannot come back unnoticed.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn dispatch(
@@ -2103,7 +2103,7 @@ impl From<RuleRow> for NotificationRuleResponse {
 /// `contacts::service::mirror_writers` shape, under `cargo test --lib`, with
 /// no script, recipe or CI step to add.
 ///
-/// `tests/notification_dispatch_query_budget.rs` is the behavioural half: this
+/// `tests/suites/notification_dispatch_query_budget.rs` is the behavioural half: this
 /// scan proves no transaction is opened in the render path, that test counts
 /// the `set_config` and the `COMMIT` a real dispatch actually issues.
 #[cfg(test)]

@@ -15,7 +15,7 @@ use validator::Validate;
 
 pub use mokosh_types::integrations::{Capability, IntegrationProvider, IntegrationStatus};
 
-use super::registry::{ConnectionHome, ProviderDescriptor};
+use super::registry::{ConnectionHome, CredentialHome, ProviderDescriptor};
 
 /// One capability, as the checkbox list renders it.
 ///
@@ -92,6 +92,32 @@ pub struct IntegrationResponse {
     /// What this tenant has handed over. Empty for a provider with no row.
     pub enabled_capabilities: Vec<String>,
     pub status: IntegrationStatus,
+    /// The settings surface that owns this provider's setup, and the one
+    /// action the panel offers (MAPPS-1122). `None` for a provider with
+    /// nowhere to send an operator yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupSurfaceResponse>,
+    /// Whether this provider's lifecycle can be CHANGED through this surface
+    /// (MAPPS-1129).
+    ///
+    /// `false` means the four per-provider routes answer 404 for it and the
+    /// panel's job here is to say what it is connected to and link to the
+    /// surface in `setup`. Served rather than derived, for the reason
+    /// `available` and `credential_elsewhere` are (PMS-1447): a client cannot
+    /// work it out from a provider name, and the one that tried rendered
+    /// capability checkboxes, Connect and Disconnect on Stripe and PayPal,
+    /// whose every call `parse_provider` refuses.
+    ///
+    /// It is the same predicate that route refuses on, so the two cannot drift
+    /// into a surface that offers a control the server will not take.
+    pub configurable_here: bool,
+    /// Whether this build has anything behind the provider (MAPPS-1121).
+    /// `false` means the entry exists so its capabilities can be named, and
+    /// connect and capability changes are refused: a client renders it as not
+    /// available rather than offering a credential field whose value nothing
+    /// would read. Served rather than derived from the provider name, the
+    /// reason `credential_elsewhere` is (PMS-1447).
+    pub available: bool,
     /// `Some` when the connection is owned by another subsystem, in which case
     /// connect, disconnect and capability changes are refused here.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,19 +145,58 @@ pub struct IntegrationResponse {
     pub last_error: Option<String>,
 }
 
+/// Where a provider is set up, as the panel renders it (MAPPS-1122).
+///
+/// `kind` is what the client routes on and `label` is what a reader sees. Two
+/// fields because the prose has already changed once ("Settings > Contact
+/// sync" named one page for three providers), and a client routing on prose
+/// would have broken when it did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupSurfaceResponse {
+    pub kind: String,
+    pub label: String,
+}
+
+impl From<crate::modules::integrations::registry::SetupSurface> for SetupSurfaceResponse {
+    fn from(surface: crate::modules::integrations::registry::SetupSurface) -> Self {
+        Self {
+            kind: surface.kind.to_string(),
+            label: surface.label.to_string(),
+        }
+    }
+}
+
 /// The descriptor's credential home as the response carries it.
 ///
 /// A free function rather than a method on the descriptor so the mapping from
 /// "which home" to "what the client is told" lives beside the DTO it fills,
 /// which is where a reader looking at the JSON will come looking for it.
 fn credential_elsewhere(descriptor: &ProviderDescriptor) -> Option<CredentialElsewhereResponse> {
-    descriptor
-        .credential_home
-        .entered_at()
-        .map(|entered_at| CredentialElsewhereResponse {
-            kind: descriptor.credential_home.as_str().to_string(),
-            entered_at: entered_at.to_string(),
-        })
+    // MAPPS-1153: composed from the HOME, and labelled from the provider's
+    // own surface when it has one.
+    //
+    // It used to be composed from `entered_at` alone, which made the home's
+    // one string do a per-provider job: `ContactSync` answers "Settings >
+    // Google Contacts" for all three contact sources, so iCloud's card
+    // named Google's page. `InvoiceIssuer` cannot have such a string at all
+    // - nothing is entered, and the two providers have different pages -
+    // which is what made the mismatch visible.
+    //
+    // The condition is now the home itself, so a provider whose credential
+    // does NOT arrive in the connect request always says so, and the label
+    // comes from `setup_surface` when there is one.
+    if descriptor.credential_home == CredentialHome::Integration {
+        return None;
+    }
+    let entered_at = descriptor
+        .setup_surface()
+        .map(|surface| surface.label.to_string())
+        .or_else(|| descriptor.credential_home.entered_at().map(str::to_string))
+        .unwrap_or_else(|| "its own settings page".to_string());
+    Some(CredentialElsewhereResponse {
+        kind: descriptor.credential_home.as_str().to_string(),
+        entered_at,
+    })
 }
 
 impl IntegrationResponse {
@@ -153,6 +218,9 @@ impl IntegrationResponse {
                 .collect(),
             enabled_capabilities: Vec::new(),
             status: IntegrationStatus::NotConnected,
+            setup: descriptor.setup_surface().map(SetupSurfaceResponse::from),
+            configurable_here: descriptor.is_writable_on_integrations_page(),
+            available: descriptor.build.is_built(),
             managed_elsewhere: match descriptor.connection_home {
                 ConnectionHome::Integrations => None,
                 ConnectionHome::Elsewhere {

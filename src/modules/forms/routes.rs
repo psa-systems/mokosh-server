@@ -85,7 +85,7 @@ pub fn forms_routes(service: FormsService, app_url: String) -> Router {
 //
 // Backend-only, no SPA caller wanted: `GET /forms/{id}`. The SPA lists every
 // definition and edits from that list, so a by-id read is redundant there; it
-// stays for API clients and is the shape `tests/forms.rs` reads back with.
+// stays for API clients and is the shape `tests/suites/forms.rs` reads back with.
 //
 // No SPA caller yet, and that is the gap: `GET /forms/{id}/submissions`. A
 // client's answers are otherwise unreadable once rendered into the ticket

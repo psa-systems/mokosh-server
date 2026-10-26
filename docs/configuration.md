@@ -12,6 +12,29 @@ In development, `.env` is generated once per clone from the committed `.env.exam
 
 Configuration changes in the last 5 releases, newest first, rendered by `just config-docs` from `src/config/registry.rs` and `src/config/variables.toml` (edit those, not this section). **Breaking: won't start** marks a change after which the restart fails until the operator acts; apply it before restarting. **Breaking: feature off** marks a change after which the server runs but the named feature stops working or changes until the operator acts; review it before restarting. Both name the operator action and the issue that introduced them. An unmarked entry needs no action unless you relied on the old behavior. Upgrading across more releases than this? Run `just config-since <running version>`.
 
+<a id="release-v0-19-0"></a>
+
+### Unreleased (v0.19.0)
+
+#### Added
+
+- [`PORTAL_COOKIE_DOMAIN`](#var-portal-cookie-domain) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-17-0"></a>
+
+### v0.17.0
+
+#### Added
+
+- **Breaking: feature off:** [`QUICKBOOKS_CLIENT_ID`](#var-quickbooks-client-id) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`QUICKBOOKS_CLIENT_SECRET`](#var-quickbooks-client-secret) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`QUICKBOOKS_VERIFIER_TOKEN`](#var-quickbooks-verifier-token) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`XERO_CLIENT_ID`](#var-xero-client-id) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`XERO_CLIENT_SECRET`](#var-xero-client-secret) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- **Breaking: feature off:** [`XERO_WEBHOOK_KEY`](#var-xero-webhook-key) (Required: no) - Feature: delegated invoice issuing through Xero and QuickBooks. Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh. (MAPPS-1139)
+- [`MICROSOFT_CONTACTS_CLIENT_ID`](#var-microsoft-contacts-client-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MICROSOFT_CONTACTS_CLIENT_SECRET`](#var-microsoft-contacts-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
+
 <a id="release-v0-16-0"></a>
 
 ### v0.16.0
@@ -118,18 +141,6 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 ### v0.13.0
 
 No configuration changes.
-
-<a id="release-v0-12-0"></a>
-
-### v0.12.0
-
-#### Added
-
-- [`ABUSE_CONTACT_EMAIL`](#var-abuse-contact-email) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
-- [`INFISICAL_ADDRESS`](#var-infisical-address) (Required: no) - Optional. Blank reports Infisical as skipped in the readiness probe. (GOV-50)
-- [`PUBLIC_API_BASE_URL`](#var-public-api-base-url) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
-- [`SPA_BASE_URL`](#var-spa-base-url) (Required: no) - Optional at the time (required since v0.14.0). Set it to the mokosh-apps origin so SPA-only email links land there. (MAPPS-425)
-- [`TENANT_LOGO_MAX_BYTES`](#var-tenant-logo-max-bytes) (Required: no) - Optional. Leave it unset to keep the default.
 
 <!-- END GENERATED: recently-added -->
 
@@ -286,6 +297,15 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-bunyip-mailer-url"></a>`BUNYIP_MAILER_URL` | no, unset makes `MAIL_PROVIDER=bunyip` refuse to boot | v0.16.0 | `.env` | Base URL of Bunyip's mailer relay that `MAIL_PROVIDER=bunyip` sends through (`POST /v1/mailer/send`, BUNYIP-602). |
 | <a id="var-bunyip-mailer-client-id"></a>`BUNYIP_MAILER_CLIENT_ID` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client id presented as HTTP Basic to the mailer relay. |
 | <a id="var-bunyip-mailer-client-secret"></a>`BUNYIP_MAILER_CLIENT_SECRET` | no, needed only with `BUNYIP_MAILER_URL` | v0.16.0 | `.env` | Machine-credential client secret presented as HTTP Basic to the mailer relay. |
+| <a id="var-microsoft-contacts-client-id"></a>`MICROSOFT_CONTACTS_CLIENT_ID` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The host's Microsoft 365 OAuth client id for the Microsoft Contacts import (MAPPS-1101). Served by the `APP_SECRET_BACKEND` provider: Infisical under `/app`, a `{NAME}_FILE` compose secret, an `APP_SECRETS_DIR` file or an `app_secrets` row. Setting only one half of the pair is a boot error naming the missing half. |
+| <a id="var-microsoft-contacts-client-secret"></a>`MICROSOFT_CONTACTS_CLIENT_SECRET` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The secret half of the pair above, served by the same provider so both come from one Entra ID app registration. |
+| <a id="var-portal-cookie-domain"></a>`PORTAL_COOKIE_DOMAIN` | no | v0.19.0 | `.env` | Optional `Domain=` attribute for the contact-portal refresh cookie (`mokosh:contact_token`). Set to the shared apex (e.g. `.a8n.run`) when the SPA runs on `tenant-*.<apex>` and the API host is a different subdomain of the same apex, so the cookie reaches `/api/v1/contact/auth/refresh` across subdomains. Unset leaves the cookie host-scoped. |
+| <a id="var-quickbooks-client-id"></a>`QUICKBOOKS_CLIENT_ID` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The host's QuickBooks Online OAuth client id for delegated invoice issuing (MAPPS-1139). Served by the `APP_SECRET_BACKEND` provider; setting only one half of the pair is a boot error naming the missing half. Unset leaves no tenant on this deployment able to connect a QuickBooks company. |
+| <a id="var-quickbooks-client-secret"></a>`QUICKBOOKS_CLIENT_SECRET` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The secret half of the pair above, served by the same provider so both come from one QuickBooks Online app registration (MAPPS-1139). |
+| <a id="var-quickbooks-verifier-token"></a>`QUICKBOOKS_VERIFIER_TOKEN` | no | v0.17.0 | governed application-tier secret, NOT `.env` | Verifier token QuickBooks signs webhook deliveries with. Served by the `APP_SECRET_BACKEND` provider; unset refuses deliveries, so an invoice QuickBooks marks paid stays outstanding in Mokosh until recorded by hand (MAPPS-1139). |
+| <a id="var-xero-client-id"></a>`XERO_CLIENT_ID` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The host's Xero OAuth client id for delegated invoice issuing (MAPPS-1139). Served by the `APP_SECRET_BACKEND` provider; setting only one half of the pair is a boot error naming the missing half. Unset leaves no tenant on this deployment able to connect a Xero organisation. |
+| <a id="var-xero-client-secret"></a>`XERO_CLIENT_SECRET` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The secret half of the pair above, served by the same provider so both come from one Xero app registration (MAPPS-1139). |
+| <a id="var-xero-webhook-key"></a>`XERO_WEBHOOK_KEY` | no | v0.17.0 | governed application-tier secret, NOT `.env` | Signing key Xero webhook deliveries are verified against. Served by the `APP_SECRET_BACKEND` provider; unset refuses deliveries, so an invoice Xero marks paid stays outstanding in Mokosh until recorded by hand (MAPPS-1139). |
 
 ## Development stack variables
 
@@ -324,20 +344,8 @@ Every stored object lives under one root: `STORAGE_ROOT` when `STORAGE_PROVIDER`
 
 ### Paths that do not yet begin with their tenant
 
-Two kinds of path are exceptions, and an operator reading a volume will see both.
+**Old locations, read-only.** A knowledge base image written before the layout change is at `kb-articles/{id}`, a tenant logo written before it is at `tenant-logos/{tenant}.{ext}`, and the five pre-PMS-1397 branding directories (`tenant-favicons/`, `tenant-backgrounds/`, `company-logos/`, `company-favicons/`, `company-backgrounds/`) still carry files not yet moved. All are still served; a one-shot pass at each server start (`BrandingAssetMover` and friends) walks them to the paths above and nothing writes back.
 
-**Old locations, read-only.** A knowledge base image written before the layout change is at `kb-articles/{id}`, and a tenant logo written before it is at `tenant-logos/{tenant}.{ext}`. Both are still served, and a one-shot pass at each server start walks them to the paths above; once it has, neither directory refills. Nothing writes to them.
+Every current write goes under its tenant. The five branding pairs now land at `{tenant}/branding/favicon.{ext}`, `{tenant}/branding/background.{ext}` and `{tenant}/branding/company-{kind}/{company}.{ext}` through `src/modules/branding/assets.rs`.
 
-**Branding assets other than the tenant logo**, which are still on a shared directory per kind and are the subject of PMS-1397:
-
-| Path | What it is |
-|---|---|
-| `tenant-favicons/{tenant}.{ext}` | the tenant's favicon |
-| `tenant-backgrounds/{tenant}.{ext}` | the tenant's sign-in background |
-| `company-logos/{company}.{ext}` | a client company's logo |
-| `company-favicons/{company}.{ext}` | a client company's favicon |
-| `company-backgrounds/{company}.{ext}` | a client company's sign-in background |
-
-These are listed rather than left to be discovered, because the point of documenting a layout is that it is the real one. The three `company-*` directories carry no tenant at all. That is not a way for one tenant to read another's file through the API - the routes that serve these are deliberately public, with the id as the credential, so no tenant-scoped key is presented in the first place - but it does mean those five cannot be moved, quota-limited or exported per tenant until PMS-1397 lands.
-
-`crate::storage` is the only place any of this is decided, with `src/modules/branding/assets.rs` holding the five above. A caller is handed a tenant and an object identity and never a path, so a new kind of stored object cannot invent its own layout, and `storage::tests::every_object_kind_puts_its_tenant_first` fails the build if one is added without its tenant in front.
+`crate::storage` is the only place any of this is decided. A caller is handed a tenant and an object identity and never a path, so a new kind of stored object cannot invent its own layout, and `storage::tests::every_object_kind_puts_its_tenant_first` fails the build if one is added without its tenant in front.

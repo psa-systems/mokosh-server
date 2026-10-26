@@ -10,7 +10,7 @@ Two vCard files that put PMS-1216's awkward account into a Google account, so th
 
 ## Why these values
 
-They are the ones `tests/contact_sync_engine.rs::the_awkward_account_imports_through_the_engine` drives through the
+They are the ones `tests/suites/contact_sync_engine.rs::the_awkward_account_imports_through_the_engine` drives through the
 real engine offline: several emails and phones with the primary first, a contact with no email, a single name, a
 non-Latin name, two records that resolve to one Mokosh contact, and one record outside every label. Keeping the two
 in step is what lets a failure during the pass be read as "Google does not behave the way the stub says" rather than

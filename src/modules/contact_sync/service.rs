@@ -33,7 +33,10 @@ use crate::utils::error::{AppError, AppResult};
 const STATE_TTL_MINUTES: i64 = 10;
 
 /// The provider this phase implements.
-const GOOGLE: &str = "google";
+pub(crate) const GOOGLE: &str = "google";
+/// MAPPS-1101: the Microsoft 365 provider discriminator used throughout the
+/// state table, the connections table, and the dispatch factory.
+pub(crate) const MICROSOFT: &str = "microsoft";
 
 #[derive(Clone)]
 pub struct ContactSyncService {
@@ -65,6 +68,12 @@ pub struct ContactSyncService {
     /// default handle holds `None`, which is the honest answer for a process
     /// that never resolved one.
     host_client: Arc<SharedGoogleClient>,
+    /// MAPPS-1101: the handle to the host's Microsoft 365 Entra OAuth client,
+    /// swappable at runtime for the same reason the Google one is. Held even
+    /// on a deployment with no Microsoft client (then `.current()` is `None`
+    /// and connect attempts are refused with the "not available on this
+    /// deployment" shape).
+    microsoft_client: Arc<super::microsoft_oauth::SharedMicrosoftClient>,
     /// PMS-1429: run the import worker as soon as a run is queued, instead of
     /// leaving it to sleep out its interval.
     ///
@@ -168,6 +177,21 @@ pub struct ContactSyncOverview {
     /// existing client reads `connection` and a tenant holding both is the point:
     /// two cards, two credentials, two selections, one response.
     pub icloud_connection: Option<ConnectionStatus>,
+    /// This deployment's host has an Entra ID client, the Microsoft half of
+    /// `configured` (MAPPS-1101). Without one nobody on the deployment can
+    /// connect, and the card says so rather than offering a button whose only
+    /// outcome is a 500 an admin cannot act on.
+    pub microsoft_configured: bool,
+    /// `integrations/microsoft_contacts_enabled` (PMS-1512), the Microsoft 365
+    /// half of `enabled`.
+    ///
+    /// MAPPS-1124: MAPPS-1101 shipped the Graph client, the Entra OAuth routes
+    /// and the sync dispatch, and this response never grew the pair that lets a
+    /// Settings page draw any of it. A provider the server can sync and the
+    /// client cannot see is a provider nobody can turn on.
+    pub microsoft_enabled: bool,
+    /// The Microsoft 365 connection, `null` when there is none.
+    pub microsoft_connection: Option<ConnectionStatus>,
 }
 
 /// What one connection looks like to the Settings card.
@@ -343,6 +367,7 @@ impl ContactSyncService {
             public_api_base,
             spa_base_url,
             host_client: Arc::new(SharedGoogleClient::default()),
+            microsoft_client: Arc::new(super::microsoft_oauth::SharedMicrosoftClient::default()),
             run_wake: None,
             payment_methods: None,
             carddav_base_url: carddav::ICLOUD_BASE_URL.to_string(),
@@ -367,6 +392,24 @@ impl ContactSyncService {
     /// path) rather than read it.
     pub fn host_client_handle(&self) -> Arc<SharedGoogleClient> {
         self.host_client.clone()
+    }
+
+    /// Hand the service the shared handle holding the host's Microsoft 365
+    /// Entra OAuth client (MAPPS-1101). Same posture as [`Self::with_host_client`]:
+    /// one handle, shared by the router's service, the worker's service, and
+    /// the Settings write path.
+    pub fn with_microsoft_client(
+        mut self,
+        client: Arc<super::microsoft_oauth::SharedMicrosoftClient>,
+    ) -> Self {
+        self.microsoft_client = client;
+        self
+    }
+
+    /// The Microsoft client handle, for a caller that has to swap it rather
+    /// than read it.
+    pub fn microsoft_client_handle(&self) -> Arc<super::microsoft_oauth::SharedMicrosoftClient> {
+        self.microsoft_client.clone()
     }
 
     /// Hand the service the handle that wakes the import worker (PMS-1429).
@@ -419,6 +462,28 @@ impl ContactSyncService {
             })?;
         Ok(format!(
             "{}/api/v1/public/contact-sync/google/callback",
+            base.trim_end_matches('/')
+        ))
+    }
+
+    /// Where Microsoft Entra sends the browser back to. Same posture as
+    /// [`Self::redirect_uri`]: byte-identical in the authorization URL and
+    /// the token exchange, and also what the Entra app registration lists
+    /// as a permitted redirect URI.
+    pub fn microsoft_redirect_uri(&self) -> AppResult<String> {
+        let base = self
+            .public_api_base
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                AppError::Configuration(
+                    "PUBLIC_API_BASE_URL is not set, so Microsoft has no address to return to."
+                        .to_string(),
+                )
+            })?;
+        Ok(format!(
+            "{}/api/v1/public/contact-sync/microsoft/callback",
             base.trim_end_matches('/')
         ))
     }
@@ -593,6 +658,167 @@ impl ContactSyncService {
         };
         Ok(format!(
             "{}/settings/integrations/google-contacts?contact_sync={flag}",
+            self.spa_base_url.trim_end_matches('/')
+        ))
+    }
+
+    /// MAPPS-1101: Microsoft 365 counterpart to [`Self::begin_connect`].
+    ///
+    /// Writes a `contact_sync_oauth_states` row with provider = microsoft
+    /// and returns the Entra authorization URL. A tenant without the
+    /// `contact_sync` module enabled is refused, same as the Google path.
+    pub async fn begin_microsoft_connect(
+        &self,
+        tenant_id: TenantId,
+        user_id: Uuid,
+    ) -> AppResult<String> {
+        self.assert_enabled(tenant_id, MICROSOFT).await?;
+        let client = self.require_microsoft_oauth_client()?;
+        let redirect_uri = self.microsoft_redirect_uri()?;
+        let pkce = Pkce::generate();
+        let secret = generate_token(48);
+        let state_hash = hash_password(&secret).await?;
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let state_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO contact_sync_oauth_states \
+             (tenant_id, provider, started_by_user_id, state_hash, code_verifier, redirect_uri, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+        )
+        .bind(tenant_id)
+        .bind(MICROSOFT)
+        .bind(user_id)
+        .bind(&state_hash)
+        .bind(&pkce.verifier)
+        .bind(&redirect_uri)
+        .bind(Utc::now() + Duration::minutes(STATE_TTL_MINUTES))
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let state = format!("{state_id}.{secret}");
+        Ok(super::microsoft_oauth::authorization_url(
+            &client,
+            &redirect_uri,
+            &state,
+            &pkce,
+        ))
+    }
+
+    /// MAPPS-1101: Microsoft 365 counterpart to [`Self::complete_connect`].
+    ///
+    /// SAFETY (PMS-285): runs with no session, so the tenant comes from the
+    /// state row the caller proved possession of. Every write is scoped to
+    /// that tenant. Mirrors Google's shape: load state, verify, consume,
+    /// exchange code, verify scope grant, record connection, redirect.
+    pub async fn complete_microsoft_connect(&self, state: &str, code: &str) -> AppResult<String> {
+        let (state_id, secret) = state
+            .split_once('.')
+            .ok_or_else(|| AppError::BadRequest("That sign-in link is not valid.".to_string()))?;
+        let state_id = Uuid::parse_str(state_id)
+            .map_err(|_| AppError::BadRequest("That sign-in link is not valid.".to_string()))?;
+
+        let row: Option<OauthStateRow> = sqlx::query_as(
+            "SELECT tenant_id, started_by_user_id, state_hash, code_verifier, redirect_uri, \
+                    consumed_at, expires_at \
+             FROM contact_sync_oauth_states WHERE id = $1 AND provider = $2",
+        )
+        .bind(state_id)
+        .bind(MICROSOFT)
+        .fetch_optional(self.db.migrator_pool())
+        .await?;
+        let Some(OauthStateRow {
+            tenant_id: tenant_uuid,
+            started_by_user_id: started_by,
+            state_hash,
+            code_verifier,
+            redirect_uri,
+            consumed_at,
+            expires_at,
+        }) = row
+        else {
+            return Err(AppError::BadRequest(
+                "That connection attempt is no longer valid. Start again from Settings."
+                    .to_string(),
+            ));
+        };
+        let usable = consumed_at.is_none()
+            && expires_at > Utc::now()
+            && verify_password(secret, &state_hash).await.unwrap_or(false);
+        if !usable {
+            return Err(AppError::BadRequest(
+                "That connection attempt is no longer valid. Start again from Settings."
+                    .to_string(),
+            ));
+        }
+        let tenant_id = TenantId::from_trusted(tenant_uuid);
+        let client = self.require_microsoft_oauth_client()?;
+
+        // Consume BEFORE the exchange so a slow or failing exchange cannot
+        // be retried with the same state.
+        let consumed: u64 = sqlx::query(
+            "UPDATE contact_sync_oauth_states SET consumed_at = NOW() \
+             WHERE id = $1 AND consumed_at IS NULL",
+        )
+        .bind(state_id)
+        .execute(self.db.migrator_pool())
+        .await?
+        .rows_affected();
+        if consumed == 0 {
+            return Err(AppError::BadRequest(
+                "That connection attempt is no longer valid. Start again from Settings."
+                    .to_string(),
+            ));
+        }
+
+        let tokens = super::microsoft_oauth::exchange_code(
+            &self.http,
+            &client,
+            &redirect_uri,
+            code,
+            &code_verifier,
+        )
+        .await
+        .map_err(AppError::from)?;
+        let Some(refresh_token) = tokens.refresh_token.clone() else {
+            // Microsoft returns a refresh token when `offline_access` is in
+            // the granted scope; the SCOPES constant always includes it, so
+            // its absence means consent was changed on the Entra side and
+            // the Settings card has to say what to do rather than storing a
+            // connection that dies in an hour.
+            return Err(AppError::BadRequest(
+                "Microsoft did not return a refresh token. Revoke this app in the Microsoft account's privacy settings and connect again."
+                    .to_string(),
+            ));
+        };
+        if tokens
+            .scope
+            .as_deref()
+            .is_some_and(|granted| !super::microsoft_oauth::grants_contacts_read(granted))
+        {
+            return Err(AppError::BadRequest(
+                "This Microsoft account was connected without permission to read its contacts. Connect again and leave the Contacts permission ticked."
+                    .to_string(),
+            ));
+        }
+        let account_email =
+            super::microsoft_oauth::account_email(&self.http, &tokens.access_token).await?;
+
+        let outcome = self
+            .record_connection(
+                tenant_id,
+                started_by,
+                MICROSOFT,
+                &account_email,
+                &refresh_token,
+            )
+            .await?;
+        let flag = match outcome {
+            ConnectOutcome::Connected(_) => "connected",
+            ConnectOutcome::Reconnected(_) => "reconnected",
+        };
+        Ok(format!(
+            "{}/settings/integrations/microsoft-contacts?contact_sync={flag}",
             self.spa_base_url.trim_end_matches('/')
         ))
     }
@@ -814,6 +1040,12 @@ impl ContactSyncService {
             )
             .await?,
             icloud_connection: self.connection(tenant_id, ICLOUD).await?,
+            microsoft_configured: self.microsoft_oauth_client().is_some(),
+            microsoft_enabled: crate::modules::settings::read_microsoft_contacts_enabled(
+                &self.db, tenant_id,
+            )
+            .await?,
+            microsoft_connection: self.connection(tenant_id, MICROSOFT).await?,
         })
     }
 
@@ -844,18 +1076,73 @@ impl ContactSyncService {
         })
     }
 
+    /// MAPPS-1101: the deployment's Microsoft 365 Entra client, as of now.
+    /// `None` when the deployment holds no Microsoft pair; the Settings card
+    /// reads that as "not available on this deployment".
+    pub fn microsoft_oauth_client(&self) -> Option<super::microsoft_oauth::OauthClient> {
+        self.microsoft_client.current()
+    }
+
+    fn require_microsoft_oauth_client(&self) -> AppResult<super::microsoft_oauth::OauthClient> {
+        self.microsoft_oauth_client().ok_or_else(|| {
+            AppError::Configuration(
+                "Microsoft 365 Contacts is not available on this deployment. Its Entra ID sign-in \
+                 client is configured by whoever runs it."
+                    .to_string(),
+            )
+        })
+    }
+
+    /// MAPPS-1101: fresh access token for a Microsoft 365 contact-sync
+    /// connection. Parallel to [`Self::access_token`] (Google), with the two
+    /// providers' refresh paths kept separate because the OAuth clients and
+    /// endpoints differ. `GrantRevoked` is handled identically: the
+    /// connection is marked `reconnect_required` and the error is propagated
+    /// unchanged.
+    pub async fn microsoft_access_token(
+        &self,
+        tenant_id: TenantId,
+        connection_id: Uuid,
+    ) -> AppResult<String> {
+        let client = self.require_microsoft_oauth_client()?;
+        let refresh_token = self
+            .secrets
+            .get(&SecretKey::contact_sync(
+                tenant_id.get(),
+                "microsoft",
+                connection_id,
+            ))
+            .await?
+            .ok_or_else(|| {
+                AppError::Configuration(
+                    "This connection's credential is missing from the secret store.".to_string(),
+                )
+            })?;
+        match super::microsoft_oauth::refresh_access_token(&self.http, &client, &refresh_token)
+            .await
+        {
+            Ok(tokens) => Ok(tokens.access_token),
+            Err(TokenError::GrantRevoked) => {
+                self.mark_reconnect_required(tenant_id, connection_id).await;
+                Err(AppError::from(TokenError::GrantRevoked))
+            }
+            Err(other) => Err(AppError::from(other)),
+        }
+    }
+
     /// Refuse while `integrations/google_contacts_enabled` is off (PSA-70 K).
     /// A 409 naming the setting, because the request is fine and the tenant's
     /// state is what stands in the way.
     pub async fn assert_enabled(&self, tenant_id: TenantId, provider: &str) -> AppResult<()> {
         // PMS-1409: each integration has its own switch (PMS-1341), so this asks
         // the one the caller is actually using. Reading Google's flag for an
-        // iCloud request would have made one integration turn the other off.
-        let on = if provider == ICLOUD {
-            crate::modules::settings::read_icloud_contacts_enabled(&self.db, tenant_id).await?
-        } else {
-            crate::modules::settings::read_google_contacts_enabled(&self.db, tenant_id).await?
-        };
+        // iCloud request would have made one integration turn the other off;
+        // PMS-1512 gives Microsoft the same treatment.
+        //
+        // PMS-1524 moved the selection to `switch::contacts_enabled`, because
+        // the same three-way choice is made again before a queued run executes
+        // and that copy had not been given Microsoft's key.
+        let on = super::switch::contacts_enabled(&self.db, tenant_id, provider).await?;
         if on {
             Ok(())
         } else {
@@ -1042,6 +1329,20 @@ impl ContactSyncService {
                 app_password,
             );
             return Ok((connection, Box::new(ICloudProvider::new(client))));
+        }
+        // PMS-1512: Microsoft's access token is minted against the Entra
+        // OAuth client, not Google's, matching `runs.rs::GoogleSourceFactory::source`.
+        if provider == MICROSOFT {
+            let token = self
+                .microsoft_access_token(tenant_id, connection.id)
+                .await?;
+            return Ok((
+                connection,
+                Box::new(super::microsoft::MicrosoftContactsProvider::new(
+                    self.http.clone(),
+                    token,
+                )),
+            ));
         }
         let token = self
             .access_token(tenant_id, connection.id, &connection.provider)
@@ -1860,6 +2161,12 @@ impl ContactSyncService {
         connection_id: Uuid,
         provider: &str,
     ) -> AppResult<String> {
+        // PMS-1512: Microsoft's refresh token is never sent to Google's token
+        // endpoint, even if a future caller reaches this function directly
+        // with `provider == MICROSOFT` instead of going through `source`.
+        if provider == MICROSOFT {
+            return self.microsoft_access_token(tenant_id, connection_id).await;
+        }
         let client = self.require_oauth_client()?;
         let refresh_token = self
             .secrets

@@ -46,8 +46,8 @@ Read endpoints (`GET /teams`, `GET /teams/{id}`, `GET /teams/{id}/members`) are 
 
 ## Where the tests live
 
-- Service-layer: `tests/teams.rs`, pinning the CRUD, member roster, and validation behaviour.
-- HTTP-layer projection guard: `tests/team_management_projection.rs`, pinning that an admin passes without a manager binding, a technician passes only when they are the row's `manager_id`, and `UserRole::Manager` alone is refused.
+- Service-layer: `tests/suites/teams.rs`, pinning the CRUD, member roster, and validation behaviour.
+- HTTP-layer projection guard: `tests/suites/team_management_projection.rs`, pinning that an admin passes without a manager binding, a technician passes only when they are the row's `manager_id`, and `UserRole::Manager` alone is refused.
 
 ## Related tickets
 

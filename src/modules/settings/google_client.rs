@@ -409,6 +409,19 @@ mod tests {
                         "GOCSPX-pms1444-secret".to_string()
                     }
                     GovernedSecret::SmtpPassword => "smtp".to_string(),
+                    // MAPPS-1101: this fake only exercises the Google
+                    // pair; Microsoft's writable surface is a separate
+                    // follow-up and this test does not drive it.
+                    // MAPPS-1139: the invoice-issuer apps are the host's
+                    // too, and this fake drives none of them.
+                    GovernedSecret::MicrosoftContactsClientId
+                    | GovernedSecret::MicrosoftContactsClientSecret
+                    | GovernedSecret::XeroClientId
+                    | GovernedSecret::XeroClientSecret
+                    | GovernedSecret::XeroWebhookKey
+                    | GovernedSecret::QuickbooksClientId
+                    | GovernedSecret::QuickbooksClientSecret
+                    | GovernedSecret::QuickbooksVerifierToken => return None,
                 })
             }
         }
@@ -503,7 +516,15 @@ mod tests {
                     GovernedSecret::GoogleContactsClientSecret => {
                         self.secret.lock().unwrap().clone()
                     }
-                    GovernedSecret::SmtpPassword => None,
+                    GovernedSecret::SmtpPassword
+                    | GovernedSecret::MicrosoftContactsClientId
+                    | GovernedSecret::MicrosoftContactsClientSecret
+                    | GovernedSecret::XeroClientId
+                    | GovernedSecret::XeroClientSecret
+                    | GovernedSecret::XeroWebhookKey
+                    | GovernedSecret::QuickbooksClientId
+                    | GovernedSecret::QuickbooksClientSecret
+                    | GovernedSecret::QuickbooksVerifierToken => None,
                 }
             }
             async fn set(&self, secret: GovernedSecret, value: &str) -> AppResult<()> {
@@ -518,7 +539,15 @@ mod tests {
                     GovernedSecret::GoogleContactsClientSecret => {
                         *self.secret.lock().unwrap() = Some(value.to_string());
                     }
-                    GovernedSecret::SmtpPassword => {}
+                    GovernedSecret::SmtpPassword
+                    | GovernedSecret::MicrosoftContactsClientId
+                    | GovernedSecret::MicrosoftContactsClientSecret
+                    | GovernedSecret::XeroClientId
+                    | GovernedSecret::XeroClientSecret
+                    | GovernedSecret::XeroWebhookKey
+                    | GovernedSecret::QuickbooksClientId
+                    | GovernedSecret::QuickbooksClientSecret
+                    | GovernedSecret::QuickbooksVerifierToken => {}
                 }
                 Ok(())
             }

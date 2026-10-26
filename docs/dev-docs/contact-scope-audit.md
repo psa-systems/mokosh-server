@@ -4,13 +4,13 @@ Every HTTP handler a portal contact (JWT `typ: "contact"`) can reach
 must scope its response to the caller's own `session.company_id`.
 Two existing regression suites already lock this promise:
 
-- [`tests/contact_scope.rs`](../../tests/contact_scope.rs) — tickets
+- [`tests/suites/contact_scope.rs`](../../tests/suites/contact_scope.rs) — tickets
   (create / list / detail-foreign / add-note redaction), invoices
   (list scoped, detail cross-tenant 404, staff non-finance still
   403), quotes (accept flips, accept-foreign 404, without-cap 403,
   staff-accept-endpoint 403), the CRM blocks (staff-only 401 for
   contact bearers), plus a stale-JWT cap re-check.
-- [`tests/contact_scope_expanded.rs`](../../tests/contact_scope_expanded.rs)
+- [`tests/suites/contact_scope_expanded.rs`](../../tests/suites/contact_scope_expanded.rs)
   — contracts, assets, projects, dashboard summary, PUT /auth/me.
 
 The audit that produced this doc walked every handler enumerated
@@ -32,7 +32,7 @@ endpoint, extend one of these files.
   type carries the MSP's notes, rates, budgets, purchase prices, network
   identity and assignees. A new dual-plane read of an entity with any
   such field needs a projection and a case in
-  `tests/contact_dto_projection.rs`.
+  `tests/suites/contact_dto_projection.rs`.
 - **N/A**: auth / session lifecycle (login, refresh, logout, set +
   reset + forgot password), the public `/host` and
   `/resolve-to-portal-id` hooks, and any endpoint that never returns
@@ -161,28 +161,28 @@ the scoped read + write paths. Together they assert:
 - A stale JWT that carries a since-revoked cap fails 403 within one
   request (the server DB-loads caps live per prompt 008).
 
-`tests/contact_ticket_sla.rs` (PMS-1087) covers the SLA read: the
+`tests/suites/contact_ticket_sla.rs` (PMS-1087) covers the SLA read: the
 four states on own tickets, the same shape for staff, a foreign ticket
 indistinguishable from an unknown id, 403 without `tickets:read`.
 
-`tests/contact_approvals.rs` (PMS-1084) covers the approvals a staff
+`tests/suites/contact_approvals.rs` (PMS-1084) covers the approvals a staff
 user addresses to a contact: the contact lists exactly those, decides
 each once with the contact recorded, a sibling's, a staff role's and an
 unknown id are 404 alike, staff cannot decide a contact's row, and a
 contact without `approvals:decide` is 403.
 
-`tests/contact_notifications.rs` (PMS-1083) covers the inbox: the
+`tests/suites/contact_notifications.rs` (PMS-1083) covers the inbox: the
 dispatcher writes the contact's `in_app` row (and none for an opted-out
 contact), the list shows the caller's rows and neither a sibling's nor a
 staff user's, mark-read is idempotent and a foreign id is a 404, and a
 contact without `notifications:read` is 403.
 
-`tests/contact_invoice_payments.rs` (PMS-1088) covers the invoice
+`tests/suites/contact_invoice_payments.rs` (PMS-1088) covers the invoice
 ledger: payments and refunds newest first in the safe subset, an empty
 ledger, the staff shape, a foreign invoice with payments answering the
 unknown-id 404, 403 without `invoices:read`.
 
-`tests/contact_kb.rs` (PMS-1082) covers the three KB reads: the
+`tests/suites/contact_kb.rs` (PMS-1082) covers the three KB reads: the
 visible slice for a contact with `kb:read`, the identical 404 for an
 internal, draft, foreign or unknown article, the 403 without the
 capability, the trimmed DTO, and the staff arm unchanged behind its

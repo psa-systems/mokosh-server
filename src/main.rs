@@ -657,6 +657,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // MAPPS-1139: the deployment's Xero and Intuit applications, resolved
+    // here for the same reason the Google pair is. A host holding one half of
+    // a pair is a boot error naming the missing key, raised where an operator
+    // is present to read it rather than at a customer's first click.
+    let issuer_apps = std::sync::Arc::new(match mokosh_server::app_secrets::current() {
+        Some(secrets) => {
+            mokosh_server::modules::billing::invoice_issuer_app::IssuerApps::from_app_secrets(
+                secrets.as_ref(),
+            )?
+        }
+        None => Default::default(),
+    });
+
     // PMS-1444: ONE handle, shared by the router's service, the worker's
     // service and the settings write path. A deployment operator setting the
     // pair from Settings swaps this, so the next Connect and the next token
@@ -666,6 +679,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // outcomes.
     let google_client = std::sync::Arc::new(
         mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
+    );
+    // MAPPS-1101: same posture as the Google client above. One Entra app
+    // registration held by the deployment; a half-configured pair raises a
+    // boot error naming the missing half. One shared handle swapped at
+    // runtime so a Settings write takes effect in both the router and the
+    // worker without a restart.
+    let microsoft_client = match mokosh_server::app_secrets::current() {
+        Some(secrets) => {
+            mokosh_server::modules::contact_sync::microsoft_oauth::OauthClient::from_app_secrets(
+                secrets.as_ref(),
+            )?
+        }
+        None => None,
+    };
+    let microsoft_client = std::sync::Arc::new(
+        mokosh_server::modules::contact_sync::microsoft_oauth::SharedMicrosoftClient::new(
+            microsoft_client,
+        ),
     );
     // PMS-1444: the router's deployment-wide Google client handler writes
     // through these. `init_from_env` above installed them, so `current()` is
@@ -950,7 +981,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The worker refreshes each run's access token, which is an exchange
         // with the same client the connection was made under, so it needs the
         // host client as much as the request path does.
-        .with_host_client(google_client.clone()),
+        .with_host_client(google_client.clone())
+        // MAPPS-1101: the worker also refreshes Microsoft 365 access tokens.
+        .with_microsoft_client(microsoft_client.clone()),
     );
     let contact_sync_notifications =
         mokosh_server::modules::notifications::NotificationsService::with_encryption_key(
@@ -1103,6 +1136,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         async move { tenant_logo_mover.run_tick().await.map(|_| ()) },
     );
 
+    // PMS-1397: the five non-logo (scope, kind) pairs that still lived
+    // in a directory shared across tenants (`tenant-favicons/`,
+    // `tenant-backgrounds/`, `company-logos/`, `company-favicons/`,
+    // `company-backgrounds/`) now serve under `{tenant}/branding/...`.
+    // `BrandingAssetStore` reads fall back to the legacy layout until
+    // this pass reaches them, so a live asset keeps rendering.
+    mokosh_server::modules::branding::mover::arm(
+        mokosh_server::storage::StorageConfig::from_env().root,
+        db.clone(),
+    );
+
     // PMS-968: pre-existing gateway credentials out of their column and into
     // the configured secret provider.
     let gateway_credential_mover = mokosh_server::modules::billing::GatewayCredentialMover::new(
@@ -1220,7 +1264,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         secrets.clone(),
         Some(contact_sync_wake),
         google_client,
+        microsoft_client,
         app_secrets,
+        issuer_apps,
         features,
     );
     let router = psa_router;

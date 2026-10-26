@@ -521,6 +521,12 @@ async fn boot_with_db(
         std::sync::Arc::new(
             mokosh_server::modules::contact_sync::SharedGoogleClient::new(google_client),
         ),
+        // MAPPS-1101: the host's Microsoft 365 Entra client, same posture as
+        // the Google handle above. `None` for every suite that does not care,
+        // which reads as a deployment that cannot connect Microsoft 365.
+        std::sync::Arc::new(
+            mokosh_server::modules::contact_sync::microsoft_oauth::SharedMicrosoftClient::default(),
+        ),
         // PMS-1444: application-tier secrets over THIS suite's database, which
         // is what lets the deployment-wide Google client handler be exercised
         // per test. `app_secrets::current()` would be the wrong answer here: it
@@ -552,6 +558,14 @@ async fn boot_with_db(
                 }
             }
         },
+        // MAPPS-1139: no Xero or Intuit application on the booted app, which
+        // reads as a deployment that cannot connect either. A suite that
+        // exercises the delegated path builds its own dispatcher with fixture
+        // applications, because what it is testing is the issuing, not how a
+        // deployment came by its client id.
+        std::sync::Arc::new(
+            mokosh_server::modules::billing::invoice_issuer_app::IssuerApps::default(),
+        ),
         // PMS-1414: a fresh feature-toggle snapshot per booted app, every
         // feature off. Off is what a database with no rows means, so a suite
         // that does not care about toggles sees the state a new deployment has.

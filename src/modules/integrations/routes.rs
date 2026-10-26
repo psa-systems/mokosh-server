@@ -34,6 +34,7 @@ use crate::utils::error::{AppError, AppResult};
 use crate::utils::json::Json;
 
 use super::models::*;
+use super::registry;
 use super::service::IntegrationsService;
 
 #[derive(Clone)]
@@ -67,8 +68,21 @@ pub fn integration_routes(service: IntegrationsService) -> Router {
 /// exist. Parsing here rather than in the service means the service only ever
 /// sees a provider the registry has an entry for, which is what lets
 /// `registry::descriptor` be infallible.
+///
+/// MAPPS-1098: also 404 for a provider whose lifecycle belongs to another
+/// settings surface. The row still exists and the owning subsystem still
+/// writes to it; the HTTP surface here does not expose it, so that one
+/// surface is the single place the lifecycle happens.
+///
+/// MAPPS-1153: that is now every provider in the registry. The payment
+/// providers are the payments surface's, the three contact sources are
+/// contact sync's, and the two invoice issuers are their own pages' - so
+/// these four routes currently serve nobody. They are kept rather than
+/// deleted because the registry is the one place that decides, and a
+/// provider whose credential does arrive in a connect request would be
+/// served by them again without a route being rebuilt.
 fn parse_provider(raw: &str) -> AppResult<IntegrationProvider> {
-    IntegrationProvider::from_str(raw).ok_or_else(|| {
+    let provider = IntegrationProvider::from_str(raw).ok_or_else(|| {
         AppError::NotFound(format!(
             "{raw} is not an integration provider. The providers are: {}",
             IntegrationProvider::ALL
@@ -77,7 +91,29 @@ fn parse_provider(raw: &str) -> AppResult<IntegrationProvider> {
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
-    })
+    })?;
+    // MAPPS-1098: a provider whose lifecycle belongs elsewhere is refused
+    // here. MAPPS-1122 kept this and stopped the LIST sharing the predicate:
+    // the panel lists every provider, and only CHANGING one is confined to
+    // its own surface.
+    //
+    // MAPPS-1153: the message names that surface from the registry rather
+    // than saying "Settings > Payment Gateways" the way it used to. That was
+    // true while the payment providers were the only refused ones and became
+    // a lie the moment they were not: it would have sent a Xero admin to the
+    // payments page.
+    let descriptor = registry::descriptor(provider);
+    if !descriptor.is_writable_on_integrations_page() {
+        return Err(AppError::NotFound(match descriptor.setup_surface() {
+            Some(surface) => format!(
+                "{} is configured under {}",
+                provider.as_str(),
+                surface.label
+            ),
+            None => format!("{} is not configured here", provider.as_str()),
+        }));
+    }
+    Ok(provider)
 }
 
 async fn list_integrations(

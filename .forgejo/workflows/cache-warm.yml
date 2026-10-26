@@ -1,0 +1,142 @@
+---
+
+# Cache warmup after merge (PMS-1252).
+#
+# `check.yml` and `integration.yml` trigger only on `pull_request` into
+# main. forgejo-runner's `getWriteIsolationKey` gives a `pull_request`
+# event the write isolation key `refs/pull/<N>/...`, which only later
+# runs of THAT pull request can read; a `push` event (and a merged
+# pull_request's `closed` event) writes under the empty key, which
+# every run in the repository can read. So no pull-request run ever
+# writes to the shared scope and every new pull request starts cold.
+#
+# DEV-612's push-to-main gate was deleted to stop re-running the pull-
+# request's own compile + test suites against a merged tree that was
+# usually byte-identical. That cost is real; the pull request is the
+# merge gate and the merged tree gets its own fresh compile out of
+# `build-oci-image.yml`. The share-cache gap is a separate concern:
+# this workflow fills it after merge, builds without running anything,
+# and sets the same `shared-key` the pull-request jobs set so a
+# subsequent pull request restores it.
+#
+# Replaces `scripts/check-single-build.nu`. DEV-612's real concern was
+# re-RUNNING the suites after merge; the warm jobs run neither tests
+# nor the heavier guard scripts, so a push-to-main compile here does
+# not re-trip the "same tree twice" symptom. See
+# `docs/invariants/ci-release.md` for the model.
+#
+# Per-runner cache: each runner host serves its own cache
+# (`ACTIONS_CACHE_URL` differs per runner in the logs). A warm run
+# fills the cache only on the host that ran it, so a pull-request run
+# landing on a different host from the warm run still restores
+# nothing; this is a limit of the forgejo-runner cache, not a
+# regression here.
+
+name: Cache warm
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  warm-check:
+    name: warm check.yml cache
+    # Same label as check.yml itself (the dev image carries cc / gcc / ld
+    # plus the OpenSSL headers), so the restore matches the write.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: Cap build parallelism
+        # Matches check.yml so the compile fingerprints line up.
+        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
+
+      - name: Cache Rust build
+        # `shared-key` MUST match check.yml's pull-request job. Both
+        # land in the key as the `-check-` segment; the restore key
+        # printed by a pull-request run must equal the key this run
+        # saved.
+        uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          cache-on-failure: true
+
+      - name: Compile what check.yml compiles
+        # Build the profile fingerprints check.yml's job builds (clippy's
+        # lint-flagged dev, plain check, lib test-no-run) plus actually run
+        # the doc tests. The lib tests stay compile-only; the doc tests
+        # cannot — Cargo rejects `--no-run` for doc tests outright
+        # (`error: can't skip running doc tests with --no-run`), because
+        # rustdoc builds and runs them in one step. The run itself still
+        # primes the fingerprint check.yml's doc-test step reuses on a PR,
+        # which is the point of this workflow.
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo check --all-targets
+          cargo test --no-run --workspace --lib
+          cargo test --workspace --doc
+
+  warm-integration:
+    name: warm integration.yml cache
+    # Same label as integration.yml itself (compiles natively on the
+    # runner, needs the dev image's cc / gcc / ld + OpenSSL headers).
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_DEV_LATEST }}
+    timeout-minutes: 30
+
+    # SQLX_OFFLINE lets `cargo nextest archive` compile the test
+    # binaries without a reachable database. integration.yml uses the
+    # same offline flag plus a Postgres service for running the suite;
+    # this warm job archives only, so Postgres is deliberately not
+    # stood up here.
+    env:
+      SQLX_OFFLINE: "true"
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: Clone the repository
+        uses: https://code.forgejo.org/actions/checkout@v5
+
+      - name: Cap build parallelism
+        run: echo "CARGO_BUILD_JOBS=$(($(nproc) / 2))" >> "$GITHUB_ENV"
+
+      - name: Cache Rust build
+        # `shared-key` MUST match integration.yml's pull-request job.
+        uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          shared-key: integration
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        # Mirrors integration.yml's pinned install so the archive step
+        # below links the same binary the pull-request job will. The
+        # version + sha256 are the ones integration.yml pins today; if
+        # that file bumps nextest, bump the pair here too (otherwise
+        # the archive step compiles against a different binary and the
+        # cache fingerprints will not match the pull-request job).
+        env:
+          NEXTEST_VERSION: "0.9.145"
+          NEXTEST_SHA256: "32aa82416099eb12fffae9cf1a279ad201fecbd3f74826c613e32e9006b29867"
+        run: |
+          set -euo pipefail
+          curl --silent --fail --location --output /tmp/nextest.tar.gz \
+            "https://get.nexte.st/${NEXTEST_VERSION}/linux"
+          echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum --check --strict
+          cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          mkdir -p "${cargo_bin}"
+          tar --extract --gzip --file /tmp/nextest.tar.gz --directory "${cargo_bin}"
+
+      - name: Archive what integration.yml archives
+        # Same command the pull-request job uses, writing to a scratch
+        # path. The archive itself is discarded; this step exists to
+        # fill the build cache with the test-binary fingerprints the
+        # pull-request job will restore.
+        run: |
+          cargo nextest archive \
+            --archive-file /tmp/nextest-archive.tar.zst \
+            --workspace --tests

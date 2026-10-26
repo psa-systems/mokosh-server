@@ -34,7 +34,6 @@ just check-rate-limit-helper # fail if a 429 response is built outside the share
 just check-runner-labels    # fail if a CI job requests the wrong runner label
 just check-oci-cache        # fail if the OCI build leaves the type=gha runner cache
 just check-oci-publish-tags # fail if the publish tags drift from oci-build/get-tags.nu
-just check-single-build     # fail if a compiling workflow builds the same tree twice
 just check-workspace-deps   # fail if [workspace.dependencies] and its members disagree
 just check-unused-deps      # cargo-machete: fail on a dependency with no call site
 just check-env-example      # fail if a var the code reads is missing from .env.example or compose.dev.yml
@@ -52,9 +51,9 @@ just ci-stalls-self-test    # prove the stall report still reports, on fixtures,
 
 # Format, test, build
 just fmt                    # cargo fmt --all
-just test                   # cargo test
+just test                   # cargo test --workspace --lib --bins (unit tests only)
 just ensure-test-db-roles   # create the DB roles the migrations grant to, before the Postgres-backed suite
-just test-integration       # Postgres-backed tests/*.rs suite in the dev `server` container (mirrors CI integration.yml)
+just test-integration       # Postgres-backed tests/suites/*.rs suite in the dev `server` container (mirrors CI integration.yml)
 just test-integration-unsupported # the suites integration.yml skips: functionality nothing currently uses (mirrors CI integration-unsupported.yml)
 just verify-demo            # the demo-critical subset of the integration suite (seed_demo + data_transfer)
 just verify-providers       # boot every provider seam against the running dev stack, report pass/fail per capability

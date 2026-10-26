@@ -181,6 +181,27 @@ pub struct InvoiceResponse {
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups.
     pub lines: Option<Vec<InvoiceLineResponse>>,
+    /// MAPPS-1099: the external provider (`xero`, `quickbooks`) that issued
+    /// this invoice, when the tenant delegated the Invoicing capability.
+    /// `None` is "Mokosh issued this invoice", which is every row on a
+    /// deployment that has not turned `DelegatedInvoiceIssuer` on.
+    ///
+    /// Set by `create_invoice` since MAPPS-1134. Before that the column was
+    /// schema-ready and unwritten, and this comment said so for three
+    /// phases after it stopped being true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_provider: Option<String>,
+    /// The external provider's own id for this invoice (Xero's guid,
+    /// QuickBooks's numeric id), used by the webhook receiver to reconcile
+    /// provider events back to the local row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_invoice_id: Option<String>,
+    /// The human-readable number as the external provider rendered it, kept
+    /// because that is what the customer sees and what admins reconcile
+    /// against. `None` for a Mokosh-issued invoice, which prints
+    /// `invoice_number` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_number: Option<String>,
 }
 
 /// MAPPS-984: server-side aggregate for the dashboard "open invoices"
@@ -454,6 +475,20 @@ pub struct PaymentResponse {
     pub gateway_transaction_id: Option<String>,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// The columns a webhook receiver needs about an invoice its provider holds
+/// (MAPPS-1136).
+///
+/// Three fields rather than the whole `InvoiceResponse`: the receiver is
+/// about to record what the provider collected, and the amount and the
+/// currency are what that record takes. Reading the rest would be reading
+/// it to throw away.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DelegatedInvoiceRow {
+    pub id: uuid::Uuid,
+    pub balance_due: Decimal,
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Validate)]

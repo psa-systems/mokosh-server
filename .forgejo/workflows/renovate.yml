@@ -1,0 +1,29 @@
+---
+
+# Thin caller for the reusable Renovate workflow in psa-systems/common
+# (feat/renovate-reusable-workflow, PC-91 follow-up). The definition
+# lives there; this stub owns the schedule for THIS repo so an operator
+# changing mokosh-server's cadence does not have to touch common.
+#
+# Renovate scans the tree against `renovate.json` at the repo root and
+# opens PRs grouped by family (sqlx-*, actix-*, serde-*, dunite-*, ...).
+# The reusable job reads `secrets.RENOVATE_CI_TOKEN` directly, so this
+# caller passes the org-level `psa-systems` secret through explicitly
+# under that same name, below.
+
+name: Renovate
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+jobs:
+  renovate:
+    name: Renovate (caller)
+    uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@main  # secret-scope-ok: same-org shared workflow repo, tracked separately for SHA pinning
+    with:
+      target_repository: ${{ github.repository }}
+    secrets:
+      # secret-scope-ok: reusable workflow needs RENOVATE_CI_TOKEN (write:repository + write:issue) to open dependency-update PRs; this caller job runs no step and reads no secret itself. Explicit pass-through, named to match what the reusable workflow reads.
+      RENOVATE_CI_TOKEN: ${{ secrets.RENOVATE_CI_TOKEN }}

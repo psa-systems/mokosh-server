@@ -38,6 +38,54 @@ required = false
 reader = "src/app_secrets/mod.rs"
 
 [[variable]]
+name = "MICROSOFT_CONTACTS_CLIENT_ID"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "MICROSOFT_CONTACTS_CLIENT_SECRET"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "QUICKBOOKS_CLIENT_ID"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "QUICKBOOKS_CLIENT_SECRET"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "QUICKBOOKS_VERIFIER_TOKEN"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "XERO_CLIENT_ID"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "XERO_CLIENT_SECRET"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
+name = "XERO_WEBHOOK_KEY"
+since = "v0.17.0"
+required = false
+reader = "src/app_secrets/mod.rs"
+
+[[variable]]
 name = "MOKOSH_ADMIN_DATABASE_URL"
 since = "v0.4.0"
 required = false
@@ -252,6 +300,15 @@ issue = "PMS-1424"
 breaking = "feature-off"
 feature = "application-tier secrets (`SMTP_PASSWORD` for outbound mail, the Google Contacts client pair)"
 action = "Now selects tenant-tier secrets only. If you set it expecting application secrets (`SMTP_PASSWORD`, the Google client pair) to move too, also set `APP_SECRET_BACKEND` to the same provider before restarting."
+
+[[change]]
+release = "v0.17.0"
+group = "Added"
+variables = ["XERO_CLIENT_ID", "XERO_CLIENT_SECRET", "XERO_WEBHOOK_KEY", "QUICKBOOKS_CLIENT_ID", "QUICKBOOKS_CLIENT_SECRET", "QUICKBOOKS_VERIFIER_TOKEN"]
+issue = "MAPPS-1139"
+breaking = "feature-off"
+feature = "delegated invoice issuing through Xero and QuickBooks"
+action = "Application-tier secrets served by `APP_SECRET_BACKEND`'s provider, for the reason the Google and Microsoft 365 client pairs are (PMS-1430): the application is the deployment's, not the tenant's. Leave them unset and no tenant can connect either provider, which is what every deployment reads as today. Setting one half of a client pair without the other refuses boot. The two webhook keys are separate: without one, deliveries from that provider cannot be verified and are refused, so an invoice it marks paid stays outstanding in Mokosh."
 
 [[change]]
 release = "v0.16.0"
