@@ -89,11 +89,37 @@ impl From<ExpenseCategory> for ExpenseCategoryResponse {
 #[derive(Clone)]
 pub struct ExpensesService {
     db: Database,
+    /// MAPPS-1155: the dispatcher that raises a bill in the provider a
+    /// tenant delegated Bills and expenses to. `None` on every test
+    /// harness and QA seeder, so a build that does not opt in keeps the
+    /// local path byte for byte; wired on the serving instance after
+    /// `IntegrationsService` is built.
+    bill_dispatch:
+        Option<std::sync::Arc<crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher>>,
 }
 
 impl ExpensesService {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            bill_dispatch: None,
+        }
+    }
+
+    /// Opt this instance into delegated bills (MAPPS-1155).
+    ///
+    /// The same shape `BillingService::with_invoice_dispatch` uses, for
+    /// the same reason: an instance built without it runs the local path
+    /// for every tenant, and one built with it still does until an
+    /// operator flips `Feature::DelegatedBills` AND the tenant delegates.
+    pub fn with_bill_dispatch(
+        mut self,
+        dispatcher: std::sync::Arc<
+            crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher,
+        >,
+    ) -> Self {
+        self.bill_dispatch = Some(dispatcher);
+        self
     }
 
     // ── Vendors ──────────────────────────────────────────────────────────
@@ -518,6 +544,51 @@ impl ExpensesService {
         }
         let totals = BillTotals::from_lines(&request.lines);
         let id = Uuid::new_v4();
+
+        // MAPPS-1155: when the tenant has delegated Bills and expenses, the
+        // provider holds the bill, and it is raised there BEFORE anything
+        // local is written, so a provider that refuses leaves no row
+        // behind. Outside the transaction for the reason MAPPS-1134 put
+        // the invoice push outside its own: an HTTP round trip inside a
+        // write transaction holds its locks for the length of somebody
+        // else's outage.
+        //
+        // The pass is skipped entirely unless the deployment switch is on,
+        // so a deployment that has not flipped it runs exactly the
+        // statements it ran before.
+        let external = match self.bill_dispatch.as_ref() {
+            Some(dispatcher) if dispatcher.bills_delegation_enabled() => {
+                use crate::modules::billing::invoice_issuer_dispatch::{
+                    BillLineShape, BillPlan, CreateBillShape,
+                };
+                let lines: Vec<BillLineShape> = request
+                    .lines
+                    .iter()
+                    .map(|l| BillLineShape {
+                        category_id: l.category_id,
+                        description: l.description.clone(),
+                        quantity_hundredths: l.quantity_hundredths,
+                        unit_price_minor: l.unit_price_minor,
+                    })
+                    .collect();
+                let shape = CreateBillShape {
+                    vendor_id: request.vendor_id,
+                    issue_date: request.issue_date,
+                    // A bill with no due date is due on issue as far as the
+                    // provider is concerned; Mokosh keeps the NULL, which is
+                    // "the vendor did not say".
+                    due_date: request.due_date.unwrap_or(request.issue_date),
+                    currency: &currency,
+                    lines: &lines,
+                };
+                match dispatcher.plan_bill(tenant_id, &shape).await? {
+                    BillPlan::Local => None,
+                    BillPlan::Delegated(external) => Some(external),
+                }
+            }
+            _ => None,
+        };
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // The vendor must belong to this tenant: FK + the RLS GUC enforce
@@ -533,8 +604,9 @@ impl ExpensesService {
         let bill: Bill = sqlx::query_as(
             r#"INSERT INTO bills
                  (id, tenant_id, vendor_id, bill_number, issue_date, due_date,
-                  currency, subtotal_minor, tax_minor, total_minor, notes)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                  currency, subtotal_minor, tax_minor, total_minor, notes,
+                  external_provider, external_bill_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                RETURNING id, tenant_id, vendor_id, bill_number, issue_date, due_date,
                          currency, subtotal_minor, tax_minor, total_minor, paid_minor,
                          status, notes, external_provider, external_bill_id,
@@ -551,6 +623,13 @@ impl ExpensesService {
         .bind(totals.tax_minor)
         .bind(totals.total_minor)
         .bind(request.notes.as_deref())
+        // MAPPS-1155: NULL on the local path, which is every row on a
+        // deployment that has not delegated. The pair records who holds
+        // the bill of record, and the local row keeps every other column
+        // it already had: nothing about the Mokosh bill changes because a
+        // provider also has it.
+        .bind(external.as_ref().map(|e| e.provider.as_str()))
+        .bind(external.as_ref().map(|e| e.external_bill_id.as_str()))
         .fetch_one(&mut *tx)
         .await?;
 

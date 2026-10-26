@@ -398,6 +398,13 @@ pub fn create_api_router(
         ),
     );
     let billing_service = billing_service.with_invoice_dispatch(issuer_dispatcher.clone());
+    // MAPPS-1155: the bill half of the same dispatch, on its own flag
+    // (`Feature::DelegatedBills`, also OFF by default). Assigned here
+    // rather than at construction because the dispatcher is built after
+    // the services it serves, and a bill push needs the same clients,
+    // the same credential blob and the same near-expiry refresh an
+    // invoice push does.
+    let expenses_service = expenses_service.with_bill_dispatch(issuer_dispatcher.clone());
     // MAPPS-1142: the OAuth round trip that writes the credential blob the
     // dispatcher and the receivers read. Its own service rather than another
     // method on `IntegrationsService`, because what it does is a browser round
