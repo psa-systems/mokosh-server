@@ -21,7 +21,7 @@ hold.
 ## 1. Register the application, once per deployment
 
 The application is the DEPLOYMENT's, not a tenant's, for the reasons
-[PMS-1430](invariants/config-providers.md#google-client-pms-1340) gives for the Google client: a
+[PMS-1430](../invariants/config-providers.md#google-client-pms-1340) gives for the Google client: a
 tenant-owned app costs every MSP a developer-console walkthrough, and an unverified one is capped and
 warned about.
 
