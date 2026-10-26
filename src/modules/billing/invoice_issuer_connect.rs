@@ -758,13 +758,6 @@ pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) 
             "/integrations/invoice-issuer/{provider}/disconnect",
             post(disconnect),
         )
-        // parity record 2026-10-25 (MAPPS-1155): no SPA caller for
-        // "/integrations/invoice-issuer/{provider}/bills" until the
-        // mokosh-apps half of MAPPS-1155 adds the Bills and expenses
-        // toggle to the provider's page. The route lands first because
-        // nothing else can set the capability, so without it the
-        // dispatcher's bill half is unreachable and the server PR would
-        // ship a path no deployment can exercise.
         .route(
             "/integrations/invoice-issuer/{provider}/bills",
             put(set_bills_delegation),
