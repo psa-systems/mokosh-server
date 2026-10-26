@@ -515,6 +515,30 @@ async fn a_refusing_provider_leaves_no_bill_behind(pool: PgPool) {
     );
 }
 
+/// An id that names no vendor is a 404 on the delegated path too, not a
+/// "map this vendor" conflict pointing at a vendor that does not exist.
+#[mokosh_test]
+async fn a_vendor_that_does_not_exist_is_still_a_404(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _pw) = common::seed_admin(&pool).await;
+    let (svc, _db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    connect(&pool, "xero", &["bills_and_expenses"]).await;
+    seed_xero_blob(&secrets).await;
+
+    let err = svc
+        .create_bill(tenant(), &bill_body(Uuid::new_v4(), None), &ctx())
+        .await
+        .expect_err("there is no such vendor");
+
+    assert!(
+        matches!(&err, AppError::NotFound(what) if what == "Vendor"),
+        "a lookup that found nothing is not a mapping problem: {err:?}"
+    );
+    assert_eq!(stub.lock().unwrap().bills.len(), 0, "nothing was sent");
+    assert_eq!(bill_count(&pool).await, 0);
+}
+
 /// QuickBooks takes a bill against a vendor with an account-based line,
 /// and the account comes from the expense category's mapping.
 #[mokosh_test]

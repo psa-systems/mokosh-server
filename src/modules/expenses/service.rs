@@ -525,6 +525,24 @@ impl ExpensesService {
         Ok(BillWithLines { bill, lines })
     }
 
+    /// The vendor must belong to this tenant. FK + the RLS GUC enforce it,
+    /// but the explicit lookup gives a clear 404 instead of a generic
+    /// FK-violation 500 on a wrong id.
+    async fn assert_vendor_exists(&self, tenant_id: TenantId, vendor_id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let found = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM vendors WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(vendor_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        found
+            .map(|_| ())
+            .ok_or_else(|| AppError::NotFound("Vendor".to_string()))
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
     pub async fn create_bill(
         &self,
@@ -561,6 +579,14 @@ impl ExpensesService {
                 use crate::modules::billing::invoice_issuer_dispatch::{
                     BillLineShape, BillPlan, CreateBillShape,
                 };
+                // The same lookup the write transaction does below, run
+                // first on this path only. Without it an id that names no
+                // vendor is refused as "not mapped to a Xero vendor",
+                // which sends the reader to the mapping surface to map a
+                // vendor that does not exist; the local path answers 404
+                // and so should this one.
+                self.assert_vendor_exists(tenant_id, request.vendor_id)
+                    .await?;
                 let lines: Vec<BillLineShape> = request
                     .lines
                     .iter()
@@ -593,7 +619,10 @@ impl ExpensesService {
 
         // The vendor must belong to this tenant: FK + the RLS GUC enforce
         // it, but the explicit lookup gives a clear 404 instead of a
-        // generic FK-violation 500 on a wrong id.
+        // generic FK-violation 500 on a wrong id. Inside the transaction
+        // that writes, so it holds for the row being written; the
+        // delegated path checks it a second time before the push, where
+        // no transaction is open yet.
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM vendors WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(request.vendor_id)
