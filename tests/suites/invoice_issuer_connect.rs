@@ -27,6 +27,7 @@ use mokosh_server::modules::billing::invoice_issuer_credentials::{
 use mokosh_server::modules::billing::provider_invoice::{QuickBooksClient, XeroClient};
 use mokosh_server::modules::billing::service::BillingService;
 use mokosh_server::secrets::{DatabaseSecretProvider, SecretKey, SecretProvider};
+use mokosh_server::utils::error::AppError;
 use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -639,6 +640,102 @@ async fn the_overview_says_whether_the_deployment_has_switched_it_on(pool: PgPoo
         .await
         .expect("overview");
     assert!(view.delegated && view.delegation_enabled);
+}
+
+/// MAPPS-1155: delegating bills is a second decision, taken on the
+/// connected row and not by consenting, and the overview reports it apart
+/// from the invoice one.
+#[mokosh_test]
+async fn bills_are_delegated_separately_from_invoicing(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+
+    // Before connecting there is nothing to delegate to.
+    let err = svc
+        .set_bills_delegation(tenant, InvoiceProviderKind::Xero, true)
+        .await
+        .expect_err("there is no connection yet");
+    assert!(
+        matches!(&err, AppError::Conflict(m) if m.contains("Connect xero")),
+        "a capability on a provider with no credentials is an arrangement nothing can honour: {err:?}"
+    );
+
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("complete");
+
+    // Connecting delegates invoicing and nothing else.
+    let view = svc
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert!(view.delegated, "consenting IS the invoice delegation");
+    assert!(
+        !view.bills_delegated,
+        "and says nothing about the other direction"
+    );
+
+    svc.set_bills_delegation(tenant, InvoiceProviderKind::Xero, true)
+        .await
+        .expect("delegate bills");
+    let view = svc
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert!(view.bills_delegated, "the capability is on the row now");
+    assert!(view.delegated, "and invoicing is untouched");
+    assert!(
+        !view.bills_delegation_enabled,
+        "the bills switch is its own, and this service only flipped the invoice one"
+    );
+
+    // Off again leaves invoicing where it was: the toggle rewrites one
+    // capability, not the list.
+    svc.set_bills_delegation(tenant, InvoiceProviderKind::Xero, false)
+        .await
+        .expect("stop delegating bills");
+    let view = svc
+        .overview(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("overview");
+    assert!(!view.bills_delegated);
+    assert!(view.delegated);
+}
+
+/// Disconnecting is not a reason to forget what was delegated, but it IS a
+/// reason to refuse a new delegation: there are no credentials to honour it.
+#[mokosh_test]
+async fn bills_cannot_be_delegated_to_a_disconnected_provider(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("complete");
+    svc.disconnect(tenant, InvoiceProviderKind::Xero)
+        .await
+        .expect("disconnect");
+
+    let err = svc
+        .set_bills_delegation(tenant, InvoiceProviderKind::Xero, true)
+        .await
+        .expect_err("a disconnected provider cannot take bills");
+    assert!(
+        matches!(&err, AppError::Conflict(m) if m.contains("not connected")),
+        "{err:?}"
+    );
 }
 
 /// One tenant's connection is invisible to another.

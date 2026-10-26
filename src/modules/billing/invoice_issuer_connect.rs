@@ -333,6 +333,65 @@ impl InvoiceIssuerConnectService {
         Ok(())
     }
 
+    /// Delegate, or stop delegating, this tenant's bills to the provider
+    /// (MAPPS-1155).
+    ///
+    /// `record_connection` writes `{invoicing}` because connecting through
+    /// that flow IS the invoice delegation. Bills are a second decision in
+    /// the other direction (what the MSP owes, not what it is owed), so
+    /// they are a toggle on the connected row rather than part of
+    /// consenting, and nothing else can set the capability: without this
+    /// the dispatcher's bill half would be unreachable on every
+    /// deployment, which is the "advertises what the build cannot deliver"
+    /// defect MAPPS-1155 exists to close.
+    ///
+    /// Refused unless the row is connected: a capability on a provider
+    /// with no credentials is an arrangement nothing can honour.
+    pub async fn set_bills_delegation(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        enabled: bool,
+    ) -> AppResult<()> {
+        let bills = Capability::BillsAndExpenses.as_str();
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<(String, Vec<String>)> = sqlx::query_as(
+            "SELECT status, enabled_capabilities FROM integrations \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((status, capabilities)) = row else {
+            return Err(AppError::Conflict(format!(
+                "Connect {} before delegating bills to it.",
+                provider.as_str()
+            )));
+        };
+        if status != IntegrationStatus::Connected.as_str() {
+            return Err(AppError::Conflict(format!(
+                "{} is not connected, so bills cannot be delegated to it.",
+                provider.as_str()
+            )));
+        }
+        let mut next: Vec<String> = capabilities.into_iter().filter(|c| c != bills).collect();
+        if enabled {
+            next.push(bills.to_string());
+        }
+        sqlx::query(
+            "UPDATE integrations SET enabled_capabilities = $3, updated_at = NOW() \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .bind(&next)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// What a settings page for one provider reads (MAPPS-1143).
     ///
     /// Four facts, and three of them the integrations catalog cannot
@@ -363,6 +422,9 @@ impl InvoiceIssuerConnectService {
         let delegation_enabled = self
             .features
             .is_enabled(crate::modules::features::Feature::DelegatedInvoiceIssuer);
+        let bills_delegation_enabled = self
+            .features
+            .is_enabled(crate::modules::features::Feature::DelegatedBills);
         let Some(row) = row else {
             // Never connected is an offer, not an error.
             return Ok(InvoiceIssuerOverview {
@@ -372,6 +434,8 @@ impl InvoiceIssuerConnectService {
                 organisation_id: None,
                 delegated: false,
                 delegation_enabled,
+                bills_delegated: false,
+                bills_delegation_enabled,
                 last_error: None,
             });
         };
@@ -389,6 +453,11 @@ impl InvoiceIssuerConnectService {
                 .iter()
                 .any(|c| c == Capability::Invoicing.as_str()),
             delegation_enabled,
+            bills_delegated: row
+                .enabled_capabilities
+                .iter()
+                .any(|c| c == Capability::BillsAndExpenses.as_str()),
+            bills_delegation_enabled,
             last_error: row.last_error,
         })
     }
@@ -516,6 +585,14 @@ pub struct InvoiceIssuerOverview {
     /// answers `Local` while this is false. The card has to say so, or it
     /// claims an arrangement the deployment has switched off.
     pub delegation_enabled: bool,
+    /// Whether this tenant delegated BILLS to the provider (MAPPS-1155),
+    /// which is a second decision in the other direction and not implied
+    /// by having delegated invoicing.
+    pub bills_delegated: bool,
+    /// Whether delegated BILLS are switched on for this DEPLOYMENT
+    /// (MAPPS-1155). Its own switch, so a card that reports the invoice
+    /// one would be answering a different question.
+    pub bills_delegation_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -637,7 +714,7 @@ mod tests {
 
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Redirect};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 
 use crate::modules::auth::{RequireAdmin, RequireAuth, TenantScoped};
@@ -680,6 +757,17 @@ pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) 
         .route(
             "/integrations/invoice-issuer/{provider}/disconnect",
             post(disconnect),
+        )
+        // parity record 2026-10-25 (MAPPS-1155): no SPA caller for
+        // "/integrations/invoice-issuer/{provider}/bills" until the
+        // mokosh-apps half of MAPPS-1155 adds the Bills and expenses
+        // toggle to the provider's page. The route lands first because
+        // nothing else can set the capability, so without it the
+        // dispatcher's bill half is unreachable and the server PR would
+        // ship a path no deployment can exercise.
+        .route(
+            "/integrations/invoice-issuer/{provider}/bills",
+            put(set_bills_delegation),
         )
         .with_state(InvoiceIssuerConnectRouterState { service })
 }
@@ -735,6 +823,27 @@ async fn disconnect(
 ) -> AppResult<axum::http::StatusCode> {
     let provider = parse_provider(&provider)?;
     state.service.disconnect(user.tenant(), provider).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// The body of the bills toggle: one field, because one decision.
+#[derive(Debug, serde::Deserialize)]
+struct SetBillsDelegationRequest {
+    enabled: bool,
+}
+
+async fn set_bills_delegation(
+    State(state): State<InvoiceIssuerConnectRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Path(provider): Path<String>,
+    Json(request): Json<SetBillsDelegationRequest>,
+) -> AppResult<axum::http::StatusCode> {
+    let provider = parse_provider(&provider)?;
+    state
+        .service
+        .set_bills_delegation(user.tenant(), provider, request.enabled)
+        .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

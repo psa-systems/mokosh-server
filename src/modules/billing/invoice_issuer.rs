@@ -60,6 +60,20 @@ pub struct ExternalInvoiceRef {
     pub external_number: String,
 }
 
+/// What a provider gave back for a bill it now holds (MAPPS-1155).
+///
+/// One field and not three, which is the difference from
+/// [`ExternalInvoiceRef`]: a bill carries no number the MSP has to show
+/// anybody. The invoice number matters because a customer reads it off a
+/// document; a bill's number is the VENDOR's, it is already on the paper
+/// the MSP received, and it lives in `bills.bill_number` whether or not
+/// the bill is delegated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalBillRef {
+    pub provider: InvoiceProviderKind,
+    pub external_bill_id: String,
+}
+
 /// MAPPS-1099 Phase 2: what the dispatch decided to do with a given
 /// `create_invoice` call, before any wire I/O. Local means the current
 /// Mokosh path (number allocation + row insert + mail dispatch);
