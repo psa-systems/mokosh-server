@@ -43,12 +43,29 @@
 //!   `/api/v1/expenses/{id}/approve`, `/api/v1/expenses/{id}/reject`,
 //!   and `/api/v1/expenses/{id}/reimburse`.
 //!
+//! # What ships in Phase 2 (MAPPS-1155)
+//!
+//! - Delegated BILLS: [`service::ExpensesService::create_bill`] raises
+//!   the bill in Xero or QuickBooks when the tenant has delegated
+//!   `BillsAndExpenses` and the deployment has `Feature::DelegatedBills`
+//!   on, and records `external_provider` / `external_bill_id` on the
+//!   local row. The push runs before the write transaction, so a
+//!   provider that refuses leaves nothing behind.
+//! - Migrations 285 and 286: the vendor mapping every push needs, and
+//!   the expense-category-to-account mapping QuickBooks requires on
+//!   every bill line.
+//!
 //! # What does NOT ship
 //!
 //! - **worker**: due-date reminders and reimbursement batching are a
 //!   later phase.
-//! - **delegation to Xero / QuickBooks**: builds on the OAuth + webhook
-//!   infrastructure MAPPS-1099 shipped; not yet started.
+//! - **delegated EXPENSES**: an expense is a claim from a person, not an
+//!   obligation to a vendor, and in both providers it is a different
+//!   document (a spend-money transaction, not a bill). Pushing one as a
+//!   bill would be wrong in the provider's own ledger.
+//! - **vendor payments read back**: the MAPPS-1136 receivers report what
+//!   a customer paid; no receiver reads a vendor payment, so a bill paid
+//!   in the provider stays open here until somebody records it.
 //!
 //! # Why six tables and not fewer
 //!
