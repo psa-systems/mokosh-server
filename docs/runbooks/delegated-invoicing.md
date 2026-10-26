@@ -93,6 +93,42 @@ On `Settings > Integrations > Xero`:
 From then on a new invoice for a mapped client is created in the provider, and the local row carries the
 provider's own number beside Mokosh's.
 
+## Delegating bills, which is a different switch
+
+Delegating Invoicing pushes what your customers owe you. Delegating Bills and expenses pushes what you
+owe your vendors, and it is deliberately a separate decision (MAPPS-1155): an MSP can keep invoicing in
+Mokosh and still want its payables in the accountant's ledger, or the reverse.
+
+Two gates, mirroring 2 and 3 above:
+
+```
+PUT /api/v1/settings/feature-toggles/delegated_bills   {"enabled": true}
+```
+
+and, on the tenant's side, the **Bills and expenses** capability enabled on the provider's integration
+row. Both plus a connected organisation, and a new bill is raised in the provider; any one missing and
+the bill is written locally exactly as before, with `external_provider` and `external_bill_id` left
+NULL. The application secrets and the connection from steps 1 to 3 are the same ones; there is nothing
+further to register.
+
+What the tenant admin maps:
+
+| Provider | Mapping | Route | Without it |
+|---|---|---|---|
+| Xero, QuickBooks | each vendor to the vendor over there | `PUT /api/v1/invoice-issuer-mappings/vendors/{provider}/{vendor_id}` | creating a bill is refused, naming the vendor |
+| QuickBooks only | each expense category to a ledger account | `PUT /api/v1/invoice-issuer-mappings/expense-accounts/quickbooks/{category_id}` | creating a bill is refused, naming the category |
+
+QuickBooks needs the account because every bill line it accepts carries an `AccountRef`, and nothing
+else in Mokosh can say which account an MSP's own books put a cost in. A line with no expense category
+at all is refused for the same reason, naming the line. Xero takes the account from the contact, so a
+Xero-only tenant maps vendors and nothing more.
+
+Two things delegated bills does NOT do. A delegated bill is still created `draft` in Mokosh, because
+approving a bill is the MSP's own step and the provider holding a copy does not change who signs it off.
+And payment of a bill is not mirrored back: the invoice webhooks (MAPPS-1136) report what a customer
+paid you, and no receiver reads a vendor payment yet, so a bill paid in the provider stays open in
+Mokosh until somebody records it here.
+
 ## Turning it off
 
 **Disconnect** on the provider's page forgets the credential and stops delegating; invoices the provider
