@@ -120,6 +120,25 @@ pub struct BillLine {
     pub created_at: DateTime<Utc>,
 }
 
+/// One payment the MSP made against a bill (PMS-1536).
+///
+/// Money leaving, in minor units like everything else in this subsystem.
+/// The rows are the record of WHAT was paid and WHEN, which a vendor
+/// statement has to be reconciled against; `bills.paid_minor` is the
+/// running total derived from them and has exactly one writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromRow)]
+pub struct BillPayment {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub bill_id: Uuid,
+    pub paid_on: NaiveDate,
+    pub amount_minor: i64,
+    pub payment_method: String,
+    pub reference: Option<String>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// The lifecycle of an expense claim. `reimbursed` is terminal and
 /// immutable; a correction is a reversing expense per the MAPPS-1100
 /// scoping (same pattern as invoice amendments in PMS-1334).
