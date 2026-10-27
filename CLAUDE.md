@@ -31,7 +31,7 @@ just check-config-docs     # docs/configuration.md matches the registry's since/
 just check-doc-links       # every relative Markdown link resolves to a path that exists
 just check-claude-md       # CLAUDE.md stays under 20,000 bytes and its docs/ links resolve (PMS-1437)
 just fmt                   # cargo fmt --all
-just test                  # cargo test (workspace-wide)
+just test                  # cargo test --workspace --lib --bins (unit tests; the Postgres suite is test-integration, nextest-only per PMS-1523)
 just test-integration      # Postgres-backed tests/suites/*.rs suite (mirrors CI integration.yml)
 just install-hooks         # install the git pre-commit and pre-push hooks -> run `just pre-commit` and `just pre-push` (from common)
 just pre-commit            # fmt check plus check-tree-ownership only; the full suite moved to `just pre-push`
@@ -64,7 +64,7 @@ just infisical-bootstrap   # one-time after `just dev-infisical`, fills INFISICA
 
 OIDC client registration recipes (`register-client`, etc.) were removed with mokosh-auth in PMS-295: bunyip is the sole OP and owns its own client registry, so RPs register with bunyip, not mokosh.
 
-`just dev` rewrites `USER` in `.env` on each run, generates `.env` from `.env.example` once per clone (PMS-490), needs the external `network-traefik-public`, and runs as compose project `dev-mokosh-${USER}` (PMS-1281). Details: [dev stack notes](docs/quickstart.md#12-dev-stack-notes).
+`just dev` rewrites `USER` in `.env` on each run, generates `.env` from `.env.example` once per clone (PMS-490), needs the external `network-traefik-public`, and runs as compose project `dev-mokosh-${USER}` (PMS-1281). Details: [dev stack notes](docs/internal.md#dev-stack-notes).
 
 ## Architecture
 

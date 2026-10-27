@@ -135,28 +135,40 @@ impl IntegrationsService {
         .map_err(|e| AppError::Database(e.to_string()))?;
         tx.commit().await?;
 
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let status =
-                    contact_sync_status(row.is_active, &row.sync_status, row.disconnected_at);
-                (
-                    row.provider,
-                    ContactSyncState {
-                        status,
-                        // Only when the state IS the error: a stale message
-                        // from a sync that later succeeded would read as a
-                        // live failure.
-                        last_error: match status {
-                            IntegrationStatus::Error => row.last_error,
-                            _ => None,
-                        },
-                        connected_at: Some(row.created_at),
-                        disconnected_at: row.disconnected_at,
+        let mut states = std::collections::HashMap::new();
+        for row in rows {
+            // The registry's providers only. `contact_sync_connections` also
+            // holds a `vcard` row per tenant since PMS-1290, which is an
+            // uploaded file rather than an integration: it has no registry
+            // entry, nothing on this page looks it up, and it has no
+            // tenant-wide switch to read.
+            if IntegrationProvider::from_str(&row.provider).is_none() {
+                continue;
+            }
+            let enabled = crate::modules::contact_sync::switch::contacts_enabled(
+                &self.db,
+                tenant_id,
+                &row.provider,
+            )
+            .await?;
+            let status = contact_sync_status(row.is_active, &row.sync_status, row.disconnected_at);
+            states.insert(
+                row.provider,
+                ContactSyncState {
+                    status,
+                    enabled,
+                    // Only when the state IS the error: a stale message from a
+                    // sync that later succeeded would read as a live failure.
+                    last_error: match status {
+                        IntegrationStatus::Error => row.last_error,
+                        _ => None,
                     },
-                )
-            })
-            .collect())
+                    connected_at: Some(row.created_at),
+                    disconnected_at: row.disconnected_at,
+                },
+            );
+        }
+        Ok(states)
     }
 
     /// One provider. Answers for a provider with no row too, for the same
@@ -694,6 +706,31 @@ fn compose(
         response.last_error = state.last_error.clone();
         response.connected_at = state.connected_at;
         response.disconnected_at = state.disconnected_at;
+        // MAPPS-1131: and the DELEGATION from there too. MAPPS-1122 moved the
+        // status and stopped, so a tenant actively syncing Google Contacts was
+        // listed as connected with nothing delegated to it: these providers
+        // have no `integrations` row at all (`ConnectionHome::Elsewhere`, so
+        // two tables cannot disagree about one fact), which left
+        // `enabled_capabilities` permanently empty.
+        //
+        // Delegated means both halves: a live connection AND the tenant-wide
+        // switch. A disconnected connection is handing nothing over, and
+        // neither is a live one whose switch is off - `assert_enabled` refuses
+        // a sync on the switch alone. `Error` counts as live: the account is
+        // linked and the last attempt to read it failed, which is a failing
+        // delegation, not an absent one.
+        if state.enabled
+            && matches!(
+                state.status,
+                IntegrationStatus::Connected | IntegrationStatus::Error
+            )
+        {
+            response.enabled_capabilities = descriptor
+                .supported_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect();
+        }
         return response;
     }
     let Some(row) = row else {
@@ -758,6 +795,14 @@ struct ContactSyncRow {
 /// `contact_sync_connections` part of what integrations depends on.
 struct ContactSyncState {
     status: IntegrationStatus,
+    /// Whether the tenant-wide switch for this provider is on (MAPPS-1131).
+    ///
+    /// A second fact from a second table, and both are needed to answer what is
+    /// delegated: the connection says the account is linked, and the switch
+    /// says whether anything is allowed to read it. `assert_enabled` refuses a
+    /// sync request on the switch alone, so a tenant with a live connection and
+    /// the switch off has handed nothing over.
+    enabled: bool,
     last_error: Option<String>,
     connected_at: Option<chrono::DateTime<chrono::Utc>>,
     disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -930,18 +975,31 @@ mod tests {
     /// act on, which is worse than the button failing.
     #[test]
     fn a_planned_provider_is_refused_and_a_built_one_is_not() {
+        // MAPPS-1153 flipped the last two planned entries, so the refusal
+        // is exercised against a descriptor built for it rather than
+        // against whichever provider happened to be unfinished. The rule
+        // outlives the providers that prompted it, and a test naming Xero
+        // would have been deleted with the flip rather than kept.
+        let planned = ProviderDescriptor {
+            build: registry::ProviderBuild::Planned {
+                tracked_by: "MAPPS-1099",
+            },
+            ..*registry::descriptor(IntegrationProvider::Xero)
+        };
+        let error = assert_built(&planned).expect_err("planned, so refused");
+        let message = format!("{error}");
+        assert!(
+            message.contains(planned.display_name),
+            "the refusal names the provider: {message}"
+        );
+        assert!(
+            !message.contains("MAPPS-"),
+            "an MSP admin reading their own settings has no use for our issue keys: {message}"
+        );
         for provider in [IntegrationProvider::Quickbooks, IntegrationProvider::Xero] {
-            let descriptor = registry::descriptor(provider);
-            let error = assert_built(descriptor).expect_err("planned, so refused");
-            let message = format!("{error}");
             assert!(
-                message.contains(descriptor.display_name),
-                "the refusal names the provider: {message}"
-            );
-            assert!(
-                !message.contains("MAPPS-"),
-                "an MSP admin reading their own settings has no use for our issue keys: \
-                 {message}"
+                assert_built(registry::descriptor(provider)).is_ok(),
+                "{provider:?} has a client, a consent flow and a settings page now"
             );
         }
         for provider in [
@@ -1098,6 +1156,16 @@ mod tests {
             (IntegrationProvider::Stripe, "Payment Gateways"),
             (IntegrationProvider::Paypal, "Payment Gateways"),
             (IntegrationProvider::Google, "Google Contacts"),
+            // MAPPS-1153: and the ones that made the per-home label a lie.
+            // `ContactSync` answered "Settings > Google Contacts" for all
+            // three contact sources, so iCloud's card named Google's page;
+            // `InvoiceIssuer` has no such string at all, because nothing is
+            // entered and the two providers have different pages. The label
+            // comes from each provider's own setup surface now.
+            (IntegrationProvider::Icloud, "iCloud Contacts"),
+            (IntegrationProvider::Microsoft, "Microsoft 365 Contacts"),
+            (IntegrationProvider::Xero, "Xero"),
+            (IntegrationProvider::Quickbooks, "QuickBooks"),
         ] {
             let response = IntegrationResponse::not_installed(registry::descriptor(provider));
             let elsewhere = response
@@ -1110,14 +1178,18 @@ mod tests {
             );
         }
         // And one that takes its credential here, so the absence is asserted
-        // rather than assumed from the loop above.
+        // rather than assumed from the loop above. No provider in the
+        // registry does since MAPPS-1153, so it is a descriptor built for
+        // the case: the rule is about the home, not about who holds it.
+        let arrives_here = registry::ProviderDescriptor {
+            credential_home: registry::CredentialHome::Integration,
+            ..*registry::descriptor(IntegrationProvider::Quickbooks)
+        };
         assert!(
-            IntegrationResponse::not_installed(registry::descriptor(
-                IntegrationProvider::Quickbooks
-            ))
-            .credential_elsewhere
-            .is_none(),
-            "QuickBooks takes its credential in the connect request"
+            IntegrationResponse::not_installed(&arrives_here)
+                .credential_elsewhere
+                .is_none(),
+            "a credential that arrives in the connect request names no other surface"
         );
     }
 

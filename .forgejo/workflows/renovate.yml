@@ -7,9 +7,9 @@
 #
 # Renovate scans the tree against `renovate.json` at the repo root and
 # opens PRs grouped by family (sqlx-*, actix-*, serde-*, dunite-*, ...).
-# RENOVATE_TOKEN comes from the org-level `psa-systems` secret inherited
-# via `secrets: inherit`; the token is claude-bot's and has
-# `write:repository` + `write:issue` scope.
+# The reusable job reads `secrets.RENOVATE_CI_TOKEN` directly, so this
+# caller passes the org-level `psa-systems` secret through explicitly
+# under that same name, below.
 
 name: Renovate
 
@@ -20,9 +20,10 @@ on:
 
 jobs:
   renovate:
+    name: Renovate (caller)
     uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@main  # secret-scope-ok: same-org shared workflow repo, tracked separately for SHA pinning
     with:
       target_repository: ${{ github.repository }}
     secrets:
-      # secret-scope-ok: reusable workflow needs RENOVATE_TOKEN (write:repository + write:issue) to open dependency-update PRs; this caller job runs no step and reads no secret itself. Explicit pass-through: Forgejo `secrets: inherit` does not propagate reliably to cross-repo reusable workflows that declare a `secrets:` block.
-      RENOVATE_TOKEN: ${{ secrets.RENOVATE_CI_TOKEN }}
+      # secret-scope-ok: reusable workflow needs RENOVATE_CI_TOKEN (write:repository + write:issue) to open dependency-update PRs; this caller job runs no step and reads no secret itself. Explicit pass-through, named to match what the reusable workflow reads.
+      RENOVATE_CI_TOKEN: ${{ secrets.RENOVATE_CI_TOKEN }}

@@ -292,6 +292,66 @@ async fn overdue_is_derived_on_every_read_and_filters_the_list(pool: PgPool) {
 /// invoice 3 days past due gets one mail, a second run the same hour sends
 /// nothing, day 7 sends the second, and reminders off send nothing. The mail
 /// goes to the billing contact and carries the stored document.
+/// MAPPS-1135: a delegated invoice is not reminded about.
+///
+/// It is created `sent` because the provider sent it, which makes it match
+/// `claim_due_reminders`' predicate exactly: sent, a balance, past due. The
+/// result would be two organisations emailing one customer about one debt,
+/// and Mokosh's half would carry a document that customer has never seen,
+/// since the invoice they hold is the provider's.
+///
+/// The fixture makes the two invoices identical apart from
+/// `external_provider`, so the exclusion is the only thing that can explain
+/// the difference.
+#[mokosh_test]
+async fn a_delegated_invoice_is_chased_by_its_provider_and_not_by_us(pool: PgPool) {
+    install_test_attachment_env();
+    tenant_on_utc(&pool).await;
+    let (_admin, email, password) = common::seed_admin(&pool).await;
+    let company = common::seed_company(&pool).await;
+    seed_billing_contact(&pool, company, "ap@client.example").await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let now = Utc::now();
+    put_setting(&app, &token, "enabled", Value::Bool(true)).await;
+    put_setting(&app, &token, "schedule", serde_json::json!([3])).await;
+    put_setting(&app, &token, "send_hour", Value::from(now.hour())).await;
+
+    let ours = invoice(&app, &token, company, 3, "150").await;
+    send(&app, &token, &ours).await;
+    let theirs = invoice(&app, &token, company, 3, "150").await;
+    send(&app, &token, &theirs).await;
+    // The one difference. Written here rather than created through the
+    // dispatcher because this case is about the reminder predicate, not
+    // about how the column came to be set.
+    sqlx::query(
+        "UPDATE invoices SET external_provider = 'xero', \
+             external_invoice_id = '9f1d1c62-0f3a-4a1e-9c6f-7b2c9d4e5a60', \
+             external_number = 'INV-0042' \
+         WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&theirs).unwrap())
+    .execute(&pool)
+    .await
+    .expect("mark the second invoice delegated");
+
+    let mailer = Arc::new(CapturingMailer::default());
+    let svc = reminder_service(&pool, mailer.clone());
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    let sent = svc.send_due_reminders(tenant, now).await.expect("the run");
+    assert_eq!(
+        sent,
+        vec![Uuid::parse_str(&ours).unwrap()],
+        "only the invoice Mokosh issued is chased by Mokosh"
+    );
+    assert_eq!(
+        mailer.sent.lock().unwrap().len(),
+        1,
+        "and the customer hears about it once"
+    );
+}
+
 #[mokosh_test]
 async fn reminders_follow_the_schedule_once_per_step(pool: PgPool) {
     install_test_attachment_env();

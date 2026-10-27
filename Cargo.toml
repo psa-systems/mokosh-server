@@ -23,17 +23,17 @@ authors = ["Mokosh Server Team"]
 # (PMS-785): an entry nobody inherits pins a version and a feature set the build
 # never uses. `scripts/check-workspace-deps.nu` fails the build if that drifts.
 [workspace.dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
-secrecy = { version = "0.10", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+async-trait = "0.1.92"
+secrecy = { version = "0.10.3", features = ["serde"] }
 ipnetwork = "0.20"
 # `pool` is NOT a lettre default; opt in so LettreMailer reuses TCP
 # connections across sends. `native-tls` over rustls because some SMTP
 # relays' cert chains historically failed verification under rustls.
-lettre = { version = "0.11", default-features = false, features = ["tokio1-native-tls", "builder", "smtp-transport", "pool"] }
+lettre = { version = "0.11.23", default-features = false, features = ["tokio1-native-tls", "builder", "smtp-transport", "pool"] }
 
 [package]
 name = "mokosh-server"
@@ -63,7 +63,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Axum HTTP server
-axum = { version = "0.8.3", features = ["macros", "multipart", "ws"] }
+axum = { version = "0.8.9", features = ["macros", "multipart", "ws"] }
 tower = { version = "0.5", features = ["full"] }
 # PMS-780: `compression-br` alongside `compression-gzip` so the global
 # `CompressionLayer` can answer `Accept-Encoding: br`; without the feature it
@@ -104,8 +104,20 @@ chrono-tz = "0.9"
 # Password hashing
 argon2 = "0.5"
 
-# JWT tokens
-jsonwebtoken = "9"
+# JWT tokens.
+#
+# `rust_crypto` is not optional: jsonwebtoken 10 moved to rustls-style
+# provider selection and its default features enable NEITHER provider, so a
+# bare `jsonwebtoken = "10"` compiles and then panics on the first sign or
+# verify with "Could not automatically determine the process-level
+# CryptoProvider". Every login in the integration suite died that way.
+#
+# `rust_crypto` rather than `aws_lc_rs`: it covers everything both auth paths
+# use (HS256 for the legacy sessions, RSA / P-256 / P-384 / Ed25519 for
+# bunyip's `at+jwt`), and it is pure Rust. `aws_lc_rs` would add a C and
+# CMake build dependency to every image and every runner, which is the class
+# of thing that has broken this repository's CI before.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # Validation
 validator = { version = "0.19", features = ["derive"] }
@@ -118,14 +130,14 @@ zxcvbn = "3"
 
 # Error handling
 thiserror = "2"
-anyhow = "1"
+anyhow = "1.0.104"
 
 # Logging/Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Environment
-dotenvy = "0.15"
+dotenvy = "0.15.7"
 
 # Email. Lettre powers the host-crate `Mailer` (utils/email.rs).
 lettre = { workspace = true }
@@ -154,8 +166,8 @@ constant_time_eq = "0.3"
 # Stalwart's CardDAV server, lenient by design; default features off, which
 # drops its JMAP and serde stack. `encoding_rs` transcodes an Outlook card
 # written as raw 8-bit bytes before the parser, which takes `&str`, sees it.
-calcard = { version = "0.3", default-features = false }
-encoding_rs = "0.8"
+calcard = { version = "0.3.14", default-features = false }
+encoding_rs = "0.8.42"
 
 # CardDAV multistatus parsing for the iCloud contact sync (PMS-1341). XML is
 # unavoidable here in a way it was not for the S3 provider (PMS-958), which
@@ -166,7 +178,7 @@ encoding_rs = "0.8"
 # directly, event by event, because the parts this needs (hrefs, etags,
 # address-data, the sync token) are a handful of elements rather than a document
 # model.
-quick-xml = { version = "0.37", default-features = false }
+quick-xml = { version = "0.41", default-features = false }
 
 # CIDR parsing for the trusted-proxy allowlist that gates X-Forwarded-For
 # client-IP extraction (PMS-587).
@@ -210,19 +222,19 @@ mokosh-types = { path = "crates/mokosh-types" }
 # by a8n-tools and bunyip so the same defect is not solved three times. Pinned by
 # rev (not branch) so a dunite bump is an explicit reviewable diff, mirroring
 # bunyip's dunite pins. Pinned to dunite main.
-dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "cc10e8358a6f21160544a415a9488c16827af699" }
+dunite-stripe-core = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
 
 # BUNYIP-475: the shared ASN / VPN enrichment crate (BUNYIP-437), consumed here
 # as mokosh's second-product use of the same offline IP2Proxy signal so there is
 # no second implementation to drift. Leaf crate (owns its error, depends only on
 # ip2location), so it is pinned to the dunite rev that introduced it independently
 # of dunite-stripe-core above.
-dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "ae62c276ab187852578daad1c4b9c823579b194a" }
+dunite-ipenrich = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
 # PMS-1014: the shared provider-status contract (report, summary, envelope).
 # Extracted from mokosh's local types so BUNYIP-634's aggregator binds to one
 # definition instead of a copy per producer. Leaf crate, pinned to the dunite
 # rev that introduced it independently of the dunite-* deps above.
-dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "f3d31295e98ef716ec9f2a6d49f4c16c7dca994a" }
+dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev = "91e27f2b798128aa2cf54f742df8248564888bf0" }
 # PMS-876 took no default features (they carry HTML rendering and hyphenation
 # dictionaries nothing here uses). PMS-911 adds the image codecs, and exactly
 # the four `utils::inline_image` already accepts for an uploaded logo: a
@@ -238,13 +250,13 @@ printpdf = { version = "0.12.7", default-features = false, features = ["png", "j
 # subsetter it calls is this crate - already in the build graph as printpdf's own
 # non-optional dependency, so naming it here adds no compile. Same version and
 # same feature set as printpdf pins, so both see one build of it.
-allsorts = { package = "allsorts-azul", version = "0.17.1", default-features = false, features = ["flate2_rust"] }
+allsorts = { package = "allsorts-azul", version = "0.17.2", default-features = false, features = ["flate2_rust"] }
 
 [dev-dependencies]
 # `test-util` exposes `tokio::time::{pause, advance, resume}` for
 # deterministic virtual-clock tests (used by tests/scheduler.rs).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
-tempfile = "3"
+tempfile = "3.27.0"
 # Integration-test HTTP client. Tests pull the bearer token out of the
 # login JSON body and attach it via `.bearer_auth(&token)` on each call,
 # so no cookie jar is required (the legacy AuthMiddleware authenticates
@@ -265,7 +277,7 @@ hmac = "0.12"
 sha2 = "0.10"
 # MAPPS-542: exercise `PaginationParams` deserialization from a raw query
 # string in unit tests, matching what axum's `Query` extractor does.
-serde_urlencoded = "0.7"
+serde_urlencoded = "0.7.1"
 # PMS-1254: `#[mokosh_test]`, which clones each test's database from a
 # migrated template instead of applying every migration into it. A
 # dev-dependency only, so nothing it expands to reaches a release build. It

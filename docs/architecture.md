@@ -80,7 +80,7 @@ Two Dockerfiles, two purposes.
 | File | Purpose |
 | --- | --- |
 | `Dockerfile` | Dev image. Debug build, source mounted from the host via volumes, `cargo run` as the entrypoint. Used by `compose.dev.yml`. |
-| `oci-build/Dockerfile` | Production image. Multi-stage Alpine build (musl + lld), release binaries, non-root `appuser`, healthcheck on `/api/v1/health`. Built and published by the Forgejo workflow in `.forgejo/workflows/build-oci-image.yml`. |
+| `oci-build/Dockerfile` | Production image. Multi-stage Alpine build (musl + lld), release binaries, healthcheck on `/api/v1/health`. PMS-1513 / GOV-82: the runtime stage starts as root; the shared `oci-build/gosu-entrypoint.sh` remaps `appuser` to `PUID`/`PGID` (or the owner of the first `DATA_DIRS` entry, else 1001), chowns the data directories and drops privileges with `gosu`. A compose `user:` pin disables the remap and refuses to start unless every data dir is already writable by that uid. Built and published by the Forgejo workflow in `.forgejo/workflows/build-oci-image.yml`. |
 
 ## Repository layout
 

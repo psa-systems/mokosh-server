@@ -29,9 +29,18 @@
 pub mod credential_move;
 pub mod descriptions;
 pub mod documents;
+pub mod invoice_issuer;
+pub mod invoice_issuer_app;
+pub mod invoice_issuer_connect;
+pub mod invoice_issuer_credentials;
+pub mod invoice_issuer_dispatch;
+pub mod invoice_issuer_mapping_routes;
+pub mod invoice_issuer_mappings;
 pub mod issuer;
 pub mod issuer_delegation;
 pub mod models;
+pub mod provider_invoice;
+pub mod webhook_invoice_issuer;
 // PMS-979: what an invoice number is and who it belongs to.
 pub mod numbering;
 pub mod provider;

@@ -30,6 +30,8 @@ The public documentation set. The repository [`README.md`](../README.md) is deli
 
 ## Internal notes
 
+[`internal.md`](internal.md) absorbs the engineering explanations that used to live in `quickstart.md`: "what is real vs stub" in the handler layer, and the deep behaviour of `just dev` with its PMS-xxx justifications. Marked internal; not published to users.
+
 [`dev-docs/`](dev-docs/README.md) holds the internal working notes: the local-versus-CI check mapping, the architecture seams, decision records, and a frozen audit snapshot. Its index says which of those is maintained and which is a point-in-time record.
 
 Conventions for AI agents working in this repository are in [`CLAUDE.md`](../CLAUDE.md).

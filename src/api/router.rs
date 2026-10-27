@@ -38,6 +38,7 @@ use crate::modules::contacts::{contact_routes, ContactService};
 use crate::modules::contracts::{contracts_routes, ContractsService};
 use crate::modules::dashboards::{dashboard_routes, DashboardsService};
 use crate::modules::email_intake::{email_intake_routes, EmailIntakeService};
+use crate::modules::expenses::{expenses_routes, ExpensesService};
 use crate::modules::forms::{forms_routes, public_form_routes, FormsService};
 use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::attachments::{
@@ -153,6 +154,11 @@ pub fn create_api_router(
     // against a database of its own, and the provider it would find is
     // whichever one initialised the global first.
     app_secrets: Arc<crate::app_secrets::AppSecrets>,
+    // MAPPS-1139: the deployment's Xero and Intuit applications, resolved in
+    // `main` so a half-configured pair fails the boot rather than a customer's
+    // first click. Empty is a deployment that has neither, which refuses at
+    // the point a tenant tries to use one.
+    issuer_apps: Arc<crate::modules::billing::invoice_issuer_app::IssuerApps>,
     // PMS-1414: the process's feature-toggle snapshot. Passed rather than built
     // here so `main` can hand the SAME handle to the refresh job: a router with
     // its own copy would never see a flip made by the interval tick.
@@ -337,6 +343,10 @@ pub fn create_api_router(
         spa_base_url.clone(),
     );
     let assets_service = AssetsService::with_encryption_key(db.clone(), encryption_key);
+    // MAPPS-1100 Phase A: Bills and Expenses leaf lookups. Vendors +
+    // expense categories only; the bills/expenses headers themselves
+    // land in Phase B.
+    let expenses_service = ExpensesService::new(db.clone());
     // PMS-1129: an @mention in a KB comment notifies through the queue.
     let kb_service = KbService::new(db.clone()).with_notifications(notifications_service.clone());
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
@@ -354,6 +364,68 @@ pub fn create_api_router(
     // deployment on Infisical keeps its integration credentials there too.
     let integrations_service =
         crate::modules::integrations::IntegrationsService::new(db.clone(), secrets.clone());
+    // MAPPS-1099 / MAPPS-1134: wire the feature-flagged invoice-issuer
+    // dispatch onto the serving `BillingService`. The flag defaults OFF
+    // (`Feature::DelegatedInvoiceIssuer`), so this is a no-op on every
+    // environment until an admin flips it; even flipped on, only a tenant
+    // with Xero or QuickBooks connected and the `Invoicing` capability
+    // enabled sees the delegated path.
+    //
+    // The two clients are built here with their real hosts. They are the
+    // only place those hosts are named, and a test builds the same
+    // dispatcher with `with_api_base` / `with_identity_base` pointing at a
+    // stub, which is what lets the delegated path be exercised end to end
+    // without reaching Xero or Intuit.
+    let issuer_dispatcher = Arc::new(
+        crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher::new(
+            features.clone(),
+            Arc::new(integrations_service.clone()),
+            Arc::new(
+                crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService::new(
+                    db.clone(),
+                ),
+            ),
+            secrets.clone(),
+            // MAPPS-1139: the deployment's own Xero and Intuit applications,
+            // read through the application-tier secret seam exactly as the
+            // Google and Microsoft 365 clients are. A deployment with neither
+            // configured still builds the dispatcher; it refuses at the point
+            // a tenant tries to use one, naming the deployment rather than
+            // failing somewhere inside a provider call.
+            issuer_apps.clone(),
+            Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
+            Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
+        ),
+    );
+    let billing_service = billing_service.with_invoice_dispatch(issuer_dispatcher.clone());
+    // MAPPS-1155: the bill half of the same dispatch, on its own flag
+    // (`Feature::DelegatedBills`, also OFF by default). Assigned here
+    // rather than at construction because the dispatcher is built after
+    // the services it serves, and a bill push needs the same clients,
+    // the same credential blob and the same near-expiry refresh an
+    // invoice push does.
+    let expenses_service = expenses_service.with_bill_dispatch(issuer_dispatcher.clone());
+    // MAPPS-1142: the OAuth round trip that writes the credential blob the
+    // dispatcher and the receivers read. Its own service rather than another
+    // method on `IntegrationsService`, because what it does is a browser round
+    // trip with a single-use state, which is contact sync's shape and not the
+    // integrations catalog's.
+    let issuer_connect = Arc::new(
+        crate::modules::billing::invoice_issuer_connect::InvoiceIssuerConnectService::new(
+            db.clone(),
+            secrets.clone(),
+            issuer_apps.clone(),
+            // MAPPS-1154: so the settings card can say whether delegated
+            // issuing is switched on for this deployment. The connect flow
+            // does not gate on it; the card just stops claiming an
+            // arrangement the toggle has switched off.
+            features.clone(),
+            Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
+            Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
+            public_api_base_url.clone(),
+            client_origin.clone(),
+        ),
+    );
     let reports_service = ReportsService::new(db.clone());
     // PMS-457: saved-report definitions (Phase 1).
     let saved_reports_service = SavedReportsService::new(db.clone());
@@ -666,10 +738,26 @@ pub fn create_api_router(
         // `billing_routes` defines the full paths so the URL structure
         // stays flat. PMS-34.
         .merge(billing_routes(billing_service, public_api_base_url.clone()))
+        // MAPPS-1099 Phase 2c: admin surfaces that populate the
+        // invoice-issuer mapping tables (Mokosh company -> external
+        // customer, Mokosh product -> external item). Behind the same
+        // `Feature::DelegatedInvoiceIssuer` flag the dispatch reads;
+        // every route answers 404 while the flag is off.
+        .merge(crate::modules::billing::invoice_issuer_mapping_routes::invoice_issuer_mapping_routes(
+            crate::modules::billing::invoice_issuer_mapping_routes::InvoiceIssuerMappingRouterState {
+                service: Arc::new(crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService::new(db.clone())),
+                features: features.clone(),
+            },
+        ))
         // Quotes: the sales document that precedes a Project, plus its
         // line items. Shares the billing module gate + finance role with
         // invoices. PMS-672.
         .merge(quotes_routes(quotes_service))
+        // MAPPS-1100: the inbound-money plane (vendors + expense
+        // categories so far; bills + expenses themselves land next). Same
+        // RequireBilling + RequireFinance gates as the customer-facing
+        // billing plane.
+        .merge(expenses_routes(expenses_service))
         // Assets / CMDB: types, assets, relationships, config items,
         // credential vault, audit log. PMS-72.
         //
@@ -722,6 +810,13 @@ pub fn create_api_router(
         .merge(crate::modules::integrations::integration_routes(
             integrations_service,
         ))
+        // MAPPS-1142: starting a Xero or QuickBooks connection. Admin-gated
+        // inside, beside the catalog it ends up writing a row in.
+        .merge(
+            crate::modules::billing::invoice_issuer_connect::invoice_issuer_connect_routes(
+                issuer_connect.clone(),
+            ),
+        )
         // RMM: connections, device mappings, alert rules, alert ingest. PMS-101.
         .merge(rmm_routes(rmm_service))
         // Client service status: monitored systems and observed check
@@ -1046,6 +1141,48 @@ pub fn create_api_router(
             crate::utils::error::normalize_error_envelope,
         ));
 
+    // MAPPS-1136 / MAPPS-1141: the invoice-issuer webhook receivers, under
+    // `/api/v1/webhooks/{provider}` OUTSIDE the auth chain for the same reason
+    // the payment ones are: the provider authenticates itself with an HMAC
+    // over the raw body.
+    //
+    // ONE URL per provider, not one per tenant, because there is one
+    // application per provider and therefore one webhook subscription for the
+    // host to configure. The delivery says which organisation it is about and
+    // `integrations.external_organisation_id` says whose that is. The payment
+    // receivers keep their per-tenant path, which is still right there: a
+    // gateway's webhook secret IS the tenant's.
+    //
+    // The prefix is in `RAW_BODY_PATHS`, because a byte the JSON sanitizer
+    // rewrote is a signature that does not verify.
+    //
+    // They share the dispatcher the serving `BillingService` was given, rather
+    // than building a second one: it owns the credential load, the near-expiry
+    // refresh and the two clients, and a receiver needs all three.
+    let invoice_issuer_webhooks = |path: &'static str, provider| {
+        Router::new()
+            .route(
+                path,
+                post(
+                    crate::modules::billing::webhook_invoice_issuer::invoice_issuer_webhook_handler,
+                ),
+            )
+            .with_state(Arc::new(
+                crate::modules::billing::webhook_invoice_issuer::InvoiceIssuerWebhookState {
+                    billing: Arc::new(BillingService::with_secrets(
+                        db.clone(),
+                        encryption_key,
+                        secrets.clone(),
+                    )),
+                    dispatcher: issuer_dispatcher.clone(),
+                    provider,
+                },
+            ))
+            .layer(middleware::from_fn(
+                crate::utils::error::normalize_error_envelope,
+            ))
+    };
+
     // Combine everything. The `.fallback` swallows any non-/api/v1/* request
     // (including hitting `/` directly in a browser) with a small placeholder
     // page that links the user back to the Mokosh frontend. This keeps
@@ -1063,6 +1200,16 @@ pub fn create_api_router(
         .merge(crate::modules::features::routes::public_config_routes(
             features.clone(),
         ))
+        // MAPPS-1142: the OAuth redirect Xero and Intuit send an admin's
+        // browser to. Unauthenticated by construction, the same reasoning as
+        // the contact-sync callbacks below: a redirect carries no session, and
+        // the single-use state is the only identity it has. Every outcome is a
+        // redirect back to the SPA.
+        .merge(
+            crate::modules::billing::invoice_issuer_connect::invoice_issuer_public_routes(
+                issuer_connect.clone(),
+            ),
+        )
         // PMS-1212 (PSA-70): the OAuth redirect Google sends an admin's
         // browser to. Unauthenticated by construction - a redirect carries no
         // session - and its credential is the single-use `state` parameter,
@@ -1152,6 +1299,17 @@ pub fn create_api_router(
         .nest("/api/v1/bunyip", bunyip_nest)
         .nest("/api/v1/stripe", stripe_webhooks)
         .nest("/api/v1/paypal", paypal_webhooks)
+        .nest(
+            "/api/v1/webhooks",
+            invoice_issuer_webhooks(
+                "/xero",
+                crate::modules::billing::invoice_issuer::InvoiceProviderKind::Xero,
+            )
+            .merge(invoice_issuer_webhooks(
+                "/quickbooks",
+                crate::modules::billing::invoice_issuer::InvoiceProviderKind::Quickbooks,
+            )),
+        )
         .fallback(get(move |headers| {
             not_a_frontend(headers, client_origin.clone())
         }))

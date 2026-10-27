@@ -202,7 +202,7 @@ just dev-clean-all           # everything dev-clean does, plus this repo's image
 just check                   # every check.yml step except its cargo test steps (run before pushing)
 just pre-commit              # fmt-only check plus check-tree-ownership, runs on every commit
 just pre-push                 # the unit tests `just check` leaves out, plus fmt/clippy/compile; runs on every push (doc tests are CI-only, PMS-786)
-just test                    # cargo test workspace-wide
+just test                    # the unit tests (the Postgres suite is the line below)
 just test-integration        # the Postgres-backed tests/suites/*.rs suite
 just fmt                     # cargo fmt --all
 just migrate-run             # sqlx migrate run against $DATABASE_URL (host)
@@ -251,20 +251,6 @@ just dev-clean        # stop + drop this repo's volumes + target/ + .env
 # the project rows in its Postgres are gone with the volume.
 ```
 
-## 11. What is real vs. stub
+---
 
-Most of the ~30 route groups have real handlers (`auth`, `contacts`, `tenants`, `tickets`, `billing`, `projects`, `calendar`, `contracts`, `quotes`, `assets`, `rmm`, `sla`, and more). The report-export route serves `csv` and `pdf` (PMS-876) and rejects every other `format` with 400 and not 501: `format` is an enumerated query parameter, so a value outside the implemented set is an out-of-range request rather than a server-side gap (PMS-854). The database schema is still ahead of the handler layer in places. Before adding a feature module, read the "Routing model" section of [`architecture.md`](architecture.md#routing-model) for what is mounted today and what authenticates it; [`codebase-state.md`](dev-docs/codebase-state.md) is a frozen 2026-05-06 snapshot (PMS-849) that is still worth reading for the `F1..F14` fix ids, the numbered cross-cutting issues and the shallow-DTO traps, but every status claim in it is from that date.
-
-Authentication (PMS-295): mokosh no longer runs its own OIDC IdP. That subsystem's workspace crates and its `MOKOSH_AUTH_*` env vars were removed; bunyip is the sole OP. Two independent paths run in parallel: the bunyip-as-OP Resource-Server path (mokosh verifies bunyip-issued Bearer tokens against bunyip's JWKS, configured by `OIDC_ISSUER` / `OIDC_AUDIENCE`), which the SPA and E2E suite use, and the legacy HS256 email/password Bearer auth used by the original PSA endpoints. A bare dev `.env` with no OIDC vars still boots and serves the legacy path. As of PMS-511 `just dev` is the single Traefik-routed stack (per-developer `https://${USER}-mokosh-api.a8n.run`); the former separate `dev-sso` overlay recipe is gone.
-
-<!-- PMS-1437 -->
-
-## 12. Dev stack notes
-
-`just dev` rewrites `USER` in `.env` each run, which names the per-developer containers, volumes, networks and the `${USER}-mokosh-api.a8n.run` route. It discovers no LAN IP: PMS-496 moved the `postgres`/`mailpit` host publishes to loopback and left the `server` ingress-only via Traefik, so nothing consumed the address, and PMS-863 dropped the `MOKOSH_HOST_BIND_IP` it was written to - a var stamped on every run that nothing reads is what makes reintroducing a LAN-IP publish look supported. First run generates `.env` from the committed `.env.example` (via the `ensure-env` recipe, a dependency of `just dev`), minting fresh random values for every self-owned secret (PMS-490: DB passwords, `JWT_SECRET`, `ENCRYPTION_KEY`, the Infisical secrets) and leaving third-party credentials as empty placeholders. It does not copy a file; an existing `.env` is left untouched, so the generation runs once per clone.
-
-`just dev-infisical` rewrites `MOKOSH_SERVER_INFISICAL_ADDRESS` in `.env` to `http://infisical:8080`, which compose passes to the `server` container as `INFISICAL_ADDRESS` (restart `server` to pick it up). It stays empty on a plain `just dev` so the readiness probe reports `checks.infisical == "skipped"` rather than 503ing against the profile-gated service (PMS-707). The separate plain `INFISICAL_URL` in `.env` is a different key: the host-side `http://localhost:28002` that the bootstrap CLI reads when `just infisical-bootstrap` runs it. PMS-853 renamed that template key onto the name the CLI actually reads; the previous name was read by nothing.
-
-`just dev` requires the shared external `network-traefik-public` to already exist. (Before PMS-295 it also needed a local Ed25519 keypair for mokosh-auth's OP signing; that subsystem is gone, so no key material is provisioned now. The bunyip-as-OP Resource-Server path verifies tokens against bunyip's JWKS over the network.)
-
-The compose project name is `dev-mokosh-${USER}` (PMS-1281), not the bare `dev-mokosh` it used to be: every container, volume and network was already `${USER}`-suffixed, but the project name itself was shared, so `docker compose`'s own orphan/volume cleanup (`just down`'s `--remove-orphans`, `just dev-clean`'s volume removal) could treat another developer's resources as belonging to the same project. A developer updating past this change must run `just down` once under the OLD name first, or it never stops: `docker compose -p dev-mokosh down` (no `-v`, to keep volumes). After that, `just down` / `just dev` address only the per-user project.
+Internal engineering notes (what is real vs stub, the deep behaviour of `just dev`, the compose-project rename) live in [`internal.md`](internal.md). Not required to run the server; read it before changing the dev stack or adding a feature module.

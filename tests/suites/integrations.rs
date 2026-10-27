@@ -108,6 +108,65 @@ async fn row_count(pool: &PgPool, provider: &str) -> i64 {
         .expect("count integrations")
 }
 
+/// MAPPS-1129: `configurable_here` agrees with what the write route actually
+/// does, for every provider in the catalog.
+///
+/// The client renders its one mutating control set - the capability
+/// checkboxes, Connect/Disconnect, the poll interval - exactly where it
+/// believes a change is accepted, and before this field it believed that
+/// wherever `managed_elsewhere` was absent. Stripe's connection home IS this
+/// subsystem since PMS-1312, so it carries no `managed_elsewhere`, and
+/// MAPPS-1122 put it back in this list; the page offered an admin checkboxes
+/// whose every tick came back 404.
+///
+/// Asserted against the route's own answer rather than against a list of
+/// provider names, because a second list is how the first one drifts. The
+/// question "will PUT take this?" has one true answer and this is it.
+#[mokosh_test]
+async fn the_catalog_says_which_providers_the_write_route_will_take(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let entries = list(&app, &token).await;
+    assert!(!entries.is_empty(), "the catalog is never empty");
+    let mut refused = 0;
+    for row in &entries {
+        let provider = row["provider"].as_str().expect("provider");
+        let configurable = row["configurable_here"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("{provider} does not say whether it is configurable: {row}"));
+
+        let put = app
+            .client
+            .put(app.url(&format!("/api/v1/integrations/{provider}")))
+            .bearer_auth(&token)
+            .json(&json!({ "capabilities": [] }))
+            .send()
+            .await
+            .expect("put");
+        let takes_it = put.status() != StatusCode::NOT_FOUND;
+        assert_eq!(
+            configurable,
+            takes_it,
+            "{provider} says configurable_here={configurable} and PUT answered {}; a client \
+             renders its controls off this field, so the two disagreeing is a control that \
+             404s (MAPPS-1129)",
+            put.status()
+        );
+        if !configurable {
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        refused,
+        entries.len(),
+        "MAPPS-1153: every provider is configured on its own surface now, so none of them is \
+         configurable here. A provider that WAS would be the exception and should be read \
+         twice, which is why this counts rather than sampling"
+    );
+}
+
 /// The page's job is to show what COULD be connected, so every provider in the
 /// registry is listed on a tenant that has installed nothing, and each carries
 /// the supported set the server will hold it to.
@@ -150,8 +209,10 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
         ("google", Some("contact_sync_google")),
         ("icloud", Some("contact_sync_icloud")),
         ("microsoft", Some("contact_sync_microsoft")),
-        ("quickbooks", None),
-        ("xero", None),
+        // MAPPS-1153: both issuers have their own page now, which is where
+        // the consent round trip starts and where the mappings live.
+        ("quickbooks", Some("invoice_issuer_quickbooks")),
+        ("xero", Some("invoice_issuer_xero")),
     ] {
         let row = entry(&entries, provider);
         match kind {
@@ -173,8 +234,9 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
     // so its capabilities can be named; Google's client exists, so the two
     // differ here even though neither can be connected on this surface.
     assert_eq!(
-        xero["available"], false,
-        "no Xero client, nothing reads its capabilities, no poll job"
+        xero["available"], true,
+        "MAPPS-1153: the client, the consent flow, the mapping surface and the settings page \
+         all exist now, which is what `available` has always meant"
     );
     assert_eq!(
         entry(&entries, MANAGED_ELSEWHERE)["available"],
@@ -297,18 +359,35 @@ async fn no_provider_can_be_connected_here_and_each_refusal_says_why(pool: PgPoo
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
 
-    for provider in [MANAGED_HERE, ALSO_PLANNED] {
+    // MAPPS-1153: every provider is configured on its own surface, so the
+    // route refuses all seven BEFORE the service's own reasons are reached.
+    // The 404 is the registry's answer and the message carries the one thing
+    // an operator needs, which is the page that does own the lifecycle.
+    //
+    // The service-level refusals this case used to read through HTTP are
+    // still there and still different from each other - `assert_built` for a
+    // provider with nothing behind it, `assert_managed_here` for one owned by
+    // another subsystem - and they are unit-tested where they live. What
+    // changed is that nothing can reach them through this route, which is the
+    // statement below.
+    for (provider, surface) in [
+        (MANAGED_HERE, "Settings > Xero"),
+        (ALSO_PLANNED, "Settings > QuickBooks"),
+        (MANAGED_ELSEWHERE, "Settings > Google Contacts"),
+        (ALSO_ELSEWHERE, "Settings > Microsoft 365 Contacts"),
+        ("stripe", "Settings > Payment Gateways"),
+    ] {
         let response = connect(&app, &token, provider, json!({ "credential": "anything" })).await;
         assert_eq!(
             response.status(),
-            StatusCode::CONFLICT,
-            "{provider} has no client, so connecting it claims a delegation nothing can act on"
+            StatusCode::NOT_FOUND,
+            "{provider} is configured on its own page, so this surface does not offer it"
         );
         let body: Value = response.json().await.expect("refusal json");
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("nothing behind it"),
-            "the refusal says what is missing: {message}"
+            message.contains(surface),
+            "{provider} must name the page that owns it, not another provider's: {message}"
         );
         assert!(
             !message.contains("MAPPS-"),
@@ -327,26 +406,37 @@ async fn no_provider_can_be_connected_here_and_each_refusal_says_why(pool: PgPoo
             .await
             .expect("count integration secrets"),
             0,
-            "and stores no credential for a provider that could not read one"
+            "and stores no credential for a provider it would not have read one for"
         );
     }
 
-    for provider in [MANAGED_ELSEWHERE, ALSO_ELSEWHERE] {
-        let response = connect(&app, &token, provider, json!({ "credential": "anything" })).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+    // The refusals still differ, which was this case's point when they were
+    // reachable: four providers, four pages, and none of them sent to
+    // another's.
+    let mut surfaces: Vec<String> = Vec::new();
+    for provider in [
+        MANAGED_HERE,
+        ALSO_PLANNED,
+        MANAGED_ELSEWHERE,
+        ALSO_ELSEWHERE,
+    ] {
+        let response = connect(&app, &token, provider, json!({})).await;
         let body: Value = response.json().await.expect("refusal json");
-        let message = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("contact_sync_connections"),
-            "the refusal names where the connection does live: {message}"
+        surfaces.push(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         );
-        assert!(
-            !message.contains("nothing behind it"),
-            "{provider} is built; saying otherwise sends an operator to wait for shipped \
-             work: {message}"
-        );
-        assert_eq!(row_count(&pool, provider).await, 0);
     }
+    let mut unique = surfaces.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        surfaces.len(),
+        "two providers were sent to the same page: {surfaces:?}"
+    );
 }
 
 /// A capability change is the same claim connect makes, in smaller print, and
@@ -369,7 +459,19 @@ async fn delegating_a_capability_to_a_planned_provider_is_refused(pool: PgPool) 
         .send()
         .await
         .expect("update");
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "MAPPS-1153: Xero's lifecycle is its own page's, so this route does not offer it"
+    );
+    let body: Value = response.json().await.expect("refusal json");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Settings > Xero"),
+        "and says where the delegation IS changed: {body}"
+    );
     assert_eq!(
         row_count(&pool, MANAGED_HERE).await,
         0,
@@ -416,6 +518,9 @@ async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) 
 
     let app = common::boot(pool.clone()).await;
     let token = common::login(&app, &email, &password).await;
+
+    // MAPPS-1153: this route does not offer Xero any more, and says where
+    // the lifecycle lives instead.
     let response = app
         .client
         .post(app.url(&format!("/api/v1/integrations/{MANAGED_HERE}/disconnect")))
@@ -423,13 +528,35 @@ async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) 
         .send()
         .await
         .expect("disconnect");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // And the way out exists on the page that owns it, which is the half of
+    // this case that matters: the invariant is that a tenant is never
+    // stranded in a state an earlier build wrote, not that one particular
+    // route is the exit.
+    let response = app
+        .client
+        .post(app.url(&format!(
+            "/api/v1/integrations/invoice-issuer/{MANAGED_HERE}/disconnect"
+        )))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("disconnect through the owning surface");
     assert_eq!(
         response.status(),
-        StatusCode::OK,
+        StatusCode::NO_CONTENT,
         "the way out of the old state cannot be gated on the state being possible"
     );
-    let body: Value = response.json().await.expect("disconnect json");
-    assert_eq!(body["status"], "disconnected");
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM integrations WHERE tenant_id = $1 AND provider = $2",
+    )
+    .bind(tenant_id)
+    .bind(MANAGED_HERE)
+    .fetch_one(&pool)
+    .await
+    .expect("read the row back");
+    assert_eq!(status, "disconnected");
     assert_eq!(
         row_count(&pool, MANAGED_HERE).await,
         1,
@@ -448,8 +575,18 @@ async fn a_row_left_by_an_earlier_build_can_still_be_disconnected(pool: PgPool) 
 }
 
 /// The guard that keeps one connection in one place while PMS-1315 is
-/// outstanding. A 409 rather than a 404, because Google exists and is listed;
-/// what is wrong is that this is the wrong surface for it.
+/// outstanding.
+///
+/// It answered 409 through this route until MAPPS-1153 - Google exists and
+/// is listed, and what was wrong was the surface. Now the registry refuses
+/// first with a 404, because Google is not configured here at all, and the
+/// message names the page that does own it. The 409 and its PMS-1315
+/// reference are still what `assert_managed_here` produces for a caller
+/// that reaches the service directly, and that is where they are pinned.
+///
+/// The case is kept rather than deleted because what it protects is
+/// unchanged: a credential for a provider owned by another subsystem must
+/// not be stored here, whatever the status code on the way out.
 #[mokosh_test]
 async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
     let (_admin_id, email, password) = common::seed_admin(&pool).await;
@@ -463,11 +600,13 @@ async fn a_provider_managed_elsewhere_cannot_be_connected_here(pool: PgPool) {
         json!({ "credential": "refresh-token-x" }),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body: Value = response.json().await.expect("refusal json");
     let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains("Contact sync"), "{message}");
-    assert!(message.contains("PMS-1315"), "{message}");
+    assert!(
+        message.contains("Settings > Google Contacts"),
+        "the refusal names the page that owns the connection: {message}"
+    );
 
     assert_eq!(
         row_count(&pool, MANAGED_ELSEWHERE).await,
@@ -678,6 +817,176 @@ async fn a_contact_sync_provider_reports_the_state_contact_sync_is_in(pool: PgPo
     assert!(
         entry(&entries, "google").get("last_error").is_none(),
         "a stale message from a sync that later succeeded would read as a live failure"
+    );
+}
+
+/// MAPPS-1131: what a contact-sync provider is DELEGATED comes from contact
+/// sync too, and it takes both halves.
+///
+/// MAPPS-1122 moved the status to the owning subsystem and stopped there. These
+/// three providers have no `integrations` row at all - `ConnectionHome::Elsewhere`,
+/// so two tables cannot disagree about one fact - which left
+/// `enabled_capabilities` permanently empty, and a tenant actively syncing
+/// Google Contacts was listed as connected with nothing delegated to it.
+///
+/// The two halves are asserted apart, because each alone is a state a tenant
+/// can be in and they mean different things: a live connection with the switch
+/// off is an account still linked and nothing being read from it.
+#[mokosh_test]
+async fn a_contact_sync_provider_reports_what_it_is_actually_delegated(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded admin's tenant");
+
+    // google: live and switched on. icloud: live, switched OFF. microsoft:
+    // disconnected, switched on.
+    for (provider, disconnected) in [("google", false), ("icloud", false), ("microsoft", true)] {
+        sqlx::query(
+            "INSERT INTO contact_sync_connections \
+             (tenant_id, provider, account_email, is_active, sync_status, disconnected_at) \
+             VALUES ($1, $2, $3, TRUE, 'success', $4)",
+        )
+        .bind(tenant_id)
+        .bind(provider)
+        .bind(format!("admin@{provider}.example"))
+        .bind(disconnected.then(chrono::Utc::now))
+        .execute(&pool)
+        .await
+        .expect("seed a contact-sync connection");
+    }
+    sqlx::query(
+        "INSERT INTO tenant_settings (tenant_id, category, key, value) \
+         VALUES ($1, 'integrations', 'icloud_contacts_enabled', 'false'::jsonb)",
+    )
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("switch iCloud off");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let entries = list(&app, &token).await;
+
+    let delegated = |provider: &str| -> Vec<String> {
+        entry(&entries, provider)["enabled_capabilities"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|c| c.as_str().expect("capability").to_string())
+            .collect()
+    };
+
+    assert_eq!(
+        delegated("google"),
+        vec!["contacts".to_string()],
+        "a tenant syncing Google Contacts has delegated contacts to it"
+    );
+
+    let icloud = entry(&entries, "icloud");
+    assert_eq!(
+        icloud["status"], "connected",
+        "the account is still linked, and saying otherwise would hide a credential that still exists: {icloud}"
+    );
+    assert!(
+        delegated("icloud").is_empty(),
+        "the switch is off, so nothing is being read from it: {icloud}"
+    );
+
+    assert!(
+        delegated("microsoft").is_empty(),
+        "a disconnected connection hands nothing over, switch or no switch"
+    );
+
+    // The row that is not an integration. `contact_sync_connections` holds a
+    // vcard row per tenant since PMS-1290; it has no registry entry, so it is
+    // neither listed nor asked for a switch it does not have.
+    sqlx::query(
+        "INSERT INTO contact_sync_connections (tenant_id, provider, account_email, is_active) \
+         VALUES ($1, 'vcard', 'files@msp.example', TRUE)",
+    )
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("seed the vcard row");
+    let after = list(&app, &token).await;
+    assert!(
+        after.iter().all(|row| row["provider"] != "vcard"),
+        "an uploaded file is not an integration"
+    );
+    assert_eq!(
+        after.len(),
+        entries.len(),
+        "and it changes nothing else about the catalog"
+    );
+}
+
+/// PMS-1525: migration 283 clears the capability from the rows that carry it,
+/// and leaves `payments` alone.
+///
+/// The row is seeded the way a deployment actually has it and then given the
+/// extra value the closed route used to be able to write. No API can produce
+/// this state any more, which is exactly why it needs a migration rather than
+/// a release note telling an admin to untick it.
+///
+/// The migration has already run against this database (every suite database
+/// is migrated before a case touches it) and the row is seeded after, so the
+/// case runs the migration's own statement to prove the state cannot survive
+/// it, and then reads the result back through the API the panel uses.
+#[mokosh_test]
+async fn a_stripe_row_no_longer_claims_an_invoicing_delegation(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let tenant_id: uuid::Uuid = sqlx::query_scalar("SELECT tenant_id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded admin's tenant");
+    sqlx::query(
+        "INSERT INTO integrations (tenant_id, provider, status, enabled_capabilities) \
+         VALUES ($1, 'stripe', 'connected', ARRAY['payments', 'invoicing']::text[])",
+    )
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("seed a stripe row from before the capability was retired");
+
+    sqlx::query(
+        "UPDATE integrations SET enabled_capabilities = array_remove(enabled_capabilities, 'invoicing') \
+         WHERE provider = 'stripe' AND 'invoicing' = ANY(enabled_capabilities)",
+    )
+    .execute(&pool)
+    .await
+    .expect("run the migration statement");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+    let entries = list(&app, &token).await;
+    let stripe = entry(&entries, "stripe");
+
+    let delegated: Vec<&str> = stripe["enabled_capabilities"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|c| c.as_str().expect("capability"))
+        .collect();
+    assert_eq!(
+        delegated,
+        vec!["payments"],
+        "card payments are real and read; invoicing was neither: {stripe}"
+    );
+
+    let supported: Vec<&str> = stripe["supported_capabilities"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|c| c["key"].as_str().expect("key"))
+        .collect();
+    assert_eq!(
+        supported,
+        vec!["payments"],
+        "and the catalog stops offering a capability no issuer can receive: {stripe}"
     );
 }
 

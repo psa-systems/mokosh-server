@@ -48,6 +48,20 @@ pub struct BillingService {
     /// built here, so the provider is chosen once at startup by
     /// `secrets::provider_from_env` and no constructor can pick a different one.
     secrets: Arc<dyn crate::secrets::SecretProvider>,
+    /// MAPPS-1099: the feature-flagged dispatch between the local path
+    /// and the Xero / QuickBooks clients. `None` on every test harness,
+    /// QA seeder and portal-side instance so a build that does not opt
+    /// into the dispatch keeps today's behaviour byte for byte; wired on
+    /// the serving instance by [`Self::with_invoice_dispatch`] after
+    /// `IntegrationsService` is built.
+    ///
+    /// MAPPS-1134 replaced the Phase 2b `InvoiceDispatchContext` (the
+    /// feature snapshot and the integrations service, which this file
+    /// used to re-read the capability from) with the dispatcher itself.
+    /// The two were deciding the same thing in two places, and only one
+    /// of them could carry it out.
+    invoice_dispatch:
+        Option<Arc<crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher>>,
 }
 
 /// PMS-990: the due date offset when neither the invoice's term nor the
@@ -83,6 +97,7 @@ impl BillingService {
             mailer: None,
             portal_origin: None,
             secrets,
+            invoice_dispatch: None,
         }
     }
 
@@ -797,6 +812,7 @@ impl BillingService {
             mailer: None,
             portal_origin: None,
             secrets,
+            invoice_dispatch: None,
         }
     }
 
@@ -819,6 +835,65 @@ impl BillingService {
             mailer: Some(mailer),
             portal_origin: Some(portal_origin),
             secrets,
+            invoice_dispatch: None,
+        }
+    }
+
+    /// MAPPS-1099: enable the feature-flagged dispatch between the local
+    /// invoice path and an external provider (Xero or QuickBooks). An
+    /// instance built without this is byte-identical in behaviour to the
+    /// local-only code: `create_invoice` runs the local path end to end
+    /// for every tenant, every time. An instance built WITH this still
+    /// runs the local path for every tenant until an admin flips
+    /// `Feature::DelegatedInvoiceIssuer` on, and even then only reroutes
+    /// a tenant whose `integrations` row carries `Capability::Invoicing`
+    /// for Xero or QuickBooks. The flag defaults OFF (a missing
+    /// `feature_toggles` row reads as off, PMS-1414).
+    pub fn with_invoice_dispatch(
+        mut self,
+        dispatcher: Arc<crate::modules::billing::invoice_issuer_dispatch::IssuerDispatcher>,
+    ) -> Self {
+        self.invoice_dispatch = Some(dispatcher);
+        self
+    }
+
+    /// MAPPS-1134: issue this invoice externally when the tenant has
+    /// delegated it, and answer `None` for every path that leaves the
+    /// local behaviour alone.
+    ///
+    /// `None` on four paths:
+    /// 1. The dispatch was never wired (every test harness, QA seeder,
+    ///    and portal-side instance).
+    /// 2. The dispatch is wired but the feature toggle is OFF, which is
+    ///    every deployment until operations flips it. This is checked
+    ///    here rather than inside `plan`, because the caller does
+    ///    preparatory reads before it can build the request shape and
+    ///    the toggle being off has to cost nothing at all: no extra
+    ///    query, no reordering, nothing for a reviewer to weigh up
+    ///    against the local path they already trust.
+    /// 3. The toggle is on but neither Xero nor QuickBooks carries
+    ///    `Capability::Invoicing` on this tenant.
+    /// 4. A provider is delegated and `plan` chose the local path
+    ///    anyway, which it does not today and is free to in future.
+    ///
+    /// `Some(ExternalInvoiceRef)` means the external provider HAS the
+    /// invoice: the caller writes its columns onto the local row. An
+    /// error means it does not, and no local row may be written, which
+    /// is why this runs before the transaction opens rather than inside
+    /// it.
+    async fn issue_externally(
+        &self,
+        tenant_id: TenantId,
+        shape: &crate::modules::billing::invoice_issuer_dispatch::CreateInvoiceRequestShape<'_>,
+    ) -> AppResult<Option<crate::modules::billing::invoice_issuer::ExternalInvoiceRef>> {
+        use crate::modules::billing::invoice_issuer_dispatch::IssuerPlan;
+
+        let Some(dispatcher) = &self.invoice_dispatch else {
+            return Ok(None);
+        };
+        match dispatcher.plan(tenant_id, shape).await? {
+            IssuerPlan::Local => Ok(None),
+            IssuerPlan::Delegated(external) => Ok(Some(external)),
         }
     }
 
@@ -985,7 +1060,8 @@ impl BillingService {
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
                    tax_rate_id, tax_rate, amends_invoice_id,
-                   delivery_method, delivery_note, delivered_by_id
+                   delivery_method, delivery_note, delivered_by_id,
+                   external_provider, external_invoice_id, external_number
             FROM invoices
             WHERE {data_where}
             ORDER BY {order_by}
@@ -1045,6 +1121,63 @@ impl BillingService {
         request: &CreateInvoiceRequest,
         ctx: &AuditCtx,
     ) -> AppResult<InvoiceResponse> {
+        // MAPPS-1134: when the tenant has delegated Invoicing, the
+        // external provider issues the invoice BEFORE anything local is
+        // written, so a provider that refuses leaves no row behind and
+        // consumes no number from the tenant's sequence.
+        //
+        // That ordering is why this is a separate pass rather than a
+        // call inside the transaction below. `plan` needs the resolved
+        // due date and currency, which are read from the database, and
+        // the transaction opens by LOCKING the tenant's invoice-number
+        // sequence row (`next_invoice_number`, which serialises
+        // concurrent creates on purpose). Calling Xero from inside it
+        // would hold that lock across an HTTP round trip: every other
+        // invoice create for the tenant would queue behind a third
+        // party, and a provider timeout would hold the lock for its
+        // whole duration.
+        //
+        // The whole pass is skipped unless the toggle is on, so every
+        // deployment that has not flipped `DelegatedInvoiceIssuer` runs
+        // exactly the statements it ran before, in the same order and
+        // the same number of them.
+        let external = match self.invoice_dispatch.as_ref() {
+            Some(dispatcher) if dispatcher.delegation_enabled() => {
+                let mut pre = self.db.begin_with_tenant(tenant_id).await?;
+                // The same two guards the write path runs, moved ahead of
+                // the provider call: an invoice for a company this tenant
+                // does not own must not reach Xero either (PMS-1367).
+                Self::assert_company_in_tenant(&mut pre, tenant_id, request.company_id).await?;
+                if let Some(pt) = request.payment_term_id {
+                    Self::assert_payment_term_in_tenant(&mut pre, tenant_id, pt).await?;
+                }
+                let (due_date, _) = Self::resolve_due_date(
+                    &mut pre,
+                    tenant_id,
+                    request.invoice_date,
+                    request.payment_term_id,
+                    request.due_date,
+                )
+                .await?;
+                let currency = match request.currency.as_deref() {
+                    Some(c) => c.to_string(),
+                    None => read_default_currency(&mut pre, tenant_id).await?,
+                };
+                pre.commit().await?;
+
+                let shape =
+                    crate::modules::billing::invoice_issuer_dispatch::CreateInvoiceRequestShape {
+                        company_id: request.company_id,
+                        invoice_date: request.invoice_date,
+                        due_date,
+                        currency: &currency,
+                        lines: &request.lines,
+                    };
+                self.issue_externally(tenant_id, &shape).await?
+            }
+            _ => None,
+        };
+
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
         // The sequence row is locked by the shared helper, so concurrent
@@ -1103,10 +1236,11 @@ impl BillingService {
                 contract_id, status, invoice_date, due_date, payment_terms,
                 payment_term_id,
                 subtotal, tax_amount, discount_amount, total, amount_paid,
-                balance_due, currency, notes, po_number, number_scheme
+                balance_due, currency, notes, po_number, number_scheme,
+                external_provider, external_invoice_id, external_number, sent_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7, $8, $9, $17, $10, $11,
-                    $12, $13, 0, $13, $14, $15, $16, $18)
+            VALUES ($1, $2, $3, $4, $5, $6, $22, $7, $8, $9, $17, $10, $11,
+                    $12, $13, 0, $13, $14, $15, $16, $18, $19, $20, $21, $23)
             "#,
         )
         .bind(invoice_id)
@@ -1127,6 +1261,35 @@ impl BillingService {
         .bind(&request.po_number)
         .bind(payment_term_id)
         .bind(number_scheme.as_str())
+        // MAPPS-1134: NULL on the local path, which is every row on a
+        // deployment that has not delegated. The local `invoice_number`
+        // is still minted either way: the external number is what the
+        // customer sees, and the local one is what every existing Mokosh
+        // reference to this invoice already uses.
+        .bind(external.as_ref().map(|e| e.provider.as_str()))
+        .bind(external.as_ref().map(|e| e.external_invoice_id.as_str()))
+        .bind(external.as_ref().map(|e| e.external_number.as_str()))
+        // MAPPS-1135: a delegated invoice is created `sent`, because the
+        // provider sent it, and `sent` is what this model means by that
+        // (PMS-991: "sent means it went"). The transition that would
+        // otherwise set it is `update_invoice`'s send, and that send is
+        // exactly what delegation replaces: it resolves a recipient,
+        // renders a document, freezes an issuer and mails it, and the
+        // provider did all four.
+        //
+        // The columns recording HOW it went stay NULL, because Mokosh did
+        // none of it: `emailed_to`, `emailed_at`, `delivery_method` and
+        // the issuer snapshot. Migration 263's note is the precedent for
+        // leaving them rather than inventing a value - a method we did not
+        // use is the false claim that migration exists to remove.
+        // `external_provider` is the record of who delivered it.
+        //
+        // Left in draft, the row would be invisible to every receivables
+        // read, uncorrectable by amendment or write-off, and unable to
+        // accept the payment a provider webhook reports (PMS-999 refuses a
+        // payment against a draft, deliberately).
+        .bind(if external.is_some() { "sent" } else { "draft" })
+        .bind(external.as_ref().map(|_| Utc::now()))
         .execute(&mut *tx)
         .await?;
 
@@ -2018,6 +2181,13 @@ impl BillingService {
               AND status IN ('sent', 'partially_paid')
               AND balance_due > 0
               AND due_date < $2
+              -- MAPPS-1135: an invoice the provider issued is an invoice
+              -- the provider chases. Since a delegated invoice is created
+              -- `sent` it otherwise matches this predicate exactly, and
+              -- the result would be two organisations emailing one
+              -- customer about one debt, one of them with a document that
+              -- customer has never seen.
+              AND external_provider IS NULL
             ORDER BY due_date, invoice_number
             "#,
         )
@@ -3691,6 +3861,139 @@ impl BillingService {
     /// `gateway_transaction_id` = the provider reference, `gateway_response` =
     /// the raw event, `currency` recorded) under the invoice row lock and
     /// recomputes the invoice's payment state, returning `Ok(true)`.
+    /// Whose tenant an invoice-issuer delivery is about (MAPPS-1141).
+    ///
+    /// The delivery names an ORGANISATION - Xero's `tenantId`, Intuit's
+    /// `realmId` - and `integrations.external_organisation_id` is where the
+    /// OAuth exchange wrote it. This is the one caller in the subsystem that
+    /// legitimately does not know its tenant yet, which is why it looks one
+    /// up instead of being handed one.
+    ///
+    /// SAFETY (PMS-285): the lookup spans every tenant, because the question
+    /// it answers is which tenant this is. It runs on the migrator pool for
+    /// that reason and returns a tenant id and nothing else; every read and
+    /// write after it is scoped to the tenant it returned.
+    pub async fn tenant_for_external_organisation(
+        &self,
+        provider: &str,
+        organisation_id: &str,
+    ) -> AppResult<Option<Uuid>> {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "SELECT tenant_id FROM integrations \
+             WHERE provider = $1 AND external_organisation_id = $2",
+        )
+        .bind(provider)
+        .bind(organisation_id)
+        .fetch_optional(self.db.migrator_pool())
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(found)
+    }
+
+    /// The local row for an invoice a provider holds (MAPPS-1136).
+    ///
+    /// Keyed on the pair, not on the external id alone: the id is the
+    /// provider's and two providers can mint the same one. `balance_due`
+    /// and `currency` come back with it because the caller is about to
+    /// record what the provider collected, and both are what that record
+    /// needs.
+    pub async fn delegated_invoice(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+        external_invoice_id: &str,
+    ) -> AppResult<Option<DelegatedInvoiceRow>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row = sqlx::query_as(
+            "SELECT id, balance_due, currency FROM invoices \
+             WHERE tenant_id = $1 AND external_provider = $2 AND external_invoice_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(provider)
+        .bind(external_invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Void an invoice because the provider that issued it voided it
+    /// (MAPPS-1136).
+    ///
+    /// Separate from [`Self::void_invoice`], which refuses anything past
+    /// draft on the grounds that the customer already holds the document
+    /// and a credit note is the instrument for correcting one. That rule is
+    /// right for an invoice Mokosh issued and wrong here: the document the
+    /// customer holds is the provider's, the provider voided it, and
+    /// Mokosh insisting on a credit note would be a second correction for
+    /// one event.
+    ///
+    /// Guarded on the delegation rather than on a status: the provider
+    /// named here must be the one on the row, so a delivery for one
+    /// provider cannot void an invoice issued through another, and a local
+    /// invoice (`external_provider IS NULL`) matches nothing. No
+    /// `voided_by_id`, because no person did this; `void_reason` says who
+    /// did.
+    pub async fn void_delegated_invoice(
+        &self,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        provider: &str,
+    ) -> AppResult<bool> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let voided = sqlx::query(
+            r#"
+            UPDATE invoices
+            SET status      = 'void',
+                voided_at   = NOW(),
+                void_reason = $3,
+                updated_at  = NOW()
+            WHERE id = $1 AND tenant_id = $2
+              AND external_provider = $4
+              AND status <> 'void'
+            "#,
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .bind(format!("Voided in {provider}, which issued it"))
+        .bind(provider)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if !voided {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let after: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            &AuditCtx::system(tenant_id.get()),
+            AuditAction::Update,
+            "invoices",
+            Some(invoice_id),
+            before,
+            after,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn record_gateway_payment(
         &self,
@@ -6123,7 +6426,8 @@ impl BillingService {
                    voided_at, voided_by_id, void_reason,
                    number_scheme,
                    tax_rate_id, tax_rate, amends_invoice_id,
-                   delivery_method, delivery_note, delivered_by_id
+                   delivery_method, delivery_note, delivered_by_id,
+                   external_provider, external_invoice_id, external_number
             FROM invoices
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -7996,6 +8300,14 @@ struct InvoiceRow {
     delivery_method: Option<String>,
     delivery_note: Option<String>,
     delivered_by_id: Option<Uuid>,
+    /// MAPPS-1099: external-issuer columns from migration 278, NULL on every
+    /// row until the Xero / QuickBooks clients land. The read path carries
+    /// them through to `InvoiceResponse` so the SPA can distinguish a
+    /// Mokosh-issued invoice from one issued by a delegated provider as
+    /// soon as the first delegated row exists.
+    external_provider: Option<String>,
+    external_invoice_id: Option<String>,
+    external_number: Option<String>,
 }
 
 impl From<InvoiceRow> for InvoiceResponse {
@@ -8059,6 +8371,9 @@ impl From<InvoiceRow> for InvoiceResponse {
             delivered_by_id: r.delivered_by_id,
             // Resolved by `enrich_invoices` the way `voided_by_name` is.
             delivered_by_name: None,
+            external_provider: r.external_provider,
+            external_invoice_id: r.external_invoice_id,
+            external_number: r.external_number,
         }
     }
 }
