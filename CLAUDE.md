@@ -148,6 +148,7 @@ One line per rule, linking its full text. A new convention adds its text under `
 - `apply_tax` derives tax from the tenant rate ([PMS-1029](docs/invariants/billing.md#invoice-tax-pms-1029))
 - An invoice's balance has one writer ([PMS-953](docs/invariants/billing.md#balance-pms-953))
 - A bill's paid total has one writer ([PMS-1536](docs/invariants/billing.md#bill-payments-pms-1536))
+- A claim reaches the provider on reimbursement, never before ([PMS-1541](docs/invariants/billing.md#delegated-claims-pms-1541))
 - A sent invoice is replaced, and the replacement voids it ([PMS-1334](docs/invariants/billing.md#amendment-pms-1334))
 - Overdue is derived; reminders are a worker ([PMS-1037](docs/invariants/billing.md#overdue-pms-1037))
 - A write-off is not a credit ([PMS-1036](docs/invariants/billing.md#write-off-pms-1036))
