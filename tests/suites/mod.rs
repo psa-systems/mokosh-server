@@ -18,6 +18,7 @@ pub mod auth;
 pub mod auth_provider_local_only;
 pub mod automation_transaction_budget;
 pub mod bill_delegation;
+pub mod bill_payments;
 pub mod billing;
 pub mod billing_contact_portal_access;
 pub mod billing_empty_invoice_message;
