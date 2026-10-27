@@ -20,7 +20,10 @@ use sqlx::FromRow;
 use uuid::Uuid;
 use validator::Validate;
 
-use super::models::{Bill, BillLine, BillPayment, Expense, ExpenseCategory, ExpenseLine, Vendor};
+use super::models::{
+    Bill, BillFilter, BillLine, BillPayment, Expense, ExpenseCategory, ExpenseFilter, ExpenseLine,
+    Vendor,
+};
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
@@ -468,16 +471,50 @@ impl ExpensesService {
     // committed row's `subtotal_minor` / `tax_minor` / `total_minor`
     // match its line set exactly.
 
+    /// Bills for this tenant, narrowed by status and by free text
+    /// (PMS-1539).
+    ///
+    /// The count uses the same predicate as the page, so `total`
+    /// describes the filtered set: a count over every bill beside a
+    /// filtered page would page an operator into empty pages and
+    /// misreport how many matched, which is why MAPPS-1167 could not do
+    /// this client-side.
+    ///
+    /// `q` matches the bill's own number and the vendor's name. The
+    /// invoices precedent searches `invoice_number` and `po_number`, the
+    /// document's own identifiers; a bill's second identifier is who sent
+    /// it, and that name lives on `vendors`, so it is reached through an
+    /// EXISTS rather than a join, which keeps the count query and the
+    /// page query the same shape.
     pub async fn list_bills(
         &self,
         tenant_id: TenantId,
+        filter: &BillFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Bill>, u64)> {
+        let status = filter
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let pattern = search_pattern(filter.q.as_deref());
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bills WHERE tenant_id = $1")
-            .bind(tenant_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let total: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM bills
+               WHERE tenant_id = $1
+                 AND ($2::text IS NULL OR status = $2)
+                 AND ($3::text IS NULL OR bill_number ILIKE $3 OR EXISTS (
+                       SELECT 1 FROM vendors v
+                       WHERE v.tenant_id = bills.tenant_id
+                         AND v.id = bills.vendor_id
+                         AND v.name ILIKE $3
+                     ))"#,
+        )
+        .bind(tenant_id)
+        .bind(status)
+        .bind(pattern.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
         let rows: Vec<Bill> = sqlx::query_as(
             r#"SELECT id, tenant_id, vendor_id, bill_number, issue_date, due_date,
                       currency, subtotal_minor, tax_minor, total_minor, paid_minor,
@@ -485,10 +522,19 @@ impl ExpensesService {
                       created_at, updated_at
                FROM bills
                WHERE tenant_id = $1
+                 AND ($2::text IS NULL OR status = $2)
+                 AND ($3::text IS NULL OR bill_number ILIKE $3 OR EXISTS (
+                       SELECT 1 FROM vendors v
+                       WHERE v.tenant_id = bills.tenant_id
+                         AND v.id = bills.vendor_id
+                         AND v.name ILIKE $3
+                     ))
                ORDER BY issue_date DESC, created_at DESC
-               LIMIT $2 OFFSET $3"#,
+               LIMIT $4 OFFSET $5"#,
         )
         .bind(tenant_id)
+        .bind(status)
+        .bind(pattern.as_deref())
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
@@ -919,18 +965,44 @@ impl ExpensesService {
     /// rather than two methods because the count and the page have to
     /// agree: a total over every claim beside a page of one person's
     /// would page a technician through claims they cannot read.
+    /// Claims for this tenant or for one submitter, narrowed by status and
+    /// by free text (PMS-1539).
+    ///
+    /// `q` matches the claim's notes and its lines' descriptions, because
+    /// a claim has no number of its own: what somebody remembers is what
+    /// it was for, and that is written on the lines. The submitter scope
+    /// from PMS-1535 applies first, so a filter can only narrow what that
+    /// caller could already see.
     pub async fn list_expenses(
         &self,
         tenant_id: TenantId,
         submitter: Option<Uuid>,
+        filter: &ExpenseFilter,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Expense>, u64)> {
+        let status = filter
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let pattern = search_pattern(filter.q.as_deref());
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM expenses              WHERE tenant_id = $1 AND ($2::uuid IS NULL OR user_id = $2)",
+            r#"SELECT COUNT(*) FROM expenses
+               WHERE tenant_id = $1
+                 AND ($2::uuid IS NULL OR user_id = $2)
+                 AND ($3::text IS NULL OR status = $3)
+                 AND ($4::text IS NULL OR notes ILIKE $4 OR EXISTS (
+                       SELECT 1 FROM expense_lines el
+                       WHERE el.tenant_id = expenses.tenant_id
+                         AND el.expense_id = expenses.id
+                         AND el.description ILIKE $4
+                     ))"#,
         )
         .bind(tenant_id)
         .bind(submitter)
+        .bind(status)
+        .bind(pattern.as_deref())
         .fetch_one(&mut *tx)
         .await?;
         let rows: Vec<Expense> = sqlx::query_as(
@@ -940,12 +1012,22 @@ impl ExpensesService {
                       external_provider, external_expense_id,
                       created_at, updated_at
                FROM expenses
-               WHERE tenant_id = $1 AND ($2::uuid IS NULL OR user_id = $2)
+               WHERE tenant_id = $1
+                 AND ($2::uuid IS NULL OR user_id = $2)
+                 AND ($3::text IS NULL OR status = $3)
+                 AND ($4::text IS NULL OR notes ILIKE $4 OR EXISTS (
+                       SELECT 1 FROM expense_lines el
+                       WHERE el.tenant_id = expenses.tenant_id
+                         AND el.expense_id = expenses.id
+                         AND el.description ILIKE $4
+                     ))
                ORDER BY incurred_on DESC, created_at DESC
-               LIMIT $3 OFFSET $4"#,
+               LIMIT $5 OFFSET $6"#,
         )
         .bind(tenant_id)
         .bind(submitter)
+        .bind(status)
+        .bind(pattern.as_deref())
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
@@ -1284,6 +1366,22 @@ pub struct ExpenseWithLines {
     #[serde(flatten)]
     pub expense: Expense,
     pub lines: Vec<ExpenseLine>,
+}
+
+/// A `%q%` pattern for an ILIKE, or `None` when nothing was typed
+/// (PMS-1539).
+///
+/// Blank and whitespace-only collapse to `None` rather than to `%%`: a
+/// `q=` left on the URL by a cleared search box would otherwise be a
+/// filter that matches everything by accident, and the first wildcard
+/// somebody escapes would change that silently.
+fn search_pattern(q: Option<&str>) -> Option<String> {
+    let q = q?.trim();
+    if q.is_empty() {
+        None
+    } else {
+        Some(format!("%{q}%"))
+    }
 }
 
 /// The payment methods `bill_payments`' CHECK allows, in one place so the

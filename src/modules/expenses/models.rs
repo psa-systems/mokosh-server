@@ -13,6 +13,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
+use validator::Validate;
 
 /// A vendor the MSP buys from. Tenant-scoped; separate from `companies`
 /// (which is the MSP's customers) on purpose.
@@ -118,6 +119,30 @@ pub struct BillLine {
     pub total_minor: i64,
     pub position: i32,
     pub created_at: DateTime<Utc>,
+}
+
+/// What narrows `GET /bills` (PMS-1539).
+///
+/// The shape `InvoiceFilter` set for receivables, with the two fields a
+/// bills list needs and none it does not: `status` is one of the four the
+/// CHECK allows, and a value outside it answers an empty page rather than
+/// a 400, which is what `InvoiceFilter` does with an unknown status.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct BillFilter {
+    #[validate(length(max = 20))]
+    pub status: Option<String>,
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
+}
+
+/// What narrows `GET /expenses` (PMS-1539). The claims half of
+/// [`BillFilter`]; `status` is one of the five an expense moves through.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct ExpenseFilter {
+    #[validate(length(max = 20))]
+    pub status: Option<String>,
+    #[validate(length(max = 200))]
+    pub q: Option<String>,
 }
 
 /// One payment the MSP made against a bill (PMS-1536).
