@@ -75,8 +75,26 @@ impl<S: tracing::Subscriber> Layer<S> for RecordingLayer {
         }
         let mut v = SqlVisitor::default();
         event.record(&mut v);
-        if let Some(text) = v.statement.or(v.summary) {
-            self.0.statements.lock().expect("statement log").push(text);
+        // sqlx 0.8 wraps `db.statement` for a multi-line SQL in a leading
+        // `\n\n` and a trailing `\n` (sqlx-core-0.8.6/src/logger.rs:109),
+        // so a stored statement starts with "\n\n" and the response-fetch
+        // SELECT below fails a `starts_with("SELECT")` filter. Normalise
+        // the whitespace at push time, matching contact_hydration_query_budget.rs.
+        // When the SQL is a one-liner (`summary == self.sql`) sqlx sets
+        // `db.statement` to the empty string and only `summary` is useful;
+        // the `.or(v.summary)` fallback handles that.
+        let text = v
+            .statement
+            .filter(|s| !s.is_empty())
+            .or(v.summary)
+            .unwrap_or_default();
+        if !text.is_empty() {
+            let normalised = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            self.0
+                .statements
+                .lock()
+                .expect("statement log")
+                .push(normalised);
         }
     }
 }
