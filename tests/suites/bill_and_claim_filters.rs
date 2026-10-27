@@ -14,7 +14,7 @@ use mokosh_server::modules::auth::TenantId;
 use mokosh_server::modules::expenses::models::{BillFilter, ExpenseFilter};
 use mokosh_server::modules::expenses::service::{
     BillLineInput, CreateBillRequest, CreateExpenseRequest, ExpenseLineInput, ExpensesService,
-    UpsertVendorRequest,
+    RecordBillPaymentRequest, UpsertVendorRequest,
 };
 use mokosh_server::utils::pagination::PaginationParams;
 use mokosh_server::Database;
@@ -263,6 +263,60 @@ async fn a_filtered_total_is_the_one_paging_uses(pool: PgPool) {
         rows.len(),
         1,
         "and page two of two-per-page holds the third"
+    );
+}
+
+/// A bill the payment path moved to `paid` is selectable by that status
+/// (PMS-1536 + PMS-1539).
+///
+/// The two features landed in the same week in the same file, and this is
+/// the seam between them: `recompute_bill_payment_state` writes the
+/// status, and the filter reads the column rather than a list of statuses
+/// it knows about, so a status gaining a writer needs no change here. A
+/// test rather than an assumption, because the merge that brought them
+/// together could have resolved either way.
+#[mokosh_test]
+async fn a_bill_paid_through_the_payment_path_is_selectable_as_paid(pool: PgPool) {
+    let (_admin, _email, _pw) = common::seed_admin(&pool).await;
+    let svc = ExpensesService::new(Database::from_pool(pool.clone()));
+    let rack = vendor(&svc, "Rack Co").await;
+    let settled = bill(&svc, rack, "VEN-1").await;
+    let outstanding = bill(&svc, rack, "VEN-2").await;
+    for id in [settled, outstanding] {
+        svc.approve_bill(tenant(), id, &ctx())
+            .await
+            .expect("approve");
+    }
+    svc.record_bill_payment(
+        tenant(),
+        settled,
+        &RecordBillPaymentRequest {
+            paid_on: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            amount_minor: 50_00,
+            payment_method: "ach".to_string(),
+            reference: None,
+            notes: None,
+        },
+        &ctx(),
+    )
+    .await
+    .expect("pay it in full");
+
+    let (rows, total) = svc
+        .list_bills(tenant(), &status_filter("paid"), &page_one())
+        .await
+        .expect("list");
+    assert_eq!((rows.len(), total), (1, 1));
+    assert_eq!(rows[0].id, settled);
+
+    let (rows, _total) = svc
+        .list_bills(tenant(), &status_filter("approved"), &page_one())
+        .await
+        .expect("list");
+    assert_eq!(
+        rows.iter().map(|b| b.id).collect::<Vec<_>>(),
+        vec![outstanding],
+        "and the one still owed stays where it was"
     );
 }
 
