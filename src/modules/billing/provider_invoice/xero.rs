@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::modules::billing::invoice_issuer::{
-    ExternalBillRef, ExternalInvoiceRef, InvoiceProviderKind,
+    ExternalBillRef, ExternalExpenseRef, ExternalInvoiceRef, InvoiceProviderKind,
 };
 use crate::utils::error::{AppError, AppResult};
 
@@ -123,6 +123,35 @@ pub struct XeroLineItemInput {
     pub description: String,
     pub quantity_hundredths: i64,
     pub unit_price_minor: i64,
+}
+
+/// One line of a spend-money transaction (PMS-1541).
+///
+/// An expense line is an amount against an ACCOUNT, where an invoice line
+/// is a quantity at a price: a taxi fare is one number, and the account is
+/// what the MSP's books file it under.
+#[derive(Debug, Clone)]
+pub struct XeroSpendLineInput {
+    pub description: String,
+    pub amount_minor: i64,
+    /// The Xero account code this cost lands in, from the expense-category
+    /// mapping (migration 286).
+    pub account_code: String,
+}
+
+/// Request body for `record_spend`: a reimbursement leaving the MSP's
+/// account (PMS-1541).
+///
+/// `bank_account_id` is the account the money left, which Xero refuses the
+/// call without; `contact_id` is the person reimbursed, which Xero also
+/// refuses the call without.
+#[derive(Debug, Clone)]
+pub struct XeroRecordSpendRequest {
+    pub bank_account_id: String,
+    pub contact_id: Uuid,
+    pub paid_on: NaiveDate,
+    pub currency: String,
+    pub lines: Vec<XeroSpendLineInput>,
 }
 
 /// Request body for `issue_invoice`. The customer is given by Xero's
@@ -222,6 +251,55 @@ struct XeroLineItemBody {
 }
 
 #[derive(Debug, Serialize)]
+struct XeroBankAccountRef {
+    #[serde(rename = "AccountID")]
+    account_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct XeroSpendLineBody {
+    #[serde(rename = "Description")]
+    description: String,
+    #[serde(rename = "LineAmount")]
+    line_amount: String,
+    #[serde(rename = "AccountCode")]
+    account_code: String,
+}
+
+/// A spend-money bank transaction. `Type: "SPEND"` is the whole
+/// difference between money leaving and money arriving, so it is a
+/// literal here and a unit test reads this call's own body for it.
+#[derive(Debug, Serialize)]
+struct XeroBankTransactionBody {
+    #[serde(rename = "Type")]
+    kind: &'static str,
+    #[serde(rename = "Contact")]
+    contact: XeroContactRef,
+    #[serde(rename = "BankAccount")]
+    bank_account: XeroBankAccountRef,
+    #[serde(rename = "LineItems")]
+    line_items: Vec<XeroSpendLineBody>,
+    #[serde(rename = "Date")]
+    date: NaiveDate,
+    #[serde(rename = "CurrencyCode")]
+    currency_code: String,
+    #[serde(rename = "Status")]
+    status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct XeroBankTransactionEnvelope {
+    #[serde(rename = "BankTransactions")]
+    bank_transactions: Vec<XeroBankTransactionDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XeroBankTransactionDto {
+    #[serde(rename = "BankTransactionID")]
+    bank_transaction_id: String,
+}
+
+#[derive(Debug, Serialize)]
 struct XeroVoidBody {
     #[serde(rename = "Status")]
     status: &'static str,
@@ -287,6 +365,65 @@ impl XeroClient {
     /// vendor would put money the MSP OWES on the receivable side of
     /// their accounts, and a test asserts the type on the wire for
     /// exactly that reason.
+    /// Record a reimbursement as a spend-money bank transaction
+    /// (PMS-1541).
+    ///
+    /// `SPEND`, not `RECEIVE`: this is the MSP's money leaving to pay
+    /// somebody back. Xero refuses the call without a `Contact` and
+    /// without a `BankAccount`, which is why both are required fields on
+    /// the request rather than options with a fallback.
+    ///
+    /// `AUTHORISED`: the money has already left the MSP's account by the
+    /// time a claim is marked reimbursed here, so a draft over there would
+    /// be a second place to confirm something that has happened.
+    pub async fn record_spend(
+        &self,
+        creds: &XeroCredentials,
+        request: &XeroRecordSpendRequest,
+    ) -> AppResult<ExternalExpenseRef> {
+        let body = XeroBankTransactionBody {
+            kind: "SPEND",
+            contact: XeroContactRef {
+                contact_id: request.contact_id,
+            },
+            bank_account: XeroBankAccountRef {
+                account_id: request.bank_account_id.clone(),
+            },
+            line_items: request
+                .lines
+                .iter()
+                .map(|l| XeroSpendLineBody {
+                    description: l.description.clone(),
+                    line_amount: minor_to_decimal(l.amount_minor, 2),
+                    account_code: l.account_code.clone(),
+                })
+                .collect(),
+            date: request.paid_on,
+            currency_code: request.currency.to_ascii_uppercase(),
+            status: "AUTHORISED",
+        };
+        let url = format!("{}/api.xro/2.0/BankTransactions", self.api_base);
+        let envelope: XeroBankTransactionEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Xero-Tenant-Id", &creds.tenant_id)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        let dto = envelope
+            .bank_transactions
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::internal("Xero returned no bank transaction".to_string()))?;
+        Ok(ExternalExpenseRef {
+            provider: InvoiceProviderKind::Xero,
+            external_expense_id: dto.bank_transaction_id,
+        })
+    }
+
     pub async fn create_bill(
         &self,
         creds: &XeroCredentials,
@@ -791,6 +928,75 @@ mod tests {
         assert!(
             !create_bill.contains(r#"kind: "ACCREC""#),
             "and never the receivable type"
+        );
+    }
+
+    /// PMS-1541: a reimbursement is SPEND, never RECEIVE.
+    ///
+    /// The type is the whole difference between money leaving and money
+    /// arriving, and a wrong one puts a reimbursement on the income side
+    /// of the MSP's books. Read off `record_spend`'s own body, bounded to
+    /// the next method so the bill and invoice calls below cannot satisfy
+    /// it.
+    #[test]
+    fn a_reimbursement_is_spend_and_never_receive() {
+        let src = include_str!("xero.rs");
+        let start = src
+            .find("pub async fn record_spend")
+            .expect("the spend call");
+        let end = start
+            + src[start..]
+                .find("\n    pub async fn ")
+                .expect("the next method");
+        let record_spend = &src[start..end];
+        assert!(
+            record_spend.contains(r#"kind: "SPEND""#),
+            "the spend call sends SPEND"
+        );
+        assert!(
+            !record_spend.contains(r#"kind: "RECEIVE""#),
+            "and never the money-in type"
+        );
+    }
+
+    /// The spend body carries the two refs Xero refuses the call without,
+    /// and an amount per line rather than a quantity at a price.
+    #[test]
+    fn the_spend_body_serialises_the_bank_account_and_the_contact() {
+        let body = XeroBankTransactionBody {
+            kind: "SPEND",
+            contact: XeroContactRef {
+                contact_id: Uuid::nil(),
+            },
+            bank_account: XeroBankAccountRef {
+                account_id: "13918178-849a-247f-8ed7-c7b1f5e7e71c".to_string(),
+            },
+            line_items: vec![XeroSpendLineBody {
+                description: "Taxi to site".to_string(),
+                line_amount: "32.50".to_string(),
+                account_code: "429".to_string(),
+            }],
+            date: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            currency_code: "USD".to_string(),
+            status: "AUTHORISED",
+        };
+        let v = serde_json::to_value(&body).expect("serialise");
+        assert_eq!(v["Type"], "SPEND");
+        assert_eq!(
+            v["BankAccount"]["AccountID"], "13918178-849a-247f-8ed7-c7b1f5e7e71c",
+            "the account the money left"
+        );
+        assert_eq!(v["Contact"]["ContactID"], Uuid::nil().to_string());
+        assert_eq!(v["Date"], "2026-11-01");
+        assert_eq!(v["Status"], "AUTHORISED");
+        assert_eq!(v["LineItems"][0]["LineAmount"], "32.50");
+        assert_eq!(
+            v["LineItems"][0]["AccountCode"], "429",
+            "and what the cost was filed under"
+        );
+        assert!(
+            v["LineItems"][0].get("Quantity").is_none(),
+            "a claim line is an amount, not a quantity at a price"
         );
     }
 

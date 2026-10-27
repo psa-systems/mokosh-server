@@ -39,9 +39,9 @@ use crate::modules::billing::invoice_issuer_credentials::{
 use crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService;
 use crate::modules::billing::models::CreateInvoiceLineRequest;
 use crate::modules::billing::provider_invoice::quickbooks::{
-    QuickBooksBillLineInput, QuickBooksCreateBillRequest,
+    QuickBooksBillLineInput, QuickBooksCreateBillRequest, QuickBooksRecordSpendRequest,
 };
-use crate::modules::billing::provider_invoice::xero::XeroLineItemInput;
+use crate::modules::billing::provider_invoice::xero::{XeroLineItemInput, XeroSpendLineInput};
 use crate::modules::billing::provider_invoice::{
     QuickBooksClient, QuickBooksIssueInvoiceRequest, XeroClient, XeroIssueInvoiceRequest,
 };
@@ -72,6 +72,35 @@ pub enum ExternalInvoiceState {
 pub enum BillPlan {
     Local,
     Delegated(crate::modules::billing::invoice_issuer::ExternalBillRef),
+}
+
+/// What the dispatcher decided to do with one `reimburse_expense` call
+/// (PMS-1541).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpensePlan {
+    Local,
+    Delegated(crate::modules::billing::invoice_issuer::ExternalExpenseRef),
+}
+
+/// The part of a claim the dispatcher needs to record the reimbursement.
+///
+/// `user_id` is the person reimbursed, which is what the provider's
+/// counterparty field wants; `paid_on` is today rather than the date the
+/// cost was incurred, because the transaction being recorded is the money
+/// leaving the MSP's account now.
+pub struct ReimburseExpenseShape<'a> {
+    pub user_id: Uuid,
+    pub paid_on: NaiveDate,
+    pub currency: &'a str,
+    pub lines: &'a [ExpenseLineShape],
+}
+
+/// One line of a claim, in the minor units both clients take. An amount,
+/// with no quantity to multiply: a taxi fare is one number.
+pub struct ExpenseLineShape {
+    pub category_id: Option<Uuid>,
+    pub description: String,
+    pub amount_minor: i64,
 }
 
 /// The part of a bill the dispatcher needs, borrowed from the request so
@@ -316,6 +345,196 @@ impl IssuerDispatcher {
                     )
                     .await?;
                 Ok(BillPlan::Delegated(bill))
+            }
+        }
+    }
+
+    /// Record one reimbursed claim in the provider the tenant delegated
+    /// Bills and expenses to (PMS-1541).
+    ///
+    /// The bill path again, with a different document on the other end: a
+    /// claim is money the MSP has already spent, so Xero takes a SPEND
+    /// bank transaction and QuickBooks a purchase, where a bill is an
+    /// obligation. Returns `ExpensePlan::Local` for every path that leaves
+    /// `reimburse_expense` alone, and an error when the provider was asked
+    /// and refused, so the caller never marks a claim reimbursed that the
+    /// provider does not have.
+    ///
+    /// Three facts are needed and two of them are mappings an admin sets:
+    /// the account the money left (one per tenant per provider), the
+    /// expense account each line posts to (migration 286, shared with
+    /// bills), and the person reimbursed (required by Xero, optional for
+    /// QuickBooks). Each missing one is a `Conflict` naming the route that
+    /// fixes it.
+    pub async fn plan_expense(
+        &self,
+        tenant_id: TenantId,
+        request: &ReimburseExpenseShape<'_>,
+    ) -> AppResult<ExpensePlan> {
+        if !self
+            .features
+            .is_enabled(crate::modules::features::Feature::DelegatedBills)
+        {
+            return Ok(ExpensePlan::Local);
+        }
+        let bills = Capability::BillsAndExpenses.as_str();
+        let delegated = |integration: &crate::modules::integrations::IntegrationResponse| {
+            matches!(
+                integration.status,
+                crate::modules::integrations::IntegrationStatus::Connected
+                    | crate::modules::integrations::IntegrationStatus::Error
+            ) && integration.enabled_capabilities.iter().any(|c| c == bills)
+        };
+        let xero = self
+            .integrations
+            .get(tenant_id, IntegrationProvider::Xero)
+            .await?;
+        let quickbooks = self
+            .integrations
+            .get(tenant_id, IntegrationProvider::Quickbooks)
+            .await?;
+        // Xero before QuickBooks, the tie-break the invoice and bill paths
+        // already use, so a tenant with both connected does not see one
+        // provider some days and the other on others.
+        let provider = if delegated(&xero) {
+            InvoiceProviderKind::Xero
+        } else if delegated(&quickbooks) {
+            InvoiceProviderKind::Quickbooks
+        } else {
+            return Ok(ExpensePlan::Local);
+        };
+
+        let bank_account = self
+            .mappings
+            .get_payment_account(tenant_id, provider)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "No {} account is set to reimburse from. Set it at PUT \
+                     /api/v1/integrations/invoice-issuer/{}/payment-account first.",
+                    provider.as_str(),
+                    provider.as_str()
+                ))
+            })?;
+
+        // The expense accounts, batched like the bill path's: one round
+        // trip for the whole claim, and a category absent from the map is
+        // the refusal that names a line.
+        let category_ids: Vec<Uuid> = request.lines.iter().filter_map(|l| l.category_id).collect();
+        let account_map = self
+            .mappings
+            .get_expense_account_mappings(tenant_id, provider, &category_ids)
+            .await?;
+        let mut accounts = Vec::with_capacity(request.lines.len());
+        for line in request.lines {
+            let category_id = line.category_id.ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "Claim line '{}' has no expense category, and a reimbursement has to say \
+                     which account the cost posts to. Set a category on every line.",
+                    line.description
+                ))
+            })?;
+            let mapping = account_map.get(&category_id).ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "Expense category {category_id} is not mapped to a {} account. Set the \
+                     mapping at PUT /api/v1/invoice-issuer-mappings/expense-accounts/{}/{category_id} first.",
+                    provider.as_str(),
+                    provider.as_str()
+                ))
+            })?;
+            accounts.push(mapping.external_account_id.clone());
+        }
+
+        let person = self
+            .mappings
+            .get_user_mapping(tenant_id, provider, request.user_id)
+            .await?;
+
+        match provider {
+            InvoiceProviderKind::Xero => {
+                let (blob, _refreshed) = self
+                    .load_and_refresh_blob(tenant_id, InvoiceProviderKind::Xero)
+                    .await?;
+                let IntegrationCredentialBlob::Xero(xero_blob) = &blob else {
+                    return Err(AppError::Unauthorized);
+                };
+                let creds =
+                    xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, xero_blob);
+                // Xero refuses a bank transaction with no Contact, so the
+                // people mapping is required here where QuickBooks takes
+                // it or leaves it.
+                let mapping = person.ok_or_else(|| {
+                    AppError::Conflict(format!(
+                        "The person this claim belongs to is not mapped to a Xero contact, and \
+                         Xero needs one on every spend. Set the mapping at PUT \
+                         /api/v1/invoice-issuer-mappings/people/xero/{} first.",
+                        request.user_id
+                    ))
+                })?;
+                let contact_id = Uuid::parse_str(&mapping.external_contact_id).map_err(|_| {
+                    AppError::internal(format!(
+                        "person {} is mapped to {:?} but Xero expects a UUID ContactID",
+                        request.user_id, mapping.external_contact_id
+                    ))
+                })?;
+                let spend = self
+                    .xero
+                    .record_spend(
+                        &creds,
+                        &crate::modules::billing::provider_invoice::xero::XeroRecordSpendRequest {
+                            bank_account_id: bank_account,
+                            contact_id,
+                            paid_on: request.paid_on,
+                            currency: request.currency.to_string(),
+                            lines: request
+                                .lines
+                                .iter()
+                                .zip(accounts)
+                                .map(|(l, account_code)| XeroSpendLineInput {
+                                    description: l.description.clone(),
+                                    amount_minor: l.amount_minor,
+                                    account_code,
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await?;
+                Ok(ExpensePlan::Delegated(spend))
+            }
+            InvoiceProviderKind::Quickbooks => {
+                let (blob, _refreshed) = self
+                    .load_and_refresh_blob(tenant_id, InvoiceProviderKind::Quickbooks)
+                    .await?;
+                let IntegrationCredentialBlob::Quickbooks(qbo_blob) = &blob else {
+                    return Err(AppError::Unauthorized);
+                };
+                let creds = quickbooks_credentials(
+                    self.apps.require(InvoiceProviderKind::Quickbooks)?,
+                    qbo_blob,
+                );
+                let spend = self
+                    .quickbooks
+                    .record_spend(
+                        &creds,
+                        &QuickBooksRecordSpendRequest {
+                            bank_account_id: bank_account,
+                            entity_id: person.map(|p| p.external_contact_id),
+                            paid_on: request.paid_on,
+                            currency: request.currency.to_string(),
+                            lines: request
+                                .lines
+                                .iter()
+                                .zip(accounts)
+                                .map(|(l, account_id)| QuickBooksBillLineInput {
+                                    description: l.description.clone(),
+                                    amount_minor: l.amount_minor,
+                                    account_id,
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await?;
+                Ok(ExpensePlan::Delegated(spend))
             }
         }
     }

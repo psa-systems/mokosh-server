@@ -94,6 +94,7 @@ pub mod email_intake_attachments;
 pub mod email_intake_phase2;
 pub mod employee_time;
 pub mod expense_claim_gates;
+pub mod expense_delegation;
 pub mod expenses_vendors_categories;
 pub mod expenses_workflow;
 pub mod feature_toggles;

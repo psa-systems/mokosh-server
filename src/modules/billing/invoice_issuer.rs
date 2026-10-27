@@ -74,6 +74,18 @@ pub struct ExternalBillRef {
     pub external_bill_id: String,
 }
 
+/// What a provider calls the reimbursement it now holds (PMS-1541).
+///
+/// A Xero `BankTransactionID` or a QuickBooks `Purchase.Id`. Its own type
+/// rather than a reuse of [`ExternalBillRef`]: a bill and a reimbursement
+/// are different documents over there, and a column named for one holding
+/// the id of the other is how a reconciliation reads the wrong ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalExpenseRef {
+    pub provider: InvoiceProviderKind,
+    pub external_expense_id: String,
+}
+
 /// MAPPS-1099 Phase 2: what the dispatch decided to do with a given
 /// `create_invoice` call, before any wire I/O. Local means the current
 /// Mokosh path (number allocation + row insert + mail dispatch);

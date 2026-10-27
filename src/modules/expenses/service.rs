@@ -1132,8 +1132,17 @@ impl ExpensesService {
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<Expense> {
-        self.transition_expense(tenant_id, id, &["draft"], "submitted", None, false, ctx)
-            .await
+        self.transition_expense(
+            tenant_id,
+            id,
+            &["draft"],
+            "submitted",
+            None,
+            false,
+            None,
+            ctx,
+        )
+        .await
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, expense_id = %id))]
@@ -1151,6 +1160,7 @@ impl ExpensesService {
             "approved",
             Some(approver_id),
             false,
+            None,
             ctx,
         )
         .await
@@ -1163,21 +1173,93 @@ impl ExpensesService {
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<Expense> {
-        self.transition_expense(tenant_id, id, &["submitted"], "rejected", None, false, ctx)
-            .await
+        self.transition_expense(
+            tenant_id,
+            id,
+            &["submitted"],
+            "rejected",
+            None,
+            false,
+            None,
+            ctx,
+        )
+        .await
     }
 
     /// `reimbursed` is terminal and immutable: `transition_expense`
     /// refuses every outbound move from it.
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, expense_id = %id))]
+    /// Mark a claim paid back, and record it in the provider when the
+    /// tenant delegated Bills and expenses (PMS-1541).
+    ///
+    /// The push happens here and not on create, because a claim becomes
+    /// the MSP's money LEAVING when it is paid back: a draft or submitted
+    /// claim is an internal document the provider has no business holding,
+    /// and a rejected one must never reach the ledger at all.
+    ///
+    /// Before the write transaction, for the reason MAPPS-1134 put the
+    /// invoice push outside its own: a provider that refuses leaves the
+    /// claim `approved`, which is the state somebody can retry from, and
+    /// an HTTP round trip inside a write transaction holds its locks for
+    /// the length of somebody else's outage.
     pub async fn reimburse_expense(
         &self,
         tenant_id: TenantId,
         id: Uuid,
         ctx: &AuditCtx,
     ) -> AppResult<Expense> {
-        self.transition_expense(tenant_id, id, &["approved"], "reimbursed", None, true, ctx)
-            .await
+        let external = match self.bill_dispatch.as_ref() {
+            Some(dispatcher) if dispatcher.bills_delegation_enabled() => {
+                use crate::modules::billing::invoice_issuer_dispatch::{
+                    ExpenseLineShape, ExpensePlan, ReimburseExpenseShape,
+                };
+                // Read first so the push has the lines, and so an unknown
+                // id or a claim in the wrong state is refused before any
+                // wire call. `transition_expense` checks the state again
+                // under its row lock, which is what actually guards it.
+                let claim = self.get_expense(tenant_id, id).await?;
+                if claim.expense.status != "approved" {
+                    return Err(AppError::Conflict(format!(
+                        "Cannot move expense from {} to reimbursed.",
+                        claim.expense.status
+                    )));
+                }
+                let lines: Vec<ExpenseLineShape> = claim
+                    .lines
+                    .iter()
+                    .map(|l| ExpenseLineShape {
+                        category_id: l.category_id,
+                        description: l.description.clone(),
+                        amount_minor: l.amount_minor,
+                    })
+                    .collect();
+                let shape = ReimburseExpenseShape {
+                    user_id: claim.expense.user_id,
+                    // Today, not `incurred_on`: what the provider is being
+                    // told about is the money leaving the MSP's account
+                    // now, not when the person spent theirs.
+                    paid_on: Utc::now().date_naive(),
+                    currency: &claim.expense.currency,
+                    lines: &lines,
+                };
+                match dispatcher.plan_expense(tenant_id, &shape).await? {
+                    ExpensePlan::Local => None,
+                    ExpensePlan::Delegated(external) => Some(external),
+                }
+            }
+            _ => None,
+        };
+        self.transition_expense(
+            tenant_id,
+            id,
+            &["approved"],
+            "reimbursed",
+            None,
+            true,
+            external.as_ref(),
+            ctx,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1189,6 +1271,7 @@ impl ExpensesService {
         to: &str,
         set_approver: Option<Uuid>,
         reimbursing: bool,
+        external: Option<&crate::modules::billing::invoice_issuer::ExternalExpenseRef>,
         ctx: &AuditCtx,
     ) -> AppResult<Expense> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
@@ -1231,6 +1314,8 @@ impl ExpensesService {
         let after: Expense = sqlx::query_as(
             r#"UPDATE expenses
                SET status = $3, approver_id = $4, approved_at = $5, reimbursed_at = $6,
+                   external_provider = COALESCE($7, external_provider),
+                   external_expense_id = COALESCE($8, external_expense_id),
                    updated_at = NOW()
                WHERE tenant_id = $1 AND id = $2
                RETURNING id, tenant_id, user_id, incurred_on, currency,
@@ -1245,6 +1330,12 @@ impl ExpensesService {
         .bind(approver_val)
         .bind(approved_at)
         .bind(reimbursed_at)
+        // PMS-1541: COALESCE rather than a plain assignment, so the four
+        // transitions that are not a reimbursement cannot blank a pair
+        // somebody else wrote. NULL on every local path, which is every
+        // claim on a deployment that has not delegated.
+        .bind(external.map(|e| e.provider.as_str()))
+        .bind(external.map(|e| e.external_expense_id.as_str()))
         .fetch_one(&mut *tx)
         .await?;
         audit_write(
