@@ -20,7 +20,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 use validator::Validate;
 
-use super::models::{Bill, BillLine, Expense, ExpenseCategory, ExpenseLine, Vendor};
+use super::models::{Bill, BillLine, BillPayment, Expense, ExpenseCategory, ExpenseLine, Vendor};
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
@@ -757,6 +757,151 @@ impl ExpensesService {
         Ok(after)
     }
 
+    /// Record one payment the MSP made against a bill (PMS-1536).
+    ///
+    /// The four refusals, each for its own reason:
+    ///
+    /// - a **draft** bill cannot be paid, because approval is the step
+    ///   where somebody checks the bill against what was ordered, and
+    ///   paying first makes that check decorative;
+    /// - a **void** bill cannot be paid, and the refusal says it was
+    ///   voided rather than leaving the reader to guess;
+    /// - an amount **at or below zero** is not a payment. A refund from a
+    ///   vendor is a credit they owe, which is a different document;
+    ///   `bill_payments_amount_positive` is the floor under this.
+    /// - an amount **over what remains** is refused, naming what remains.
+    ///   A duplicate payment is a thing to fix with the vendor, not to
+    ///   record as an overpayment that leaves `paid_minor > total_minor`
+    ///   and `status` meaning neither one thing nor the other.
+    ///
+    /// The insert and the recompute share one transaction, so a reader can
+    /// never see a payment row that `paid_minor` does not include.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, bill_id = %bill_id))]
+    pub async fn record_bill_payment(
+        &self,
+        tenant_id: TenantId,
+        bill_id: Uuid,
+        request: &RecordBillPaymentRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<BillWithPayments> {
+        if request.amount_minor <= 0 {
+            return Err(field_error(
+                "amount_minor",
+                "a payment is an amount above zero; a vendor refund is a credit, not a negative payment",
+            ));
+        }
+        let method = request.payment_method.trim().to_ascii_lowercase();
+        if !BILL_PAYMENT_METHODS.contains(&method.as_str()) {
+            return Err(field_error(
+                "payment_method",
+                "payment_method is one of check, credit_card, ach, wire, cash, other",
+            ));
+        }
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let bill: Bill = sqlx::query_as(
+            r#"SELECT id, tenant_id, vendor_id, bill_number, issue_date, due_date,
+                      currency, subtotal_minor, tax_minor, total_minor, paid_minor,
+                      status, notes, external_provider, external_bill_id,
+                      created_at, updated_at
+               FROM bills WHERE tenant_id = $1 AND id = $2 FOR UPDATE"#,
+        )
+        .bind(tenant_id)
+        .bind(bill_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Bill".to_string()))?;
+
+        match bill.status.as_str() {
+            "approved" | "paid" => {}
+            "void" => {
+                return Err(AppError::Conflict(
+                    "This bill was voided, so there is nothing to pay.".to_string(),
+                ))
+            }
+            other => {
+                return Err(AppError::Conflict(format!(
+                "A bill is paid after it is approved, and this one is {other}. Approve it first."
+            )))
+            }
+        }
+
+        let remaining = bill.total_minor.saturating_sub(bill.paid_minor);
+        if request.amount_minor > remaining {
+            return Err(AppError::Conflict(format!(
+                "That is more than this bill has left to pay ({} remaining of {}). \
+                 A duplicate payment is settled with the vendor, not recorded here.",
+                remaining, bill.total_minor
+            )));
+        }
+
+        let payment: BillPayment = sqlx::query_as(
+            r#"INSERT INTO bill_payments
+                 (tenant_id, bill_id, paid_on, amount_minor, payment_method, reference, notes)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               RETURNING id, tenant_id, bill_id, paid_on, amount_minor,
+                         payment_method, reference, notes, created_at"#,
+        )
+        .bind(tenant_id)
+        .bind(bill_id)
+        .bind(request.paid_on)
+        .bind(request.amount_minor)
+        .bind(&method)
+        .bind(request.reference.as_deref().map(str::trim))
+        .bind(request.notes.as_deref().map(str::trim))
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let updated = recompute_bill_payment_state(&mut tx, tenant_id, bill_id).await?;
+
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Create,
+            "bill_payments",
+            Some(payment.id),
+            None,
+            Some(serde_json::to_value(&payment).unwrap_or(Value::Null)),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(BillWithPayments {
+            bill: updated,
+            payments: vec![payment],
+        })
+    }
+
+    /// Every payment against one bill, newest first.
+    pub async fn list_bill_payments(
+        &self,
+        tenant_id: TenantId,
+        bill_id: Uuid,
+    ) -> AppResult<Vec<BillPayment>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        // The bill itself is read first so an unknown id is a 404 rather
+        // than an empty list, which would read as "paid nothing yet".
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM bills WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(bill_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Bill".to_string()))?;
+        let rows: Vec<BillPayment> = sqlx::query_as(
+            r#"SELECT id, tenant_id, bill_id, paid_on, amount_minor,
+                      payment_method, reference, notes, created_at
+               FROM bill_payments
+               WHERE tenant_id = $1 AND bill_id = $2
+               ORDER BY paid_on DESC, created_at DESC"#,
+        )
+        .bind(tenant_id)
+        .bind(bill_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
+    }
+
     // ── Expenses ─────────────────────────────────────────────────────────
     //
     // Expenses are what an MSP's own people spent. Lifecycle is
@@ -1097,6 +1242,36 @@ pub struct ExpenseLineInput {
     pub position: i32,
 }
 
+/// `POST /bills/{id}/payments` (PMS-1536).
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct RecordBillPaymentRequest {
+    pub paid_on: NaiveDate,
+    /// Minor units, like every other amount on a bill. Validated in the
+    /// service rather than by `validator`, because the useful message
+    /// names what a vendor refund is instead of saying "must be > 0".
+    pub amount_minor: i64,
+    #[validate(length(min = 1, max = 20))]
+    pub payment_method: String,
+    #[serde(default)]
+    #[validate(length(max = 100))]
+    pub reference: Option<String>,
+    #[serde(default)]
+    #[validate(length(max = 2000))]
+    pub notes: Option<String>,
+}
+
+/// What recording a payment answers with: the bill as it now stands, and
+/// the payment just written.
+///
+/// Flattened like [`BillWithLines`], so a caller reads the bill's own
+/// fields at the top level either way.
+#[derive(Debug, Clone, Serialize)]
+pub struct BillWithPayments {
+    #[serde(flatten)]
+    pub bill: Bill,
+    pub payments: Vec<BillPayment>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BillWithLines {
     #[serde(flatten)]
@@ -1109,6 +1284,54 @@ pub struct ExpenseWithLines {
     #[serde(flatten)]
     pub expense: Expense,
     pub lines: Vec<ExpenseLine>,
+}
+
+/// The payment methods `bill_payments`' CHECK allows, in one place so the
+/// service refuses a bad one with a message instead of a 23514.
+const BILL_PAYMENT_METHODS: [&str; 6] = ["check", "credit_card", "ach", "wire", "cash", "other"];
+
+/// The ONE writer of `bills.paid_minor` and of `bills.status` on the paid
+/// edge (PMS-1536, the rule PMS-953 states for invoices).
+///
+/// Derives both from the payment rows rather than adjusting a counter: a
+/// running total nudged by each caller drifts the first time one of them
+/// fails halfway, and the sum is the answer the rows already hold.
+///
+/// `paid` once the total is covered, and nothing else is reached from
+/// here. A part-paid bill stays `approved`, because the bills CHECK has no
+/// `partially_paid` and `total_minor - paid_minor` answers "what do we
+/// owe" without one; adding a status value is a migration plus every
+/// consumer that matches on it.
+async fn recompute_bill_payment_state(
+    conn: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    bill_id: Uuid,
+) -> AppResult<Bill> {
+    let bill: Bill = sqlx::query_as(
+        r#"UPDATE bills SET
+             paid_minor = COALESCE((
+                 SELECT SUM(amount_minor) FROM bill_payments
+                 WHERE tenant_id = $1 AND bill_id = $2
+             ), 0),
+             status = CASE
+                 WHEN COALESCE((
+                     SELECT SUM(amount_minor) FROM bill_payments
+                     WHERE tenant_id = $1 AND bill_id = $2
+                 ), 0) >= total_minor THEN 'paid'
+                 ELSE status
+             END,
+             updated_at = NOW()
+           WHERE tenant_id = $1 AND id = $2
+           RETURNING id, tenant_id, vendor_id, bill_number, issue_date, due_date,
+                     currency, subtotal_minor, tax_minor, total_minor, paid_minor,
+                     status, notes, external_provider, external_bill_id,
+                     created_at, updated_at"#,
+    )
+    .bind(tenant_id)
+    .bind(bill_id)
+    .fetch_one(conn)
+    .await?;
+    Ok(bill)
 }
 
 struct BillTotals {
