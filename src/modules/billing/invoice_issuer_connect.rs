@@ -824,11 +824,6 @@ pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) 
             "/integrations/invoice-issuer/{provider}/bills",
             put(set_bills_delegation),
         )
-        // parity record 2026-10-27 (PMS-1541): no SPA caller yet for
-        // "/integrations/invoice-issuer/{provider}/payment-account".
-        // MAPPS-1168 builds it; the route lands with the dispatcher that
-        // reads the value, because a push refused for a missing account an
-        // admin cannot set would be a dead end.
         .route(
             "/integrations/invoice-issuer/{provider}/payment-account",
             put(set_payment_account),
