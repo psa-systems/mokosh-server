@@ -1,31 +1,39 @@
-//! MAPPS-1100 Phases A + B: HTTP surface for the Bills and Expenses
-//! subsystem.
+//! HTTP surface for the Bills and Expenses subsystem (MAPPS-1100 Phases
+//! A and B, delegation in MAPPS-1155).
 //!
-//! Phase A: vendors, expense categories.
-//! Phase B: bill + expense headers with lifecycle transitions.
-//! Phase C (Xero / QuickBooks delegation) builds on the OAuth + webhook
-//! infrastructure MAPPS-1099 shipped; it has not yet been started.
+//! Phase A: vendors, expense categories. Phase B: the bill and expense
+//! headers with their lifecycle transitions. MAPPS-1155 added the push to
+//! Xero or QuickBooks inside `create_bill`, which changes no route here.
 //!
-//! parity record 2026-10-23: every route this module mounts has no
-//! SPA caller yet. They all land ahead of the SPA half MAPPS-1123
-//! (Bills and Expenses settings + ledger surfaces) wires up. The
-//! server ships first so the SPA has something concrete to call
-//! against; one dated record covers both phases so a Phase C
-//! follow-up has one line to update once the SPA callers merge.
-//! The MAPPS-1083 recorded-exemption rule matches each path literally,
-//! so every route the file mounts gets its own `//` line below.
+//! # Who may do what with a claim (PMS-1535)
 //!
-//! Phase A leaf lookups:
-//! - /vendors
-//! - /vendors/{id}
-//! - /expense-categories
-//! - /expense-categories/{id}
+//! Everything about vendors, categories and bills is finance's: those are
+//! the MSP's own books. A CLAIM is not. `expenses.user_id` is the person
+//! who spent the money and `approver_id` is whoever decided, a distinction
+//! with no purpose if only the people who approve can file. So:
 //!
-//! Phase B headers and lifecycle transitions:
-//! - /bills
-//! - /bills/{id}
-//! - /bills/{id}/approve
-//! - /bills/{id}/void
+//! - any member of the tenant can create a claim, and the submitter is the
+//!   caller;
+//! - a non-finance caller sees their own claims and no others, on the list
+//!   and on the read;
+//! - submitting is the submitter's own act, and the one transition they
+//!   may make;
+//! - approve, reject and reimburse stay finance's.
+//!
+//! `RequireBilling` stays on all of them: claims live under the billing
+//! module, and a deployment with billing switched off should not grow an
+//! expense surface.
+//!
+//! The vendor, expense-category and bill routes are called by
+//! `/settings/vendors`, `/settings/expense-categories` and `/bills` in
+//! mokosh-apps (MAPPS-1157), so the record that exempted them is gone.
+//!
+//! parity record 2026-10-26 (PMS-1534): the six expense-claim paths below
+//! have no SPA caller yet. MAPPS-1163 builds it; MAPPS-1157 shipped the
+//! rest of this module's surfaces and left claims out deliberately,
+//! because a claim from a person has a submitter and an approver where a
+//! bill has neither. The MAPPS-1083 recorded-exemption rule matches each
+//! path literally, so each one gets its own line:
 //! - /expenses
 //! - /expenses/{id}
 //! - /expenses/{id}/submit
@@ -48,7 +56,7 @@ use super::service::{
     ExpenseWithLines, ExpensesService, UpsertExpenseCategoryRequest, UpsertVendorRequest,
 };
 use crate::modules::audit::AuditCtx;
-use crate::modules::auth::{RequireBilling, RequireFinance, TenantScoped};
+use crate::modules::auth::{CurrentUser, RequireBilling, RequireFinance, TenantScoped};
 use crate::modules::expenses::models::{Bill, Expense, Vendor};
 use crate::utils::error::AppResult;
 use crate::utils::json::Json;
@@ -284,16 +292,45 @@ async fn void_bill(
 
 // ── Expenses ──────────────────────────────────────────────────────────
 
+/// Whose claims this caller may see: `None` for every claim in the tenant,
+/// `Some(their own id)` for everybody else (PMS-1535).
+///
+/// `can_manage_billing()` and not `is_admin()`: finance is exactly who
+/// decides claims, and finance is not an admin.
+fn own_claims_only(user: &CurrentUser) -> Option<Uuid> {
+    if user.role.can_manage_billing() {
+        None
+    } else {
+        Some(user.id)
+    }
+}
+
+/// Refuse a claim that is somebody else's, unless this caller may see
+/// every claim (PMS-1535).
+fn assert_may_read(user: &CurrentUser, submitter: Uuid) -> AppResult<()> {
+    if user.role.can_manage_billing() || submitter == user.id {
+        Ok(())
+    } else {
+        Err(crate::utils::error::AppError::Forbidden(
+            "That expense claim belongs to somebody else".to_string(),
+        ))
+    }
+}
+
 async fn list_expenses(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<Expense>>> {
     pagination.reject_unsupported_sort()?;
+    // PMS-1535: a claim belongs to the person who made it. Finance sees
+    // every claim because deciding them is their job; everybody else sees
+    // their own, and the filter is forced here rather than offered as a
+    // query parameter, because a scope a caller can set is a scope a
+    // caller can widen.
     let (rows, total) = state
         .service
-        .list_expenses(user.tenant(), &pagination)
+        .list_expenses(user.tenant(), own_claims_only(&user), &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         rows,
@@ -305,17 +342,20 @@ async fn list_expenses(
 async fn get_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ExpenseWithLines>> {
     let e = state.service.get_expense(user.tenant(), id).await?;
+    // The 404 for an unknown id comes first, from the read above: whether
+    // this claim exists is not a fact worth withholding from somebody who
+    // is already in the tenant, and answering 403 before the lookup would
+    // say "it exists" about an id nobody has.
+    assert_may_read(&user, e.expense.user_id)?;
     Ok(Json(e))
 }
 
 async fn create_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
     ctx: AuditCtx,
     Json(request): Json<CreateExpenseRequest>,
 ) -> AppResult<Json<ExpenseWithLines>> {
@@ -331,10 +371,15 @@ async fn create_expense(
 async fn submit_expense(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
-    _finance: RequireFinance,
     Path(id): Path<Uuid>,
     ctx: AuditCtx,
 ) -> AppResult<Json<Expense>> {
+    // Submitting is the submitter's own act, so it is the one transition a
+    // non-finance caller may make, and only on their own claim. Finance can
+    // do it too: somebody has to be able to send on the claim of a person
+    // who has left.
+    let existing = state.service.get_expense(user.tenant(), id).await?;
+    assert_may_read(&user, existing.expense.user_id)?;
     let e = state
         .service
         .submit_expense(user.tenant(), id, &ctx)

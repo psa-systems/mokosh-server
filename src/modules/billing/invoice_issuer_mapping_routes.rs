@@ -10,9 +10,10 @@
 //! `RequireFinance` pair of today's billing surface applies; the service
 //! layer PR 2b-rest shipped carries the write itself.
 //!
-//! MAPPS-1155 adds the bill half, four more routes on the same prefix:
+//! MAPPS-1155 added the bill half, four more routes on the same prefix:
 //! vendors (which vendor a bill is raised against over there) and
-//! expense accounts (which ledger account a category's lines post to).
+//! expense accounts (which ledger account a category's lines post to),
+//! called by the same Mappings page since MAPPS-1156.
 //! Those four read `Feature::DelegatedBills`, not
 //! `Feature::DelegatedInvoiceIssuer`, because they serve a different
 //! switch: a deployment can delegate bills without delegating invoices,
@@ -81,18 +82,6 @@ pub fn invoice_issuer_mapping_routes(state: InvoiceIssuerMappingRouterState) -> 
             "/invoice-issuer-mappings/products/{provider}/{product_id}",
             put(upsert_product_mapping),
         )
-        // parity record 2026-10-25 (MAPPS-1155): the four bill-mapping
-        // paths below have no SPA caller for the window between this PR
-        // and the mokosh-apps half of MAPPS-1155, which adds the Vendors
-        // and Expense accounts sections to Settings > Integrations >
-        // {Xero,QuickBooks} > Mappings. Operations needs the write
-        // surface to populate the tables before the delegated-bills
-        // switch can be flipped anywhere, so the routes land first. The
-        // paths this record covers, named per MAPPS-1083:
-        // "/invoice-issuer-mappings/vendors",
-        // "/invoice-issuer-mappings/vendors/{provider}/{vendor_id}",
-        // "/invoice-issuer-mappings/expense-accounts",
-        // "/invoice-issuer-mappings/expense-accounts/{provider}/{category_id}".
         .route(
             "/invoice-issuer-mappings/vendors",
             get(list_vendor_mappings),

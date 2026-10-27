@@ -766,16 +766,28 @@ impl ExpensesService {
     // MAPPS-1100 scoping, mirroring the invoice amendment pattern in
     // PMS-1334.
 
+    /// Claims for this tenant, or for one submitter within it
+    /// (PMS-1535).
+    ///
+    /// `submitter` is `None` for a caller who may see everyone's claims
+    /// and `Some(user_id)` for everyone else. The filter is a parameter
+    /// rather than two methods because the count and the page have to
+    /// agree: a total over every claim beside a page of one person's
+    /// would page a technician through claims they cannot read.
     pub async fn list_expenses(
         &self,
         tenant_id: TenantId,
+        submitter: Option<Uuid>,
         pagination: &PaginationParams,
     ) -> AppResult<(Vec<Expense>, u64)> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM expenses WHERE tenant_id = $1")
-            .bind(tenant_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM expenses              WHERE tenant_id = $1 AND ($2::uuid IS NULL OR user_id = $2)",
+        )
+        .bind(tenant_id)
+        .bind(submitter)
+        .fetch_one(&mut *tx)
+        .await?;
         let rows: Vec<Expense> = sqlx::query_as(
             r#"SELECT id, tenant_id, user_id, incurred_on, currency,
                       subtotal_minor, tax_minor, total_minor, status,
@@ -783,11 +795,12 @@ impl ExpensesService {
                       external_provider, external_expense_id,
                       created_at, updated_at
                FROM expenses
-               WHERE tenant_id = $1
+               WHERE tenant_id = $1 AND ($2::uuid IS NULL OR user_id = $2)
                ORDER BY incurred_on DESC, created_at DESC
-               LIMIT $2 OFFSET $3"#,
+               LIMIT $3 OFFSET $4"#,
         )
         .bind(tenant_id)
+        .bind(submitter)
         .bind(pagination.limit() as i64)
         .bind(pagination.offset() as i64)
         .fetch_all(&mut *tx)
