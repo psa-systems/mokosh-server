@@ -34,7 +34,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::modules::billing::invoice_issuer::{
-    ExternalBillRef, ExternalInvoiceRef, InvoiceProviderKind,
+    ExternalBillRef, ExternalExpenseRef, ExternalInvoiceRef, InvoiceProviderKind,
 };
 use crate::utils::error::{AppError, AppResult};
 
@@ -196,6 +196,43 @@ struct QuickBooksCreateInvoiceBody {
 /// `AccountBasedExpenseLineDetail` against an expense account, where an
 /// invoice line is a `SalesItemLineDetail` against an item. Reusing the
 /// invoice body would send a sales line to the payables side.
+/// A purchase: money the MSP spent, from a named account (PMS-1541).
+///
+/// `AccountRef` at the top level is WHERE the money came from (a bank or
+/// credit-card account) and `AccountRef` inside each line's detail is WHAT
+/// it was spent on. QuickBooks refuses the call without the first and
+/// without a `PaymentType`.
+#[derive(Debug, Serialize)]
+struct QuickBooksPurchaseBody {
+    #[serde(rename = "AccountRef")]
+    account_ref: QuickBooksRef,
+    #[serde(rename = "PaymentType")]
+    payment_type: &'static str,
+    #[serde(rename = "Line")]
+    line: Vec<QuickBooksBillLineBody>,
+    #[serde(rename = "TxnDate")]
+    txn_date: NaiveDate,
+    #[serde(rename = "CurrencyRef")]
+    currency_ref: QuickBooksRef,
+    /// Who was reimbursed. Optional in QuickBooks, sent when the tenant
+    /// has mapped the person, because a spend with no counterparty tells
+    /// the MSP's books less than one with a name.
+    #[serde(rename = "EntityRef", skip_serializing_if = "Option::is_none")]
+    entity_ref: Option<QuickBooksRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksPurchaseEnvelope {
+    #[serde(rename = "Purchase")]
+    purchase: QuickBooksPurchaseDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksPurchaseDto {
+    #[serde(rename = "Id")]
+    id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct QuickBooksCreateBillBody {
     #[serde(rename = "VendorRef")]
@@ -250,6 +287,19 @@ pub struct QuickBooksCreateBillRequest {
     pub vendor_id: String,
     pub issue_date: NaiveDate,
     pub due_date: NaiveDate,
+    pub currency: String,
+    pub lines: Vec<QuickBooksBillLineInput>,
+}
+
+/// Request body for `record_spend` (PMS-1541).
+///
+/// `bank_account_id` is the account the money left; `entity_id` is the
+/// person reimbursed, when the tenant has mapped them.
+#[derive(Debug, Clone)]
+pub struct QuickBooksRecordSpendRequest {
+    pub bank_account_id: String,
+    pub entity_id: Option<String>,
+    pub paid_on: NaiveDate,
     pub currency: String,
     pub lines: Vec<QuickBooksBillLineInput>,
 }
@@ -328,6 +378,66 @@ impl QuickBooksClient {
     pub fn with_identity_base(mut self, base: impl Into<String>) -> Self {
         self.identity_base = base.into();
         self
+    }
+
+    /// Record a reimbursement as a purchase (PMS-1541).
+    ///
+    /// `/purchase` rather than `/bill`: a bill is money the MSP owes and a
+    /// purchase is money it has already spent, and a reimbursement is the
+    /// second. `PaymentType: "Bank"` because the account the money left is
+    /// the one the tenant mapped, and QuickBooks requires the pair to
+    /// agree; a tenant reimbursing from a credit card maps that account
+    /// and QuickBooks reads the type from the account itself.
+    pub async fn record_spend(
+        &self,
+        creds: &QuickBooksCredentials,
+        request: &QuickBooksRecordSpendRequest,
+    ) -> AppResult<ExternalExpenseRef> {
+        let body = QuickBooksPurchaseBody {
+            account_ref: QuickBooksRef {
+                value: request.bank_account_id.clone(),
+            },
+            payment_type: "Bank",
+            line: request
+                .lines
+                .iter()
+                .map(|l| QuickBooksBillLineBody {
+                    amount: minor_to_decimal(l.amount_minor, 2),
+                    detail_type: "AccountBasedExpenseLineDetail",
+                    description: l.description.clone(),
+                    account_based_expense_line_detail: QuickBooksAccountDetail {
+                        account_ref: QuickBooksRef {
+                            value: l.account_id.clone(),
+                        },
+                    },
+                })
+                .collect(),
+            txn_date: request.paid_on,
+            currency_ref: QuickBooksRef {
+                value: request.currency.to_ascii_uppercase(),
+            },
+            entity_ref: request
+                .entity_id
+                .as_ref()
+                .map(|id| QuickBooksRef { value: id.clone() }),
+        };
+        let url = format!(
+            "{}/v3/company/{}/purchase?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksPurchaseEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(ExternalExpenseRef {
+            provider: InvoiceProviderKind::Quickbooks,
+            external_expense_id: envelope.purchase.id,
+        })
     }
 
     /// Raise a bill against a vendor (MAPPS-1155).
@@ -828,5 +938,89 @@ mod tests {
             v["Line"][0]["SalesItemLineDetail"]["ItemRef"]["value"],
             "item-9"
         );
+    }
+
+    /// PMS-1541: a reimbursement is a purchase, not a bill.
+    ///
+    /// A bill is money owed and a purchase is money already spent, and
+    /// `/purchase` is the endpoint that says so. Read off `record_spend`'s
+    /// own body so the bill call cannot satisfy it.
+    #[test]
+    fn a_reimbursement_goes_to_the_purchase_resource() {
+        let src = include_str!("quickbooks.rs");
+        let start = src
+            .find("pub async fn record_spend")
+            .expect("the spend call");
+        let end = start
+            + src[start..]
+                .find("\n    pub async fn ")
+                .expect("the next method");
+        let record_spend = &src[start..end];
+        assert!(
+            record_spend.contains("/v3/company/{}/purchase"),
+            "the spend call posts to /purchase"
+        );
+        assert!(
+            !record_spend.contains("/v3/company/{}/bill"),
+            "and never to /bill, which is money owed rather than money spent"
+        );
+    }
+
+    /// The purchase body carries the account the money left, a payment
+    /// type, the expense account per line, and the person when known.
+    #[test]
+    fn the_purchase_body_names_both_accounts() {
+        let body = QuickBooksPurchaseBody {
+            account_ref: QuickBooksRef {
+                value: "35".to_string(),
+            },
+            payment_type: "Bank",
+            line: vec![QuickBooksBillLineBody {
+                amount: "32.50".to_string(),
+                detail_type: "AccountBasedExpenseLineDetail",
+                description: "Taxi to site".to_string(),
+                account_based_expense_line_detail: QuickBooksAccountDetail {
+                    account_ref: QuickBooksRef {
+                        value: "7".to_string(),
+                    },
+                },
+            }],
+            txn_date: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            currency_ref: QuickBooksRef {
+                value: "USD".to_string(),
+            },
+            entity_ref: Some(QuickBooksRef {
+                value: "56".to_string(),
+            }),
+        };
+        let v = serde_json::to_value(&body).expect("serialise");
+        assert_eq!(v["AccountRef"]["value"], "35", "where the money came from");
+        assert_eq!(v["PaymentType"], "Bank");
+        assert_eq!(
+            v["Line"][0]["AccountBasedExpenseLineDetail"]["AccountRef"]["value"], "7",
+            "and what it was spent on"
+        );
+        assert_eq!(v["EntityRef"]["value"], "56", "who was reimbursed");
+        assert_eq!(v["TxnDate"], "2026-11-01");
+    }
+
+    /// An unmapped person leaves `EntityRef` off the body rather than
+    /// sending a null, which QuickBooks rejects.
+    #[test]
+    fn an_unmapped_person_omits_the_entity_ref() {
+        let body = QuickBooksPurchaseBody {
+            account_ref: QuickBooksRef {
+                value: "35".to_string(),
+            },
+            payment_type: "Bank",
+            line: Vec::new(),
+            txn_date: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            currency_ref: QuickBooksRef {
+                value: "USD".to_string(),
+            },
+            entity_ref: None,
+        };
+        let v = serde_json::to_value(&body).expect("serialise");
+        assert!(v.get("EntityRef").is_none());
     }
 }
