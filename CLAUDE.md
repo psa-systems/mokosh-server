@@ -64,7 +64,7 @@ just infisical-bootstrap   # one-time after `just dev-infisical`, fills INFISICA
 
 OIDC client registration recipes (`register-client`, etc.) were removed with mokosh-auth in PMS-295: bunyip is the sole OP and owns its own client registry, so RPs register with bunyip, not mokosh.
 
-`just dev` rewrites `USER` in `.env` on each run, generates `.env` from `.env.example` once per clone (PMS-490), needs the external `network-traefik-public`, and runs as compose project `dev-mokosh-${USER}` (PMS-1281). Details: [dev stack notes](docs/quickstart.md#12-dev-stack-notes).
+`just dev` rewrites `USER` in `.env` on each run, generates `.env` from `.env.example` once per clone (PMS-490), needs the external `network-traefik-public`, and runs as compose project `dev-mokosh-${USER}` (PMS-1281). Details: [dev stack notes](docs/internal.md#dev-stack-notes).
 
 ## Architecture
 
