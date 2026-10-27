@@ -738,6 +738,79 @@ async fn bills_cannot_be_delegated_to_a_disconnected_provider(pool: PgPool) {
     );
 }
 
+/// PMS-1541: the reimburse-from account is set through the service and
+/// read back on the overview.
+///
+/// Read back as well as written, because a settings field that cannot show
+/// its current value is a write-only form. Blank clears it, which is how an
+/// admin stops reimbursing through a provider without disconnecting it.
+#[mokosh_test]
+async fn the_reimburse_from_account_round_trips(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+
+    // Before connecting there is nothing to reimburse from.
+    let err = svc
+        .set_payment_account(tenant, InvoiceProviderKind::Xero, Some("acct-1"))
+        .await
+        .expect_err("there is no connection yet");
+    assert!(
+        matches!(&err, AppError::Conflict(m) if m.contains("Connect xero")),
+        "{err:?}"
+    );
+
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("complete");
+    assert_eq!(
+        svc.overview(tenant, InvoiceProviderKind::Xero)
+            .await
+            .expect("overview")
+            .payment_account_id,
+        None,
+        "connecting sets no account: it is the admin's to choose"
+    );
+
+    svc.set_payment_account(
+        tenant,
+        InvoiceProviderKind::Xero,
+        Some("  13918178-849a-247f-8ed7-c7b1f5e7e71c  "),
+    )
+    .await
+    .expect("set the account");
+    assert_eq!(
+        svc.overview(tenant, InvoiceProviderKind::Xero)
+            .await
+            .expect("overview")
+            .payment_account_id
+            .as_deref(),
+        Some("13918178-849a-247f-8ed7-c7b1f5e7e71c"),
+        "trimmed, and readable by the page that set it"
+    );
+
+    // Blank clears, and so does whitespace: a cleared field is not an
+    // account named by spaces.
+    for blank in ["", "   "] {
+        svc.set_payment_account(tenant, InvoiceProviderKind::Xero, Some(blank))
+            .await
+            .expect("clear the account");
+        assert_eq!(
+            svc.overview(tenant, InvoiceProviderKind::Xero)
+                .await
+                .expect("overview")
+                .payment_account_id,
+            None,
+            "{blank:?}"
+        );
+    }
+}
+
 /// One tenant's connection is invisible to another.
 #[mokosh_test]
 async fn an_overview_does_not_leak_another_tenants_connection(pool: PgPool) {
