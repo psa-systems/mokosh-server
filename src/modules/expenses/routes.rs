@@ -57,7 +57,7 @@ use super::service::{
 };
 use crate::modules::audit::AuditCtx;
 use crate::modules::auth::{CurrentUser, RequireBilling, RequireFinance, TenantScoped};
-use crate::modules::expenses::models::{Bill, Expense, Vendor};
+use crate::modules::expenses::models::{Bill, BillFilter, Expense, ExpenseFilter, Vendor};
 use crate::utils::error::AppResult;
 use crate::utils::json::Json;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
@@ -232,10 +232,15 @@ async fn list_bills(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
     _finance: RequireFinance,
+    Query(filter): Query<BillFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<Bill>>> {
     pagination.reject_unsupported_sort()?;
-    let (rows, total) = state.service.list_bills(user.tenant(), &pagination).await?;
+    filter.validate()?;
+    let (rows, total) = state
+        .service
+        .list_bills(user.tenant(), &filter, &pagination)
+        .await?;
     Ok(Json(PaginatedResponse::from_params(
         rows,
         &pagination,
@@ -320,9 +325,11 @@ fn assert_may_read(user: &CurrentUser, submitter: Uuid) -> AppResult<()> {
 async fn list_expenses(
     State(state): State<ExpensesRouterState>,
     RequireBilling { user, .. }: RequireBilling,
+    Query(filter): Query<ExpenseFilter>,
     Query(pagination): Query<PaginationParams>,
 ) -> AppResult<Json<PaginatedResponse<Expense>>> {
     pagination.reject_unsupported_sort()?;
+    filter.validate()?;
     // PMS-1535: a claim belongs to the person who made it. Finance sees
     // every claim because deciding them is their job; everybody else sees
     // their own, and the filter is forced here rather than offered as a
@@ -330,7 +337,7 @@ async fn list_expenses(
     // caller can widen.
     let (rows, total) = state
         .service
-        .list_expenses(user.tenant(), own_claims_only(&user), &pagination)
+        .list_expenses(user.tenant(), own_claims_only(&user), &filter, &pagination)
         .await?;
     Ok(Json(PaginatedResponse::from_params(
         rows,
