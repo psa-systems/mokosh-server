@@ -51,7 +51,7 @@ use crate::modules::auth::{RequireAdmin, RequireBilling, RequireFinance, TenantS
 use crate::modules::billing::invoice_issuer::InvoiceProviderKind;
 use crate::modules::billing::invoice_issuer_mappings::{
     CompanyMapping, ExpenseAccountMapping, InvoiceIssuerMappingService, ProductMapping,
-    VendorMapping,
+    UserMapping, VendorMapping,
 };
 use crate::modules::features::FeatureSnapshot;
 use crate::utils::error::{AppError, AppResult};
@@ -98,6 +98,17 @@ pub fn invoice_issuer_mapping_routes(state: InvoiceIssuerMappingRouterState) -> 
             "/invoice-issuer-mappings/expense-accounts/{provider}/{category_id}",
             put(upsert_expense_account_mapping),
         )
+        // parity record 2026-10-27 (PMS-1541): no SPA caller yet for
+        // "/invoice-issuer-mappings/people" or
+        // "/invoice-issuer-mappings/people/{provider}/{user_id}".
+        // MAPPS-1168 builds it. The routes land with the dispatcher that
+        // reads them, because Xero refuses a reimbursement with no contact
+        // and an admin needs somewhere to say who somebody is over there.
+        .route("/invoice-issuer-mappings/people", get(list_user_mappings))
+        .route(
+            "/invoice-issuer-mappings/people/{provider}/{user_id}",
+            put(upsert_user_mapping),
+        )
         .with_state(state)
 }
 
@@ -123,6 +134,17 @@ pub struct UpsertVendorMappingRequest {
 pub struct UpsertExpenseAccountMappingRequest {
     #[validate(length(min = 1, max = 100))]
     pub external_account_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertUserMappingRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub external_contact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListUserMappingsResponse {
+    pub mappings: Vec<UserMapping>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,6 +341,40 @@ async fn upsert_expense_account_mapping(
             provider,
             category_id,
             &request.external_account_id,
+        )
+        .await?;
+    Ok(Json(row))
+}
+
+async fn list_user_mappings(
+    State(state): State<InvoiceIssuerMappingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    _admin: RequireAdmin,
+) -> AppResult<Json<ListUserMappingsResponse>> {
+    require_delegated_bills(&state)?;
+    let mappings = state.service.list_user_mappings(user.tenant()).await?;
+    Ok(Json(ListUserMappingsResponse { mappings }))
+}
+
+async fn upsert_user_mapping(
+    State(state): State<InvoiceIssuerMappingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    _admin: RequireAdmin,
+    Path((provider_raw, user_id)): Path<(String, Uuid)>,
+    Json(request): Json<UpsertUserMappingRequest>,
+) -> AppResult<Json<UserMapping>> {
+    require_delegated_bills(&state)?;
+    request.validate()?;
+    let provider = parse_provider(&provider_raw)?;
+    let row = state
+        .service
+        .upsert_user_mapping(
+            user.tenant(),
+            provider,
+            user_id,
+            &request.external_contact_id,
         )
         .await?;
     Ok(Json(row))

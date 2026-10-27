@@ -392,6 +392,57 @@ impl InvoiceIssuerConnectService {
         Ok(())
     }
 
+    /// Set the provider account a reimbursement is paid from (PMS-1541).
+    ///
+    /// One value per tenant per provider, so it sits on the integration
+    /// row beside the organisation id rather than in a mapping table that
+    /// would hold one row. Refused unless the row is connected, for the
+    /// reason the bills toggle is: an account on a provider with no
+    /// credentials is an arrangement nothing can honour.
+    ///
+    /// Blank clears it, which is how an admin says "stop reimbursing
+    /// through the provider" without disconnecting it; the dispatcher then
+    /// refuses the push by name again.
+    pub async fn set_payment_account(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        account_id: Option<&str>,
+    ) -> AppResult<()> {
+        let value = account_id.map(str::trim).filter(|v| !v.is_empty());
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM integrations WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(status) = status else {
+            return Err(AppError::Conflict(format!(
+                "Connect {} before choosing the account to reimburse from.",
+                provider.as_str()
+            )));
+        };
+        if status != IntegrationStatus::Connected.as_str() {
+            return Err(AppError::Conflict(format!(
+                "{} is not connected, so nothing can be reimbursed through it.",
+                provider.as_str()
+            )));
+        }
+        sqlx::query(
+            "UPDATE integrations SET external_payment_account_id = $3, updated_at = NOW() \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .bind(value)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// What a settings page for one provider reads (MAPPS-1143).
     ///
     /// Four facts, and three of them the integrations catalog cannot
@@ -762,6 +813,15 @@ pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) 
             "/integrations/invoice-issuer/{provider}/bills",
             put(set_bills_delegation),
         )
+        // parity record 2026-10-27 (PMS-1541): no SPA caller yet for
+        // "/integrations/invoice-issuer/{provider}/payment-account".
+        // MAPPS-1168 builds it; the route lands with the dispatcher that
+        // reads the value, because a push refused for a missing account an
+        // admin cannot set would be a dead end.
+        .route(
+            "/integrations/invoice-issuer/{provider}/payment-account",
+            put(set_payment_account),
+        )
         .with_state(InvoiceIssuerConnectRouterState { service })
 }
 
@@ -823,6 +883,29 @@ async fn disconnect(
 #[derive(Debug, serde::Deserialize)]
 struct SetBillsDelegationRequest {
     enabled: bool,
+}
+
+/// The body of the payment-account setter (PMS-1541). `null` or blank
+/// clears it.
+#[derive(Debug, serde::Deserialize)]
+struct SetPaymentAccountRequest {
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+async fn set_payment_account(
+    State(state): State<InvoiceIssuerConnectRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Path(provider): Path<String>,
+    Json(request): Json<SetPaymentAccountRequest>,
+) -> AppResult<axum::http::StatusCode> {
+    let provider = parse_provider(&provider)?;
+    state
+        .service
+        .set_payment_account(user.tenant(), provider, request.account_id.as_deref())
+        .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 async fn set_bills_delegation(
