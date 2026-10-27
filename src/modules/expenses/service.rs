@@ -769,11 +769,24 @@ impl ExpensesService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Bill".to_string()))?;
+        // PMS-977's rule for every refusal on this surface: say what to do
+        // instead, because "cannot be moved" leaves the operator guessing.
         if !allowed_from.iter().any(|s| *s == before.status) {
-            return Err(AppError::Conflict(format!(
-                "Cannot move bill from {} to {to}.",
-                before.status
-            )));
+            return Err(AppError::Conflict(match before.status.as_str() {
+                "paid" => "This bill has already been paid, so moving it would misstate what \
+                           was settled. Issue a credit or adjustment instead."
+                    .to_string(),
+                "void" => "This bill is void, so there is nothing left to move. Raise a new \
+                           bill instead."
+                    .to_string(),
+                status if status == to => {
+                    format!("This bill is already '{to}'.")
+                }
+                status => format!(
+                    "This bill is '{status}', so it cannot move to '{to}'. No remedy is \
+                     defined yet for this transition."
+                ),
+            }));
         }
         let after: Bill = sqlx::query_as(
             r#"UPDATE bills SET status = $3, updated_at = NOW()
@@ -1293,11 +1306,27 @@ impl ExpensesService {
                 "A reimbursed expense is immutable. File a reversing expense instead.".to_string(),
             ));
         }
+        // PMS-977's rule for every refusal on this surface: say what to do
+        // instead, because "cannot be moved" leaves the operator guessing.
+        // This mirrors the `reimbursed` branch above it, which already
+        // follows the shape.
         if !allowed_from.iter().any(|s| *s == before.status) {
-            return Err(AppError::Conflict(format!(
-                "Cannot move expense from {} to {to}.",
-                before.status
-            )));
+            return Err(AppError::Conflict(match before.status.as_str() {
+                "rejected" => "This expense was rejected, which is terminal. File a new \
+                               expense instead."
+                    .to_string(),
+                status if status == to => {
+                    format!("This expense is already '{to}'.")
+                }
+                "draft" => format!(
+                    "This expense has not been submitted yet, so it cannot move to '{to}'. \
+                     Submit it first."
+                ),
+                status => format!(
+                    "This expense is '{status}', so it cannot move to '{to}'. No remedy is \
+                     defined yet for this transition."
+                ),
+            }));
         }
         let now: DateTime<Utc> = Utc::now();
         let approver_val = set_approver.or(before.approver_id);
