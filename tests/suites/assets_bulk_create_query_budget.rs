@@ -152,7 +152,11 @@ async fn bulk_create_fetches_the_response_in_one_select(pool: PgPool) {
     )
     .expect("install the recording subscriber");
 
-    let _ = common::seed_admin(&pool).await;
+    // `bulk_create_assets` writes one `asset_audit_log` row per inserted
+    // asset with `performed_by_id = performer`, which has an FK to `users.id`.
+    // The seeded admin's id is the one row we know exists in this fresh
+    // template; a `Uuid::new_v4()` here would fail the FK constraint.
+    let (performer_id, _, _) = common::seed_admin(&pool).await;
     let company_id = seed_company(&pool).await;
     let asset_type_id = seed_asset_type(&pool).await;
     let model_id = seed_asset_model(&pool, asset_type_id).await;
@@ -183,7 +187,7 @@ async fn bulk_create_fetches_the_response_in_one_select(pool: PgPool) {
 
     recorder.armed.store(true, Ordering::SeqCst);
     let created = svc
-        .bulk_create_assets(tenant, Uuid::new_v4(), &request)
+        .bulk_create_assets(tenant, performer_id, &request)
         .await
         .expect("bulk create");
     recorder.armed.store(false, Ordering::SeqCst);
