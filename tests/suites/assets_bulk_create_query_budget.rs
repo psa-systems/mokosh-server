@@ -192,16 +192,18 @@ async fn bulk_create_fetches_the_response_in_one_select(pool: PgPool) {
 
     // The response-fetch query joins `assets a` to `asset_types`, `companies`,
     // `users` and `contacts`, and (post PMS-1517) matches rows by
-    // `a.id = ANY(...)`. Any SELECT matching that join shape is the batched
-    // fetch; count how many landed.
+    // `a.id = ANY(...)`. Any statement matching that join shape is the batched
+    // fetch; count how many landed. A `starts_with("SELECT")` prefix check is
+    // deliberately NOT used: `tracing` records string field values with the
+    // Debug formatter, so sqlx's `db.statement` arrives as a quoted, escaped
+    // string that starts with `"` (and the `summary` fallback carries the same
+    // escaping). The two contains() checks together are unique to the response
+    // fetch in `bulk_create_assets` already: nothing else in the write path
+    // joins `assets a` to `asset_types`.
     let statements = recorder.take();
     let response_fetch: Vec<&String> = statements
         .iter()
-        .filter(|s| {
-            s.starts_with("SELECT")
-                && s.contains("FROM assets a")
-                && s.contains("LEFT JOIN asset_types")
-        })
+        .filter(|s| s.contains("FROM assets a") && s.contains("LEFT JOIN asset_types"))
         .collect();
     assert_eq!(
         response_fetch.len(),
