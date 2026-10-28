@@ -34,7 +34,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::modules::billing::invoice_issuer::{
-    ExternalBillRef, ExternalExpenseRef, ExternalInvoiceRef, InvoiceProviderKind,
+    decimal_string_to_minor, ExternalBillRef, ExternalExpenseRef, ExternalInvoiceRef,
+    ExternalSettlement, InvoiceProviderKind,
 };
 use crate::utils::error::{AppError, AppResult};
 
@@ -214,6 +215,47 @@ struct XeroInvoiceDto {
     invoice_number: Option<String>,
     #[serde(rename = "Status")]
     status: String,
+}
+
+/// `GET /Invoices/{id}` read for its amounts (PMS-1543). Its own DTO
+/// rather than fields bolted onto [`XeroInvoiceDto`]: that one is shared
+/// with the issue path, where `AmountPaid` is always absent and a reader
+/// would wonder why.
+///
+/// Xero serialises these as JSON numbers, and the client never hands a
+/// float to a money field, so they are read as strings through serde's
+/// untagged scalar and converted by [`decimal_string_to_minor`].
+#[derive(Debug, Deserialize)]
+struct XeroSettlementEnvelope {
+    #[serde(rename = "Invoices", default)]
+    invoices: Vec<XeroSettlementDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XeroSettlementDto {
+    #[serde(rename = "Type", default)]
+    kind: String,
+    #[serde(rename = "Status", default)]
+    status: String,
+    #[serde(rename = "AmountPaid", default, deserialize_with = "scalar_as_string")]
+    amount_paid: Option<String>,
+    #[serde(rename = "Total", default, deserialize_with = "scalar_as_string")]
+    total: Option<String>,
+}
+
+/// Read a JSON number or string into a string, so a provider that changes
+/// which it sends does not change what this client can parse.
+fn scalar_as_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        other => Some(other.to_string()),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -659,6 +701,57 @@ impl XeroClient {
     /// Fetch the current Xero-side status of a previously-issued invoice.
     /// Used by the Phase 3 webhook receiver's reconciliation pass and by
     /// an operator "re-sync" button.
+    /// What the provider says has been paid against one bill (PMS-1543).
+    ///
+    /// The same `GET /Invoices/{id}` the invoice status read uses, for the
+    /// amounts rather than the status: an `ACCPAY` invoice carries
+    /// `AmountPaid` and `Total`, and the difference between that paid
+    /// figure and the local `paid_minor` is what Mokosh has not recorded.
+    ///
+    /// Reconciled rather than accumulated on purpose. A webhook delivery
+    /// says "this changed", not "this much arrived", and providers
+    /// redeliver; reading the provider's own running total makes a second
+    /// delivery a no-op by arithmetic instead of by a dedupe table.
+    ///
+    /// The document type is checked: Xero puts bills and invoices on one
+    /// endpoint and one webhook category, so a receiver that did not look
+    /// would happily read an `ACCREC` invoice as a bill and record the
+    /// customer's payment as the MSP's.
+    pub async fn fetch_bill_settlement(
+        &self,
+        creds: &XeroCredentials,
+        external_bill_id: &str,
+    ) -> AppResult<Option<ExternalSettlement>> {
+        let url = format!("{}/api.xro/2.0/Invoices/{external_bill_id}", self.api_base);
+        let envelope: XeroSettlementEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Xero-Tenant-Id", &creds.tenant_id)
+                    .header("Accept", "application/json")
+            })
+            .await?;
+        let dto = envelope
+            .invoices
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::internal("Xero returned no document".to_string()))?;
+        // Not a bill: the caller asked about an id that turned out to be a
+        // receivable, which is an answer and not a failure.
+        if !dto.kind.eq_ignore_ascii_case("ACCPAY") {
+            return Ok(None);
+        }
+        Ok(Some(ExternalSettlement {
+            paid_minor: decimal_string_to_minor(dto.amount_paid.as_deref().unwrap_or("0")),
+            total_minor: decimal_string_to_minor(dto.total.as_deref().unwrap_or("0")),
+            voided: matches!(
+                XeroInvoiceStatus::parse(&dto.status),
+                Some(XeroInvoiceStatus::Voided) | Some(XeroInvoiceStatus::Deleted)
+            ),
+        }))
+    }
+
     pub async fn fetch_invoice_status(
         &self,
         creds: &XeroCredentials,

@@ -770,9 +770,9 @@ impl ExpensesService {
         .await?
         .ok_or_else(|| AppError::NotFound("Bill".to_string()))?;
         if !allowed_from.iter().any(|s| *s == before.status) {
-            return Err(AppError::Conflict(format!(
-                "Cannot move bill from {} to {to}.",
-                before.status
+            return Err(AppError::Conflict(bill_transition_refusal(
+                &before.status,
+                to,
             )));
         }
         let after: Bill = sqlx::query_as(
@@ -916,6 +916,124 @@ impl ExpensesService {
             bill: updated,
             payments: vec![payment],
         })
+    }
+
+    /// The delegated bill one provider id names, for the webhook receiver
+    /// (PMS-1543).
+    ///
+    /// The bill half of `BillingService::delegated_invoice`, and keyed the
+    /// same way: tenant, provider and the provider's own id. Returns the
+    /// three figures reconciliation needs rather than the whole row,
+    /// because the receiver's job is arithmetic.
+    pub async fn delegated_bill(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+        external_bill_id: &str,
+    ) -> AppResult<Option<DelegatedBillRow>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<DelegatedBillRow> = sqlx::query_as(
+            "SELECT id, status, total_minor, paid_minor, currency FROM bills \
+             WHERE tenant_id = $1 AND external_provider = $2 AND external_bill_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(provider)
+        .bind(external_bill_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Record what the provider says it has paid against a delegated bill
+    /// (PMS-1543).
+    ///
+    /// Reconciles rather than appends: the caller passes the provider's
+    /// RUNNING total, and this writes the difference against what Mokosh
+    /// already holds. A redelivered webhook therefore records nothing
+    /// because the difference is zero, which is idempotency by arithmetic
+    /// rather than by a dedupe column somebody has to keep unique.
+    ///
+    /// Returns the payment it wrote, or `None` when there was nothing to
+    /// write. Three ways to get `None`, all of them ordinary: the provider
+    /// is level with Mokosh, the bill is already fully paid here, or the
+    /// bill is in a state that cannot take a payment (a void bill whose
+    /// provider copy was paid is a disagreement to surface, not one to
+    /// paper over by writing anyway).
+    ///
+    /// An amount beyond the remaining balance is recorded UP TO the
+    /// balance and the excess logged. The local refusal that
+    /// `record_bill_payment` gives a human is the right answer when a
+    /// person is typing; here the provider has already committed the
+    /// payment, and refusing it would leave the two ledgers disagreeing,
+    /// which is the thing this path exists to stop.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, external_bill_id = %report.external_bill_id))]
+    pub async fn reconcile_external_bill_payment(
+        &self,
+        tenant_id: TenantId,
+        report: &ExternalBillPaymentReport<'_>,
+        ctx: &AuditCtx,
+    ) -> AppResult<Option<BillPayment>> {
+        let ExternalBillPaymentReport {
+            provider,
+            external_bill_id,
+            provider_paid_minor,
+            paid_on,
+        } = *report;
+        // The bill is resolved from the provider's id rather than passed
+        // in: the caller holds only that id, and one that passed both could
+        // pass a figure from one bill with the id of another.
+        let Some(bill) = self
+            .delegated_bill(tenant_id, provider, external_bill_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if bill.status != "approved" && bill.status != "paid" {
+            tracing::warn!(
+                status = %bill.status,
+                "provider reports a payment against a bill this status cannot take; left for an operator"
+            );
+            return Ok(None);
+        }
+        let unrecorded = provider_paid_minor.saturating_sub(bill.paid_minor);
+        if unrecorded <= 0 {
+            return Ok(None);
+        }
+        let remaining = bill.total_minor.saturating_sub(bill.paid_minor);
+        if remaining <= 0 {
+            return Ok(None);
+        }
+        let amount_minor = unrecorded.min(remaining);
+        if amount_minor < unrecorded {
+            tracing::warn!(
+                excess_minor = unrecorded - amount_minor,
+                "provider reports more paid than this bill is for; recording the balance only"
+            );
+        }
+        let payment = self
+            .record_bill_payment(
+                tenant_id,
+                bill.id,
+                &RecordBillPaymentRequest {
+                    paid_on,
+                    amount_minor,
+                    // The CHECK set has no "the provider did it" value and
+                    // inventing one would mean a migration plus every
+                    // consumer that matches on it; `other` with the
+                    // provider named in the reference says the same thing
+                    // in the columns that already exist.
+                    payment_method: "other".to_string(),
+                    reference: Some(format!("{provider}:{external_bill_id}")),
+                    notes: Some(format!(
+                        "Recorded from {provider}, which reports {} paid against this bill.",
+                        provider_paid_minor
+                    )),
+                },
+                ctx,
+            )
+            .await?;
+        Ok(payment.payments.into_iter().next())
     }
 
     /// Every payment against one bill, newest first.
@@ -1219,9 +1337,14 @@ impl ExpensesService {
                 // under its row lock, which is what actually guards it.
                 let claim = self.get_expense(tenant_id, id).await?;
                 if claim.expense.status != "approved" {
-                    return Err(AppError::Conflict(format!(
-                        "Cannot move expense from {} to reimbursed.",
-                        claim.expense.status
+                    // The same refusal `transition_expense` would give, from
+                    // the same function: this check exists only so a wire
+                    // call is not made for a claim the transition will
+                    // refuse anyway, and a second wording here would be a
+                    // second thing to keep in step (PMS-1538).
+                    return Err(AppError::Conflict(expense_transition_refusal(
+                        &claim.expense.status,
+                        "reimbursed",
                     )));
                 }
                 let lines: Vec<ExpenseLineShape> = claim
@@ -1289,14 +1412,19 @@ impl ExpensesService {
         .await?
         .ok_or_else(|| AppError::NotFound("Expense".to_string()))?;
         if before.status == "reimbursed" {
-            return Err(AppError::Conflict(
-                "A reimbursed expense is immutable. File a reversing expense instead.".to_string(),
-            ));
+            // Checked before `allowed_from` because it holds for every
+            // target, including one a future transition might allow. The
+            // wording comes from the shared function so this branch and
+            // the generic one cannot drift (PMS-1538).
+            return Err(AppError::Conflict(expense_transition_refusal(
+                &before.status,
+                to,
+            )));
         }
         if !allowed_from.iter().any(|s| *s == before.status) {
-            return Err(AppError::Conflict(format!(
-                "Cannot move expense from {} to {to}.",
-                before.status
+            return Err(AppError::Conflict(expense_transition_refusal(
+                &before.status,
+                to,
             )));
         }
         let now: DateTime<Utc> = Utc::now();
@@ -1415,6 +1543,32 @@ pub struct ExpenseLineInput {
     pub position: i32,
 }
 
+/// What a provider says it has paid against one delegated bill
+/// (PMS-1543).
+///
+/// A named value rather than four parameters: the running total and the id
+/// it belongs to have to travel together, and a caller passing them
+/// separately could pass a figure from one bill with the id of another.
+#[derive(Debug, Clone, Copy)]
+pub struct ExternalBillPaymentReport<'a> {
+    pub provider: &'a str,
+    pub external_bill_id: &'a str,
+    /// The provider's RUNNING total, not one payment: the difference
+    /// against `bills.paid_minor` is what has not been recorded here.
+    pub provider_paid_minor: i64,
+    pub paid_on: NaiveDate,
+}
+
+/// The three figures the webhook receiver reconciles against (PMS-1543).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DelegatedBillRow {
+    pub id: Uuid,
+    pub status: String,
+    pub total_minor: i64,
+    pub paid_minor: i64,
+    pub currency: String,
+}
+
 /// `POST /bills/{id}/payments` (PMS-1536).
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct RecordBillPaymentRequest {
@@ -1457,6 +1611,76 @@ pub struct ExpenseWithLines {
     #[serde(flatten)]
     pub expense: Expense,
     pub lines: Vec<ExpenseLine>,
+}
+
+/// Why a bill cannot make this move, and what to do instead (PMS-1538).
+///
+/// PMS-977's rule for every refusal on this surface: "cannot be moved"
+/// leaves the operator holding a document and no next step. The sibling
+/// invoice-amendment path distinguishes its terminal states the same way,
+/// and the `reimbursed` branch in `transition_expense` already did.
+///
+/// Pure and shared, so the one other place that pre-checks this state
+/// (`reimburse_expense`, before it reaches a provider) cannot drift into a
+/// second wording.
+fn bill_transition_refusal(from: &str, to: &str) -> String {
+    match from {
+        // Both terminal, and for different reasons, so they get different
+        // remedies: a paid bill is a settled fact to correct with another
+        // document, where a void one never settled anything.
+        "paid" => "This bill has already been paid, so moving it would misstate what was \
+                   settled. Issue a credit or adjustment instead."
+            .to_string(),
+        "void" => "This bill is void, so there is nothing left to move. Raise a new bill instead."
+            .to_string(),
+        status if status == to => format!("This bill is already '{to}'."),
+        "draft" if to == "paid" => "This bill has not been approved yet, so paying it would \
+                                    skip the check that it matches what was ordered. Approve \
+                                    it first."
+            .to_string(),
+        status => format!(
+            "This bill is '{status}', so it cannot move to '{to}'. No remedy is defined yet \
+             for this transition."
+        ),
+    }
+}
+
+/// Why a claim cannot make this move, and what to do instead (PMS-1538).
+///
+/// Each arm names the step that is missing rather than the step that
+/// failed, because the caller is holding a claim and wants to know what to
+/// press next.
+fn expense_transition_refusal(from: &str, to: &str) -> String {
+    match from {
+        "rejected" => {
+            "This expense was rejected, which is terminal. File a new expense instead.".to_string()
+        }
+        "reimbursed" => {
+            "A reimbursed expense is immutable. File a reversing expense instead.".to_string()
+        }
+        status if status == to => format!("This expense is already '{to}'."),
+        "draft" => format!(
+            "This expense has not been submitted yet, so it cannot move to '{to}'. Submit it \
+             first."
+        ),
+        // The pair the salvaged work left to the fallback, which is the one
+        // somebody actually hits: finance opens a submitted claim and tries
+        // to pay it back before anybody approved it.
+        "submitted" if to == "reimbursed" => {
+            "This expense has not been approved yet, so there is nothing to pay back. Approve \
+             it first."
+                .to_string()
+        }
+        "approved" if to == "submitted" => {
+            "This expense is already approved, which is past submission. There is nothing to \
+             submit."
+                .to_string()
+        }
+        status => format!(
+            "This expense is '{status}', so it cannot move to '{to}'. No remedy is defined yet \
+             for this transition."
+        ),
+    }
 }
 
 /// A `%q%` pattern for an ILIKE, or `None` when nothing was typed
@@ -1649,4 +1873,110 @@ async fn insert_expense_lines(
         rows.push(row);
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bill_transition_refusal, expense_transition_refusal};
+
+    /// Every refusal names a next step, which is what PMS-977 asks of this
+    /// surface: a message that only says "cannot" leaves the operator
+    /// holding a document and nothing to press.
+    ///
+    /// Asserted as a property over every pair the two state machines can
+    /// refuse, rather than one case per arm, because the arm somebody adds
+    /// later is the one that will forget.
+    #[test]
+    fn every_refusal_names_a_next_step_or_says_none_is_defined() {
+        let bill_statuses = ["draft", "approved", "paid", "void"];
+        for from in bill_statuses {
+            for to in ["approved", "void", "paid"] {
+                let message = bill_transition_refusal(from, to);
+                assert!(
+                    message.contains("instead")
+                        || message.contains("first")
+                        || message.contains("already")
+                        || message.contains("No remedy is defined yet"),
+                    "bill {from} -> {to}: {message}"
+                );
+                assert!(
+                    !message.starts_with("Cannot move"),
+                    "and never the bare shape: {message}"
+                );
+            }
+        }
+        let expense_statuses = ["draft", "submitted", "approved", "reimbursed", "rejected"];
+        for from in expense_statuses {
+            for to in ["submitted", "approved", "rejected", "reimbursed"] {
+                let message = expense_transition_refusal(from, to);
+                assert!(
+                    message.contains("instead")
+                        || message.contains("first")
+                        || message.contains("already")
+                        || message.contains("nothing to submit")
+                        || message.contains("No remedy is defined yet"),
+                    "expense {from} -> {to}: {message}"
+                );
+                assert!(!message.starts_with("Cannot move"), "{message}");
+            }
+        }
+    }
+
+    /// The two terminal bill states get different remedies, because they
+    /// are terminal for different reasons: a paid bill settled something
+    /// and a void one never did.
+    #[test]
+    fn a_paid_bill_and_a_void_bill_are_told_different_things() {
+        let paid = bill_transition_refusal("paid", "void");
+        assert!(paid.contains("credit or adjustment"), "{paid}");
+        let void = bill_transition_refusal("void", "approved");
+        assert!(void.contains("Raise a new bill"), "{void}");
+        assert_ne!(paid, void);
+    }
+
+    /// The pair somebody actually hits: finance opens a submitted claim
+    /// and tries to pay it back before anybody approved it.
+    #[test]
+    fn paying_back_an_unapproved_claim_says_to_approve_it() {
+        let message = expense_transition_refusal("submitted", "reimbursed");
+        assert!(message.contains("Approve it first"), "{message}");
+        assert!(
+            !message.contains("No remedy is defined yet"),
+            "this one has an obvious remedy and had fallen through to the fallback"
+        );
+    }
+
+    /// Paying an unapproved bill says the same thing, for the same reason:
+    /// approval is where the bill is checked against what was ordered.
+    #[test]
+    fn paying_an_unapproved_bill_says_to_approve_it() {
+        let message = bill_transition_refusal("draft", "paid");
+        assert!(message.contains("Approve it first"), "{message}");
+    }
+
+    /// A reimbursed claim keeps the wording it already had (PMS-1538's
+    /// third criterion), and now keeps it from one place.
+    #[test]
+    fn the_reimbursed_message_is_unchanged_and_shared() {
+        for to in ["submitted", "approved", "rejected", "reimbursed"] {
+            assert_eq!(
+                expense_transition_refusal("reimbursed", to),
+                "A reimbursed expense is immutable. File a reversing expense instead.",
+                "{to}"
+            );
+        }
+    }
+
+    /// A redundant move says so rather than reciting both halves.
+    #[test]
+    fn a_move_to_the_state_it_is_in_says_already() {
+        assert_eq!(
+            bill_transition_refusal("approved", "approved"),
+            "This bill is already 'approved'."
+        );
+        assert_eq!(
+            expense_transition_refusal("submitted", "submitted"),
+            "This expense is already 'submitted'."
+        );
+    }
 }

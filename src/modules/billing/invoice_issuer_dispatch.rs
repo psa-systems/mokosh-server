@@ -29,7 +29,8 @@ use uuid::Uuid;
 
 use crate::modules::auth::TenantId;
 use crate::modules::billing::invoice_issuer::{
-    select_issuer_with, ExternalInvoiceRef, InvoiceProviderKind, IssuerSelection,
+    select_issuer_with, ExternalInvoiceRef, ExternalSettlement, InvoiceProviderKind,
+    IssuerSelection,
 };
 use crate::modules::billing::invoice_issuer_app::{IssuerApp, IssuerApps};
 use crate::modules::billing::invoice_issuer_credentials::{
@@ -902,6 +903,38 @@ impl IssuerDispatcher {
                     .void_invoice(&creds, external_invoice_id, &sync_token)
                     .await
                     .map(|()| ProviderVoid::Voided)
+            }
+        }
+    }
+
+    /// What the provider says has been settled against one delegated bill
+    /// (PMS-1543).
+    ///
+    /// `None` when the id is not a bill the provider holds: Xero puts
+    /// bills and invoices on one endpoint and one webhook category, so the
+    /// receiver asks about ids that turn out to be receivables, and
+    /// QuickBooks answers 404 for an id that is not a bill in that company
+    /// file. Neither is an error.
+    pub async fn external_bill_settlement(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        external_bill_id: &str,
+    ) -> AppResult<Option<ExternalSettlement>> {
+        let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
+        match &blob {
+            IntegrationCredentialBlob::Xero(x) => {
+                let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
+                self.xero
+                    .fetch_bill_settlement(&creds, external_bill_id)
+                    .await
+            }
+            IntegrationCredentialBlob::Quickbooks(q) => {
+                let creds =
+                    quickbooks_credentials(self.apps.require(InvoiceProviderKind::Quickbooks)?, q);
+                self.quickbooks
+                    .fetch_bill_settlement(&creds, external_bill_id)
+                    .await
             }
         }
     }
