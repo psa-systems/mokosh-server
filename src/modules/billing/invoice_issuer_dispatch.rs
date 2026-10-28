@@ -40,7 +40,8 @@ use crate::modules::billing::invoice_issuer_credentials::{
 use crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService;
 use crate::modules::billing::models::CreateInvoiceLineRequest;
 use crate::modules::billing::provider_invoice::quickbooks::{
-    QuickBooksBillLineInput, QuickBooksCreateBillRequest, QuickBooksRecordSpendRequest,
+    QuickBooksBillLineInput, QuickBooksCreateBillRequest, QuickBooksPayBillRequest,
+    QuickBooksRecordSpendRequest,
 };
 use crate::modules::billing::provider_invoice::xero::{XeroLineItemInput, XeroSpendLineInput};
 use crate::modules::billing::provider_invoice::{
@@ -838,6 +839,97 @@ impl IssuerDispatcher {
     /// receiver comes and looks, through the same credential load and
     /// near-expiry refresh an issue goes through, because a webhook can
     /// easily be the first call after a token has aged out.
+    /// Tell the provider a bill it holds has been paid (PMS-1545).
+    ///
+    /// The outbound mirror of PMS-1543: that one records what the provider
+    /// already did, this one tells the provider what the MSP just did.
+    /// Without it an MSP paying a delegated bill from Mokosh left the
+    /// provider showing it owing, and the accountant reconciled against a
+    /// balance wrong by the amount paid.
+    ///
+    /// `None` when there is nothing to tell: no dispatcher, the switch
+    /// off, or a bill no provider holds. Each missing mapping is a
+    /// `Conflict` naming the route that sets it, as every other push
+    /// here is.
+    pub async fn pay_bill_in_provider(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        external_bill_id: &str,
+        vendor_id: Uuid,
+        amount_minor: i64,
+        paid_on: NaiveDate,
+    ) -> AppResult<String> {
+        let bank_account = self
+            .mappings
+            .get_payment_account(tenant_id, provider)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "No {} account is set to pay from. Set it at PUT \
+                     /api/v1/integrations/invoice-issuer/{}/payment-account first.",
+                    provider.as_str(),
+                    provider.as_str()
+                ))
+            })?;
+        let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
+        match &blob {
+            IntegrationCredentialBlob::Xero(x) => {
+                let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
+                // Xero attaches the payment to the document it settles, so
+                // the bill's own id is the only link needed and no vendor
+                // is sent: the bill already names the contact.
+                let bill_id = Uuid::parse_str(external_bill_id).map_err(|_| {
+                    AppError::internal(format!(
+                        "bill {external_bill_id} is not a Xero InvoiceID, which is a uuid"
+                    ))
+                })?;
+                self.xero
+                    .pay_bill(
+                        &creds,
+                        &crate::modules::billing::provider_invoice::xero::XeroPayBillRequest {
+                            bill_id,
+                            bank_account_id: bank_account,
+                            paid_on,
+                            amount_minor,
+                        },
+                    )
+                    .await
+            }
+            IntegrationCredentialBlob::Quickbooks(q) => {
+                let creds =
+                    quickbooks_credentials(self.apps.require(InvoiceProviderKind::Quickbooks)?, q);
+                // A QuickBooks bill payment is its own document and names
+                // the vendor it pays, so the vendor mapping is required
+                // here where Xero needs none.
+                let vendor = self
+                    .mappings
+                    .get_vendor_mapping(tenant_id, provider, vendor_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Conflict(format!(
+                            "Vendor {vendor_id} is not mapped to a quickbooks vendor, and a \
+                             QuickBooks bill payment names the vendor it pays. Set the mapping \
+                             at PUT /api/v1/invoice-issuer-mappings/vendors/quickbooks/{vendor_id} \
+                             first."
+                        ))
+                    })?;
+                self.quickbooks
+                    .pay_bill(
+                        &creds,
+                        &QuickBooksPayBillRequest {
+                            bill_id: external_bill_id.to_string(),
+                            vendor_id: vendor.external_vendor_id,
+                            bank_account_id: bank_account,
+                            paid_on,
+                            amount_minor,
+                        },
+                    )
+                    .await
+            }
+        }
+    }
+
     /// Void the provider's copy of an invoice Mokosh has replaced
     /// (PMS-1544).
     ///
