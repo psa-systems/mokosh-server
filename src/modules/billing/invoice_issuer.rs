@@ -60,6 +60,19 @@ pub struct ExternalInvoiceRef {
     pub external_number: String,
 }
 
+/// What a provider gave back after issuing a credit note (PMS-1546).
+///
+/// Three fields like [`ExternalInvoiceRef`] rather than the bill's one,
+/// and for the same reason that one has three: a credit note is a
+/// document the CUSTOMER is given, so the number the provider rendered is
+/// what they will quote back and what reconciliation matches on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalCreditNoteRef {
+    pub provider: InvoiceProviderKind,
+    pub external_credit_note_id: String,
+    pub external_number: String,
+}
+
 /// What a provider gave back for a bill it now holds (MAPPS-1155).
 ///
 /// One field and not three, which is the difference from

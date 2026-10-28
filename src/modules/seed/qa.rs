@@ -1520,6 +1520,9 @@ fn qa_credit_note_spec(invoice_id: Uuid) -> CreateCreditNoteRequest {
         notes: Some("QA seed credit note.".to_string()),
         lines: vec![CreateCreditNoteLineRequest {
             line_type: InvoiceLineType::Adjustment,
+            // An adjustment line names no catalogue product, which the
+            // local path and Xero both take (PMS-1546).
+            product_id: None,
             description: "QA-Decommissioned site, May".to_string(),
             quantity: Decimal::ONE,
             unit_price: Decimal::new(50000, 2),
