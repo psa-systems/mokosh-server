@@ -379,6 +379,29 @@ impl AppSecretProviderKind {
         }
     }
 
+    /// The variables a provider is BUILT from, named in the refusal when a
+    /// declared provider could not be built (PMS-1537).
+    ///
+    /// An operator reading "the bunyip provider could not be built" has to go
+    /// and find out which inputs that means; an operator reading the variable
+    /// names can act. The environment and database providers are always built,
+    /// so their text says so rather than inventing an input.
+    pub fn construction_inputs(self) -> &'static str {
+        match self {
+            Self::Environment => "nothing: the environment provider is always built",
+            Self::File => "APP_SECRETS_DIR",
+            Self::Database => "nothing: the database provider is built from the open pool",
+            Self::Infisical => {
+                "INFISICAL_ADDRESS, INFISICAL_PROJECT_ID, INFISICAL_CLIENT_ID and \
+                 INFISICAL_CLIENT_SECRET"
+            }
+            Self::Bunyip => {
+                "BUNYIP_SECRETS_URL, BUNYIP_SECRETS_CLIENT_ID and BUNYIP_SECRETS_CLIENT_SECRET \
+                 (either all three or none)"
+            }
+        }
+    }
+
     /// The kind's slot in a `Vec<Option<Arc<dyn AppSecretProvider>>>` of
     /// length [`Self::ALL`]`.len()`. Made `pub(crate)` so the PMS-1012 CLI can
     /// index a slot without reimplementing the mapping.
@@ -781,11 +804,11 @@ pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
             }
             Classification::Unavailable => {
                 fatal.push(format!(
-                    "{} is declared to the {} provider, which this process could not build, \
-                     so nothing was asked for the value. Fix that provider's inputs, or \
-                     declare the secret somewhere this deployment can read.",
+                    "{} is declared to the {} provider, which this process could not build, so \
+                     nothing was asked for the value. That provider is built from: {}.",
                     row.secret.name(),
                     declared.as_str(),
+                    declared.construction_inputs(),
                 ));
             }
         }
@@ -1175,6 +1198,10 @@ mod tests {
         assert!(
             message.contains("could not build"),
             "the message says what happened rather than what was missing: {message}"
+        );
+        assert!(
+            message.contains("BUNYIP_SECRETS_URL"),
+            "and names the inputs an operator has to set: {message}"
         );
     }
 
