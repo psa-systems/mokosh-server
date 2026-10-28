@@ -809,6 +809,50 @@ async fn a_microsoft_run_is_stopped_by_its_own_switch_and_not_by_googles(pool: P
     );
 }
 
+/// PMS-1551: `schedule_due`'s own three-way choice, made in raw SQL at queuing
+/// time, had not been given Microsoft 365's key either, so a connection whose
+/// tenant had switched Microsoft off still got a `contact_sync_runs` row
+/// inserted (and then cancelled by `attempt`'s check) on every elapsed
+/// interval instead of never being scheduled.
+#[mokosh_test]
+async fn schedule_due_does_not_queue_a_connection_microsofts_switch_turned_off(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+
+    let microsoft_connection = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contact_sync_connections \
+             (id, tenant_id, provider, account_email, selected_groups, last_sync_at, sync_status) \
+         VALUES ($1, $2, 'microsoft', 'ops@contoso.example', $3, NOW() - INTERVAL '2 hours', 'success')",
+    )
+    .bind(microsoft_connection)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(json!([CLIENTS]))
+    .execute(&f.pool)
+    .await
+    .expect("seed a microsoft connection");
+
+    let (status, body) = f
+        .call(
+            Method::PUT,
+            "/api/v1/settings",
+            Some(json!({ "category": "integrations", "key": "microsoft_contacts_enabled", "value": false })),
+        )
+        .await;
+    assert!(status.is_success(), "{status}: {body}");
+
+    f.runner.tick().await.unwrap();
+
+    assert_eq!(
+        f.count(&format!(
+            "SELECT count(*) FROM contact_sync_runs WHERE connection_id = '{microsoft_connection}'"
+        ))
+        .await,
+        0,
+        "Microsoft's own switch must stop schedule_due from queuing a run for it, not just \
+         attempt from executing one"
+    );
+}
+
 /// PMS-1241: the tenant-wide off switch. Off, nothing connects, imports or
 /// resolves, a run queued before the switch is cancelled rather than run, and
 /// the worker schedules nothing; the connection and its contacts stay. On
