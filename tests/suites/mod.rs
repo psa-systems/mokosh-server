@@ -82,6 +82,7 @@ pub mod contacts_delete_role;
 pub mod contract_sweep_query_budget;
 pub mod contracts;
 pub mod create_update_validation_parity;
+pub mod credit_note_delegation;
 pub mod credit_notes;
 pub mod dashboards_crud;
 pub mod data_transfer;
