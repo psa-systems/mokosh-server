@@ -150,6 +150,7 @@ One line per rule, linking its full text. A new convention adds its text under `
 - A bill's paid total has one writer ([PMS-1536](docs/invariants/billing.md#bill-payments-pms-1536))
 - A claim reaches the provider on reimbursement, never before ([PMS-1541](docs/invariants/billing.md#delegated-claims-pms-1541))
 - An inbound vendor payment is reconciled, not accumulated ([PMS-1543](docs/invariants/billing.md#inbound-bill-payments-pms-1543))
+- Paying a delegated bill tells the provider ([PMS-1545](docs/invariants/billing.md#paying-a-bill-pms-1545))
 - A replacement voids the provider's copy too ([PMS-1544](docs/invariants/billing.md#voiding-a-delegated-invoice-pms-1544))
 - A sent invoice is replaced, and the replacement voids it ([PMS-1334](docs/invariants/billing.md#amendment-pms-1334))
 - Overdue is derived; reminders are a worker ([PMS-1037](docs/invariants/billing.md#overdue-pms-1037))
