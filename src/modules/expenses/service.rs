@@ -24,7 +24,7 @@ use super::models::{
     Bill, BillFilter, BillLine, BillPayment, Expense, ExpenseCategory, ExpenseFilter, ExpenseLine,
     Vendor,
 };
-use crate::db::Database;
+use crate::db::{Database, TenantTransaction};
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::auth::TenantId;
 use crate::utils::error::{AppError, AppResult, FieldError};
@@ -1331,22 +1331,27 @@ impl ExpensesService {
                 use crate::modules::billing::invoice_issuer_dispatch::{
                     ExpenseLineShape, ExpensePlan, ReimburseExpenseShape,
                 };
-                // Read first so the push has the lines, and so an unknown
-                // id or a claim in the wrong state is refused before any
-                // wire call. `transition_expense` checks the state again
-                // under its row lock, which is what actually guards it.
+                // Lock the row and assert the status under that lock, in
+                // our own transaction committed immediately after, before
+                // the wire call. A concurrent caller's own call to this
+                // same helper then blocks on this row: it either finds the
+                // lock free with the status unchanged, or (once
+                // `transition_expense` has taken it and committed) finds
+                // the status no longer `approved` and refuses before ever
+                // reaching the external call (PMS-1547). Committing right
+                // away, rather than holding this lock across the wire call
+                // below, is what keeps that call off the row lock.
+                let mut lock_tx = self.db.begin_with_tenant(tenant_id).await?;
+                self.lock_and_assert_status(
+                    &mut lock_tx,
+                    tenant_id,
+                    id,
+                    &["approved"],
+                    "reimbursed",
+                )
+                .await?;
+                lock_tx.commit().await?;
                 let claim = self.get_expense(tenant_id, id).await?;
-                if claim.expense.status != "approved" {
-                    // The same refusal `transition_expense` would give, from
-                    // the same function: this check exists only so a wire
-                    // call is not made for a claim the transition will
-                    // refuse anyway, and a second wording here would be a
-                    // second thing to keep in step (PMS-1538).
-                    return Err(AppError::Conflict(expense_transition_refusal(
-                        &claim.expense.status,
-                        "reimbursed",
-                    )));
-                }
                 let lines: Vec<ExpenseLineShape> = claim
                     .lines
                     .iter()
@@ -1385,19 +1390,21 @@ impl ExpensesService {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn transition_expense(
+    /// Lock the expense row `FOR UPDATE` and assert its current status is
+    /// one of `allowed_from`, returning the locked row. Shared by
+    /// `transition_expense`'s own check and by `reimburse_expense`'s
+    /// earlier pre-check, so the two cannot drift and so a lock taken here
+    /// is what a concurrent caller's own call to this helper blocks on
+    /// (PMS-1547), not a plain unlocked read that could still see the
+    /// pre-transition status.
+    async fn lock_and_assert_status(
         &self,
+        tx: &mut TenantTransaction<'_>,
         tenant_id: TenantId,
         id: Uuid,
         allowed_from: &[&str],
         to: &str,
-        set_approver: Option<Uuid>,
-        reimbursing: bool,
-        external: Option<&crate::modules::billing::invoice_issuer::ExternalExpenseRef>,
-        ctx: &AuditCtx,
     ) -> AppResult<Expense> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let before: Expense = sqlx::query_as(
             r#"SELECT id, tenant_id, user_id, incurred_on, currency,
                       subtotal_minor, tax_minor, total_minor, status,
@@ -1408,7 +1415,7 @@ impl ExpensesService {
         )
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Expense".to_string()))?;
         if before.status == "reimbursed" {
@@ -1427,6 +1434,25 @@ impl ExpensesService {
                 to,
             )));
         }
+        Ok(before)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transition_expense(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        allowed_from: &[&str],
+        to: &str,
+        set_approver: Option<Uuid>,
+        reimbursing: bool,
+        external: Option<&crate::modules::billing::invoice_issuer::ExternalExpenseRef>,
+        ctx: &AuditCtx,
+    ) -> AppResult<Expense> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let before = self
+            .lock_and_assert_status(&mut tx, tenant_id, id, allowed_from, to)
+            .await?;
         let now: DateTime<Utc> = Utc::now();
         let approver_val = set_approver.or(before.approver_id);
         let approved_at = if to == "approved" {
