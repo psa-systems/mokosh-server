@@ -80,6 +80,22 @@ const DEFAULT_NET_DAYS: i32 = 30;
 /// used verbatim; a value below this default is clamped up.
 pub const DEFAULT_MIN_PARTIAL_AMOUNT: Decimal = Decimal::ONE;
 
+/// The invoice an amendment replaces, as its send transaction reads it
+/// (PMS-1334, PMS-1544).
+///
+/// A named row rather than a six-tuple: `clippy::type_complexity` is right
+/// that nobody keeps six positional fields straight, and the last two
+/// (PMS-1544's provider pair) were what tipped it over.
+#[derive(sqlx::FromRow)]
+struct AmendedOriginalRow {
+    invoice_number: String,
+    status: String,
+    amount_paid: Decimal,
+    amount_credited: Decimal,
+    external_provider: Option<String>,
+    external_invoice_id: Option<String>,
+}
+
 impl BillingService {
     /// Zero-key constructor for callers that never touch secret material (the
     /// QA seeder). Its secret provider is the database one under the same zero
@@ -4738,16 +4754,23 @@ impl BillingService {
         };
         // Captured before the void so the audit row carries both sides of it.
         let mut voided_before: Option<serde_json::Value> = None;
+        // PMS-1544: the provider and id of the invoice being replaced,
+        // when a provider holds it.
+        let mut voided_external: Option<(
+            crate::modules::billing::invoice_issuer::InvoiceProviderKind,
+            String,
+        )> = None;
         if let Some(original_id) = amends {
-            let original: Option<(String, String, Decimal, Decimal)> = sqlx::query_as(
-                "SELECT invoice_number, status, amount_paid, amount_credited FROM invoices \
+            let original: Option<AmendedOriginalRow> = sqlx::query_as(
+                "SELECT invoice_number, status, amount_paid, amount_credited, \
+                        external_provider, external_invoice_id FROM invoices \
                  WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
             )
             .bind(original_id)
             .bind(tenant_id)
             .fetch_optional(&mut *tx)
             .await?;
-            let Some((original_number, original_status, paid, credited)) = original else {
+            let Some(original) = original else {
                 return Err(AppError::Conflict(
                     "The invoice this one amends no longer exists, so sending it would replace \
                      nothing. Raise it as an ordinary invoice instead."
@@ -4755,18 +4778,31 @@ impl BillingService {
                 ));
             };
             let original_status =
-                InvoiceStatus::from_str(&original_status).unwrap_or(InvoiceStatus::Draft);
+                InvoiceStatus::from_str(&original.status).unwrap_or(InvoiceStatus::Draft);
             if !matches!(original_status, InvoiceStatus::Sent)
-                || paid > Decimal::ZERO
-                || credited > Decimal::ZERO
+                || original.amount_paid > Decimal::ZERO
+                || original.amount_credited > Decimal::ZERO
             {
                 return Err(AppError::Conflict(format!(
-                    "Invoice {original_number} is no longer in a state this amendment can replace \
-                     (status '{}', {paid} paid, {credited} credited). Issue a credit note against \
-                     it instead, and invoice the difference.",
-                    original_status.as_str()
+                    "Invoice {} is no longer in a state this amendment can replace (status \
+                     '{}', {} paid, {} credited). Issue a credit note against it instead, and \
+                     invoice the difference.",
+                    original.invoice_number,
+                    original_status.as_str(),
+                    original.amount_paid,
+                    original.amount_credited
                 )));
             }
+            // PMS-1544: who holds the copy the customer is looking at. Read
+            // here, under the same row lock as the preconditions, so the
+            // void below cannot act on a pair that changed in between.
+            voided_external = original
+                .external_provider
+                .zip(original.external_invoice_id)
+                .and_then(|(provider, id)| {
+                    crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(&provider)
+                        .map(|kind| (kind, id))
+                });
             voided_before = sqlx::query_scalar(
                 "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
             )
@@ -5216,6 +5252,53 @@ impl BillingService {
             .bind(format!("Replaced by invoice {}", current.invoice_number))
             .execute(&mut *tx)
             .await?;
+            // PMS-1544: the customer is holding the PROVIDER's copy of the
+            // invoice this replaces, so voiding only the local row leaves
+            // them being chased for a document the MSP has replaced.
+            //
+            // Inside the send transaction, which is where this function
+            // already puts an irreversible external effect: PMS-991 mails
+            // the invoice here and lets a relay refusal roll the send back,
+            // for the reason that a `sent` nobody received is worse than no
+            // send. The same argument applies to a replacement that goes
+            // out while the thing it replaces stays payable.
+            //
+            // A provider call that succeeds and is then rolled back by a
+            // later failure leaves the provider voided and the original
+            // still `sent` here. That divergence is self-healing rather
+            // than silent: the provider's own webhook reports the void and
+            // `void_delegated_invoice` applies it (MAPPS-1136), which is
+            // also what makes `AlreadyVoided` the common outcome on a
+            // retry.
+            if let Some((provider, external_id)) = voided_external.as_ref() {
+                match self.invoice_dispatch.as_ref() {
+                    Some(dispatcher) if dispatcher.delegation_enabled() => {
+                        let outcome = dispatcher
+                            .void_in_provider(tenant_id, *provider, external_id)
+                            .await?;
+                        tracing::info!(
+                            provider = %provider.as_str(),
+                            external_invoice_id = %external_id,
+                            already_voided = outcome
+                                == crate::modules::billing::invoice_issuer_dispatch::ProviderVoid::AlreadyVoided,
+                            "voided the replaced invoice in the provider that holds it"
+                        );
+                    }
+                    // The switch is off, or this build has no dispatcher.
+                    // The local void still stands, because the amendment is
+                    // the MSP's decision and refusing it would strand them;
+                    // the divergence is logged by the invoice the operator
+                    // can go and void by hand, which is the honest answer
+                    // when the deployment has said "do not talk to the
+                    // provider".
+                    _ => tracing::warn!(
+                        provider = %provider.as_str(),
+                        external_invoice_id = %external_id,
+                        "replaced an invoice this provider holds while delegated issuing is off; \
+                         its copy stays live until somebody voids it there"
+                    ),
+                }
+            }
             let voided_after: Option<serde_json::Value> = sqlx::query_scalar(
                 "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
             )
