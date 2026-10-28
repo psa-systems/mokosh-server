@@ -399,6 +399,33 @@ async fn build_secret_providers(
         }
     }
 
+    // PMS-1537: bunyip, when the deployment named one. A failure is reported
+    // as unreachable rather than fatal, like the two above: this CLI exists to
+    // SHOW an operator what is wrong, so it must still render a report when a
+    // provider is down. The serving path refuses to boot on the same failure.
+    match crate::app_secrets::BunyipSecretsConfig::from_env() {
+        Ok(Some(config)) => match crate::app_secrets::BunyipProvider::load(&config).await {
+            Ok(provider) => {
+                out[AppSecretProviderKind::Bunyip.index()] = Some(Arc::new(provider));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "provider-status: the bunyip app-secret provider could not be built; \
+                     reporting it as unreachable"
+                );
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "provider-status: the bunyip app-secret provider's inputs are incomplete; \
+                 reporting it as unreachable"
+            );
+        }
+    }
+
     Ok(out)
 }
 
@@ -909,20 +936,27 @@ pub async fn run_provider_set(args: &[String]) -> AppResult<()> {
     let (db, encryption_key) = boot_shared_state().await?;
     let providers = build_secret_providers(&db, encryption_key).await?;
     let selection = current_secret_selection()?;
-    let declared = selection.provider;
     let secret = parsed.secret;
+    let declared = declared_for_secret(selection, secret)?;
 
-    let report = set_one_secret(secret, &plain, selection, &providers, || async {
-        // Re-BUILD rather than re-read the handle just written to. The database
-        // provider caches the plaintext on a successful write, so reading the
-        // same handle would prove the cache agrees with itself and say nothing
-        // about the row. A fresh build re-reads the row (or re-fetches from
-        // Infisical), which is what the next boot will do.
-        let fresh = build_secret_providers(&db, encryption_key).await?;
-        Ok(fresh[declared.index()]
-            .as_ref()
-            .and_then(|provider| provider.get(secret)))
-    })
+    let report = set_one_secret(
+        secret,
+        &plain,
+        declared,
+        selection.source,
+        &providers,
+        || async {
+            // Re-BUILD rather than re-read the handle just written to. The database
+            // provider caches the plaintext on a successful write, so reading the
+            // same handle would prove the cache agrees with itself and say nothing
+            // about the row. A fresh build re-reads the row (or re-fetches from
+            // Infisical), which is what the next boot will do.
+            let fresh = build_secret_providers(&db, encryption_key).await?;
+            Ok(fresh[declared.index()]
+                .as_ref()
+                .and_then(|provider| provider.get(secret)))
+        },
+    )
     .await?;
 
     redaction::assert_no_leak(&report);
@@ -949,7 +983,8 @@ pub async fn run_provider_set(args: &[String]) -> AppResult<()> {
 async fn set_one_secret<ReadBack, Fut>(
     secret: GovernedSecret,
     plain: &str,
-    selection: AppSecretsSelection,
+    declared: AppSecretProviderKind,
+    source: crate::utils::deployment::EnablementSource,
     providers: &[Option<Arc<dyn AppSecretProvider>>],
     read_back: ReadBack,
 ) -> AppResult<SetReport>
@@ -957,7 +992,6 @@ where
     ReadBack: FnOnce() -> Fut,
     Fut: std::future::Future<Output = AppResult<Option<String>>>,
 {
-    let declared = selection.provider;
     let target = providers[declared.index()].clone().ok_or_else(|| {
         AppError::Configuration(format!(
             "provider-set: the declared {declared} app-secret provider could not be built, so \
@@ -986,7 +1020,7 @@ where
     Ok(SetReport {
         secret: secret.name().to_string(),
         provider: declared.as_str().to_string(),
-        declared_by: match selection.source {
+        declared_by: match source {
             crate::utils::deployment::EnablementSource::Profile => {
                 "the hosting profile's default".to_string()
             }
@@ -1431,6 +1465,29 @@ async fn boot_shared_state() -> AppResult<(Database, [u8; 32])> {
     Ok((db, encryption_key))
 }
 
+/// PMS-1537: the provider declared for ONE secret, which is the process's
+/// unless the hosting profile gave that secret its own.
+///
+/// `provider-set` needs this and not the process-wide selection: on a
+/// deployment whose profile reads the Google client from bunyip, writing the
+/// pair into the database would report success and leave the value unread,
+/// because the boot path resolves that secret from bunyip.
+fn declared_for_secret(
+    selection: AppSecretsSelection,
+    secret: GovernedSecret,
+) -> AppResult<AppSecretProviderKind> {
+    let profile = DeploymentMode::from_env_for_providers()
+        .map_err(|e| AppError::Configuration(e.to_string()))?;
+    for (declared_for, provider) in
+        crate::app_secrets::per_secret_defaults(profile.default_secret_providers())?
+    {
+        if declared_for == secret {
+            return AppSecretProviderKind::parse_name(provider);
+        }
+    }
+    Ok(selection.provider)
+}
+
 fn current_secret_selection() -> AppResult<AppSecretsSelection> {
     let profile = DeploymentMode::from_env_for_providers()
         .map_err(|e| AppError::Configuration(e.to_string()))?;
@@ -1655,7 +1712,8 @@ mod tests {
         let err = set_one_secret(
             GovernedSecret::GoogleContactsClientId,
             "x.apps.googleusercontent.com",
-            selection,
+            selection.provider,
+            selection.source,
             &providers,
             || async { panic!("the read-back must not be reached when there is no target") },
         )
@@ -1687,7 +1745,8 @@ mod tests {
         let err = set_one_secret(
             GovernedSecret::SmtpPassword,
             "hunter2",
-            selection,
+            selection.provider,
+            selection.source,
             &providers,
             || async { panic!("the read-back must not be reached when the target refuses writes") },
         )
@@ -1742,7 +1801,8 @@ mod tests {
         let report = set_one_secret(
             GovernedSecret::GoogleContactsClientSecret,
             "a-google-client-secret",
-            selection,
+            selection.provider,
+            selection.source,
             &providers,
             || async move {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1813,7 +1873,8 @@ mod tests {
         let err = set_one_secret(
             GovernedSecret::SmtpPassword,
             "hunter2",
-            selection,
+            selection.provider,
+            selection.source,
             &providers,
             || async { Ok(Some("something-else".to_string())) },
         )
@@ -2007,7 +2068,8 @@ mod tests {
             name: "infisical",
             value: None,
         });
-        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> = vec![None; 4];
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
         providers[AppSecretProviderKind::Environment.index()] = Some(env);
         providers[AppSecretProviderKind::File.index()] = Some(file);
         providers[AppSecretProviderKind::Database.index()] = Some(db);
@@ -2053,7 +2115,8 @@ mod tests {
     /// pretends the provider was reachable.
     #[test]
     fn an_absent_provider_shows_up_as_absent_not_as_holding_nothing() {
-        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> = vec![None; 4];
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
         providers[AppSecretProviderKind::Environment.index()] = Some(Arc::new(FixedProvider {
             name: "environment",
             value: None,
@@ -2081,7 +2144,8 @@ mod tests {
     /// every held key with a named reason.
     #[tokio::test]
     async fn purge_refuses_when_target_is_the_declared_provider() {
-        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> = vec![None; 4];
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
         providers[AppSecretProviderKind::Environment.index()] = Some(Arc::new(FixedProvider {
             name: "environment",
             value: None,
@@ -2120,7 +2184,8 @@ mod tests {
     async fn purge_refuses_when_key_not_verified_live_in_the_serving_provider() {
         // Declared = infisical (serving); infisical does NOT hold it.
         // Target = database, which DOES hold it and IS disabled.
-        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> = vec![None; 4];
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
         providers[AppSecretProviderKind::Environment.index()] = Some(Arc::new(FixedProvider {
             name: "environment",
             value: None,
@@ -2184,7 +2249,8 @@ mod tests {
         let target: Arc<dyn AppSecretProvider> = Arc::new(CountingTarget {
             deletes: AtomicUsize::new(0),
         });
-        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> = vec![None; 4];
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
         providers[AppSecretProviderKind::Environment.index()] = Some(Arc::new(FixedProvider {
             name: "environment",
             value: None,
@@ -2259,7 +2325,8 @@ mod tests {
                 false
             }
         }
-        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> = vec![None; 4];
+        let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
         providers[AppSecretProviderKind::Environment.index()] = Some(Arc::new(EnvHolder));
         providers[AppSecretProviderKind::Database.index()] = Some(Arc::new(FixedProvider {
             name: "database",
@@ -2322,7 +2389,8 @@ mod tests {
                 keys: vec!["THIS_KEY_IS_NOT_DECLARED".to_string()],
             }),
         )]);
-        let providers: Vec<Option<Arc<dyn AppSecretProvider>>> = vec![None; 4];
+        let providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
+            vec![None; AppSecretProviderKind::ALL.len()];
         let selection = AppSecretsSelection {
             provider: AppSecretProviderKind::Database,
             source: crate::utils::deployment::EnablementSource::Profile,
