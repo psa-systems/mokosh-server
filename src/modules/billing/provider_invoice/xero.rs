@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::modules::billing::invoice_issuer::{
-    decimal_string_to_minor, ExternalBillRef, ExternalExpenseRef, ExternalInvoiceRef,
-    ExternalSettlement, InvoiceProviderKind,
+    decimal_string_to_minor, ExternalBillRef, ExternalCreditNoteRef, ExternalExpenseRef,
+    ExternalInvoiceRef, ExternalSettlement, InvoiceProviderKind,
 };
 use crate::utils::error::{AppError, AppResult};
 
@@ -107,6 +107,47 @@ pub struct XeroPayBillRequest {
     pub bank_account_id: String,
     pub paid_on: NaiveDate,
     pub amount_minor: i64,
+}
+
+/// What a credit note push needs from the caller (PMS-1546).
+///
+/// No due date, which is the shape difference from an invoice: a credit
+/// note is money owed BACK and nothing falls due on it. `contact_id` is
+/// the customer's, because a receivable credit is raised against whoever
+/// was invoiced.
+#[derive(Debug, Clone)]
+pub struct XeroIssueCreditNoteRequest {
+    pub contact_id: Uuid,
+    pub issue_date: NaiveDate,
+    pub currency: String,
+    pub lines: Vec<XeroLineItemInput>,
+}
+
+/// What applying a credit note to an invoice needs (PMS-1546).
+///
+/// Xero keeps allocation as its own sub-resource rather than a field on
+/// the credit note, so this is a second call and not a larger body. The
+/// amount is carried in minor units like every other money field here and
+/// serialised to a decimal string at the wire.
+#[derive(Debug, Clone)]
+pub struct XeroAllocateCreditRequest {
+    pub invoice_id: Uuid,
+    pub amount_minor: i64,
+    pub date: NaiveDate,
+}
+
+/// A credit note as Xero holds it now: its status, and the allocations
+/// standing against it (PMS-1546).
+///
+/// Both answers come from one `GET`, for the reason the QuickBooks void
+/// target does: a caller that asked twice could act on a status from one
+/// read and allocations from another.
+#[derive(Debug, Clone)]
+pub struct XeroCreditNoteState {
+    /// `None` when Xero sent a status this client does not know, which is
+    /// not the same as voided and must not be read as it.
+    pub status: Option<XeroInvoiceStatus>,
+    pub allocation_ids: Vec<String>,
 }
 
 /// One organisation a grant covers, as `GET /connections` lists it.
@@ -383,6 +424,62 @@ struct XeroPaymentEnvelope {
 struct XeroPaymentDto {
     #[serde(rename = "PaymentID", default)]
     payment_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct XeroCreateCreditNoteBody {
+    #[serde(rename = "Type")]
+    kind: &'static str,
+    #[serde(rename = "Contact")]
+    contact: XeroContactRef,
+    #[serde(rename = "LineItems")]
+    line_items: Vec<XeroLineItemBody>,
+    #[serde(rename = "Date")]
+    date: NaiveDate,
+    #[serde(rename = "CurrencyCode")]
+    currency_code: String,
+    #[serde(rename = "Status")]
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct XeroAllocationsBody {
+    #[serde(rename = "Allocations")]
+    allocations: Vec<XeroAllocationBody>,
+}
+
+#[derive(Debug, Serialize)]
+struct XeroAllocationBody {
+    #[serde(rename = "Invoice")]
+    invoice: XeroPaymentInvoiceRef,
+    #[serde(rename = "Amount")]
+    amount: String,
+    #[serde(rename = "Date")]
+    date: NaiveDate,
+}
+
+#[derive(Debug, Deserialize)]
+struct XeroCreditNoteEnvelope {
+    #[serde(rename = "CreditNotes", default)]
+    credit_notes: Vec<XeroCreditNoteDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XeroCreditNoteDto {
+    #[serde(rename = "CreditNoteID")]
+    credit_note_id: String,
+    #[serde(rename = "CreditNoteNumber", default)]
+    credit_note_number: Option<String>,
+    #[serde(rename = "Status", default)]
+    status: String,
+    #[serde(rename = "Allocations", default)]
+    allocations: Vec<XeroAllocationDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XeroAllocationDto {
+    #[serde(rename = "AllocationID", default)]
+    allocation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -787,6 +884,205 @@ impl XeroClient {
         Ok(())
     }
 
+    /// Issue a credit note against an invoice this organisation holds
+    /// (PMS-1546).
+    ///
+    /// `/CreditNotes` and not `/Invoices` with a third type: Xero keeps
+    /// invoices and bills in one resource and credit notes in their own,
+    /// so the type literal alone would not have been enough.
+    ///
+    /// `ACCRECCREDIT` and not `ACCPAYCREDIT`, which is the same mistake
+    /// `ACCREC` against a vendor would be, in the other direction: the
+    /// payable form credits a VENDOR, and a customer refund filed there
+    /// would reduce what the MSP owes somebody else.
+    ///
+    /// `AUTHORISED`, because the credit note exists in Mokosh before this
+    /// call and is not awaiting anybody's approval, and Xero refuses to
+    /// allocate one that is still `DRAFT`.
+    pub async fn issue_credit_note(
+        &self,
+        creds: &XeroCredentials,
+        request: &XeroIssueCreditNoteRequest,
+    ) -> AppResult<ExternalCreditNoteRef> {
+        let body = XeroCreateCreditNoteBody {
+            kind: "ACCRECCREDIT",
+            contact: XeroContactRef {
+                contact_id: request.contact_id,
+            },
+            line_items: request
+                .lines
+                .iter()
+                .map(|l| XeroLineItemBody {
+                    description: l.description.clone(),
+                    quantity: minor_to_decimal(l.quantity_hundredths, 2),
+                    unit_amount: minor_to_decimal(l.unit_price_minor, 2),
+                })
+                .collect(),
+            date: request.issue_date,
+            currency_code: request.currency.to_ascii_uppercase(),
+            status: "AUTHORISED",
+        };
+        let url = format!("{}/api.xro/2.0/CreditNotes", self.api_base);
+        let envelope: XeroCreditNoteEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Xero-Tenant-Id", &creds.tenant_id)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        let dto = envelope
+            .credit_notes
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::internal("Xero returned no credit note".to_string()))?;
+        Ok(ExternalCreditNoteRef {
+            provider: InvoiceProviderKind::Xero,
+            external_credit_note_id: dto.credit_note_id,
+            external_number: dto.credit_note_number.unwrap_or_default(),
+        })
+    }
+
+    /// Apply a credit note to the invoice it corrects (PMS-1546).
+    ///
+    /// A second call rather than a field, because Xero keeps allocation
+    /// as the credit note's own sub-resource. Unallocated, the credit
+    /// sits on the customer's account as `RemainingCredit` and the
+    /// invoice keeps showing its full balance, which is the disagreement
+    /// this whole path exists to close.
+    ///
+    /// Xero refuses an amount over what the invoice still owes, so a
+    /// caller crediting an invoice the customer has already settled over
+    /// there gets a refusal rather than a negative balance.
+    pub async fn allocate_credit_note(
+        &self,
+        creds: &XeroCredentials,
+        credit_note_id: &str,
+        request: &XeroAllocateCreditRequest,
+    ) -> AppResult<()> {
+        let body = XeroAllocationsBody {
+            allocations: vec![XeroAllocationBody {
+                invoice: XeroPaymentInvoiceRef {
+                    invoice_id: request.invoice_id,
+                },
+                amount: minor_to_decimal(request.amount_minor, 2),
+                date: request.date,
+            }],
+        };
+        let url = format!(
+            "{}/api.xro/2.0/CreditNotes/{credit_note_id}/Allocations",
+            self.api_base
+        );
+        let _envelope: serde_json::Value = self
+            .call_with_retry(|| {
+                self.http
+                    .put(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Xero-Tenant-Id", &creds.tenant_id)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// What Xero says about one credit note now: its status and the
+    /// allocations standing against it (PMS-1546).
+    ///
+    /// `None` for an id this organisation does not hold, which is an
+    /// answer and not a failure, exactly as the QuickBooks void target
+    /// treats a 404: a credit note that is not there is already in the
+    /// state a void is asking for.
+    pub async fn fetch_credit_note(
+        &self,
+        creds: &XeroCredentials,
+        credit_note_id: &str,
+    ) -> AppResult<Option<XeroCreditNoteState>> {
+        let url = format!("{}/api.xro/2.0/CreditNotes/{credit_note_id}", self.api_base);
+        let envelope: XeroCreditNoteEnvelope = match self
+            .call_with_retry(|| {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Xero-Tenant-Id", &creds.tenant_id)
+                    .header("Accept", "application/json")
+            })
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(AppError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(dto) = envelope.credit_notes.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(XeroCreditNoteState {
+            status: XeroInvoiceStatus::parse(&dto.status),
+            allocation_ids: dto
+                .allocations
+                .into_iter()
+                .filter_map(|a| a.allocation_id)
+                .collect(),
+        }))
+    }
+
+    /// Remove one allocation from a credit note (PMS-1546).
+    ///
+    /// What a void has to do first. Xero will not change a document an
+    /// allocation stands against, so voiding an applied credit note is
+    /// refused until the application is taken off; doing it in that order
+    /// also puts the invoice back to the balance it had, which is what
+    /// voiding the credit means.
+    pub async fn delete_credit_note_allocation(
+        &self,
+        creds: &XeroCredentials,
+        credit_note_id: &str,
+        allocation_id: &str,
+    ) -> AppResult<()> {
+        let url = format!(
+            "{}/api.xro/2.0/CreditNotes/{credit_note_id}/Allocations/{allocation_id}",
+            self.api_base
+        );
+        let _answer: serde_json::Value = self
+            .call_with_retry(|| {
+                self.http
+                    .delete(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Xero-Tenant-Id", &creds.tenant_id)
+                    .header("Accept", "application/json")
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Void a credit note in Xero (PMS-1546).
+    ///
+    /// The same shape as [`Self::void_invoice`] on the credit note's own
+    /// URL: a status write, idempotent on the id, with a second call
+    /// against an already-voided document answering the 400 the client
+    /// classifies as a conflict.
+    pub async fn void_credit_note(
+        &self,
+        creds: &XeroCredentials,
+        credit_note_id: &str,
+    ) -> AppResult<()> {
+        let url = format!("{}/api.xro/2.0/CreditNotes/{credit_note_id}", self.api_base);
+        let body = XeroVoidBody { status: "VOIDED" };
+        let _envelope: XeroCreditNoteEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Xero-Tenant-Id", &creds.tenant_id)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Fetch the current Xero-side status of a previously-issued invoice.
     /// Used by the Phase 3 webhook receiver's reconciliation pass and by
     /// an operator "re-sync" button.
@@ -1118,6 +1414,68 @@ mod tests {
         assert!(
             !create_bill.contains(r#"kind: "ACCREC""#),
             "and never the receivable type"
+        );
+    }
+
+    /// PMS-1546: a customer credit is `ACCRECCREDIT`, and it goes to
+    /// `/CreditNotes`.
+    ///
+    /// Two mistakes are available here and both are silent. The payable
+    /// form, `ACCPAYCREDIT`, would credit a VENDOR, so money the MSP is
+    /// giving a customer back would reduce what it owes somebody else.
+    /// And posting the receivable credit to `/Invoices`, which is what
+    /// the one-resource shape of bills and invoices suggests, is refused
+    /// by Xero outright: credit notes are their own resource.
+    #[test]
+    fn a_customer_credit_is_accreccredit_on_the_credit_notes_resource() {
+        let note = XeroCreateCreditNoteBody {
+            kind: "ACCRECCREDIT",
+            contact: XeroContactRef {
+                contact_id: Uuid::nil(),
+            },
+            line_items: vec![XeroLineItemBody {
+                description: "Overcharged month".to_string(),
+                quantity: "1.00".to_string(),
+                unit_amount: "40.00".to_string(),
+            }],
+            date: NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
+            currency_code: "USD".to_string(),
+            status: "AUTHORISED",
+        };
+        let v = serde_json::to_value(&note).expect("serialise");
+        assert_eq!(
+            v["Type"], "ACCRECCREDIT",
+            "a customer credit, not a vendor one"
+        );
+        assert!(
+            v.get("DueDate").is_none(),
+            "nothing falls due on money owed back: {v}"
+        );
+        assert_eq!(
+            v["Status"], "AUTHORISED",
+            "Xero refuses to allocate a draft credit note"
+        );
+
+        let src = include_str!("xero.rs");
+        let start = src
+            .find("pub async fn issue_credit_note")
+            .expect("the credit note call");
+        let end = start
+            + src[start..]
+                .find("\n    pub async fn ")
+                .expect("the next method");
+        let issue_credit_note = &src[start..end];
+        assert!(
+            issue_credit_note.contains(r#"kind: "ACCRECCREDIT""#),
+            "the credit note call sends the receivable credit type"
+        );
+        assert!(
+            !issue_credit_note.contains(r#"kind: "ACCPAYCREDIT""#),
+            "and never the payable one, which credits a vendor"
+        );
+        assert!(
+            issue_credit_note.contains("/api.xro/2.0/CreditNotes"),
+            "and posts to the credit notes resource"
         );
     }
 
