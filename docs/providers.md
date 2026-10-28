@@ -16,7 +16,7 @@ without losing it.
 | Kind | Trait | Providers | Tier | Refreshable |
 |---|---|---|---|---|
 | Configuration | `ConfigProvider` | environment, file, database, Bunyip | bootstrap + application | application only |
-| Secrets (deployment) | `AppSecretProvider` | environment, file, database, Infisical | application | yes |
+| Secrets (deployment) | `AppSecretProvider` | environment, file, database, Infisical, Bunyip | application | yes |
 | Secrets (tenant) | `SecretProvider` | database, Infisical | tenant | yes |
 | Storage | `ObjectProvider` | local, S3 | tenant | no |
 | Authentication | `AuthProvider` | Bunyip OIDC, local | application | yes (PMS-981: `AuthService::login` and `auth_middleware` both gate on it) |
@@ -101,6 +101,7 @@ For every declared key, the application checks which enabled providers hold it, 
 | No provider holds it, and the registry names no such feature | Silent (the key is legitimately unset by design; see the module note in `src/config/registry.rs`) |
 | More than one provider holds it | Warning per duplicate, naming the purge command |
 | The highest-priority provider does not hold it, a lower one does | **Fatal.** The process exits. |
+| The declared provider could not be BUILT, so nothing was asked (PMS-1537) | **Fatal.** The process exits, naming the provider. A provider that answers "no value" has been consulted; one whose construction failed has not, and reporting the second as the first is how an unreachable Bunyip becomes "the feature is off". |
 
 The last row is the important one. It is the shape of the Bunyip production incident that this model exists to
 prevent: secrets sat in the database while Infisical was configured and serving nothing, and no layer said so.
@@ -292,6 +293,32 @@ The TENANT tier is the part that is not a flag flip, because tenant secrets in P
 (PMS-1055) and every contact-sync refresh token, `provider-migrate` moves the application tier only, and flipping
 `SECRET_BACKEND` with those unmigrated makes them unreadable. BUNYIP-855 is the design discussion, and a tenant-tier
 migrator is the missing piece.
+
+### A secret can be declared to its own provider (PMS-1537)
+
+One provider serves the application tier, chosen by `APP_SECRET_BACKEND`, except for the secrets a hosting profile
+declares elsewhere. The `saas` profile declares both halves of the Google OAuth client pair to Bunyip, which holds it
+for the whole suite (BUNYIP-983): an operator sets it once under Admin > Mokosh in Bunyip, and every hosted Mokosh
+reads it from there on its next restart. Everything else on that deployment still comes from the database.
+
+This is a per-secret DECLARATION and not a precedence chain, which is the distinction that keeps the rule above
+true: every secret has exactly one provider, and no read falls back to a second when the first holds nothing. What
+changed is that the deployment can say which provider that is for one secret without moving the rest, which is
+necessary because Bunyip serves the one key and `SMTP_PASSWORD` has no business moving with it.
+
+The declarations live in `SELF_HOSTED_SECRET_PROVIDERS` and `SAAS_SECRET_PROVIDERS` in `src/utils/deployment.rs`,
+beside the per-kind rows, and `app_secrets::per_secret_defaults` resolves them at boot. A typo in a secret name
+there refuses boot rather than silently leaving the secret on the process provider.
+
+The Bunyip provider takes no writes. Bunyip owns the value, so `provider-set` against a secret declared to Bunyip
+refuses and names it, instead of writing a copy the next boot would ignore while Bunyip held something else.
+
+Three variables build it, and either all three are set or none: `BUNYIP_SECRETS_URL`,
+`BUNYIP_SECRETS_CLIENT_ID` and `BUNYIP_SECRETS_CLIENT_SECRET`. The credential is a Bunyip machine registration with
+a one-key allow-list, made with `bunyip-api machine-client register --name mokosh-host-secrets --secret-key
+mokosh/google_oauth_client`, and it is presented as HTTP Basic: Bunyip's `/oauth2/token` implements
+`authorization_code` and `refresh_token` only, so there is no machine bearer to obtain. Both credential halves
+honour the `{NAME}_FILE` convention and should use it in production.
 
 ## Authentication, and what its modes are called
 
