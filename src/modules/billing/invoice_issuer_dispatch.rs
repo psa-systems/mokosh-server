@@ -75,6 +75,17 @@ pub enum BillPlan {
     Delegated(crate::modules::billing::invoice_issuer::ExternalBillRef),
 }
 
+/// What voiding the provider's copy came to (PMS-1544).
+///
+/// `AlreadyVoided` is a success and not a near-miss: the states agree,
+/// which is all the caller wanted. It is kept apart from `Voided` so the
+/// audit trail can say whether this call did it or found it done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderVoid {
+    Voided,
+    AlreadyVoided,
+}
+
 /// What the dispatcher decided to do with one `reimburse_expense` call
 /// (PMS-1541).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -827,6 +838,75 @@ impl IssuerDispatcher {
     /// receiver comes and looks, through the same credential load and
     /// near-expiry refresh an issue goes through, because a webhook can
     /// easily be the first call after a token has aged out.
+    /// Void the provider's copy of an invoice Mokosh has replaced
+    /// (PMS-1544).
+    ///
+    /// The outbound half of the void the receiver already handles inbound.
+    /// Both clients have carried a `void_invoice` since MAPPS-1099 with no
+    /// caller: a delegated invoice replaced here left the provider's copy
+    /// live, so the customer was chased from the provider for a document
+    /// the MSP had replaced, and the MSP could not see the thing doing the
+    /// chasing.
+    ///
+    /// Reads before writing, which is not ceremony. A provider that has
+    /// already voided the invoice (its own webhook got here first, or this
+    /// is a retry) answers an error to a second void, and that error is
+    /// indistinguishable from a real refusal; asking first turns the
+    /// common case into `AlreadyVoided` instead. QuickBooks needs the read
+    /// regardless, because it rejects a write without a current
+    /// `SyncToken`.
+    pub async fn void_in_provider(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        external_invoice_id: &str,
+    ) -> AppResult<ProviderVoid> {
+        let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
+        match &blob {
+            IntegrationCredentialBlob::Xero(x) => {
+                let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
+                let status = self
+                    .xero
+                    .fetch_invoice_status(&creds, external_invoice_id)
+                    .await?;
+                if matches!(
+                    status,
+                    crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Voided
+                        | crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Deleted
+                ) {
+                    return Ok(ProviderVoid::AlreadyVoided);
+                }
+                self.xero
+                    .void_invoice(&creds, external_invoice_id)
+                    .await
+                    .map(|()| ProviderVoid::Voided)
+            }
+            IntegrationCredentialBlob::Quickbooks(q) => {
+                let creds =
+                    quickbooks_credentials(self.apps.require(InvoiceProviderKind::Quickbooks)?, q);
+                let Some((status, sync_token)) = self
+                    .quickbooks
+                    .fetch_invoice_void_target(&creds, external_invoice_id)
+                    .await?
+                else {
+                    // Deleted over there, which is already the state a void
+                    // is asking for.
+                    return Ok(ProviderVoid::AlreadyVoided);
+                };
+                if matches!(
+                    status,
+                    crate::modules::billing::provider_invoice::quickbooks::QuickBooksInvoiceStatus::Voided
+                ) {
+                    return Ok(ProviderVoid::AlreadyVoided);
+                }
+                self.quickbooks
+                    .void_invoice(&creds, external_invoice_id, &sync_token)
+                    .await
+                    .map(|()| ProviderVoid::Voided)
+            }
+        }
+    }
+
     /// What the provider says has been settled against one delegated bill
     /// (PMS-1543).
     ///

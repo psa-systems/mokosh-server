@@ -648,6 +648,47 @@ impl QuickBooksClient {
     /// `SyncToken` (QBO's optimistic-concurrency check) which the
     /// caller fetched alongside the id when the invoice was issued or
     /// read.
+    /// The status and the `SyncToken` of one invoice, which is what
+    /// voiding it needs (PMS-1544).
+    ///
+    /// QuickBooks requires the token on every write and rejects a stale
+    /// one, so a void is always a read then a write. Both come from one
+    /// GET rather than two: `fetch_invoice_status` answers the status
+    /// alone, and a caller that wanted both would otherwise fetch twice
+    /// and could act on a token from a different read than the status.
+    ///
+    /// `None` for an id this company file does not hold, which is an
+    /// answer and not a failure: an invoice deleted over there is already
+    /// in the state a void is asking for.
+    pub async fn fetch_invoice_void_target(
+        &self,
+        creds: &QuickBooksCredentials,
+        external_invoice_id: &str,
+    ) -> AppResult<Option<(QuickBooksInvoiceStatus, String)>> {
+        let url = format!(
+            "{}/v3/company/{}/invoice/{external_invoice_id}?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksInvoiceEnvelope = match self
+            .call_with_retry(|| {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+            })
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(AppError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let dto = envelope.invoice;
+        // The same classifier the status read uses, so a void decision and
+        // a status read can never disagree about the same invoice.
+        let status = classify_status(&dto);
+        Ok(Some((status, dto.sync_token.clone().unwrap_or_default())))
+    }
+
     pub async fn void_invoice(
         &self,
         creds: &QuickBooksCredentials,
