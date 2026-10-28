@@ -308,9 +308,13 @@ async fn record_bill_payment(
     Json(request): Json<RecordBillPaymentRequest>,
 ) -> AppResult<Json<BillWithPayments>> {
     request.validate()?;
+    // PMS-1545: the operator-facing method, which pushes to the provider
+    // when one holds the bill. The inner `record_bill_payment` is what the
+    // webhook receiver calls, so a payment that arrived FROM a provider is
+    // never pushed back to it.
     let b = state
         .service
-        .record_bill_payment(user.tenant(), id, &request, &ctx)
+        .pay_bill(user.tenant(), id, &request, &ctx)
         .await?;
     Ok(Json(b))
 }

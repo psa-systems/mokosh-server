@@ -1036,6 +1036,98 @@ impl ExpensesService {
         Ok(payment.payments.into_iter().next())
     }
 
+    /// Record a payment an operator is making, and tell the provider when
+    /// it holds the bill (PMS-1545).
+    ///
+    /// The outer half of [`Self::record_bill_payment`], which stays the
+    /// one writer and is deliberately NOT the thing that pushes. The
+    /// inbound receiver calls the inner method (PMS-1543), so a payment
+    /// that arrived FROM a provider can never be pushed back to it: the
+    /// loop is prevented by which method each caller holds rather than by
+    /// a flag somebody has to set correctly. A test asserts the inner one
+    /// sends nothing even on a service that has a dispatcher.
+    ///
+    /// The push runs BEFORE the local write, like every other push in this
+    /// subsystem: a provider that refuses leaves no local payment row, so
+    /// the operator sees a failure and retries rather than ending up with
+    /// a payment Mokosh believes in and the provider does not.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, bill_id = %bill_id))]
+    pub async fn pay_bill(
+        &self,
+        tenant_id: TenantId,
+        bill_id: Uuid,
+        request: &RecordBillPaymentRequest,
+        ctx: &AuditCtx,
+    ) -> AppResult<BillWithPayments> {
+        let delegated = match self.bill_dispatch.as_ref() {
+            Some(dispatcher) if dispatcher.bills_delegation_enabled() => {
+                // Read first so the push has the bill's provider pair and
+                // its vendor, and so a bill in a state that cannot take a
+                // payment is refused before any wire call. The inner
+                // method checks the state again under its row lock, which
+                // is what actually guards it.
+                let bill = self.get_bill(tenant_id, bill_id).await?.bill;
+                match (
+                    bill.external_provider.as_deref(),
+                    bill.external_bill_id.as_deref(),
+                ) {
+                    (Some(provider), Some(external_id)) => {
+                        crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
+                            provider,
+                        )
+                        .map(|kind| (kind, external_id.to_string(), bill.vendor_id))
+                    }
+                    // A bill no provider holds: the local path unchanged,
+                    // which is every bill on a deployment that has not
+                    // delegated.
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        let external_payment_id = match (delegated.as_ref(), self.bill_dispatch.as_ref()) {
+            (Some((provider, external_id, vendor_id)), Some(dispatcher)) => Some(
+                dispatcher
+                    .pay_bill_in_provider(
+                        tenant_id,
+                        *provider,
+                        external_id,
+                        *vendor_id,
+                        request.amount_minor,
+                        request.paid_on,
+                    )
+                    .await?,
+            ),
+            _ => None,
+        };
+
+        // The provider's own payment id goes in the note rather than a
+        // column of its own. PMS-1543 reconciles against the provider's
+        // running total, so nothing keys on this id; what it is for is a
+        // human holding two ledgers, and a migration for a value only a
+        // person reads is a column every consumer then has to learn.
+        let request = match external_payment_id.as_deref() {
+            Some(id) => {
+                let provider = delegated
+                    .as_ref()
+                    .map(|(kind, _, _)| kind.as_str())
+                    .unwrap_or("the provider");
+                let mut annotated = request.clone();
+                annotated.notes = Some(match request.notes.as_deref() {
+                    Some(note) if !note.trim().is_empty() => {
+                        format!("{note}\n\nRecorded in {provider} as payment {id}.")
+                    }
+                    _ => format!("Recorded in {provider} as payment {id}."),
+                });
+                annotated
+            }
+            None => request.clone(),
+        };
+        self.record_bill_payment(tenant_id, bill_id, &request, ctx)
+            .await
+    }
+
     /// Every payment against one bill, newest first.
     pub async fn list_bill_payments(
         &self,
