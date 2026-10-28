@@ -1151,6 +1151,15 @@ impl BillingService {
                 if let Some(pt) = request.payment_term_id {
                     Self::assert_payment_term_in_tenant(&mut pre, tenant_id, pt).await?;
                 }
+                // PMS-1548: the local write's own per-line guard, moved
+                // ahead of the provider call for the same reason the two
+                // above it were: a retired product must reject before
+                // issuing externally, not after.
+                for line in &request.lines {
+                    if let Some(product_id) = line.product_id {
+                        Self::assert_product_sellable(&mut pre, tenant_id, product_id).await?;
+                    }
+                }
                 let (due_date, _) = Self::resolve_due_date(
                     &mut pre,
                     tenant_id,
