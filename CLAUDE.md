@@ -238,3 +238,4 @@ One line per rule, or per group of rules answering one subject, linking its full
 - Ticket-note editing is a tenant policy ([PMS-974](docs/invariants/contacts.md#note-editing-pms-974))
 - A second mail audience is a second event ([PMS-1140](docs/invariants/contacts.md#mail-audiences-pms-1140))
 - The label selection is the import filter ([PSA-70 E, PMS-1358](docs/invariants/contacts.md#sync-labels-psa-70-e-pms-1358))
+- A contact source's connection and its cadence live in contact sync ([PMS-1315](docs/invariants/contacts.md#contact-syncs-own-home-pms-1315))
