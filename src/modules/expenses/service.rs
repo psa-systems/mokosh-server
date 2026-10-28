@@ -1499,6 +1499,7 @@ pub struct CreateBillRequest {
     #[validate(length(max = 2000))]
     pub notes: Option<String>,
     #[validate(length(min = 1, max = 200))]
+    #[validate(nested)]
     pub lines: Vec<BillLineInput>,
 }
 
@@ -1509,10 +1510,14 @@ pub struct BillLineInput {
     #[validate(length(min = 1, max = 500))]
     pub description: String,
     /// Quantity in hundredths, matching the schema and the invoice-line
-    /// convention (so 1.25 = 125).
+    /// convention (so 1.25 = 125). A non-positive quantity is degenerate
+    /// (PMS-1550).
+    #[validate(range(min = 1))]
     pub quantity_hundredths: i64,
+    #[validate(range(min = 0))]
     pub unit_price_minor: i64,
     #[serde(default)]
+    #[validate(range(min = 0))]
     pub tax_minor: i64,
     #[serde(default)]
     pub position: i32,
@@ -1527,6 +1532,7 @@ pub struct CreateExpenseRequest {
     #[validate(length(max = 2000))]
     pub notes: Option<String>,
     #[validate(length(min = 1, max = 200))]
+    #[validate(nested)]
     pub lines: Vec<ExpenseLineInput>,
 }
 
@@ -1536,8 +1542,10 @@ pub struct ExpenseLineInput {
     pub category_id: Option<Uuid>,
     #[validate(length(min = 1, max = 500))]
     pub description: String,
+    #[validate(range(min = 0))]
     pub amount_minor: i64,
     #[serde(default)]
+    #[validate(range(min = 0))]
     pub tax_minor: i64,
     #[serde(default)]
     pub position: i32,
