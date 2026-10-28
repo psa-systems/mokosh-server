@@ -14,6 +14,12 @@
 //! vendors (which vendor a bill is raised against over there) and
 //! expense accounts (which ledger account a category's lines post to),
 //! called by the same Mappings page since MAPPS-1156.
+//!
+//! PMS-1541 added the people half, two more: which contact a member of
+//! the tenant is in the provider, which a reimbursement names. Xero
+//! refuses a bank transaction without one, where QuickBooks sends it as
+//! an optional `EntityRef`; the Mappings page has said which is which
+//! since MAPPS-1168.
 //! Those four read `Feature::DelegatedBills`, not
 //! `Feature::DelegatedInvoiceIssuer`, because they serve a different
 //! switch: a deployment can delegate bills without delegating invoices,
@@ -98,12 +104,6 @@ pub fn invoice_issuer_mapping_routes(state: InvoiceIssuerMappingRouterState) -> 
             "/invoice-issuer-mappings/expense-accounts/{provider}/{category_id}",
             put(upsert_expense_account_mapping),
         )
-        // parity record 2026-10-27 (PMS-1541): no SPA caller yet for
-        // "/invoice-issuer-mappings/people" or
-        // "/invoice-issuer-mappings/people/{provider}/{user_id}".
-        // MAPPS-1168 builds it. The routes land with the dispatcher that
-        // reads them, because Xero refuses a reimbursement with no contact
-        // and an admin needs somewhere to say who somebody is over there.
         .route("/invoice-issuer-mappings/people", get(list_user_mappings))
         .route(
             "/invoice-issuer-mappings/people/{provider}/{user_id}",

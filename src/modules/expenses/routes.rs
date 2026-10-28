@@ -31,11 +31,10 @@
 //! The claim routes are called by `/expenses` in mokosh-apps
 //! (MAPPS-1163), so the record that exempted them is gone with them.
 //!
-//! parity record 2026-10-26 (PMS-1536): one path has no SPA caller yet,
-//! named literally per MAPPS-1083 so the exemption covers it and nothing
-//! else. MAPPS-1166 builds the caller: recording a payment from the bill
-//! page and showing what has been paid.
-//! - /bills/{id}/payments
+//! The payment routes are called by `/bills/{id}` in mokosh-apps
+//! (MAPPS-1166), so the last record in this file is gone too: every route
+//! it mounts now has a caller, and `check-route-consumers` checks them
+//! all again.
 
 use std::sync::Arc;
 

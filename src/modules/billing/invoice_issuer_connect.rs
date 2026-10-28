@@ -460,7 +460,8 @@ impl InvoiceIssuerConnectService {
     ) -> AppResult<InvoiceIssuerOverview> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let row: Option<OverviewRow> = sqlx::query_as(
-            "SELECT status, enabled_capabilities, external_organisation_id, last_error \
+            "SELECT status, enabled_capabilities, external_organisation_id, \
+                    external_payment_account_id, last_error \
              FROM integrations WHERE tenant_id = $1 AND provider = $2",
         )
         .bind(tenant_id)
@@ -487,6 +488,7 @@ impl InvoiceIssuerConnectService {
                 delegation_enabled,
                 bills_delegated: false,
                 bills_delegation_enabled,
+                payment_account_id: None,
                 last_error: None,
             });
         };
@@ -509,6 +511,7 @@ impl InvoiceIssuerConnectService {
                 .iter()
                 .any(|c| c == Capability::BillsAndExpenses.as_str()),
             bills_delegation_enabled,
+            payment_account_id: row.external_payment_account_id,
             last_error: row.last_error,
         })
     }
@@ -644,6 +647,13 @@ pub struct InvoiceIssuerOverview {
     /// (MAPPS-1155). Its own switch, so a card that reports the invoice
     /// one would be answering a different question.
     pub bills_delegation_enabled: bool,
+    /// The provider account a reimbursement is paid from (PMS-1541).
+    ///
+    /// Read back as well as written, because a settings field that cannot
+    /// show its current value is a write-only form: an admin would have no
+    /// way to tell "not set yet" from "set to something I cannot see".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -654,6 +664,7 @@ struct OverviewRow {
     status: String,
     enabled_capabilities: Vec<String>,
     external_organisation_id: Option<String>,
+    external_payment_account_id: Option<String>,
     last_error: Option<String>,
 }
 
@@ -813,11 +824,6 @@ pub fn invoice_issuer_connect_routes(service: Arc<InvoiceIssuerConnectService>) 
             "/integrations/invoice-issuer/{provider}/bills",
             put(set_bills_delegation),
         )
-        // parity record 2026-10-27 (PMS-1541): no SPA caller yet for
-        // "/integrations/invoice-issuer/{provider}/payment-account".
-        // MAPPS-1168 builds it; the route lands with the dispatcher that
-        // reads the value, because a push refused for a missing account an
-        // admin cannot set would be a dead end.
         .route(
             "/integrations/invoice-issuer/{provider}/payment-account",
             put(set_payment_account),
