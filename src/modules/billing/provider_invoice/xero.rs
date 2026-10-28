@@ -862,10 +862,15 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Duration {
 /// today (zero-decimal currencies are out of scope for the first
 /// Xero slice, same as `provider::stripe`).
 fn minor_to_decimal(minor: i64, places: u32) -> String {
-    let scale: i64 = 10_i64.pow(places);
-    let whole = minor / scale;
-    let frac = (minor % scale).abs();
-    format!("{whole}.{frac:0width$}", width = places as usize)
+    let scale: u64 = 10_u64.pow(places);
+    let sign = if minor < 0 { "-" } else { "" };
+    let abs = minor.unsigned_abs();
+    format!(
+        "{sign}{}.{:0width$}",
+        abs / scale,
+        abs % scale,
+        width = places as usize
+    )
 }
 
 /// Whether an access token is close enough to expiry that the caller
@@ -928,6 +933,9 @@ mod tests {
         // A negative-sign case is a credit note's shape; print the
         // fraction unsigned so "-123.45" never becomes "-123.-45".
         assert_eq!(minor_to_decimal(-12345, 2), "-123.45");
+        // |minor| < scale: the whole part collapses to 0, so the sign
+        // must come from the input, not from a nonzero whole part.
+        assert_eq!(minor_to_decimal(-50, 2), "-0.50");
     }
 
     #[test]
