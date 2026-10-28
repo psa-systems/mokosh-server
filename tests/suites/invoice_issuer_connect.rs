@@ -872,3 +872,65 @@ async fn a_deployment_without_an_application_cannot_connect(pool: PgPool) {
         "and no state is minted for a flow that cannot run"
     );
 }
+
+/// PMS-1533: two tenants connecting to the same Xero organisation is a
+/// collision, not a race. Without `idx_integrations_provider_external_org`
+/// both rows would carry `external_organisation_id = 'xero-org-1'` and
+/// `tenant_for_external_organisation` would have no way to tell them apart.
+#[mokosh_test]
+async fn a_second_tenant_cannot_claim_an_organisation_the_first_already_connected(pool: PgPool) {
+    let (_script, base) = start_stub().await;
+    let (admin, _email, _password) = common::seed_admin(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+
+    let url = svc
+        .begin(tenant, admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    svc.complete(InvoiceProviderKind::Xero, &state_from(&url), "code", None)
+        .await
+        .expect("the first tenant connects cleanly");
+
+    let (other_tenant_id, other_admin, _other_email, _other_password) =
+        common::seed_tenant_with_admin(&pool, "other-msp").await;
+    let other_tenant = TenantId::from_trusted(other_tenant_id);
+
+    let other_url = svc
+        .begin(other_tenant, other_admin, InvoiceProviderKind::Xero)
+        .await
+        .expect("begin");
+    let err = svc
+        .complete(
+            InvoiceProviderKind::Xero,
+            &state_from(&other_url),
+            "code",
+            None,
+        )
+        .await
+        .expect_err("the organisation is already claimed by the first tenant");
+    assert!(
+        matches!(&err, AppError::Conflict(m) if m.contains("Another tenant")),
+        "{err:?}"
+    );
+
+    let row = integration_row(&pool, "xero").await.expect("a row");
+    assert_eq!(
+        row.2.as_deref(),
+        Some("xero-org-1"),
+        "the first tenant's row is unchanged"
+    );
+    let other_row: Option<(String, Vec<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, enabled_capabilities, external_organisation_id \
+         FROM integrations WHERE tenant_id = $1 AND provider = $2",
+    )
+    .bind(other_tenant_id)
+    .bind("xero")
+    .fetch_optional(&pool)
+    .await
+    .expect("read the integrations row");
+    assert!(
+        other_row.is_none(),
+        "the rejected tenant gets no row at all, not a half-written one: {other_row:?}"
+    );
+}
