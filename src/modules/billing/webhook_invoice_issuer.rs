@@ -187,6 +187,10 @@ use crate::utils::error::{AppError, AppResult};
 #[derive(Clone)]
 pub struct InvoiceIssuerWebhookState {
     pub billing: Arc<BillingService>,
+    /// PMS-1543: the bills half. A delegated bill's paid total has one
+    /// writer (PMS-1536) and it lives here, so the receiver goes through
+    /// it rather than writing the columns itself.
+    pub expenses: Arc<crate::modules::expenses::ExpensesService>,
     pub dispatcher: Arc<IssuerDispatcher>,
     /// Which provider this mount serves, so one handler serves both.
     pub provider: InvoiceProviderKind,
@@ -244,15 +248,21 @@ struct QuickBooksEntity {
     id: String,
 }
 
-/// The invoice ids one delivery names, in the order the provider sent
+/// The document ids one delivery names, in the order the provider sent
 /// them.
 ///
-/// Only invoice events: both providers multiplex every resource type they
-/// were subscribed to onto one stream, and a contact or a payment event
-/// names an id that is not an invoice id. Looking those up would find
-/// nothing, which is harmless, but it would also record a delivery as
-/// "matched nothing" when the honest answer is that it was never about an
-/// invoice.
+/// Invoices and bills (PMS-1543), and nothing else: both providers
+/// multiplex every resource type they were subscribed to onto one stream,
+/// and a contact event names an id that is neither. Looking those up would
+/// find nothing, which is harmless, but it would also record a delivery as
+/// "matched nothing" when the honest answer is that it was never about a
+/// document this receiver handles.
+///
+/// Xero needs no filter change for bills: an `ACCPAY` bill IS an invoice
+/// there, delivered under the same `INVOICE` category, which is why those
+/// events were already arriving and being dropped by the lookup. The
+/// document type is settled by asking the provider, in
+/// `external_bill_settlement`.
 fn invoice_events(provider: InvoiceProviderKind, body: &[u8]) -> AppResult<Vec<InvoiceEvent>> {
     match provider {
         InvoiceProviderKind::Xero => {
@@ -281,7 +291,16 @@ fn invoice_events(provider: InvoiceProviderKind, body: &[u8]) -> AppResult<Vec<I
                     n.data_change_event
                         .into_iter()
                         .flat_map(|c| c.entities)
-                        .filter(|e| e.name.eq_ignore_ascii_case("Invoice"))
+                        // PMS-1543: `Bill` as well as `Invoice`. QuickBooks
+                        // keeps the two on separate resources, so the
+                        // entity name is the only way to tell which
+                        // document an id belongs to, and a bill the
+                        // accountant paid over there arrives here as a
+                        // `Bill` change.
+                        .filter(|e| {
+                            e.name.eq_ignore_ascii_case("Invoice")
+                                || e.name.eq_ignore_ascii_case("Bill")
+                        })
                         .map(move |e| InvoiceEvent {
                             organisation_id: realm_id.clone(),
                             external_invoice_id: e.id,
@@ -434,6 +453,78 @@ impl Outcome {
     }
 }
 
+/// One event that was not an invoice, tried as a bill (PMS-1543).
+///
+/// The MSP's accountant works in the provider, so the provider is where a
+/// delegated bill is most likely to be paid. Before this, every such event
+/// was dropped: `paid_minor` stayed 0 and the status stayed `approved`
+/// here, so the payables ledger answered "what do we owe" with money that
+/// had already left the MSP's account, and nothing surfaced the
+/// disagreement.
+///
+/// Reconciled against the provider's running total rather than the event's
+/// contents, so a redelivery records nothing by arithmetic. The provider
+/// is asked what it holds, which is the same shape the invoice path uses
+/// for status: a webhook says "this changed", never "this is the new
+/// value".
+async fn apply_bill_event(
+    state: &InvoiceIssuerWebhookState,
+    tenant_id: TenantId,
+    external_id: &str,
+) -> AppResult<Outcome> {
+    let provider = state.provider;
+    let Some(local) = state
+        .expenses
+        .delegated_bill(tenant_id, provider.as_str(), external_id)
+        .await?
+    else {
+        return Ok(Outcome::Ignored);
+    };
+    let Some(settlement) = state
+        .dispatcher
+        .external_bill_settlement(tenant_id, provider, external_id)
+        .await?
+    else {
+        // The id is not a bill over there after all: on Xero it was a
+        // receivable sharing the invoice category, which the lookup above
+        // cannot tell apart on its own.
+        return Ok(Outcome::Ignored);
+    };
+    if settlement.voided {
+        // A bill the provider voided is a disagreement worth a human, not
+        // a local void: voiding here would discard the MSP's own record of
+        // what it was billed, and `void_bill` is their decision to make.
+        tracing::warn!(
+            bill_id = %local.id,
+            "provider reports this delegated bill voided; left for an operator"
+        );
+        return Ok(Outcome::Unreconciled);
+    }
+    let recorded = state
+        .expenses
+        .reconcile_external_bill_payment(
+            tenant_id,
+            &crate::modules::expenses::service::ExternalBillPaymentReport {
+                provider: provider.as_str(),
+                external_bill_id: external_id,
+                provider_paid_minor: settlement.paid_minor,
+                // Today, not a date read off the event: what is recorded is
+                // that the money has left by now, and the two providers do
+                // not agree on where a payment date lives in a webhook.
+                paid_on: chrono::Utc::now().date_naive(),
+            },
+            &crate::modules::audit::AuditCtx::system(*tenant_id),
+        )
+        .await?;
+    Ok(if recorded.is_some() {
+        Outcome::Accepted
+    } else {
+        // Level with the provider already, which is what every redelivery
+        // after the first looks like.
+        Outcome::Ignored
+    })
+}
+
 /// One event, for the tenant it resolved to.
 async fn apply_one(
     state: &InvoiceIssuerWebhookState,
@@ -450,10 +541,13 @@ async fn apply_one(
             .delegated_invoice(tenant_id, provider.as_str(), external_id)
             .await?
         else {
-            // A provider re-delivers, and it delivers events for invoices
-            // this tenant created in the provider's own UI. Neither is an
-            // error, and answering with one makes them retry forever.
-            return Ok(Outcome::Ignored);
+            // Not an invoice this tenant holds. It may be a BILL this
+            // tenant holds (PMS-1543), which is the common case on Xero,
+            // where a bill is an invoice and arrives under the same
+            // category. Anything that is neither is a document created in
+            // the provider's own UI or a redelivery: not an error, and
+            // answering with one makes them retry forever.
+            return apply_bill_event(state, tenant_id, external_id).await;
         };
 
         match state

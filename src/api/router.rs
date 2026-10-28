@@ -1174,6 +1174,13 @@ pub fn create_api_router(
                         encryption_key,
                         secrets.clone(),
                     )),
+                    // PMS-1543: its own instance rather than the serving
+                    // one, which `expenses_routes` has taken by value. It
+                    // carries no bill dispatch on purpose: this path
+                    // RECORDS what the provider already did, and a push
+                    // back out from here would be the loop PMS-1545 has to
+                    // avoid.
+                    expenses: Arc::new(crate::modules::expenses::ExpensesService::new(db.clone())),
                     dispatcher: issuer_dispatcher.clone(),
                     provider,
                 },
