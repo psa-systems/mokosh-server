@@ -191,17 +191,22 @@ async fn vendor_bill_expense_reimburse_workflow(pool: PgPool) {
         .expect("submit");
     assert_eq!(submitted.status, "submitted");
 
-    // Reimburse before approve is a conflict (allowed_from = ["approved"]):
-    // names the current state and the target, not a bare from/to message
-    // (PMS-1538).
+    // Reimburse before approve is a conflict, and the refusal names the
+    // step that is missing rather than reciting both states (PMS-1538).
+    // This pair had fallen through to "no remedy is defined yet", and it is
+    // the one somebody actually hits: finance opens a submitted claim and
+    // tries to pay it back before anybody approved it.
     let too_early_msg = conflict_message(
         svc.reimburse_expense(tenant, expense.expense.id, &ctx())
             .await,
     );
     assert!(
-        too_early_msg.contains("submitted") && too_early_msg.contains("reimbursed"),
-        "PMS-1538: cannot reimburse a submitted expense, and the refusal must name why: \
-         {too_early_msg:?}"
+        too_early_msg.contains("Approve it first"),
+        "PMS-1538: the refusal names the next step: {too_early_msg:?}"
+    );
+    assert!(
+        !too_early_msg.starts_with("Cannot move"),
+        "and never the bare shape this ticket removed: {too_early_msg:?}"
     );
 
     let approved_exp = svc
