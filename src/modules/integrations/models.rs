@@ -49,7 +49,6 @@ impl From<Capability> for CapabilityDescriptorResponse {
 pub struct ManagedElsewhereResponse {
     pub table: String,
     pub configured_at: String,
-    pub issue: String,
 }
 
 /// Where a provider's credential is entered, when it is not entered here
@@ -226,11 +225,9 @@ impl IntegrationResponse {
                 ConnectionHome::Elsewhere {
                     table,
                     configured_at,
-                    issue,
                 } => Some(ManagedElsewhereResponse {
                     table: table.to_string(),
                     configured_at: configured_at.to_string(),
-                    issue: issue.to_string(),
                 }),
             },
             credential_elsewhere: credential_elsewhere(descriptor),

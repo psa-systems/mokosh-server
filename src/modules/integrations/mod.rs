@@ -22,7 +22,7 @@
 //! not answer that too while it does, so each registry entry names the subsystem
 //! that owns its connection and the service refuses `connect`, `disconnect` and a
 //! capability change for a provider whose home is elsewhere, naming where it is
-//! configured and the issue that moves it. No row is written for such a provider
+//! configured instead. No row is written for such a provider
 //! at all, so the two tables cannot disagree in the meantime. PMS-1315 flips the
 //! remaining entry and backfills its rows in the same change.
 //!
