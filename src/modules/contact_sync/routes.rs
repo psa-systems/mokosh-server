@@ -95,12 +95,6 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
             post(disconnect_microsoft),
         )
         .route("/integrations/contact-sync/selection", put(set_selection))
-        // Parity record 2026-10-28 (PMS-1315): the SPA does not name
-        // "/integrations/contact-sync/schedule" yet. The server half of
-        // "polling frequency is configurable" lands first because the
-        // control has nothing to call until it does; the Settings card
-        // that sets it is MAPPS-1174, and this record goes when that
-        // lands.
         .route("/integrations/contact-sync/schedule", put(set_schedule))
         .route("/integrations/contact-sync/preview", post(preview))
         .route(
