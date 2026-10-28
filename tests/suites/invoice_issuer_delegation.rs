@@ -61,6 +61,15 @@ struct Calls {
     /// When set, the issue endpoint answers this status with a plain body
     /// instead of an invoice.
     refuse_with: Option<StatusCode>,
+    /// PMS-1544: each void the provider was asked for, as
+    /// `(external_id, body)`. Counting them is the point: the amendment
+    /// has to void the invoice it replaces exactly once.
+    voids: Vec<(String, Value)>,
+    /// What the provider says the invoice's status is when asked, which is
+    /// what decides `Voided` against `AlreadyVoided`.
+    xero_status: String,
+    /// When set, the void endpoint answers this status instead of voiding.
+    void_refuses_with: Option<StatusCode>,
 }
 
 type Stub = Arc<Mutex<Calls>>;
@@ -100,6 +109,77 @@ async fn quickbooks_issue(State(stub): State<Stub>, Json(body): Json<Value>) -> 
     )
 }
 
+/// `GET /Invoices/{id}`: what Xero says the invoice is now (PMS-1544).
+async fn xero_invoice_status(
+    State(stub): State<Stub>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let status = stub.lock().unwrap().xero_status.clone();
+    Json(json!({
+        "Invoices": [{
+            "InvoiceID": id,
+            "InvoiceNumber": "INV-0042",
+            "Type": "ACCREC",
+            "Status": status,
+        }]
+    }))
+}
+
+/// `POST /Invoices/{id}` carrying `{"Status": "VOIDED"}` (PMS-1544).
+async fn xero_void(
+    State(stub): State<Stub>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let mut calls = stub.lock().unwrap();
+    calls.voids.push((id.clone(), body));
+    if let Some(status) = calls.void_refuses_with {
+        return (status, Json(json!({ "Message": "the provider refused" })));
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "Invoices": [{ "InvoiceID": id, "Status": "VOIDED" }] })),
+    )
+}
+
+/// `GET /invoice/{id}`: QuickBooks answers the status through its balance
+/// and its `SyncToken`, which a void has to carry.
+async fn quickbooks_invoice_read(
+    State(_stub): State<Stub>,
+    axum::extract::Path((_realm, id)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    Json(json!({
+        "Invoice": {
+            "Id": id,
+            "SyncToken": "3",
+            "DocNumber": "1042",
+            "TotalAmt": 300.0,
+            "Balance": 300.0,
+        }
+    }))
+}
+
+/// `POST /invoice?operation=void` (PMS-1544).
+async fn quickbooks_void(State(stub): State<Stub>, Json(body): Json<Value>) -> impl IntoResponse {
+    let mut calls = stub.lock().unwrap();
+    let id = body
+        .get("Id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    calls.voids.push((id.clone(), body));
+    if let Some(status) = calls.void_refuses_with {
+        return (
+            status,
+            Json(json!({ "Fault": { "type": "ValidationFault" } })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "Invoice": { "Id": id, "SyncToken": "4", "Balance": 0.0 } })),
+    )
+}
+
 async fn token(State(stub): State<Stub>) -> impl IntoResponse {
     stub.lock().unwrap().token += 1;
     Json(json!({
@@ -113,13 +193,48 @@ async fn token(State(stub): State<Stub>) -> impl IntoResponse {
 
 /// One stub serving both providers' endpoints, since a case only ever
 /// delegates to one of them and the paths do not collide.
+/// One POST handler for the QuickBooks invoice collection: `operation=void`
+/// is a void, anything else is an issue (PMS-1544).
+async fn quickbooks_dispatch(
+    State(stub): State<Stub>,
+    uri: axum::http::Uri,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let is_void = uri.query().unwrap_or_default().contains("operation=void");
+    if is_void {
+        quickbooks_void(State(stub), Json(body))
+            .await
+            .into_response()
+    } else {
+        quickbooks_issue(State(stub), Json(body))
+            .await
+            .into_response()
+    }
+}
+
 async fn start_stub() -> (Stub, String) {
-    let stub: Stub = Arc::new(Mutex::new(Calls::default()));
+    let stub: Stub = Arc::new(Mutex::new(Calls {
+        xero_status: "AUTHORISED".to_string(),
+        ..Calls::default()
+    }));
     let app = axum::Router::new()
         .route("/api.xro/2.0/Invoices", axum::routing::post(xero_issue))
+        // PMS-1544: the void is a POST to the invoice's own URL, and the
+        // dispatcher reads the status first, so both verbs on that path.
+        .route(
+            "/api.xro/2.0/Invoices/{id}",
+            axum::routing::get(xero_invoice_status).post(xero_void),
+        )
+        .route(
+            "/v3/company/{realm}/invoice/{id}",
+            axum::routing::get(quickbooks_invoice_read),
+        )
         .route(
             "/v3/company/{realm}/invoice",
-            axum::routing::post(quickbooks_issue),
+            // Issue and void share the collection URL; `operation=void` in
+            // the query is what tells them apart, so the stub reads the
+            // body's `Id` the way Intuit does.
+            axum::routing::post(quickbooks_dispatch),
         )
         .route("/connect/token", axum::routing::post(token))
         .route("/oauth2/v1/tokens/bearer", axum::routing::post(token))
@@ -280,6 +395,43 @@ fn request(company_id: Uuid) -> CreateInvoiceRequest {
             sort_order: 0,
         }],
     }
+}
+
+/// A send that attests to a delivery made outside Mokosh, which is what
+/// every test here wants: the point is the provider call, not the mail.
+fn send_request() -> mokosh_server::modules::billing::models::UpdateInvoiceRequest {
+    use mokosh_server::modules::billing::models::{
+        DeliveryMethod, DeliveryRequest, InvoiceStatus, UpdateInvoiceRequest,
+    };
+    UpdateInvoiceRequest {
+        company_id: None,
+        billing_contact_id: None,
+        contract_id: None,
+        invoice_date: None,
+        due_date: None,
+        payment_terms: None,
+        payment_term_id: None,
+        tax_amount: None,
+        tax_rate_id: None,
+        discount_amount: None,
+        notes: None,
+        po_number: None,
+        lines: None,
+        status: Some(InvoiceStatus::Sent),
+        delivery: Some(DeliveryRequest {
+            method: DeliveryMethod::Other,
+            note: Some("Delivered outside Mokosh for this test".to_string()),
+        }),
+        legacy_skip_email: None,
+    }
+}
+
+async fn invoice_status(pool: &PgPool, id: Uuid) -> String {
+    sqlx::query_scalar("SELECT status FROM invoices WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read the invoice status")
 }
 
 /// The five columns that record how an invoice was sent, read as one row.
@@ -940,4 +1092,353 @@ async fn a_tenant_that_delegated_nothing_keeps_the_local_path(pool: PgPool) {
         .await
         .expect("the row exists");
     assert_eq!((columns.0, columns.1, columns.2), (None, None, None));
+}
+
+// ── Voiding the provider's copy (PMS-1544) ───────────────────────────────
+
+/// Amend a delegated invoice, send the replacement, and the provider's
+/// copy of the original is voided too.
+///
+/// This is the only local path that voids a delegated invoice:
+/// `void_invoice` takes `draft` or `pending` and a delegated invoice is
+/// created `sent` (MAPPS-1135), so PMS-1334's amendment is where it
+/// happens. Before this, the customer kept being chased from the provider
+/// for a document the MSP had replaced.
+#[mokosh_test]
+async fn an_amendment_voids_the_replaced_invoice_in_xero(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (billing, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    delegate(&pool, common::DEFAULT_TENANT_ID, "xero").await;
+    seed_xero_blob(&secrets, common::DEFAULT_TENANT_ID, 55).await;
+    InvoiceIssuerMappingService::new(db)
+        .upsert_customer_mapping(
+            tenant,
+            InvoiceProviderKind::Xero,
+            company_id,
+            "3f6c6a2e-9d41-4a39-9f6a-6d1a1c2b3d4e",
+        )
+        .await
+        .expect("map the company");
+
+    let original = billing
+        .create_invoice(
+            tenant,
+            &request(company_id),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create the invoice");
+    let external_id = external_columns(&pool, original.id)
+        .await
+        .expect("the row exists")
+        .1
+        .expect("a delegated invoice carries the provider's id");
+
+    let amendment = billing
+        .amend_invoice(
+            tenant,
+            original.id,
+            "UTC",
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("amend");
+    assert!(
+        stub.lock().unwrap().voids.is_empty(),
+        "creating the amendment voids nothing: sending it is the act that replaces"
+    );
+
+    billing
+        .update_invoice(
+            tenant,
+            amendment.id,
+            &send_request(),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("send the amendment");
+
+    let voids = stub.lock().unwrap().voids.clone();
+    assert_eq!(voids.len(), 1, "the original is voided once");
+    assert_eq!(voids[0].0, external_id, "and it is the ORIGINAL's id");
+    assert_eq!(
+        voids[0].1["Status"], "VOIDED",
+        "which is the one field a Xero void sends: {:?}",
+        voids[0].1
+    );
+}
+
+/// QuickBooks, same contract through its own wire shape: the void carries
+/// the id and the `SyncToken` the read just returned.
+#[mokosh_test]
+async fn an_amendment_voids_the_replaced_invoice_in_quickbooks(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (billing, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    delegate(&pool, common::DEFAULT_TENANT_ID, "quickbooks").await;
+    seed_quickbooks_blob(&secrets, common::DEFAULT_TENANT_ID).await;
+    let product_id = seed_product(&pool).await;
+    let mappings = InvoiceIssuerMappingService::new(db);
+    mappings
+        .upsert_customer_mapping(tenant, InvoiceProviderKind::Quickbooks, company_id, "58")
+        .await
+        .expect("map the company");
+    mappings
+        .upsert_product_mapping(tenant, InvoiceProviderKind::Quickbooks, product_id, "12")
+        .await
+        .expect("map the product");
+
+    let mut body = request(company_id);
+    body.lines[0].product_id = Some(product_id);
+    let original = billing
+        .create_invoice(tenant, &body, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect("create the invoice");
+    let external_id = external_columns(&pool, original.id)
+        .await
+        .expect("the row exists")
+        .1
+        .expect("a delegated invoice carries the provider's id");
+
+    let amendment = billing
+        .amend_invoice(
+            tenant,
+            original.id,
+            "UTC",
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("amend");
+    billing
+        .update_invoice(
+            tenant,
+            amendment.id,
+            &send_request(),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("send the amendment");
+
+    let voids = stub.lock().unwrap().voids.clone();
+    assert_eq!(voids.len(), 1);
+    assert_eq!(voids[0].0, external_id);
+    assert_eq!(
+        voids[0].1["SyncToken"], "3",
+        "QuickBooks rejects a write without the current token: {:?}",
+        voids[0].1
+    );
+}
+
+/// An invoice the provider has already voided is not voided twice.
+///
+/// The provider's own webhook can get here first, and a second void
+/// answers an error that reads like a refusal. Asking first turns the
+/// common case into agreement.
+#[mokosh_test]
+async fn an_invoice_the_provider_already_voided_is_not_voided_again(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (billing, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    delegate(&pool, common::DEFAULT_TENANT_ID, "xero").await;
+    seed_xero_blob(&secrets, common::DEFAULT_TENANT_ID, 55).await;
+    InvoiceIssuerMappingService::new(db)
+        .upsert_customer_mapping(
+            tenant,
+            InvoiceProviderKind::Xero,
+            company_id,
+            "3f6c6a2e-9d41-4a39-9f6a-6d1a1c2b3d4e",
+        )
+        .await
+        .expect("map the company");
+
+    let original = billing
+        .create_invoice(
+            tenant,
+            &request(company_id),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create the invoice");
+    let amendment = billing
+        .amend_invoice(
+            tenant,
+            original.id,
+            "UTC",
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("amend");
+    stub.lock().unwrap().xero_status = "VOIDED".to_string();
+
+    billing
+        .update_invoice(
+            tenant,
+            amendment.id,
+            &send_request(),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("the amendment still goes out");
+
+    assert!(
+        stub.lock().unwrap().voids.is_empty(),
+        "nothing was voided, because it already was"
+    );
+    assert_eq!(
+        invoice_status(&pool, original.id).await,
+        "void",
+        "and the local original is void either way"
+    );
+}
+
+/// A provider that refuses the void rolls the whole send back.
+///
+/// The ordering argument PMS-991 settled for email, pointed at a void: a
+/// replacement that goes out while the thing it replaces stays payable is
+/// worse than a send that did not happen, and the operator can retry.
+#[mokosh_test]
+async fn a_refused_void_rolls_the_send_back(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (billing, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    delegate(&pool, common::DEFAULT_TENANT_ID, "xero").await;
+    seed_xero_blob(&secrets, common::DEFAULT_TENANT_ID, 55).await;
+    InvoiceIssuerMappingService::new(db)
+        .upsert_customer_mapping(
+            tenant,
+            InvoiceProviderKind::Xero,
+            company_id,
+            "3f6c6a2e-9d41-4a39-9f6a-6d1a1c2b3d4e",
+        )
+        .await
+        .expect("map the company");
+
+    let original = billing
+        .create_invoice(
+            tenant,
+            &request(company_id),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create the invoice");
+    let amendment = billing
+        .amend_invoice(
+            tenant,
+            original.id,
+            "UTC",
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("amend");
+    stub.lock().unwrap().void_refuses_with = Some(StatusCode::BAD_REQUEST);
+
+    let err = billing
+        .update_invoice(
+            tenant,
+            amendment.id,
+            &send_request(),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect_err("the provider refused the void");
+
+    assert!(
+        !stub.lock().unwrap().voids.is_empty(),
+        "the provider WAS asked: {err:?}"
+    );
+    assert_eq!(
+        invoice_status(&pool, original.id).await,
+        "sent",
+        "the original is still the invoice the customer owes"
+    );
+    assert_eq!(
+        invoice_status(&pool, amendment.id).await,
+        "draft",
+        "and the replacement never went out, so there is one document and not two"
+    );
+}
+
+/// With delegated issuing switched off, the local void stands and nothing
+/// is sent.
+///
+/// The amendment is the MSP's decision and refusing it would strand them;
+/// a deployment that has said "do not talk to the provider" gets the
+/// warning rather than the call.
+#[mokosh_test]
+async fn the_switch_off_voids_locally_and_calls_nothing(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    // Delegated while the flag was on, so the row carries a provider id.
+    let (delegating, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+    delegate(&pool, common::DEFAULT_TENANT_ID, "xero").await;
+    seed_xero_blob(&secrets, common::DEFAULT_TENANT_ID, 55).await;
+    InvoiceIssuerMappingService::new(db)
+        .upsert_customer_mapping(
+            tenant,
+            InvoiceProviderKind::Xero,
+            company_id,
+            "3f6c6a2e-9d41-4a39-9f6a-6d1a1c2b3d4e",
+        )
+        .await
+        .expect("map the company");
+    let original = delegating
+        .create_invoice(
+            tenant,
+            &request(company_id),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("create the invoice");
+    stub.lock().unwrap().issue.clear();
+
+    // The operator then switches delegating off.
+    let (local_only, _db, _secrets) = service_with_dispatch(&pool, &base, false).await;
+    let amendment = local_only
+        .amend_invoice(
+            tenant,
+            original.id,
+            "UTC",
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("amend");
+    local_only
+        .update_invoice(
+            tenant,
+            amendment.id,
+            &send_request(),
+            &AuditCtx::system(common::DEFAULT_TENANT_ID),
+        )
+        .await
+        .expect("send the amendment");
+
+    // Copied out rather than asserted under the guard: `drop` before the
+    // next await is not enough for `clippy::await_holding_lock`, which
+    // reads the binding's scope and not the drop.
+    let (voids, issues) = {
+        let calls = stub.lock().unwrap();
+        (calls.voids.len(), calls.issue.len())
+    };
+    assert_eq!(voids, 0, "no void was sent");
+    assert_eq!(
+        issues, 0,
+        "and the replacement was not issued over there either"
+    );
+    assert_eq!(invoice_status(&pool, original.id).await, "void");
 }
