@@ -918,6 +918,124 @@ impl ExpensesService {
         })
     }
 
+    /// The delegated bill one provider id names, for the webhook receiver
+    /// (PMS-1543).
+    ///
+    /// The bill half of `BillingService::delegated_invoice`, and keyed the
+    /// same way: tenant, provider and the provider's own id. Returns the
+    /// three figures reconciliation needs rather than the whole row,
+    /// because the receiver's job is arithmetic.
+    pub async fn delegated_bill(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+        external_bill_id: &str,
+    ) -> AppResult<Option<DelegatedBillRow>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<DelegatedBillRow> = sqlx::query_as(
+            "SELECT id, status, total_minor, paid_minor, currency FROM bills \
+             WHERE tenant_id = $1 AND external_provider = $2 AND external_bill_id = $3",
+        )
+        .bind(tenant_id)
+        .bind(provider)
+        .bind(external_bill_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Record what the provider says it has paid against a delegated bill
+    /// (PMS-1543).
+    ///
+    /// Reconciles rather than appends: the caller passes the provider's
+    /// RUNNING total, and this writes the difference against what Mokosh
+    /// already holds. A redelivered webhook therefore records nothing
+    /// because the difference is zero, which is idempotency by arithmetic
+    /// rather than by a dedupe column somebody has to keep unique.
+    ///
+    /// Returns the payment it wrote, or `None` when there was nothing to
+    /// write. Three ways to get `None`, all of them ordinary: the provider
+    /// is level with Mokosh, the bill is already fully paid here, or the
+    /// bill is in a state that cannot take a payment (a void bill whose
+    /// provider copy was paid is a disagreement to surface, not one to
+    /// paper over by writing anyway).
+    ///
+    /// An amount beyond the remaining balance is recorded UP TO the
+    /// balance and the excess logged. The local refusal that
+    /// `record_bill_payment` gives a human is the right answer when a
+    /// person is typing; here the provider has already committed the
+    /// payment, and refusing it would leave the two ledgers disagreeing,
+    /// which is the thing this path exists to stop.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, external_bill_id = %report.external_bill_id))]
+    pub async fn reconcile_external_bill_payment(
+        &self,
+        tenant_id: TenantId,
+        report: &ExternalBillPaymentReport<'_>,
+        ctx: &AuditCtx,
+    ) -> AppResult<Option<BillPayment>> {
+        let ExternalBillPaymentReport {
+            provider,
+            external_bill_id,
+            provider_paid_minor,
+            paid_on,
+        } = *report;
+        // The bill is resolved from the provider's id rather than passed
+        // in: the caller holds only that id, and one that passed both could
+        // pass a figure from one bill with the id of another.
+        let Some(bill) = self
+            .delegated_bill(tenant_id, provider, external_bill_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if bill.status != "approved" && bill.status != "paid" {
+            tracing::warn!(
+                status = %bill.status,
+                "provider reports a payment against a bill this status cannot take; left for an operator"
+            );
+            return Ok(None);
+        }
+        let unrecorded = provider_paid_minor.saturating_sub(bill.paid_minor);
+        if unrecorded <= 0 {
+            return Ok(None);
+        }
+        let remaining = bill.total_minor.saturating_sub(bill.paid_minor);
+        if remaining <= 0 {
+            return Ok(None);
+        }
+        let amount_minor = unrecorded.min(remaining);
+        if amount_minor < unrecorded {
+            tracing::warn!(
+                excess_minor = unrecorded - amount_minor,
+                "provider reports more paid than this bill is for; recording the balance only"
+            );
+        }
+        let payment = self
+            .record_bill_payment(
+                tenant_id,
+                bill.id,
+                &RecordBillPaymentRequest {
+                    paid_on,
+                    amount_minor,
+                    // The CHECK set has no "the provider did it" value and
+                    // inventing one would mean a migration plus every
+                    // consumer that matches on it; `other` with the
+                    // provider named in the reference says the same thing
+                    // in the columns that already exist.
+                    payment_method: "other".to_string(),
+                    reference: Some(format!("{provider}:{external_bill_id}")),
+                    notes: Some(format!(
+                        "Recorded from {provider}, which reports {} paid against this bill.",
+                        provider_paid_minor
+                    )),
+                },
+                ctx,
+            )
+            .await?;
+        Ok(payment.payments.into_iter().next())
+    }
+
     /// Every payment against one bill, newest first.
     pub async fn list_bill_payments(
         &self,
@@ -1413,6 +1531,32 @@ pub struct ExpenseLineInput {
     pub tax_minor: i64,
     #[serde(default)]
     pub position: i32,
+}
+
+/// What a provider says it has paid against one delegated bill
+/// (PMS-1543).
+///
+/// A named value rather than four parameters: the running total and the id
+/// it belongs to have to travel together, and a caller passing them
+/// separately could pass a figure from one bill with the id of another.
+#[derive(Debug, Clone, Copy)]
+pub struct ExternalBillPaymentReport<'a> {
+    pub provider: &'a str,
+    pub external_bill_id: &'a str,
+    /// The provider's RUNNING total, not one payment: the difference
+    /// against `bills.paid_minor` is what has not been recorded here.
+    pub provider_paid_minor: i64,
+    pub paid_on: NaiveDate,
+}
+
+/// The three figures the webhook receiver reconciles against (PMS-1543).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DelegatedBillRow {
+    pub id: Uuid,
+    pub status: String,
+    pub total_minor: i64,
+    pub paid_minor: i64,
+    pub currency: String,
 }
 
 /// `POST /bills/{id}/payments` (PMS-1536).
