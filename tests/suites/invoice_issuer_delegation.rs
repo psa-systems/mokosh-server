@@ -1094,6 +1094,65 @@ async fn a_tenant_that_delegated_nothing_keeps_the_local_path(pool: PgPool) {
     assert_eq!((columns.0, columns.1, columns.2), (None, None, None));
 }
 
+/// PMS-1548: a retired product is the same `BadRequest` the local path
+/// returns, but the delegated pre-pass catches it before the provider is
+/// ever called, for both providers.
+///
+/// Before this, the pre-pass ran the company and payment-term guards but
+/// not this one, so the request reached QuickBooks/Xero, got a real
+/// invoice issued there, and only then failed locally when the per-line
+/// loop ran `assert_product_sellable` - leaving an orphaned external
+/// invoice with no local row to point at it.
+#[mokosh_test]
+async fn a_retired_product_is_refused_before_any_external_call(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+    let (billing, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    delegate(&pool, common::DEFAULT_TENANT_ID, "quickbooks").await;
+    seed_quickbooks_blob(&secrets, common::DEFAULT_TENANT_ID).await;
+    let product_id = seed_product(&pool).await;
+    sqlx::query("UPDATE products SET is_active = false WHERE id = $1")
+        .bind(product_id)
+        .execute(&pool)
+        .await
+        .expect("retire the product");
+    let mappings = InvoiceIssuerMappingService::new(db);
+    mappings
+        .upsert_customer_mapping(tenant, InvoiceProviderKind::Quickbooks, company_id, "58")
+        .await
+        .expect("map the company to a QuickBooks customer");
+    mappings
+        .upsert_product_mapping(tenant, InvoiceProviderKind::Quickbooks, product_id, "14")
+        .await
+        .expect("the stale mapping nobody deleted when the product was retired");
+
+    let before = last_number(&pool).await;
+    let mut body = request(company_id);
+    body.lines[0].product_id = Some(product_id);
+    let err = billing
+        .create_invoice(tenant, &body, &AuditCtx::system(common::DEFAULT_TENANT_ID))
+        .await
+        .expect_err("a retired product is rejected");
+
+    assert!(
+        err.to_string().contains("retired"),
+        "the same message the local path gives: {err}"
+    );
+    assert_eq!(
+        stub.lock().unwrap().issue.len(),
+        0,
+        "the provider must never see this request"
+    );
+    assert_eq!(invoice_count(&pool).await, 0, "and no row is written");
+    assert_eq!(
+        last_number(&pool).await,
+        before,
+        "and no number is consumed"
+    );
+}
 // ── Voiding the provider's copy (PMS-1544) ───────────────────────────────
 
 /// Amend a delegated invoice, send the replacement, and the provider's
