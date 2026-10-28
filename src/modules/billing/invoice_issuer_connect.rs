@@ -585,6 +585,16 @@ impl InvoiceIssuerConnectService {
     /// flow IS the delegation: an admin who authorised Xero to issue their
     /// invoices asked for exactly that, and a connected provider delegated
     /// nothing would read on the panel as connected with nothing delegated.
+    ///
+    /// `idx_integrations_provider_external_org` (PMS-1533) is a second,
+    /// cross-tenant unique constraint on `(provider, external_organisation_id)`.
+    /// The `ON CONFLICT` target below only ever arms for THIS tenant's own
+    /// `(tenant_id, provider)` row, so a `23505` reaching this call is always
+    /// the other index: some other tenant already claimed this organisation
+    /// under this provider. Without this, `tenant_for_external_organisation`
+    /// could not tell the two tenants' rows apart and would silently route
+    /// every webhook for that organisation to whichever row Postgres
+    /// happened to return first.
     async fn record_connection(
         &self,
         tenant_id: TenantId,
@@ -592,7 +602,7 @@ impl InvoiceIssuerConnectService {
         organisation_id: &str,
     ) -> AppResult<()> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-        sqlx::query(
+        let insert = sqlx::query(
             "INSERT INTO integrations \
                  (tenant_id, provider, status, enabled_capabilities, external_organisation_id, \
                   connected_at) \
@@ -609,7 +619,24 @@ impl InvoiceIssuerConnectService {
         .bind(provider.as_str())
         .bind(organisation_id)
         .execute(&mut *tx)
-        .await?;
+        .await;
+        match insert {
+            Ok(_) => {}
+            // Deliberate suppression (`docs/invariants/error-visibility.md`
+            // section 4): this 23505 can only be the cross-tenant unique
+            // index, and the 409 states that cause in full, so the raw
+            // Postgres cause carries nothing the caller does not already
+            // get. Every other code falls through to the shared mapping,
+            // which logs at `error`.
+            Err(sqlx::Error::Database(dbe)) if dbe.code().as_deref() == Some("23505") => {
+                return Err(AppError::conflict(format!(
+                    "Another tenant has already connected this {} organisation. Disconnect it \
+                     there first, or contact support.",
+                    provider.as_str()
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        }
         tx.commit().await?;
         Ok(())
     }
