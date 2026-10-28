@@ -74,6 +74,44 @@ pub struct ExternalBillRef {
     pub external_bill_id: String,
 }
 
+/// What a provider says has been settled against one document
+/// (PMS-1543).
+///
+/// Minor units, like every amount in the bills subsystem. Carried as the
+/// provider's RUNNING TOTAL rather than as one payment, because a webhook
+/// says "this changed" and not "this much arrived": reading the total and
+/// recording the difference makes a redelivery a no-op by arithmetic
+/// instead of by a dedupe table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalSettlement {
+    pub paid_minor: i64,
+    pub total_minor: i64,
+    pub voided: bool,
+}
+
+/// A provider's decimal amount (`"120.50"`, or a JSON number rendered as
+/// one) in minor units, truncating rather than rounding.
+///
+/// Truncation is deliberate and matches `BillTotals::from_lines`: a
+/// third decimal from a provider is a precision Mokosh's columns do not
+/// hold, and rounding it up would record a payment larger than the one
+/// that was made.
+pub fn decimal_string_to_minor(raw: &str) -> i64 {
+    let trimmed = raw.trim();
+    let (sign, digits) = match trimmed.strip_prefix('-') {
+        Some(rest) => (-1i64, rest),
+        None => (1i64, trimmed),
+    };
+    let (whole, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    let whole: i64 = whole.parse().unwrap_or(0);
+    let mut cents = 0i64;
+    for (i, c) in frac.chars().take(2).enumerate() {
+        let d = c.to_digit(10).unwrap_or(0) as i64;
+        cents += if i == 0 { d * 10 } else { d };
+    }
+    sign * (whole.saturating_mul(100).saturating_add(cents))
+}
+
 /// What a provider calls the reimbursement it now holds (PMS-1541).
 ///
 /// A Xero `BankTransactionID` or a QuickBooks `Purchase.Id`. Its own type
@@ -215,6 +253,34 @@ mod tests {
             IssuerSelection::Delegated {
                 provider: InvoiceProviderKind::Xero
             }
+        );
+    }
+
+    /// PMS-1543: a provider's decimal amount in minor units, truncating.
+    ///
+    /// Truncation matches `BillTotals::from_lines`, and the direction
+    /// matters: rounding a third decimal UP would record a payment larger
+    /// than the one the provider made.
+    #[test]
+    fn a_provider_amount_becomes_minor_units() {
+        assert_eq!(decimal_string_to_minor("70"), 7000);
+        assert_eq!(decimal_string_to_minor("70.00"), 7000);
+        assert_eq!(
+            decimal_string_to_minor("70.5"),
+            7050,
+            "one decimal is tenths"
+        );
+        assert_eq!(decimal_string_to_minor(" 1234.56 "), 123456);
+        assert_eq!(
+            decimal_string_to_minor("70.999"),
+            7099,
+            "a third decimal is dropped, never rounded up"
+        );
+        assert_eq!(decimal_string_to_minor("-5.00"), -500);
+        assert_eq!(
+            decimal_string_to_minor("not a number"),
+            0,
+            "an unreadable amount is nothing rather than a panic: the caller is a webhook"
         );
     }
 }

@@ -34,7 +34,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::modules::billing::invoice_issuer::{
-    ExternalBillRef, ExternalExpenseRef, ExternalInvoiceRef, InvoiceProviderKind,
+    decimal_string_to_minor, ExternalBillRef, ExternalExpenseRef, ExternalInvoiceRef,
+    ExternalSettlement, InvoiceProviderKind,
 };
 use crate::utils::error::{AppError, AppResult};
 
@@ -173,6 +174,21 @@ struct QuickBooksInvoiceDto {
     balance: Option<f64>,
     #[serde(rename = "PrivateNote", default)]
     private_note: Option<String>,
+}
+
+/// `GET /bill/{id}` read for its amounts (PMS-1543).
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillSettlementEnvelope {
+    #[serde(rename = "Bill")]
+    bill: QuickBooksBillSettlementDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillSettlementDto {
+    #[serde(rename = "TotalAmt", default)]
+    total_amt: Option<f64>,
+    #[serde(rename = "Balance", default)]
+    balance: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -664,6 +680,57 @@ impl QuickBooksClient {
     /// `TotalAmt` and the `Voided` marker QBO writes to `PrivateNote`
     /// on a void. Used by the Phase 3 webhook receiver's reconciliation
     /// pass and the "re-sync" operator button.
+    /// What the provider says has been paid against one bill (PMS-1543).
+    ///
+    /// `GET /bill/{id}` carries `TotalAmt` and `Balance`, and QuickBooks
+    /// has no "amount paid" field: paid is the difference, which is why
+    /// this reads both rather than one. Reconciled against the provider's
+    /// own figures rather than accumulated from events, so a redelivery
+    /// records nothing by arithmetic.
+    ///
+    /// `/bill/{id}` and not `/invoice/{id}`: unlike Xero, QuickBooks keeps
+    /// the two documents on separate resources, so an id that is not a
+    /// bill answers 404 and the caller sees `None` rather than reading a
+    /// customer's invoice as the MSP's bill.
+    pub async fn fetch_bill_settlement(
+        &self,
+        creds: &QuickBooksCredentials,
+        external_bill_id: &str,
+    ) -> AppResult<Option<ExternalSettlement>> {
+        let url = format!(
+            "{}/v3/company/{}/bill/{external_bill_id}?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksBillSettlementEnvelope = match self
+            .call_with_retry(|| {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+            })
+            .await
+        {
+            Ok(envelope) => envelope,
+            // An id this company file does not hold as a bill. Not a
+            // failure: the receiver is told about documents Mokosh never
+            // created, and answering with an error would have Intuit retry
+            // forever.
+            Err(AppError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let bill = envelope.bill;
+        let total_minor = decimal_string_to_minor(&format!("{:.2}", bill.total_amt.unwrap_or(0.0)));
+        let balance_minor = decimal_string_to_minor(&format!("{:.2}", bill.balance.unwrap_or(0.0)));
+        Ok(Some(ExternalSettlement {
+            paid_minor: total_minor.saturating_sub(balance_minor),
+            total_minor,
+            // QuickBooks deletes rather than voids a bill, and a deleted
+            // one answers 404 above, so there is no voided state to read
+            // here.
+            voided: false,
+        }))
+    }
+
     pub async fn fetch_invoice_status(
         &self,
         creds: &QuickBooksCredentials,
