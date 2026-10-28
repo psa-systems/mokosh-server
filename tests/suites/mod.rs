@@ -106,6 +106,7 @@ pub mod form_drafts;
 pub mod forms;
 pub mod gateway_credential_move;
 pub mod gateway_credential_state;
+pub mod google_client_from_bunyip;
 pub mod google_client_from_infisical;
 pub mod google_client_settings;
 pub mod grant_invitation_accept_cancel_race;
