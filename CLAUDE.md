@@ -139,30 +139,23 @@ Around thirty modules are mounted and the 501 placeholder mechanism is gone; the
 
 ## Conventions specific to this repo
 
-One line per rule, linking its full text. A new convention adds its text under `docs/invariants/` and one line here (PMS-1437).
+One line per rule, or per group of rules answering one subject, linking its full text. A new convention adds its text under `docs/invariants/` and one line here, or a subsection under the group that already covers it (PMS-1437, PMS-1552).
 
 ### Billing
 
 - Billable time is armed at creation, not approval ([PMS-944](docs/invariants/billing.md#billable-time-pms-944))
-- A quote's tax follows the invoice rule ([PMS-1038](docs/invariants/billing.md#quote-tax-pms-1038))
-- `apply_tax` derives tax from the tenant rate ([PMS-1029](docs/invariants/billing.md#invoice-tax-pms-1029))
-- An invoice's balance has one writer ([PMS-953](docs/invariants/billing.md#balance-pms-953))
-- A bill's paid total has one writer ([PMS-1536](docs/invariants/billing.md#bill-payments-pms-1536))
-- A claim reaches the provider on reimbursement, never before ([PMS-1541](docs/invariants/billing.md#delegated-claims-pms-1541))
-- An inbound vendor payment is reconciled, not accumulated ([PMS-1543](docs/invariants/billing.md#inbound-bill-payments-pms-1543))
-- Paying a delegated bill tells the provider ([PMS-1545](docs/invariants/billing.md#paying-a-bill-pms-1545))
-- A replacement voids the provider's copy too ([PMS-1544](docs/invariants/billing.md#voiding-a-delegated-invoice-pms-1544))
+- Tax derives from the tenant rate, on invoices and quotes alike ([PMS-1029, PMS-1038](docs/invariants/billing.md#tax))
+- A money total has one writer, receivables and payables alike ([PMS-953, PMS-1536](docs/invariants/billing.md#single-writer))
+- What crosses to Xero or QuickBooks, in which direction and when ([PMS-1541, PMS-1543, PMS-1544, PMS-1545](docs/invariants/billing.md#delegated-issuing))
 - A sent invoice is replaced, and the replacement voids it ([PMS-1334](docs/invariants/billing.md#amendment-pms-1334))
 - Overdue is derived; reminders are a worker ([PMS-1037](docs/invariants/billing.md#overdue-pms-1037))
 - A write-off is not a credit ([PMS-1036](docs/invariants/billing.md#write-off-pms-1036))
 - Sending emails the invoice; `sent` means it went ([PMS-991, PMS-992](docs/invariants/billing.md#sending-pms-991-pms-992))
 - `net_days` derives the default due date ([PMS-990](docs/invariants/billing.md#net-terms-pms-990))
 - Lines copy prices; `billing_rule` decides billing ([PMS-955](docs/invariants/billing.md#products-pms-955))
-- Prepaid blocks draw down when time is logged ([PMS-951](docs/invariants/billing.md#prepaid-draw-pms-951))
-- Prepaid hours never re-invoice; overage bills at its rate ([PMS-1035](docs/invariants/billing.md#overage-pms-1035))
+- A prepaid block draws down, and overage bills at its rate ([PMS-951, PMS-1035](docs/invariants/billing.md#prepaid-blocks))
 - An invoice uses the tenant's currency ([PMS-1028](docs/invariants/billing.md#currency-pms-1028))
-- Billing handlers take `RequireBilling` and `RequireFinance` ([PMS-962](docs/invariants/billing.md#read-gates-pms-962))
-- Dual-plane invoice handlers gate in the body ([PMS-1041](docs/invariants/billing.md#dual-plane-gates-pms-1041))
+- A billing read is gated by extractor, dual-plane routes in the body ([PMS-962, PMS-1041](docs/invariants/billing.md#financial-read-gates))
 
 ### Documents and PDF
 
