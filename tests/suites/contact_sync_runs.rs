@@ -679,6 +679,109 @@ async fn the_worker_schedules_only_connections_that_are_due_and_able(pool: PgPoo
     );
 }
 
+/// PMS-1315: an admin sets how often contacts sync, and the worker paces
+/// itself by what they set.
+///
+/// `sync_interval_minutes` decided the cadence since migration 220 and
+/// nothing could write it, so every tenant polled at the column's default
+/// of 60 minutes. This is the half that makes the column mean something: a
+/// tenant whose address book barely moves can poll twice a day, and one
+/// running a service desk off it can poll every ten minutes.
+#[mokosh_test]
+async fn an_admin_sets_how_often_contacts_sync_and_the_worker_obeys(pool: PgPool) {
+    let f = Fixture::new(pool, &[CLIENTS]).await;
+    let schedule = "/api/v1/integrations/contact-sync/schedule";
+
+    assert_eq!(
+        f.connection().await["sync_interval_minutes"],
+        json!(60),
+        "the column's default is where a new connection starts"
+    );
+
+    let (status, body) = f
+        .call(
+            Method::PUT,
+            schedule,
+            Some(json!({ "sync_interval_minutes": 4 })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a one-minute poll against a third party is a rate limit waiting to happen: {body}"
+    );
+    let (status, body) = f
+        .call(
+            Method::PUT,
+            schedule,
+            Some(json!({ "sync_interval_minutes": 2880 })),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "and longer than a day is a way of saying stop, which the switch says properly: {body}"
+    );
+    assert_eq!(
+        f.count("SELECT sync_interval_minutes::bigint FROM contact_sync_connections")
+            .await,
+        60,
+        "neither refusal wrote anything"
+    );
+
+    let (status, connection) = f
+        .call(
+            Method::PUT,
+            schedule,
+            Some(json!({ "sync_interval_minutes": 120 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{connection}");
+    assert_eq!(
+        connection["sync_interval_minutes"],
+        json!(120),
+        "the answer carries what the card will show: {connection}"
+    );
+
+    // Ninety minutes since the last sync: due at the old hour, not due at
+    // the two hours just set, which is the whole point of the column.
+    sqlx::query(
+        "UPDATE contact_sync_connections SET last_sync_at = NOW() - INTERVAL '90 minutes', \
+         sync_status = 'success'",
+    )
+    .execute(&f.pool)
+    .await
+    .expect("age the last sync");
+    assert_eq!(
+        f.runner.tick().await.unwrap().scheduled,
+        0,
+        "not due yet at two hours"
+    );
+
+    let (status, _) = f
+        .call(
+            Method::PUT,
+            schedule,
+            Some(json!({ "sync_interval_minutes": 60 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        f.runner.tick().await.unwrap().scheduled,
+        1,
+        "and due at an hour, on the same row and the same clock"
+    );
+    assert_eq!(
+        f.count(
+            "SELECT count(*) FROM audit_log WHERE entity_type = 'contact_sync_connections' \
+             AND new_values->>'event' = 'contact_sync.schedule_changed'"
+        )
+        .await,
+        2,
+        "each change the admin made is on the audit trail, and the refusals are not"
+    );
+}
+
 /// Starting imports and choosing labels are an admin's; watching progress and
 /// answering the queue are any staff member's.
 #[mokosh_test]
@@ -714,6 +817,13 @@ async fn admins_start_imports_and_staff_follow_them(pool: PgPool) {
             Method::POST,
             "/api/v1/integrations/contact-sync/preview".to_string(),
             Some(json!({})),
+        ),
+        // PMS-1315: the cadence is an admin's for the reason the labels
+        // are, so it joins this list rather than getting its own case.
+        (
+            Method::PUT,
+            "/api/v1/integrations/contact-sync/schedule".to_string(),
+            Some(json!({ "sync_interval_minutes": 120 })),
         ),
     ] {
         let (status, _) = f.call_as(&tech, method.clone(), &path, body).await;

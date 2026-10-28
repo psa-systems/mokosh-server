@@ -809,7 +809,7 @@ struct ContactSyncState {
 }
 
 /// Refuse a provider whose connection is owned by another subsystem, naming
-/// where it is configured and the issue that moves it.
+/// where it is configured instead.
 ///
 /// A 409 rather than a 404: the provider exists and is listed, and what is
 /// wrong is that this is the wrong surface for it.
@@ -819,11 +819,10 @@ fn assert_managed_here(descriptor: &ProviderDescriptor) -> AppResult<()> {
         ConnectionHome::Elsewhere {
             table,
             configured_at,
-            issue,
         } => Err(AppError::Conflict(format!(
             "{} is configured under {configured_at} and not as an integration, so its \
-             connection stays in {table} until {issue} moves it. Changing it here would \
-             give one connection two places to live.",
+             connection stays in {table}. Changing it here would give one connection two \
+             places to live.",
             descriptor.display_name
         ))),
     }
@@ -1201,8 +1200,12 @@ mod tests {
         assert!(message.contains("Contact sync"), "{message}");
         assert!(message.contains("contact_sync_connections"), "{message}");
         assert!(
-            message.contains("PMS-1315"),
-            "the refusal names the issue that moves it: {message}"
+            message.contains("Changing it here"),
+            "the refusal says why this surface is not the place: {message}"
+        );
+        assert!(
+            !message.contains("PMS-"),
+            "and names no issue, because the connection stays where it is (PMS-1315): {message}"
         );
 
         assert_managed_here(xero()).expect("Xero is managed here");

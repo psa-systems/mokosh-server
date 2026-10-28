@@ -283,7 +283,18 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
         elsewhere["managed_elsewhere"]["table"],
         "contact_sync_connections"
     );
-    assert_eq!(elsewhere["managed_elsewhere"]["issue"], "PMS-1315");
+    assert_eq!(
+        elsewhere["managed_elsewhere"]["configured_at"], "Settings > Contact sync",
+        "the page is told where to go instead"
+    );
+    // PMS-1315: and no issue pointer. The field named the ticket that would
+    // bring this connection under the integrations surface, and the answer
+    // turned out to be that it stays where the flow that creates it lives.
+    assert!(
+        elsewhere["managed_elsewhere"].get("issue").is_none(),
+        "{}",
+        elsewhere["managed_elsewhere"]
+    );
     assert!(
         xero.get("managed_elsewhere").is_none(),
         "a provider managed here says nothing about being managed elsewhere: {xero}"
