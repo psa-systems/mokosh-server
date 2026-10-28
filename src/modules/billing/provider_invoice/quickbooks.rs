@@ -192,6 +192,57 @@ struct QuickBooksBillSettlementDto {
 }
 
 #[derive(Debug, Serialize)]
+struct QuickBooksCheckPayment {
+    #[serde(rename = "BankAccountRef")]
+    bank_account_ref: QuickBooksRef,
+}
+
+#[derive(Debug, Serialize)]
+struct QuickBooksLinkedTxn {
+    #[serde(rename = "TxnId")]
+    txn_id: String,
+    #[serde(rename = "TxnType")]
+    txn_type: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct QuickBooksBillPaymentLine {
+    #[serde(rename = "Amount")]
+    amount: String,
+    #[serde(rename = "LinkedTxn")]
+    linked_txn: Vec<QuickBooksLinkedTxn>,
+}
+
+/// A bill payment: its own document, linked to the bill it settles.
+#[derive(Debug, Serialize)]
+struct QuickBooksBillPaymentBody {
+    #[serde(rename = "VendorRef")]
+    vendor_ref: QuickBooksRef,
+    #[serde(rename = "TotalAmt")]
+    total_amt: String,
+    #[serde(rename = "PayType")]
+    pay_type: &'static str,
+    #[serde(rename = "CheckPayment")]
+    check_payment: QuickBooksCheckPayment,
+    #[serde(rename = "TxnDate")]
+    txn_date: NaiveDate,
+    #[serde(rename = "Line")]
+    line: Vec<QuickBooksBillPaymentLine>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillPaymentEnvelope {
+    #[serde(rename = "BillPayment")]
+    bill_payment: QuickBooksBillPaymentDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillPaymentDto {
+    #[serde(rename = "Id")]
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
 struct QuickBooksCreateInvoiceBody {
     #[serde(rename = "CustomerRef")]
     customer_ref: QuickBooksRef,
@@ -320,6 +371,20 @@ pub struct QuickBooksRecordSpendRequest {
     pub lines: Vec<QuickBooksBillLineInput>,
 }
 
+/// Request body for `pay_bill` (PMS-1545).
+///
+/// QuickBooks keeps a bill payment as its own document that LINKS to the
+/// bill, so this carries the vendor it is paid to, the account it leaves,
+/// and the bill's own id for the link.
+#[derive(Debug, Clone)]
+pub struct QuickBooksPayBillRequest {
+    pub bill_id: String,
+    pub vendor_id: String,
+    pub bank_account_id: String,
+    pub paid_on: NaiveDate,
+    pub amount_minor: i64,
+}
+
 /// One line of a bill: an amount against an expense ACCOUNT, which is
 /// what QuickBooks puts on the payables side.
 #[derive(Debug, Clone)]
@@ -404,6 +469,59 @@ impl QuickBooksClient {
     /// the one the tenant mapped, and QuickBooks requires the pair to
     /// agree; a tenant reimbursing from a credit card maps that account
     /// and QuickBooks reads the type from the account itself.
+    /// Record a payment against a bill the provider holds (PMS-1545).
+    ///
+    /// `/billpayment`, which is its own document linking to the bill
+    /// through `LinkedTxn`, not a second purchase: the bill is already
+    /// over there and what is being recorded is that it has been settled.
+    /// `PayType: "Check"` with a `CheckPayment.BankAccountRef` is the
+    /// shape for money leaving a bank account, which is what the account
+    /// PMS-1541 stores is; a tenant paying by card maps that account and
+    /// QuickBooks reads the instrument from the account itself.
+    ///
+    /// Returns the provider's payment id, which is what a reconciliation
+    /// reads back.
+    pub async fn pay_bill(
+        &self,
+        creds: &QuickBooksCredentials,
+        request: &QuickBooksPayBillRequest,
+    ) -> AppResult<String> {
+        let body = QuickBooksBillPaymentBody {
+            vendor_ref: QuickBooksRef {
+                value: request.vendor_id.clone(),
+            },
+            total_amt: minor_to_decimal(request.amount_minor, 2),
+            pay_type: "Check",
+            check_payment: QuickBooksCheckPayment {
+                bank_account_ref: QuickBooksRef {
+                    value: request.bank_account_id.clone(),
+                },
+            },
+            txn_date: request.paid_on,
+            line: vec![QuickBooksBillPaymentLine {
+                amount: minor_to_decimal(request.amount_minor, 2),
+                linked_txn: vec![QuickBooksLinkedTxn {
+                    txn_id: request.bill_id.clone(),
+                    txn_type: "Bill",
+                }],
+            }],
+        };
+        let url = format!(
+            "{}/v3/company/{}/billpayment?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksBillPaymentEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(envelope.bill_payment.id)
+    }
+
     pub async fn record_spend(
         &self,
         creds: &QuickBooksCredentials,

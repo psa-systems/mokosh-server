@@ -95,6 +95,20 @@ pub struct XeroCreateBillRequest {
     pub lines: Vec<XeroLineItemInput>,
 }
 
+/// Request body for `pay_bill`: money leaving against a bill the provider
+/// holds (PMS-1545).
+///
+/// Xero attaches a payment to the document it settles, so the bill's own
+/// `InvoiceID` is the whole link; `bank_account_id` is the account it left,
+/// which is the value PMS-1541 put on the integration row.
+#[derive(Debug, Clone)]
+pub struct XeroPayBillRequest {
+    pub bill_id: Uuid,
+    pub bank_account_id: String,
+    pub paid_on: NaiveDate,
+    pub amount_minor: i64,
+}
+
 /// One organisation a grant covers, as `GET /connections` lists it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct XeroConnection {
@@ -342,6 +356,36 @@ struct XeroBankTransactionDto {
 }
 
 #[derive(Debug, Serialize)]
+struct XeroPaymentInvoiceRef {
+    #[serde(rename = "InvoiceID")]
+    invoice_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+struct XeroPaymentBody {
+    #[serde(rename = "Invoice")]
+    invoice: XeroPaymentInvoiceRef,
+    #[serde(rename = "Account")]
+    account: XeroBankAccountRef,
+    #[serde(rename = "Date")]
+    date: NaiveDate,
+    #[serde(rename = "Amount")]
+    amount: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XeroPaymentEnvelope {
+    #[serde(rename = "Payments", default)]
+    payments: Vec<XeroPaymentDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XeroPaymentDto {
+    #[serde(rename = "PaymentID", default)]
+    payment_id: String,
+}
+
+#[derive(Debug, Serialize)]
 struct XeroVoidBody {
     #[serde(rename = "Status")]
     status: &'static str,
@@ -418,6 +462,51 @@ impl XeroClient {
     /// `AUTHORISED`: the money has already left the MSP's account by the
     /// time a claim is marked reimbursed here, so a draft over there would
     /// be a second place to confirm something that has happened.
+    /// Record a payment against a bill the provider holds (PMS-1545).
+    ///
+    /// `PUT /Payments`, not a second bill: the bill is already over there
+    /// (MAPPS-1155 raised it), and what is being told to Xero is that it
+    /// has been settled. Xero's own `Payments` resource takes payments
+    /// against either document type, so an `ACCPAY` bill is paid the same
+    /// way a receivable is collected.
+    ///
+    /// Returns the provider's payment id, which is what a reconciliation
+    /// reads back; the amount is sent as a decimal string for the reason
+    /// every other money field here is, so no float reaches the wire.
+    pub async fn pay_bill(
+        &self,
+        creds: &XeroCredentials,
+        request: &XeroPayBillRequest,
+    ) -> AppResult<String> {
+        let body = XeroPaymentBody {
+            invoice: XeroPaymentInvoiceRef {
+                invoice_id: request.bill_id,
+            },
+            account: XeroBankAccountRef {
+                account_id: request.bank_account_id.clone(),
+            },
+            date: request.paid_on,
+            amount: minor_to_decimal(request.amount_minor, 2),
+        };
+        let url = format!("{}/api.xro/2.0/Payments", self.api_base);
+        let envelope: XeroPaymentEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .put(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Xero-Tenant-Id", &creds.tenant_id)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        envelope
+            .payments
+            .into_iter()
+            .next()
+            .map(|p| p.payment_id)
+            .ok_or_else(|| AppError::internal("Xero returned no payment".to_string()))
+    }
+
     pub async fn record_spend(
         &self,
         creds: &XeroCredentials,
