@@ -314,10 +314,7 @@ impl ContactSyncRunner {
                AND NOT EXISTS (SELECT 1 FROM tenant_settings s \
                                WHERE s.tenant_id = c.tenant_id AND s.category = 'integrations' \
                                  AND s.value = 'false'::jsonb \
-                                 AND ((c.provider = 'google' \
-                                       AND s.key = 'google_contacts_enabled') \
-                                   OR (c.provider = 'icloud' \
-                                       AND s.key = 'icloud_contacts_enabled'))) \
+                                 AND s.key = c.provider || '_contacts_enabled') \
                AND c.sync_status NOT IN ('reconnect_required', 'in_progress') \
                AND c.last_sync_at IS NOT NULL \
                AND c.last_sync_at <= NOW() - (c.sync_interval_minutes * INTERVAL '1 minute') \
