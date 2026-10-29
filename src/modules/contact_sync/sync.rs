@@ -55,6 +55,20 @@
 //! moved past a record that failed would drop that change until the record
 //! next changes in the source, while replaying a delta is harmless because
 //! the whole pass is idempotent.
+//!
+//! # Chunked commit boundary (PMS-1303)
+//!
+//! The per-record "its own transaction" above is the SEMANTIC boundary, not
+//! the wire boundary. Records are applied in chunks of [`CHUNK_SIZE`] inside
+//! ONE `begin_with_tenant` per chunk, with a `SAVEPOINT contact_sync_record`
+//! around each record so a per-record error rolls back only that record
+//! (released on success, rolled back + released on failure). A run of 500
+//! records opens 5 `begin_with_tenant` pairs instead of 500 while every
+//! per-record outcome keeps the shape it had before: a bad record still
+//! counts as one entry in `report.failed` with the next record still
+//! applied. The `checkpoint` writer runs between chunks on its own
+//! transaction so a long-lived chunk tx does not fight the progress-row
+//! update.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -146,9 +160,16 @@ pub struct RecordFailure {
 /// grow a run row without bound. `failed` still counts every one.
 pub const MAX_RECORDED_FAILURES: usize = 50;
 
-/// How many records between progress writes. Each checkpoint is one UPDATE
-/// that also reports whether the run was cancelled.
-const CHECKPOINT_EVERY: usize = 25;
+/// PMS-1303: how many records share one `begin_with_tenant` transaction in
+/// the per-chunk apply loop AND how many between progress-row writes. The
+/// two are now one constant because the checkpoint runs between chunks (so
+/// a long-lived chunk tx does not fight the `contact_sync_runs` UPDATE)
+/// and lowering CHUNK_SIZE below the checkpoint cadence would double the
+/// commit cost without buying anything. 25 preserves the pre-chunking
+/// cancel-detection latency (every 25 records at worst) while dropping
+/// the begin/commit pair count 25x: a run of 500 records opens 20
+/// instead of 500.
+const CHUNK_SIZE: usize = 25;
 
 impl SyncReport {
     /// Records that were read and deliberately not imported: outside the
@@ -517,7 +538,7 @@ impl ContactSyncEngine {
     }
 
     /// [`Self::run`], writing progress to `contact_sync_runs` row `run_id`
-    /// every [`CHECKPOINT_EVERY`] records and stopping at the first checkpoint
+    /// every [`CHUNK_SIZE`] records and stopping at the first checkpoint
     /// after a cancel was requested (PMS-1215).
     pub async fn run_tracked(
         &self,
@@ -630,62 +651,118 @@ impl ContactSyncEngine {
         let ctx = AuditCtx::system(tenant_id.get());
         let mut seen: HashSet<&str> = HashSet::new();
 
-        for (index, record) in changes.contacts.iter().enumerate() {
+        // PMS-1303: chunk the per-record apply inside one `begin_with_tenant`
+        // per chunk, with a SAVEPOINT around each record so a single bad
+        // record does not poison the chunk (which would silently fail every
+        // later record in the chunk and change `report.failed` from an
+        // accurate count into "chunk size minus one"). A chunk of 100 drops
+        // the begin/commit cost from one pair per record to one pair per
+        // 100, and a run of 500 records falls from 500 begin+commit pairs
+        // to 5 while every per-record outcome keeps the exact shape it had
+        // before (SAVEPOINT isolation and the error branch below).
+        //
+        // Checkpoints run between chunks so the long-lived chunk tx does
+        // not fight the `UPDATE contact_sync_runs` row the checkpoint
+        // writes under its own tx.
+        'chunks: for (chunk_start, chunk) in changes
+            .contacts
+            .chunks(CHUNK_SIZE)
+            .enumerate()
+            .map(|(i, c)| (i * CHUNK_SIZE, c))
+        {
             if let Some(run_id) = run_id {
-                if index > 0
-                    && index % CHECKPOINT_EVERY == 0
-                    && self.checkpoint(tenant_id, run_id, &report, index).await?
+                if chunk_start > 0
+                    && self
+                        .checkpoint(tenant_id, run_id, &report, chunk_start)
+                        .await?
                 {
                     report.cancelled = true;
-                    break;
+                    break 'chunks;
                 }
             }
-            seen.insert(record.external_id.as_str());
-            let outcome = self
-                .apply_record(
-                    tenant_id,
-                    connection_id,
-                    &connection,
-                    record,
-                    &selected,
-                    &label_names,
-                    &snapshot,
-                    full_read,
-                    &ctx,
-                )
-                .await;
-            match outcome {
-                Ok(Outcome::Created { contact_id, link }) => {
-                    report.created += 1;
-                    snapshot.remember(contact_id, record, link);
-                }
-                Ok(Outcome::Linked { contact_id, link }) => {
-                    report.linked += 1;
-                    snapshot.mark_linked(contact_id, link);
-                }
-                Ok(Outcome::Updated) => report.updated += 1,
-                Ok(Outcome::Unchanged) => report.unchanged += 1,
-                Ok(Outcome::Queued) => report.queued += 1,
-                Ok(Outcome::AwaitingReview) => report.awaiting_review += 1,
-                Ok(Outcome::AlreadyReviewed) => report.already_reviewed += 1,
-                Ok(Outcome::NotSelected) => report.not_selected += 1,
-                Ok(Outcome::Excluded) => report.excluded += 1,
-                Ok(Outcome::DeletedInSource) => report.deleted_in_source += 1,
-                Err(e) => {
-                    report.failed += 1;
-                    tracing::warn!(
-                        connection_id = %connection_id,
-                        external_id = %record.external_id,
-                        "contact sync could not apply a record: {e}"
-                    );
-                    if report.failures.len() < MAX_RECORDED_FAILURES {
-                        report.failures.push(RecordFailure {
-                            external_id: record.external_id.clone(),
-                            reason: e.to_string().chars().take(300).collect(),
-                        });
+            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+            for record in chunk {
+                seen.insert(record.external_id.as_str());
+                // Guard against intra-chunk poisoning: a per-record error
+                // rolls back only that record, not the whole chunk. Matches
+                // the pre-PMS-1303 shape where each record had its own tx.
+                sqlx::query("SAVEPOINT contact_sync_record")
+                    .execute(&mut *tx)
+                    .await?;
+                let outcome = self
+                    .apply_record_in_tx(
+                        &mut tx,
+                        tenant_id,
+                        connection_id,
+                        &connection,
+                        record,
+                        &selected,
+                        &label_names,
+                        &snapshot,
+                        full_read,
+                        &ctx,
+                    )
+                    .await;
+                match outcome {
+                    Ok(Outcome::Created { contact_id, link }) => {
+                        sqlx::query("RELEASE SAVEPOINT contact_sync_record")
+                            .execute(&mut *tx)
+                            .await?;
+                        report.created += 1;
+                        snapshot.remember(contact_id, record, link);
+                    }
+                    Ok(Outcome::Linked { contact_id, link }) => {
+                        sqlx::query("RELEASE SAVEPOINT contact_sync_record")
+                            .execute(&mut *tx)
+                            .await?;
+                        report.linked += 1;
+                        snapshot.mark_linked(contact_id, link);
+                    }
+                    Ok(outcome) => {
+                        sqlx::query("RELEASE SAVEPOINT contact_sync_record")
+                            .execute(&mut *tx)
+                            .await?;
+                        match outcome {
+                            Outcome::Updated => report.updated += 1,
+                            Outcome::Unchanged => report.unchanged += 1,
+                            Outcome::Queued => report.queued += 1,
+                            Outcome::AwaitingReview => report.awaiting_review += 1,
+                            Outcome::AlreadyReviewed => report.already_reviewed += 1,
+                            Outcome::NotSelected => report.not_selected += 1,
+                            Outcome::Excluded => report.excluded += 1,
+                            Outcome::DeletedInSource => report.deleted_in_source += 1,
+                            Outcome::Created { .. } | Outcome::Linked { .. } => {
+                                // The two match arms above handle these;
+                                // this branch is unreachable but kept
+                                // exhaustive so a new Outcome variant
+                                // forces an explicit decision here.
+                                unreachable!("Created/Linked are handled above");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT contact_sync_record")
+                            .execute(&mut *tx)
+                            .await?;
+                        sqlx::query("RELEASE SAVEPOINT contact_sync_record")
+                            .execute(&mut *tx)
+                            .await?;
+                        report.failed += 1;
+                        tracing::warn!(
+                            connection_id = %connection_id,
+                            external_id = %record.external_id,
+                            "contact sync could not apply a record: {e}"
+                        );
+                        if report.failures.len() < MAX_RECORDED_FAILURES {
+                            report.failures.push(RecordFailure {
+                                external_id: record.external_id.clone(),
+                                reason: e.to_string().chars().take(300).collect(),
+                            });
+                        }
                     }
                 }
             }
+            tx.commit().await?;
         }
 
         // A cancel stops here: no tombstones from a read that was not
@@ -717,9 +794,15 @@ impl ContactSyncEngine {
                 })
                 .cloned()
                 .collect();
-            for link in absent {
-                self.flag_deleted(tenant_id, &link, &ctx).await?;
-                report.deleted_in_source += 1;
+            // PMS-1303: the absent-sweep is its own transaction, same
+            // chunked shape as the per-record apply above.
+            for chunk in absent.chunks(CHUNK_SIZE) {
+                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+                for link in chunk {
+                    self.flag_deleted_in(&mut tx, tenant_id, link, &ctx).await?;
+                    report.deleted_in_source += 1;
+                }
+                tx.commit().await?;
             }
         }
 
@@ -1081,9 +1164,23 @@ impl ContactSyncEngine {
         })
     }
 
+    /// Apply one planned record inside an EXTERNAL transaction. PMS-1303
+    /// introduces this split so `run_tracked` can hold one `begin_with_tenant`
+    /// across a chunk of records instead of opening and committing per record.
+    ///
+    /// A caller that needs the earlier per-record isolation (so one bad record
+    /// does not poison the whole chunk) wraps each invocation in a SAVEPOINT;
+    /// the chunk driver in `run_tracked` does exactly that so a record-level
+    /// error matches the pre-chunking behaviour (one record skipped, the rest
+    /// continue).
+    ///
+    /// Any `begin_with_tenant` previously opened inside `flag_deleted` is now
+    /// `flag_deleted_in` taking the external connection, so this function
+    /// opens no transaction of its own and performs no commits.
     #[allow(clippy::too_many_arguments)]
-    async fn apply_record(
+    async fn apply_record_in_tx(
         &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         connection_id: Uuid,
         connection: &ConnectionRow,
@@ -1111,14 +1208,14 @@ impl ContactSyncEngine {
             Plan::Unchanged => Ok(Outcome::Unchanged),
             Plan::AlreadyReviewed => Ok(Outcome::AlreadyReviewed),
             Plan::FlagDeleted(link) => {
-                self.flag_deleted(tenant_id, link, ctx).await?;
+                self.flag_deleted_in(&mut *conn, tenant_id, link, ctx)
+                    .await?;
                 Ok(Outcome::DeletedInSource)
             }
             Plan::Update(link) => {
-                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 let changed = self
                     .apply_fields(
-                        &mut tx,
+                        &mut *conn,
                         tenant_id,
                         link.contact_id,
                         record,
@@ -1136,9 +1233,8 @@ impl ContactSyncEngine {
                 .bind(tenant_id)
                 .bind(link.id)
                 .bind(&record.etag)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
-                tx.commit().await?;
                 Ok(if changed {
                     Outcome::Updated
                 } else {
@@ -1146,9 +1242,8 @@ impl ContactSyncEngine {
                 })
             }
             Plan::Link(contact_id) => {
-                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 self.apply_fields(
-                    &mut tx,
+                    &mut *conn,
                     tenant_id,
                     contact_id,
                     record,
@@ -1160,7 +1255,7 @@ impl ContactSyncEngine {
                 .await?;
                 let link = self
                     .insert_link(
-                        &mut tx,
+                        &mut *conn,
                         tenant_id,
                         connection_id,
                         connection,
@@ -1171,12 +1266,10 @@ impl ContactSyncEngine {
                         ctx,
                     )
                     .await?;
-                tx.commit().await?;
                 Ok(Outcome::Linked { contact_id, link })
             }
             Plan::Review(open) => {
                 let snapshot_json = source_snapshot(record, &mapped, &labels(), connection);
-                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 let mut inserted = 0;
                 for (candidate, reason) in open {
                     // A refreshed etag refreshes the snapshot the reviewer
@@ -1198,13 +1291,12 @@ impl ContactSyncEngine {
                     .bind(candidate)
                     .bind(reason.as_str())
                     .bind(&snapshot_json)
-                    .fetch_optional(&mut *tx)
+                    .fetch_optional(&mut *conn)
                     .await?;
                     if written == Some(true) {
                         inserted += 1;
                     }
                 }
-                tx.commit().await?;
                 Ok(if inserted > 0 {
                     Outcome::Queued
                 } else {
@@ -1213,14 +1305,13 @@ impl ContactSyncEngine {
             }
             Plan::Create(suggestion) => {
                 let request = create_request(&mapped, &labels());
-                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
                 let contact_id = self
                     .contacts
-                    .import_contact_in(&mut tx, tenant_id, &request, ctx)
+                    .import_contact_in(&mut *conn, tenant_id, &request, ctx)
                     .await?;
                 let link = self
                     .insert_link(
-                        &mut tx,
+                        &mut *conn,
                         tenant_id,
                         connection_id,
                         connection,
@@ -1231,7 +1322,6 @@ impl ContactSyncEngine {
                         ctx,
                     )
                     .await?;
-                tx.commit().await?;
                 Ok(Outcome::Created { contact_id, link })
             }
         }
@@ -1397,25 +1487,25 @@ impl ContactSyncEngine {
         Ok(link)
     }
 
-    async fn flag_deleted(
+    async fn flag_deleted_in(
         &self,
+        conn: &mut sqlx::PgConnection,
         tenant_id: TenantId,
         link: &LinkRow,
         ctx: &AuditCtx,
     ) -> AppResult<()> {
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let flagged = sqlx::query(
             "UPDATE contact_sync_links SET deleted_in_source_at = NOW(), updated_at = NOW() \
              WHERE tenant_id = $1 AND id = $2 AND deleted_in_source_at IS NULL",
         )
         .bind(tenant_id)
         .bind(link.id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?
         .rows_affected();
         if flagged > 0 {
             audit_write(
-                &mut *tx,
+                &mut *conn,
                 tenant_id,
                 ctx,
                 AuditAction::Update,
@@ -1431,7 +1521,6 @@ impl ContactSyncEngine {
             )
             .await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 
