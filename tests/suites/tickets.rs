@@ -1903,3 +1903,268 @@ async fn the_ticket_list_filters_by_parent(pool: PgPool) {
         assert!(children(absent).await.is_empty(), "{absent} matched rows");
     }
 }
+
+/// PMS-1565: `UpdateTicketRequest` accepted `type_id`, `category_id`,
+/// `contact_id`, `site_id`, `team_id`, `contract_id`, `sla_id`,
+/// `scheduled_start`, `scheduled_end`, `estimated_hours`, `is_billable`,
+/// `billing_status`, `custom_fields` and `tags`, and `update_ticket`
+/// FK-validated several of them, but issued no `UPDATE` for any of them: a
+/// client got a 200 and the row never changed. Reads the row back from the
+/// database rather than `TicketResponse` because several of these columns
+/// (site_id, team_id, contract_id, sla_id, scheduled_start, scheduled_end)
+/// are not on that DTO at all - a separate, narrower concern from whether
+/// the column itself is written.
+#[mokosh_test]
+async fn update_ticket_persists_every_accepted_field(pool: PgPool) {
+    let (_admin_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let contact_id = common::seed_billing_contact(&pool, company_id).await;
+    let team_id = common::seed_team(&pool, common::DEFAULT_TENANT_ID, "Patch team", None).await;
+
+    let type_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_types WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("seeded ticket type");
+    let category_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_categories WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("seeded ticket category");
+    let sla_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM sla_policies WHERE tenant_id = $1 LIMIT 1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("seeded sla policy");
+
+    let site_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO sites (id, tenant_id, company_id, name) VALUES ($1, $2, $3, 'Main site')",
+    )
+    .bind(site_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed site");
+
+    let contract_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO contracts (id, tenant_id, name, company_id, contract_type, start_date) \
+         VALUES ($1, $2, 'Managed services', $3, 'managed_services', CURRENT_DATE)",
+    )
+    .bind(contract_id)
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(company_id)
+    .execute(&pool)
+    .await
+    .expect("seed contract");
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let create_resp = app
+        .client
+        .post(app.url("/api/v1/tickets"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "title": "Needs every field persisted",
+            "company_id": company_id,
+            "custom_fields": {},
+        }))
+        .send()
+        .await
+        .expect("send create ticket");
+    assert!(create_resp.status().is_success());
+    let created: serde_json::Value = create_resp.json().await.expect("create ticket JSON");
+    let ticket_id: Uuid = created["id"]
+        .as_str()
+        .expect("created ticket has id")
+        .parse()
+        .expect("ticket id is a uuid");
+
+    #[derive(sqlx::FromRow, Debug, PartialEq)]
+    struct Row {
+        type_id: Option<Uuid>,
+        category_id: Option<Uuid>,
+        contact_id: Option<Uuid>,
+        site_id: Option<Uuid>,
+        team_id: Option<Uuid>,
+        contract_id: Option<Uuid>,
+        sla_id: Option<Uuid>,
+        scheduled_start: Option<DateTime<chrono::Utc>>,
+        scheduled_end: Option<DateTime<chrono::Utc>>,
+        estimated_hours: Option<f64>,
+        is_billable: bool,
+        billing_status: String,
+        custom_fields: serde_json::Value,
+        tags: Vec<String>,
+    }
+    const ROW_QUERY: &str = "SELECT type_id, category_id, contact_id, site_id, team_id, \
+         contract_id, sla_id, scheduled_start, scheduled_end, \
+         estimated_hours::float8 AS estimated_hours, is_billable, billing_status, \
+         custom_fields, COALESCE(tags, '{}') AS tags FROM tickets WHERE id = $1";
+    async fn read_row(pool: &PgPool, ticket_id: Uuid) -> Row {
+        sqlx::query_as(ROW_QUERY)
+            .bind(ticket_id)
+            .fetch_one(pool)
+            .await
+            .expect("read back ticket row")
+    }
+
+    let scheduled_start = "2026-01-05T09:00:00Z";
+    let scheduled_end = "2026-01-05T17:00:00Z";
+    let update_body = serde_json::json!({
+        "type_id": type_id,
+        "category_id": category_id,
+        "contact_id": contact_id,
+        "site_id": site_id,
+        "team_id": team_id,
+        "contract_id": contract_id,
+        "sla_id": sla_id,
+        "scheduled_start": scheduled_start,
+        "scheduled_end": scheduled_end,
+        "estimated_hours": 4.5,
+        "is_billable": false,
+        "billing_status": "ready_to_bill",
+        "custom_fields": {"severity": "high"},
+        "tags": ["urgent", "vip"],
+    });
+    let update_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&update_body)
+        .send()
+        .await
+        .expect("send update ticket");
+    let update_status = update_resp.status();
+    let update_text = update_resp.text().await.expect("update ticket body");
+    assert!(
+        update_status.is_success(),
+        "update should 2xx, got {update_status} body={update_text}"
+    );
+
+    let row = read_row(&pool, ticket_id).await;
+    assert_eq!(row.type_id, Some(type_id), "type_id must persist");
+    assert_eq!(
+        row.category_id,
+        Some(category_id),
+        "category_id must persist"
+    );
+    assert_eq!(row.contact_id, Some(contact_id), "contact_id must persist");
+    assert_eq!(row.site_id, Some(site_id), "site_id must persist");
+    assert_eq!(row.team_id, Some(team_id), "team_id must persist");
+    assert_eq!(
+        row.contract_id,
+        Some(contract_id),
+        "contract_id must persist"
+    );
+    assert_eq!(row.sla_id, Some(sla_id), "sla_id must persist");
+    assert_eq!(
+        row.scheduled_start,
+        Some(scheduled_start.parse().unwrap()),
+        "scheduled_start must persist"
+    );
+    assert_eq!(
+        row.scheduled_end,
+        Some(scheduled_end.parse().unwrap()),
+        "scheduled_end must persist"
+    );
+    assert_eq!(
+        row.estimated_hours,
+        Some(4.5),
+        "estimated_hours must persist"
+    );
+    assert!(!row.is_billable, "is_billable must persist");
+    assert_eq!(
+        row.billing_status, "ready_to_bill",
+        "billing_status must persist"
+    );
+    assert_eq!(
+        row.custom_fields,
+        serde_json::json!({"severity": "high"}),
+        "custom_fields must persist"
+    );
+    assert_eq!(
+        row.tags,
+        vec!["urgent".to_string(), "vip".to_string()],
+        "tags must persist"
+    );
+
+    // Explicit null clears every nullable FK/date/number field above (the
+    // same PATCH convention `asset_id` already followed): absent leaves a
+    // column unchanged, but a body that spells out `null` must clear it.
+    let clear_body = serde_json::json!({
+        "type_id": null,
+        "category_id": null,
+        "contact_id": null,
+        "site_id": null,
+        "team_id": null,
+        "contract_id": null,
+        "sla_id": null,
+        "scheduled_start": null,
+        "scheduled_end": null,
+        "estimated_hours": null,
+    });
+    let clear_resp = app
+        .client
+        .put(app.url(&format!("/api/v1/tickets/{ticket_id}")))
+        .bearer_auth(&token)
+        .json(&clear_body)
+        .send()
+        .await
+        .expect("send clear ticket fields");
+    assert!(
+        clear_resp.status().is_success(),
+        "clearing fields should 2xx, got {}",
+        clear_resp.status()
+    );
+
+    let cleared = read_row(&pool, ticket_id).await;
+    assert_eq!(cleared.type_id, None, "explicit null must clear type_id");
+    assert_eq!(
+        cleared.category_id, None,
+        "explicit null must clear category_id"
+    );
+    assert_eq!(
+        cleared.contact_id, None,
+        "explicit null must clear contact_id"
+    );
+    assert_eq!(cleared.site_id, None, "explicit null must clear site_id");
+    assert_eq!(cleared.team_id, None, "explicit null must clear team_id");
+    assert_eq!(
+        cleared.contract_id, None,
+        "explicit null must clear contract_id"
+    );
+    assert_eq!(cleared.sla_id, None, "explicit null must clear sla_id");
+    assert_eq!(
+        cleared.scheduled_start, None,
+        "explicit null must clear scheduled_start"
+    );
+    assert_eq!(
+        cleared.scheduled_end, None,
+        "explicit null must clear scheduled_end"
+    );
+    assert_eq!(
+        cleared.estimated_hours, None,
+        "explicit null must clear estimated_hours"
+    );
+    // Fields left absent from the clear body stay at their prior value.
+    assert!(
+        !cleared.is_billable,
+        "is_billable must be untouched by an absent field"
+    );
+    assert_eq!(
+        cleared.billing_status, "ready_to_bill",
+        "billing_status must be untouched by an absent field"
+    );
+    assert_eq!(
+        cleared.tags,
+        vec!["urgent".to_string(), "vip".to_string()],
+        "tags must be untouched by an absent field"
+    );
+}
