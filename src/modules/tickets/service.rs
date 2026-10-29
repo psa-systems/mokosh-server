@@ -488,6 +488,20 @@ impl TicketService {
         .await?;
         tx.commit().await?;
 
+        // Audit F11: run on_create automation rules. Failures are logged
+        // but do not abort the ticket creation - a misconfigured rule
+        // shouldn't block legitimate work. Runs before `evaluate_sla`
+        // (PMS-1564): a rule's `set_priority_id` / `set_status_id` action
+        // can change which SLA target applies, so SLA must be evaluated
+        // against the row after automation, not before it.
+        if let Err(e) = self
+            .automation
+            .process_rules(tenant_id, ticket_id, AutomationTrigger::OnCreate)
+            .await
+        {
+            tracing::warn!(?e, %tenant_id, %ticket_id, "on_create automation failed");
+        }
+
         // PMS-1564: evaluate the ticket's SLA through the business-hours-
         // aware evaluator (no-op when no `SlaService` is wired).
         self.evaluate_sla(tenant_id, ticket_id).await;
@@ -513,17 +527,6 @@ impl TicketService {
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
-        }
-
-        // Audit F11: run on_create automation rules. Failures are logged
-        // but do not abort the ticket creation - a misconfigured rule
-        // shouldn't block legitimate work.
-        if let Err(e) = self
-            .automation
-            .process_rules(tenant_id, ticket_id, AutomationTrigger::OnCreate)
-            .await
-        {
-            tracing::warn!(?e, %tenant_id, %ticket_id, "on_create automation failed");
         }
 
         self.get_ticket(tenant_id, ticket_id).await
@@ -779,11 +782,6 @@ impl TicketService {
             }
         }
 
-        // PMS-1564: whether this update names a status or a priority; the
-        // SLA re-evaluation that depends on them runs after the tx commits
-        // so it reads the committed row (`evaluate_sla` goes through the
-        // pool, not this tx).
-        let needs_sla_eval = request.status_id.is_some() || request.priority_id.is_some();
         if let Some(priority_id) = request.priority_id {
             sqlx::query("UPDATE tickets SET priority_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
                 .bind(priority_id)
@@ -899,15 +897,12 @@ impl TicketService {
         }
         tx.commit().await?;
 
-        // PMS-1564: re-evaluate SLA when status or priority changes. Runs
-        // after commit so it reads the persisted row (mirrors the
-        // post-commit follow-up pattern in contacts::update_company).
-        if needs_sla_eval {
-            self.evaluate_sla(tenant_id, ticket_id).await;
-        }
-
         // Audit F11: run on_update automation rules. Same fail-soft
-        // policy as on_create - log but do not surface a 500.
+        // policy as on_create - log but do not surface a 500. Runs
+        // before `evaluate_sla` (PMS-1564): a rule's `set_priority_id` /
+        // `set_status_id` action mutates the row independently of
+        // `request`, so SLA must be evaluated after automation, not
+        // before it, or that mutation keeps stale due dates.
         if let Err(e) = self
             .automation
             .process_rules(tenant_id, ticket_id, AutomationTrigger::OnUpdate)
@@ -915,6 +910,17 @@ impl TicketService {
         {
             tracing::warn!(?e, %tenant_id, %ticket_id, "on_update automation failed");
         }
+
+        // PMS-1564: re-evaluate SLA unconditionally. This request may
+        // have changed status or priority itself, or the on_update
+        // automation rule just above may have (its `set_status_id` /
+        // `set_priority_id` actions are not gated on `request`'s
+        // fields), so evaluation can no longer key off `request` alone.
+        // `evaluate_for_ticket` is a cheap no-op when neither changed
+        // which policy/target applies. Runs after commit so it reads
+        // the persisted row (mirrors the post-commit follow-up pattern
+        // in contacts::update_company).
+        self.evaluate_sla(tenant_id, ticket_id).await;
 
         self.get_ticket(tenant_id, ticket_id).await
     }
@@ -2800,6 +2806,12 @@ impl TicketService {
         .await?;
 
         tx.commit().await?;
+
+        // PMS-1564: reopening flips status_id back to open, which is
+        // exactly the kind of status change the manual evaluate route
+        // exists to redo; the ticket otherwise keeps the due dates it
+        // had when it was closed.
+        self.evaluate_sla(tenant_id, ticket_id).await;
 
         self.get_ticket_response(tenant_id, ticket_id).await
     }

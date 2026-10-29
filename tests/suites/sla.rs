@@ -503,3 +503,197 @@ async fn ticket_create_and_status_change_evaluate_sla(pool: PgPool) {
         "status change must re-evaluate resolution_due via business hours"
     );
 }
+
+/// PMS-1564: `TicketService::reopen_portal_ticket` flips a closed ticket's
+/// `status_id` back to the tenant's default status, which is a real status
+/// change and must re-evaluate SLA exactly like `update_ticket`'s own
+/// status-change path does. Seeds the same non-default business-hours
+/// policy as the test above, closes a ticket with its `created_at` moved to
+/// a Friday evening and its due dates cleared (standing in for stale due
+/// dates left over from before the ticket closed), reopens it through the
+/// portal path, and asserts the due dates come back populated with the
+/// business-hours math rather than staying NULL.
+#[mokosh_test]
+async fn reopen_portal_ticket_evaluates_sla(pool: PgPool) {
+    let tenant_id = common::DEFAULT_TENANT_ID;
+    let tenant = TenantId::from_trusted(tenant_id);
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+
+    let priority_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ticket_priorities WHERE tenant_id = $1 AND name = 'Medium'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seeded Medium priority");
+    let queue_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM ticket_queues WHERE tenant_id = $1 LIMIT 1")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .expect("seeded queue");
+    let closed_status_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ticket_statuses WHERE tenant_id = $1 AND name = 'Closed'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seeded Closed status");
+
+    let company_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO companies (id, tenant_id, name) VALUES ($1, $2, 'PMS-1564 Reopen Co')",
+    )
+    .bind(company_id)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("seed company");
+
+    let bh_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO business_hours (id, tenant_id, name, timezone, schedule, is_default)
+           VALUES ($1, $2, 'PMS-1564 Reopen Hours', 'America/New_York',
+                   '{
+                       "0": null,
+                       "1": {"start": "09:00", "end": "17:00"},
+                       "2": {"start": "09:00", "end": "17:00"},
+                       "3": {"start": "09:00", "end": "17:00"},
+                       "4": {"start": "09:00", "end": "17:00"},
+                       "5": {"start": "09:00", "end": "17:00"},
+                       "6": null
+                   }'::jsonb, FALSE)"#,
+    )
+    .bind(bh_id)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("seed business hours");
+
+    let policy_id = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO sla_policies (id, tenant_id, name, business_hours_id, is_default)
+           VALUES ($1, $2, 'PMS-1564 Reopen SLA', $3, FALSE)"#,
+    )
+    .bind(policy_id)
+    .bind(tenant_id)
+    .bind(bh_id)
+    .execute(&pool)
+    .await
+    .expect("seed sla policy");
+
+    sqlx::query(
+        r#"INSERT INTO sla_targets
+           (sla_policy_id, priority_id, first_response_hours, resolution_hours, operational_hours)
+           VALUES ($1, $2, 4, 8, 'business_hours')"#,
+    )
+    .bind(policy_id)
+    .bind(priority_id)
+    .execute(&pool)
+    .await
+    .expect("seed sla target");
+
+    let db = Database::from_pool(pool.clone());
+    let sla_service = SlaService::new(db.clone());
+    let ticket_service = TicketService::new(db.clone()).with_sla(Arc::new(sla_service));
+
+    let request = CreateTicketRequest {
+        title: "PMS-1564 reopen probe".to_string(),
+        description: None,
+        priority_id: None,
+        type_id: None,
+        category_id: None,
+        queue_id: Some(queue_id),
+        source: TicketSource::Api,
+        company_id,
+        contact_id: None,
+        site_id: None,
+        assigned_to_id: None,
+        team_id: None,
+        parent_ticket_id: None,
+        contract_id: None,
+        sla_id: Some(policy_id),
+        scheduled_start: None,
+        scheduled_end: None,
+        estimated_hours: None,
+        is_billable: true,
+        asset_id: None,
+        custom_fields: serde_json::json!({}),
+        tags: vec![],
+        source_kb_article_id: None,
+        procedure_kb_article_id: None,
+        email_message_id: None,
+        email_thread_id: None,
+    };
+    let created = ticket_service
+        .create_ticket(tenant, admin_id, &request, &AuditCtx::system(tenant_id))
+        .await
+        .expect("create ticket");
+    let ticket_id = created.id;
+
+    // Close the ticket directly (bypassing update_ticket, which would
+    // itself re-evaluate SLA) and move created_at to a Friday evening with
+    // the due dates cleared, so the reopen is the only thing standing
+    // between this ticket and stale/missing due dates.
+    let friday_evening = utc(2026, 6, 5, 20, 0); // 16:00 EDT Friday
+    sqlx::query(
+        "UPDATE tickets SET status_id = $1, created_at = $2, closed_at = NOW(), \
+         first_response_due = NULL, resolution_due = NULL, sla_due_date = NULL \
+         WHERE id = $3",
+    )
+    .bind(closed_status_id)
+    .bind(friday_evening)
+    .bind(ticket_id)
+    .execute(&pool)
+    .await
+    .expect("close ticket and clear due dates");
+
+    ticket_service
+        .reopen_portal_ticket(tenant, company_id, None, ticket_id, None)
+        .await
+        .expect("reopen ticket");
+
+    let (fr_due, res_due): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT first_response_due, resolution_due FROM tickets WHERE id = $1")
+            .bind(ticket_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read back due dates after reopen");
+
+    let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+    let five = NaiveTime::from_hms_opt(17, 0, 0).unwrap();
+    let schedule = BusinessSchedule::from_windows(
+        New_York,
+        [
+            (Weekday::Mon, vec![(nine, five)]),
+            (Weekday::Tue, vec![(nine, five)]),
+            (Weekday::Wed, vec![(nine, five)]),
+            (Weekday::Thu, vec![(nine, five)]),
+            (Weekday::Fri, vec![(nine, five)]),
+        ],
+    );
+    let expected_fr = clock::due_at(
+        friday_evening,
+        4.0,
+        &schedule,
+        &HashSet::new(),
+        OperationalHours::BusinessHours,
+    );
+    let expected_res = clock::due_at(
+        friday_evening,
+        8.0,
+        &schedule,
+        &HashSet::new(),
+        OperationalHours::BusinessHours,
+    );
+    assert_eq!(
+        fr_due,
+        Some(expected_fr),
+        "reopen must re-evaluate first_response_due via business hours"
+    );
+    assert_eq!(
+        res_due,
+        Some(expected_res),
+        "reopen must re-evaluate resolution_due via business hours"
+    );
+}
