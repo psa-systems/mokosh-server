@@ -1157,6 +1157,16 @@ impl BillingService {
         // deployment that has not flipped `DelegatedInvoiceIssuer` runs
         // exactly the statements it ran before, in the same order and
         // the same number of them.
+        // PMS-1561 (F5): when the pre-pass below runs, it already asserts
+        // the company, the payment term and every line's product
+        // sellability against this exact tenant and request, which cannot
+        // have changed by the time the main transaction opens a few lines
+        // down. Carrying its due date and payment term forward, and
+        // skipping the main transaction's copies of those three guards
+        // when they already ran, is what stops a delegated create from
+        // paying for the full guard set twice. The non-delegated path
+        // (`prevalidated` stays `None`) is unchanged.
+        let mut prevalidated: Option<(NaiveDate, Option<Uuid>)> = None;
         let external = match self.invoice_dispatch.as_ref() {
             Some(dispatcher) if dispatcher.delegation_enabled() => {
                 let mut pre = self.db.begin_with_tenant(tenant_id).await?;
@@ -1176,7 +1186,7 @@ impl BillingService {
                         Self::assert_product_sellable(&mut pre, tenant_id, product_id).await?;
                     }
                 }
-                let (due_date, _) = Self::resolve_due_date(
+                let (due_date, payment_term_id) = Self::resolve_due_date(
                     &mut pre,
                     tenant_id,
                     request.invoice_date,
@@ -1189,6 +1199,7 @@ impl BillingService {
                     None => read_default_currency(&mut pre, tenant_id).await?,
                 };
                 pre.commit().await?;
+                prevalidated = Some((due_date, payment_term_id));
 
                 let shape =
                     crate::modules::billing::invoice_issuer_dispatch::CreateInvoiceRequestShape {
@@ -1224,20 +1235,27 @@ impl BillingService {
         let total = subtotal + tax - discount;
 
         // PMS-1367: before anything is written, and before the contact is
-        // resolved against it.
-        Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
-        if let Some(pt) = request.payment_term_id {
-            Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
-        }
-        // PMS-990: the due date the caller gave, or the one the term implies.
-        let (due_date, payment_term_id) = Self::resolve_due_date(
-            &mut tx,
-            tenant_id,
-            request.invoice_date,
-            request.payment_term_id,
-            request.due_date,
-        )
-        .await?;
+        // resolved against it. Skipped when the pre-pass above already ran
+        // these same two guards against this tenant and request (PMS-1561
+        // F5): the non-delegated path, where `prevalidated` is `None`,
+        // still runs them here exactly as before.
+        let (due_date, payment_term_id) = if let Some(prevalidated) = prevalidated {
+            prevalidated
+        } else {
+            Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
+            if let Some(pt) = request.payment_term_id {
+                Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
+            }
+            // PMS-990: the due date the caller gave, or the one the term implies.
+            Self::resolve_due_date(
+                &mut tx,
+                tenant_id,
+                request.invoice_date,
+                request.payment_term_id,
+                request.due_date,
+            )
+            .await?
+        };
 
         // PMS-1016: the contact the caller named, else the company's default.
         let billing_contact_id = Self::resolve_billing_contact(
@@ -1322,9 +1340,13 @@ impl BillingService {
         // line is written, so a bad id on the third line does not leave the
         // first two behind. RLS does not cover this: an FK check bypasses it,
         // so a foreign-tenant product would link silently (PMS-333's lesson).
-        for line in &request.lines {
-            if let Some(product_id) = line.product_id {
-                Self::assert_product_sellable(&mut tx, tenant_id, product_id).await?;
+        // Skipped when the pre-pass already ran this same loop against this
+        // tenant and these lines (PMS-1561 F5).
+        if prevalidated.is_none() {
+            for line in &request.lines {
+                if let Some(product_id) = line.product_id {
+                    Self::assert_product_sellable(&mut tx, tenant_id, product_id).await?;
+                }
             }
         }
 

@@ -173,14 +173,26 @@ impl IntegrationsService {
 
     /// One provider. Answers for a provider with no row too, for the same
     /// reason the list does.
+    ///
+    /// `capability` is what the caller actually needs: `contact_sync_states`
+    /// loops over all three contact-sync providers, each opening its own
+    /// transaction, and every one of those reads is wasted on a caller that
+    /// only wants invoicing or bills-and-expenses state (PMS-1561 F4). Only a
+    /// caller asking about `Capability::Contacts` pays for it; pass that
+    /// value to keep the old full-response behaviour.
     pub async fn get(
         &self,
         tenant_id: TenantId,
         provider: IntegrationProvider,
+        capability: Capability,
     ) -> AppResult<IntegrationResponse> {
         let descriptor = registry::descriptor(provider);
         let row = self.read_row(tenant_id, provider).await?;
-        let contact_sync = self.contact_sync_states(tenant_id).await?;
+        let contact_sync = if capability == Capability::Contacts {
+            self.contact_sync_states(tenant_id).await?
+        } else {
+            std::collections::HashMap::new()
+        };
         Ok(compose(
             descriptor,
             row.as_ref(),
