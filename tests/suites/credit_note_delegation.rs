@@ -80,6 +80,10 @@ struct Calls {
     /// Whether the Xero credit note still carries an allocation when the
     /// void reads it.
     xero_credit_allocated: bool,
+    /// PMS-1559: how long `xero_credit_note` sleeps before answering, so a
+    /// test can simulate a slow provider and show the invoice lock is not
+    /// held across that wait.
+    credit_delay_ms: u64,
 }
 
 type Stub = Arc<Mutex<Calls>>;
@@ -100,6 +104,10 @@ async fn xero_issue(State(stub): State<Stub>, Json(body): Json<Value>) -> impl I
 
 /// `POST /CreditNotes`: Xero raises the credit document.
 async fn xero_credit_note(State(stub): State<Stub>, Json(body): Json<Value>) -> impl IntoResponse {
+    let delay_ms = stub.lock().unwrap().credit_delay_ms;
+    if delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
     let mut calls = stub.lock().unwrap();
     calls.credits.push(body);
     if let Some(status) = calls.credit_refuses_with {
@@ -1014,5 +1022,64 @@ async fn a_quickbooks_credit_line_without_a_product_is_refused(pool: PgPool) {
         stub.lock().unwrap().credits.len(),
         0,
         "and the provider was never asked"
+    );
+}
+
+/// PMS-1559 regression: `create_credit_note` must not hold the invoice's
+/// `FOR UPDATE` lock across the provider call. Two concurrent credit notes
+/// against the SAME invoice, each hitting a provider stub that sleeps,
+/// finish in roughly one sleep's worth of wall time rather than two: if the
+/// lock were still held across the HTTP round trip (as it was before this
+/// split), the second attempt would queue behind the first's provider call
+/// and the total would be close to double the delay.
+#[mokosh_test]
+async fn a_slow_provider_call_does_not_block_a_concurrent_credit_note(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (_admin, _email, _password) = common::seed_admin(&pool).await;
+    let (billing, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+
+    delegate(&pool, "xero").await;
+    seed_xero_blob(&secrets).await;
+    // Total 300, so two credit notes of 40 each fit well inside the cap.
+    let (invoice_id, _product) =
+        delegated_invoice(&billing, &pool, db, InvoiceProviderKind::Xero, XERO_CONTACT).await;
+
+    const DELAY_MS: u64 = 300;
+    stub.lock().unwrap().credit_delay_ms = DELAY_MS;
+
+    let first = billing.clone();
+    let second = billing.clone();
+    let started = std::time::Instant::now();
+    let (first_result, second_result) = tokio::join!(
+        async move {
+            first
+                .create_credit_note(tenant(), "UTC", &credit_request(invoice_id, None), &ctx())
+                .await
+        },
+        async move {
+            second
+                .create_credit_note(tenant(), "UTC", &credit_request(invoice_id, None), &ctx())
+                .await
+        },
+    );
+    let elapsed = started.elapsed();
+
+    first_result.expect("the first credit note succeeds");
+    second_result.expect("the second credit note succeeds");
+    assert_eq!(
+        stub.lock().unwrap().credits.len(),
+        2,
+        "both attempts reached the provider"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(DELAY_MS * 3 / 2),
+        "two concurrent provider calls of {DELAY_MS}ms each took {elapsed:?}, which is close to \
+         double the delay and means the invoice lock serialised them instead of the provider \
+         calls overlapping"
+    );
+    assert_eq!(
+        amount_credited(&pool, invoice_id).await,
+        Decimal::from(80),
+        "both credits landed"
     );
 }
