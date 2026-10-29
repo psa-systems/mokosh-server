@@ -479,18 +479,6 @@ pub struct CreateTicketRequest {
     pub email_thread_id: Option<String>,
 }
 
-/// Bound to the `DECIMAL(10, 2)` column (see
-/// `CreateTicketRequest::estimated_hours`) so an oversized value is a clean
-/// 422, not a 500. `validator`'s derive macro unwraps both `Option` layers of
-/// `Option<Option<f64>>` before calling a `custom` validator, so this takes
-/// the bare value rather than `#[validate(range)]` (which only unwraps one).
-fn validate_estimated_hours(hours: f64) -> Result<(), ValidationError> {
-    if !(0.0..=99_999_999.99).contains(&hours) {
-        return Err(ValidationError::new("range"));
-    }
-    Ok(())
-}
-
 /// Update ticket request
 ///
 /// PMS-1565: every nullable FK/date/number column here follows the
@@ -527,7 +515,7 @@ pub struct UpdateTicketRequest {
     #[serde(default, deserialize_with = "crate::deserialize_double_option")]
     pub scheduled_end: Option<Option<DateTime<Utc>>>,
     #[serde(default, deserialize_with = "crate::deserialize_double_option")]
-    #[validate(custom(function = "validate_estimated_hours"))]
+    #[validate(range(min = 0.0, max = 99_999_999.99))]
     pub estimated_hours: Option<Option<f64>>,
     pub is_billable: Option<bool>,
     pub billing_status: Option<BillingStatus>,
