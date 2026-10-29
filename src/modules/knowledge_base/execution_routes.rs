@@ -6,6 +6,15 @@
 //! (`RequireAuth`): a contact-plane read is a separate follow-up. The
 //! service scopes every query on `tenant_id` from the caller's user,
 //! so RLS + the explicit WHERE clauses backstop a dropped filter.
+//!
+//! parity record 2026-10-29: `/tickets/{ticket_id}/kb-executions`,
+//! `/kb-executions/{id}` and `/kb-executions/{id}/steps/{index}` have
+//! no SPA caller in mokosh-apps yet. This is the server half of the
+//! PMS-1555 execution model (Phase 2a). The SPA ticket-page checklist
+//! that consumes these endpoints is the Phase 2b follow-up and lands
+//! in a separate mokosh-apps PR; the server endpoints must exist on
+//! main first so the SPA PR has something to call. Remove this record
+//! when the SPA caller lands.
 
 use std::sync::Arc;
 
