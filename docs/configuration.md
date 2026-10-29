@@ -20,6 +20,16 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 - [`PORTAL_COOKIE_DOMAIN`](#var-portal-cookie-domain) (Required: no) - Optional. Leave it unset to keep the default.
 
+<a id="release-v0-18-0"></a>
+
+### Unreleased (v0.18.0)
+
+#### Added
+
+- [`BUNYIP_SECRETS_CLIENT_ID`](#var-bunyip-secrets-client-id) (Required: no) - Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537)
+- [`BUNYIP_SECRETS_CLIENT_SECRET`](#var-bunyip-secrets-client-secret) (Required: no) - Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537)
+- [`BUNYIP_SECRETS_URL`](#var-bunyip-secrets-url) (Required: no) - Optional, and set together or not at all. A hosted deployment points these at bunyip's host-secrets route and the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider: an operator sets it once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537)
+
 <a id="release-v0-17-0"></a>
 
 ### v0.17.0
@@ -306,6 +316,9 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-xero-client-id"></a>`XERO_CLIENT_ID` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The host's Xero OAuth client id for delegated invoice issuing (MAPPS-1139). Served by the `APP_SECRET_BACKEND` provider; setting only one half of the pair is a boot error naming the missing half. Unset leaves no tenant on this deployment able to connect a Xero organisation. |
 | <a id="var-xero-client-secret"></a>`XERO_CLIENT_SECRET` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The secret half of the pair above, served by the same provider so both come from one Xero app registration (MAPPS-1139). |
 | <a id="var-xero-webhook-key"></a>`XERO_WEBHOOK_KEY` | no | v0.17.0 | governed application-tier secret, NOT `.env` | Signing key Xero webhook deliveries are verified against. Served by the `APP_SECRET_BACKEND` provider; unset refuses deliveries, so an invoice Xero marks paid stays outstanding in Mokosh until recorded by hand (MAPPS-1139). |
+| <a id="var-bunyip-secrets-url"></a>`BUNYIP_SECRETS_URL` | no | v0.18.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-bunyip-secrets-client-id"></a>`BUNYIP_SECRETS_CLIENT_ID` | no | v0.18.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-bunyip-secrets-client-secret"></a>`BUNYIP_SECRETS_CLIENT_SECRET` | no | v0.18.0 | `.env` | Not described yet: say what it does. |
 
 ## Development stack variables
 
