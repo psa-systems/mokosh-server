@@ -244,6 +244,14 @@ dunite-provider-status = { git = "https://dev.a8n.run/psa-systems/dunite", rev =
 # with `default-features = false` was for RSS reasons under earlyoom;
 # 0.12.7 inherits `default-features = false` and the image codecs are
 # additive, so the RSS concern stays addressed here.
+# Template engine for the knowledge-base render endpoint. Default `{{ }}` /
+# `{% %}` delimiters are what the ticket's examples use 1:1; Lenient undefined
+# so a missing variable takes the else branch of a conditional, and the engine
+# never 500s on a bad values map (parse / render errors land as 4xx instead).
+# Default features cover `builtins` (needed for `|default`), `multi_template`
+# is unused.
+minijinja = "2.11"
+
 printpdf = { version = "0.12.7", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # PMS-1008 subsets the embedded faces per document. printpdf's own subsetter is
 # behind its `text_layout` feature, which is what we are declining, but the

@@ -142,6 +142,7 @@ pub mod kb_attachments;
 pub mod kb_comments;
 pub mod kb_drafts;
 pub mod kb_parent_and_company_filter;
+pub mod kb_render;
 pub mod knowledge_base;
 pub mod list_filter_pagination;
 pub mod login_approval;

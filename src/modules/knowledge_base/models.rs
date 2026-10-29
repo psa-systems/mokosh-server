@@ -35,6 +35,37 @@ fn default_internal() -> String {
     "internal".into()
 }
 
+/// One declared template variable on a KB article. The render endpoint
+/// accepts a `{name: value}` map that must be a subset of these names;
+/// an unknown name is a 400. A variable with no `allowed_values` is
+/// free-text, otherwise the value must be one of them. `default` seeds
+/// the value when the caller does not pass one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KbTemplateVariable {
+    pub name: String,
+    pub label: String,
+    #[serde(default)]
+    pub allowed_values: Vec<String>,
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// Body of POST /kb/articles/{id}/render. An absent or empty `values`
+/// is `{}`.
+#[derive(Debug, Clone, Default, Deserialize, Validate)]
+pub struct RenderKbArticleRequest {
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, String>,
+}
+
+/// The rendered article body; the id so a caller re-reading several
+/// articles can match the response to its request.
+#[derive(Debug, Clone, Serialize)]
+pub struct RenderKbArticleResponse {
+    pub id: Uuid,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct KbArticleResponse {
     pub id: Uuid,
@@ -79,6 +110,11 @@ pub struct KbArticleResponse {
     /// `None` for a top-level article. The parent is scoped to the same
     /// tenant; a cross-tenant link cannot be written through the API.
     pub parent_article_id: Option<Uuid>,
+    /// Declared template variables, carried through write + restore so a
+    /// `/render` call knows what names it accepts. Empty for an article
+    /// that has none, which is how every pre-templating row reads.
+    #[serde(default)]
+    pub template_variables: Vec<KbTemplateVariable>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -101,6 +137,14 @@ pub struct ContactKbArticleResponse {
     pub category_id: Option<Uuid>,
     pub published_at: Option<DateTime<Utc>>,
     pub tags: Vec<String>,
+    /// Declared template variables, so the portal's variable picker
+    /// knows what names to prompt for before calling `/render`. The
+    /// contact never sees `default` leaking out on a staff article it
+    /// is not supposed to read: `template_variables` is only populated
+    /// for an article the portal already resolved as published +
+    /// visible.
+    #[serde(default)]
+    pub template_variables: Vec<KbTemplateVariable>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -115,6 +159,7 @@ impl From<KbArticleResponse> for ContactKbArticleResponse {
             category_id: a.category_id,
             published_at: a.published_at,
             tags: a.tags,
+            template_variables: a.template_variables,
             updated_at: a.updated_at,
         }
     }
@@ -147,6 +192,11 @@ pub struct CreateKbArticleRequest {
     /// self-reference.
     #[serde(default)]
     pub parent_article_id: Option<Uuid>,
+    /// Declared template variables (optional on create). Service-side
+    /// validation refuses duplicate names and a default that is not in
+    /// a non-empty `allowed_values`.
+    #[serde(default)]
+    pub template_variables: Option<Vec<KbTemplateVariable>>,
 }
 
 fn default_draft() -> String {
@@ -181,6 +231,11 @@ pub struct UpdateKbArticleRequest {
     /// no version for it to explain.
     #[validate(length(max = 500))]
     pub change_note: Option<String>,
+    /// Declared template variables; `Some(vec)` replaces the whole set,
+    /// `None` leaves it alone. The service applies the same duplicate /
+    /// default-in-allowed-values rules as create.
+    #[serde(default)]
+    pub template_variables: Option<Vec<KbTemplateVariable>>,
 }
 
 /// A JSON `null` deserializes into `Some(None)`, an absent field into
