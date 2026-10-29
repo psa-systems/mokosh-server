@@ -334,6 +334,104 @@ async fn service_desk_time_slice_happy_path(pool: PgPool) {
     );
 }
 
+/// PMS-1563: stopping another user's running timer must answer the same 404
+/// as an unknown id, and must leave the `active_timers` row untouched - a
+/// non-owner's stop attempt must not be able to turn someone else's timer
+/// into a time entry.
+#[mokosh_test]
+async fn non_owner_cannot_stop_another_users_timer(pool: PgPool) {
+    let (_admin_id, admin_email, admin_pw) = common::seed_admin(&pool).await;
+    let (_a_id, a_email, a_pw) = seed_technician(&pool).await;
+    let (_b_id, b_email, b_pw) = common::seed_user(
+        &pool,
+        common::DEFAULT_TENANT_ID,
+        "tech-b-stop@example.com",
+        "technician",
+    )
+    .await;
+    let company_id = common::seed_company(&pool).await;
+    let db_pool = pool.clone();
+    let app = common::boot(pool).await;
+
+    let admin_token = common::login(&app, &admin_email, &admin_pw).await;
+    let a_token = common::login(&app, &a_email, &a_pw).await;
+    let b_token = common::login(&app, &b_email, &b_pw).await;
+
+    let work_types: serde_json::Value = app
+        .client
+        .get(app.url("/api/v1/work-types"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("list work types")
+        .json()
+        .await
+        .expect("work types JSON");
+    let work_type_id = work_types["data"][0]["id"]
+        .as_str()
+        .expect("seed has at least one work type")
+        .to_string();
+
+    // Technician A starts a timer.
+    let timer: serde_json::Value = app
+        .client
+        .post(app.url("/api/v1/timers/start"))
+        .bearer_auth(&a_token)
+        .json(&serde_json::json!({
+            "company_id": company_id,
+            "work_type_id": work_type_id,
+            "notes": "A's own work",
+        }))
+        .send()
+        .await
+        .expect("start timer")
+        .json()
+        .await
+        .expect("timer JSON");
+    let timer_id = timer["id"].as_str().expect("timer id").to_string();
+
+    // Technician B, in the same tenant, must not be able to stop A's timer.
+    let b_stop = app
+        .client
+        .post(app.url(&format!("/api/v1/timers/{timer_id}/stop")))
+        .bearer_auth(&b_token)
+        .send()
+        .await
+        .expect("B stop attempt");
+    assert_eq!(
+        b_stop.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a non-owner must get the same 404 as an unknown timer id"
+    );
+
+    // The active_timers row must still be in place: B's attempt did not
+    // turn A's timer into a time entry.
+    let still_active: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM active_timers WHERE id = $1")
+            .bind(timer_id.parse::<Uuid>().expect("timer id is a uuid"))
+            .fetch_optional(&db_pool)
+            .await
+            .expect("query active_timers");
+    assert!(
+        still_active.is_some(),
+        "the active_timers row must remain after a non-owner's failed stop attempt"
+    );
+
+    // The owner can still stop their own timer afterward.
+    let a_stop = app
+        .client
+        .post(app.url(&format!("/api/v1/timers/{timer_id}/stop")))
+        .bearer_auth(&a_token)
+        .send()
+        .await
+        .expect("A stop attempt");
+    assert!(
+        a_stop.status().is_success(),
+        "the owner must still be able to stop their own timer, got {}",
+        a_stop.status()
+    );
+}
+
 // ============================================================================
 // PMS-328: PUT /time-entries preserves task_id, and the read paths expose it.
 // ============================================================================

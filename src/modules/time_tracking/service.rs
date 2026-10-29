@@ -1503,14 +1503,16 @@ impl TimeTrackingService {
         &self,
         tenant_id: TenantId,
         timer_id: Uuid,
+        user_id: Uuid,
     ) -> AppResult<TimeEntryResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
         let timer: Option<ActiveTimerRow> = sqlx::query_as(
             "SELECT id, user_id, ticket_id, project_id, company_id, work_type_id, notes, started_at \
-             FROM active_timers WHERE tenant_id = $1 AND id = $2",
+             FROM active_timers WHERE tenant_id = $1 AND id = $2 AND user_id = $3",
         )
         .bind(tenant_id)
         .bind(timer_id)
+        .bind(user_id)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(timer) = timer else {
