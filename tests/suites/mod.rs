@@ -65,6 +65,7 @@ pub mod contact_reset_password_verify_count;
 pub mod contact_scope;
 pub mod contact_scope_expanded;
 pub mod contact_sessions;
+pub mod contact_sync_chunking;
 pub mod contact_sync_connect;
 pub mod contact_sync_engine;
 pub mod contact_sync_host_client;
