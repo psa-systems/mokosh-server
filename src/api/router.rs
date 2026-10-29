@@ -44,7 +44,9 @@ use crate::modules::invitations::{invitations_routes, InvitationsService};
 use crate::modules::knowledge_base::attachments::{
     kb_attachment_routes, public_kb_attachment_routes, KbAttachmentConfig, KbAttachmentService,
 };
-use crate::modules::knowledge_base::{kb_routes, KbService};
+use crate::modules::knowledge_base::{
+    kb_execution_routes, kb_routes, KbExecutionService, KbService,
+};
 use crate::modules::mileage_tracking::{mileage_tracking_routes, MileageTrackingService};
 use crate::modules::notifications::{notifications_routes, NotificationsService};
 use crate::modules::platform::{platform_routes, PlatformAdminService};
@@ -349,6 +351,11 @@ pub fn create_api_router(
     let expenses_service = ExpensesService::new(db.clone());
     // PMS-1129: an @mention in a KB comment notifies through the queue.
     let kb_service = KbService::new(db.clone()).with_notifications(notifications_service.clone());
+    // KB article executions: the "I followed this article" record on a
+    // ticket. Reuses the KB render path, so a template change in the
+    // Phase 1a service propagates automatically.
+    let kb_execution_service =
+        KbExecutionService::new(db.clone(), std::sync::Arc::new(kb_service.clone()));
     // PMS-246: the SPA origin is the invite accept-link base (login-driven
     // acceptance), so created invites email the invitee. PMS-1378 routed
     // the invite mail through `NotificationsService::dispatch`
@@ -793,6 +800,10 @@ pub fn create_api_router(
         )
         // Knowledge base: categories + articles + versions + portal feed. PMS-80.
         .merge(kb_routes(kb_service))
+        // KB article executions on tickets. Staff-only in this phase;
+        // the per-ticket surface and the per-execution step toggles
+        // share one service wired through the Phase 1a render path.
+        .merge(kb_execution_routes(kb_execution_service))
         // PMS-923: images an article embeds. Upload / list / delete are
         // manager-gated here; the READ is public (see the public tree below),
         // because an `<img>` cannot carry an Authorization header.
