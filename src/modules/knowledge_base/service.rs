@@ -658,19 +658,34 @@ impl KbService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("KB article".to_string()))?;
-        if bump_view {
-            // Increment view count on read; fire-and-forget if the bump fails.
-            let _ = sqlx::query("UPDATE kb_articles SET view_count = view_count + 1 WHERE id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await;
-        }
         tx.commit().await?;
+        if bump_view {
+            // The read already committed, so a failed bump cannot abort or
+            // hide behind it: it runs as its own tenant-scoped transaction
+            // and a failure is only logged, never returned to the caller.
+            if let Err(err) = self.bump_view_count(tenant_id, id).await {
+                tracing::warn!(article_id = %id, error = %err, "KB article view-count bump failed");
+            }
+        }
         crate::utils::unresolved_person::log_unresolved_person_names(
             "knowledge_base.get_article",
             &unresolved_article_person_ids(std::slice::from_ref(&row)),
         );
         Ok(row.into())
+    }
+
+    /// Increment `view_count` for a tenant-scoped article as its own
+    /// transaction, independent of the read that triggered it. Kept
+    /// separate so a failure here never aborts or hides behind the read's
+    /// transaction (PMS-1566).
+    async fn bump_view_count(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query("UPDATE kb_articles SET view_count = view_count + 1 WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
