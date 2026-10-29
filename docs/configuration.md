@@ -365,7 +365,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 | <a id="var-allow-uninvited-bunyip-signup"></a>`ALLOW_UNINVITED_BUNYIP_SIGNUP` | no, default off | v0.16.0 | `.env` | Lets a Bunyip identity with a verified email provision a personal tenant on first sight. Production stays invitation-only; staging turns it on (PMS-1457). |
 | <a id="var-bunyip-status-client-id"></a>`BUNYIP_STATUS_CLIENT_ID` | no, unset gates provider status on `RequireAdmin` alone | v0.14.0 | `.env` | Machine credential Bunyip's provider-status aggregator presents as HTTP Basic (PMS-1193). Set together with the secret below. |
 | <a id="var-bunyip-status-client-secret"></a>`BUNYIP_STATUS_CLIENT_SECRET` | no, unset gates provider status on `RequireAdmin` alone | v0.14.0 | `.env` | The secret half, compared in constant time. |
-| <a id="var-admin-email"></a>`ADMIN_EMAIL` | no, unset skips the first-run admin | v0.1.0 | `.env` | Optional first-run super-admin, development only; see [`first-run-onboarding.md`](first-run-onboarding.md). |
+| <a id="var-admin-email"></a>`ADMIN_EMAIL` | no, unset skips the first-run admin | v0.1.0 | `.env` | Optional first-run platform admin (a `platform_admins` row, signed in at `/platform/login`), development only; see [`first-run-onboarding.md`](first-run-onboarding.md). |
 | <a id="var-admin-password"></a>`ADMIN_PASSWORD` | no, unset skips the first-run admin | v0.1.0 | `.env` | Password for the first-run admin above. |
 | <a id="var-login-approval-enabled"></a>`LOGIN_APPROVAL_ENABLED` | no, default off | v0.8.0 | `.env` | The suspicious-login notify-and-approve gate (PMS-658), off by default because it can withhold a login. |
 

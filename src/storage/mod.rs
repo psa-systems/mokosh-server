@@ -48,9 +48,9 @@
 //! operator-facing variable is still `STORAGE_BACKEND` and deliberately so:
 //! renaming it breaks every existing deployment for a vocabulary change.
 
-// PMS-1317: the `STORAGE_`-prefixed variables an operator sets, and the older
-// names still honoured as deprecated aliases while every deployment's compose
-// file catches up.
+// PMS-1317: the `STORAGE_`-prefixed variables an operator sets. PMS-1443
+// ended the alias grace period: setting an older name refuses boot rather
+// than being honoured.
 pub mod env;
 mod ledger;
 pub mod s3;
@@ -387,11 +387,10 @@ impl StorageConfig {
     /// The ONE reader of the storage root. Three modules used to have their
     /// own, with two different fallbacks between them.
     ///
-    /// PMS-1317 renamed the variable to `STORAGE_ROOT`; `ATTACHMENT_DIR` is
-    /// still honoured as a deprecated alias and says so once, because the
-    /// compose file that sets it lives in another repository and a hard rename
-    /// would serve 404s for every file already on the volume until that
-    /// repository caught up. [`env::resolve`] is the rule.
+    /// PMS-1317 renamed the variable to `STORAGE_ROOT`. `ATTACHMENT_DIR` was
+    /// honoured as a deprecated alias for one release; PMS-1443 ended that
+    /// grace period, so setting it now refuses to boot instead of supplying
+    /// a value. [`env::resolve`] is the rule.
     pub fn from_env() -> Self {
         let root = env::from_env(env::ROOT).unwrap_or_else(|| DEFAULT_ROOT.to_string());
         Self {
