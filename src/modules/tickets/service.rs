@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::db::Database;
 use crate::modules::audit::{audit_write, AuditAction, AuditCtx};
 use crate::modules::notifications::NotificationsService;
+use crate::modules::sla::SlaService;
 use crate::utils::email::{LogMailer, Mailer};
 use crate::utils::error::{AppError, AppResult};
 use crate::utils::pagination::PaginationParams;
@@ -40,6 +41,14 @@ pub struct TicketService {
     /// is retained so test fixtures that build `TicketService::new`
     /// keep compiling.
     notifications: Option<NotificationsService>,
+    /// PMS-1564: when `Some`, `create_ticket` and `update_ticket` call
+    /// `SlaService::evaluate_for_ticket` after their write transaction
+    /// commits, so due dates follow the policy's business hours and
+    /// pause rules instead of the simple wall-clock math this service
+    /// used to do inline. `None` (every constructor below) skips SLA
+    /// evaluation entirely; `create_api_router` is the only caller that
+    /// wires it via `with_sla`.
+    sla: Option<Arc<SlaService>>,
 }
 
 impl TicketService {
@@ -116,6 +125,7 @@ impl TicketService {
             automation,
             mailer,
             notifications: None,
+            sla: None,
         }
     }
 
@@ -136,6 +146,32 @@ impl TicketService {
             automation,
             mailer,
             notifications: Some(notifications),
+            sla: None,
+        }
+    }
+
+    /// Wire the SLA evaluator (PMS-1564). The server calls this from
+    /// `create_api_router` right after building `sla_service`, so
+    /// `create_ticket` / `update_ticket` recompute due dates through
+    /// `SlaService::evaluate_for_ticket` rather than leaving them on
+    /// wall-clock time.
+    pub fn with_sla(mut self, sla: Arc<SlaService>) -> Self {
+        self.sla = Some(sla);
+        self
+    }
+
+    /// Run the SLA evaluator for `ticket_id`, if one is wired. A
+    /// failing evaluation is logged at warn with the ticket id and
+    /// cause rather than propagated: the ticket create or
+    /// status-change write that triggered this already committed and
+    /// must not be undone by a broken SLA policy. A no-op when no
+    /// `SlaService` was wired (test fixtures built via `new` /
+    /// `with_mailer` / `with_dispatcher`).
+    async fn evaluate_sla(&self, tenant_id: TenantId, ticket_id: Uuid) {
+        if let Some(sla) = &self.sla {
+            if let Err(e) = sla.evaluate_for_ticket(tenant_id, ticket_id).await {
+                tracing::warn!(%ticket_id, error = %e, "SLA evaluation failed");
+            }
         }
     }
 
@@ -452,12 +488,13 @@ impl TicketService {
         .await?;
         tx.commit().await?;
 
-        // Calculate and set SLA due dates
-        self.calculate_sla_dates(tenant_id, ticket_id).await?;
+        // PMS-1564: evaluate the ticket's SLA through the business-hours-
+        // aware evaluator (no-op when no `SlaService` is wired).
+        self.evaluate_sla(tenant_id, ticket_id).await;
 
         // PMS-345: tickets that match no SLA get no resolution due date.
         // Fall back to the tenant-wide standard due date (today + N business
-        // days; N = 0 disables it). Only fills when calculate_sla_dates left
+        // days; N = 0 disables it). Only fills when evaluate_sla left
         // sla_due_date NULL, so SLA-derived dates always win.
         let n =
             crate::modules::settings::read_default_due_business_days(&self.db, tenant_id).await?;
@@ -742,10 +779,11 @@ impl TicketService {
             }
         }
 
-        // Whether the priority changed; the SLA recalc that depends on it
-        // runs after the tx commits so it reads the committed priority
-        // (calculate_sla_dates goes through the pool, not this tx).
-        let priority_changed = request.priority_id.is_some();
+        // PMS-1564: whether this update names a status or a priority; the
+        // SLA re-evaluation that depends on them runs after the tx commits
+        // so it reads the committed row (`evaluate_sla` goes through the
+        // pool, not this tx).
+        let needs_sla_eval = request.status_id.is_some() || request.priority_id.is_some();
         if let Some(priority_id) = request.priority_id {
             sqlx::query("UPDATE tickets SET priority_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
                 .bind(priority_id)
@@ -861,11 +899,11 @@ impl TicketService {
         }
         tx.commit().await?;
 
-        // Recalculate SLA when priority changes. Runs after commit so it
-        // reads the persisted priority (mirrors the post-commit follow-up
-        // pattern in contacts::update_company).
-        if priority_changed {
-            self.calculate_sla_dates(tenant_id, ticket_id).await?;
+        // PMS-1564: re-evaluate SLA when status or priority changes. Runs
+        // after commit so it reads the persisted row (mirrors the
+        // post-commit follow-up pattern in contacts::update_company).
+        if needs_sla_eval {
+            self.evaluate_sla(tenant_id, ticket_id).await;
         }
 
         // Audit F11: run on_update automation rules. Same fail-soft
@@ -1480,78 +1518,6 @@ impl TicketService {
             &unresolved,
         );
         Ok((rows.into_iter().map(Into::into).collect(), total as u64))
-    }
-
-    /// Calculate SLA due dates for a ticket
-    async fn calculate_sla_dates(&self, tenant_id: TenantId, ticket_id: Uuid) -> AppResult<()> {
-        // Get ticket details
-        let ticket = self.get_ticket(tenant_id, ticket_id).await?;
-
-        // Get SLA policy
-        let sla_id = match ticket.sla_id {
-            Some(id) => id,
-            None => {
-                // Try to get default SLA
-                let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-                let default: Option<Uuid> = sqlx::query_scalar(
-                    "SELECT id FROM sla_policies WHERE tenant_id = $1 AND is_default = TRUE LIMIT 1",
-                )
-                .bind(tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                match default {
-                    Some(id) => id,
-                    None => return Ok(()), // No SLA applicable
-                }
-            }
-        };
-
-        // Get SLA targets for this priority. The columns are declared
-        // DECIMAL(10, 2); cast to float8 in SQL so sqlx can decode them
-        // into `Option<f64>` without a column-type mismatch (the test
-        // harness in `tests/suites/tickets.rs` surfaced this as
-        // `ColumnDecode { ... Rust type Option<f64> is not compatible
-        // with SQL type NUMERIC }`).
-        // `sla_targets` has no `tenant_id` column but is RLS-covered via a parent
-        // join to `sla_policies` (migration 041), so the read needs the tenant
-        // GUC set; run it through a tenant-scoped transaction.
-        let mut sla_tx = self.db.begin_with_tenant(tenant_id).await?;
-        let targets = sqlx::query_as::<_, (Option<f64>, Option<f64>)>(
-            r#"
-            SELECT first_response_hours::float8, resolution_hours::float8
-            FROM sla_targets
-            WHERE sla_policy_id = $1 AND priority_id = $2
-            "#,
-        )
-        .bind(sla_id)
-        .bind(ticket.priority_id)
-        .fetch_optional(&mut *sla_tx)
-        .await?;
-        drop(sla_tx);
-
-        if let Some((first_response_hours, resolution_hours)) = targets {
-            let now = Utc::now();
-
-            let first_response_due =
-                first_response_hours.map(|h| now + chrono::Duration::minutes((h * 60.0) as i64));
-            let sla_due_date =
-                resolution_hours.map(|h| now + chrono::Duration::minutes((h * 60.0) as i64));
-
-            let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-            sqlx::query(
-                "UPDATE tickets SET sla_id = $1, first_response_due = $2, sla_due_date = $3, resolution_due = $3 WHERE id = $4",
-            )
-            .bind(sla_id)
-            .bind(first_response_due)
-            .bind(sla_due_date)
-            .bind(ticket_id)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-        }
-
-        Ok(())
     }
 
     /// Get ticket statuses for tenant

@@ -282,8 +282,16 @@ pub fn create_api_router(
         notifications_service.clone(),
     )
     .with_payment_methods(payment_methods_service.clone());
+    // SLA service shares the notifications dispatcher so the
+    // `sla_sweep` worker (spawned from main.rs with this same service)
+    // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
+    // do not use the dispatcher; only the worker does. Built ahead of
+    // `ticket_service` (PMS-1564) so the ticket service can hold a
+    // clone and call `evaluate_for_ticket` on create / status change.
+    let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
     let ticket_service =
-        TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone());
+        TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone())
+            .with_sla(Arc::new(sla_service.clone()));
     // PMS-711: the agent-facing billing service also sends the outbound invoice
     // "Pay Now" email on the send transition, so it takes the mailer + the SPA
     // origin the pay link is built from.
@@ -473,11 +481,6 @@ pub fn create_api_router(
     // the auth logic.
     let rmm_service_shared = std::sync::Arc::new(rmm_service.clone());
     let status_service = crate::modules::status::StatusService::new(db.clone());
-    // SLA service shares the notifications dispatcher so the
-    // `sla_sweep` worker (spawned from main.rs with this same service)
-    // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
-    // do not use the dispatcher; only the worker does.
-    let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
     // PMS-157 / PMS-710: first-visit demo seeding. Holds its own clones of the
     // contacts, tickets, projects, and SLA services so it can drive the real
     // create paths for the connected demo dataset; wired below as a middleware
