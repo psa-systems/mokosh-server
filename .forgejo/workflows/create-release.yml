@@ -47,7 +47,9 @@ jobs:
     if: >-
       github.event.pull_request.merged == true
       && startsWith(github.event.pull_request.head.ref, 'release/v')
-    uses: psa-systems/common/.forgejo/workflows/create-release.yml@main
+    # PMS-1554: explicit Forgejo URL so Renovate's github-actions
+    # manager stops treating `psa-systems/common` as github.com.
+    uses: https://dev.a8n.run/psa-systems/common/.forgejo/workflows/create-release.yml@main
     # Base label: the reusable job runs git and two HTTP calls to the Forgejo
     # releases API. It compiles nothing, so the dev image's C toolchain is not
     # needed. Medium is the size common's own stub specifies for it.
