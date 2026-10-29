@@ -131,7 +131,12 @@ async fn get_integration(
     Path(provider): Path<String>,
 ) -> AppResult<Json<IntegrationResponse>> {
     let provider = parse_provider(&provider)?;
-    Ok(Json(state.service.get(user.tenant(), provider).await?))
+    Ok(Json(
+        state
+            .service
+            .get(user.tenant(), provider, Capability::Contacts)
+            .await?,
+    ))
 }
 
 async fn update_integration(

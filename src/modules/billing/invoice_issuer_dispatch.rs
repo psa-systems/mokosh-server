@@ -218,11 +218,19 @@ impl IssuerDispatcher {
         };
         let xero = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Xero)
+            .get(
+                tenant_id,
+                IntegrationProvider::Xero,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         let quickbooks = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Quickbooks)
+            .get(
+                tenant_id,
+                IntegrationProvider::Quickbooks,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         // Xero before QuickBooks, the tie-break `select_issuer_with`
         // already uses for invoices, so a tenant with both connected does
@@ -402,11 +410,19 @@ impl IssuerDispatcher {
         };
         let xero = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Xero)
+            .get(
+                tenant_id,
+                IntegrationProvider::Xero,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         let quickbooks = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Quickbooks)
+            .get(
+                tenant_id,
+                IntegrationProvider::Quickbooks,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         // Xero before QuickBooks, the tie-break the invoice and bill paths
         // already use, so a tenant with both connected does not see one
@@ -654,7 +670,10 @@ impl IssuerDispatcher {
         tenant_id: TenantId,
         provider: IntegrationProvider,
     ) -> AppResult<bool> {
-        let integration = self.integrations.get(tenant_id, provider).await?;
+        let integration = self
+            .integrations
+            .get(tenant_id, provider, Capability::Invoicing)
+            .await?;
         let live = matches!(
             integration.status,
             crate::modules::integrations::IntegrationStatus::Connected

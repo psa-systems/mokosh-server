@@ -561,6 +561,7 @@ async fn disconnecting_forgets_the_credential_and_stops_delegating(pool: PgPool)
         .get(
             tenant,
             mokosh_types::integrations::IntegrationProvider::Xero,
+            mokosh_types::integrations::Capability::Invoicing,
         )
         .await
         .expect("read the row");
