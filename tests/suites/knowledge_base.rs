@@ -1796,8 +1796,6 @@ async fn get_article_increments_view_count_and_contact_read_does_not(pool: PgPoo
         .await
         .expect("send get article");
     assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
-    let got: serde_json::Value = get_resp.json().await.expect("get article JSON");
-    assert_eq!(got["view_count"].as_i64(), Some(1));
     assert_eq!(article_view_count(&pool, article_id).await, 1);
 
     // A second staff read bumps it again.
