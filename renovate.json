@@ -2,15 +2,14 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended",
-    ":semanticCommits",
-    ":prHourlyLimitNone"
+    ":semanticCommits"
   ],
   "platform": "forgejo",
   "endpoint": "https://dev.a8n.run/api/v1/",
   "gitAuthor": "renovate-bot <renovate-bot@users.noreply.dev.a8n.run>",
   "autodiscover": false,
   "onboarding": false,
-  "prConcurrentLimit": 10,
+  "prConcurrentLimit": 3,
   "rangeStrategy": "bump",
   "rebaseWhen": "behind-base-branch",
   "vulnerabilityAlerts": {
@@ -25,13 +24,20 @@
     "github-actions"
   ],
   "packageRules": [
-    { "groupName": "rust toolchain", "matchPackageNames": ["rust", "rustc"] },
-    { "groupName": "actix family", "matchPackagePatterns": ["^actix"] },
-    { "groupName": "axum family", "matchPackagePatterns": ["^axum"] },
-    { "groupName": "sqlx family", "matchPackagePatterns": ["^sqlx"] },
-    { "groupName": "serde family", "matchPackagePatterns": ["^serde"] },
-    { "groupName": "tokio family", "matchPackagePatterns": ["^tokio"] },
-    { "groupName": "tower family", "matchPackagePatterns": ["^tower"] },
-    { "groupName": "reqwest family", "matchPackagePatterns": ["^reqwest"] }
+    {
+      "description": "PMS-1554: collapse every scheduled update into two PRs. Security advisories still open their own PR per advisory via `vulnerabilityAlerts.enabled` above; those bypass the group and are the third stream.",
+      "groupName": "major dependency updates",
+      "matchUpdateTypes": ["major"]
+    },
+    {
+      "description": "PMS-1554: the catch-all for minor, patch, pin and digest bumps across every manager.",
+      "groupName": "non-major dependency updates",
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+    },
+    {
+      "description": "Rust toolchain stays on its own: a toolchain bump has to land before any crate update that needs its new MSRV, so it cannot be folded into the general stream.",
+      "groupName": "rust toolchain",
+      "matchPackageNames": ["rust", "rustc"]
+    }
   ]
 }
