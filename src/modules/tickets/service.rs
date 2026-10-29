@@ -705,13 +705,15 @@ impl TicketService {
             tenant_id,
             &[
                 ("ticket_priorities", request.priority_id),
+                ("ticket_types", request.type_id.flatten()),
+                ("ticket_categories", request.category_id.flatten()),
                 ("ticket_queues", request.queue_id),
-                ("contacts", request.contact_id),
-                ("sites", request.site_id),
+                ("contacts", request.contact_id.flatten()),
+                ("sites", request.site_id.flatten()),
                 ("users", request.assigned_to_id),
-                ("teams", request.team_id),
-                ("contracts", request.contract_id),
-                ("sla_policies", request.sla_id),
+                ("teams", request.team_id.flatten()),
+                ("contracts", request.contract_id.flatten()),
+                ("sla_policies", request.sla_id.flatten()),
                 ("assets", request.asset_id.flatten()),
             ],
         )
@@ -828,6 +830,151 @@ impl TicketService {
                 .await?;
         }
 
+        // PMS-1565: the remaining `UpdateTicketRequest` fields, previously
+        // accepted (and FK-validated, for the nullable FKs) but never
+        // written. Each nullable FK/date/number column follows the
+        // `asset_id` PATCH convention just above: `Some(None)` clears the
+        // column, `Some(Some(v))` sets it, `None` leaves it untouched.
+        if let Some(type_id_opt) = request.type_id {
+            sqlx::query("UPDATE tickets SET type_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(type_id_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(category_id_opt) = request.category_id {
+            sqlx::query("UPDATE tickets SET category_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(category_id_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(contact_id_opt) = request.contact_id {
+            sqlx::query("UPDATE tickets SET contact_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(contact_id_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(site_id_opt) = request.site_id {
+            sqlx::query("UPDATE tickets SET site_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(site_id_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(team_id_opt) = request.team_id {
+            sqlx::query("UPDATE tickets SET team_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(team_id_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(contract_id_opt) = request.contract_id {
+            sqlx::query("UPDATE tickets SET contract_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(contract_id_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(sla_id_opt) = request.sla_id {
+            sqlx::query("UPDATE tickets SET sla_id = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(sla_id_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(scheduled_start_opt) = request.scheduled_start {
+            sqlx::query("UPDATE tickets SET scheduled_start = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(scheduled_start_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(scheduled_end_opt) = request.scheduled_end {
+            sqlx::query("UPDATE tickets SET scheduled_end = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(scheduled_end_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(estimated_hours_opt) = request.estimated_hours {
+            sqlx::query("UPDATE tickets SET estimated_hours = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(estimated_hours_opt)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(is_billable) = request.is_billable {
+            sqlx::query("UPDATE tickets SET is_billable = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(is_billable)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(billing_status) = request.billing_status {
+            sqlx::query("UPDATE tickets SET billing_status = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(billing_status.as_str())
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(ref custom_fields) = request.custom_fields {
+            sqlx::query("UPDATE tickets SET custom_fields = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(custom_fields)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(ref tags) = request.tags {
+            sqlx::query("UPDATE tickets SET tags = $1, last_updated_by_id = $2, updated_at = NOW() WHERE tenant_id = $3 AND id = $4")
+                .bind(tags)
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(ticket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM tickets t WHERE tenant_id = $1 AND id = $2",
         )
@@ -871,7 +1018,7 @@ impl TicketService {
                         priority_id: request.priority_id.unwrap_or(ticket.priority_id),
                         queue_id: request.queue_id.unwrap_or(ticket.queue_id),
                         company_id: ticket.company_id,
-                        type_id: request.type_id.or(ticket.type_id),
+                        type_id: request.type_id.unwrap_or(ticket.type_id),
                     },
                 )
                 .await?;
@@ -889,7 +1036,7 @@ impl TicketService {
                         status_id: request.status_id.unwrap_or(ticket.status_id),
                         queue_id: request.queue_id.unwrap_or(ticket.queue_id),
                         company_id: ticket.company_id,
-                        type_id: request.type_id.or(ticket.type_id),
+                        type_id: request.type_id.unwrap_or(ticket.type_id),
                     },
                 )
                 .await?;
