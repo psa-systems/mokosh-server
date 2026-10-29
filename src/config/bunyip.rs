@@ -1,32 +1,67 @@
-//! The Bunyip configuration provider (PMS-987): read declared keys from
-//! Bunyip's `/v1/config` API, authenticated as a machine client.
+//! The Bunyip configuration provider (PMS-987, corrected by PMS-1553): read
+//! the suite facts bunyip holds from its host-config route.
 //!
-//! Bunyip authenticates the caller as a service via `POST /v1/oauth2/token`
-//! with a `client_credentials` grant. This provider follows the same shape
-//! the PayPal integration uses (`modules/billing/provider/paypal.rs`): the
-//! client id and secret are HTTP Basic on the token request, the returned
-//! bearer is presented on subsequent reads. That endpoint (`/v1/config/{KEY}`)
-//! may not exist upstream yet: the ticket ships the seam, and the failure
-//! shape when it does not answer is exactly the shape it will when a specific
-//! key is not held there.
+//! ## What was wrong with it
+//!
+//! PMS-987 shipped this provider against two endpoints bunyip does not serve.
+//! It exchanged the machine credential at `POST /v1/oauth2/token` for a bearer
+//! and then read `GET /v1/config/{KEY}`: bunyip's token endpoint is root-level
+//! and implements `authorization_code` and `refresh_token` only, so it mints
+//! nothing for a machine, and there was no `/v1/config` route at all. The
+//! provider could not have resolved a key against a real bunyip, and nothing
+//! noticed because no boot path can select it (`CONFIG_BACKEND` takes
+//! `environment` alone, and `CONFIG_PROVIDERS` is read by the provider CLI).
+//!
+//! BUNYIP-1011 shipped the route it needed, so this now reads
+//! `GET /v1/host/config/{KEY}` with the machine credential as HTTP Basic,
+//! which is how every machine endpoint over there authenticates.
+//!
+//! ## One key, not every key
+//!
+//! The old loop asked bunyip for every declared key in the registry, which is
+//! over a hundred requests per build and more than bunyip's own per-app cap
+//! allows in a minute. bunyip serves the facts it OWNS, so this provider
+//! carries the mapping from a Mokosh key to bunyip's namespaced one and asks
+//! only for those. One today: `ABUSE_CONTACT_EMAIL`, which is bunyip's
+//! monitored support mailbox (`mokosh/abuse_contact_email`), and which a
+//! deployment otherwise keeps in step with bunyip's own setting by hand.
+//!
+//! ## What a failure means
+//!
+//! A refused CREDENTIAL (401) or a refused KEY (403) is a hard error: the
+//! provider cannot serve anything, and the remedy is in bunyip, so saying so
+//! beats reporting the key as unheld. A 404 or a transport failure on one key
+//! leaves that key unheld and logs it, because the provider itself is working
+//! and the next key may be fine. That is the same distinction the app-secret
+//! tier draws between a provider that could not be built and one that holds
+//! nothing (PMS-1537).
 //!
 //! `BUNYIP_CONFIG_URL` unset builds an empty provider silently, the way an
 //! absent `CONFIG_FILE_DIR` builds the file provider empty: this is
-//! ENABLEMENT, not misconfiguration. When set, [`from_env`] performs the
-//! token exchange and then one GET per declared key. All three inputs
-//! (URL, client id, client secret) live under `ConfigKey::Bootstrap`
-//! because this provider is BUILT from them.
+//! ENABLEMENT, not misconfiguration. All three inputs live under
+//! `ConfigKey::Bootstrap` because this provider is BUILT from them.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::{ConfigProvider, Enumeration, REGISTRY};
+use super::{ConfigProvider, Enumeration};
 use crate::utils::error::{AppError, AppResult};
 
-const TOKEN_PATH: &str = "/v1/oauth2/token";
-const CONFIG_PATH_PREFIX: &str = "/v1/config/";
+/// bunyip's host-config route (BUNYIP-1011). Not `/v1/config/`, which does
+/// not exist there, and not under `/v1/oauth2/` either: there is no token to
+/// exchange, because bunyip mints no bearer for a machine caller.
+const HOST_CONFIG_PREFIX: &str = "/v1/host/config/";
+
+/// The keys bunyip serves, as `(this registry's name, bunyip's key)`.
+///
+/// A mapping rather than the whole registry: bunyip serves the facts it owns,
+/// and asking it for all hundred-odd declared keys would be a hundred requests
+/// per build and an instant 429 against its per-app cap. A key bunyip starts
+/// serving joins this list, and its `--config-key` goes on the deployment's
+/// registration over there.
+const SERVED_KEYS: &[(&str, &str)] = &[("ABUSE_CONTACT_EMAIL", "mokosh/abuse_contact_email")];
 /// Bunyip's per-request budget. Sized like the PayPal token call and long
 /// enough that a slow probe does not silently swallow a real timeout.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -68,7 +103,31 @@ impl BunyipConfig {
     }
 }
 
+/// A credential half, read file-first: `{NAME}_FILE` is the compose-secret
+/// form, because a plain value in a compose `environment:` block is visible to
+/// `docker inspect` and to every child process (PMS-1537 reads the host-secret
+/// credential the same way).
 fn required(name: &'static str) -> AppResult<String> {
+    let from_file = std::env::var(format!("{name}_FILE"))
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .and_then(|path| match std::fs::read_to_string(&path) {
+            Ok(contents) => Some(contents.trim().to_string()),
+            Err(e) => {
+                tracing::error!(
+                    file = %path,
+                    error = %e,
+                    "{name}_FILE points at an unreadable file, so the bunyip configuration \
+                     provider has no credential from it"
+                );
+                None
+            }
+        })
+        .filter(|value| !value.is_empty());
+    if let Some(value) = from_file {
+        return Ok(value);
+    }
     match std::env::var(name).ok().map(|s| s.trim().to_string()) {
         Some(v) if !v.is_empty() => Ok(v),
         _ => Err(AppError::Configuration(format!(
@@ -83,6 +142,17 @@ fn required(name: &'static str) -> AppResult<String> {
 /// [`BunyipProvider::from_env`] / [`BunyipProvider::load`]; never mutated.
 pub struct BunyipProvider {
     values: BTreeMap<String, String>,
+}
+
+/// Hand-written rather than derived: these are not secrets, but a provider
+/// that prints its contents into a panic message is a habit worth not having,
+/// and the useful fact in a diagnostic is how many keys it resolved.
+impl std::fmt::Debug for BunyipProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BunyipProvider")
+            .field("keys_held", &self.values.len())
+            .finish()
+    }
 }
 
 impl BunyipProvider {
@@ -108,28 +178,26 @@ impl BunyipProvider {
                 AppError::external_service("bunyip-config", format!("http client build: {e}"))
             })?;
 
-        let token = fetch_access_token(&http, config).await?;
-
         let mut values = BTreeMap::new();
-        for key in REGISTRY {
-            match fetch_value(&http, config, &token, key.name()).await {
+        for (local, remote) in SERVED_KEYS {
+            match fetch_value(&http, config, remote).await {
                 Ok(Some(value)) => {
-                    values.insert(key.name().to_string(), value);
+                    values.insert((*local).to_string(), value);
                 }
                 Ok(None) => {
-                    // 404 = "Bunyip does not hold this key".
-                }
-                Err(err) => {
-                    // A network failure on ONE key must not blank the whole
-                    // provider. The value stays unheld for classification.
-                    // The KEY is named, never the value.
-                    tracing::error!(
-                        key = key.name(),
-                        error = %err,
-                        "Bunyip configuration provider could not read {}; treating it as unheld",
-                        key.name()
+                    // 404: bunyip serves this key but holds no value for it,
+                    // which is a fact about bunyip's own configuration and
+                    // leaves the key unheld here.
+                    tracing::info!(
+                        key = *local,
+                        bunyip_key = *remote,
+                        "bunyip holds no value for {remote}; {local} stays unheld"
                     );
                 }
+                // A refused credential or a refused key is the provider
+                // failing, not one value missing, so it stops the build with
+                // the remedy named.
+                Err(err) => return Err(err),
             }
         }
 
@@ -165,79 +233,80 @@ impl ConfigProvider for BunyipProvider {
     }
 }
 
-async fn fetch_access_token(http: &reqwest::Client, config: &BunyipConfig) -> AppResult<String> {
-    let url = format!("{}{TOKEN_PATH}", config.base_url);
-    let resp = http
-        .post(&url)
-        .basic_auth(&config.client_id, Some(&config.client_secret))
-        .form(&[("grant_type", "client_credentials")])
-        .send()
-        .await
-        .map_err(|e| AppError::external_service("bunyip-config", format!("token request: {e}")))?;
-    let status = resp.status();
-    let body: serde_json::Value = resp.json().await.map_err(|e| {
-        AppError::external_service("bunyip-config", format!("token body not json: {e}"))
-    })?;
-    if !status.is_success() {
-        let msg = body["error_description"]
-            .as_str()
-            .or_else(|| body["error"].as_str())
-            .unwrap_or("unknown error");
-        return Err(AppError::external_service(
-            "bunyip-config",
-            format!("token exchange failed ({status}): {msg}"),
-        ));
-    }
-    body["access_token"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            AppError::external_service("bunyip-config", "token response missing access_token")
-        })
-}
-
+/// One key, read with the machine credential as HTTP Basic.
+///
+/// `Ok(None)` only for a 404, which is bunyip saying it holds no value for a
+/// key it does serve. A refused credential and a refused key are errors
+/// naming their own remedy, because they are fixed in bunyip and in two
+/// different places.
 async fn fetch_value(
     http: &reqwest::Client,
     config: &BunyipConfig,
-    token: &str,
     key: &str,
 ) -> AppResult<Option<String>> {
-    let url = format!("{}{CONFIG_PATH_PREFIX}{key}", config.base_url);
+    let url = format!("{}{HOST_CONFIG_PREFIX}{key}", config.base_url);
     let resp = http
         .get(&url)
-        .bearer_auth(token)
+        .basic_auth(&config.client_id, Some(&config.client_secret))
+        .header("Accept", "application/json")
         .send()
         .await
-        .map_err(|e| AppError::external_service("bunyip-config", format!("config request: {e}")))?;
+        .map_err(|e| {
+            AppError::external_service(
+                "bunyip-config",
+                format!(
+                    "could not reach bunyip at {url}: {e}. Check BUNYIP_CONFIG_URL and that \
+                     bunyip is reachable from this host."
+                ),
+            )
+        })?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(AppError::external_service(
+            "bunyip-config",
+            "bunyip refused this deployment's configuration credential (401). The registration \
+             named by BUNYIP_CONFIG_CLIENT_ID is unknown, disabled or holds a different secret; \
+             rotate it with `bunyip-api machine-client rotate --client-id <id>`."
+                .to_string(),
+        ));
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return Err(AppError::external_service(
+            "bunyip-config",
+            format!(
+                "bunyip serves {key} but this registration may not read it (403). Add it to the \
+                 registration's allow-list: `bunyip-api machine-client register --name \
+                 mokosh-host-config --config-key {key}`. A host-SECRETS credential does not \
+                 carry configuration keys (BUNYIP-855 D9), so check which registration \
+                 BUNYIP_CONFIG_CLIENT_ID names."
+            ),
+        ));
     }
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
         return Err(AppError::external_service(
             "bunyip-config",
-            format!("config read failed ({status}): {text}"),
+            format!("bunyip answered {status} for {key}: {text}"),
         ));
     }
-    // The endpoint's shape is `{ "value": "..." }` when it exists; a raw
-    // string body is also accepted for robustness before Bunyip formalises
-    // the response contract.
-    let text = resp.text().await.unwrap_or_default();
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(value) = json.get("value").and_then(|v| v.as_str()) {
-            return Ok(Some(value.to_string()));
-        }
-        if let Some(value) = json.as_str() {
-            return Ok(Some(value.to_string()));
-        }
-    }
-    Ok(Some(trimmed.to_string()))
+
+    // bunyip's envelope: `{"data": {"key": "...", "value": "..."}}`. Read
+    // through the shape rather than guessing, since guessing is what left the
+    // old implementation accepting three shapes and matching none of them.
+    let envelope: serde_json::Value = resp.json().await.map_err(|e| {
+        AppError::external_service(
+            "bunyip-config",
+            format!("bunyip's answer for {key} was not the expected envelope: {e}"),
+        )
+    })?;
+    Ok(envelope["data"]["value"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string))
 }
 
 #[cfg(test)]
