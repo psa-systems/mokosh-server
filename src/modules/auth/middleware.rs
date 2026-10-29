@@ -1802,8 +1802,8 @@ async fn place_bunyip_caller(
     // invited user is seeded with the invite's role; otherwise the user owns
     // their own single-tenant Mokosh world (PMS-447) so the JIT default is
     // `Admin`, not `Technician`. The Bunyip-role reconciliation below still
-    // runs and promotes to `SuperAdmin` if the at+jwt carries the platform
-    // admin claim.
+    // runs, but since MAPPS-519 a platform admin claim floors at `Admin`, not
+    // `SuperAdmin` (see `effective_role_from_bunyip`).
     let initial_role = invite
         .as_ref()
         .and_then(|i| UserRole::from_str(&i.role))
@@ -1969,7 +1969,9 @@ async fn place_bunyip_caller(
     // MAPPS-330: every Mokosh user is an admin of their own instance. The
     // PMS-458 invite-respect branch (preserving least-privilege grants into
     // SHARED org tenants) is removed: even invited joiners floor at `admin`,
-    // and a platform-level Bunyip `admin` claim still rises to `super_admin`.
+    // and since MAPPS-519 a platform-level Bunyip `admin` claim no longer
+    // rises to `super_admin` (platform privilege comes only from
+    // `platform_admins`; see `effective_role_from_bunyip` below).
     let effective = effective_role_from_bunyip(claims.bunyip_role.as_deref(), user.role);
     if effective != user.role {
         // Role transitions are security-relevant; log every one (fires only on
