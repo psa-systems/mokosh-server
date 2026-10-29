@@ -6853,6 +6853,84 @@ impl BillingService {
         ))
     }
 
+    /// PMS-1559: lock the invoice row and run the checks a credit note must
+    /// pass against it, shared between `create_credit_note`'s `pre` pass and
+    /// its main transaction's re-check of the same invoice after the
+    /// provider round trip. Re-reading rather than reusing the pre-pass's
+    /// row is the point: a concurrent credit or payment that changed the
+    /// invoice between the two transactions must not be missed.
+    async fn lock_and_check_credit_note_invoice(
+        tx: &mut sqlx::PgConnection,
+        tenant_id: TenantId,
+        invoice_id: Uuid,
+        total: Decimal,
+    ) -> AppResult<CreditedInvoiceRow> {
+        let invoice: Option<CreditedInvoiceRow> = sqlx::query_as(
+            "SELECT total, amount_credited, status, company_id, currency, \
+             external_provider, external_invoice_id \
+             FROM invoices WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(invoice_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(invoice) = invoice else {
+            return Err(AppError::NotFound("Invoice".to_string()));
+        };
+
+        // A draft or pending invoice has no correction problem: it can still be
+        // edited, and crediting one would leave a document correcting something
+        // the customer was never sent.
+        let status = InvoiceStatus::from_str(&invoice.status).unwrap_or(InvoiceStatus::Draft);
+        if !status.is_frozen() {
+            return Err(AppError::BadRequest(format!(
+                "Invoice in status '{}' can still be edited, so it does not need a credit note",
+                status.as_str()
+            )));
+        }
+        // PMS-1235: a write-off already says the MSP will not collect this
+        // (PMS-1036); a credit note says the customer never owed it. Issuing
+        // both records the same debt going away twice, the way a recovery
+        // payment did before `total_recovered` (see `build_statement`), except
+        // here nothing downstream can net it back out because the write-off's
+        // `write_off_amount` is frozen and this invoice's own correction path
+        // is the credit note itself. Write-offs have no reversal in v1, so
+        // there is no "reverse it first" to defer to: the write-off stands and
+        // this credit note is refused outright.
+        if status == InvoiceStatus::WrittenOff {
+            return Err(AppError::BadRequest(
+                "This invoice has been written off; issuing a credit note against it would \
+                 remove the same debt twice"
+                    .to_string(),
+            ));
+        }
+        // PMS-1333: `void` passes the `is_frozen` gate above, and before this
+        // it could only be reached BY a credit note, so there was nothing to
+        // refuse. Now that voiding is its own act it means the document never
+        // stood, and there is nothing to correct: a credit note against it
+        // would be a correction to a charge that was never made.
+        if status == InvoiceStatus::Void {
+            return Err(AppError::BadRequest(
+                "This invoice was voided, so it charges nothing to credit".to_string(),
+            ));
+        }
+
+        // Capped at the invoice's own total, less what is already credited, and
+        // deliberately NOT less what has been paid: an invoice the customer has
+        // already paid can still be credited in full, which is exactly the case
+        // where they are owed money back.
+        let remaining = invoice.total - invoice.amount_credited;
+        if total > remaining {
+            return Err(AppError::BadRequest(format!(
+                "A credit note for {total} exceeds what is left to credit on this invoice \
+                 ({remaining} of {})",
+                invoice.total
+            )));
+        }
+
+        Ok(invoice)
+    }
+
     /// PMS-953: correct an issued invoice by crediting it.
     ///
     /// This is the path `update_invoice` and `delete_payment` have deferred to
@@ -6906,95 +6984,156 @@ impl BillingService {
             ));
         }
 
-        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
-
-        let invoice: Option<CreditedInvoiceRow> = sqlx::query_as(
-            "SELECT total, amount_credited, status, company_id, currency, \
-             external_provider, external_invoice_id \
-             FROM invoices WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        // PMS-1559: the invoice lock and its checks run in a short `pre`
+        // transaction, committed before the provider call, exactly the
+        // split `create_invoice` already uses for the same reason (its own
+        // comment at :1140-1159, citing MAPPS-1134): calling the provider
+        // with the invoice row still locked would queue every other write
+        // to that invoice behind an HTTP round trip.
+        let mut pre = self.db.begin_with_tenant(tenant_id).await?;
+        let pre_invoice = Self::lock_and_check_credit_note_invoice(
+            &mut pre,
+            tenant_id,
+            request.invoice_id,
+            total,
         )
-        .bind(request.invoice_id)
-        .bind(tenant_id)
-        .fetch_optional(&mut *tx)
         .await?;
-        let Some(invoice) = invoice else {
-            return Err(AppError::NotFound("Invoice".to_string()));
-        };
-        let CreditedInvoiceRow {
-            total: invoice_total,
-            amount_credited: already_credited,
-            status: invoice_status,
-            company_id,
-            currency: invoice_currency,
-            external_provider,
-            external_invoice_id,
-        } = invoice;
-
-        // A draft or pending invoice has no correction problem: it can still be
-        // edited, and crediting one would leave a document correcting something
-        // the customer was never sent.
-        let status = InvoiceStatus::from_str(&invoice_status).unwrap_or(InvoiceStatus::Draft);
-        if !status.is_frozen() {
-            return Err(AppError::BadRequest(format!(
-                "Invoice in status '{}' can still be edited, so it does not need a credit note",
-                status.as_str()
-            )));
-        }
-        // PMS-1235: a write-off already says the MSP will not collect this
-        // (PMS-1036); a credit note says the customer never owed it. Issuing
-        // both records the same debt going away twice, the way a recovery
-        // payment did before `total_recovered` (see `build_statement`), except
-        // here nothing downstream can net it back out because the write-off's
-        // `write_off_amount` is frozen and this invoice's own correction path
-        // is the credit note itself. Write-offs have no reversal in v1, so
-        // there is no "reverse it first" to defer to: the write-off stands and
-        // this credit note is refused outright.
-        if status == InvoiceStatus::WrittenOff {
-            return Err(AppError::BadRequest(
-                "This invoice has been written off; issuing a credit note against it would \
-                 remove the same debt twice"
-                    .to_string(),
-            ));
-        }
-        // PMS-1333: `void` passes the `is_frozen` gate above, and before this
-        // it could only be reached BY a credit note, so there was nothing to
-        // refuse. Now that voiding is its own act it means the document never
-        // stood, and there is nothing to correct: a credit note against it
-        // would be a correction to a charge that was never made.
-        if status == InvoiceStatus::Void {
-            return Err(AppError::BadRequest(
-                "This invoice was voided, so it charges nothing to credit".to_string(),
-            ));
-        }
-
-        // Capped at the invoice's own total, less what is already credited, and
-        // deliberately NOT less what has been paid: an invoice the customer has
-        // already paid can still be credited in full, which is exactly the case
-        // where they are owed money back.
-        let remaining = invoice_total - already_credited;
-        if total > remaining {
-            return Err(AppError::BadRequest(format!(
-                "A credit note for {total} exceeds what is left to credit on this invoice \
-                 ({remaining} of {invoice_total})"
-            )));
-        }
-
-        let credit_note_id = Uuid::new_v4();
-        let number = Self::next_credit_note_number(&mut tx, tenant_id).await?;
-        // PMS-1027: today in the caller's zone. The note is issued the instant
-        // it exists (PMS-953) and its document is stored in this transaction
-        // (PMS-959), so a wrong day here is on paper the customer keeps.
-        let issue_date = request
-            .issue_date
-            .unwrap_or_else(|| user_today(chrono::Utc::now(), user_tz));
+        let company_id = pre_invoice.company_id;
+        let external_provider = pre_invoice.external_provider.clone();
+        let external_invoice_id = pre_invoice.external_invoice_id.clone();
         // The invoice's currency unless the caller names one, so the two
         // documents cannot silently disagree about what is being credited.
-        let currency = match request.currency.clone().or(invoice_currency) {
+        let currency = match request.currency.clone().or(pre_invoice.currency.clone()) {
             Some(c) => c,
             // PMS-1028: an invoice older than the currency column's population
             // has none to inherit; the tenant's default is the next best answer.
-            None => read_default_currency(&mut tx, tenant_id).await?,
+            None => read_default_currency(&mut pre, tenant_id).await?,
         };
+        pre.commit().await?;
+
+        // PMS-1027: today in the caller's zone. The note is issued the instant
+        // it exists (PMS-953) and its document is stored in the main
+        // transaction below (PMS-959), so a wrong day here is on paper the
+        // customer keeps.
+        let issue_date = request
+            .issue_date
+            .unwrap_or_else(|| user_today(chrono::Utc::now(), user_tz));
+
+        // PMS-1546 / PMS-1559: the provider push, with no transaction open.
+        // Inside a transaction, like the amendment's void (PMS-1544) and for
+        // the same reason, a credit note whose provider half was refused is
+        // better not written at all - but that no longer means holding the
+        // invoice lock across the HTTP round trip, which this pass does not.
+        let push = if let (Some(provider), Some(ext_invoice_id)) =
+            (external_provider.as_deref(), external_invoice_id.as_deref())
+        {
+            match self.invoice_dispatch.as_ref() {
+                Some(dispatcher) if dispatcher.delegation_enabled() => {
+                    let Some(kind) =
+                        crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
+                            provider,
+                        )
+                    else {
+                        return Err(AppError::internal(format!(
+                            "invoice {} is recorded against provider {provider}, which this \
+                             build does not know",
+                            request.invoice_id
+                        )));
+                    };
+                    let lines: Vec<
+                        crate::modules::billing::invoice_issuer_dispatch::CreditNoteLineShape,
+                    > = request
+                        .lines
+                        .iter()
+                        .map(|l| {
+                            crate::modules::billing::invoice_issuer_dispatch::CreditNoteLineShape {
+                                description: l.description.clone(),
+                                quantity: l.quantity,
+                                unit_price: l.unit_price,
+                                product_id: l.product_id,
+                            }
+                        })
+                        .collect();
+                    let push = dispatcher
+                        .issue_credit_note_in_provider(
+                            tenant_id,
+                            kind,
+                            &crate::modules::billing::invoice_issuer_dispatch::CreditNoteShape {
+                                company_id,
+                                external_invoice_id: ext_invoice_id,
+                                issue_date,
+                                currency: &currency,
+                                total,
+                                lines: &lines,
+                            },
+                        )
+                        .await?;
+                    match &push.allocation {
+                        crate::modules::billing::invoice_issuer_dispatch::CreditAllocation::Applied(
+                            reference,
+                        ) => tracing::info!(
+                            provider = %provider,
+                            external_credit_note_id = %push.reference.external_credit_note_id,
+                            external_invoice_id = %ext_invoice_id,
+                            application = reference.as_deref().unwrap_or("part of the credit note"),
+                            "credited a delegated invoice in the provider that holds it"
+                        ),
+                        // The credit EXISTS over there and is not applied,
+                        // which is a visible account credit for the
+                        // customer rather than a reduced invoice. Not
+                        // fatal, because rolling back here would strand a
+                        // provider document nothing local points at, and
+                        // the usual cause is an invoice already settled on
+                        // their side, where somebody has to decide what
+                        // the credit is for.
+                        crate::modules::billing::invoice_issuer_dispatch::CreditAllocation::Refused(
+                            reason,
+                        ) => tracing::warn!(
+                            provider = %provider,
+                            external_credit_note_id = %push.reference.external_credit_note_id,
+                            external_invoice_id = %ext_invoice_id,
+                            reason = %reason,
+                            "the provider holds this credit note but would not apply it to the \
+                             invoice; it stands as an unapplied credit on the customer's account \
+                             there until somebody allocates it"
+                        ),
+                    }
+                    Some(push)
+                }
+                // The switch is off, or this build has no dispatcher. The
+                // local credit still stands, because correcting an invoice
+                // is the MSP's decision and refusing it would strand them;
+                // what the deployment has said is "do not talk to the
+                // provider", and the divergence is logged rather than
+                // hidden.
+                _ => {
+                    tracing::warn!(
+                        provider = %provider,
+                        external_invoice_id = %ext_invoice_id,
+                        "credited an invoice this provider issued while delegated issuing is off; \
+                         its copy still shows the balance this credit corrects"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+
+        // PMS-1559: re-check the invoice's FOR UPDATE-relevant state inside
+        // the main transaction with a fresh read, not the pre-pass's row:
+        // the pre-pass's lock was released at its commit, so a concurrent
+        // credit or payment against this invoice between the two
+        // transactions must be caught here rather than missed.
+        let invoice =
+            Self::lock_and_check_credit_note_invoice(&mut tx, tenant_id, request.invoice_id, total)
+                .await?;
+        let company_id = invoice.company_id;
+
+        let credit_note_id = Uuid::new_v4();
+        let number = Self::next_credit_note_number(&mut tx, tenant_id).await?;
 
         sqlx::query(
             r#"
@@ -7087,116 +7226,24 @@ impl BillingService {
 
         Self::recompute_invoice_balance(&mut tx, tenant_id, request.invoice_id).await?;
 
-        // PMS-1546: the customer holds the PROVIDER's copy of a delegated
-        // invoice, so the credit has to reach the provider or the two
-        // ledgers disagree by exactly this amount while the customer
-        // keeps being shown the balance this credit just corrected.
-        //
-        // Inside this transaction, like the amendment's void (PMS-1544)
-        // and for the same reason: a credit note whose provider half was
-        // refused is better not written at all, because then the operator
-        // retries instead of reading a local credit the customer's own
-        // copy does not show.
-        if let (Some(provider), Some(external_invoice_id)) =
-            (external_provider.as_deref(), external_invoice_id.as_deref())
-        {
-            match self.invoice_dispatch.as_ref() {
-                Some(dispatcher) if dispatcher.delegation_enabled() => {
-                    let Some(kind) =
-                        crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
-                            provider,
-                        )
-                    else {
-                        return Err(AppError::internal(format!(
-                            "invoice {} is recorded against provider {provider}, which this \
-                             build does not know",
-                            request.invoice_id
-                        )));
-                    };
-                    let lines: Vec<
-                        crate::modules::billing::invoice_issuer_dispatch::CreditNoteLineShape,
-                    > = request
-                        .lines
-                        .iter()
-                        .map(|l| {
-                            crate::modules::billing::invoice_issuer_dispatch::CreditNoteLineShape {
-                                description: l.description.clone(),
-                                quantity: l.quantity,
-                                unit_price: l.unit_price,
-                                product_id: l.product_id,
-                            }
-                        })
-                        .collect();
-                    let push = dispatcher
-                        .issue_credit_note_in_provider(
-                            tenant_id,
-                            kind,
-                            &crate::modules::billing::invoice_issuer_dispatch::CreditNoteShape {
-                                company_id,
-                                external_invoice_id,
-                                issue_date,
-                                currency: &currency,
-                                total,
-                                lines: &lines,
-                            },
-                        )
-                        .await?;
-                    sqlx::query(
-                        "UPDATE credit_notes SET external_provider = $3, \
-                         external_credit_note_id = $4, external_number = $5, \
-                         updated_at = NOW() WHERE id = $1 AND tenant_id = $2",
-                    )
-                    .bind(credit_note_id)
-                    .bind(tenant_id)
-                    .bind(push.reference.provider.as_str())
-                    .bind(&push.reference.external_credit_note_id)
-                    .bind(&push.reference.external_number)
-                    .execute(&mut *tx)
-                    .await?;
-                    match &push.allocation {
-                        crate::modules::billing::invoice_issuer_dispatch::CreditAllocation::Applied(
-                            reference,
-                        ) => tracing::info!(
-                            provider = %provider,
-                            external_credit_note_id = %push.reference.external_credit_note_id,
-                            external_invoice_id = %external_invoice_id,
-                            application = reference.as_deref().unwrap_or("part of the credit note"),
-                            "credited a delegated invoice in the provider that holds it"
-                        ),
-                        // The credit EXISTS over there and is not applied,
-                        // which is a visible account credit for the
-                        // customer rather than a reduced invoice. Not
-                        // fatal, because rolling back here would strand a
-                        // provider document nothing local points at, and
-                        // the usual cause is an invoice already settled on
-                        // their side, where somebody has to decide what
-                        // the credit is for.
-                        crate::modules::billing::invoice_issuer_dispatch::CreditAllocation::Refused(
-                            reason,
-                        ) => tracing::warn!(
-                            provider = %provider,
-                            external_credit_note_id = %push.reference.external_credit_note_id,
-                            external_invoice_id = %external_invoice_id,
-                            reason = %reason,
-                            "the provider holds this credit note but would not apply it to the \
-                             invoice; it stands as an unapplied credit on the customer's account \
-                             there until somebody allocates it"
-                        ),
-                    }
-                }
-                // The switch is off, or this build has no dispatcher. The
-                // local credit still stands, because correcting an invoice
-                // is the MSP's decision and refusing it would strand them;
-                // what the deployment has said is "do not talk to the
-                // provider", and the divergence is logged rather than
-                // hidden.
-                _ => tracing::warn!(
-                    provider = %provider,
-                    external_invoice_id = %external_invoice_id,
-                    "credited an invoice this provider issued while delegated issuing is off; \
-                     its copy still shows the balance this credit corrects"
-                ),
-            }
+        // PMS-1546 / PMS-1559: write the provider's reference now that the
+        // credit note row exists to write it onto. The push itself already
+        // happened above, with no transaction open; a provider that
+        // refused it returned an error before this transaction opened at
+        // all, so nothing local was ever written for that case.
+        if let Some(push) = &push {
+            sqlx::query(
+                "UPDATE credit_notes SET external_provider = $3, \
+                 external_credit_note_id = $4, external_number = $5, \
+                 updated_at = NOW() WHERE id = $1 AND tenant_id = $2",
+            )
+            .bind(credit_note_id)
+            .bind(tenant_id)
+            .bind(push.reference.provider.as_str())
+            .bind(&push.reference.external_credit_note_id)
+            .bind(&push.reference.external_number)
+            .execute(&mut *tx)
+            .await?;
         }
 
         // PMS-959: a credit note is issued at creation and never edited
