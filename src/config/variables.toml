@@ -349,7 +349,7 @@ release = "v0.15.0"
 group = "Added"
 variables = ["STORAGE_PROVIDER", "STORAGE_ROOT", "STORAGE_S3_ENDPOINT", "STORAGE_S3_BUCKET", "STORAGE_S3_REGION", "STORAGE_S3_PATH_STYLE", "STORAGE_S3_ACCESS_KEY_ID", "STORAGE_S3_SECRET_ACCESS_KEY"]
 issue = "PMS-1317"
-action = "Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit."
+action = "Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443)."
 
 [[change]]
 release = "v0.14.0"

@@ -32,7 +32,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-17-0"></a>
 
-### v0.17.0
+### Unreleased (v0.17.0)
 
 #### Added
 
@@ -47,7 +47,7 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-16-0"></a>
 
-### v0.16.0
+### Unreleased (v0.16.0)
 
 #### Added
 
@@ -68,34 +68,34 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 
 <a id="release-v0-15-0"></a>
 
-### v0.15.0
+### Unreleased (v0.15.0)
 
 #### Added
 
 - [`OIDC_BACKCHANNEL_CLIENT_ID`](#var-oidc-backchannel-client-id) (Required: no) - Optional. Set it to the OIDC client id Bunyip addresses back-channel logout tokens to; unset refuses every logout token. (PMS-998)
-- [`STORAGE_PROVIDER`](#var-storage-provider) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_ROOT`](#var-storage-root) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_ACCESS_KEY_ID`](#var-storage-s3-access-key-id) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_BUCKET`](#var-storage-s3-bucket) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_ENDPOINT`](#var-storage-s3-endpoint) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_PATH_STYLE`](#var-storage-s3-path-style) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_REGION`](#var-storage-s3-region) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
-- [`STORAGE_S3_SECRET_ACCESS_KEY`](#var-storage-s3-secret-access-key) (Required: no) - Optional. The new name for a storage setting; the old name keeps working, so rename at your next compose edit. (PMS-1317)
+- [`STORAGE_PROVIDER`](#var-storage-provider) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_ROOT`](#var-storage-root) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_ACCESS_KEY_ID`](#var-storage-s3-access-key-id) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_BUCKET`](#var-storage-s3-bucket) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_ENDPOINT`](#var-storage-s3-endpoint) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_PATH_STYLE`](#var-storage-s3-path-style) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_REGION`](#var-storage-s3-region) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
+- [`STORAGE_S3_SECRET_ACCESS_KEY`](#var-storage-s3-secret-access-key) (Required: no) - Optional. The new name for a storage setting; the old name refuses boot, so rename at your next compose edit (PMS-1443). (PMS-1317)
 
 #### Deprecated
 
-- [`ATTACHMENT_DIR`](#var-attachment-dir) (Required: no) - Renamed to `STORAGE_ROOT`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_ACCESS_KEY_ID`](#var-s3-access-key-id) (Required: no) - Renamed to `STORAGE_S3_ACCESS_KEY_ID`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_BUCKET`](#var-s3-bucket) (Required: no) - Renamed to `STORAGE_S3_BUCKET`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_ENDPOINT`](#var-s3-endpoint) (Required: no) - Renamed to `STORAGE_S3_ENDPOINT`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_PATH_STYLE`](#var-s3-path-style) (Required: no) - Renamed to `STORAGE_S3_PATH_STYLE`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_REGION`](#var-s3-region) (Required: no) - Renamed to `STORAGE_S3_REGION`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`S3_SECRET_ACCESS_KEY`](#var-s3-secret-access-key) (Required: no) - Renamed to `STORAGE_S3_SECRET_ACCESS_KEY`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
-- [`STORAGE_BACKEND`](#var-storage-backend) (Required: no) - Renamed to `STORAGE_PROVIDER`. The old name still works and logs a warning naming the new one; rename it at your next compose edit. (PMS-1317)
+- [`ATTACHMENT_DIR`](#var-attachment-dir) (Required: no) - Renamed to `STORAGE_ROOT`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_ACCESS_KEY_ID`](#var-s3-access-key-id) (Required: no) - Renamed to `STORAGE_S3_ACCESS_KEY_ID`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_BUCKET`](#var-s3-bucket) (Required: no) - Renamed to `STORAGE_S3_BUCKET`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_ENDPOINT`](#var-s3-endpoint) (Required: no) - Renamed to `STORAGE_S3_ENDPOINT`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_PATH_STYLE`](#var-s3-path-style) (Required: no) - Renamed to `STORAGE_S3_PATH_STYLE`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_REGION`](#var-s3-region) (Required: no) - Renamed to `STORAGE_S3_REGION`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`S3_SECRET_ACCESS_KEY`](#var-s3-secret-access-key) (Required: no) - Renamed to `STORAGE_S3_SECRET_ACCESS_KEY`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
+- [`STORAGE_BACKEND`](#var-storage-backend) (Required: no) - Renamed to `STORAGE_PROVIDER`. The old name no longer works: the server refuses to boot when it is set (PMS-1443); rename it in your compose file. (PMS-1317)
 
 <a id="release-v0-14-0"></a>
 
-### v0.14.0
+### Unreleased (v0.14.0)
 
 #### Added
 
@@ -146,11 +146,132 @@ Configuration changes in the last 5 releases, newest first, rendered by `just co
 - [`GOOGLE_OAUTH_REDIRECT_URI`](#var-google-oauth-redirect-uri) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; the Google sign-in routes it served are gone. (PMS-837)
 - [`OAUTH_SUPER_ADMIN_EMAILS`](#var-oauth-super-admin-emails) (Required: no) - No action needed: the server ignores it. Cleanup: delete it from the compose variables; only the removed Google sign-in path read it. (PMS-837)
 
-<a id="release-v0-13-0"></a>
+<a id="release-v0-12-0"></a>
 
-### v0.13.0
+### Unreleased (v0.12.0)
 
-No configuration changes.
+#### Added
+
+- [`ABUSE_CONTACT_EMAIL`](#var-abuse-contact-email) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
+- [`INFISICAL_ADDRESS`](#var-infisical-address) (Required: no) - Optional. Blank reports Infisical as skipped in the readiness probe. (GOV-50)
+- [`PUBLIC_API_BASE_URL`](#var-public-api-base-url) (Required: no) - Optional. Unset drops the public logo URL or the abuse line from client-facing surfaces. (PMS-748)
+- [`SPA_BASE_URL`](#var-spa-base-url) (Required: no) - Optional at the time (required since v0.14.0). Set it to the mokosh-apps origin so SPA-only email links land there. (MAPPS-425)
+- [`TENANT_LOGO_MAX_BYTES`](#var-tenant-logo-max-bytes) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-11-0"></a>
+
+### Unreleased (v0.11.0)
+
+#### Added
+
+- [`IP2PROXY_DB_PATH`](#var-ip2proxy-db-path) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-10-0"></a>
+
+### Unreleased (v0.10.0)
+
+#### Added
+
+- [`STRIPE_API_BASE`](#var-stripe-api-base) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-8-0"></a>
+
+### Unreleased (v0.8.0)
+
+#### Added
+
+- [`LOGIN_APPROVAL_ENABLED`](#var-login-approval-enabled) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-7-0"></a>
+
+### Unreleased (v0.7.0)
+
+#### Added
+
+- [`IP2LOCATION_DB_PATH`](#var-ip2location-db-path) (Required: no) - Optional. Leave it unset to keep the default.
+- [`TRUSTED_PROXY_CIDR`](#var-trusted-proxy-cidr) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-6-0"></a>
+
+### Unreleased (v0.6.0)
+
+#### Added
+
+- **Breaking: won't start:** [`BUNYIP_WEBHOOK_SECRET`](#var-bunyip-webhook-secret) (Required: yes) - Set it to bunyip-api's `BUNYIP_WEBHOOK_SIGNING_SECRET` before restarting; boot refuses without it outside dev/test. (PMS-591)
+
+<a id="release-v0-4-0"></a>
+
+### Unreleased (v0.4.0)
+
+#### Added
+
+- [`ATTACHMENT_DIR`](#var-attachment-dir) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ATTACHMENT_MAX_BYTES`](#var-attachment-max-bytes) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_ADMIN_DATABASE_URL`](#var-mokosh-admin-database-url) (Required: no) - Optional. Leave it unset to keep the default.
+
+#### Changed
+
+- **Breaking: won't start:** [`ENCRYPTION_KEY`](#var-encryption-key) (Required: yes) - Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting. (PMS-499)
+- **Breaking: won't start:** [`JWT_SECRET`](#var-jwt-secret) (Required: yes) - Now required outside dev/test: boot refuses an unset value or the built-in dev value. Set a real secret before restarting. (PMS-499)
+
+<a id="release-v0-3-0"></a>
+
+### Unreleased (v0.3.0)
+
+#### Added
+
+- [`MOKOSH_APP_DATABASE_URL`](#var-mokosh-app-database-url) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_APP_PASSWORD`](#var-mokosh-app-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_DEMO_SEED`](#var-mokosh-demo-seed) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_MIGRATOR_PASSWORD`](#var-mokosh-migrator-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_SEED_TENANT_ID`](#var-mokosh-seed-tenant-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`MOKOSH_UPDATE_CHECK_URL`](#var-mokosh-update-check-url) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OAUTH_SUPER_ADMIN_EMAILS`](#var-oauth-super-admin-emails) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_AUDIENCE`](#var-oidc-audience) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_DEFAULT_TENANT_ID`](#var-oidc-default-tenant-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_ISSUER`](#var-oidc-issuer) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_JWKS_CACHE_TTL_SECS`](#var-oidc-jwks-cache-ttl-secs) (Required: no) - Optional. Leave it unset to keep the default.
+- [`OIDC_LEEWAY_SECONDS`](#var-oidc-leeway-seconds) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-2-0"></a>
+
+### Unreleased (v0.2.0)
+
+#### Added
+
+- [`CLIENT_ORIGIN`](#var-client-origin) (Required: no) - Optional. Leave it unset to keep the default.
+- [`CORS_ORIGIN`](#var-cors-origin) (Required: no) - Optional. Leave it unset to keep the default.
+- [`GOOGLE_OAUTH_CLIENT_ID`](#var-google-oauth-client-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`GOOGLE_OAUTH_CLIENT_SECRET`](#var-google-oauth-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
+- [`GOOGLE_OAUTH_REDIRECT_URI`](#var-google-oauth-redirect-uri) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_FROM`](#var-smtp-from) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_HOST`](#var-smtp-host) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_PASSWORD`](#var-smtp-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_PORT`](#var-smtp-port) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_TLS`](#var-smtp-tls) (Required: no) - Optional. Leave it unset to keep the default.
+- [`SMTP_USERNAME`](#var-smtp-username) (Required: no) - Optional. Leave it unset to keep the default.
+
+<a id="release-v0-1-0"></a>
+
+### Unreleased (v0.1.0)
+
+#### Added
+
+- [`DATABASE_URL`](#var-database-url) (Required: yes) - Required: set it before the server starts.
+- [`ADMIN_EMAIL`](#var-admin-email) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ADMIN_PASSWORD`](#var-admin-password) (Required: no) - Optional. Leave it unset to keep the default.
+- [`BASE_URL`](#var-base-url) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ENCRYPTION_KEY`](#var-encryption-key) (Required: no) - Optional. Leave it unset to keep the default.
+- [`ENVIRONMENT`](#var-environment) (Required: no) - Optional. Leave it unset to keep the default.
+- [`HOST`](#var-host) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_CLIENT_ID`](#var-infisical-client-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_CLIENT_SECRET`](#var-infisical-client-secret) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_ENVIRONMENT`](#var-infisical-environment) (Required: no) - Optional. Leave it unset to keep the default.
+- [`INFISICAL_PROJECT_ID`](#var-infisical-project-id) (Required: no) - Optional. Leave it unset to keep the default.
+- [`JWT_SECRET`](#var-jwt-secret) (Required: no) - Optional. Leave it unset to keep the default.
+- [`PORT`](#var-port) (Required: no) - Optional. Leave it unset to keep the default.
+- [`RUN_MIGRATIONS`](#var-run-migrations) (Required: no) - Optional. Leave it unset to keep the default.
+- [`RUST_LOG`](#var-rust-log) (Required: no) - Optional. Leave it unset to keep the default.
 
 <!-- END GENERATED: recently-added -->
 
@@ -274,14 +395,14 @@ No configuration changes.
 | <a id="var-storage-s3-path-style"></a>`STORAGE_S3_PATH_STYLE` | no, default `true` | v0.15.0 | `compose.dev.yml` | Path-style addressing, which every non-AWS store serves; `false` selects virtual-hosted. |
 | <a id="var-storage-s3-access-key-id"></a>`STORAGE_S3_ACCESS_KEY_ID` | no, needed when `STORAGE_PROVIDER=s3` | v0.15.0 | `compose.dev.yml` | Access key id. |
 | <a id="var-storage-s3-secret-access-key"></a>`STORAGE_S3_SECRET_ACCESS_KEY` | no, needed when `STORAGE_PROVIDER=s3` | v0.15.0 | `compose.dev.yml` | Secret access key. |
-| <a id="var-storage-backend"></a>`STORAGE_BACKEND` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_PROVIDER` | `compose.dev.yml` | Deprecated alias, honoured only when the new name is unset; using it logs a line naming the replacement, and `mokosh-server provider-status` reports which name supplied each setting. Removal is PMS-1443. |
-| <a id="var-attachment-dir"></a>`ATTACHMENT_DIR` | no | v0.4.0; deprecated in v0.15.0, use `STORAGE_ROOT` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-endpoint"></a>`S3_ENDPOINT` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ENDPOINT` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-bucket"></a>`S3_BUCKET` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_BUCKET` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-region"></a>`S3_REGION` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_REGION` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-path-style"></a>`S3_PATH_STYLE` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_PATH_STYLE` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-access-key-id"></a>`S3_ACCESS_KEY_ID` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ACCESS_KEY_ID` | `compose.dev.yml` | Deprecated alias, as above. |
-| <a id="var-s3-secret-access-key"></a>`S3_SECRET_ACCESS_KEY` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_SECRET_ACCESS_KEY` | `compose.dev.yml` | Deprecated alias, as above. |
+| <a id="var-storage-backend"></a>`STORAGE_BACKEND` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_PROVIDER` | `compose.dev.yml` | Deprecated alias. Setting it refuses boot (`check_boot_env`, PMS-1443): rename to `STORAGE_PROVIDER` in your compose file. |
+| <a id="var-attachment-dir"></a>`ATTACHMENT_DIR` | no | v0.4.0; deprecated in v0.15.0, use `STORAGE_ROOT` | `compose.dev.yml` | Deprecated, as above. |
+| <a id="var-s3-endpoint"></a>`S3_ENDPOINT` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ENDPOINT` | `compose.dev.yml` | Deprecated, as above. |
+| <a id="var-s3-bucket"></a>`S3_BUCKET` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_BUCKET` | `compose.dev.yml` | Deprecated, as above. |
+| <a id="var-s3-region"></a>`S3_REGION` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_REGION` | `compose.dev.yml` | Deprecated, as above. |
+| <a id="var-s3-path-style"></a>`S3_PATH_STYLE` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_PATH_STYLE` | `compose.dev.yml` | Deprecated, as above. |
+| <a id="var-s3-access-key-id"></a>`S3_ACCESS_KEY_ID` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_ACCESS_KEY_ID` | `compose.dev.yml` | Deprecated, as above. |
+| <a id="var-s3-secret-access-key"></a>`S3_SECRET_ACCESS_KEY` | no | v0.14.0; deprecated in v0.15.0, use `STORAGE_S3_SECRET_ACCESS_KEY` | `compose.dev.yml` | Deprecated, as above. |
 | <a id="var-attachment-max-bytes"></a>`ATTACHMENT_MAX_BYTES` | no, default 25 MiB | v0.4.0 | `.env` | Per-attachment size cap in bytes. |
 | <a id="var-kb-attachment-max-bytes"></a>`KB_ATTACHMENT_MAX_BYTES` | no, default 5 MiB | v0.14.0 | `.env` | Cap on an image embedded in a knowledge base article (PMS-923). |
 | <a id="var-tenant-logo-max-bytes"></a>`TENANT_LOGO_MAX_BYTES` | no, default 1 MiB | v0.12.0 | `.env` | Cap on an uploaded tenant logo. |
@@ -316,9 +437,9 @@ Kept so an old compose file can still be read against this page. The server igno
 | <a id="var-xero-client-id"></a>`XERO_CLIENT_ID` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The host's Xero OAuth client id for delegated invoice issuing (MAPPS-1139). Served by the `APP_SECRET_BACKEND` provider; setting only one half of the pair is a boot error naming the missing half. Unset leaves no tenant on this deployment able to connect a Xero organisation. |
 | <a id="var-xero-client-secret"></a>`XERO_CLIENT_SECRET` | no | v0.17.0 | governed application-tier secret, NOT `.env` | The secret half of the pair above, served by the same provider so both come from one Xero app registration (MAPPS-1139). |
 | <a id="var-xero-webhook-key"></a>`XERO_WEBHOOK_KEY` | no | v0.17.0 | governed application-tier secret, NOT `.env` | Signing key Xero webhook deliveries are verified against. Served by the `APP_SECRET_BACKEND` provider; unset refuses deliveries, so an invoice Xero marks paid stays outstanding in Mokosh until recorded by hand (MAPPS-1139). |
-| <a id="var-bunyip-secrets-url"></a>`BUNYIP_SECRETS_URL` | no | v0.18.0 | `.env` | Not described yet: say what it does. |
-| <a id="var-bunyip-secrets-client-id"></a>`BUNYIP_SECRETS_CLIENT_ID` | no | v0.18.0 | `.env` | Not described yet: say what it does. |
-| <a id="var-bunyip-secrets-client-secret"></a>`BUNYIP_SECRETS_CLIENT_SECRET` | no | v0.18.0 | `.env` | Not described yet: say what it does. |
+| <a id="var-bunyip-secrets-url"></a>`BUNYIP_SECRETS_URL` | no | v0.18.0 | `.env` | Optional, and set together with `BUNYIP_SECRETS_CLIENT_ID` / `_SECRET` or not at all. A hosted deployment points these at bunyip's host-secrets route; the Google OAuth client pair (`GOOGLE_CONTACTS_CLIENT_ID` / `_SECRET`) is then read from there instead of from this deployment's own provider, set once in bunyip under Admin > Mokosh. A URL with only one half of the credential refuses boot. Unset on a self-hosted deployment, where the pair stays where `APP_SECRET_BACKEND` says. (PMS-1537) |
+| <a id="var-bunyip-secrets-client-id"></a>`BUNYIP_SECRETS_CLIENT_ID` | no | v0.18.0 | `.env` | Optional, and set together with `BUNYIP_SECRETS_URL` / `_CLIENT_SECRET` or not at all. See `BUNYIP_SECRETS_URL` above. (PMS-1537) |
+| <a id="var-bunyip-secrets-client-secret"></a>`BUNYIP_SECRETS_CLIENT_SECRET` | no | v0.18.0 | `.env` | Optional, and set together with `BUNYIP_SECRETS_URL` / `_CLIENT_ID` or not at all. See `BUNYIP_SECRETS_URL` above. (PMS-1537) |
 
 ## Development stack variables
 

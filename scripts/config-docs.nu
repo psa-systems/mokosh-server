@@ -152,7 +152,7 @@ def build-entries [catalog: list, meta: record] {
         }
         if $v.deprecated != null {
             let d = $v.deprecated
-            $auto = ($auto | append { release: $d.release, group: "Deprecated", var: $v.name, required: false, level: "", feature: "", issue: ($d.issue? | default ""), action: $"Renamed to `($d.replacement)`. The old name still works and logs a warning naming the new one; rename it at your next compose edit." })
+            $auto = ($auto | append { release: $d.release, group: "Deprecated", var: $v.name, required: false, level: "", feature: "", issue: ($d.issue? | default ""), action: $"Renamed to `($d.replacement)`. The old name no longer works: the server refuses to boot when it is set \(PMS-1443); rename it in your compose file." })
         }
         if $v.removed != null {
             let r = $v.removed
