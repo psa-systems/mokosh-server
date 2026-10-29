@@ -783,10 +783,13 @@ pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
                         secret = row.secret.name(),
                         declared = declared.as_str(),
                         duplicate = other.as_str(),
-                        "{} is also held by {}; run secrets-migrate --to {} then secrets-purge to remove it",
+                        "{} is also held by {}; run `provider-migrate --from {} --to {}` then \
+                         `provider-purge --provider {} --confirm` to remove it",
                         row.secret.name(),
                         other.as_str(),
+                        other.as_str(),
                         declared.as_str(),
+                        other.as_str(),
                     );
                 }
             }
@@ -794,8 +797,9 @@ pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
                 fatal.push(format!(
                     "{} is absent from the declared {} provider but present in the {}. \
                      mokosh will not silently use a provider the deployment did not \
-                     declare. Copy it with `mokosh-server secrets-migrate --to {}`, \
-                     or set APP_SECRET_BACKEND to the provider that holds it.",
+                     declare. Copy it with `mokosh-server provider-migrate --from <provider> \
+                     --to {}`, naming one of the providers above as <provider>, or set \
+                     APP_SECRET_BACKEND to the provider that holds it.",
                     row.secret.name(),
                     declared.as_str(),
                     provider_list(&elsewhere),
@@ -1273,7 +1277,7 @@ mod tests {
         assert!(message.contains("infisical"), "{message}");
         assert!(message.contains("database"), "{message}");
         assert!(
-            message.contains("secrets-migrate --to infisical"),
+            message.contains("provider-migrate --from <provider> --to infisical"),
             "{message}"
         );
     }
