@@ -688,3 +688,70 @@ async fn a_provider_without_the_capability_is_not_asked(pool: PgPool) {
     );
     assert_eq!(external_columns(&pool, claim).await, (None, None));
 }
+
+/// PMS-1547 regression: a second `reimburse_expense` attempt that reaches
+/// its own pre-check while a winning attempt's `transition_expense` holds
+/// the row lock must block on that lock rather than racing it with a
+/// plain unlocked read, and once unblocked must see the completed
+/// transition and refuse before ever calling the provider. Before the
+/// fix the pre-check was a plain `SELECT` that does not wait on another
+/// transaction's row lock, so it would still read the pre-transition
+/// `approved` status and dispatch to the provider a second time.
+#[mokosh_test]
+async fn a_losing_attempt_blocks_on_the_lock_and_never_dispatches(pool: PgPool) {
+    let (stub, base) = start_stub().await;
+    let (admin, _email, _pw) = common::seed_admin(&pool).await;
+    let (svc, db, secrets) = service_with_dispatch(&pool, &base, true).await;
+    let category_id = category(&svc).await;
+    let claim = approved_claim(&svc, admin, Some(category_id)).await;
+
+    connect(&pool, "xero", Some(XERO_BANK_ACCOUNT)).await;
+    seed_xero_blob(&secrets).await;
+    let mappings = InvoiceIssuerMappingService::new(db);
+    mappings
+        .upsert_expense_account_mapping(tenant(), InvoiceProviderKind::Xero, category_id, "429")
+        .await
+        .expect("map the category");
+    mappings
+        .upsert_user_mapping(tenant(), InvoiceProviderKind::Xero, admin, XERO_CONTACT)
+        .await
+        .expect("map the person");
+
+    // Hold the row lock open on a separate connection, as if a winning
+    // attempt's own `transition_expense` already took it and is about to
+    // commit its transition to `reimbursed`.
+    let mut holder = pool.begin().await.expect("open the holding transaction");
+    sqlx::query("SELECT id FROM expenses WHERE id = $1 FOR UPDATE")
+        .bind(claim)
+        .execute(&mut *holder)
+        .await
+        .expect("take the row lock");
+
+    let losing_svc = svc.clone();
+    let (losing_result, ()) = tokio::join!(
+        async move { losing_svc.reimburse_expense(tenant(), claim, &ctx()).await },
+        async {
+            // Long enough for the losing attempt to reach its own
+            // `SELECT ... FOR UPDATE` pre-check and park behind this lock.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            sqlx::query(
+                "UPDATE expenses SET status = 'reimbursed', reimbursed_at = NOW() WHERE id = $1",
+            )
+            .bind(claim)
+            .execute(&mut *holder)
+            .await
+            .expect("simulate the winning attempt's own commit");
+            holder.commit().await.expect("release the row lock");
+        },
+    );
+
+    assert!(
+        matches!(losing_result, Err(AppError::Conflict(_))),
+        "the blocked attempt must see the post-transition status and refuse: {losing_result:?}"
+    );
+    assert_eq!(
+        stub.lock().unwrap().spends.len(),
+        0,
+        "the attempt that lost the race must never reach the provider"
+    );
+}
