@@ -190,6 +190,7 @@ One line per rule, or per group of rules answering one subject, linking its full
 - Stored files go through one seam, `crate::storage` ([PMS-910](docs/invariants/config-providers.md#storage-seam-pms-910))
 - The storage provider is chosen once per process ([PMS-958](docs/invariants/config-providers.md#storage-provider-pms-958))
 - Config has one read path over a declared registry ([PMS-982](docs/invariants/config-providers.md#config-registry-pms-982))
+- A secret may be declared to its own provider, which is not a fallback ([PMS-1537](docs/invariants/config-providers.md#per-secret-declaration-pms-1537))
 - A selectable implementation is a provider ([PMS-1010](docs/invariants/config-providers.md#provider-naming-pms-1010))
 - The deployment mode supplies default providers ([PMS-1011](docs/invariants/config-providers.md#deployment-mode-pms-1011))
 - The hosted deployments declare the database secret provider ([PMS-1440](docs/providers.md#what-the-hosted-deployments-actually-declare-pms-1440))

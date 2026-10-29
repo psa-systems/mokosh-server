@@ -48,6 +48,46 @@ The older route, for a deployment that already has the value in a file, is
 it. That needs the file provider built, which is what step 1 below does, and it
 never clears the source, so remove the file afterwards.
 
+## The Google OAuth client on a hosted deployment (PMS-1537)
+
+One secret on `saas` does not follow the rest of this runbook, and knowing which saves an hour: the Google OAuth
+client pair (`GOOGLE_CONTACTS_CLIENT_ID` and `GOOGLE_CONTACTS_CLIENT_SECRET`) is declared to BUNYIP, not to the
+provider `APP_SECRET_BACKEND` names. bunyip holds it for the whole suite (BUNYIP-983), so it is set once there
+rather than once per product.
+
+`provider-status --text` says so per secret, and `provider-set` refuses the pair with the same sentence, because
+bunyip takes no writes from Mokosh.
+
+Setting it up on a deployment that has not had it:
+
+1. In bunyip, register a credential for this deployment and keep the secret it prints once:
+
+   ```
+   bunyip-api machine-client register --name mokosh-host-secrets --secret-key mokosh/google_oauth_client
+   ```
+
+2. In bunyip, set the pair under Admin > Mokosh. Changing the client id later invalidates every tenant's existing
+   Google grant, so set it once: bunyip's own page asks twice before accepting a change for that reason.
+
+3. On this deployment, point the three variables at it and restart:
+
+   ```
+   BUNYIP_SECRETS_URL=https://auth.example.com
+   BUNYIP_SECRETS_CLIENT_ID_FILE=/run/secrets/bunyip_secrets_client_id
+   BUNYIP_SECRETS_CLIENT_SECRET_FILE=/run/secrets/bunyip_secrets_client_secret
+   ```
+
+   All three or none: a URL with half a credential refuses boot, as does a deployment that declares the pair to
+   bunyip and cannot reach it. That refusal is deliberate (`Classification::Unavailable`): an unreachable bunyip
+   reported as "the Google client is absent" would stop every tenant's contact sync with a warning in a log nobody
+   is watching.
+
+4. If the deployment already held a copy of the pair in its own provider, the boot warns that bunyip's value is
+   shadowed. `provider-purge` clears a whole provider and only one that is disabled, so it is the wrong instrument
+   for two keys inside the declared one: delete the two `app_secrets` rows (or the two files, or the two Infisical
+   keys) by hand, then restart and confirm `provider-status --text` lists bunyip alone as holding them. The warning
+   is the only thing standing between a rotation in bunyip and a deployment still serving the old pair.
+
 ## Step 1: enable the new provider at a higher priority
 
 Provider ENABLEMENT is bootstrap configuration and lives in the operator's
