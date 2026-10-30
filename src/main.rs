@@ -189,7 +189,7 @@ struct DeploymentRequirement {
     example: &'static str,
 }
 
-/// The five deployment-shape variables mokosh-server refuses to start without
+/// The six deployment-shape variables mokosh-server refuses to start without
 /// outside dev/test (PMS-1160). The list is ORDERED by consequence: the first
 /// one that fails at boot is the first one printed, so an operator who lands
 /// on a fresh compose fills them in top-to-bottom.
@@ -203,6 +203,17 @@ struct DeploymentRequirement {
 /// moment they are needed, which is the first boot on a database that has
 /// never been provisioned.
 const ESSENTIAL_DEPLOYMENT_REQUIREMENTS: &[DeploymentRequirement] = &[
+    DeploymentRequirement {
+        name: "DATABASE_URL",
+        reader: || config::get(&keys::DATABASE_URL),
+        purpose: "the privileged (mokosh_migrator, BYPASSRLS) connection string used for \
+                  migrations, bootstrap and the cross-tenant workers. Unset falls back to a \
+                  local postgres:postgres URL outside dev/test only until this check runs; a \
+                  deployed environment pointed at that URL would be a database that likely \
+                  does not exist.",
+        options: &[],
+        example: "DATABASE_URL=postgres://mokosh_migrator:<pw>@<host>:5432/mokosh",
+    },
     DeploymentRequirement {
         name: "MOKOSH_DEPLOYMENT_MODE",
         reader: mokosh_server::utils::deployment::raw_deployment_mode,
@@ -419,31 +430,56 @@ impl AppConfig {
             .into());
         }
 
-        Ok(Self {
-            database_url: config::get(&keys::DATABASE_URL).unwrap_or_else(|| {
-                "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
-            }),
-            // PMS-285: the request-serving role. Default to DATABASE_URL so a
-            // dev box without the split still boots (RLS stays inert until the
-            // app role is a NOBYPASSRLS one).
-            app_database_url: config::get(&keys::MOKOSH_APP_DATABASE_URL)
-                .or_else(|| config::get(&keys::DATABASE_URL))
-                .unwrap_or_else(|| {
+        // PMS-1577: DATABASE_URL is `required` in the registry (PMS-1442), but
+        // outside dev/test it must not silently fall back to a local
+        // postgres:postgres URL that may not even exist on a deployed host.
+        // The dev/test fallback stays, because that is the shape the
+        // documented default has always had; everywhere else an unset value
+        // is left empty for `check_deployment_requirements` (PMS-1160) to
+        // name and refuse before anything tries to connect.
+        let database_url = config::get(&keys::DATABASE_URL)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| {
+                if env_allows_dev_secrets(&environment) {
                     "postgres://postgres:postgres@localhost:5432/mokosh".to_string()
-                }),
+                } else {
+                    String::new()
+                }
+            });
+        // PMS-285: the request-serving role. Default to DATABASE_URL (now
+        // itself already resolved above) so a dev box without the split
+        // still boots (RLS stays inert until the app role is a NOBYPASSRLS
+        // one).
+        let app_database_url = config::get(&keys::MOKOSH_APP_DATABASE_URL)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| database_url.clone());
+
+        let port =
+            config::parse::parse_optional(&keys::PORT, config::get(&keys::PORT))?.unwrap_or(8080);
+        let run_migrations = config::parse::parse_optional(
+            &keys::RUN_MIGRATIONS,
+            config::get(&keys::RUN_MIGRATIONS),
+        )?
+        .unwrap_or(true);
+        // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS. Unset ->
+        // None (uncapped, as documented); set and a positive integer ->
+        // Some(N); set and malformed or non-positive is now a boot error
+        // naming the variable and value rather than a silent "uncapped".
+        let max_tenants = config::parse::parse_positive(
+            &keys::MOKOSH_MAX_TENANTS,
+            config::get(&keys::MOKOSH_MAX_TENANTS),
+        )?;
+
+        Ok(Self {
+            database_url,
+            app_database_url,
             jwt_secret,
             host: config::get(&keys::HOST).unwrap_or_else(|| "0.0.0.0".to_string()),
-            port: config::get(&keys::PORT)
-                .unwrap_or_else(|| "8080".to_string())
-                .parse()
-                .unwrap_or(8080),
+            port,
             environment,
             base_url: config::get(&keys::BASE_URL)
                 .unwrap_or_else(|| "http://localhost:8080".to_string()),
-            run_migrations: config::get(&keys::RUN_MIGRATIONS)
-                .unwrap_or_else(|| "true".to_string())
-                .parse()
-                .unwrap_or(true),
+            run_migrations,
             encryption_key,
             client_origin: client_origin.clone(),
             spa_base_url,
@@ -473,14 +509,11 @@ impl AppConfig {
             // through `config::flags::LOGIN_APPROVAL_ENABLED` so the parse
             // rule and the default live with the flag rather than here.
             login_approval_enabled: config::flags::LOGIN_APPROVAL_ENABLED.read(),
-            // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS. Empty,
-            // unset, unparseable, or non-positive -> None (uncapped). Positive
-            // usize -> Some(N). The value is threaded into `TenantService` via
-            // its builder so the service layer probes `COUNT(*)` before
-            // insert.
-            max_tenants: config::get(&keys::MOKOSH_MAX_TENANTS)
-                .and_then(|raw| raw.trim().parse::<usize>().ok())
-                .filter(|n| *n > 0),
+            // MAPPS-457: optional cap parsed from MOKOSH_MAX_TENANTS above.
+            // Unset or empty -> None (uncapped, as documented). The value is
+            // threaded into `TenantService` via its builder so the service
+            // layer probes `COUNT(*)` before insert.
+            max_tenants,
             // PMS-902: self-hosted (default) or saas. Unset and unrecognised
             // both resolve to self-hosted, so a typo cannot silently stop a
             // self-hosted deployment's account email.
@@ -540,7 +573,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The env file has to land before ANYTHING reads a variable: the hosting
     // profile below chooses the configuration provider, and that provider then
     // resolves every declared key out of this process's environment.
-    dotenvy::dotenv().ok();
+    // PMS-1577: a missing `.env` is the documented default (nothing to load);
+    // a malformed one silently discarded every variable it defined, with
+    // nothing logged, so only the not-found case is ignored here.
+    if let Err(e) = dotenvy::dotenv() {
+        if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(format!(".env could not be loaded: {e}").into());
+        }
+    }
 
     // PMS-1011: the same variable, read strictly, because this answer chooses
     // providers rather than gating mail. Read here so an unrecognised mode
@@ -566,6 +607,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rather than silently serving from the default.
     let config_selection =
         config::init_from_env(hosting_profile.default_provider_for(ProviderKind::Configuration)?)?;
+
+    // PMS-1577: a set-but-unparseable feature flag is a boot error naming the
+    // flag and value, not a silent fallback to its default. Runs once every
+    // declared flag has a resolved generation to read.
+    config::flags::check_boot()?;
 
     let config = AppConfig::from_env().expect("Failed to load configuration");
 
@@ -1298,8 +1344,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// and use a plain `info`-default tracing filter (not the server's `debug`
 /// one). Dispatch lives in [`mokosh_server::cli`].
 async fn run_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = dotenvy::from_filename(".env.infisical");
-    let _ = dotenvy::dotenv();
+    // PMS-1577: same rule as the server's own startup load above: a missing
+    // file is the documented default, a malformed one is not.
+    for result in [dotenvy::from_filename(".env.infisical"), dotenvy::dotenv()] {
+        if let Err(e) = result {
+            if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(format!("env file could not be loaded: {e}").into());
+            }
+        }
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1468,10 +1522,11 @@ mod tests {
         }
     }
 
-    // PMS-1160: the five variables named by the ticket are the exact ones the
-    // list carries. A sixth entry added without moving the ticket is a change
-    // the list intends to refuse; adding one deliberately means updating this
-    // test and the ticket in the same PR.
+    // PMS-1160 (extended by PMS-1577 with `DATABASE_URL`): the six variables
+    // named by the two tickets are the exact ones the list carries. A seventh
+    // entry added without moving a ticket is a change the list intends to
+    // refuse; adding one deliberately means updating this test and the
+    // ticket in the same PR.
     #[test]
     fn the_essential_set_is_exactly_the_pms_1160_five() {
         let names: Vec<&str> = ESSENTIAL_DEPLOYMENT_REQUIREMENTS
@@ -1481,13 +1536,14 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "DATABASE_URL",
                 "MOKOSH_DEPLOYMENT_MODE",
                 "MOKOSH_APP_DATABASE_URL",
                 "BASE_URL",
                 "CLIENT_ORIGIN",
                 "SPA_BASE_URL",
             ],
-            "the essential requirements list must match PMS-1160 exactly; \
+            "the essential requirements list must match PMS-1160 + PMS-1577 exactly; \
              adding a new entry means updating this assertion and the ticket \
              in the same PR"
         );
@@ -1499,7 +1555,7 @@ mod tests {
     // options" line at all.
     #[test]
     fn format_missing_requirement_names_options_when_closed() {
-        let mode = &ESSENTIAL_DEPLOYMENT_REQUIREMENTS[0];
+        let mode = &ESSENTIAL_DEPLOYMENT_REQUIREMENTS[1];
         assert_eq!(mode.name, "MOKOSH_DEPLOYMENT_MODE");
         let msg = format_missing_requirement(mode, "staging");
         assert!(
@@ -1509,7 +1565,7 @@ mod tests {
         assert!(msg.contains("MOKOSH_DEPLOYMENT_MODE=saas"), "{msg}");
         assert!(msg.contains("'staging' environment"), "{msg}");
 
-        let app_db = &ESSENTIAL_DEPLOYMENT_REQUIREMENTS[1];
+        let app_db = &ESSENTIAL_DEPLOYMENT_REQUIREMENTS[2];
         assert_eq!(app_db.name, "MOKOSH_APP_DATABASE_URL");
         let msg = format_missing_requirement(app_db, "production");
         assert!(
