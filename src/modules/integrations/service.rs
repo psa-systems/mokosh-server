@@ -1240,12 +1240,22 @@ mod tests {
 
     /// The floor is the one the column enforces, so a value the service accepts
     /// can never be a constraint violation.
+    ///
+    /// PMS-1583 set every real provider's `polling` to `None`, so this test
+    /// builds its own polled descriptor to exercise the floor check that
+    /// `assert_poll_interval` still owns for whichever provider polls next.
     #[test]
     fn a_poll_interval_below_the_floor_is_refused_before_the_database_sees_it() {
-        let error = assert_poll_interval(xero(), Some(1)).expect_err("below the floor");
+        let mut polled = *xero();
+        polled.polling = Some(registry::PollingSpec {
+            default_minutes: registry::DEFAULT_POLL_INTERVAL_MINUTES,
+            min_minutes: registry::MIN_POLL_INTERVAL_MINUTES,
+        });
+
+        let error = assert_poll_interval(&polled, Some(1)).expect_err("below the floor");
         assert!(error.to_string().contains("floor"), "{error}");
         assert_eq!(
-            assert_poll_interval(xero(), Some(registry::MIN_POLL_INTERVAL_MINUTES))
+            assert_poll_interval(&polled, Some(registry::MIN_POLL_INTERVAL_MINUTES))
                 .expect("the floor itself is legal"),
             Some(registry::MIN_POLL_INTERVAL_MINUTES)
         );

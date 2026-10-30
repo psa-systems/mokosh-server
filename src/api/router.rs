@@ -431,7 +431,10 @@ pub fn create_api_router(
             Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
             Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
             public_api_base_url.clone(),
-            client_origin.clone(),
+            // PMS-1580: the settings page the admin lands on exists only in
+            // mokosh-apps, the contact-sync shape (`router.rs` above), not on
+            // the apex `client_origin` serves.
+            spa_base_url.clone(),
         ),
     );
     let reports_service = ReportsService::new(db.clone());
