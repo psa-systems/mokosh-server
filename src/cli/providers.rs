@@ -1441,7 +1441,7 @@ async fn boot_shared_state() -> AppResult<(Database, [u8; 32])> {
     let default = profile
         .default_provider_for(ProviderKind::Configuration)
         .map_err(|e| AppError::Configuration(e.to_string()))?;
-    let _ = config::init_from_env(default);
+    config::init_from_env(default)?;
 
     let database_url = std::env::var("DATABASE_URL").map_err(|_| {
         AppError::Configuration(

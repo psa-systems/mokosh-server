@@ -737,7 +737,9 @@ pub fn init_from_env(profile_default: &str) -> AppResult<(StorageProviderKind, E
             source = source.as_str(),
             "storage provider selected"
         );
-        let _ = SHARED.set(built);
+        if SHARED.set(built).is_err() {
+            tracing::debug!("storage provider already set by a concurrent builder");
+        }
     }
     Ok((kind, source))
 }

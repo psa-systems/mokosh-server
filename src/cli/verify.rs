@@ -196,7 +196,7 @@ fn init_bootstrap_config() -> AppResult<()> {
     let profile = DeploymentMode::from_env_for_providers()
         .map_err(|e| AppError::Configuration(e.to_string()))?;
     let default = profile.default_provider_for(ProviderKind::Configuration)?;
-    let _ = crate::config::init_from_env(default);
+    crate::config::init_from_env(default)?;
     Ok(())
 }
 
