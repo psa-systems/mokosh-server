@@ -12,10 +12,12 @@ on:
 jobs:
   renovate:
     name: Renovate (caller)
-    uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@5213b60641e19912747467e02bf630c9596bf790  # main
+    uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@f466fa87127d4c5d78e9b8d5a730bfc59ef45450  # main
     with:
       target_repository: ${{ github.repository }}
     secrets:
       RENOVATE_CI_TOKEN: ${{ secrets.RENOVATE_CI_TOKEN }}
       PUBLIC_GITHUB_REPO_TOKEN: ${{ secrets.PUBLIC_GITHUB_REPO_TOKEN }}
       PSA_SYSTEMS_PRIVATE_PACKAGE_PAT: ${{ secrets.PSA_SYSTEMS_PRIVATE_PACKAGE_PAT }}
+      A8N_TOOLS_PRIVATE_PACKAGE_PAT: ${{ secrets.A8N_TOOLS_PRIVATE_PACKAGE_PAT }}
+      FORGEJO_PAT: ${{ secrets.FORGEJO_PAT }}
