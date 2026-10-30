@@ -32,6 +32,12 @@ use mokosh_test::mokosh_test;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
+/// PMS-1580: the settings page a callback lands on exists only in
+/// mokosh-apps, never on the apex `CLIENT_ORIGIN` serves. Deliberately not
+/// `https://api.msp.example`, the fixture's `public_api_base`, so a
+/// destination built from the wrong origin cannot pass by coincidence.
+const SPA_BASE: &str = "https://app.msp.example";
+
 /// How many organisations the stub's `GET /connections` reports.
 #[derive(Clone, Default)]
 struct Script {
@@ -155,7 +161,7 @@ async fn service_with_toggle(
                 .with_identity_base(base),
         ),
         Some("https://api.msp.example".to_string()),
-        "https://app.msp.example".to_string(),
+        SPA_BASE.to_string(),
     );
     (service, secrets, db)
 }
@@ -216,7 +222,11 @@ async fn connecting_xero_writes_the_credential_and_names_the_organisation(pool: 
         .await
         .expect("complete");
     assert!(
-        destination.contains("/settings/integrations"),
+        destination.starts_with(SPA_BASE),
+        "a connect callback must land on the SPA, not the apex CLIENT_ORIGIN serves: {destination}"
+    );
+    assert!(
+        destination.ends_with("/settings/integrations"),
         "{destination}"
     );
 
@@ -336,6 +346,50 @@ async fn quickbooks_without_a_realm_is_refused(pool: PgPool) {
         .expect_err("no company was named");
     assert!(err.to_string().contains("named no company"), "{err}");
     assert!(integration_row(&pool, "quickbooks").await.is_none());
+}
+
+/// PMS-1580: a failed callback redirects to the SPA too, not the apex
+/// `CLIENT_ORIGIN` serves. Exercised through the actual HTTP handler
+/// (`invoice_issuer_public_routes`), since `app_base` is only read there and
+/// in `InvoiceIssuerConnectService::complete`'s success path, already
+/// covered above.
+#[mokosh_test]
+async fn a_failed_callback_redirects_to_the_spa(pool: PgPool) {
+    use mokosh_server::modules::billing::invoice_issuer_connect::invoice_issuer_public_routes;
+    use tower::ServiceExt;
+
+    let (_script, base) = start_stub().await;
+    let (svc, _secrets, _db) = service(&pool, &base, apps()).await;
+    let router = invoice_issuer_public_routes(Arc::new(svc));
+
+    for query in ["?error=access_denied", "?state=not-even-known", ""] {
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/invoice-issuer/xero/callback{query}"))
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("the callback answers");
+        assert!(
+            response.status().is_redirection(),
+            "{query} should redirect, got {}",
+            response.status()
+        );
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            location.starts_with(SPA_BASE),
+            "a failed connect callback must land on the SPA, not the apex CLIENT_ORIGIN serves: {query} -> {location}"
+        );
+        assert!(location.contains("connect=failed"), "{query} -> {location}");
+    }
 }
 
 /// A state is spent once.
