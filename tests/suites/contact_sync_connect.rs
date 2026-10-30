@@ -285,3 +285,49 @@ async fn reconnecting_the_same_account_keeps_the_connection(pool: PgPool) {
         .unwrap();
     assert_eq!(connections, 1);
 }
+
+/// PMS-1568: `contact_sync_oauth_states.provider` (migration 221) only
+/// allowed `'google'`. Migration 276 widened `contact_sync_connections` to
+/// include `microsoft` but left this table's check behind, so starting a
+/// Microsoft connect inserted a state row the constraint refused before this
+/// fix exists to widen it too.
+#[mokosh_test]
+async fn starting_a_microsoft_connection_stores_its_state_row(pool: PgPool) {
+    use mokosh_server::db::Database;
+    use mokosh_server::modules::auth::TenantId;
+    use mokosh_server::modules::contact_sync::microsoft_oauth::{
+        OauthClient as MicrosoftOauthClient, SharedMicrosoftClient,
+    };
+    use mokosh_server::modules::contact_sync::ContactSyncService;
+    use mokosh_server::secrets::DatabaseSecretProvider;
+    use std::sync::Arc;
+
+    let (admin_id, _email, _password) = common::seed_admin(&pool).await;
+    let db = Database::from_pool(pool.clone());
+    let secrets = Arc::new(DatabaseSecretProvider::new(db.clone(), [0u8; 32]));
+    let microsoft_client = Arc::new(SharedMicrosoftClient::new(Some(MicrosoftOauthClient {
+        client_id: "entra-client-id".to_string(),
+        client_secret: "entra-client-secret".to_string(),
+    })));
+    let service = ContactSyncService::new(
+        db,
+        secrets,
+        Some("https://app.msp.example".to_string()),
+        "https://app.msp.example".to_string(),
+    )
+    .with_microsoft_client(microsoft_client);
+    let tenant = TenantId::from_trusted(common::DEFAULT_TENANT_ID);
+
+    service
+        .begin_microsoft_connect(tenant, admin_id)
+        .await
+        .expect("starting a microsoft connection must store its state row");
+
+    let provider: String =
+        sqlx::query_scalar("SELECT provider FROM contact_sync_oauth_states WHERE tenant_id = $1")
+            .bind(common::DEFAULT_TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("the state row the connect attempt wrote");
+    assert_eq!(provider, "microsoft");
+}

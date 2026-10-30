@@ -282,8 +282,16 @@ pub fn create_api_router(
         notifications_service.clone(),
     )
     .with_payment_methods(payment_methods_service.clone());
+    // SLA service shares the notifications dispatcher so the
+    // `sla_sweep` worker (spawned from main.rs with this same service)
+    // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
+    // do not use the dispatcher; only the worker does. Built ahead of
+    // `ticket_service` (PMS-1564) so the ticket service can hold a
+    // clone and call `evaluate_for_ticket` on create / status change.
+    let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
     let ticket_service =
-        TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone());
+        TicketService::with_dispatcher(db.clone(), mailer.clone(), notifications_service.clone())
+            .with_sla(Arc::new(sla_service.clone()));
     // PMS-711: the agent-facing billing service also sends the outbound invoice
     // "Pay Now" email on the send transition, so it takes the mailer + the SPA
     // origin the pay link is built from.
@@ -423,7 +431,10 @@ pub fn create_api_router(
             Arc::new(crate::modules::billing::provider_invoice::XeroClient::new()),
             Arc::new(crate::modules::billing::provider_invoice::QuickBooksClient::new()),
             public_api_base_url.clone(),
-            client_origin.clone(),
+            // PMS-1580: the settings page the admin lands on exists only in
+            // mokosh-apps, the contact-sync shape (`router.rs` above), not on
+            // the apex `client_origin` serves.
+            spa_base_url.clone(),
         ),
     );
     let reports_service = ReportsService::new(db.clone());
@@ -473,11 +484,6 @@ pub fn create_api_router(
     // the auth logic.
     let rmm_service_shared = std::sync::Arc::new(rmm_service.clone());
     let status_service = crate::modules::status::StatusService::new(db.clone());
-    // SLA service shares the notifications dispatcher so the
-    // `sla_sweep` worker (spawned from main.rs with this same service)
-    // can enqueue at-risk / breach alerts. The CRUD + evaluate routes
-    // do not use the dispatcher; only the worker does.
-    let sla_service = SlaService::with_dispatcher(db.clone(), notifications_service.clone());
     // PMS-157 / PMS-710: first-visit demo seeding. Holds its own clones of the
     // contacts, tickets, projects, and SLA services so it can drive the real
     // create paths for the connected demo dataset; wired below as a middleware
@@ -1174,6 +1180,13 @@ pub fn create_api_router(
                         encryption_key,
                         secrets.clone(),
                     )),
+                    // PMS-1543: its own instance rather than the serving
+                    // one, which `expenses_routes` has taken by value. It
+                    // carries no bill dispatch on purpose: this path
+                    // RECORDS what the provider already did, and a push
+                    // back out from here would be the loop PMS-1545 has to
+                    // avoid.
+                    expenses: Arc::new(crate::modules::expenses::ExpensesService::new(db.clone())),
                     dispatcher: issuer_dispatcher.clone(),
                     provider,
                 },

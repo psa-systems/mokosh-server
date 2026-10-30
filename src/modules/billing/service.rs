@@ -80,6 +80,22 @@ const DEFAULT_NET_DAYS: i32 = 30;
 /// used verbatim; a value below this default is clamped up.
 pub const DEFAULT_MIN_PARTIAL_AMOUNT: Decimal = Decimal::ONE;
 
+/// The invoice an amendment replaces, as its send transaction reads it
+/// (PMS-1334, PMS-1544).
+///
+/// A named row rather than a six-tuple: `clippy::type_complexity` is right
+/// that nobody keeps six positional fields straight, and the last two
+/// (PMS-1544's provider pair) were what tipped it over.
+#[derive(sqlx::FromRow)]
+struct AmendedOriginalRow {
+    invoice_number: String,
+    status: String,
+    amount_paid: Decimal,
+    amount_credited: Decimal,
+    external_provider: Option<String>,
+    external_invoice_id: Option<String>,
+}
+
 impl BillingService {
     /// Zero-key constructor for callers that never touch secret material (the
     /// QA seeder). Its secret provider is the database one under the same zero
@@ -1141,6 +1157,16 @@ impl BillingService {
         // deployment that has not flipped `DelegatedInvoiceIssuer` runs
         // exactly the statements it ran before, in the same order and
         // the same number of them.
+        // PMS-1561 (F5): when the pre-pass below runs, it already asserts
+        // the company, the payment term and every line's product
+        // sellability against this exact tenant and request, which cannot
+        // have changed by the time the main transaction opens a few lines
+        // down. Carrying its due date and payment term forward, and
+        // skipping the main transaction's copies of those three guards
+        // when they already ran, is what stops a delegated create from
+        // paying for the full guard set twice. The non-delegated path
+        // (`prevalidated` stays `None`) is unchanged.
+        let mut prevalidated: Option<(NaiveDate, Option<Uuid>)> = None;
         let external = match self.invoice_dispatch.as_ref() {
             Some(dispatcher) if dispatcher.delegation_enabled() => {
                 let mut pre = self.db.begin_with_tenant(tenant_id).await?;
@@ -1151,7 +1177,16 @@ impl BillingService {
                 if let Some(pt) = request.payment_term_id {
                     Self::assert_payment_term_in_tenant(&mut pre, tenant_id, pt).await?;
                 }
-                let (due_date, _) = Self::resolve_due_date(
+                // PMS-1548: the local write's own per-line guard, moved
+                // ahead of the provider call for the same reason the two
+                // above it were: a retired product must reject before
+                // issuing externally, not after.
+                for line in &request.lines {
+                    if let Some(product_id) = line.product_id {
+                        Self::assert_product_sellable(&mut pre, tenant_id, product_id).await?;
+                    }
+                }
+                let (due_date, payment_term_id) = Self::resolve_due_date(
                     &mut pre,
                     tenant_id,
                     request.invoice_date,
@@ -1164,6 +1199,7 @@ impl BillingService {
                     None => read_default_currency(&mut pre, tenant_id).await?,
                 };
                 pre.commit().await?;
+                prevalidated = Some((due_date, payment_term_id));
 
                 let shape =
                     crate::modules::billing::invoice_issuer_dispatch::CreateInvoiceRequestShape {
@@ -1199,20 +1235,27 @@ impl BillingService {
         let total = subtotal + tax - discount;
 
         // PMS-1367: before anything is written, and before the contact is
-        // resolved against it.
-        Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
-        if let Some(pt) = request.payment_term_id {
-            Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
-        }
-        // PMS-990: the due date the caller gave, or the one the term implies.
-        let (due_date, payment_term_id) = Self::resolve_due_date(
-            &mut tx,
-            tenant_id,
-            request.invoice_date,
-            request.payment_term_id,
-            request.due_date,
-        )
-        .await?;
+        // resolved against it. Skipped when the pre-pass above already ran
+        // these same two guards against this tenant and request (PMS-1561
+        // F5): the non-delegated path, where `prevalidated` is `None`,
+        // still runs them here exactly as before.
+        let (due_date, payment_term_id) = if let Some(prevalidated) = prevalidated {
+            prevalidated
+        } else {
+            Self::assert_company_in_tenant(&mut tx, tenant_id, request.company_id).await?;
+            if let Some(pt) = request.payment_term_id {
+                Self::assert_payment_term_in_tenant(&mut tx, tenant_id, pt).await?;
+            }
+            // PMS-990: the due date the caller gave, or the one the term implies.
+            Self::resolve_due_date(
+                &mut tx,
+                tenant_id,
+                request.invoice_date,
+                request.payment_term_id,
+                request.due_date,
+            )
+            .await?
+        };
 
         // PMS-1016: the contact the caller named, else the company's default.
         let billing_contact_id = Self::resolve_billing_contact(
@@ -1297,9 +1340,13 @@ impl BillingService {
         // line is written, so a bad id on the third line does not leave the
         // first two behind. RLS does not cover this: an FK check bypasses it,
         // so a foreign-tenant product would link silently (PMS-333's lesson).
-        for line in &request.lines {
-            if let Some(product_id) = line.product_id {
-                Self::assert_product_sellable(&mut tx, tenant_id, product_id).await?;
+        // Skipped when the pre-pass already ran this same loop against this
+        // tenant and these lines (PMS-1561 F5).
+        if prevalidated.is_none() {
+            for line in &request.lines {
+                if let Some(product_id) = line.product_id {
+                    Self::assert_product_sellable(&mut tx, tenant_id, product_id).await?;
+                }
             }
         }
 
@@ -4738,16 +4785,23 @@ impl BillingService {
         };
         // Captured before the void so the audit row carries both sides of it.
         let mut voided_before: Option<serde_json::Value> = None;
+        // PMS-1544: the provider and id of the invoice being replaced,
+        // when a provider holds it.
+        let mut voided_external: Option<(
+            crate::modules::billing::invoice_issuer::InvoiceProviderKind,
+            String,
+        )> = None;
         if let Some(original_id) = amends {
-            let original: Option<(String, String, Decimal, Decimal)> = sqlx::query_as(
-                "SELECT invoice_number, status, amount_paid, amount_credited FROM invoices \
+            let original: Option<AmendedOriginalRow> = sqlx::query_as(
+                "SELECT invoice_number, status, amount_paid, amount_credited, \
+                        external_provider, external_invoice_id FROM invoices \
                  WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
             )
             .bind(original_id)
             .bind(tenant_id)
             .fetch_optional(&mut *tx)
             .await?;
-            let Some((original_number, original_status, paid, credited)) = original else {
+            let Some(original) = original else {
                 return Err(AppError::Conflict(
                     "The invoice this one amends no longer exists, so sending it would replace \
                      nothing. Raise it as an ordinary invoice instead."
@@ -4755,18 +4809,31 @@ impl BillingService {
                 ));
             };
             let original_status =
-                InvoiceStatus::from_str(&original_status).unwrap_or(InvoiceStatus::Draft);
+                InvoiceStatus::from_str(&original.status).unwrap_or(InvoiceStatus::Draft);
             if !matches!(original_status, InvoiceStatus::Sent)
-                || paid > Decimal::ZERO
-                || credited > Decimal::ZERO
+                || original.amount_paid > Decimal::ZERO
+                || original.amount_credited > Decimal::ZERO
             {
                 return Err(AppError::Conflict(format!(
-                    "Invoice {original_number} is no longer in a state this amendment can replace \
-                     (status '{}', {paid} paid, {credited} credited). Issue a credit note against \
-                     it instead, and invoice the difference.",
-                    original_status.as_str()
+                    "Invoice {} is no longer in a state this amendment can replace (status \
+                     '{}', {} paid, {} credited). Issue a credit note against it instead, and \
+                     invoice the difference.",
+                    original.invoice_number,
+                    original_status.as_str(),
+                    original.amount_paid,
+                    original.amount_credited
                 )));
             }
+            // PMS-1544: who holds the copy the customer is looking at. Read
+            // here, under the same row lock as the preconditions, so the
+            // void below cannot act on a pair that changed in between.
+            voided_external = original
+                .external_provider
+                .zip(original.external_invoice_id)
+                .and_then(|(provider, id)| {
+                    crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(&provider)
+                        .map(|kind| (kind, id))
+                });
             voided_before = sqlx::query_scalar(
                 "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
             )
@@ -5216,6 +5283,53 @@ impl BillingService {
             .bind(format!("Replaced by invoice {}", current.invoice_number))
             .execute(&mut *tx)
             .await?;
+            // PMS-1544: the customer is holding the PROVIDER's copy of the
+            // invoice this replaces, so voiding only the local row leaves
+            // them being chased for a document the MSP has replaced.
+            //
+            // Inside the send transaction, which is where this function
+            // already puts an irreversible external effect: PMS-991 mails
+            // the invoice here and lets a relay refusal roll the send back,
+            // for the reason that a `sent` nobody received is worse than no
+            // send. The same argument applies to a replacement that goes
+            // out while the thing it replaces stays payable.
+            //
+            // A provider call that succeeds and is then rolled back by a
+            // later failure leaves the provider voided and the original
+            // still `sent` here. That divergence is self-healing rather
+            // than silent: the provider's own webhook reports the void and
+            // `void_delegated_invoice` applies it (MAPPS-1136), which is
+            // also what makes `AlreadyVoided` the common outcome on a
+            // retry.
+            if let Some((provider, external_id)) = voided_external.as_ref() {
+                match self.invoice_dispatch.as_ref() {
+                    Some(dispatcher) if dispatcher.delegation_enabled() => {
+                        let outcome = dispatcher
+                            .void_in_provider(tenant_id, *provider, external_id)
+                            .await?;
+                        tracing::info!(
+                            provider = %provider.as_str(),
+                            external_invoice_id = %external_id,
+                            already_voided = outcome
+                                == crate::modules::billing::invoice_issuer_dispatch::ProviderVoid::AlreadyVoided,
+                            "voided the replaced invoice in the provider that holds it"
+                        );
+                    }
+                    // The switch is off, or this build has no dispatcher.
+                    // The local void still stands, because the amendment is
+                    // the MSP's decision and refusing it would strand them;
+                    // the divergence is logged by the invoice the operator
+                    // can go and void by hand, which is the honest answer
+                    // when the deployment has said "do not talk to the
+                    // provider".
+                    _ => tracing::warn!(
+                        provider = %provider.as_str(),
+                        external_invoice_id = %external_id,
+                        "replaced an invoice this provider holds while delegated issuing is off; \
+                         its copy stays live until somebody voids it there"
+                    ),
+                }
+            }
             let voided_after: Option<serde_json::Value> = sqlx::query_scalar(
                 "SELECT to_jsonb(t) FROM invoices t WHERE tenant_id = $1 AND id = $2",
             )
@@ -6816,26 +6930,27 @@ impl BillingService {
 
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        let invoice: Option<(Decimal, Decimal, String, Uuid, Option<String>, String)> =
-            sqlx::query_as(
-                "SELECT total, amount_credited, status, company_id, currency, invoice_number \
-                 FROM invoices WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
-            )
-            .bind(request.invoice_id)
-            .bind(tenant_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some((
-            invoice_total,
-            already_credited,
-            invoice_status,
-            company_id,
-            invoice_currency,
-            _invoice_number,
-        )) = invoice
-        else {
+        let invoice: Option<CreditedInvoiceRow> = sqlx::query_as(
+            "SELECT total, amount_credited, status, company_id, currency, \
+             external_provider, external_invoice_id \
+             FROM invoices WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(request.invoice_id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(invoice) = invoice else {
             return Err(AppError::NotFound("Invoice".to_string()));
         };
+        let CreditedInvoiceRow {
+            total: invoice_total,
+            amount_credited: already_credited,
+            status: invoice_status,
+            company_id,
+            currency: invoice_currency,
+            external_provider,
+            external_invoice_id,
+        } = invoice;
 
         // A draft or pending invoice has no correction problem: it can still be
         // edited, and crediting one would leave a document correcting something
@@ -6935,13 +7050,14 @@ impl BillingService {
             r#"
             INSERT INTO credit_note_lines (
                 id, credit_note_id, line_type, description, quantity,
-                unit_price, total, sort_order
+                unit_price, total, sort_order, product_id
             )
             SELECT gen_random_uuid(), $1, t.line_type, t.description, t.quantity,
-                   t.unit_price, t.total, t.sort_order
+                   t.unit_price, t.total, t.sort_order, t.product_id
             FROM UNNEST($2::text[], $3::text[], $4::numeric[], $5::numeric[],
-                        $6::numeric[], $7::int[])
-                 AS t(line_type, description, quantity, unit_price, total, sort_order)
+                        $6::numeric[], $7::int[], $8::uuid[])
+                 AS t(line_type, description, quantity, unit_price, total, sort_order,
+                      product_id)
             "#,
         )
         .bind(credit_note_id)
@@ -6981,10 +7097,129 @@ impl BillingService {
                 .map(|l| l.sort_order)
                 .collect::<Vec<_>>(),
         )
+        .bind(
+            request
+                .lines
+                .iter()
+                .map(|l| l.product_id)
+                .collect::<Vec<_>>(),
+        )
         .execute(&mut *tx)
         .await?;
 
         Self::recompute_invoice_balance(&mut tx, tenant_id, request.invoice_id).await?;
+
+        // PMS-1546: the customer holds the PROVIDER's copy of a delegated
+        // invoice, so the credit has to reach the provider or the two
+        // ledgers disagree by exactly this amount while the customer
+        // keeps being shown the balance this credit just corrected.
+        //
+        // Inside this transaction, like the amendment's void (PMS-1544)
+        // and for the same reason: a credit note whose provider half was
+        // refused is better not written at all, because then the operator
+        // retries instead of reading a local credit the customer's own
+        // copy does not show.
+        if let (Some(provider), Some(external_invoice_id)) =
+            (external_provider.as_deref(), external_invoice_id.as_deref())
+        {
+            match self.invoice_dispatch.as_ref() {
+                Some(dispatcher) if dispatcher.delegation_enabled() => {
+                    let Some(kind) =
+                        crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
+                            provider,
+                        )
+                    else {
+                        return Err(AppError::internal(format!(
+                            "invoice {} is recorded against provider {provider}, which this \
+                             build does not know",
+                            request.invoice_id
+                        )));
+                    };
+                    let lines: Vec<
+                        crate::modules::billing::invoice_issuer_dispatch::CreditNoteLineShape,
+                    > = request
+                        .lines
+                        .iter()
+                        .map(|l| {
+                            crate::modules::billing::invoice_issuer_dispatch::CreditNoteLineShape {
+                                description: l.description.clone(),
+                                quantity: l.quantity,
+                                unit_price: l.unit_price,
+                                product_id: l.product_id,
+                            }
+                        })
+                        .collect();
+                    let push = dispatcher
+                        .issue_credit_note_in_provider(
+                            tenant_id,
+                            kind,
+                            &crate::modules::billing::invoice_issuer_dispatch::CreditNoteShape {
+                                company_id,
+                                external_invoice_id,
+                                issue_date,
+                                currency: &currency,
+                                total,
+                                lines: &lines,
+                            },
+                        )
+                        .await?;
+                    sqlx::query(
+                        "UPDATE credit_notes SET external_provider = $3, \
+                         external_credit_note_id = $4, external_number = $5, \
+                         updated_at = NOW() WHERE id = $1 AND tenant_id = $2",
+                    )
+                    .bind(credit_note_id)
+                    .bind(tenant_id)
+                    .bind(push.reference.provider.as_str())
+                    .bind(&push.reference.external_credit_note_id)
+                    .bind(&push.reference.external_number)
+                    .execute(&mut *tx)
+                    .await?;
+                    match &push.allocation {
+                        crate::modules::billing::invoice_issuer_dispatch::CreditAllocation::Applied(
+                            reference,
+                        ) => tracing::info!(
+                            provider = %provider,
+                            external_credit_note_id = %push.reference.external_credit_note_id,
+                            external_invoice_id = %external_invoice_id,
+                            application = reference.as_deref().unwrap_or("part of the credit note"),
+                            "credited a delegated invoice in the provider that holds it"
+                        ),
+                        // The credit EXISTS over there and is not applied,
+                        // which is a visible account credit for the
+                        // customer rather than a reduced invoice. Not
+                        // fatal, because rolling back here would strand a
+                        // provider document nothing local points at, and
+                        // the usual cause is an invoice already settled on
+                        // their side, where somebody has to decide what
+                        // the credit is for.
+                        crate::modules::billing::invoice_issuer_dispatch::CreditAllocation::Refused(
+                            reason,
+                        ) => tracing::warn!(
+                            provider = %provider,
+                            external_credit_note_id = %push.reference.external_credit_note_id,
+                            external_invoice_id = %external_invoice_id,
+                            reason = %reason,
+                            "the provider holds this credit note but would not apply it to the \
+                             invoice; it stands as an unapplied credit on the customer's account \
+                             there until somebody allocates it"
+                        ),
+                    }
+                }
+                // The switch is off, or this build has no dispatcher. The
+                // local credit still stands, because correcting an invoice
+                // is the MSP's decision and refusing it would strand them;
+                // what the deployment has said is "do not talk to the
+                // provider", and the divergence is logged rather than
+                // hidden.
+                _ => tracing::warn!(
+                    provider = %provider,
+                    external_invoice_id = %external_invoice_id,
+                    "credited an invoice this provider issued while delegated issuing is off; \
+                     its copy still shows the balance this credit corrects"
+                ),
+            }
+        }
 
         // PMS-959: a credit note is issued at creation and never edited
         // (PMS-953), so this is its moment. Voiding one later does not replace
@@ -7058,14 +7293,15 @@ impl BillingService {
     ) -> AppResult<CreditNoteResponse> {
         let mut tx = self.db.begin_with_tenant(tenant_id).await?;
 
-        let row: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT invoice_id, status FROM credit_notes WHERE id = $1 AND tenant_id = $2",
+        let row: Option<(Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT invoice_id, status, external_provider, external_credit_note_id \
+             FROM credit_notes WHERE id = $1 AND tenant_id = $2",
         )
         .bind(credit_note_id)
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((invoice_id, status)) = row else {
+        let Some((invoice_id, status, external_provider, external_credit_note_id)) = row else {
             return Err(AppError::NotFound("Credit note".to_string()));
         };
         if status == "void" {
@@ -7096,6 +7332,54 @@ impl BillingService {
         .await?;
 
         Self::recompute_invoice_balance(&mut tx, tenant_id, invoice_id).await?;
+
+        // PMS-1546: a credit the customer no longer holds has to stop
+        // standing in the provider too, or they keep a credit the MSP has
+        // withdrawn and the invoice stays reduced on the copy they read.
+        //
+        // Inside this transaction, like the credit note's own push and
+        // the amendment's void (PMS-1544): a provider that refuses rolls
+        // the local void back, so the two halves cannot end up saying
+        // different things about whether the credit stands.
+        if let (Some(provider), Some(external_id)) = (
+            external_provider.as_deref(),
+            external_credit_note_id.as_deref(),
+        ) {
+            match self.invoice_dispatch.as_ref() {
+                Some(dispatcher) if dispatcher.delegation_enabled() => {
+                    let Some(kind) =
+                        crate::modules::billing::invoice_issuer::InvoiceProviderKind::parse(
+                            provider,
+                        )
+                    else {
+                        return Err(AppError::internal(format!(
+                            "credit note {credit_note_id} is recorded against provider \
+                             {provider}, which this build does not know"
+                        )));
+                    };
+                    let outcome = dispatcher
+                        .void_credit_note_in_provider(tenant_id, kind, external_id)
+                        .await?;
+                    tracing::info!(
+                        provider = %provider,
+                        external_credit_note_id = %external_id,
+                        already_voided = outcome
+                            == crate::modules::billing::invoice_issuer_dispatch::ProviderVoid::AlreadyVoided,
+                        "voided this credit note in the provider that holds it"
+                    );
+                }
+                // Same answer as the amendment's: the local void stands,
+                // because withdrawing a credit is the MSP's decision, and
+                // the deployment that turned delegation off has said not
+                // to call. The divergence is logged rather than hidden.
+                _ => tracing::warn!(
+                    provider = %provider,
+                    external_credit_note_id = %external_id,
+                    "voided a credit note this provider holds while delegated issuing is off; \
+                     its copy stands until somebody voids it there"
+                ),
+            }
+        }
 
         let after: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT to_jsonb(t) FROM credit_notes t WHERE tenant_id = $1 AND id = $2",
@@ -7147,7 +7431,9 @@ impl BillingService {
                    c.name AS company_name, cn.invoice_id, i.invoice_number,
                    cn.status, cn.issue_date, cn.reason, cn.subtotal,
                    cn.tax_amount, cn.total, cn.currency, cn.notes,
-                   cn.created_by_id, cn.voided_at, cn.created_at, cn.updated_at
+                   cn.created_by_id, cn.voided_at, cn.created_at, cn.updated_at,
+                   cn.external_provider, cn.external_credit_note_id,
+                   cn.external_number
             FROM credit_notes cn
             LEFT JOIN companies c ON c.id = cn.company_id
             LEFT JOIN invoices i ON i.id = cn.invoice_id
@@ -7164,7 +7450,8 @@ impl BillingService {
 
         let lines: Vec<CreditNoteLineRow> = sqlx::query_as(
             r#"
-            SELECT id, line_type, description, quantity, unit_price, total, sort_order
+            SELECT id, line_type, product_id, description, quantity, unit_price,
+                   total, sort_order
             FROM credit_note_lines
             WHERE credit_note_id = $1
             ORDER BY sort_order, id
@@ -7214,7 +7501,9 @@ impl BillingService {
                    c.name AS company_name, cn.invoice_id, i.invoice_number,
                    cn.status, cn.issue_date, cn.reason, cn.subtotal,
                    cn.tax_amount, cn.total, cn.currency, cn.notes,
-                   cn.created_by_id, cn.voided_at, cn.created_at, cn.updated_at
+                   cn.created_by_id, cn.voided_at, cn.created_at, cn.updated_at,
+                   cn.external_provider, cn.external_credit_note_id,
+                   cn.external_number
             FROM credit_notes cn
             LEFT JOIN companies c ON c.id = cn.company_id
             LEFT JOIN invoices i ON i.id = cn.invoice_id
@@ -8604,6 +8893,19 @@ mod pms944_uninvoiceable_time_tests {
 /// PMS-953: one credit-note row, joined to the names a client would otherwise
 /// have to fetch separately.
 #[derive(sqlx::FromRow)]
+struct CreditedInvoiceRow {
+    total: Decimal,
+    amount_credited: Decimal,
+    status: String,
+    company_id: Uuid,
+    currency: Option<String>,
+    /// PMS-1546: set when the provider issued the invoice, which makes
+    /// crediting it a push as well as a local write.
+    external_provider: Option<String>,
+    external_invoice_id: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
 struct CreditNoteRow {
     id: Uuid,
     tenant_id: Uuid,
@@ -8624,6 +8926,9 @@ struct CreditNoteRow {
     voided_at: Option<chrono::DateTime<Utc>>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
+    external_provider: Option<String>,
+    external_credit_note_id: Option<String>,
+    external_number: Option<String>,
 }
 
 impl From<CreditNoteRow> for CreditNoteResponse {
@@ -8652,6 +8957,9 @@ impl From<CreditNoteRow> for CreditNoteResponse {
             created_at: r.created_at,
             updated_at: r.updated_at,
             lines: None,
+            external_provider: r.external_provider,
+            external_credit_note_id: r.external_credit_note_id,
+            external_number: r.external_number,
         }
     }
 }
@@ -8660,6 +8968,7 @@ impl From<CreditNoteRow> for CreditNoteResponse {
 struct CreditNoteLineRow {
     id: Uuid,
     line_type: String,
+    product_id: Option<Uuid>,
     description: String,
     quantity: Decimal,
     unit_price: Decimal,
@@ -8672,6 +8981,7 @@ impl From<CreditNoteLineRow> for CreditNoteLineResponse {
         Self {
             id: r.id,
             line_type: InvoiceLineType::from_str(&r.line_type).unwrap_or(InvoiceLineType::Service),
+            product_id: r.product_id,
             description: r.description,
             quantity: r.quantity,
             unit_price: r.unit_price,

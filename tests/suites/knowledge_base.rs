@@ -1750,3 +1750,76 @@ async fn article_tickets_lists_referencing_tickets_open_first(pool: PgPool) {
         .expect("send cross-tenant list");
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
+
+// ============================================================================
+// PMS-1566: a staff read bumps view_count; a contact-plane read does not
+// ============================================================================
+
+async fn article_view_count(pool: &PgPool, article_id: uuid::Uuid) -> i32 {
+    sqlx::query_scalar("SELECT view_count FROM kb_articles WHERE id = $1")
+        .bind(article_id)
+        .fetch_one(pool)
+        .await
+        .expect("read view_count")
+}
+
+/// A successful staff read increments `view_count` by exactly one per read,
+/// and the bump is not merely incidental to a transaction that could abort
+/// it: a second read from the same still-published article increments
+/// again. The contact-plane read of the same article leaves the counter
+/// untouched (PMS-1566).
+#[mokosh_test]
+async fn get_article_increments_view_count_and_contact_read_does_not(pool: PgPool) {
+    let (author_id, email, password) = common::seed_admin(&pool).await;
+    let company_id = common::seed_company(&pool).await;
+    let article_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO kb_articles (tenant_id, title, slug, content, visibility, status, \
+         author_id, published_at) \
+         VALUES ($1, 'View Count', 'view-count', 'body', 'public', 'published', $2, NOW()) \
+         RETURNING id",
+    )
+    .bind(common::DEFAULT_TENANT_ID)
+    .bind(author_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed article");
+    assert_eq!(article_view_count(&pool, article_id).await, 0);
+
+    let app = common::boot(pool.clone()).await;
+    let token = common::login(&app, &email, &password).await;
+
+    let get_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send get article");
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(article_view_count(&pool, article_id).await, 1);
+
+    // A second staff read bumps it again.
+    let get_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("send second get article");
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(article_view_count(&pool, article_id).await, 2);
+
+    // The contact-plane read of the same article does not bump it.
+    let contact =
+        common::seed_portal_contact(&pool, company_id, "reader@example.com", &["Read-Only"]).await;
+    let contact_token = common::contact_token(&app, &contact).await;
+    let contact_resp = app
+        .client
+        .get(app.url(&format!("/api/v1/kb/articles/{article_id}")))
+        .bearer_auth(&contact_token)
+        .send()
+        .await
+        .expect("send contact get article");
+    assert_eq!(contact_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(article_view_count(&pool, article_id).await, 2);
+}

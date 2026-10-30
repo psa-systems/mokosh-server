@@ -1440,6 +1440,72 @@ impl ContactSyncService {
         self.live_connection(tenant_id, provider).await
     }
 
+    /// How often this connection is polled (PMS-1315).
+    ///
+    /// `contact_sync_connections.sync_interval_minutes` has decided when the
+    /// worker queues a scheduled run since migration 220, and until now
+    /// nothing could write it: every tenant polled at the column's default
+    /// of 60 minutes whatever their address book looked like. PMS-1315 asked
+    /// for a configurable frequency and this is it, on the connection rather
+    /// than on `integrations.poll_interval_minutes`, because the connection
+    /// these providers poll lives here (`ConnectionHome::Elsewhere`) and the
+    /// interval belongs with the thing it paces.
+    ///
+    /// The floor is the schema's own CHECK, restated here so the refusal is
+    /// a field error naming the minimum rather than a constraint violation:
+    /// a one-minute poll against Google or Microsoft is a rate limit waiting
+    /// to happen. The ceiling is a day, because an interval longer than that
+    /// is a way of saying "stop syncing" and the switch (PMS-1358) says it
+    /// properly, leaving the cadence to mean what it says.
+    pub async fn set_schedule(
+        &self,
+        tenant_id: TenantId,
+        provider: &str,
+        sync_interval_minutes: i32,
+        ctx: &AuditCtx,
+    ) -> AppResult<ConnectionStatus> {
+        const MIN_MINUTES: i32 = 5;
+        const MAX_MINUTES: i32 = 1440;
+        if !(MIN_MINUTES..=MAX_MINUTES).contains(&sync_interval_minutes) {
+            return Err(AppError::validation_field(
+                "sync_interval_minutes",
+                format!(
+                    "must be between {MIN_MINUTES} and {MAX_MINUTES} minutes; turn the \
+                     integration off to stop syncing altogether"
+                ),
+            ));
+        }
+        let connection = self.live_connection(tenant_id, provider).await?;
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query(
+            "UPDATE contact_sync_connections SET sync_interval_minutes = $3, \
+             updated_at = NOW() WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(connection.id)
+        .bind(sync_interval_minutes)
+        .execute(&mut *tx)
+        .await?;
+        audit_write(
+            &mut *tx,
+            tenant_id,
+            ctx,
+            AuditAction::Update,
+            "contact_sync_connections",
+            Some(connection.id),
+            Some(serde_json::json!({
+                "sync_interval_minutes": connection.sync_interval_minutes
+            })),
+            Some(serde_json::json!({
+                "event": "contact_sync.schedule_changed",
+                "sync_interval_minutes": sync_interval_minutes,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        self.live_connection(tenant_id, provider).await
+    }
+
     /// Queue an import now. The first one after connecting is `initial`.
     pub async fn queue_run(
         &self,

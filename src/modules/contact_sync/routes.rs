@@ -95,6 +95,7 @@ pub fn contact_sync_routes(service: Arc<ContactSyncService>) -> Router {
             post(disconnect_microsoft),
         )
         .route("/integrations/contact-sync/selection", put(set_selection))
+        .route("/integrations/contact-sync/schedule", put(set_schedule))
         .route("/integrations/contact-sync/preview", post(preview))
         .route(
             "/integrations/contact-sync/runs",
@@ -322,6 +323,35 @@ async fn set_selection(
         state
             .service
             .set_selection(user.tenant(), which.resolve()?, &request.group_ids, &ctx)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleRequest {
+    sync_interval_minutes: i32,
+}
+
+/// How often this connection is polled (PMS-1315). `RequireAdmin` like the
+/// selection it sits beside: how hard an MSP leans on a customer's address
+/// book is the same kind of decision as which labels it reads.
+async fn set_schedule(
+    State(state): State<ContactSyncRouterState>,
+    _admin: RequireAdmin,
+    RequireAuth(user): RequireAuth,
+    Query(which): Query<ProviderQuery>,
+    ctx: AuditCtx,
+    Json(request): Json<ScheduleRequest>,
+) -> AppResult<Json<ConnectionStatus>> {
+    Ok(Json(
+        state
+            .service
+            .set_schedule(
+                user.tenant(),
+                which.resolve()?,
+                request.sync_interval_minutes,
+                &ctx,
+            )
             .await?,
     ))
 }

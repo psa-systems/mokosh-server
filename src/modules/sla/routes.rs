@@ -57,9 +57,9 @@ pub fn sla_routes(service: SlaService) -> Router {
             "/sla/holiday-calendars/{id}",
             put(update_holiday_calendar).delete(delete_holiday_calendar),
         )
-        // PMS-112 evaluator (manual trigger; ticket service calls
-        // SlaService::evaluate_for_ticket on create/status change in a
-        // follow-up wire-up commit)
+        // PMS-112 evaluator (manual trigger; PMS-1564 wires the ticket
+        // service to call SlaService::evaluate_for_ticket on create and
+        // on status change)
         .route("/sla/tickets/{id}/evaluate", post(evaluate_for_ticket))
         .with_state(state)
 }

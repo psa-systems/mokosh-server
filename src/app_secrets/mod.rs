@@ -45,11 +45,13 @@ use crate::db::Database;
 use crate::utils::deployment::{provider, EnablementSource};
 use crate::utils::error::{AppError, AppResult};
 
+pub mod bunyip;
 pub mod database;
 pub mod env;
 pub mod file;
 pub mod infisical;
 
+pub use bunyip::{BunyipProvider, BunyipSecretsConfig};
 pub use database::DatabaseProvider;
 pub use env::EnvironmentProvider;
 pub use file::FileProvider;
@@ -317,16 +319,22 @@ pub enum AppSecretProviderKind {
     Database,
     /// Infisical, via the same client `crate::secrets::infisical` uses.
     Infisical,
+    /// bunyip's host-secrets route (PMS-1537). Read-only, and it serves only
+    /// the secrets bunyip holds on the suite's behalf, so it is declared per
+    /// secret rather than for the whole process: see
+    /// [`AppSecrets::declared_for`].
+    Bunyip,
 }
 
 impl AppSecretProviderKind {
     /// Every provider, in a stable order used everywhere a status report or
     /// membership vector wants to be reproducible.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Environment,
         Self::File,
         Self::Database,
         Self::Infisical,
+        Self::Bunyip,
     ];
 
     /// The wire/env spelling. Matches `crate::utils::deployment::provider`
@@ -340,11 +348,12 @@ impl AppSecretProviderKind {
             Self::File => "file",
             Self::Database => provider::DATABASE,
             Self::Infisical => provider::INFISICAL,
+            Self::Bunyip => provider::BUNYIP,
         }
     }
 
     /// Legal names, for the operator-facing error on an unrecognised value.
-    pub const LEGAL_VALUES: &'static str = "environment, file, database, infisical";
+    pub const LEGAL_VALUES: &'static str = "environment, file, database, infisical, bunyip";
 
     /// A provider NAME to a kind. Blank is not a name: the caller resolves an
     /// unset `APP_SECRET_BACKEND` against the hosting profile's default before it
@@ -361,11 +370,35 @@ impl AppSecretProviderKind {
             "file" => Ok(Self::File),
             provider::DATABASE => Ok(Self::Database),
             provider::INFISICAL => Ok(Self::Infisical),
+            provider::BUNYIP => Ok(Self::Bunyip),
             other => Err(AppError::Configuration(format!(
                 "APP_SECRET_BACKEND {other:?} is not a known application-tier secret provider; \
                  expected one of: {}",
                 Self::LEGAL_VALUES
             ))),
+        }
+    }
+
+    /// The variables a provider is BUILT from, named in the refusal when a
+    /// declared provider could not be built (PMS-1537).
+    ///
+    /// An operator reading "the bunyip provider could not be built" has to go
+    /// and find out which inputs that means; an operator reading the variable
+    /// names can act. The environment and database providers are always built,
+    /// so their text says so rather than inventing an input.
+    pub fn construction_inputs(self) -> &'static str {
+        match self {
+            Self::Environment => "nothing: the environment provider is always built",
+            Self::File => "APP_SECRETS_DIR",
+            Self::Database => "nothing: the database provider is built from the open pool",
+            Self::Infisical => {
+                "INFISICAL_ADDRESS, INFISICAL_PROJECT_ID, INFISICAL_CLIENT_ID and \
+                 INFISICAL_CLIENT_SECRET"
+            }
+            Self::Bunyip => {
+                "BUNYIP_SECRETS_URL, BUNYIP_SECRETS_CLIENT_ID and BUNYIP_SECRETS_CLIENT_SECRET \
+                 (either all three or none)"
+            }
         }
     }
 
@@ -378,6 +411,7 @@ impl AppSecretProviderKind {
             Self::File => 1,
             Self::Database => 2,
             Self::Infisical => 3,
+            Self::Bunyip => 4,
         }
     }
 }
@@ -453,6 +487,21 @@ impl AppSecretsSelection {
 /// remains the enumeration order for reporting.
 pub struct AppSecrets {
     declared: AppSecretProviderKind,
+    /// PMS-1537: the secrets whose provider is NOT the process's declared one,
+    /// with the provider that serves each.
+    ///
+    /// A per-secret declaration rather than a precedence chain, which is the
+    /// distinction that keeps `docs/providers.md` true: every secret still has
+    /// exactly ONE provider and no read falls back to a second. What the
+    /// deployment gained is the ability to say that one secret lives somewhere
+    /// else, which is what bunyip serving the suite's Google client needs
+    /// (BUNYIP-983): the pair lives in bunyip, and `SMTP_PASSWORD` has no
+    /// business moving there with it.
+    ///
+    /// A `Vec` of pairs rather than a map: there are eleven governed secrets
+    /// and at most a couple of overrides, so a linear scan is cheaper than a
+    /// hash and the order stays the deployment table's.
+    per_secret: Vec<(GovernedSecret, AppSecretProviderKind)>,
     providers: Vec<Option<Arc<dyn AppSecretProvider>>>,
 }
 
@@ -461,11 +510,22 @@ impl AppSecrets {
     /// declared provider holds none. This is the read path every feature
     /// uses; the survey/enforce path walks every provider separately.
     pub fn get(&self, secret: GovernedSecret) -> Option<String> {
-        self.provider(self.declared)
+        self.provider(self.declared_for(secret))
             .and_then(|provider| provider.get(secret))
     }
 
-    /// The declared provider for this process.
+    /// The provider that serves ONE secret: its own declaration when the
+    /// deployment gave it one, else the process's (PMS-1537).
+    pub fn declared_for(&self, secret: GovernedSecret) -> AppSecretProviderKind {
+        self.per_secret
+            .iter()
+            .find(|(declared_for, _)| *declared_for == secret)
+            .map(|(_, kind)| *kind)
+            .unwrap_or(self.declared)
+    }
+
+    /// The declared provider for this process: the one that serves every
+    /// secret without a declaration of its own.
     pub fn declared(&self) -> AppSecretProviderKind {
         self.declared
     }
@@ -500,8 +560,35 @@ impl AppSecrets {
         providers[declared.index()] = Some(provider);
         Self {
             declared,
+            per_secret: Vec::new(),
             providers,
         }
+    }
+
+    /// Declare one secret to a provider other than the process's (PMS-1537),
+    /// as a hosting profile's table does at boot.
+    ///
+    /// `pub` for [`Self::with_provider`]'s reason: an integration test links
+    /// the library compiled WITHOUT `cfg(test)`, so a test-only builder is
+    /// invisible exactly where the deployment claim is made. The serving path
+    /// does not use it; `init_from_env` assembles the declarations from the
+    /// profile.
+    pub fn declaring(mut self, secret: GovernedSecret, kind: AppSecretProviderKind) -> Self {
+        self.per_secret
+            .retain(|(declared_for, _)| *declared_for != secret);
+        self.per_secret.push((secret, kind));
+        self
+    }
+
+    /// Install one more built provider on an existing handle, so a test can
+    /// hold two and prove which one a declaration reaches.
+    pub fn with_additional_provider(
+        mut self,
+        kind: AppSecretProviderKind,
+        provider: Arc<dyn AppSecretProvider>,
+    ) -> Self {
+        self.providers[kind.index()] = Some(provider);
+        self
     }
 
     /// A handle whose declared provider could not be BUILT.
@@ -522,6 +609,7 @@ impl AppSecrets {
     pub fn without_provider(declared: AppSecretProviderKind) -> Self {
         Self {
             declared,
+            per_secret: Vec::new(),
             providers: vec![None; AppSecretProviderKind::ALL.len()],
         }
     }
@@ -535,6 +623,13 @@ pub struct AppSecretSurveyRow {
     /// Every built provider that holds this secret, in
     /// [`AppSecretProviderKind::ALL`] order.
     pub holders: Vec<AppSecretProviderKind>,
+    /// PMS-1537: the provider declared for THIS secret, which is the
+    /// process's unless the deployment gave this one its own.
+    pub declared: AppSecretProviderKind,
+    /// Whether that provider was built at all. A provider that could not be
+    /// constructed has not been asked, and reporting it as holding nothing is
+    /// how an unreachable bunyip becomes "the feature is off".
+    pub declared_built: bool,
 }
 
 impl AppSecretSurveyRow {
@@ -567,7 +662,13 @@ impl AppSecretsSurvey {
                             .is_some_and(|provider| provider.has(secret))
                     })
                     .collect();
-                AppSecretSurveyRow { secret, holders }
+                let declared = secrets.declared_for(secret);
+                AppSecretSurveyRow {
+                    secret,
+                    holders,
+                    declared,
+                    declared_built: secrets.provider(declared).is_some(),
+                }
             })
             .collect();
         Self {
@@ -595,6 +696,13 @@ pub enum Classification {
     /// precedence this model removes, and ignoring the other copy would
     /// disable a feature the operator plainly configured.
     Misplaced(Vec<AppSecretProviderKind>),
+    /// PMS-1537: the declared provider could not be BUILT, so it was never
+    /// asked. Fatal, and a different fact from `Missing`: a provider that
+    /// answers "no value" has been consulted, while one whose construction
+    /// failed has not, and reporting the second as the first is how an
+    /// unreachable bunyip becomes "the feature is off". Boot refuses instead,
+    /// naming the provider, because the deployment declared it.
+    Unavailable,
 }
 
 /// The pure enforcement decision: which provider was declared, which
@@ -603,6 +711,21 @@ pub fn classify(
     declared: AppSecretProviderKind,
     holders: &[AppSecretProviderKind],
 ) -> Classification {
+    classify_built(declared, holders, true)
+}
+
+/// [`classify`] plus whether the declared provider was built at all
+/// (PMS-1537). The three-argument form is what the boot path uses; the
+/// two-argument one assumes a built provider, which is what every caller
+/// before this had.
+pub fn classify_built(
+    declared: AppSecretProviderKind,
+    holders: &[AppSecretProviderKind],
+    declared_built: bool,
+) -> Classification {
+    if !declared_built {
+        return Classification::Unavailable;
+    }
     let elsewhere: Vec<AppSecretProviderKind> = holders
         .iter()
         .copied()
@@ -627,19 +750,22 @@ pub fn classify(
 pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
     let mut fatal: Vec<String> = Vec::new();
     for row in &survey.rows {
-        match classify(survey.declared, &row.holders) {
+        // PMS-1537: the declaration that applies to THIS secret, which is the
+        // process's unless the deployment gave this one its own.
+        let declared = row.declared;
+        match classify_built(declared, &row.holders, row.declared_built) {
             Classification::Used => {
                 tracing::info!(
                     secret = row.secret.name(),
-                    provider = survey.declared.as_str(),
+                    provider = declared.as_str(),
                     "app-tier secret served by {}",
-                    survey.declared.as_str()
+                    declared.as_str()
                 );
             }
             Classification::Missing => {
                 tracing::warn!(
                     secret = row.secret.name(),
-                    provider = survey.declared.as_str(),
+                    provider = declared.as_str(),
                     "no provider holds {}; {}",
                     row.secret.name(),
                     row.secret.feature(),
@@ -648,19 +774,22 @@ pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
             Classification::Shadowed(elsewhere) => {
                 tracing::info!(
                     secret = row.secret.name(),
-                    provider = survey.declared.as_str(),
+                    provider = declared.as_str(),
                     "app-tier secret served by {}",
-                    survey.declared.as_str()
+                    declared.as_str()
                 );
                 for other in elsewhere {
                     tracing::warn!(
                         secret = row.secret.name(),
-                        declared = survey.declared.as_str(),
+                        declared = declared.as_str(),
                         duplicate = other.as_str(),
-                        "{} is also held by {}; run secrets-migrate --to {} then secrets-purge to remove it",
+                        "{} is also held by {}; run `provider-migrate --from {} --to {}` then \
+                         `provider-purge --provider {} --confirm` to remove it",
                         row.secret.name(),
                         other.as_str(),
-                        survey.declared.as_str(),
+                        other.as_str(),
+                        declared.as_str(),
+                        other.as_str(),
                     );
                 }
             }
@@ -668,12 +797,22 @@ pub fn enforce(survey: &AppSecretsSurvey) -> AppResult<()> {
                 fatal.push(format!(
                     "{} is absent from the declared {} provider but present in the {}. \
                      mokosh will not silently use a provider the deployment did not \
-                     declare. Copy it with `mokosh-server secrets-migrate --to {}`, \
-                     or set APP_SECRET_BACKEND to the provider that holds it.",
+                     declare. Copy it with `mokosh-server provider-migrate --from <provider> \
+                     --to {}`, naming one of the providers above as <provider>, or set \
+                     APP_SECRET_BACKEND to the provider that holds it.",
                     row.secret.name(),
-                    survey.declared.as_str(),
+                    declared.as_str(),
                     provider_list(&elsewhere),
-                    survey.declared.as_str(),
+                    declared.as_str(),
+                ));
+            }
+            Classification::Unavailable => {
+                fatal.push(format!(
+                    "{} is declared to the {} provider, which this process could not build, so \
+                     nothing was asked for the value. That provider is built from: {}.",
+                    row.secret.name(),
+                    declared.as_str(),
+                    declared.construction_inputs(),
                 ));
             }
         }
@@ -709,6 +848,10 @@ pub struct AppSecretStatus {
     /// Every provider that holds the secret, in
     /// [`AppSecretProviderKind::ALL`] order.
     pub holders: Vec<&'static str>,
+    /// PMS-1537: the provider declared for this secret, which differs from the
+    /// report's process-wide `declared` when the deployment gave this one its
+    /// own.
+    pub declared: &'static str,
     /// The provider that would serve the secret, or `None` if the declared
     /// provider does not hold it (`Missing` / `Misplaced`).
     pub served_by: Option<&'static str>,
@@ -744,9 +887,9 @@ pub fn status(survey: &AppSecretsSurvey) -> AppSecretsStatus {
         .map(|row| AppSecretStatus {
             secret: row.secret.name(),
             holders: row.holders.iter().map(|kind| kind.as_str()).collect(),
-            served_by: row
-                .present_in(survey.declared)
-                .then(|| survey.declared.as_str()),
+            declared: row.declared.as_str(),
+            served_by: (row.declared_built && row.present_in(row.declared))
+                .then(|| row.declared.as_str()),
         })
         .collect();
     AppSecretsStatus {
@@ -768,6 +911,24 @@ pub fn current() -> Option<Arc<AppSecrets>> {
     CURRENT.get().cloned()
 }
 
+/// Resolve a hosting profile's per-secret declarations into the pairs
+/// [`init_from_env`] takes (PMS-1537).
+///
+/// The profile names secrets and providers as strings, because
+/// `crate::utils::deployment` must not depend on this registry. This is where
+/// those names become values, and an unknown secret name is a boot error
+/// rather than a silently skipped row: a typo in that table would otherwise
+/// leave a secret reading from the process provider while the deployment
+/// believed it came from somewhere else.
+pub fn per_secret_defaults(
+    declarations: &[crate::utils::deployment::SecretProviderDefault],
+) -> AppResult<Vec<(GovernedSecret, &'static str)>> {
+    declarations
+        .iter()
+        .map(|row| GovernedSecret::parse_name(row.secret).map(|secret| (secret, row.provider)))
+        .collect()
+}
+
 /// Build every application-tier secret provider whose construction inputs
 /// are present, choose the declared one from `APP_SECRET_BACKEND`, enforce the
 /// four-way classification, and install the result as the process-wide
@@ -778,15 +939,25 @@ pub fn current() -> Option<Arc<AppSecrets>> {
 /// startup wiring and passed in as a NAME. This module deliberately never
 /// holds the deployment shape, for the reason PMS-904 states.
 ///
-/// Async because the database and Infisical providers load their contents
-/// once at construction and serve from that cache afterwards; the
+/// `per_secret_defaults` is the hosting profile's per-secret declarations
+/// (PMS-1537), as `(GovernedSecret, provider name)` pairs, resolved by the
+/// startup wiring and passed in for the same reason `profile_default` is: this
+/// module never holds the deployment shape.
+///
+/// Async because the database, Infisical and bunyip providers load their
+/// contents once at construction and serve from that cache afterwards; the
 /// alternative (`block_on` on the current runtime) deadlocks.
 pub async fn init_from_env(
     profile_default: &str,
+    per_secret_defaults: &[(GovernedSecret, &str)],
     db: Database,
     encryption_key: [u8; 32],
 ) -> AppResult<AppSecretsSelection> {
     let selection = AppSecretsSelection::from_env(profile_default)?;
+    let mut per_secret: Vec<(GovernedSecret, AppSecretProviderKind)> = Vec::new();
+    for (secret, name) in per_secret_defaults {
+        per_secret.push((*secret, AppSecretProviderKind::parse_name(name)?));
+    }
 
     let mut providers: Vec<Option<Arc<dyn AppSecretProvider>>> =
         vec![None; AppSecretProviderKind::ALL.len()];
@@ -824,8 +995,18 @@ pub async fn init_from_env(
             Some(Arc::new(InfisicalProvider::load().await?));
     }
 
+    // bunyip is built when the deployment named one to read from
+    // (`BUNYIP_SECRETS_URL`). A deployment that declares a secret to bunyip
+    // and sets no URL gets the `Unavailable` refusal rather than a quiet
+    // "nobody holds it", which is the whole reason that case exists.
+    if let Some(config) = BunyipSecretsConfig::from_env()? {
+        providers[AppSecretProviderKind::Bunyip.index()] =
+            Some(Arc::new(BunyipProvider::load(&config).await?));
+    }
+
     let secrets = AppSecrets {
         declared: selection.provider,
+        per_secret,
         providers,
     };
     let survey = AppSecretsSurvey::from_current(&secrets);
@@ -918,6 +1099,7 @@ mod tests {
         }
         AppSecrets {
             declared,
+            per_secret: Vec::new(),
             providers,
         }
     }
@@ -938,8 +1120,110 @@ mod tests {
             rows: vec![AppSecretSurveyRow {
                 secret: GovernedSecret::SmtpPassword,
                 holders: ordered,
+                declared,
+                declared_built: true,
             }],
         }
+    }
+
+    /// PMS-1537: a secret declared to another provider reads from THAT one,
+    /// and every other secret still reads from the process's.
+    ///
+    /// The case worth pinning is the one with a value in both: a reader that
+    /// took the process provider's copy would serve a Google client the
+    /// deployment stopped maintaining the moment bunyip became its home.
+    #[test]
+    fn a_per_secret_declaration_decides_which_provider_answers() {
+        let secrets = AppSecrets::with_provider(Db, arc("database", Some("from-database")))
+            .with_additional_provider(
+                AppSecretProviderKind::Bunyip,
+                arc("bunyip", Some("from-bunyip")),
+            )
+            .declaring(
+                GovernedSecret::GoogleContactsClientId,
+                AppSecretProviderKind::Bunyip,
+            );
+
+        assert_eq!(
+            secrets
+                .get(GovernedSecret::GoogleContactsClientId)
+                .as_deref(),
+            Some("from-bunyip"),
+            "the declaration wins over the process provider's copy"
+        );
+        assert_eq!(
+            secrets.get(GovernedSecret::SmtpPassword).as_deref(),
+            Some("from-database"),
+            "and nothing else moved with it"
+        );
+        assert_eq!(
+            secrets.declared_for(GovernedSecret::GoogleContactsClientId),
+            AppSecretProviderKind::Bunyip
+        );
+        assert_eq!(
+            secrets.declared_for(GovernedSecret::SmtpPassword),
+            Db,
+            "the process's declaration still covers every undeclared secret"
+        );
+    }
+
+    /// A declared provider that could not be built is fatal, and is NOT the
+    /// same answer as "nobody holds it".
+    ///
+    /// Without this, a bunyip that is unreachable at boot reads as an absent
+    /// Google client: every tenant's contact sync stops with a warning in a
+    /// log nobody is watching, which is exactly the silent degrade the
+    /// four-way classification exists to remove.
+    #[test]
+    fn a_declared_provider_that_did_not_build_is_fatal_not_missing() {
+        assert_eq!(
+            classify_built(AppSecretProviderKind::Bunyip, &[], false),
+            Classification::Unavailable
+        );
+        assert_eq!(
+            classify_built(AppSecretProviderKind::Bunyip, &[], true),
+            Classification::Missing,
+            "a provider that WAS asked and holds nothing is the other case"
+        );
+
+        let survey = AppSecretsSurvey {
+            declared: Db,
+            rows: vec![AppSecretSurveyRow {
+                secret: GovernedSecret::GoogleContactsClientId,
+                holders: vec![Db],
+                declared: AppSecretProviderKind::Bunyip,
+                declared_built: false,
+            }],
+        };
+        let error = enforce(&survey).expect_err("an unbuilt declared provider refuses boot");
+        let message = error.to_string();
+        assert!(message.contains("GOOGLE_CONTACTS_CLIENT_ID"), "{message}");
+        assert!(message.contains("bunyip"), "{message}");
+        assert!(
+            message.contains("could not build"),
+            "the message says what happened rather than what was missing: {message}"
+        );
+        assert!(
+            message.contains("BUNYIP_SECRETS_URL"),
+            "and names the inputs an operator has to set: {message}"
+        );
+    }
+
+    /// The profile's table is strings, so a typo in a secret name is a boot
+    /// error here rather than a secret quietly reading from the process
+    /// provider while the deployment believes otherwise.
+    #[test]
+    fn an_unknown_secret_name_in_the_profile_table_refuses_boot() {
+        use crate::utils::deployment::SecretProviderDefault;
+        let error = per_secret_defaults(&[SecretProviderDefault {
+            secret: "GOOGLE_CONTACTS_CLIENT_IDD",
+            provider: provider::BUNYIP,
+        }])
+        .expect_err("a typo is refused");
+        assert!(
+            error.to_string().contains("GOOGLE_CONTACTS_CLIENT_ID"),
+            "and the message lists the legal names: {error}"
+        );
     }
 
     /// Row 1 of the classification table: present in the declared provider, nowhere else.
@@ -993,7 +1277,7 @@ mod tests {
         assert!(message.contains("infisical"), "{message}");
         assert!(message.contains("database"), "{message}");
         assert!(
-            message.contains("secrets-migrate --to infisical"),
+            message.contains("provider-migrate --from <provider> --to infisical"),
             "{message}"
         );
     }

@@ -48,6 +48,20 @@ pub struct VendorMapping {
     pub external_vendor_id: String,
 }
 
+/// One row of `invoice_issuer_user_mappings`: a member of the tenant maps
+/// to the contact the provider knows them as (PMS-1541).
+///
+/// A reimbursement names the person who was paid back, and Xero refuses a
+/// bank transaction with no `Contact` at all.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct UserMapping {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub provider: String,
+    pub user_id: Uuid,
+    pub external_contact_id: String,
+}
+
 /// One row of `invoice_issuer_expense_account_mappings`: a Mokosh
 /// expense category maps to the ledger account a delegated bill line
 /// posts to (MAPPS-1155).
@@ -296,6 +310,112 @@ impl InvoiceIssuerMappingService {
         .bind(provider.as_str())
         .bind(category_id)
         .bind(external_account_id.trim())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// The provider account a reimbursement is paid from (PMS-1541).
+    ///
+    /// Read from the `integrations` row rather than a mapping table,
+    /// because one value per tenant per provider is what it is; it lives
+    /// here rather than on `IntegrationResponse` so the dispatcher reads
+    /// every provider-side id through one seam, and so a widely used
+    /// response type does not grow a field only this path wants.
+    pub async fn get_payment_account(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+    ) -> AppResult<Option<String>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let value: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT external_payment_account_id FROM integrations \
+             WHERE tenant_id = $1 AND provider = $2",
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        // Two layers of absence collapse to one on purpose: no integration
+        // row and a row with no account set are the same answer to "can
+        // this tenant be reimbursed through the provider", and the
+        // dispatcher's refusal names the same route either way.
+        Ok(value.flatten().filter(|v| !v.trim().is_empty()))
+    }
+
+    /// Resolve the provider contact for one member of the tenant
+    /// (PMS-1541).
+    ///
+    /// One per reimbursement rather than a batch: a claim names one
+    /// submitter, where a bill names one vendor and many categories.
+    pub async fn get_user_mapping(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        user_id: Uuid,
+    ) -> AppResult<Option<UserMapping>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: Option<UserMapping> = sqlx::query_as(
+            r#"SELECT id, tenant_id, provider, user_id, external_contact_id
+               FROM invoice_issuer_user_mappings
+               WHERE tenant_id = $1 AND provider = $2 AND user_id = $3"#,
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Every people mapping this tenant holds, for the admin surface that
+    /// lists members beside who they are over there.
+    pub async fn list_user_mappings(&self, tenant_id: TenantId) -> AppResult<Vec<UserMapping>> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let rows: Vec<UserMapping> = sqlx::query_as(
+            r#"SELECT id, tenant_id, provider, user_id, external_contact_id
+               FROM invoice_issuer_user_mappings
+               WHERE tenant_id = $1
+               ORDER BY provider, user_id"#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    /// Set (or replace) the people mapping for a `(tenant, provider,
+    /// user)` triple.
+    pub async fn upsert_user_mapping(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        user_id: Uuid,
+        external_contact_id: &str,
+    ) -> AppResult<UserMapping> {
+        if external_contact_id.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "external_contact_id cannot be blank".to_string(),
+            ));
+        }
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        let row: UserMapping = sqlx::query_as(
+            r#"INSERT INTO invoice_issuer_user_mappings
+                 (tenant_id, provider, user_id, external_contact_id)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (tenant_id, provider, user_id) DO UPDATE
+                 SET external_contact_id = EXCLUDED.external_contact_id,
+                     updated_at = NOW()
+               RETURNING id, tenant_id, provider, user_id, external_contact_id"#,
+        )
+        .bind(tenant_id)
+        .bind(provider.as_str())
+        .bind(user_id)
+        .bind(external_contact_id.trim())
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;

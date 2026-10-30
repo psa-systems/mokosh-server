@@ -229,7 +229,8 @@ async fn init_application_secrets(
     let profile = DeploymentMode::from_env_for_providers()
         .map_err(|e| AppError::Configuration(e.to_string()))?;
     let default = profile.default_provider_for(ProviderKind::Secrets)?;
-    crate::app_secrets::init_from_env(default, db.clone(), encryption_key).await?;
+    let per_secret = crate::app_secrets::per_secret_defaults(profile.default_secret_providers())?;
+    crate::app_secrets::init_from_env(default, &per_secret, db.clone(), encryption_key).await?;
     Ok(())
 }
 

@@ -64,6 +64,10 @@ pub fn kb_routes(service: KbService) -> Router {
         // returns the recomputed tallies plus the caller's resulting
         // `my_vote`. GET reads the caller's current vote + counts without
         // mutating, so the detail page can render the active thumb on load.
+        // Templated render: dual-plane like `GET /kb/articles/{id}`.
+        // Staff reads a staff article, a contact holding `kb:read`
+        // reads a published portal-visible article.
+        .route("/kb/articles/{id}/render", post(render_article))
         .route("/kb/articles/{id}/helpful", post(mark_helpful))
         .route("/kb/articles/{id}/not_helpful", post(mark_not_helpful))
         .route("/kb/articles/{id}/vote", get(get_article_vote))
@@ -283,6 +287,36 @@ async fn get_article(
             Json(ContactKbArticleResponse::from(article)).into_response()
         }
     })
+}
+
+/// Render an article's Markdown against the caller's values map.
+/// Dual-plane: a staff caller renders a staff article, a contact
+/// holding `kb:read` renders a published portal-visible article. Same
+/// visibility rules as the corresponding GET.
+async fn render_article(
+    State(s): State<KbRouterState>,
+    RequireCallerContext(caller): RequireCallerContext,
+    axum::extract::Extension(db): axum::extract::Extension<Database>,
+    axum::extract::Extension(settings): axum::extract::Extension<Arc<SettingsService>>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<RenderKbArticleRequest>>,
+) -> AppResult<Json<RenderKbArticleResponse>> {
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    req.validate()?;
+    let tenant = caller.tenant();
+    let rendered = match &caller {
+        CallerContext::Staff(auth) => {
+            assert_staff_kb_enabled(auth, &settings).await?;
+            s.service.render_article(tenant, id, &req.values).await?
+        }
+        CallerContext::Contact(session) => {
+            caller.require_capability(caps::KB_READ, &db).await?;
+            s.service
+                .render_portal_article(tenant, session.company_id, id, &req.values)
+                .await?
+        }
+    };
+    Ok(Json(rendered))
 }
 
 async fn update_article(

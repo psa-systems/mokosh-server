@@ -638,8 +638,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every deployment first, and the migrate CLI (PMS-1012) is the
     // path there. Landing the boot survey now catches a botched
     // migration between the two ends.
+    // PMS-1537: the profile's per-secret declarations travel with the
+    // process-wide one. On `saas` that is the Google client pair, which bunyip
+    // serves for the whole suite.
+    let per_secret = mokosh_server::app_secrets::per_secret_defaults(
+        hosting_profile.default_secret_providers(),
+    )?;
     mokosh_server::app_secrets::init_from_env(
         hosting_profile.default_provider_for(ProviderKind::Secrets)?,
+        &per_secret,
         db.clone(),
         encryption_key,
     )

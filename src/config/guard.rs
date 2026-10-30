@@ -84,6 +84,13 @@ pub const ENTRY_POINTS: &[EntryPoint] = &[
                  same reason SECRET_BACKEND does",
     },
     EntryPoint {
+        path: "src/app_secrets/bunyip.rs",
+        reason: "the bunyip URL and machine credential the app-tier bunyip provider is BUILT \
+                 from (PMS-1537): a provider cannot be constructed out of a value served by \
+                 the thing being constructed, and the credential honours the {NAME}_FILE \
+                 convention the environment provider insists on",
+    },
+    EntryPoint {
         path: "src/secrets/infisical.rs",
         reason: "the Infisical machine identity and address a secret provider is BUILT from; a \
                  provider cannot be constructed out of values served by itself",

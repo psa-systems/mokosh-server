@@ -34,7 +34,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::modules::billing::invoice_issuer::{
-    ExternalBillRef, ExternalInvoiceRef, InvoiceProviderKind,
+    decimal_string_to_minor, ExternalBillRef, ExternalCreditNoteRef, ExternalExpenseRef,
+    ExternalInvoiceRef, ExternalSettlement, InvoiceProviderKind,
 };
 use crate::utils::error::{AppError, AppResult};
 
@@ -175,6 +176,72 @@ struct QuickBooksInvoiceDto {
     private_note: Option<String>,
 }
 
+/// `GET /bill/{id}` read for its amounts (PMS-1543).
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillSettlementEnvelope {
+    #[serde(rename = "Bill")]
+    bill: QuickBooksBillSettlementDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillSettlementDto {
+    #[serde(rename = "TotalAmt", default)]
+    total_amt: Option<f64>,
+    #[serde(rename = "Balance", default)]
+    balance: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct QuickBooksCheckPayment {
+    #[serde(rename = "BankAccountRef")]
+    bank_account_ref: QuickBooksRef,
+}
+
+#[derive(Debug, Serialize)]
+struct QuickBooksLinkedTxn {
+    #[serde(rename = "TxnId")]
+    txn_id: String,
+    #[serde(rename = "TxnType")]
+    txn_type: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct QuickBooksBillPaymentLine {
+    #[serde(rename = "Amount")]
+    amount: String,
+    #[serde(rename = "LinkedTxn")]
+    linked_txn: Vec<QuickBooksLinkedTxn>,
+}
+
+/// A bill payment: its own document, linked to the bill it settles.
+#[derive(Debug, Serialize)]
+struct QuickBooksBillPaymentBody {
+    #[serde(rename = "VendorRef")]
+    vendor_ref: QuickBooksRef,
+    #[serde(rename = "TotalAmt")]
+    total_amt: String,
+    #[serde(rename = "PayType")]
+    pay_type: &'static str,
+    #[serde(rename = "CheckPayment")]
+    check_payment: QuickBooksCheckPayment,
+    #[serde(rename = "TxnDate")]
+    txn_date: NaiveDate,
+    #[serde(rename = "Line")]
+    line: Vec<QuickBooksBillPaymentLine>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillPaymentEnvelope {
+    #[serde(rename = "BillPayment")]
+    bill_payment: QuickBooksBillPaymentDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksBillPaymentDto {
+    #[serde(rename = "Id")]
+    id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct QuickBooksCreateInvoiceBody {
     #[serde(rename = "CustomerRef")]
@@ -196,6 +263,43 @@ struct QuickBooksCreateInvoiceBody {
 /// `AccountBasedExpenseLineDetail` against an expense account, where an
 /// invoice line is a `SalesItemLineDetail` against an item. Reusing the
 /// invoice body would send a sales line to the payables side.
+/// A purchase: money the MSP spent, from a named account (PMS-1541).
+///
+/// `AccountRef` at the top level is WHERE the money came from (a bank or
+/// credit-card account) and `AccountRef` inside each line's detail is WHAT
+/// it was spent on. QuickBooks refuses the call without the first and
+/// without a `PaymentType`.
+#[derive(Debug, Serialize)]
+struct QuickBooksPurchaseBody {
+    #[serde(rename = "AccountRef")]
+    account_ref: QuickBooksRef,
+    #[serde(rename = "PaymentType")]
+    payment_type: &'static str,
+    #[serde(rename = "Line")]
+    line: Vec<QuickBooksBillLineBody>,
+    #[serde(rename = "TxnDate")]
+    txn_date: NaiveDate,
+    #[serde(rename = "CurrencyRef")]
+    currency_ref: QuickBooksRef,
+    /// Who was reimbursed. Optional in QuickBooks, sent when the tenant
+    /// has mapped the person, because a spend with no counterparty tells
+    /// the MSP's books less than one with a name.
+    #[serde(rename = "EntityRef", skip_serializing_if = "Option::is_none")]
+    entity_ref: Option<QuickBooksRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksPurchaseEnvelope {
+    #[serde(rename = "Purchase")]
+    purchase: QuickBooksPurchaseDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksPurchaseDto {
+    #[serde(rename = "Id")]
+    id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct QuickBooksCreateBillBody {
     #[serde(rename = "VendorRef")]
@@ -244,6 +348,35 @@ struct QuickBooksBillDto {
     id: String,
 }
 
+/// What a credit memo push needs from the caller (PMS-1546).
+///
+/// No due date, which is the shape difference from an invoice: a credit
+/// memo is money owed back and nothing falls due on it. The lines carry
+/// the same item mappings the invoice path resolves, because QuickBooks
+/// requires an `ItemRef` on a sales line whichever document it is on.
+#[derive(Debug, Clone)]
+pub struct QuickBooksIssueCreditMemoRequest {
+    pub customer_id: String,
+    pub issue_date: NaiveDate,
+    pub currency: String,
+    pub lines: Vec<QuickBooksLineItemInput>,
+}
+
+/// What applying a credit memo to an invoice needs (PMS-1546).
+///
+/// QuickBooks has no allocation endpoint: a credit memo is applied by a
+/// zero-total `Payment` that links both documents, which is the same
+/// record the "Receive payment" screen writes when a human applies a
+/// credit by hand.
+#[derive(Debug, Clone)]
+pub struct QuickBooksApplyCreditRequest {
+    pub customer_id: String,
+    pub invoice_id: String,
+    pub credit_memo_id: String,
+    pub amount_minor: i64,
+    pub applied_on: NaiveDate,
+}
+
 /// What a bill push needs from the caller (MAPPS-1155).
 #[derive(Debug, Clone)]
 pub struct QuickBooksCreateBillRequest {
@@ -252,6 +385,33 @@ pub struct QuickBooksCreateBillRequest {
     pub due_date: NaiveDate,
     pub currency: String,
     pub lines: Vec<QuickBooksBillLineInput>,
+}
+
+/// Request body for `record_spend` (PMS-1541).
+///
+/// `bank_account_id` is the account the money left; `entity_id` is the
+/// person reimbursed, when the tenant has mapped them.
+#[derive(Debug, Clone)]
+pub struct QuickBooksRecordSpendRequest {
+    pub bank_account_id: String,
+    pub entity_id: Option<String>,
+    pub paid_on: NaiveDate,
+    pub currency: String,
+    pub lines: Vec<QuickBooksBillLineInput>,
+}
+
+/// Request body for `pay_bill` (PMS-1545).
+///
+/// QuickBooks keeps a bill payment as its own document that LINKS to the
+/// bill, so this carries the vendor it is paid to, the account it leaves,
+/// and the bill's own id for the link.
+#[derive(Debug, Clone)]
+pub struct QuickBooksPayBillRequest {
+    pub bill_id: String,
+    pub vendor_id: String,
+    pub bank_account_id: String,
+    pub paid_on: NaiveDate,
+    pub amount_minor: i64,
 }
 
 /// One line of a bill: an amount against an expense ACCOUNT, which is
@@ -285,6 +445,65 @@ struct QuickBooksLineBody {
 struct QuickBooksSalesItemDetail {
     #[serde(rename = "ItemRef")]
     item_ref: QuickBooksRef,
+}
+
+#[derive(Debug, Serialize)]
+struct QuickBooksCreateCreditMemoBody {
+    #[serde(rename = "CustomerRef")]
+    customer_ref: QuickBooksRef,
+    #[serde(rename = "Line")]
+    line: Vec<QuickBooksLineBody>,
+    #[serde(rename = "TxnDate")]
+    txn_date: NaiveDate,
+    #[serde(rename = "CurrencyRef")]
+    currency_ref: QuickBooksRef,
+}
+
+/// The zero-total payment that applies a credit memo to an invoice
+/// (PMS-1546). Two lines, one linking each document.
+#[derive(Debug, Serialize)]
+struct QuickBooksCreditApplicationBody {
+    #[serde(rename = "CustomerRef")]
+    customer_ref: QuickBooksRef,
+    #[serde(rename = "TotalAmt")]
+    total_amt: String,
+    #[serde(rename = "TxnDate")]
+    txn_date: NaiveDate,
+    #[serde(rename = "Line")]
+    line: Vec<QuickBooksBillPaymentLine>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksCreditMemoEnvelope {
+    #[serde(rename = "CreditMemo")]
+    credit_memo: QuickBooksCreditMemoDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksCreditMemoDto {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "SyncToken", default)]
+    sync_token: Option<String>,
+    #[serde(rename = "DocNumber", default)]
+    doc_number: Option<String>,
+    /// QuickBooks writes `Voided` here when a document is voided, which
+    /// is the same marker the invoice path reads (there is no status
+    /// field on either entity).
+    #[serde(rename = "PrivateNote", default)]
+    private_note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksPaymentEnvelope {
+    #[serde(rename = "Payment")]
+    payment: QuickBooksPaymentDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickBooksPaymentDto {
+    #[serde(rename = "Id")]
+    id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -328,6 +547,119 @@ impl QuickBooksClient {
     pub fn with_identity_base(mut self, base: impl Into<String>) -> Self {
         self.identity_base = base.into();
         self
+    }
+
+    /// Record a reimbursement as a purchase (PMS-1541).
+    ///
+    /// `/purchase` rather than `/bill`: a bill is money the MSP owes and a
+    /// purchase is money it has already spent, and a reimbursement is the
+    /// second. `PaymentType: "Bank"` because the account the money left is
+    /// the one the tenant mapped, and QuickBooks requires the pair to
+    /// agree; a tenant reimbursing from a credit card maps that account
+    /// and QuickBooks reads the type from the account itself.
+    /// Record a payment against a bill the provider holds (PMS-1545).
+    ///
+    /// `/billpayment`, which is its own document linking to the bill
+    /// through `LinkedTxn`, not a second purchase: the bill is already
+    /// over there and what is being recorded is that it has been settled.
+    /// `PayType: "Check"` with a `CheckPayment.BankAccountRef` is the
+    /// shape for money leaving a bank account, which is what the account
+    /// PMS-1541 stores is; a tenant paying by card maps that account and
+    /// QuickBooks reads the instrument from the account itself.
+    ///
+    /// Returns the provider's payment id, which is what a reconciliation
+    /// reads back.
+    pub async fn pay_bill(
+        &self,
+        creds: &QuickBooksCredentials,
+        request: &QuickBooksPayBillRequest,
+    ) -> AppResult<String> {
+        let body = QuickBooksBillPaymentBody {
+            vendor_ref: QuickBooksRef {
+                value: request.vendor_id.clone(),
+            },
+            total_amt: minor_to_decimal(request.amount_minor, 2),
+            pay_type: "Check",
+            check_payment: QuickBooksCheckPayment {
+                bank_account_ref: QuickBooksRef {
+                    value: request.bank_account_id.clone(),
+                },
+            },
+            txn_date: request.paid_on,
+            line: vec![QuickBooksBillPaymentLine {
+                amount: minor_to_decimal(request.amount_minor, 2),
+                linked_txn: vec![QuickBooksLinkedTxn {
+                    txn_id: request.bill_id.clone(),
+                    txn_type: "Bill",
+                }],
+            }],
+        };
+        let url = format!(
+            "{}/v3/company/{}/billpayment?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksBillPaymentEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(envelope.bill_payment.id)
+    }
+
+    pub async fn record_spend(
+        &self,
+        creds: &QuickBooksCredentials,
+        request: &QuickBooksRecordSpendRequest,
+    ) -> AppResult<ExternalExpenseRef> {
+        let body = QuickBooksPurchaseBody {
+            account_ref: QuickBooksRef {
+                value: request.bank_account_id.clone(),
+            },
+            payment_type: "Bank",
+            line: request
+                .lines
+                .iter()
+                .map(|l| QuickBooksBillLineBody {
+                    amount: minor_to_decimal(l.amount_minor, 2),
+                    detail_type: "AccountBasedExpenseLineDetail",
+                    description: l.description.clone(),
+                    account_based_expense_line_detail: QuickBooksAccountDetail {
+                        account_ref: QuickBooksRef {
+                            value: l.account_id.clone(),
+                        },
+                    },
+                })
+                .collect(),
+            txn_date: request.paid_on,
+            currency_ref: QuickBooksRef {
+                value: request.currency.to_ascii_uppercase(),
+            },
+            entity_ref: request
+                .entity_id
+                .as_ref()
+                .map(|id| QuickBooksRef { value: id.clone() }),
+        };
+        let url = format!(
+            "{}/v3/company/{}/purchase?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksPurchaseEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(ExternalExpenseRef {
+            provider: InvoiceProviderKind::Quickbooks,
+            external_expense_id: envelope.purchase.id,
+        })
     }
 
     /// Raise a bill against a vendor (MAPPS-1155).
@@ -522,6 +854,47 @@ impl QuickBooksClient {
     /// `SyncToken` (QBO's optimistic-concurrency check) which the
     /// caller fetched alongside the id when the invoice was issued or
     /// read.
+    /// The status and the `SyncToken` of one invoice, which is what
+    /// voiding it needs (PMS-1544).
+    ///
+    /// QuickBooks requires the token on every write and rejects a stale
+    /// one, so a void is always a read then a write. Both come from one
+    /// GET rather than two: `fetch_invoice_status` answers the status
+    /// alone, and a caller that wanted both would otherwise fetch twice
+    /// and could act on a token from a different read than the status.
+    ///
+    /// `None` for an id this company file does not hold, which is an
+    /// answer and not a failure: an invoice deleted over there is already
+    /// in the state a void is asking for.
+    pub async fn fetch_invoice_void_target(
+        &self,
+        creds: &QuickBooksCredentials,
+        external_invoice_id: &str,
+    ) -> AppResult<Option<(QuickBooksInvoiceStatus, String)>> {
+        let url = format!(
+            "{}/v3/company/{}/invoice/{external_invoice_id}?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksInvoiceEnvelope = match self
+            .call_with_retry(|| {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+            })
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(AppError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let dto = envelope.invoice;
+        // The same classifier the status read uses, so a void decision and
+        // a status read can never disagree about the same invoice.
+        let status = classify_status(&dto);
+        Ok(Some((status, dto.sync_token.clone().unwrap_or_default())))
+    }
+
     pub async fn void_invoice(
         &self,
         creds: &QuickBooksCredentials,
@@ -548,12 +921,249 @@ impl QuickBooksClient {
         Ok(())
     }
 
+    /// Issue a credit memo against an invoice this company file holds
+    /// (PMS-1546).
+    ///
+    /// `/creditmemo` and not `/invoice` with a negative line: QuickBooks
+    /// keeps a credit as its own entity, a negative invoice line is a
+    /// discount on what is still owed, and the two land in different
+    /// places in the customer's ledger. The lines are sales lines like an
+    /// invoice's, so every one needs its mapped `ItemRef`.
+    pub async fn issue_credit_memo(
+        &self,
+        creds: &QuickBooksCredentials,
+        request: &QuickBooksIssueCreditMemoRequest,
+    ) -> AppResult<ExternalCreditNoteRef> {
+        let body = QuickBooksCreateCreditMemoBody {
+            customer_ref: QuickBooksRef {
+                value: request.customer_id.clone(),
+            },
+            line: request
+                .lines
+                .iter()
+                .map(|l| QuickBooksLineBody {
+                    amount: minor_to_decimal(l.amount_minor, 2),
+                    detail_type: "SalesItemLineDetail",
+                    description: l.description.clone(),
+                    sales_item_line_detail: QuickBooksSalesItemDetail {
+                        item_ref: QuickBooksRef {
+                            value: l.item_id.clone(),
+                        },
+                    },
+                })
+                .collect(),
+            txn_date: request.issue_date,
+            currency_ref: QuickBooksRef {
+                value: request.currency.to_ascii_uppercase(),
+            },
+        };
+        let url = format!(
+            "{}/v3/company/{}/creditmemo?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksCreditMemoEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(ExternalCreditNoteRef {
+            provider: InvoiceProviderKind::Quickbooks,
+            external_credit_note_id: envelope.credit_memo.id,
+            external_number: envelope.credit_memo.doc_number.unwrap_or_default(),
+        })
+    }
+
+    /// Apply a credit memo to the invoice it corrects (PMS-1546).
+    ///
+    /// A `Payment` with `TotalAmt` zero, which is how QuickBooks records
+    /// a credit being used: no money arrived, so the total is nothing,
+    /// and the two `LinkedTxn` lines say which invoice was settled and
+    /// which credit settled it. A payment that links the credit alone
+    /// leaves the invoice untouched, and one that links the invoice alone
+    /// would claim the customer paid cash.
+    ///
+    /// Returns the payment's id, which is what somebody reconciling the
+    /// two ledgers has to look for: the application is its own document
+    /// over there, not a field on either half.
+    pub async fn apply_credit_memo(
+        &self,
+        creds: &QuickBooksCredentials,
+        request: &QuickBooksApplyCreditRequest,
+    ) -> AppResult<String> {
+        let amount = minor_to_decimal(request.amount_minor, 2);
+        let body = QuickBooksCreditApplicationBody {
+            customer_ref: QuickBooksRef {
+                value: request.customer_id.clone(),
+            },
+            total_amt: minor_to_decimal(0, 2),
+            txn_date: request.applied_on,
+            line: vec![
+                QuickBooksBillPaymentLine {
+                    amount: amount.clone(),
+                    linked_txn: vec![QuickBooksLinkedTxn {
+                        txn_id: request.invoice_id.clone(),
+                        txn_type: "Invoice",
+                    }],
+                },
+                QuickBooksBillPaymentLine {
+                    amount,
+                    linked_txn: vec![QuickBooksLinkedTxn {
+                        txn_id: request.credit_memo_id.clone(),
+                        txn_type: "CreditMemo",
+                    }],
+                },
+            ],
+        };
+        let url = format!(
+            "{}/v3/company/{}/payment?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksPaymentEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(envelope.payment.id)
+    }
+
+    /// Whether a credit memo is already voided, and its current
+    /// `SyncToken` (PMS-1546).
+    ///
+    /// The credit-note twin of [`Self::fetch_invoice_void_target`], and
+    /// one GET for the same reason: QuickBooks rejects a write carrying a
+    /// stale token, so a void is always a read then a write, and taking
+    /// both answers from one read means they cannot describe different
+    /// states of the document.
+    ///
+    /// `None` for an id this company file does not hold, which is already
+    /// the state a void is asking for.
+    pub async fn fetch_credit_memo_void_target(
+        &self,
+        creds: &QuickBooksCredentials,
+        external_credit_memo_id: &str,
+    ) -> AppResult<Option<(bool, String)>> {
+        let url = format!(
+            "{}/v3/company/{}/creditmemo/{external_credit_memo_id}?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksCreditMemoEnvelope = match self
+            .call_with_retry(|| {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+            })
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(AppError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let dto = envelope.credit_memo;
+        let voided = dto
+            .private_note
+            .as_deref()
+            .is_some_and(|note| note.to_ascii_lowercase().contains("voided"));
+        Ok(Some((voided, dto.sync_token.clone().unwrap_or_default())))
+    }
+
+    /// Void a credit memo in QuickBooks (PMS-1546).
+    ///
+    /// The same `?operation=void` the invoice void uses, on the credit
+    /// memo's collection URL: the row stays and its amounts go to zero,
+    /// and QuickBooks unapplies the payment that linked it to the
+    /// invoice, which is what puts the invoice's balance back.
+    pub async fn void_credit_memo(
+        &self,
+        creds: &QuickBooksCredentials,
+        external_credit_memo_id: &str,
+        sync_token: &str,
+    ) -> AppResult<()> {
+        let url = format!(
+            "{}/v3/company/{}/creditmemo?operation=void&minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let body = QuickBooksVoidBody {
+            id: external_credit_memo_id,
+            sync_token,
+        };
+        let _envelope: QuickBooksCreditMemoEnvelope = self
+            .call_with_retry(|| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+                    .json(&body)
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Fetch the current QBO-side state of a previously-issued invoice.
     /// QBO does not carry a `Status` string on `Invoice`; the client
     /// derives one by [`Self::classify_status`] from `Balance`,
     /// `TotalAmt` and the `Voided` marker QBO writes to `PrivateNote`
     /// on a void. Used by the Phase 3 webhook receiver's reconciliation
     /// pass and the "re-sync" operator button.
+    /// What the provider says has been paid against one bill (PMS-1543).
+    ///
+    /// `GET /bill/{id}` carries `TotalAmt` and `Balance`, and QuickBooks
+    /// has no "amount paid" field: paid is the difference, which is why
+    /// this reads both rather than one. Reconciled against the provider's
+    /// own figures rather than accumulated from events, so a redelivery
+    /// records nothing by arithmetic.
+    ///
+    /// `/bill/{id}` and not `/invoice/{id}`: unlike Xero, QuickBooks keeps
+    /// the two documents on separate resources, so an id that is not a
+    /// bill answers 404 and the caller sees `None` rather than reading a
+    /// customer's invoice as the MSP's bill.
+    pub async fn fetch_bill_settlement(
+        &self,
+        creds: &QuickBooksCredentials,
+        external_bill_id: &str,
+    ) -> AppResult<Option<ExternalSettlement>> {
+        let url = format!(
+            "{}/v3/company/{}/bill/{external_bill_id}?minorversion={MINOR_VERSION}",
+            self.api_base, creds.realm_id
+        );
+        let envelope: QuickBooksBillSettlementEnvelope = match self
+            .call_with_retry(|| {
+                self.http
+                    .get(&url)
+                    .bearer_auth(&creds.access_token)
+                    .header("Accept", "application/json")
+            })
+            .await
+        {
+            Ok(envelope) => envelope,
+            // An id this company file does not hold as a bill. Not a
+            // failure: the receiver is told about documents Mokosh never
+            // created, and answering with an error would have Intuit retry
+            // forever.
+            Err(AppError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let bill = envelope.bill;
+        let total_minor = decimal_string_to_minor(&format!("{:.2}", bill.total_amt.unwrap_or(0.0)));
+        let balance_minor = decimal_string_to_minor(&format!("{:.2}", bill.balance.unwrap_or(0.0)));
+        Ok(Some(ExternalSettlement {
+            paid_minor: total_minor.saturating_sub(balance_minor),
+            total_minor,
+            // QuickBooks deletes rather than voids a bill, and a deleted
+            // one answers 404 above, so there is no voided state to read
+            // here.
+            voided: false,
+        }))
+    }
+
     pub async fn fetch_invoice_status(
         &self,
         creds: &QuickBooksCredentials,
@@ -678,10 +1288,15 @@ fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Duration {
 /// `Amount` as a decimal number; serialising as a string here keeps
 /// `f64` off the wire.
 fn minor_to_decimal(minor: i64, places: u32) -> String {
-    let scale: i64 = 10_i64.pow(places);
-    let whole = minor / scale;
-    let frac = (minor % scale).abs();
-    format!("{whole}.{frac:0width$}", width = places as usize)
+    let scale: u64 = 10_u64.pow(places);
+    let sign = if minor < 0 { "-" } else { "" };
+    let abs = minor.unsigned_abs();
+    format!(
+        "{sign}{}.{:0width$}",
+        abs / scale,
+        abs % scale,
+        width = places as usize
+    )
 }
 
 /// Whether an access token is close enough to expiry that the caller
@@ -760,6 +1375,9 @@ mod tests {
         assert_eq!(minor_to_decimal(1, 2), "0.01");
         assert_eq!(minor_to_decimal(12345, 2), "123.45");
         assert_eq!(minor_to_decimal(-12345, 2), "-123.45");
+        // |minor| < scale: the whole part collapses to 0, so the sign
+        // must come from the input, not from a nonzero whole part.
+        assert_eq!(minor_to_decimal(-50, 2), "-0.50");
     }
 
     #[test]
@@ -827,6 +1445,156 @@ mod tests {
         assert_eq!(
             v["Line"][0]["SalesItemLineDetail"]["ItemRef"]["value"],
             "item-9"
+        );
+    }
+
+    /// PMS-1541: a reimbursement is a purchase, not a bill.
+    ///
+    /// A bill is money owed and a purchase is money already spent, and
+    /// `/purchase` is the endpoint that says so. Read off `record_spend`'s
+    /// own body so the bill call cannot satisfy it.
+    #[test]
+    fn a_reimbursement_goes_to_the_purchase_resource() {
+        let src = include_str!("quickbooks.rs");
+        let start = src
+            .find("pub async fn record_spend")
+            .expect("the spend call");
+        let end = start
+            + src[start..]
+                .find("\n    pub async fn ")
+                .expect("the next method");
+        let record_spend = &src[start..end];
+        assert!(
+            record_spend.contains("/v3/company/{}/purchase"),
+            "the spend call posts to /purchase"
+        );
+        assert!(
+            !record_spend.contains("/v3/company/{}/bill"),
+            "and never to /bill, which is money owed rather than money spent"
+        );
+    }
+
+    /// The purchase body carries the account the money left, a payment
+    /// type, the expense account per line, and the person when known.
+    #[test]
+    fn the_purchase_body_names_both_accounts() {
+        let body = QuickBooksPurchaseBody {
+            account_ref: QuickBooksRef {
+                value: "35".to_string(),
+            },
+            payment_type: "Bank",
+            line: vec![QuickBooksBillLineBody {
+                amount: "32.50".to_string(),
+                detail_type: "AccountBasedExpenseLineDetail",
+                description: "Taxi to site".to_string(),
+                account_based_expense_line_detail: QuickBooksAccountDetail {
+                    account_ref: QuickBooksRef {
+                        value: "7".to_string(),
+                    },
+                },
+            }],
+            txn_date: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            currency_ref: QuickBooksRef {
+                value: "USD".to_string(),
+            },
+            entity_ref: Some(QuickBooksRef {
+                value: "56".to_string(),
+            }),
+        };
+        let v = serde_json::to_value(&body).expect("serialise");
+        assert_eq!(v["AccountRef"]["value"], "35", "where the money came from");
+        assert_eq!(v["PaymentType"], "Bank");
+        assert_eq!(
+            v["Line"][0]["AccountBasedExpenseLineDetail"]["AccountRef"]["value"], "7",
+            "and what it was spent on"
+        );
+        assert_eq!(v["EntityRef"]["value"], "56", "who was reimbursed");
+        assert_eq!(v["TxnDate"], "2026-11-01");
+    }
+
+    /// An unmapped person leaves `EntityRef` off the body rather than
+    /// sending a null, which QuickBooks rejects.
+    #[test]
+    fn an_unmapped_person_omits_the_entity_ref() {
+        let body = QuickBooksPurchaseBody {
+            account_ref: QuickBooksRef {
+                value: "35".to_string(),
+            },
+            payment_type: "Bank",
+            line: Vec::new(),
+            txn_date: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            currency_ref: QuickBooksRef {
+                value: "USD".to_string(),
+            },
+            entity_ref: None,
+        };
+        let v = serde_json::to_value(&body).expect("serialise");
+        assert!(v.get("EntityRef").is_none());
+    }
+
+    /// PMS-1546: a customer credit is a credit memo, and the application
+    /// is a payment of nothing.
+    ///
+    /// Two things are easy to get wrong and both are silent in the
+    /// customer's ledger. A negative line on an `/invoice` reads as a
+    /// discount on what is still owed rather than a credit the customer
+    /// holds, so the credit goes to `/creditmemo`. And a payment that
+    /// carries a real total would say cash arrived: the application is a
+    /// zero-total payment whose two links name the invoice settled and
+    /// the credit that settled it.
+    #[test]
+    fn a_credit_is_a_credit_memo_and_its_application_pays_nothing() {
+        let src = include_str!("quickbooks.rs");
+        let start = src
+            .find("pub async fn issue_credit_memo")
+            .expect("the credit memo call");
+        let end = start
+            + src[start..]
+                .find("\n    pub async fn ")
+                .expect("the next method");
+        let issue_credit_memo = &src[start..end];
+        assert!(
+            issue_credit_memo.contains("/v3/company/{}/creditmemo"),
+            "the credit goes to the credit memo resource"
+        );
+        assert!(
+            !issue_credit_memo.contains("/v3/company/{}/invoice"),
+            "and never to the invoice resource, where it would read as a discount"
+        );
+
+        let body = QuickBooksCreditApplicationBody {
+            customer_ref: QuickBooksRef {
+                value: "cust-1".to_string(),
+            },
+            total_amt: "0.00".to_string(),
+            txn_date: NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
+            line: vec![
+                QuickBooksBillPaymentLine {
+                    amount: "40.00".to_string(),
+                    linked_txn: vec![QuickBooksLinkedTxn {
+                        txn_id: "1042".to_string(),
+                        txn_type: "Invoice",
+                    }],
+                },
+                QuickBooksBillPaymentLine {
+                    amount: "40.00".to_string(),
+                    linked_txn: vec![QuickBooksLinkedTxn {
+                        txn_id: "88".to_string(),
+                        txn_type: "CreditMemo",
+                    }],
+                },
+            ],
+        };
+        let v = serde_json::to_value(&body).expect("serialise");
+        assert_eq!(
+            v["TotalAmt"], "0.00",
+            "no money arrived, so the payment totals nothing: {v}"
+        );
+        assert_eq!(v["Line"][0]["LinkedTxn"][0]["TxnType"], "Invoice");
+        assert_eq!(v["Line"][1]["LinkedTxn"][0]["TxnType"], "CreditMemo");
+        assert_eq!(
+            v["Line"][0]["Amount"], v["Line"][1]["Amount"],
+            "the credit applied and the invoice settled are the same amount"
         );
     }
 }

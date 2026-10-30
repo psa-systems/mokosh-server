@@ -951,6 +951,7 @@ mod tests {
 pub struct CreditNoteLineResponse {
     pub id: Uuid,
     pub line_type: InvoiceLineType,
+    pub product_id: Option<Uuid>,
     pub description: String,
     pub quantity: Decimal,
     pub unit_price: Decimal,
@@ -985,11 +986,23 @@ pub struct CreditNoteResponse {
     pub updated_at: DateTime<Utc>,
     /// `Some` on `GET /:id`, `None` on list rollups, like `InvoiceResponse`.
     pub lines: Option<Vec<CreditNoteLineResponse>>,
+    /// PMS-1546: `xero` or `quickbooks` when that provider holds a copy of
+    /// this credit note, with its own id and the number it rendered. All
+    /// three are `None` for a credit note only Mokosh holds, which is
+    /// every one against a locally-issued invoice.
+    pub external_provider: Option<String>,
+    pub external_credit_note_id: Option<String>,
+    pub external_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct CreateCreditNoteLineRequest {
     pub line_type: InvoiceLineType,
+    /// The catalogue product this line credits, when it names one.
+    /// Required only on the QuickBooks-delegated path, which resolves it
+    /// to an `ItemRef` the provider refuses the call without (PMS-1546).
+    #[serde(default)]
+    pub product_id: Option<Uuid>,
     #[validate(length(min = 1, max = 1000))]
     pub description: String,
     /// Required to be positive by `create_credit_note`, unlike

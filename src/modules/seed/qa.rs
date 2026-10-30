@@ -1368,6 +1368,7 @@ fn qa_kb_article_specs(category_id: Uuid) -> Vec<CreateKbArticleRequest> {
         tags: vec![QA_TAG.to_string()],
         company_ids: None,
         parent_article_id: None,
+        template_variables: None,
     };
     vec![
         mk(1, "Onboarding a new workstation", "onboard-workstation"),
@@ -1520,6 +1521,9 @@ fn qa_credit_note_spec(invoice_id: Uuid) -> CreateCreditNoteRequest {
         notes: Some("QA seed credit note.".to_string()),
         lines: vec![CreateCreditNoteLineRequest {
             line_type: InvoiceLineType::Adjustment,
+            // An adjustment line names no catalogue product, which the
+            // local path and Xero both take (PMS-1546).
+            product_id: None,
             description: "QA-Decommissioned site, May".to_string(),
             quantity: Decimal::ONE,
             unit_price: Decimal::new(50000, 2),

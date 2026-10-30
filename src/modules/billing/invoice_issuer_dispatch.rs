@@ -29,7 +29,8 @@ use uuid::Uuid;
 
 use crate::modules::auth::TenantId;
 use crate::modules::billing::invoice_issuer::{
-    select_issuer_with, ExternalInvoiceRef, InvoiceProviderKind, IssuerSelection,
+    select_issuer_with, ExternalCreditNoteRef, ExternalInvoiceRef, ExternalSettlement,
+    InvoiceProviderKind, IssuerSelection,
 };
 use crate::modules::billing::invoice_issuer_app::{IssuerApp, IssuerApps};
 use crate::modules::billing::invoice_issuer_credentials::{
@@ -39,9 +40,12 @@ use crate::modules::billing::invoice_issuer_credentials::{
 use crate::modules::billing::invoice_issuer_mappings::InvoiceIssuerMappingService;
 use crate::modules::billing::models::CreateInvoiceLineRequest;
 use crate::modules::billing::provider_invoice::quickbooks::{
-    QuickBooksBillLineInput, QuickBooksCreateBillRequest,
+    QuickBooksApplyCreditRequest, QuickBooksBillLineInput, QuickBooksCreateBillRequest,
+    QuickBooksIssueCreditMemoRequest, QuickBooksPayBillRequest, QuickBooksRecordSpendRequest,
 };
-use crate::modules::billing::provider_invoice::xero::XeroLineItemInput;
+use crate::modules::billing::provider_invoice::xero::{
+    XeroAllocateCreditRequest, XeroIssueCreditNoteRequest, XeroLineItemInput, XeroSpendLineInput,
+};
 use crate::modules::billing::provider_invoice::{
     QuickBooksClient, QuickBooksIssueInvoiceRequest, XeroClient, XeroIssueInvoiceRequest,
 };
@@ -72,6 +76,46 @@ pub enum ExternalInvoiceState {
 pub enum BillPlan {
     Local,
     Delegated(crate::modules::billing::invoice_issuer::ExternalBillRef),
+}
+
+/// What voiding the provider's copy came to (PMS-1544).
+///
+/// `AlreadyVoided` is a success and not a near-miss: the states agree,
+/// which is all the caller wanted. It is kept apart from `Voided` so the
+/// audit trail can say whether this call did it or found it done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderVoid {
+    Voided,
+    AlreadyVoided,
+}
+
+/// What the dispatcher decided to do with one `reimburse_expense` call
+/// (PMS-1541).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpensePlan {
+    Local,
+    Delegated(crate::modules::billing::invoice_issuer::ExternalExpenseRef),
+}
+
+/// The part of a claim the dispatcher needs to record the reimbursement.
+///
+/// `user_id` is the person reimbursed, which is what the provider's
+/// counterparty field wants; `paid_on` is today rather than the date the
+/// cost was incurred, because the transaction being recorded is the money
+/// leaving the MSP's account now.
+pub struct ReimburseExpenseShape<'a> {
+    pub user_id: Uuid,
+    pub paid_on: NaiveDate,
+    pub currency: &'a str,
+    pub lines: &'a [ExpenseLineShape],
+}
+
+/// One line of a claim, in the minor units both clients take. An amount,
+/// with no quantity to multiply: a taxi fare is one number.
+pub struct ExpenseLineShape {
+    pub category_id: Option<Uuid>,
+    pub description: String,
+    pub amount_minor: i64,
 }
 
 /// The part of a bill the dispatcher needs, borrowed from the request so
@@ -174,11 +218,19 @@ impl IssuerDispatcher {
         };
         let xero = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Xero)
+            .get(
+                tenant_id,
+                IntegrationProvider::Xero,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         let quickbooks = self
             .integrations
-            .get(tenant_id, IntegrationProvider::Quickbooks)
+            .get(
+                tenant_id,
+                IntegrationProvider::Quickbooks,
+                Capability::BillsAndExpenses,
+            )
             .await?;
         // Xero before QuickBooks, the tie-break `select_issuer_with`
         // already uses for invoices, so a tenant with both connected does
@@ -320,6 +372,204 @@ impl IssuerDispatcher {
         }
     }
 
+    /// Record one reimbursed claim in the provider the tenant delegated
+    /// Bills and expenses to (PMS-1541).
+    ///
+    /// The bill path again, with a different document on the other end: a
+    /// claim is money the MSP has already spent, so Xero takes a SPEND
+    /// bank transaction and QuickBooks a purchase, where a bill is an
+    /// obligation. Returns `ExpensePlan::Local` for every path that leaves
+    /// `reimburse_expense` alone, and an error when the provider was asked
+    /// and refused, so the caller never marks a claim reimbursed that the
+    /// provider does not have.
+    ///
+    /// Three facts are needed and two of them are mappings an admin sets:
+    /// the account the money left (one per tenant per provider), the
+    /// expense account each line posts to (migration 286, shared with
+    /// bills), and the person reimbursed (required by Xero, optional for
+    /// QuickBooks). Each missing one is a `Conflict` naming the route that
+    /// fixes it.
+    pub async fn plan_expense(
+        &self,
+        tenant_id: TenantId,
+        request: &ReimburseExpenseShape<'_>,
+    ) -> AppResult<ExpensePlan> {
+        if !self
+            .features
+            .is_enabled(crate::modules::features::Feature::DelegatedBills)
+        {
+            return Ok(ExpensePlan::Local);
+        }
+        let bills = Capability::BillsAndExpenses.as_str();
+        let delegated = |integration: &crate::modules::integrations::IntegrationResponse| {
+            matches!(
+                integration.status,
+                crate::modules::integrations::IntegrationStatus::Connected
+                    | crate::modules::integrations::IntegrationStatus::Error
+            ) && integration.enabled_capabilities.iter().any(|c| c == bills)
+        };
+        let xero = self
+            .integrations
+            .get(
+                tenant_id,
+                IntegrationProvider::Xero,
+                Capability::BillsAndExpenses,
+            )
+            .await?;
+        let quickbooks = self
+            .integrations
+            .get(
+                tenant_id,
+                IntegrationProvider::Quickbooks,
+                Capability::BillsAndExpenses,
+            )
+            .await?;
+        // Xero before QuickBooks, the tie-break the invoice and bill paths
+        // already use, so a tenant with both connected does not see one
+        // provider some days and the other on others.
+        let provider = if delegated(&xero) {
+            InvoiceProviderKind::Xero
+        } else if delegated(&quickbooks) {
+            InvoiceProviderKind::Quickbooks
+        } else {
+            return Ok(ExpensePlan::Local);
+        };
+
+        let bank_account = self
+            .mappings
+            .get_payment_account(tenant_id, provider)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "No {} account is set to reimburse from. Set it at PUT \
+                     /api/v1/integrations/invoice-issuer/{}/payment-account first.",
+                    provider.as_str(),
+                    provider.as_str()
+                ))
+            })?;
+
+        // The expense accounts, batched like the bill path's: one round
+        // trip for the whole claim, and a category absent from the map is
+        // the refusal that names a line.
+        let category_ids: Vec<Uuid> = request.lines.iter().filter_map(|l| l.category_id).collect();
+        let account_map = self
+            .mappings
+            .get_expense_account_mappings(tenant_id, provider, &category_ids)
+            .await?;
+        let mut accounts = Vec::with_capacity(request.lines.len());
+        for line in request.lines {
+            let category_id = line.category_id.ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "Claim line '{}' has no expense category, and a reimbursement has to say \
+                     which account the cost posts to. Set a category on every line.",
+                    line.description
+                ))
+            })?;
+            let mapping = account_map.get(&category_id).ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "Expense category {category_id} is not mapped to a {} account. Set the \
+                     mapping at PUT /api/v1/invoice-issuer-mappings/expense-accounts/{}/{category_id} first.",
+                    provider.as_str(),
+                    provider.as_str()
+                ))
+            })?;
+            accounts.push(mapping.external_account_id.clone());
+        }
+
+        let person = self
+            .mappings
+            .get_user_mapping(tenant_id, provider, request.user_id)
+            .await?;
+
+        match provider {
+            InvoiceProviderKind::Xero => {
+                let (blob, _refreshed) = self
+                    .load_and_refresh_blob(tenant_id, InvoiceProviderKind::Xero)
+                    .await?;
+                let IntegrationCredentialBlob::Xero(xero_blob) = &blob else {
+                    return Err(AppError::Unauthorized);
+                };
+                let creds =
+                    xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, xero_blob);
+                // Xero refuses a bank transaction with no Contact, so the
+                // people mapping is required here where QuickBooks takes
+                // it or leaves it.
+                let mapping = person.ok_or_else(|| {
+                    AppError::Conflict(format!(
+                        "The person this claim belongs to is not mapped to a Xero contact, and \
+                         Xero needs one on every spend. Set the mapping at PUT \
+                         /api/v1/invoice-issuer-mappings/people/xero/{} first.",
+                        request.user_id
+                    ))
+                })?;
+                let contact_id = Uuid::parse_str(&mapping.external_contact_id).map_err(|_| {
+                    AppError::internal(format!(
+                        "person {} is mapped to {:?} but Xero expects a UUID ContactID",
+                        request.user_id, mapping.external_contact_id
+                    ))
+                })?;
+                let spend = self
+                    .xero
+                    .record_spend(
+                        &creds,
+                        &crate::modules::billing::provider_invoice::xero::XeroRecordSpendRequest {
+                            bank_account_id: bank_account,
+                            contact_id,
+                            paid_on: request.paid_on,
+                            currency: request.currency.to_string(),
+                            lines: request
+                                .lines
+                                .iter()
+                                .zip(accounts)
+                                .map(|(l, account_code)| XeroSpendLineInput {
+                                    description: l.description.clone(),
+                                    amount_minor: l.amount_minor,
+                                    account_code,
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await?;
+                Ok(ExpensePlan::Delegated(spend))
+            }
+            InvoiceProviderKind::Quickbooks => {
+                let (blob, _refreshed) = self
+                    .load_and_refresh_blob(tenant_id, InvoiceProviderKind::Quickbooks)
+                    .await?;
+                let IntegrationCredentialBlob::Quickbooks(qbo_blob) = &blob else {
+                    return Err(AppError::Unauthorized);
+                };
+                let creds = quickbooks_credentials(
+                    self.apps.require(InvoiceProviderKind::Quickbooks)?,
+                    qbo_blob,
+                );
+                let spend = self
+                    .quickbooks
+                    .record_spend(
+                        &creds,
+                        &QuickBooksRecordSpendRequest {
+                            bank_account_id: bank_account,
+                            entity_id: person.map(|p| p.external_contact_id),
+                            paid_on: request.paid_on,
+                            currency: request.currency.to_string(),
+                            lines: request
+                                .lines
+                                .iter()
+                                .zip(accounts)
+                                .map(|(l, account_id)| QuickBooksBillLineInput {
+                                    description: l.description.clone(),
+                                    amount_minor: l.amount_minor,
+                                    account_id,
+                                })
+                                .collect(),
+                        },
+                    )
+                    .await?;
+                Ok(ExpensePlan::Delegated(spend))
+            }
+        }
+    }
+
     /// Whether the deployment has delegated BILLS switched on
     /// (MAPPS-1155). Its own switch, for the reason the feature registry
     /// gives: the invoice flag names the invoice issuer.
@@ -420,7 +670,10 @@ impl IssuerDispatcher {
         tenant_id: TenantId,
         provider: IntegrationProvider,
     ) -> AppResult<bool> {
-        let integration = self.integrations.get(tenant_id, provider).await?;
+        let integration = self
+            .integrations
+            .get(tenant_id, provider, Capability::Invoicing)
+            .await?;
         let live = matches!(
             integration.status,
             crate::modules::integrations::IntegrationStatus::Connected
@@ -607,6 +860,462 @@ impl IssuerDispatcher {
     /// receiver comes and looks, through the same credential load and
     /// near-expiry refresh an issue goes through, because a webhook can
     /// easily be the first call after a token has aged out.
+    /// Tell the provider a bill it holds has been paid (PMS-1545).
+    ///
+    /// The outbound mirror of PMS-1543: that one records what the provider
+    /// already did, this one tells the provider what the MSP just did.
+    /// Without it an MSP paying a delegated bill from Mokosh left the
+    /// provider showing it owing, and the accountant reconciled against a
+    /// balance wrong by the amount paid.
+    ///
+    /// `None` when there is nothing to tell: no dispatcher, the switch
+    /// off, or a bill no provider holds. Each missing mapping is a
+    /// `Conflict` naming the route that sets it, as every other push
+    /// here is.
+    pub async fn pay_bill_in_provider(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        external_bill_id: &str,
+        vendor_id: Uuid,
+        amount_minor: i64,
+        paid_on: NaiveDate,
+    ) -> AppResult<String> {
+        let bank_account = self
+            .mappings
+            .get_payment_account(tenant_id, provider)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "No {} account is set to pay from. Set it at PUT \
+                     /api/v1/integrations/invoice-issuer/{}/payment-account first.",
+                    provider.as_str(),
+                    provider.as_str()
+                ))
+            })?;
+        let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
+        match &blob {
+            IntegrationCredentialBlob::Xero(x) => {
+                let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
+                // Xero attaches the payment to the document it settles, so
+                // the bill's own id is the only link needed and no vendor
+                // is sent: the bill already names the contact.
+                let bill_id = Uuid::parse_str(external_bill_id).map_err(|_| {
+                    AppError::internal(format!(
+                        "bill {external_bill_id} is not a Xero InvoiceID, which is a uuid"
+                    ))
+                })?;
+                self.xero
+                    .pay_bill(
+                        &creds,
+                        &crate::modules::billing::provider_invoice::xero::XeroPayBillRequest {
+                            bill_id,
+                            bank_account_id: bank_account,
+                            paid_on,
+                            amount_minor,
+                        },
+                    )
+                    .await
+            }
+            IntegrationCredentialBlob::Quickbooks(q) => {
+                let creds =
+                    quickbooks_credentials(self.apps.require(InvoiceProviderKind::Quickbooks)?, q);
+                // A QuickBooks bill payment is its own document and names
+                // the vendor it pays, so the vendor mapping is required
+                // here where Xero needs none.
+                let vendor = self
+                    .mappings
+                    .get_vendor_mapping(tenant_id, provider, vendor_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Conflict(format!(
+                            "Vendor {vendor_id} is not mapped to a quickbooks vendor, and a \
+                             QuickBooks bill payment names the vendor it pays. Set the mapping \
+                             at PUT /api/v1/invoice-issuer-mappings/vendors/quickbooks/{vendor_id} \
+                             first."
+                        ))
+                    })?;
+                self.quickbooks
+                    .pay_bill(
+                        &creds,
+                        &QuickBooksPayBillRequest {
+                            bill_id: external_bill_id.to_string(),
+                            vendor_id: vendor.external_vendor_id,
+                            bank_account_id: bank_account,
+                            paid_on,
+                            amount_minor,
+                        },
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// Void the provider's copy of an invoice Mokosh has replaced
+    /// (PMS-1544).
+    ///
+    /// The outbound half of the void the receiver already handles inbound.
+    /// Both clients have carried a `void_invoice` since MAPPS-1099 with no
+    /// caller: a delegated invoice replaced here left the provider's copy
+    /// live, so the customer was chased from the provider for a document
+    /// the MSP had replaced, and the MSP could not see the thing doing the
+    /// chasing.
+    ///
+    /// Reads before writing, which is not ceremony. A provider that has
+    /// already voided the invoice (its own webhook got here first, or this
+    /// is a retry) answers an error to a second void, and that error is
+    /// indistinguishable from a real refusal; asking first turns the
+    /// common case into `AlreadyVoided` instead. QuickBooks needs the read
+    /// regardless, because it rejects a write without a current
+    /// `SyncToken`.
+    pub async fn void_in_provider(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        external_invoice_id: &str,
+    ) -> AppResult<ProviderVoid> {
+        let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
+        match &blob {
+            IntegrationCredentialBlob::Xero(x) => {
+                let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
+                let status = self
+                    .xero
+                    .fetch_invoice_status(&creds, external_invoice_id)
+                    .await?;
+                if matches!(
+                    status,
+                    crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Voided
+                        | crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Deleted
+                ) {
+                    return Ok(ProviderVoid::AlreadyVoided);
+                }
+                self.xero
+                    .void_invoice(&creds, external_invoice_id)
+                    .await
+                    .map(|()| ProviderVoid::Voided)
+            }
+            IntegrationCredentialBlob::Quickbooks(q) => {
+                let creds =
+                    quickbooks_credentials(self.apps.require(InvoiceProviderKind::Quickbooks)?, q);
+                let Some((status, sync_token)) = self
+                    .quickbooks
+                    .fetch_invoice_void_target(&creds, external_invoice_id)
+                    .await?
+                else {
+                    // Deleted over there, which is already the state a void
+                    // is asking for.
+                    return Ok(ProviderVoid::AlreadyVoided);
+                };
+                if matches!(
+                    status,
+                    crate::modules::billing::provider_invoice::quickbooks::QuickBooksInvoiceStatus::Voided
+                ) {
+                    return Ok(ProviderVoid::AlreadyVoided);
+                }
+                self.quickbooks
+                    .void_invoice(&creds, external_invoice_id, &sync_token)
+                    .await
+                    .map(|()| ProviderVoid::Voided)
+            }
+        }
+    }
+
+    /// Issue a credit note in the provider that holds the invoice it
+    /// corrects, and apply it there (PMS-1546).
+    ///
+    /// A credit note corrects a document the customer holds, and for a
+    /// delegated invoice that document is the provider's. Before this,
+    /// crediting one left the two ledgers disagreeing by exactly the
+    /// credited amount while the provider kept showing the customer the
+    /// original balance.
+    ///
+    /// Two calls, not one, because neither provider takes the credit and
+    /// its application together: Xero keeps allocation as the credit
+    /// note's own sub-resource, and QuickBooks records an application as
+    /// a zero-total payment linking both documents. The creation is fatal
+    /// and the application is not. A refused creation means the provider
+    /// holds nothing and the caller can roll its own write back; a
+    /// refused application means the credit EXISTS over there, so
+    /// rolling back would strand a document nothing local points at, and
+    /// the honest answer is to keep the id and say the credit is
+    /// unapplied.
+    pub async fn issue_credit_note_in_provider(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        shape: &CreditNoteShape<'_>,
+    ) -> AppResult<CreditNotePush> {
+        let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
+        match &blob {
+            IntegrationCredentialBlob::Xero(x) => {
+                let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
+                let contact_id = self.xero_contact_for(tenant_id, shape.company_id).await?;
+                let request = XeroIssueCreditNoteRequest {
+                    contact_id,
+                    issue_date: shape.issue_date,
+                    currency: shape.currency.to_string(),
+                    lines: shape
+                        .lines
+                        .iter()
+                        .map(|l| XeroLineItemInput {
+                            description: l.description.clone(),
+                            quantity_hundredths: decimal_to_hundredths(l.quantity),
+                            unit_price_minor: decimal_to_minor(l.unit_price),
+                        })
+                        .collect(),
+                };
+                let reference = self.xero.issue_credit_note(&creds, &request).await?;
+                // Xero identifies an invoice by UUID, and this id came
+                // from Xero itself when the invoice was issued, so a
+                // value that will not parse is a local corruption rather
+                // than a caller's mistake.
+                let invoice_id = Uuid::parse_str(shape.external_invoice_id).map_err(|_| {
+                    AppError::internal(format!(
+                        "invoice is recorded as Xero {} but Xero expects a UUID InvoiceID",
+                        shape.external_invoice_id
+                    ))
+                })?;
+                let allocation = match self
+                    .xero
+                    .allocate_credit_note(
+                        &creds,
+                        &reference.external_credit_note_id,
+                        &XeroAllocateCreditRequest {
+                            invoice_id,
+                            amount_minor: decimal_to_minor(shape.total),
+                            date: shape.issue_date,
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => CreditAllocation::Applied(None),
+                    Err(e) => CreditAllocation::Refused(e.to_string()),
+                };
+                Ok(CreditNotePush {
+                    reference,
+                    allocation,
+                })
+            }
+            IntegrationCredentialBlob::Quickbooks(q) => {
+                let creds =
+                    quickbooks_credentials(self.apps.require(InvoiceProviderKind::Quickbooks)?, q);
+                let customer_mapping = self
+                    .mappings
+                    .get_customer_mapping(
+                        tenant_id,
+                        InvoiceProviderKind::Quickbooks,
+                        shape.company_id,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Conflict(format!(
+                            "Company {} is not mapped to a QuickBooks customer. Set the mapping \
+                             at PUT /api/v1/invoice-issuer-mappings/companies/quickbooks/{} first.",
+                            shape.company_id, shape.company_id
+                        ))
+                    })?;
+
+                let product_ids: Vec<Uuid> =
+                    shape.lines.iter().filter_map(|l| l.product_id).collect();
+                let product_map = self
+                    .mappings
+                    .get_product_mappings(tenant_id, InvoiceProviderKind::Quickbooks, &product_ids)
+                    .await?;
+                let mut lines = Vec::with_capacity(shape.lines.len());
+                for line in shape.lines {
+                    let product_id = line.product_id.ok_or_else(|| {
+                        AppError::Conflict(
+                            "Every line of a credit note against a QuickBooks-issued invoice \
+                             must link to a product, because a QuickBooks sales line carries \
+                             the item it credits. Set a product_id on each line."
+                                .to_string(),
+                        )
+                    })?;
+                    let mapping = product_map.get(&product_id).ok_or_else(|| {
+                        AppError::Conflict(format!(
+                            "Product {product_id} is not mapped to a QuickBooks item. Set the \
+                             mapping at PUT \
+                             /api/v1/invoice-issuer-mappings/products/quickbooks/{product_id} \
+                             first."
+                        ))
+                    })?;
+                    lines.push(
+                        crate::modules::billing::provider_invoice::quickbooks::QuickBooksLineItemInput {
+                            description: line.description.clone(),
+                            amount_minor: decimal_to_minor(line.quantity * line.unit_price),
+                            item_id: mapping.external_item_id.clone(),
+                        },
+                    );
+                }
+
+                let reference = self
+                    .quickbooks
+                    .issue_credit_memo(
+                        &creds,
+                        &QuickBooksIssueCreditMemoRequest {
+                            customer_id: customer_mapping.external_customer_id.clone(),
+                            issue_date: shape.issue_date,
+                            currency: shape.currency.to_string(),
+                            lines,
+                        },
+                    )
+                    .await?;
+                let allocation = match self
+                    .quickbooks
+                    .apply_credit_memo(
+                        &creds,
+                        &QuickBooksApplyCreditRequest {
+                            customer_id: customer_mapping.external_customer_id.clone(),
+                            invoice_id: shape.external_invoice_id.to_string(),
+                            credit_memo_id: reference.external_credit_note_id.clone(),
+                            amount_minor: decimal_to_minor(shape.total),
+                            applied_on: shape.issue_date,
+                        },
+                    )
+                    .await
+                {
+                    Ok(payment_id) => CreditAllocation::Applied(Some(payment_id)),
+                    Err(e) => CreditAllocation::Refused(e.to_string()),
+                };
+                Ok(CreditNotePush {
+                    reference,
+                    allocation,
+                })
+            }
+        }
+    }
+
+    /// Void the provider's copy of a credit note (PMS-1546).
+    ///
+    /// PMS-1544's rule in a second place: a document the customer holds
+    /// that no longer stands has to stop standing over there too, or the
+    /// customer keeps a credit the MSP has withdrawn.
+    ///
+    /// Xero unallocates first. It will not change a document an
+    /// allocation stands against, so a void against an applied credit
+    /// note is refused until the application comes off, and taking it off
+    /// is also what puts the invoice back to the balance it had.
+    /// QuickBooks does that itself: its void unapplies the payment that
+    /// linked the two, which is why that half is a read for the
+    /// `SyncToken` and then one write.
+    pub async fn void_credit_note_in_provider(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        external_credit_note_id: &str,
+    ) -> AppResult<ProviderVoid> {
+        let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
+        match &blob {
+            IntegrationCredentialBlob::Xero(x) => {
+                let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
+                let Some(state) = self
+                    .xero
+                    .fetch_credit_note(&creds, external_credit_note_id)
+                    .await?
+                else {
+                    return Ok(ProviderVoid::AlreadyVoided);
+                };
+                if matches!(
+                    state.status,
+                    Some(
+                        crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Voided
+                            | crate::modules::billing::provider_invoice::xero::XeroInvoiceStatus::Deleted
+                    )
+                ) {
+                    return Ok(ProviderVoid::AlreadyVoided);
+                }
+                for allocation_id in &state.allocation_ids {
+                    self.xero
+                        .delete_credit_note_allocation(
+                            &creds,
+                            external_credit_note_id,
+                            allocation_id,
+                        )
+                        .await?;
+                }
+                self.xero
+                    .void_credit_note(&creds, external_credit_note_id)
+                    .await
+                    .map(|()| ProviderVoid::Voided)
+            }
+            IntegrationCredentialBlob::Quickbooks(q) => {
+                let creds =
+                    quickbooks_credentials(self.apps.require(InvoiceProviderKind::Quickbooks)?, q);
+                let Some((voided, sync_token)) = self
+                    .quickbooks
+                    .fetch_credit_memo_void_target(&creds, external_credit_note_id)
+                    .await?
+                else {
+                    return Ok(ProviderVoid::AlreadyVoided);
+                };
+                if voided {
+                    return Ok(ProviderVoid::AlreadyVoided);
+                }
+                self.quickbooks
+                    .void_credit_memo(&creds, external_credit_note_id, &sync_token)
+                    .await
+                    .map(|()| ProviderVoid::Voided)
+            }
+        }
+    }
+
+    /// The Xero `ContactID` this company is mapped to, or a `Conflict`
+    /// naming the route that sets it (PMS-1546).
+    ///
+    /// Shared by the invoice and credit note pushes: both raise a
+    /// document against the same contact, and two copies of the lookup
+    /// would be two places for the refusal message to drift.
+    async fn xero_contact_for(&self, tenant_id: TenantId, company_id: Uuid) -> AppResult<Uuid> {
+        let mapping = self
+            .mappings
+            .get_customer_mapping(tenant_id, InvoiceProviderKind::Xero, company_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Conflict(format!(
+                    "Company {company_id} is not mapped to a Xero customer. Set the mapping \
+                     at PUT /api/v1/invoice-issuer-mappings/companies/xero/{company_id} first."
+                ))
+            })?;
+        Uuid::parse_str(&mapping.external_customer_id).map_err(|_| {
+            AppError::internal(format!(
+                "company {} is mapped to {:?} but Xero expects a UUID ContactID",
+                company_id, mapping.external_customer_id
+            ))
+        })
+    }
+
+    /// What the provider says has been settled against one delegated bill
+    /// (PMS-1543).
+    ///
+    /// `None` when the id is not a bill the provider holds: Xero puts
+    /// bills and invoices on one endpoint and one webhook category, so the
+    /// receiver asks about ids that turn out to be receivables, and
+    /// QuickBooks answers 404 for an id that is not a bill in that company
+    /// file. Neither is an error.
+    pub async fn external_bill_settlement(
+        &self,
+        tenant_id: TenantId,
+        provider: InvoiceProviderKind,
+        external_bill_id: &str,
+    ) -> AppResult<Option<ExternalSettlement>> {
+        let (blob, _refreshed) = self.load_and_refresh_blob(tenant_id, provider).await?;
+        match &blob {
+            IntegrationCredentialBlob::Xero(x) => {
+                let creds = xero_credentials(self.apps.require(InvoiceProviderKind::Xero)?, x);
+                self.xero
+                    .fetch_bill_settlement(&creds, external_bill_id)
+                    .await
+            }
+            IntegrationCredentialBlob::Quickbooks(q) => {
+                let creds =
+                    quickbooks_credentials(self.apps.require(InvoiceProviderKind::Quickbooks)?, q);
+                self.quickbooks
+                    .fetch_bill_settlement(&creds, external_bill_id)
+                    .await
+            }
+        }
+    }
+
     pub async fn external_status(
         &self,
         tenant_id: TenantId,
@@ -701,6 +1410,60 @@ impl IssuerDispatcher {
         }
         Ok((blob, refreshed))
     }
+}
+
+/// Narrow view of a credit note the dispatcher needs (PMS-1546).
+///
+/// `external_invoice_id` is the provider's id for the invoice being
+/// corrected, which is what makes this a credit the customer can see
+/// against the document they hold rather than a floating account credit.
+pub struct CreditNoteShape<'a> {
+    pub company_id: Uuid,
+    pub external_invoice_id: &'a str,
+    pub issue_date: NaiveDate,
+    pub currency: &'a str,
+    /// The whole credit, which is what gets applied to the provider's
+    /// copy of the invoice. Minor units are the dispatcher's own
+    /// business, like every other amount it sends.
+    pub total: Decimal,
+    pub lines: &'a [CreditNoteLineShape],
+}
+
+/// One line of a credit note, as the dispatcher needs it (PMS-1546).
+pub struct CreditNoteLineShape {
+    pub description: String,
+    pub quantity: Decimal,
+    pub unit_price: Decimal,
+    /// Required on the QuickBooks path, which resolves it to the
+    /// `ItemRef` a sales line is refused without.
+    pub product_id: Option<Uuid>,
+}
+
+/// Whether the provider applied the credit to its copy of the invoice
+/// (PMS-1546).
+///
+/// Two outcomes and not a `bool`, because the refusal carries the
+/// provider's own reason and that reason is the only thing that tells an
+/// operator what to do next. A credit the provider holds but has not
+/// applied is money sitting on the customer's account over there: real,
+/// visible to them, and not reducing the invoice they were sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreditAllocation {
+    /// Applied, with the provider's id for the application when it is a
+    /// document of its own. QuickBooks writes a zero-total payment and
+    /// gives it an id; Xero's allocation is part of the credit note, so
+    /// there is nothing separate to name.
+    Applied(Option<String>),
+    /// The provider holds the credit and would not apply it, with what it
+    /// said. The usual cause is an invoice already settled over there,
+    /// which leaves nothing for the credit to come off.
+    Refused(String),
+}
+
+/// What a provider did with a credit note it was just given (PMS-1546).
+pub struct CreditNotePush {
+    pub reference: ExternalCreditNoteRef,
+    pub allocation: CreditAllocation,
 }
 
 /// Narrow view of a `CreateInvoiceRequest` the dispatcher needs. Named

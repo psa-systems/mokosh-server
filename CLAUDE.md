@@ -64,7 +64,7 @@ just infisical-bootstrap   # one-time after `just dev-infisical`, fills INFISICA
 
 OIDC client registration recipes (`register-client`, etc.) were removed with mokosh-auth in PMS-295: bunyip is the sole OP and owns its own client registry, so RPs register with bunyip, not mokosh.
 
-`just dev` rewrites `USER` in `.env` on each run, generates `.env` from `.env.example` once per clone (PMS-490), needs the external `network-traefik-public`, and runs as compose project `dev-mokosh-${USER}` (PMS-1281). Details: [dev stack notes](docs/quickstart.md#12-dev-stack-notes).
+`just dev` rewrites `USER` in `.env` on each run, generates `.env` from `.env.example` once per clone (PMS-490), needs the external `network-traefik-public`, and runs as compose project `dev-mokosh-${USER}` (PMS-1281). Details: [dev stack notes](docs/internal.md#dev-stack-notes).
 
 ## Architecture
 
@@ -139,25 +139,23 @@ Around thirty modules are mounted and the 501 placeholder mechanism is gone; the
 
 ## Conventions specific to this repo
 
-One line per rule, linking its full text. A new convention adds its text under `docs/invariants/` and one line here (PMS-1437).
+One line per rule, or per group of rules answering one subject, linking its full text. A new convention adds its text under `docs/invariants/` and one line here, or a subsection under the group that already covers it (PMS-1437, PMS-1552).
 
 ### Billing
 
 - Billable time is armed at creation, not approval ([PMS-944](docs/invariants/billing.md#billable-time-pms-944))
-- A quote's tax follows the invoice rule ([PMS-1038](docs/invariants/billing.md#quote-tax-pms-1038))
-- `apply_tax` derives tax from the tenant rate ([PMS-1029](docs/invariants/billing.md#invoice-tax-pms-1029))
-- An invoice's balance has one writer ([PMS-953](docs/invariants/billing.md#balance-pms-953))
+- Tax derives from the tenant rate, on invoices and quotes alike ([PMS-1029, PMS-1038](docs/invariants/billing.md#tax))
+- A money total has one writer, receivables and payables alike ([PMS-953, PMS-1536](docs/invariants/billing.md#single-writer))
+- What crosses to Xero or QuickBooks, in which direction and when ([PMS-1541, PMS-1543, PMS-1544, PMS-1545](docs/invariants/billing.md#delegated-issuing))
 - A sent invoice is replaced, and the replacement voids it ([PMS-1334](docs/invariants/billing.md#amendment-pms-1334))
 - Overdue is derived; reminders are a worker ([PMS-1037](docs/invariants/billing.md#overdue-pms-1037))
 - A write-off is not a credit ([PMS-1036](docs/invariants/billing.md#write-off-pms-1036))
 - Sending emails the invoice; `sent` means it went ([PMS-991, PMS-992](docs/invariants/billing.md#sending-pms-991-pms-992))
 - `net_days` derives the default due date ([PMS-990](docs/invariants/billing.md#net-terms-pms-990))
 - Lines copy prices; `billing_rule` decides billing ([PMS-955](docs/invariants/billing.md#products-pms-955))
-- Prepaid blocks draw down when time is logged ([PMS-951](docs/invariants/billing.md#prepaid-draw-pms-951))
-- Prepaid hours never re-invoice; overage bills at its rate ([PMS-1035](docs/invariants/billing.md#overage-pms-1035))
+- A prepaid block draws down, and overage bills at its rate ([PMS-951, PMS-1035](docs/invariants/billing.md#prepaid-blocks))
 - An invoice uses the tenant's currency ([PMS-1028](docs/invariants/billing.md#currency-pms-1028))
-- Billing handlers take `RequireBilling` and `RequireFinance` ([PMS-962](docs/invariants/billing.md#read-gates-pms-962))
-- Dual-plane invoice handlers gate in the body ([PMS-1041](docs/invariants/billing.md#dual-plane-gates-pms-1041))
+- A billing read is gated by extractor, dual-plane routes in the body ([PMS-962, PMS-1041](docs/invariants/billing.md#financial-read-gates))
 
 ### Documents and PDF
 
@@ -192,6 +190,7 @@ One line per rule, linking its full text. A new convention adds its text under `
 - Stored files go through one seam, `crate::storage` ([PMS-910](docs/invariants/config-providers.md#storage-seam-pms-910))
 - The storage provider is chosen once per process ([PMS-958](docs/invariants/config-providers.md#storage-provider-pms-958))
 - Config has one read path over a declared registry ([PMS-982](docs/invariants/config-providers.md#config-registry-pms-982))
+- A secret may be declared to its own provider, which is not a fallback ([PMS-1537](docs/invariants/config-providers.md#per-secret-declaration-pms-1537))
 - A selectable implementation is a provider ([PMS-1010](docs/invariants/config-providers.md#provider-naming-pms-1010))
 - The deployment mode supplies default providers ([PMS-1011](docs/invariants/config-providers.md#deployment-mode-pms-1011))
 - The hosted deployments declare the database secret provider ([PMS-1440](docs/providers.md#what-the-hosted-deployments-actually-declare-pms-1440))
@@ -240,3 +239,4 @@ One line per rule, linking its full text. A new convention adds its text under `
 - Ticket-note editing is a tenant policy ([PMS-974](docs/invariants/contacts.md#note-editing-pms-974))
 - A second mail audience is a second event ([PMS-1140](docs/invariants/contacts.md#mail-audiences-pms-1140))
 - The label selection is the import filter ([PSA-70 E, PMS-1358](docs/invariants/contacts.md#sync-labels-psa-70-e-pms-1358))
+- A contact source's connection and its cadence live in contact sync ([PMS-1315](docs/invariants/contacts.md#contact-syncs-own-home-pms-1315))

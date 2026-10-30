@@ -341,6 +341,97 @@ async fn alert_ingest_routes_through_tickets_service_and_honors_suppression_and_
     );
 }
 
+/// PMS-1567: a rule matches but the alerting device has no
+/// `rmm_device_mappings` row (no mapped company), so the ingest loop
+/// must skip it without reaching the ticket-creation path.
+#[mokosh_test]
+async fn alert_ingest_skips_rule_when_device_has_no_mapped_company(pool: PgPool) {
+    common::seed_admin(&pool).await;
+    let app = common::boot(pool.clone()).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+
+    let secret = "rmm-shared-secret-xyz";
+    let conn_id = seed_connection(&pool, "api-key", Some(secret)).await;
+    // No seed_unlinked_mapping: "device-A" has no company mapping.
+    seed_alert_rule(&pool, conn_id, "cpu_high", None, None).await;
+
+    let alert = build_alert(
+        conn_id,
+        "device-A",
+        "cpu_high",
+        "High CPU",
+        Some("critical"),
+    );
+    let resp = post_alert(&app, secret, &alert).await;
+    assert!(
+        resp.status().is_success(),
+        "unmapped-device alert should still ingest as a handled skip, got {}",
+        resp.status()
+    );
+
+    let ticket_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND source = 'rmm'")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count tickets");
+    assert_eq!(
+        ticket_count, 0,
+        "no ticket should be created for a device with no mapped company"
+    );
+}
+
+/// PMS-1567: a rule matches and the device is mapped, but the tenant has
+/// no active `super_admin`/`admin`/`manager` user to act as the default
+/// ticket creator, so the ingest loop must skip it without reaching the
+/// ticket-creation path.
+#[mokosh_test]
+async fn alert_ingest_skips_rule_when_tenant_has_no_default_creator(pool: PgPool) {
+    let app = common::boot(pool.clone()).await;
+    let tenant_id = common::DEFAULT_TENANT_ID;
+
+    // Migration 166 backfills a hidden "system" admin user as the fallback
+    // attribution user for a tenant with none; deactivate it so
+    // `default_creator` resolves to None, as a tenant with no eligible
+    // super_admin/admin/manager user would see.
+    sqlx::query("UPDATE users SET status = 'inactive' WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .expect("deactivate fallback users");
+
+    let secret = "rmm-shared-secret-xyz";
+    let company_id = common::seed_company(&pool).await;
+    let conn_id = seed_connection(&pool, "api-key", Some(secret)).await;
+    seed_unlinked_mapping(&pool, conn_id, "device-A", company_id).await;
+    seed_alert_rule(&pool, conn_id, "cpu_high", None, None).await;
+
+    let alert = build_alert(
+        conn_id,
+        "device-A",
+        "cpu_high",
+        "High CPU",
+        Some("critical"),
+    );
+    let resp = post_alert(&app, secret, &alert).await;
+    assert!(
+        resp.status().is_success(),
+        "no-default-creator alert should still ingest as a handled skip, got {}",
+        resp.status()
+    );
+
+    let ticket_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tickets WHERE tenant_id = $1 AND source = 'rmm'")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count tickets");
+    assert_eq!(
+        ticket_count, 0,
+        "no ticket should be created when the tenant has no default ticket creator"
+    );
+}
+
 #[mokosh_test]
 async fn channel_credentials_are_encrypted_at_rest(pool: PgPool) {
     common::seed_admin(&pool).await;

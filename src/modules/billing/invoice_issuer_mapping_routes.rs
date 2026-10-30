@@ -10,9 +10,16 @@
 //! `RequireFinance` pair of today's billing surface applies; the service
 //! layer PR 2b-rest shipped carries the write itself.
 //!
-//! MAPPS-1155 adds the bill half, four more routes on the same prefix:
+//! MAPPS-1155 added the bill half, four more routes on the same prefix:
 //! vendors (which vendor a bill is raised against over there) and
-//! expense accounts (which ledger account a category's lines post to).
+//! expense accounts (which ledger account a category's lines post to),
+//! called by the same Mappings page since MAPPS-1156.
+//!
+//! PMS-1541 added the people half, two more: which contact a member of
+//! the tenant is in the provider, which a reimbursement names. Xero
+//! refuses a bank transaction without one, where QuickBooks sends it as
+//! an optional `EntityRef`; the Mappings page has said which is which
+//! since MAPPS-1168.
 //! Those four read `Feature::DelegatedBills`, not
 //! `Feature::DelegatedInvoiceIssuer`, because they serve a different
 //! switch: a deployment can delegate bills without delegating invoices,
@@ -50,7 +57,7 @@ use crate::modules::auth::{RequireAdmin, RequireBilling, RequireFinance, TenantS
 use crate::modules::billing::invoice_issuer::InvoiceProviderKind;
 use crate::modules::billing::invoice_issuer_mappings::{
     CompanyMapping, ExpenseAccountMapping, InvoiceIssuerMappingService, ProductMapping,
-    VendorMapping,
+    UserMapping, VendorMapping,
 };
 use crate::modules::features::FeatureSnapshot;
 use crate::utils::error::{AppError, AppResult};
@@ -81,18 +88,6 @@ pub fn invoice_issuer_mapping_routes(state: InvoiceIssuerMappingRouterState) -> 
             "/invoice-issuer-mappings/products/{provider}/{product_id}",
             put(upsert_product_mapping),
         )
-        // parity record 2026-10-25 (MAPPS-1155): the four bill-mapping
-        // paths below have no SPA caller for the window between this PR
-        // and the mokosh-apps half of MAPPS-1155, which adds the Vendors
-        // and Expense accounts sections to Settings > Integrations >
-        // {Xero,QuickBooks} > Mappings. Operations needs the write
-        // surface to populate the tables before the delegated-bills
-        // switch can be flipped anywhere, so the routes land first. The
-        // paths this record covers, named per MAPPS-1083:
-        // "/invoice-issuer-mappings/vendors",
-        // "/invoice-issuer-mappings/vendors/{provider}/{vendor_id}",
-        // "/invoice-issuer-mappings/expense-accounts",
-        // "/invoice-issuer-mappings/expense-accounts/{provider}/{category_id}".
         .route(
             "/invoice-issuer-mappings/vendors",
             get(list_vendor_mappings),
@@ -108,6 +103,11 @@ pub fn invoice_issuer_mapping_routes(state: InvoiceIssuerMappingRouterState) -> 
         .route(
             "/invoice-issuer-mappings/expense-accounts/{provider}/{category_id}",
             put(upsert_expense_account_mapping),
+        )
+        .route("/invoice-issuer-mappings/people", get(list_user_mappings))
+        .route(
+            "/invoice-issuer-mappings/people/{provider}/{user_id}",
+            put(upsert_user_mapping),
         )
         .with_state(state)
 }
@@ -134,6 +134,17 @@ pub struct UpsertVendorMappingRequest {
 pub struct UpsertExpenseAccountMappingRequest {
     #[validate(length(min = 1, max = 100))]
     pub external_account_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Validate)]
+pub struct UpsertUserMappingRequest {
+    #[validate(length(min = 1, max = 100))]
+    pub external_contact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListUserMappingsResponse {
+    pub mappings: Vec<UserMapping>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -330,6 +341,40 @@ async fn upsert_expense_account_mapping(
             provider,
             category_id,
             &request.external_account_id,
+        )
+        .await?;
+    Ok(Json(row))
+}
+
+async fn list_user_mappings(
+    State(state): State<InvoiceIssuerMappingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    _admin: RequireAdmin,
+) -> AppResult<Json<ListUserMappingsResponse>> {
+    require_delegated_bills(&state)?;
+    let mappings = state.service.list_user_mappings(user.tenant()).await?;
+    Ok(Json(ListUserMappingsResponse { mappings }))
+}
+
+async fn upsert_user_mapping(
+    State(state): State<InvoiceIssuerMappingRouterState>,
+    RequireBilling { user, .. }: RequireBilling,
+    _finance: RequireFinance,
+    _admin: RequireAdmin,
+    Path((provider_raw, user_id)): Path<(String, Uuid)>,
+    Json(request): Json<UpsertUserMappingRequest>,
+) -> AppResult<Json<UserMapping>> {
+    require_delegated_bills(&state)?;
+    request.validate()?;
+    let provider = parse_provider(&provider_raw)?;
+    let row = state
+        .service
+        .upsert_user_mapping(
+            user.tenant(),
+            provider,
+            user_id,
+            &request.external_contact_id,
         )
         .await?;
     Ok(Json(row))

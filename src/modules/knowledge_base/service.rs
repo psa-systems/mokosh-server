@@ -100,6 +100,40 @@ impl KbService {
         Ok(())
     }
 
+    /// Reject a declared template-variables set with duplicate names or
+    /// with a `default` that is not one of its own `allowed_values`
+    /// (when `allowed_values` is non-empty). A variable with no
+    /// `allowed_values` is free-text and its default is accepted as-is.
+    fn validate_template_variables(vars: &[KbTemplateVariable]) -> AppResult<()> {
+        let mut seen = std::collections::HashSet::new();
+        for var in vars {
+            if var.name.is_empty() {
+                return Err(AppError::validation_field(
+                    "template_variables.name",
+                    "name must not be empty",
+                ));
+            }
+            if !seen.insert(var.name.as_str()) {
+                return Err(AppError::validation_field(
+                    "template_variables.name",
+                    format!("duplicate variable name '{}'", var.name),
+                ));
+            }
+            if let Some(default) = &var.default {
+                if !var.allowed_values.is_empty() && !var.allowed_values.contains(default) {
+                    return Err(AppError::validation_field(
+                        "template_variables.default",
+                        format!(
+                            "default '{}' for '{}' is not one of allowed_values",
+                            default, var.name
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Reject any `company_ids` entry that is not a company owned by this
     /// tenant, so a `client_specific` article cannot be scoped to another
     /// tenant's company (PMS-341). No-op for an empty set.
@@ -494,6 +528,15 @@ impl KbService {
         request: &CreateKbArticleRequest,
         ctx: &AuditCtx,
     ) -> AppResult<KbArticleResponse> {
+        // Declared template variables are optional on create; empty
+        // when the caller omits them, same shape every pre-templating
+        // row carries after migration 292.
+        let template_variables: Vec<KbTemplateVariable> =
+            request.template_variables.clone().unwrap_or_default();
+        Self::validate_template_variables(&template_variables)?;
+        let template_variables_json =
+            serde_json::to_value(&template_variables).unwrap_or_else(|_| serde_json::json!([]));
+
         // Resolve the company scope before any write. A
         // `client_specific` article requires a non-empty, tenant-owned
         // `company_ids`; for any other visibility the scope is ignored and
@@ -540,9 +583,10 @@ impl KbService {
         sqlx::query(
             r#"INSERT INTO kb_articles
                (id, tenant_id, title, slug, content, summary, category_id, visibility,
-                status, author_id, tags, company_ids, parent_article_id, published_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                       CASE WHEN $14 THEN NOW() ELSE NULL END)"#,
+                status, author_id, tags, company_ids, template_variables,
+                parent_article_id, published_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                       CASE WHEN $15 THEN NOW() ELSE NULL END)"#,
         )
         .bind(id)
         .bind(tenant_id)
@@ -556,6 +600,7 @@ impl KbService {
         .bind(author_id)
         .bind(&request.tags)
         .bind(&company_ids)
+        .bind(&template_variables_json)
         .bind(request.parent_article_id)
         .bind(publish_now)
         .execute(&mut *tx)
@@ -613,19 +658,34 @@ impl KbService {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("KB article".to_string()))?;
-        if bump_view {
-            // Increment view count on read; fire-and-forget if the bump fails.
-            let _ = sqlx::query("UPDATE kb_articles SET view_count = view_count + 1 WHERE id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await;
-        }
         tx.commit().await?;
+        if bump_view {
+            // The read already committed, so a failed bump cannot abort or
+            // hide behind it: it runs as its own tenant-scoped transaction
+            // and a failure is only logged, never returned to the caller.
+            if let Err(err) = self.bump_view_count(tenant_id, id).await {
+                tracing::warn!(article_id = %id, error = %err, "KB article view-count bump failed");
+            }
+        }
         crate::utils::unresolved_person::log_unresolved_person_names(
             "knowledge_base.get_article",
             &unresolved_article_person_ids(std::slice::from_ref(&row)),
         );
         Ok(row.into())
+    }
+
+    /// Increment `view_count` for a tenant-scoped article as its own
+    /// transaction, independent of the read that triggered it. Kept
+    /// separate so a failure here never aborts or hides behind the read's
+    /// transaction (PMS-1566).
+    async fn bump_view_count(&self, tenant_id: TenantId, id: Uuid) -> AppResult<()> {
+        let mut tx = self.db.begin_with_tenant(tenant_id).await?;
+        sqlx::query("UPDATE kb_articles SET view_count = view_count + 1 WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id))]
@@ -638,6 +698,20 @@ impl KbService {
         ctx: &AuditCtx,
     ) -> AppResult<KbArticleResponse> {
         let prior = self.get_article_inner(tenant_id, id, false).await?;
+
+        // `Some(vec)` replaces the declared set, `None` leaves it. The
+        // service validates the incoming set with the same rules as
+        // create, so a bad set never lands at the DB.
+        let (template_vars_touch, template_vars_json) = match &request.template_variables {
+            Some(vars) => {
+                Self::validate_template_variables(vars)?;
+                (
+                    true,
+                    serde_json::to_value(vars).unwrap_or_else(|_| serde_json::json!([])),
+                )
+            }
+            None => (false, serde_json::json!([])),
+        };
 
         // Resolve the company scope for the post-update state (PMS-341).
         // The effective visibility is the requested one when present, else
@@ -695,6 +769,7 @@ impl KbService {
                 tags = COALESCE($10, tags),
                 company_ids = $11,
                 parent_article_id = CASE WHEN $13 THEN $14 ELSE parent_article_id END,
+                template_variables = CASE WHEN $15 THEN $16 ELSE template_variables END,
                 -- Stamp published_at on the first transition to
                 -- 'published'; leave it untouched once set and for
                 -- draft / archived transitions.
@@ -721,6 +796,8 @@ impl KbService {
         .bind(editor)
         .bind(parent_touch)
         .bind(parent_value)
+        .bind(template_vars_touch)
+        .bind(&template_vars_json)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1911,6 +1988,95 @@ impl KbService {
         Ok(row.into())
     }
 
+    /// Render a staff-visible article against the caller's values map,
+    /// then run the output through the invisible-character sanitizer
+    /// the un-templated write path already applies. The engine's
+    /// output is Markdown source (not HTML), so the sanitizer sees
+    /// normal content; the caller returns the rendered Markdown
+    /// string to the client as-is.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, id = %id))]
+    pub async fn render_article(
+        &self,
+        tenant_id: TenantId,
+        id: Uuid,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> AppResult<RenderKbArticleResponse> {
+        let article = self.get_article_inner(tenant_id, id, false).await?;
+        self.render_article_body(article, values)
+    }
+
+    /// Portal counterpart of [`Self::render_article`]: the same visibility
+    /// gate as [`Self::get_portal_article`] (published + public OR
+    /// `client_specific` with the caller's `company_id`), rendered the
+    /// same way. A stored-but-not-visible article returns 404, matching
+    /// the GET; the render path never confirms an id outside the
+    /// caller's scope.
+    #[tracing::instrument(skip_all, fields(tenant_id = %tenant_id, company_id = %company_id, id = %id))]
+    pub async fn render_portal_article(
+        &self,
+        tenant_id: TenantId,
+        company_id: Uuid,
+        id: Uuid,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> AppResult<RenderKbArticleResponse> {
+        let article = self.get_portal_article(tenant_id, company_id, id).await?;
+        self.render_article_body(article, values)
+    }
+
+    fn render_article_body(
+        &self,
+        article: KbArticleResponse,
+        values: &std::collections::BTreeMap<String, String>,
+    ) -> AppResult<RenderKbArticleResponse> {
+        // Caller passed a name the article does not declare. We reject
+        // it as a 400 so a typo in the SPA cannot silently produce
+        // output with the user's input ignored.
+        let declared_names: std::collections::HashSet<&str> = article
+            .template_variables
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        for name in values.keys() {
+            if !declared_names.contains(name.as_str()) {
+                return Err(AppError::validation_field(
+                    "values",
+                    format!("unknown template variable '{name}'"),
+                ));
+            }
+        }
+        // Where a declared variable restricts its allowed_values, a
+        // caller value must be one of them. A free-text variable (empty
+        // allowed_values) accepts anything.
+        for var in &article.template_variables {
+            if var.allowed_values.is_empty() {
+                continue;
+            }
+            if let Some(value) = values.get(&var.name) {
+                if !var.allowed_values.contains(value) {
+                    return Err(AppError::validation_field(
+                        "values",
+                        format!(
+                            "value '{}' for '{}' is not one of allowed_values",
+                            value, var.name
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let rendered =
+            super::render::render_article(&article.content, &article.template_variables, values)?;
+        // Same sanitizer the un-templated path applies on write (the
+        // `sanitize_json_body` middleware strips invisible characters
+        // from every inbound JSON string). The engine's output is
+        // Markdown source, not HTML; the sanitizer sees normal content.
+        let sanitized = crate::utils::text::sanitize_invisible(&rendered).into_owned();
+        Ok(RenderKbArticleResponse {
+            id: article.id,
+            content: sanitized,
+        })
+    }
+
     /// Portal feed for a specific customer contact (PMS-84 / PMS-32).
     ///
     /// The contact-facing visibility rule with no other filter: a
@@ -2026,7 +2192,7 @@ const USER_NAME_SQL: &str = "NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''
 /// unambiguous.
 const ARTICLE_SELECT: &str = r#"SELECT kb_articles.id, title, slug, content, summary, category_id, visibility, status,
               author_id, view_count, helpful_count, not_helpful_count,
-              published_at, tags, company_ids,
+              published_at, tags, company_ids, template_variables,
               -- PMS-1481: resolved company labels for the Access column.
               -- Tenant-scoped join; a stale id is skipped so the array
               -- never carries a NULL that would surprise the SPA.
@@ -2075,6 +2241,7 @@ struct ArticleRow {
     tags: Option<Vec<String>>,
     company_ids: Option<Vec<Uuid>>,
     company_names: Option<Vec<String>>,
+    template_variables: Option<serde_json::Value>,
     parent_article_id: Option<Uuid>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -2118,6 +2285,13 @@ impl From<ArticleRow> for KbArticleResponse {
             company_ids: r.company_ids.unwrap_or_default(),
             company_names: r.company_names.unwrap_or_default(),
             parent_article_id: r.parent_article_id,
+            // A row written before migration 292 reads NULL here; the
+            // service always writes a non-null array, so a NULL means
+            // "none declared".
+            template_variables: r
+                .template_variables
+                .map(|v| serde_json::from_value::<Vec<KbTemplateVariable>>(v).unwrap_or_default())
+                .unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         }
