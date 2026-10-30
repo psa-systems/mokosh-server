@@ -79,6 +79,7 @@ pub mod env;
 pub mod file;
 pub mod flags;
 pub mod guard;
+pub mod parse;
 pub mod registry;
 
 pub use bunyip::{BunyipConfig, BunyipProvider};

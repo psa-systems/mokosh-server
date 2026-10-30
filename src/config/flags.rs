@@ -149,9 +149,41 @@ impl<T: FlagValue> Flag<T> {
         match config::get(self.key) {
             Some(raw) if !raw.trim().is_empty() => match T::parse(&raw) {
                 Some(value) => value,
-                None => self.resolved_default(),
+                None => {
+                    // PMS-1577: the boot-time pass (`check_boot`) is supposed to
+                    // have already refused a set-but-unparseable flag, but a
+                    // refresh after boot can still land one; warn so a value
+                    // that silently reverted to the default is visible.
+                    tracing::warn!(
+                        key = self.key.name(),
+                        value = %raw,
+                        "flag value failed to parse; serving the flag's default"
+                    );
+                    self.resolved_default()
+                }
             },
             _ => self.resolved_default(),
+        }
+    }
+
+    /// `Ok(())` when this flag is unset, blank, or set to a value that
+    /// parses; `Err` naming the flag and its raw value otherwise. The boot
+    /// pass ([`check_boot`]) runs this over every declared flag so a typo
+    /// (`LOGIN_APPROVAL_ENABLED=ture`) refuses to start rather than silently
+    /// reading as the default.
+    pub fn check(&self) -> Result<(), String> {
+        match config::get(self.key) {
+            Some(raw) if !raw.trim().is_empty() => {
+                if T::parse(&raw).is_some() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{} is set to {raw:?}, which is not a valid value",
+                        self.key.name()
+                    ))
+                }
+            }
+            _ => Ok(()),
         }
     }
 
@@ -249,6 +281,47 @@ pub static ALLOW_UNINVITED_BUNYIP_SIGNUP: Flag<bool> = Flag::new(
     &registry::ALLOW_UNINVITED_BUNYIP_SIGNUP,
     FlagDefault::Constant(false),
 );
+
+/// Object-safe view of [`Flag::check`], so every declared flag (whatever its
+/// `T`) can sit in one list for [`check_boot`] regardless of value type.
+trait FlagCheck: Sync {
+    fn check(&self) -> Result<(), String>;
+}
+
+impl<T: FlagValue + Sync> FlagCheck for Flag<T> {
+    fn check(&self) -> Result<(), String> {
+        Flag::check(self)
+    }
+}
+
+/// Every declared flag. A flag added above and left out of this list would
+/// not be covered by [`check_boot`], so a typo in it would go back to
+/// reading silently as the default; there is no other enforcement that this
+/// list stays complete.
+static ALL_FLAGS: &[&dyn FlagCheck] = &[
+    &ORGANIZATIONS_ENABLED,
+    &LOGIN_APPROVAL_ENABLED,
+    &ALLOW_UNINVITED_BUNYIP_SIGNUP,
+];
+
+/// PMS-1577: refuse to start when any declared flag is set but unparseable.
+/// Collects every failing flag into one combined error, mirroring
+/// `main.rs`'s `check_deployment_requirements`.
+pub fn check_boot() -> Result<(), String> {
+    let errors: Vec<String> = ALL_FLAGS
+        .iter()
+        .filter_map(|flag| flag.check().err())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "boot refused: {} feature flag(s) set to an unparseable value.\n\n{}",
+            errors.len(),
+            errors.join("\n")
+        ))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -414,6 +487,46 @@ mod tests {
         std::env::set_var("LOGIN_APPROVAL_ENABLED", "true");
         let _ = config::refresh();
         assert!(LOGIN_APPROVAL_ENABLED.read());
+    }
+
+    /// `check` is `Ok` when unset, blank, or a valid value, and names the
+    /// flag and the raw value when it is set but unparseable.
+    #[test]
+    fn check_is_ok_for_unset_blank_and_valid_err_for_unparseable() {
+        let _serial = refresh_test_lock();
+        let _cleanup = EnvGuard::new(&["LOGIN_APPROVAL_ENABLED"]);
+
+        assert!(LOGIN_APPROVAL_ENABLED.check().is_ok(), "unset");
+
+        std::env::set_var("LOGIN_APPROVAL_ENABLED", "  ");
+        let _ = config::refresh();
+        assert!(LOGIN_APPROVAL_ENABLED.check().is_ok(), "blank");
+
+        std::env::set_var("LOGIN_APPROVAL_ENABLED", "true");
+        let _ = config::refresh();
+        assert!(LOGIN_APPROVAL_ENABLED.check().is_ok(), "valid");
+
+        std::env::set_var("LOGIN_APPROVAL_ENABLED", "ture");
+        let _ = config::refresh();
+        let err = LOGIN_APPROVAL_ENABLED.check().expect_err("typo must fail");
+        assert!(err.contains("LOGIN_APPROVAL_ENABLED"), "{err}");
+        assert!(err.contains("ture"), "{err}");
+    }
+
+    /// `check_boot` collects every failing flag's error into one message and
+    /// is clean when every declared flag is unset or valid.
+    #[test]
+    fn check_boot_fails_on_an_unparseable_flag_and_is_clean_otherwise() {
+        let _serial = refresh_test_lock();
+        let _cleanup = EnvGuard::new(&["LOGIN_APPROVAL_ENABLED"]);
+
+        assert!(check_boot().is_ok());
+
+        std::env::set_var("LOGIN_APPROVAL_ENABLED", "ture");
+        let _ = config::refresh();
+        let err = check_boot().expect_err("a typo'd flag must refuse to boot");
+        assert!(err.contains("LOGIN_APPROVAL_ENABLED"), "{err}");
+        assert!(err.contains("ture"), "{err}");
     }
 
     /// `served_by` names the provider that held the flag's raw
