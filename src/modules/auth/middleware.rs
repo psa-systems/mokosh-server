@@ -2070,9 +2070,23 @@ fn effective_role_from_bunyip(bunyip_role: Option<&str>, local: UserRole) -> Use
 }
 
 fn default_bunyip_tenant_id() -> uuid::Uuid {
-    crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID)
-        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
-        .unwrap_or_else(|| uuid::Uuid::from_u128(1))
+    let raw = crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID);
+    match crate::config::parse::parse_optional::<uuid::Uuid>(
+        &crate::config::registry::OIDC_DEFAULT_TENANT_ID,
+        raw,
+    ) {
+        Ok(Some(id)) => id,
+        Ok(None) => uuid::Uuid::from_u128(1),
+        Err(e) => {
+            // PMS-1577: the boot-time check (`main.rs`) is supposed to have
+            // already refused a set-but-unparseable OIDC_DEFAULT_TENANT_ID,
+            // but a refresh after boot can still land one; warn so a JIT
+            // placement that silently reverted to the hardcoded default is
+            // visible.
+            tracing::warn!(error = %e, "OIDC_DEFAULT_TENANT_ID failed to parse; serving the hardcoded default tenant");
+            uuid::Uuid::from_u128(1)
+        }
+    }
 }
 
 /// PMS-245: whether an already-placed user should be backfilled off the shared

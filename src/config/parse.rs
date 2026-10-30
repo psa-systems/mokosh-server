@@ -36,6 +36,21 @@ where
     }
 }
 
+/// Boot-time check for a key read later by its own per-call accessor (for
+/// example `OIDC_DEFAULT_TENANT_ID`, read by both
+/// `auth::middleware::default_bunyip_tenant_id` and
+/// `seed::service::shared_landing_tenant`) rather than through
+/// [`crate::config::AppConfig`]: a set-but-unparseable value must still fail
+/// startup naming the key and value, not wait for the first per-call read to
+/// quietly resolve to that accessor's own fallback (PMS-1577).
+pub fn check_boot<T>(key: &ConfigKey) -> Result<(), String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    parse_optional::<T>(key, crate::config::get(key)).map(|_| ())
+}
+
 /// Same as [`parse_optional`], additionally rejecting a parsed value that is
 /// not strictly positive (a cap of zero or less is nonsensical, and PMS-1577
 /// refuses to read it as "uncapped" the way an unset value is read).
@@ -104,5 +119,27 @@ mod tests {
             parse_positive::<usize>(&registry::MOKOSH_MAX_TENANTS, None),
             Ok(None)
         );
+    }
+
+    /// `check_boot` reads the key itself (rather than a value the caller
+    /// already has) so it can run once at startup ahead of a per-call
+    /// accessor like `OIDC_DEFAULT_TENANT_ID`'s two readers.
+    #[test]
+    fn check_boot_is_clean_when_unset_and_fails_naming_the_key_when_malformed() {
+        let _serial = crate::config::refresh_test_lock();
+        std::env::remove_var("OIDC_DEFAULT_TENANT_ID");
+        let _ = crate::config::refresh();
+
+        assert!(check_boot::<uuid::Uuid>(&registry::OIDC_DEFAULT_TENANT_ID).is_ok());
+
+        std::env::set_var("OIDC_DEFAULT_TENANT_ID", "not-a-uuid");
+        let _ = crate::config::refresh();
+        let err = check_boot::<uuid::Uuid>(&registry::OIDC_DEFAULT_TENANT_ID)
+            .expect_err("a typo'd uuid must refuse to boot");
+        assert!(err.contains("OIDC_DEFAULT_TENANT_ID"), "{err}");
+        assert!(err.contains("not-a-uuid"), "{err}");
+
+        std::env::remove_var("OIDC_DEFAULT_TENANT_ID");
+        let _ = crate::config::refresh();
     }
 }

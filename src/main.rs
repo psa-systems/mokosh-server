@@ -613,6 +613,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // declared flag has a resolved generation to read.
     config::flags::check_boot()?;
 
+    // PMS-1577: OIDC_DEFAULT_TENANT_ID is read as a UUID by both the Bunyip
+    // JIT-placement path (`auth::middleware::default_bunyip_tenant_id`) and
+    // the demo-seed shared-tenant exclusion (`seed::service::shared_landing_tenant`),
+    // neither of which goes through `AppConfig`. A typo there must still fail
+    // startup naming the variable and value, not silently resolve to the
+    // hardcoded default tenant on the first request.
+    config::parse::check_boot::<uuid::Uuid>(&config::registry::OIDC_DEFAULT_TENANT_ID)?;
+
     let config = AppConfig::from_env().expect("Failed to load configuration");
 
     // PMS-1160: refuse to start when an essential deployment-shape variable

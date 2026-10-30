@@ -93,8 +93,22 @@ fn seed_enabled_for(environment: &str, override_flag: Option<&str>) -> bool {
 /// Returns `None` when the env var is unset (single-tenant / test / legacy
 /// deployments), in which case there is no shared tenant to exclude.
 fn shared_landing_tenant() -> Option<Uuid> {
-    crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID)
-        .and_then(|s| Uuid::parse_str(s.trim()).ok())
+    let raw = crate::config::get(&crate::config::registry::OIDC_DEFAULT_TENANT_ID);
+    match crate::config::parse::parse_optional::<Uuid>(
+        &crate::config::registry::OIDC_DEFAULT_TENANT_ID,
+        raw,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            // PMS-1577: the boot-time check (`main.rs`) is supposed to have
+            // already refused a set-but-unparseable OIDC_DEFAULT_TENANT_ID,
+            // but a refresh after boot can still land one; warn so this
+            // silently excludes nothing from auto-seeding instead of
+            // excluding the shared landing tenant as documented.
+            tracing::warn!(error = %e, "OIDC_DEFAULT_TENANT_ID failed to parse; no shared landing tenant excluded from auto-seed");
+            None
+        }
+    }
 }
 
 /// Outcome of an explicit, admin-triggered demo-data load
