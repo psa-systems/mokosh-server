@@ -1,51 +1,21 @@
 ---
 
-# Thin caller for the reusable Renovate workflow in psa-systems/common
-# (feat/renovate-reusable-workflow, PC-91 follow-up). The definition
-# lives there; this stub owns the schedule for THIS repo so an operator
-# changing mokosh-server's cadence does not have to touch common.
-#
-# Renovate scans the tree against `renovate.json` at the repo root and
-# opens PRs grouped by family (sqlx-*, actix-*, serde-*, dunite-*, ...).
-# The reusable job reads `secrets.RENOVATE_CI_TOKEN` directly, so this
-# caller passes the org-level `psa-systems` secret through explicitly
-# under that same name, below.
+# Caller for the reusable Renovate workflow in common. The standard for this file is in common's README.md, "Consumer setup".
 
 name: Renovate
 
 on:
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "0 2 * * 6"
   workflow_dispatch:
 
 jobs:
   renovate:
     name: Renovate (caller)
-    # Known trade-off, matching bunyip's BUNYIP-1005 pattern: the bare
-    # `psa-systems/common/...@<sha>` form runs, the explicit
-    # `https://dev.a8n.run/...@<sha>` form does not. On this Forgejo
-    # instance a cross-repo reusable `uses:` called by its full URL does
-    # not propagate the caller's `vars.*` into the callee's `runs-on`,
-    # so the dispatched job sits at "Waiting for a runner with the
-    # following labels:" with the label list empty (the reusable
-    # workflow in `psa-systems/common` already documents the same cause
-    # in its sibling `check-secrets.yml`). A reusable-workflow caller
-    # cannot carry its own `runs-on`, so the URL form is unfixable from
-    # here while the gap stands. Renovate's github-actions manager will
-    # flag `psa-systems/common` as a bare github-digest lookup on the
-    # dashboard; accepted trade-off until the propagation gap is fixed
-    # upstream in `psa-systems/common`.
-    uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@6b78b2c6c49402ee6178c82233ed3e25817f6572  # main; see comment above for the URL-form regression
+    uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@5213b60641e19912747467e02bf630c9596bf790  # main
     with:
       target_repository: ${{ github.repository }}
     secrets:
-      # secret-scope-ok: reusable workflow needs RENOVATE_CI_TOKEN (write:repository + write:issue) to open dependency-update PRs; this caller job runs no step and reads no secret itself. Explicit pass-through, named to match what the reusable workflow reads.
       RENOVATE_CI_TOKEN: ${{ secrets.RENOVATE_CI_TOKEN }}
-      # PMS-1554: silences "No github.com token has been configured" /
-      # "Rate limit exceeded for api.github.com" / "GitHub token is
-      # required for some dependencies". Renovate reaches github.com for
-      # the real github-hosted actions (Swatinem/rust-cache, crazy-max/*)
-      # and the crates.io release-notes source. `PUBLIC_GITHUB_REPO_TOKEN`
-      # is a read-only PAT (public_repo scope only). The reusable
-      # workflow maps it onto `GITHUB_COM_TOKEN` once PC-104 lands.
       PUBLIC_GITHUB_REPO_TOKEN: ${{ secrets.PUBLIC_GITHUB_REPO_TOKEN }}
+      PSA_SYSTEMS_PRIVATE_PACKAGE_PAT: ${{ secrets.PSA_SYSTEMS_PRIVATE_PACKAGE_PAT }}
