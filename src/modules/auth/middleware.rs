@@ -11,7 +11,8 @@ use super::mokosh_bunyip_grants::map_grant_role;
 use super::oidc_rs::{Verifier as BunyipVerifier, VerifyError};
 use super::service::{is_unresolved_placeholder_email, BunyipPrincipal, UNRESOLVED_EMAIL_DOMAIN};
 use super::{AuthService, AuthState, CurrentUser, UserRole};
-use crate::utils::error::AppError;
+use crate::utils::error::{AppError, AppResult};
+use uuid::Uuid;
 
 /// PMS-769: what happened to the `Authorization: Bearer` credential on this
 /// request. Recorded on the request extensions by [`auth_middleware`] (and by
@@ -500,10 +501,8 @@ pub async fn auth_middleware(
     // paths and for tenant-mismatched tokens.
     let auth_state = if !auth_state.is_authenticated {
         if let Some(sub) = candidate_sub {
-            match auth_middleware.auth_service.is_user_tombstoned(sub).await {
-                Ok(true) => AuthState::deleted(),
-                _ => auth_state,
-            }
+            let probe = auth_middleware.auth_service.is_user_tombstoned(sub).await;
+            resolve_tombstone_probe(auth_state, sub, probe)
         } else {
             auth_state
         }
@@ -539,6 +538,24 @@ pub async fn auth_middleware(
     request.extensions_mut().insert(outcome);
 
     next.run(request).await
+}
+
+/// PMS-1577: the tombstone probe's result folded into the next `AuthState`,
+/// pulled out of `auth_middleware` so the error branch is unit-testable
+/// without a database. `Ok(true)` upgrades to `deleted` (unchanged MAPPS-348
+/// behaviour); `Ok(false)` and `Err` both keep `auth_state` as it was, but a
+/// database error is logged with the user id first, because reading it as
+/// "definitely not tombstoned" the same way a real negative answer is read
+/// would hide a database outage behind an identical response.
+fn resolve_tombstone_probe(auth_state: AuthState, sub: Uuid, probe: AppResult<bool>) -> AuthState {
+    match probe {
+        Ok(true) => AuthState::deleted(),
+        Ok(false) => auth_state,
+        Err(e) => {
+            tracing::warn!(user_id = %sub, error = %e, "tombstone probe failed; treating as not tombstoned");
+            auth_state
+        }
+    }
 }
 
 fn bearer(req: &Request) -> Option<&str> {
@@ -2083,8 +2100,8 @@ fn is_stuck_in_default(
 mod tests {
     use super::{
         default_bunyip_tenant_id, effective_role_from_bunyip, is_stuck_in_default,
-        user_or_auth_error, AuthRejection, AuthState, BearerOutcome, CurrentUser, UserRole,
-        VerifyError,
+        resolve_tombstone_probe, user_or_auth_error, AuthRejection, AuthState, BearerOutcome,
+        CurrentUser, UserRole, VerifyError,
     };
     use crate::utils::error::AppError;
     use axum::response::IntoResponse;
@@ -2151,6 +2168,29 @@ mod tests {
                 other => panic!("expected unchallenged AccountDeleted, got {other:?}"),
             }
         }
+    }
+
+    /// PMS-1577: `Ok(true)` upgrades to `deleted`; `Ok(false)` and `Err`
+    /// both leave `auth_state` exactly as it was, so the response status for
+    /// an unauthenticated request is unchanged by a probe failure.
+    #[test]
+    fn resolve_tombstone_probe_distinguishes_tombstoned_from_not_found_and_error() {
+        let sub = Uuid::from_u128(7);
+        let before = AuthState::default();
+
+        assert!(
+            resolve_tombstone_probe(before.clone(), sub, Ok(true)).deleted,
+            "a confirmed tombstone must upgrade to deleted"
+        );
+        assert!(
+            !resolve_tombstone_probe(before.clone(), sub, Ok(false)).deleted,
+            "a confirmed non-tombstone must not change auth_state"
+        );
+        assert!(
+            !resolve_tombstone_probe(before.clone(), sub, Err(AppError::NotFound("db".into())))
+                .deleted,
+            "a database error must fall back to auth_state, not be read as a positive answer"
+        );
     }
 
     #[test]
