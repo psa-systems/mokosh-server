@@ -457,7 +457,7 @@ Dev-stack-only variables (compose ports, `USER`, `MINIO_*`, `MOKOSH_PG_*`) are l
 | `cache-warm.yml` | push to `main` | Compiles (no tests) what check and integration compile so later PR runs restore a warm cache |
 | `post-merge-guards.yml` | push to `main` | Re-runs migration prefix uniqueness and immutability against the merged history; no cargo or docker |
 | `create-release.yml` | closed (merged) PR from a `release/v*` branch into `main` | Calls the shared reusable workflow to create the release |
-| `renovate.yml` | every 4 hours and manual | Dependency updates via a shared reusable workflow |
+| `renovate.yml` | Saturday 02:00 UTC and manual | Dependency updates via a shared reusable workflow |
 
 `main` branch protection requires `Check`, `E2E` and `Integration` pull-request checks ([ci-release invariants](invariants/ci-release.md#integration-required-pms-1426)).
 

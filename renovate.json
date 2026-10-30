@@ -1,17 +1,9 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended",
-    ":semanticCommits"
+    "local>psa-systems/common:renovate-default"
   ],
   "gitAuthor": "renovate-bot <renovate-bot@users.noreply.dev.a8n.run>",
-  "prConcurrentLimit": 3,
-  "rangeStrategy": "bump",
-  "rebaseWhen": "behind-base-branch",
-  "vulnerabilityAlerts": {
-    "enabled": true,
-    "labels": ["security"]
-  },
   "osvVulnerabilityAlerts": true,
   "enabledManagers": [
     "cargo",
@@ -21,19 +13,12 @@
   ],
   "packageRules": [
     {
-      "description": "PMS-1554: collapse every scheduled update into two PRs. Security advisories still open their own PR per advisory via `vulnerabilityAlerts.enabled` above; those bypass the group and are the third stream.",
-      "groupName": "major dependency updates",
-      "matchUpdateTypes": ["major"]
-    },
-    {
-      "description": "PMS-1554: the catch-all for minor, patch, pin and digest bumps across every manager.",
-      "groupName": "non-major dependency updates",
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
-    },
-    {
       "description": "Rust toolchain stays on its own: a toolchain bump has to land before any crate update that needs its new MSRV, so it cannot be folded into the general stream.",
       "groupName": "rust toolchain",
-      "matchPackageNames": ["rust", "rustc"]
+      "matchPackageNames": [
+        "rust",
+        "rustc"
+      ]
     }
   ]
 }
