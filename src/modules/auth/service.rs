@@ -3993,7 +3993,20 @@ impl AuthService {
                             any_verified_user = Some(user);
                         }
                     }
-                    _ => continue,
+                    Ok(false) => continue,
+                    // PMS-1577: a verification error (corrupt stored hash)
+                    // is not the same answer as a genuine wrong password,
+                    // so it is logged distinctly before moving on to the
+                    // next membership.
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %user.id,
+                            tenant_id = %m.tenant_id,
+                            error = %e,
+                            "password verification failed; treating as not matched",
+                        );
+                        continue;
+                    }
                 }
             }
             if matched_memberships.is_empty() {
