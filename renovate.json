@@ -4,11 +4,7 @@
     "config:recommended",
     ":semanticCommits"
   ],
-  "platform": "forgejo",
-  "endpoint": "https://dev.a8n.run/api/v1/",
   "gitAuthor": "renovate-bot <renovate-bot@users.noreply.dev.a8n.run>",
-  "autodiscover": false,
-  "onboarding": false,
   "prConcurrentLimit": 3,
   "rangeStrategy": "bump",
   "rebaseWhen": "behind-base-branch",
