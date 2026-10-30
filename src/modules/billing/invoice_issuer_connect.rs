@@ -552,11 +552,18 @@ impl InvoiceIssuerConnectService {
         let Some(row) = row else {
             return Err(invalid());
         };
-        let usable = row.consumed_at.is_none()
-            && row.expires_at > Utc::now()
-            && verify_password(secret, &row.state_hash)
-                .await
-                .unwrap_or(false);
+        let not_consumed_and_fresh = row.consumed_at.is_none() && row.expires_at > Utc::now();
+        // PMS-1577: a verification error (corrupt stored hash, Argon2
+        // failure) is not the same answer as a genuine wrong secret, so it
+        // is logged distinctly before falling through to the same refusal.
+        let usable = not_consumed_and_fresh
+            && match verify_password(secret, &row.state_hash).await {
+                Ok(matches) => matches,
+                Err(e) => {
+                    tracing::warn!(state_id = %state_id, error = %e, "oauth state secret verification failed; treating as not usable");
+                    false
+                }
+            };
         if !usable {
             return Err(invalid());
         }

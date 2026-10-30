@@ -28,9 +28,17 @@ const DEFAULT_ADMIN_LAST_NAME: &str = "Admin";
 #[tokio::main]
 async fn main() -> ExitCode {
     // Load .env / .env.infisical so values can be read via env vars without
-    // forcing the operator to `export` them in their shell.
-    let _ = dotenvy::from_filename(".env.infisical");
-    let _ = dotenvy::dotenv();
+    // forcing the operator to `export` them in their shell. PMS-1577: a
+    // missing file is the documented default; a malformed one is not.
+    for result in [dotenvy::from_filename(".env.infisical"), dotenvy::dotenv()] {
+        if let Err(e) = result {
+            if !matches!(e, dotenvy::Error::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+            {
+                eprintln!("env file could not be loaded: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(

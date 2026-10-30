@@ -575,9 +575,18 @@ impl ContactSyncService {
         };
         // Same refusal for consumed, expired and wrong-secret: a caller
         // probing state ids learns nothing from the difference.
-        let usable = consumed_at.is_none()
-            && expires_at > Utc::now()
-            && verify_password(secret, &state_hash).await.unwrap_or(false);
+        let not_consumed_and_fresh = consumed_at.is_none() && expires_at > Utc::now();
+        // PMS-1577: a verification error (corrupt stored hash, Argon2
+        // failure) is not the same answer as a genuine wrong secret, so it
+        // is logged distinctly before falling through to the same refusal.
+        let usable = not_consumed_and_fresh
+            && match verify_password(secret, &state_hash).await {
+                Ok(matches) => matches,
+                Err(e) => {
+                    tracing::warn!(state_id = %state_id, error = %e, "oauth state secret verification failed; treating as not usable");
+                    false
+                }
+            };
         if !usable {
             return Err(AppError::BadRequest(
                 "That connection attempt is no longer valid. Start again from Settings."
@@ -742,9 +751,18 @@ impl ContactSyncService {
                     .to_string(),
             ));
         };
-        let usable = consumed_at.is_none()
-            && expires_at > Utc::now()
-            && verify_password(secret, &state_hash).await.unwrap_or(false);
+        let not_consumed_and_fresh = consumed_at.is_none() && expires_at > Utc::now();
+        // PMS-1577: a verification error (corrupt stored hash, Argon2
+        // failure) is not the same answer as a genuine wrong secret, so it
+        // is logged distinctly before falling through to the same refusal.
+        let usable = not_consumed_and_fresh
+            && match verify_password(secret, &state_hash).await {
+                Ok(matches) => matches,
+                Err(e) => {
+                    tracing::warn!(state_id = %state_id, error = %e, "oauth state secret verification failed; treating as not usable");
+                    false
+                }
+            };
         if !usable {
             return Err(AppError::BadRequest(
                 "That connection attempt is no longer valid. Start again from Settings."

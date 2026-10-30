@@ -110,11 +110,23 @@ pub async fn portal_contact_middleware(
                             })
                         }
                     }
-                    Ok(false) | Err(_) => {
+                    Ok(false) => {
                         tracing::info!(
                             tenant_id = %claims.tid,
                             contact_id = %claims.sub,
                             "contact request rejected: access check failed",
+                        );
+                        ContactAuthState::default()
+                    }
+                    // PMS-1577: a database error deciding access is not the
+                    // same answer as a genuine revocation, so it is logged
+                    // distinctly; the response is unchanged either way.
+                    Err(e) => {
+                        tracing::warn!(
+                            tenant_id = %claims.tid,
+                            contact_id = %claims.sub,
+                            error = %e,
+                            "contact access check failed; treating as not authenticated",
                         );
                         ContactAuthState::default()
                     }
