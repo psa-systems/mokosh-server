@@ -77,12 +77,12 @@ pub struct KbAttachmentConfig {
 }
 
 impl KbAttachmentConfig {
-    pub fn from_env() -> Self {
-        let max_bytes = crate::config::get(&crate::config::registry::KB_ATTACHMENT_MAX_BYTES)
-            .filter(|v| !v.trim().is_empty())
-            .and_then(|v| v.parse().ok())
+    pub fn from_env() -> AppResult<Self> {
+        let key = &crate::config::registry::KB_ATTACHMENT_MAX_BYTES;
+        let max_bytes = crate::config::parse::parse_positive(key, crate::config::get(key))
+            .map_err(AppError::Configuration)?
             .unwrap_or(DEFAULT_MAX_BYTES);
-        Self { max_bytes }
+        Ok(Self { max_bytes })
     }
 }
 

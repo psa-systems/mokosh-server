@@ -164,7 +164,8 @@ pub fn tenant_routes(
     // PMS-957: the authenticated tree is where a logo is uploaded and removed,
     // so it is the one that records what is stored.
     let logos =
-        TenantLogoStore::new(TenantLogoConfig::from_env()).with_ledger(tenant_service.db.clone());
+        TenantLogoStore::new(TenantLogoConfig::from_env().expect("TENANT_LOGO_MAX_BYTES invalid"))
+            .with_ledger(tenant_service.db.clone());
     // PMS-1233: read before `logos` moves into the state, so the upload
     // route's `DefaultBodyLimit` matches the cap `TenantLogoStore::store`
     // enforces rather than axum's undocumented 2 MiB default.
@@ -436,7 +437,9 @@ pub fn public_tenant_routes(tenant_service: TenantService) -> Router {
         tenant_service: Arc::new(tenant_service),
         // No ledger: this router only READS a logo, and recording is a
         // property of storing one.
-        logos: Arc::new(TenantLogoStore::new(TenantLogoConfig::from_env())),
+        logos: Arc::new(TenantLogoStore::new(
+            TenantLogoConfig::from_env().expect("TENANT_LOGO_MAX_BYTES invalid"),
+        )),
     };
     Router::new()
         .route("/tenants/{tenant_id}/logo", get(get_public_logo))

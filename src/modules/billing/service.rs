@@ -5533,7 +5533,7 @@ impl BillingService {
         let branding: mokosh_types::tenants::TenantBranding =
             serde_json::from_value(branding).unwrap_or_default();
         let logos = crate::modules::tenants::logo::TenantLogoStore::new(
-            crate::modules::tenants::logo::TenantLogoConfig::from_env(),
+            crate::modules::tenants::logo::TenantLogoConfig::from_env()?,
         );
         Ok(
             crate::modules::billing::issuer::freeze(tx, tenant_id.get(), &name, &branding, &logos)

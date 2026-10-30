@@ -59,18 +59,22 @@ pub struct TenantLogoConfig {
 }
 
 impl TenantLogoConfig {
-    pub fn from_env() -> Self {
-        let max_bytes = crate::config::get(&crate::config::registry::TENANT_LOGO_MAX_BYTES)
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|n| *n > 0)
+    pub fn from_env() -> AppResult<Self> {
+        let key = &crate::config::registry::TENANT_LOGO_MAX_BYTES;
+        let max_bytes = crate::config::parse::parse_positive(key, crate::config::get(key))
+            .map_err(AppError::Configuration)?
             .unwrap_or(DEFAULT_MAX_BYTES);
-        Self { max_bytes }
+        Ok(Self { max_bytes })
     }
 }
 
 impl Default for TenantLogoConfig {
+    /// PMS-1577: `from_env` now fails loud on a malformed / non-positive
+    /// `TENANT_LOGO_MAX_BYTES`, consistent with the other boot-time
+    /// `.expect()` sites in this crate (there is no `Result`-returning
+    /// `Default` to propagate it through instead).
     fn default() -> Self {
-        Self::from_env()
+        Self::from_env().expect("TENANT_LOGO_MAX_BYTES invalid")
     }
 }
 

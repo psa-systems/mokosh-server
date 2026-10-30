@@ -253,7 +253,12 @@ pub async fn logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>> {
 /// and when the file has gone, for the same reason as [`logo_bytes`].
 pub async fn live_logo_bytes(tenant_id: Uuid, issuer: &Issuer) -> Option<Vec<u8>> {
     let mime = issuer.logo_mime.as_deref()?;
-    let logos = TenantLogoStore::new(crate::modules::tenants::logo::TenantLogoConfig::from_env());
+    // `read` below never consults `max_bytes` (that cap only gates `store`), so a
+    // malformed `TENANT_LOGO_MAX_BYTES` must not turn a rendered statement's logo
+    // into a missing one; fall back to a value irrelevant to this call instead.
+    let config = crate::modules::tenants::logo::TenantLogoConfig::from_env()
+        .unwrap_or(crate::modules::tenants::logo::TenantLogoConfig { max_bytes: 0 });
+    let logos = TenantLogoStore::new(config);
     logos.read(tenant_id, mime).await.ok()
 }
 
