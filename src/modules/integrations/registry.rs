@@ -181,11 +181,6 @@ pub const DEFAULT_POLL_INTERVAL_MINUTES: i32 = 15;
 /// The floor, mirroring the CHECK on `integrations.poll_interval_minutes`.
 pub const MIN_POLL_INTERVAL_MINUTES: i32 = 5;
 
-const POLLED: PollingSpec = PollingSpec {
-    default_minutes: DEFAULT_POLL_INTERVAL_MINUTES,
-    min_minutes: MIN_POLL_INTERVAL_MINUTES,
-};
-
 /// Whether there is anything behind a registry entry (MAPPS-1121).
 ///
 /// PMS-1310 built the capability model before the providers, which is a
@@ -372,7 +367,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         description: "Hand the accounting over: QuickBooks issues the invoice the customer \
                       receives and holds what the MSP is billed for.",
         supported_capabilities: &[Capability::Invoicing, Capability::BillsAndExpenses],
-        polling: Some(POLLED),
+        polling: None,
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::InvoiceIssuer,
         build: ProviderBuild::Built,
@@ -383,7 +378,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         description: "Hand the accounting over: Xero issues the invoice the customer \
                       receives and holds what the MSP is billed for.",
         supported_capabilities: &[Capability::Invoicing, Capability::BillsAndExpenses],
-        polling: Some(POLLED),
+        polling: None,
         connection_home: ConnectionHome::Integrations,
         credential_home: CredentialHome::InvoiceIssuer,
         build: ProviderBuild::Built,
@@ -394,7 +389,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         description: "Synchronise people and organisations with Google Contacts, so a \
                       directory the MSP already maintains is not maintained twice.",
         supported_capabilities: &[Capability::Contacts],
-        polling: Some(POLLED),
+        polling: None,
         connection_home: ConnectionHome::Elsewhere {
             table: "contact_sync_connections",
             configured_at: "Settings > Contact sync",
@@ -409,7 +404,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
                       the same bargain as Google against the directory most MSP customers \
                       are already on.",
         supported_capabilities: &[Capability::Contacts],
-        polling: Some(POLLED),
+        polling: None,
         // MAPPS-1121: this entry said the connection was made here, with a
         // credential pasted into the integrations page. MAPPS-1101 shipped the
         // real thing and it is the Entra consent round trip in `contact_sync`:
@@ -430,7 +425,7 @@ pub const REGISTRY: &[ProviderDescriptor] = &[
         description: "Import contacts from an iCloud account over CardDAV, with an Apple ID \
                       and an app-specific password. Read-only: nothing is written back.",
         supported_capabilities: &[Capability::Contacts],
-        polling: Some(POLLED),
+        polling: None,
         // MAPPS-1122: listed so the panel can answer "what is this organization
         // connected to" for a source that has always had its own surface and
         // never had an entry here. Like Google and Microsoft 365, the

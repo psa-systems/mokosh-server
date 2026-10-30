@@ -271,9 +271,10 @@ async fn the_catalog_lists_every_provider_before_anything_is_connected(pool: PgP
         "a capability says what handing it over MEANS: {}",
         xero["supported_capabilities"][0]
     );
-    assert_eq!(
-        xero["polling"]["default_minutes"], 15,
-        "the poll default PMS-1310 settled on"
+    assert!(
+        xero.get("polling").is_none_or(|p| p.is_null()),
+        "PMS-1583: nothing paces Xero's poll off integrations.poll_interval_minutes, so it \
+         declares no polling cadence: {xero}"
     );
 
     // Google is listed, but the page is told where it is actually configured
