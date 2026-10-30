@@ -12,7 +12,9 @@ on:
 jobs:
   renovate:
     name: Renovate (caller)
-    uses: psa-systems/common/.forgejo/workflows/renovate-reusable.yml@f466fa87127d4c5d78e9b8d5a730bfc59ef45450  # main
+    uses: https://dev.a8n.run/psa-systems/common/.forgejo/workflows/renovate-reusable.yml@f466fa87127d4c5d78e9b8d5a730bfc59ef45450  # main
+    # Base label: the same one the reusable workflow's own job uses; it compiles nothing.
+    runs-on: ${{ vars.RUNS_ON_OPENSUSE_BASE_MEDIUM }}
     with:
       target_repository: ${{ github.repository }}
     secrets:
