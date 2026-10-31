@@ -628,6 +628,8 @@ and are not reused.
 - **SPEC-4.99**: a country field must be empty or be one of the 249 ISO 3166-1 alpha-2 codes, case-insensitively.
 - **SPEC-4.100**: a postal code field must be empty or be 2 to 12 characters of ASCII letters, digits, spaces or
   hyphens.
+- **SPEC-4.101**: the free-text contact field named in a field-values suggestion query must map only to one of a
+  fixed, closed set of column names, so that name is safe to interpolate into the query rather than being bound.
 
 ## 5. Interfaces
 

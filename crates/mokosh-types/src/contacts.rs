@@ -1501,6 +1501,7 @@ pub enum ContactSuggestField {
 
 impl ContactSuggestField {
     /// The whitelisted column this field maps to. Safe to interpolate.
+    // SPEC-4.101: maps only to a fixed column name, safe to interpolate.
     pub fn column(&self) -> &'static str {
         match self {
             Self::Title => "title",
