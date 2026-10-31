@@ -517,6 +517,28 @@ and are not reused.
 - **SPEC-4.63**: the self-hosted hosting profile's default provider table must name no provider that requires
   reaching an external service.
 
+### 4.14 Outbound mail
+
+- **SPEC-4.64**: a `Mailer` implementation that does not override `send_with_attachments` must send the text alone
+  and log a warning when given one or more attachments, never silently drop them without logging.
+- **SPEC-4.65**: sending to a recipient address in the reserved `.invalid` top-level domain must fail locally with
+  a client error rather than being handed to a transport.
+- **SPEC-4.66**: `SmtpTls::parse` must map `implicit`/`tls`/`smtps` to implicit TLS, `starttls` or an empty value to
+  STARTTLS, and `none`/`plain`/`off` to no TLS, rejecting any other value; `SmtpMailer::verify` must report success
+  only when the relay's `NOOP` returns true, and must report a distinct error for an unreachable host versus a
+  reachable host that refuses the `NOOP`.
+- **SPEC-4.67**: `MailerConfig::build` must select `LogMailer` when `SMTP_HOST` is unset or empty and `SmtpMailer`
+  otherwise, and `MailerConfig::from_env` must reject a configuration that sets `SMTP_USERNAME` without a
+  non-empty `SMTP_PASSWORD`.
+- **SPEC-4.68**: resolving the mail provider must honor an explicit `MAIL_PROVIDER` value over everything else,
+  must infer `smtp` as an explicit choice when `MAIL_PROVIDER` is unset but `SMTP_HOST` is set, and must otherwise
+  fall back to the hosting profile's default provider.
+- **SPEC-4.69**: building the `smtp` provider with no `SMTP_HOST` configured must fail with a named configuration
+  error rather than falling back to another provider, and building the `log` provider while `SMTP_HOST` is set
+  must still succeed but log a warning that the relay configuration is ignored.
+- **SPEC-4.70**: `SharedMailer::swap` must replace the active mailer such that every subsequent send through the
+  shared handle uses the new mailer, without any consumer needing to re-fetch a reference.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API
