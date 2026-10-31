@@ -94,6 +94,7 @@ impl DeploymentMode {
     /// continuation is the self-hosted default. An unrecognised value is
     /// logged at `warn` so a typo is visible in the log rather than only in
     /// the absence of email a week later.
+    // SPEC-4.59: mail dispatch's reader falls back to self-hosted on an unrecognized value.
     pub fn from_env() -> Self {
         Self::parse(&raw_from_env())
     }
@@ -102,6 +103,7 @@ impl DeploymentMode {
     /// boot failure naming the legal values rather than a silent fall back to
     /// a different set of providers. See the module doc for why the two
     /// readers disagree on purpose.
+    // SPEC-4.60: provider selection's reader errors, naming the accepted values, on an unrecognized value.
     pub fn from_env_for_providers() -> AppResult<Self> {
         Self::parse_for_providers(&raw_from_env())
     }
@@ -136,6 +138,7 @@ impl DeploymentMode {
 
     /// The vocabulary, in one place, so the lenient and the strict reader
     /// cannot come to accept different values.
+    // SPEC-4.61: case-insensitive, trimmed; an empty value means self-hosted, same as absent.
     fn recognise(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             // An empty value is what a forwarded-but-unset compose key looks
@@ -211,6 +214,7 @@ impl DeploymentMode {
     /// wins for its kind; the kinds nobody overrode keep the profile's row and
     /// are recorded as such, which is what makes a provider left on by a
     /// default visible rather than assumed.
+    // SPEC-4.62: an explicit per-capability override wins for that capability only; the source of each choice is recorded.
     pub fn resolve_providers(self, overrides: &ProviderOverrides) -> ProviderSelection {
         let choices = ProviderKind::ALL
             .iter()
@@ -371,6 +375,7 @@ pub mod provider {
 /// image boots and serves with no Bunyip, no Infisical and no object store"
 /// means concretely; `the_self_hosted_defaults_need_no_external_service`
 /// enforces it.
+// SPEC-4.63: the self-hosted profile's defaults name none of these.
 pub const EXTERNAL_SERVICE_PROVIDERS: &[&str] = &[
     provider::INFISICAL,
     provider::BUNYIP,

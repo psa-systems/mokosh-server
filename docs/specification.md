@@ -503,6 +503,20 @@ and are not reused.
   error's explicit `message` when present or otherwise synthesize one from its constraint code and bound
   parameters (`humanize_field_error`).
 
+### 4.13 Deployment mode and provider selection
+
+- **SPEC-4.59**: the deployment-mode reader used for mail dispatch must fall back to self-hosted and log a warning
+  on an unrecognized `MOKOSH_DEPLOYMENT_MODE` value, never fail the read.
+- **SPEC-4.60**: the deployment-mode reader used for provider selection must instead return an error naming the
+  accepted values on an unrecognized `MOKOSH_DEPLOYMENT_MODE` value.
+- **SPEC-4.61**: both readers must recognize the mode value case-insensitively and with surrounding whitespace
+  trimmed, and must treat an empty value the same as an absent one (self-hosted).
+- **SPEC-4.62**: resolving a deployment's provider table must select an operator's explicit per-capability choice
+  over the hosting profile's default for that capability only, and must record for each capability whether its
+  choice came from the profile or from an explicit override.
+- **SPEC-4.63**: the self-hosted hosting profile's default provider table must name no provider that requires
+  reaching an external service.
+
 ## 5. Interfaces
 
 ### 5.1 HTTP API
