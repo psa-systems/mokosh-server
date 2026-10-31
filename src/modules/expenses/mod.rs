@@ -55,14 +55,19 @@
 //!   the expense-category-to-account mapping QuickBooks requires on
 //!   every bill line.
 //!
+//! # What ships in Phase 3 (PMS-1541)
+//!
+//! - Delegated EXPENSES: [`service::ExpensesService::reimburse_expense`]
+//!   records a reimbursed claim in Xero or QuickBooks when the tenant has
+//!   delegated `BillsAndExpenses`, the same gate as delegated bills. An
+//!   expense is a claim from a person, not an obligation to a vendor, so
+//!   it is a different document in both providers: a Xero `SPEND` bank
+//!   transaction, or a QuickBooks purchase, never a bill.
+//!
 //! # What does NOT ship
 //!
 //! - **worker**: due-date reminders and reimbursement batching are a
 //!   later phase.
-//! - **delegated EXPENSES**: an expense is a claim from a person, not an
-//!   obligation to a vendor, and in both providers it is a different
-//!   document (a spend-money transaction, not a bill). Pushing one as a
-//!   bill would be wrong in the provider's own ledger.
 //! - **vendor payments read back**: the MAPPS-1136 receivers report what
 //!   a customer paid; no receiver reads a vendor payment, so a bill paid
 //!   in the provider stays open here until somebody records it.
